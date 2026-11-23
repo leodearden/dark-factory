@@ -12,6 +12,7 @@ import logging
 import os
 
 import pytest
+from _census_helpers import census_lines
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.deterministic_task_guard import (
@@ -20,13 +21,7 @@ from fused_memory.middleware.deterministic_task_guard import (
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_SOURCE = 'source=deterministic_task_guard'
-
-
-def _discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+_SOURCE = 'deterministic_task_guard'
 
 
 def _install_executable(root, relpath='scripts/deploy.sh'):
@@ -510,7 +505,7 @@ class TestInjectTaskKind:
         with caplog.at_level(logging.WARNING):
             result = inject_task_kind('not valid json!!!', 'normal')
         assert result == {'task_kind': 'normal'}
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     def test_non_dict_json_value_warns_schema_warning_census_token(self, caplog):
         """A syntactically valid JSON value that isn't an object (a bare list)
@@ -519,7 +514,7 @@ class TestInjectTaskKind:
         with caplog.at_level(logging.WARNING):
             result = inject_task_kind('[1,2,3]', 'normal')
         assert result == {'task_kind': 'normal'}
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     def test_valid_dict_metadata_emits_no_warning(self, caplog):
         """A well-formed dict is not a discard: no schema_warning WARNING, and
@@ -528,7 +523,7 @@ class TestInjectTaskKind:
         with caplog.at_level(logging.WARNING):
             result = inject_task_kind({'foo': 'bar', 'spawned_from': 'x'}, 'deterministic')
         assert result == {'foo': 'bar', 'spawned_from': 'x', 'task_kind': 'deterministic'}
-        assert _discard_lines(caplog) == []
+        assert census_lines(caplog, _SOURCE) == []
 
     def test_empty_string_metadata_no_warning(self, caplog):
         """Amendment: an empty-string metadata is benign-absent, not a discard.
@@ -541,7 +536,7 @@ class TestInjectTaskKind:
         with caplog.at_level(logging.WARNING):
             result = inject_task_kind('', 'normal')
         assert result == {'task_kind': 'normal'}
-        assert _discard_lines(caplog) == []
+        assert census_lines(caplog, _SOURCE) == []
 
 
 class TestDeterministicTaskErrorUnreadableMetadata:
@@ -553,7 +548,7 @@ class TestDeterministicTaskErrorUnreadableMetadata:
     ):
         with caplog.at_level(logging.WARNING):
             assert deterministic_task_error('normal', metadata, '/proj') is None
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
 
 # ---------------------------------------------------------------------------

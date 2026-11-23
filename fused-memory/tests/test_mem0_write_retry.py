@@ -14,6 +14,7 @@ from typing import Any
 import openai
 import pytest
 import pytest_asyncio
+from _fm_helpers import make_insufficient_quota_error
 from _mem0_intent_fixtures import (
     EMBEDDINGS_REQUEST,
     mem0_intent_row,
@@ -78,6 +79,19 @@ class TestClassifyTransientProviderFailure:
         ids=['write-budget-timeout', '401', '400', '429-text-only', 'value-error', 'cancelled'],
     )
     def test_everything_else_is_not_transient(self, error):
+        assert classify_transient_provider_failure(error) is None
+
+    @pytest.mark.parametrize('with_code', [True, False], ids=['type-and-code', 'type-only'])
+    def test_exhausted_credits_are_billing_not_a_rate_limit(self, with_code):
+        error = make_insufficient_quota_error(with_code=with_code)
+
+        assert classify_transient_provider_failure(error) is (
+            TransientProviderFailure.BILLING_EXHAUSTED
+        )
+
+    def test_insufficient_quota_in_a_non_openai_message_is_not_transient(self):
+        error = RuntimeError('insufficient_quota: You have no credits remaining')
+
         assert classify_transient_provider_failure(error) is None
 
 
@@ -286,6 +300,18 @@ class TestRetryDueMem0Intents:
         assert row['next_attempt_at'] == _PASS_POLICY.retry_at(
             attempts=2, now=_NOW
         ).isoformat(timespec='microseconds')
+        assert summary == Mem0RetryPassSummary(due=1, rescheduled=1)
+
+    @pytest.mark.asyncio
+    async def test_exhausted_credits_reschedule_under_a_billing_reason(self, journal):
+        intent_id, _ = await _seed_retrying(journal)
+
+        summary = await _run_pass(journal, _Reissue(make_insufficient_quota_error()))
+
+        row = await mem0_intent_row(journal, intent_id)
+        assert row['status'] == 'retrying'
+        assert row['attempts'] == 2
+        assert row['reason'].startswith('billing_exhausted')
         assert summary == Mem0RetryPassSummary(due=1, rescheduled=1)
 
     @pytest.mark.asyncio

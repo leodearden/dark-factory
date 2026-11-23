@@ -276,7 +276,7 @@ DECLINE_KINDS_KEY = 'declined_by_kind'
 # than typed out: the renderer's two decline blocks (the PRD-D6 banding NOTE and
 # the ``declined`` column legend) each carried their own hand-written copy of
 # the five names, which put the prose outside the very discipline metrics.py's
-# ``_DECLINE_READERS`` comment exists to enforce — "a sixth architect exit
+# ``DECLINE_READERS`` comment exists to enforce — "a sixth architect exit
 # cannot be half-added". Three kinds spell their exit mechanically as
 # ``report_<kind>``; the two that do not are listed here and ONLY here, so a new
 # kind renders by the rule instead of going silently missing from both blocks.

@@ -8,17 +8,22 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
+from _task_workflow_scene import (
+    SCENE_TASK_ID,
+    forked_task_workflow,
+    scene_git,
+    task_scene_config,
+    task_workflow,
+)
 
 from orchestrator import verify_evidence
-from orchestrator.agents.invoke import AgentResult
-from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.artifacts import ReviewAggregation
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
 from orchestrator.verify_admission_record import AdmissionLeg
 from orchestrator.verify_cache.modes import CacheMode
@@ -37,7 +42,7 @@ from orchestrator.verify_runner import (
     result_from_dict,
     result_to_dict,
 )
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import WorkflowOutcome
 
 _ALPHA = ModuleConfig(
     prefix='alpha',
@@ -181,6 +186,70 @@ class TestUnitsOnResult:
         assert result.units == ()
 
 
+class TestUnitVocabulary:
+    def test_a_unit_reason_round_trips_the_wire_codec(self):
+        unit = dataclasses.replace(
+            _module_unit('alpha', 'test', UnitOutcome.UNAVAILABLE), reason='registry unreadable',
+        )
+
+        rebuilt = result_from_dict(json.loads(json.dumps(result_to_dict(_result(units=(unit,))))))
+
+        assert rebuilt.units is not None
+        assert rebuilt.units == (unit,)
+        assert rebuilt.units[0].reason == 'registry unreadable'
+
+    def test_a_wire_unit_from_an_older_remote_rebuilds_without_a_reason(self):
+        wire = result_to_dict(_result())
+        wire['units'] = [{
+            'unit': 'module:alpha:test', 'tier': 'module', 'key': None,
+            'outcome': 'ran_green', 'evidence_event_id': None,
+        }]
+
+        units = result_from_dict(wire).units
+
+        assert units is not None
+        (unit,) = units
+        assert unit.reason is None
+
+    def test_every_outcome_but_ran_red_is_green(self):
+        green = verify_evidence.GREEN_OUTCOMES
+
+        assert green == frozenset({
+            UnitOutcome.RAN_GREEN, UnitOutcome.CACHE_HIT, UnitOutcome.WOULD_HIT, UnitOutcome.UNAVAILABLE,
+        })
+        assert set(UnitOutcome) - green == {UnitOutcome.RAN_RED}
+
+    def test_every_leg_names_a_module_config_command_field(self):
+        command_fields = {field.name for field in dataclasses.fields(ModuleConfig) if field.name.endswith('_command')}
+
+        assert set(verify_evidence.COMMAND_FIELD_BY_LEG) == set(verify_evidence.Leg)
+        assert set(verify_evidence.COMMAND_FIELD_BY_LEG.values()) == command_fields
+
+    @pytest.mark.parametrize(('outcome', 'evidence', 'leaked'), [
+        (UnitOutcome.RAN_RED, 7, True),
+        (UnitOutcome.RAN_RED, None, False),
+        (UnitOutcome.WOULD_HIT, 7, False),
+        (UnitOutcome.CACHE_HIT, 7, False),
+        (UnitOutcome.RAN_GREEN, None, False),
+    ])
+    def test_only_a_red_run_carrying_a_replayable_green_would_have_leaked(
+        self, outcome, evidence, leaked,
+    ):
+        unit = dataclasses.replace(_module_unit('alpha', 'test', outcome), evidence_event_id=evidence)
+
+        assert unit.would_have_leaked is leaked
+
+    def test_the_verify_event_carries_each_unit_reason(self):
+        units = (
+            dataclasses.replace(_module_unit('alpha', 'test', UnitOutcome.CACHE_HIT), reason='hit'),
+            _module_unit('alpha', 'lint', UnitOutcome.RAN_GREEN),
+        )
+
+        fields = verify_evidence.verify_event_fields(_result(units=units))
+
+        assert [unit['reason'] for unit in fields['units']] == ['hit', None]
+
+
 def _two_module_repo(root: Path) -> str:
     for module in ('alpha', 'beta'):
         (root / module).mkdir(parents=True)
@@ -242,7 +311,7 @@ class TestMergeVerifyEventCarriesUnits:
             {
                 'unit': f'module:{module}:{leg}', 'tier': 'module', 'key': None,
                 'outcome': 'ran_red' if (module, leg) == ('beta', 'test') else 'ran_green',
-                'evidence_event_id': None,
+                'evidence_event_id': None, 'reason': None,
             }
             for module in ('alpha', 'beta') for leg in ('lint', 'test', 'type')
         ]
@@ -310,74 +379,14 @@ class TestAggregatedUnits:
         assert result.units == expected
 
 
-# ---------------------------------------------------------------------------
-# A TaskWorkflow over a real git repo and a real EventStore, with its agent and
-# scheduler collaborators doubled (the test_rebase_verify_cost.py harness).
-
-_TASK_ID = '42'
-
-
-def _git(cwd: Path, *argv: str) -> str:
-    return subprocess.run(
-        ['git', '-c', 'user.email=t@t', '-c', 'user.name=t', *argv],
-        cwd=cwd, check=True, capture_output=True, text=True,
-    ).stdout.strip()
-
-
-def _commit(cwd: Path, name: str) -> None:
-    (cwd / name).write_text(f'{name}\n')
-    _git(cwd, 'add', '-A')
-    _git(cwd, 'commit', '-q', '-m', name)
-
-
 @pytest.fixture
 def config(tmp_path: Path) -> OrchestratorConfig:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    _git(repo, 'init', '-q', '-b', 'main')
-    _commit(repo, 'lib.py')
-    return OrchestratorConfig(
-        project_root=repo,
-        max_concurrent_tasks=1,
-        max_verify_attempts=2,
-        escalate_preexisting_main_break=False,
-        git=GitConfig(
-            main_branch='main', branch_prefix='task/', remote='origin', worktree_dir='.worktrees',
-        ),
-    )
+    return task_scene_config(tmp_path)
 
 
 @pytest.fixture
 def git_ops(config: OrchestratorConfig) -> GitOps:
     return GitOps(config.git, config.project_root)
-
-
-async def _task_workflow(
-    config: OrchestratorConfig, git_ops: GitOps, store: EventStore, monkeypatch: pytest.MonkeyPatch,
-) -> TaskWorkflow:
-    worktree = await git_ops.create_worktree(_TASK_ID)
-    workflow = TaskWorkflow(
-        assignment=TaskAssignment(
-            task_id=_TASK_ID,
-            task={
-                'id': _TASK_ID, 'title': 'X', 'description': '', 'status': 'pending',
-                'metadata': {'files': ['lib']}, 'dependencies': [],
-            },
-            modules=['lib'],
-        ),
-        config=config, git_ops=git_ops,
-        scheduler=MagicMock(), briefing=MagicMock(), mcp=MagicMock(),
-        event_store=store,
-    )
-    workflow.worktree = worktree.path
-    workflow._base_commit = worktree.base_commit
-    workflow.artifacts = TaskArtifacts(worktree.path)
-    workflow.artifacts.init(_TASK_ID, 'X', 'desc', base_commit=worktree.base_commit)
-    workflow.plan = {'task_id': _TASK_ID, 'steps': []}
-    workflow.briefing.build_debugger_prompt = AsyncMock(return_value='debug')
-    monkeypatch.setattr(workflow, '_check_escalations', MagicMock(return_value=[]))
-    monkeypatch.setattr(workflow, '_invoke', AsyncMock(return_value=AgentResult(success=True, output='')))
-    return workflow
 
 
 def _admission_leg(*, waited_secs: float, flock_wait_secs: float) -> AdmissionLeg:
@@ -399,7 +408,7 @@ class TestImplementSiteWorkflowVerify:
         self, config, git_ops, tmp_path, monkeypatch,
     ):
         store = EventStore(tmp_path / 'events.db', run_id='r')
-        workflow = await _task_workflow(config, git_ops, store, monkeypatch)
+        workflow = await task_workflow(config, git_ops, store, monkeypatch)
         plan = _alpha_plan().to_dict()
         failing = _result(
             passed=False, summary='tests failed', duration_secs=1.0,
@@ -422,11 +431,11 @@ class TestImplementSiteWorkflowVerify:
         assert workflow.worktree is not None
         assert _workflow_verify_rows(store) == [{
             'passed': True,
-            'tip_sha': _git(workflow.worktree, 'rev-parse', 'HEAD'),
+            'tip_sha': scene_git(workflow.worktree, 'rev-parse', 'HEAD'),
             'tip_sha_unresolved': False,
             'tip_sha_unresolved_reason': None,
-            'base_sha': _git(config.project_root, 'rev-parse', 'main'),
-            'branch': f'task/{_TASK_ID}',
+            'base_sha': scene_git(config.project_root, 'rev-parse', 'main'),
+            'branch': f'task/{SCENE_TASK_ID}',
             'duration_ms': 12500,
             'slot_wait_secs': 4.5,
             'site': 'implement',
@@ -437,17 +446,6 @@ class TestImplementSiteWorkflowVerify:
         }]
 
 
-async def _forked_task_workflow(
-    config: OrchestratorConfig, git_ops: GitOps, store: EventStore, monkeypatch: pytest.MonkeyPatch,
-) -> TaskWorkflow:
-    """A task branch with one commit of its own, forked one commit behind main's tip."""
-    workflow = await _task_workflow(config, git_ops, store, monkeypatch)
-    assert workflow.worktree is not None
-    _commit(workflow.worktree, 'task_change.py')
-    _commit(config.project_root, 'main_change.py')
-    return workflow
-
-
 class TestPreMergeSiteWorkflowVerify:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('passed', 'timed_out'), [(True, False), (False, False), (False, True)])
@@ -456,7 +454,7 @@ class TestPreMergeSiteWorkflowVerify:
     ):
         config.pre_merge_reverify = True
         store = EventStore(tmp_path / 'events.db', run_id='r')
-        workflow = await _forked_task_workflow(config, git_ops, store, monkeypatch)
+        workflow = await forked_task_workflow(config, git_ops, store, monkeypatch)
         plan = _alpha_plan().to_dict()
         verdict = _result(
             passed=passed, timed_out=timed_out, summary='' if passed else 'tests failed',
@@ -469,16 +467,16 @@ class TestPreMergeSiteWorkflowVerify:
         assert await workflow._rebase_before_enqueue() is passed
 
         assert workflow.worktree is not None
-        tip = _git(workflow.worktree, 'rev-parse', 'HEAD')
-        main_tip = _git(config.project_root, 'rev-parse', 'main')
-        assert _git(config.project_root, 'merge-base', 'main', tip) == main_tip
+        tip = scene_git(workflow.worktree, 'rev-parse', 'HEAD')
+        main_tip = scene_git(config.project_root, 'rev-parse', 'main')
+        assert scene_git(config.project_root, 'merge-base', 'main', tip) == main_tip
         assert _workflow_verify_rows(store) == [{
             'passed': passed,
             'tip_sha': tip,
             'tip_sha_unresolved': False,
             'tip_sha_unresolved_reason': None,
             'base_sha': main_tip,
-            'branch': f'task/{_TASK_ID}',
+            'branch': f'task/{SCENE_TASK_ID}',
             'duration_ms': 7000,
             'slot_wait_secs': None,
             'site': 'pre_merge',
@@ -497,7 +495,7 @@ class TestPreMergeSiteWorkflowVerify:
     ):
         assert config.pre_merge_reverify is False
         store = EventStore(tmp_path / 'events.db', run_id='r')
-        workflow = await _forked_task_workflow(config, git_ops, store, monkeypatch)
+        workflow = await forked_task_workflow(config, git_ops, store, monkeypatch)
         verify = AsyncMock(return_value=_result())
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify)
 

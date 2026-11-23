@@ -34,6 +34,7 @@ import os
 import types
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -71,6 +72,15 @@ SNAPSHOT_DIGEST_NAME = 'snapshot.sha256'
 #: wrote on their marker records before χ gave those markers a declared kind.
 _RECON_MARKER_FLAGS = ('flag_for_stage2', 'stage2_suppress')
 _RECON_MARKER_KINDS = frozenset({FLAG_FOR_STAGE2_MARKER_KIND, STAGE2_SUPPRESS_GUARD_KIND})
+
+
+class Slates(StrEnum):
+    """Which slate a write is judged on."""
+
+    #: The slate as frozen 2026-10-05, records created after the write included (π).
+    FROZEN = 'frozen'
+    #: Only records created strictly before the write, band re-decided (π2, PRD §12 D19).
+    WRITE_TIME = 'write-time'
 
 
 class PopulationWrite(TypedDict):

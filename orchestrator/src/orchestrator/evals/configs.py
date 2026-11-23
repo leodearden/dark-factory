@@ -16,6 +16,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
+from orchestrator.agents.token_pricing import price_fields
 from orchestrator.config import default_price_table
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.shadow_types import CostBasis
@@ -446,7 +447,11 @@ ALL_FINAL_CONFIG_NAMES = [c.name for c in FINAL_RUN_CONFIGS]
 # downstream role is FROZEN (decision 8: noise isolation + token savings). Per
 # the OFAT methodology, each candidate varies exactly one role — here, the
 # architect. These are the substrate the downstream μ OFAT/matrix driver
-# consumes to score the architect role.
+# consumes to score the architect role. Cost: ofat_candidates() takes this list
+# wholesale and cli.py::_run_matrix_driver crosses it with every implementer
+# incumbent (matrix_pairs), so EVERY entry adds one live architect invocation
+# per OFAT fixture/trial cell and one end-to-end pair per implementer incumbent
+# to every default matrix run, not only when named.
 ARCHITECT_EVAL_CONFIGS = [
     EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
     EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role=RoleUnderTest.ARCHITECT),
@@ -466,12 +471,12 @@ ARCHITECT_EVAL_CONFIGS = [
     # eval-revival ρ: effort-matched to architect-opus-max above — only the
     # model axis varies. Config-only: run_ofat_stage's architect branch
     # (evals/runner.py, task 2478) already dispatches any role='architect'
-    # candidate, and get_config_by_name already searches this list. Cost note:
-    # ARCHITECT_EVAL_CONFIGS is consumed wholesale by ofat_candidates(), so
-    # this is a 5th architect candidate screened by EVERY OFAT run (not just
-    # fable-trial-v2 δ's stage-2 screen) — one extra live architect invocation
-    # per fixture/trial cell for any campaign that pulls the full candidate set.
+    # candidate, and get_config_by_name already searches this list.
     EvalConfig('architect-fable-max', 'claude', 'claude-fable-5', 'max', role=RoleUnderTest.ARCHITECT),
+    # Fable 5.2 arms (task 10488). Separate names from the claude-fable-5 arms
+    # above, whose stored results are keyed by name.
+    EvalConfig('architect-fable52-high', 'claude', 'claude-fable-5-2', 'high', role=RoleUnderTest.ARCHITECT),
+    EvalConfig('architect-fable52-max', 'claude', 'claude-fable-5-2', 'max', role=RoleUnderTest.ARCHITECT),
 ]
 
 
@@ -811,16 +816,26 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
 
 @dataclass(frozen=True)
 class CandidateEndpointPrice:
-    """One candidate model's list rates (USD per 1M tokens) and how it is billed."""
+    """One candidate model's list rates (USD per 1M tokens) and how it is billed.
+
+    A None cache rate means the provider published none; resolve_cost_usd then
+    labels a cell carrying those tokens 'price_table_no_cache_rate'.
+    """
 
     input_per_1m: float
     output_per_1m: float
     cost_basis: CostBasis
+    cached_input_per_1m: float | None = None
+    cache_write_per_1m: float | None = None
 
     @property
     def imputed(self) -> bool:
         """The dollar figure is modelled, not measured: see CostBasis.imputes_dollars."""
         return self.cost_basis.imputes_dollars
+
+    def rates(self) -> dict[str, float]:
+        """The PriceEntry-shaped rates, omitting every unset cache rate."""
+        return price_fields(self)
 
 
 # List rates from the 2026-09-10 live market check (task 5384). Keyed EXACTLY
@@ -832,10 +847,17 @@ CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
     # MiniMax's native list rate from the 2026-11-01 frontier check (task
     # 8086), no long-context surcharge.
     MINIMAX_MODEL: CandidateEndpointPrice(0.15, 0.60, CostBasis.METERED),
-    GLM_MODEL: CandidateEndpointPrice(1.40, 4.40, CostBasis.SUBSCRIPTION),
+    # GLM cache rates from https://docs.z.ai/guides/overview/pricing, retrieved
+    # 2026-11-15: cached input $0.26 / $0.03 per 1M, cache storage limited-time
+    # free. No cache-write price is listed, so writes bill at the input rate.
+    GLM_MODEL: CandidateEndpointPrice(
+        1.40, 4.40, CostBasis.SUBSCRIPTION, cached_input_per_1m=0.26, cache_write_per_1m=1.40,
+    ),
     # LIST price. The 50% promo (0.075/0.25) expired 2026-09-09 24:00 UTC+8;
     # aggregator pages still quote it.
-    GLM_FLASH_MODEL: CandidateEndpointPrice(0.15, 0.50, CostBasis.SUBSCRIPTION),
+    GLM_FLASH_MODEL: CandidateEndpointPrice(
+        0.15, 0.50, CostBasis.SUBSCRIPTION, cached_input_per_1m=0.03, cache_write_per_1m=0.15,
+    ),
     DEEPSEEK_MODEL: CandidateEndpointPrice(0.28, 0.42, CostBasis.METERED),
     KIMI_MODEL: CandidateEndpointPrice(0.60, 2.50, CostBasis.METERED),
     # Imputed list prices from https://mimo.mi.com/docs/en-US/pricing, retrieved
@@ -856,15 +878,13 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
     seed it manually — an existing ``config.prices`` entry still wins on
     conflict, so a manual seed remains a valid override.
 
-    Rates only: this projection feeds ``PriceEntry``. The cost-basis tag is
-    carried by ``CANDIDATE_ENDPOINT_PRICES`` itself, not by this table.
+    Rates only, with unset cache rates omitted: this projection feeds
+    ``PriceEntry``. The cost-basis tag is carried by
+    ``CANDIDATE_ENDPOINT_PRICES`` itself, not by this table.
     """
     return {
         **default_price_table(),
-        **{
-            model: {'input_per_1m': p.input_per_1m, 'output_per_1m': p.output_per_1m}
-            for model, p in CANDIDATE_ENDPOINT_PRICES.items()
-        },
+        **{model: p.rates() for model, p in CANDIDATE_ENDPOINT_PRICES.items()},
     }
 
 

@@ -1,8 +1,8 @@
 """orchestrator.decision_cli — the decision verbs of the fleet registry CLI, served at ``session_registry.py <verb>``.
 
-write-decision, close-decision, reopen-decision, reap-decisions and
-migrate-decision-projects: their subparsers, their runners, and the decision
-half of the CLI's exit-code policy (run_verb).
+write-decision, close-decision, file-and-close-decision, reopen-decision,
+reap-decisions and migrate-decision-projects: their subparsers, their runners,
+and the decision half of the CLI's exit-code policy (run_verb).
 
 It imports only the stdlib, this checkout's stdlib-only ``shared`` leaves
 (``shared.project_id``) and its sibling ``decision_registry``, whose names it
@@ -87,7 +87,7 @@ def _locked_filing_target(
         yield qualified, _read_decision_or_none(qualified)
 
 
-def _run_write_decision(
+def _file_decision(
     local_id: str,
     project: str,
     text: str,
@@ -98,8 +98,8 @@ def _run_write_decision(
     escalations_dir: str = '',
     *,
     record_slug: str = '',
-) -> None:
-    """Run the ``write-decision`` verb (Fleet Cockpit C8: park-to-registry).
+) -> str | None:
+    """File the ``write-decision`` verb's DecisionRecord and return the id it landed on (Fleet Cockpit C8: park-to-registry).
 
     Files an OPEN DecisionRecord from a watcher's park / tell-the-human
     moment, IN ADDITION to its in-session note / afk-digest line, so the
@@ -115,7 +115,7 @@ def _run_write_decision(
     caller doesn't supply one.
 
     ``record_slug`` is best-effort enrichment derived from ``$CLAUDE_PID``'s
-    pid pointer (session_registry.py::resolve_own_record_slug), never typed
+    pid pointer (session_leases.py::resolve_own_record_slug), never typed
     by the caller and never a reason to refuse or delay a filing: an
     unresolvable one is filed as '', is announced by a WARNING at dispatch
     (session_registry.py::_resolve_filing_record_slug, run_verb's injected
@@ -130,9 +130,10 @@ def _run_write_decision(
     read boundary (``cockpit/src/cockpit/registry_reader.py``), so any other
     reader comparing a raw ``SessionRecord.project`` must fold it itself.
     This NORMALIZES an unrecognized spelling rather than
-    REJECTING it, deliberately: (1) this verb is fail-soft by contract --
-    run_verb returns 0 and write_decision never raises -- so a rejection
-    would silently DROP the decision, which is precisely the
+    REJECTING it, deliberately: (1) write-decision's runner is fail-soft by
+    contract -- run_verb returns 0 and write_decision never raises -- and
+    this function itself only reports None, so a rejection would silently
+    DROP the decision, which is precisely the
     fail-into-invisibility harm the whole verb exists to prevent; a human's
     parked question would vanish instead of appearing under a slightly-off
     token. (2) An allowlist would mean a genuinely new project cannot file a
@@ -145,7 +146,7 @@ def _run_write_decision(
     same escalation id in two projects lands on two rows, while both queues
     of ONE project still share a row (the MODE-2 collapse below). A
     same-project record filed before then under the bare id is continued in
-    place (_locked_filing_target), and the printed id is the one landed on.
+    place (_locked_filing_target), and the returned id is the one landed on.
 
     ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
     to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
@@ -219,11 +220,11 @@ def _run_write_decision(
     the incumbent cannot be shown to be the same gate, so a new filing starts
     a new ask, boost and age included.
 
-    On success, prints the filed record's id (mirrors `launching` printing
-    the record dir and `lease-claim` printing `decision=`) so the caller can
-    cross-link it into its in-session note or afk-digest line. write_decision
-    is itself self-guarding fail-soft (never raises), so a fault there is
-    silently skipped here rather than printed as a false confirmation.
+    Returns the id it landed on, or None on every path that writes nothing
+    (a stamp refusal, the cross-project refusal, a failed write, an absorbed
+    fault); the write-decision verb prints it (_run_write_decision).
+    write_decision is itself self-guarding fail-soft (never raises), so a
+    fault there is returned as None rather than as a false confirmation.
 
     Concurrency NOTE (see DecisionRecord's docstring): the read -> merge ->
     write span above is serialized per-decision-id via decision_id_lock (a
@@ -259,7 +260,7 @@ def _run_write_decision(
             'record is cross-queue-ambiguous. Pass the SAME queue dir you reap with.',
             local_id,
         )
-        return
+        return None
     if stamp == decision_registry.UNKNOWN_QUEUE:
         logger.error(
             'write-decision refusing to file %s: --escalations-dir %s is a '
@@ -270,7 +271,7 @@ def _run_write_decision(
             local_id,
             decision_registry.UNKNOWN_QUEUE,
         )
-        return
+        return None
 
     canonical_project = fold_project_token(project)
     if canonical_project != project:
@@ -381,7 +382,7 @@ def _run_write_decision(
                             project,
                             existing.project,
                         )
-                        return
+                        return None
                 elif decision_registry.normalize_escalations_dir(existing.escalations_dir) == stamp:
                     # A MATCHING stamp is the SAME watcher re-filing across a
                     # restart, which both SKILL.md files promise is a plain
@@ -419,9 +420,10 @@ def _run_write_decision(
                         # this one gets tuned out.
                         #
                         # stdout is deliberately untouched (the id is still
-                        # printed below): both SKILLs document "no id on
-                        # stdout means your filing did not land" as the
-                        # did-it-work signal, and this filing DID land.
+                        # returned below, and write-decision prints it): both
+                        # SKILLs document "no id on stdout means your filing
+                        # did not land" as the did-it-work signal, and this
+                        # filing DID land.
                         logger.warning(
                             'write-decision kept decision %s in state %r rather than '
                             're-opening it: this re-file came from the SAME queue (%s) '
@@ -460,7 +462,7 @@ def _run_write_decision(
                 # overwrite, unchanged.
 
             if decision_registry.write_decision(record):
-                print(record.id)
+                return record.id
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         logger.error(
             'write-decision: failed to file %s for project %s',
@@ -468,6 +470,41 @@ def _run_write_decision(
             canonical_project,
             exc_info=True,
         )
+    return None
+
+
+def _run_write_decision(
+    local_id: str,
+    project: str,
+    text: str,
+    task_id: str | None,
+    escalation_id: str | None,
+    session_id: str | None,
+    severity: str = '',
+    escalations_dir: str = '',
+    *,
+    record_slug: str = '',
+) -> None:
+    """Run the ``write-decision`` verb: file through _file_decision and print the id it landed on.
+
+    The printed id mirrors `launching` printing the record dir and
+    `lease-claim` printing `decision=`, so the caller can cross-link it into
+    its in-session note or afk-digest line; no id on stdout means the filing
+    did not land.
+    """
+    landed = _file_decision(
+        local_id,
+        project,
+        text,
+        task_id,
+        escalation_id,
+        session_id,
+        severity,
+        escalations_dir,
+        record_slug=record_slug,
+    )
+    if landed is not None:
+        print(landed)
 
 
 def _reap_scope_hint(reaper_project: str, *, expect_matches: bool) -> str | None:
@@ -656,6 +693,64 @@ def _run_close_decision(
     return 0
 
 
+def _run_file_and_close_decision(
+    local_id: str,
+    project: str,
+    text: str,
+    task_id: str | None,
+    escalation_id: str | None,
+    session_id: str | None,
+    severity: str,
+    escalations_dir: str,
+    *,
+    state: str,
+    evidence: str,
+    record_slug: str,
+) -> int:
+    """Run the ``file-and-close-decision`` verb: write-decision's filing, then a close of the id it landed on.
+
+    Its caller is scripts/sitting/payloads.py::close_decision_argv, closing an
+    L2 that has no DecisionRecord. The close names exactly the id this run's
+    own filing landed on (_locked_filing_target): a fresh qualified id, or a
+    same-project legacy record continued in place, so no caller ever
+    re-derives where write-decision files. The filing's --project and
+    --escalations-dir are the close's compare-and-swap expectation. Arguments
+    no close could accept are refused before anything is filed, and a filing
+    that lands nothing exits non-zero, as close-decision's refusals do.
+    """
+    try:
+        decision_registry.refuse_unclosable_arguments(local_id, state, evidence)
+    except decision_registry.DecisionCloseRefused as exc:
+        print(f'close-decision refused: {exc}', file=sys.stderr)
+        return 1
+    landed = _file_decision(
+        local_id,
+        project,
+        text,
+        task_id,
+        escalation_id,
+        session_id,
+        severity,
+        escalations_dir,
+        record_slug=record_slug,
+    )
+    if landed is None:
+        print(
+            f'file-and-close-decision: write-decision filed nothing for --id {local_id} '
+            '(see the ERROR log); nothing was closed',
+            file=sys.stderr,
+        )
+        return 1
+    return _run_close_decision(
+        landed,
+        state,
+        evidence,
+        None,
+        expected_project=project,
+        expected_escalations_dir=escalations_dir,
+    )
+
+
 def _run_reopen_decision(
     decision_id: str,
     root: str | None,
@@ -737,8 +832,8 @@ def _run_migrate_decision_projects(dry_run: bool) -> None:
 
 # The one table of decision verbs. A refusing runner's exit code is the CLI's;
 # a fail-soft runner's faults are logged and swallowed by run_verb.
-_REFUSING_RUNNERS: dict[str, Callable[[argparse.Namespace], int]] = {
-    'close-decision': lambda args: _run_close_decision(
+_REFUSING_RUNNERS: dict[str, Callable[[argparse.Namespace, Callable[[str, str], str]], int]] = {
+    'close-decision': lambda args, _filing_record_slug: _run_close_decision(
         args.id,
         args.state,
         args.evidence,
@@ -746,7 +841,20 @@ _REFUSING_RUNNERS: dict[str, Callable[[argparse.Namespace], int]] = {
         expected_project=args.project,
         expected_escalations_dir=args.escalations_dir,
     ),
-    'reopen-decision': lambda args: _run_reopen_decision(
+    'file-and-close-decision': lambda args, filing_record_slug: _run_file_and_close_decision(
+        args.id,
+        args.project,
+        args.text,
+        args.task_id,
+        args.escalation_id,
+        args.session_id,
+        args.severity,
+        args.escalations_dir,
+        state=args.state,
+        evidence=args.evidence,
+        record_slug=filing_record_slug(args.id, args.project),
+    ),
+    'reopen-decision': lambda args, _filing_record_slug: _run_reopen_decision(
         args.id,
         args.root,
         expected_project=args.project,
@@ -796,13 +904,9 @@ def _add_record_identity_args(verb_parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_verb_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Register the DECISION_VERBS subparsers on the CLI's *sub*."""
-    write_decision_p = sub.add_parser(
-        'write-decision',
-        help='file an OPEN DecisionRecord (Fleet Cockpit C8: park-to-registry)',
-    )
-    write_decision_p.add_argument(
+def _add_filing_args(verb_parser: argparse.ArgumentParser) -> None:
+    """The flags write-decision files a DecisionRecord from, shared with file-and-close-decision."""
+    verb_parser.add_argument(
         '--id',
         required=True,
         help=(
@@ -810,7 +914,7 @@ def add_verb_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -
             'filed fleet-unique as <project>-<id>, which is printed'
         ),
     )
-    write_decision_p.add_argument(
+    verb_parser.add_argument(
         '--project',
         required=True,
         help=(
@@ -819,16 +923,16 @@ def add_verb_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -
             'persist as dark_factory'
         ),
     )
-    write_decision_p.add_argument('--text', required=True, help='the decision/question text')
-    write_decision_p.add_argument('--task-id', default=None)
-    write_decision_p.add_argument('--escalation-id', default=None)
-    write_decision_p.add_argument('--session-id', default=None)
-    write_decision_p.add_argument(
+    verb_parser.add_argument('--text', required=True, help='the decision/question text')
+    verb_parser.add_argument('--task-id', default=None)
+    verb_parser.add_argument('--escalation-id', default=None)
+    verb_parser.add_argument('--session-id', default=None)
+    verb_parser.add_argument(
         '--severity',
         default='',
         help='escalation severity to weight this ask (info|blocking|critical|urgent)',
     )
-    write_decision_p.add_argument(
+    verb_parser.add_argument(
         '--escalations-dir',
         required=True,
         help=(
@@ -841,6 +945,15 @@ def add_verb_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -
         ),
     )
 
+
+def add_verb_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Register the DECISION_VERBS subparsers on the CLI's *sub*."""
+    write_decision_p = sub.add_parser(
+        'write-decision',
+        help='file an OPEN DecisionRecord (Fleet Cockpit C8: park-to-registry)',
+    )
+    _add_filing_args(write_decision_p)
+
     close_decision_p = sub.add_parser(
         'close-decision',
         help='close a decision to answered|dropped, quoting the deciding evidence (task 5376)',
@@ -850,6 +963,14 @@ def add_verb_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -
     close_decision_p.add_argument('--evidence', required=True, help='the deciding evidence, verbatim')
     _add_record_identity_args(close_decision_p)
     close_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
+
+    file_and_close_p = sub.add_parser(
+        'file-and-close-decision',
+        help="file an L2's decision as write-decision does, then close the id that filing landed on (task 7495)",
+    )
+    _add_filing_args(file_and_close_p)
+    file_and_close_p.add_argument('--state', required=True, help='answered or dropped')
+    file_and_close_p.add_argument('--evidence', required=True, help='the deciding evidence, verbatim')
 
     reopen_decision_p = sub.add_parser(
         'reopen-decision',
@@ -922,13 +1043,14 @@ def run_verb(args: argparse.Namespace, *, filing_record_slug: Callable[[str, str
     distinguish from a supplied one) stays fail-soft: ERROR log, nothing
     written, nothing printed, rc 0.
 
-    ``close-decision`` and ``reopen-decision`` are the two exceptions, and
-    they run outside the swallowing try/except: see _run_close_decision and
+    ``close-decision``, ``file-and-close-decision`` and ``reopen-decision``
+    are the three refusing verbs, and they run outside the swallowing
+    try/except: see _run_close_decision, _run_file_and_close_decision and
     _run_reopen_decision for why their refusals exit non-zero.
     """
     refusing = _REFUSING_RUNNERS.get(args.verb)
     if refusing is not None:
-        return refusing(args)
+        return refusing(args, filing_record_slug)
     fail_soft = _FAIL_SOFT_RUNNERS.get(args.verb)
     if fail_soft is None:
         raise ValueError(f'{args.verb!r} is not a decision verb; expected one of {sorted(DECISION_VERBS)}')

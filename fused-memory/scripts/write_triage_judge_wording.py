@@ -11,6 +11,9 @@ context manager refuses to nest rather than let two wordings interleave.
 
 :data:`PROMPTS_WHILE_PSI_SHIPPED` freezes what each wording sent while ψ was
 shipped, the era the committed π and π2 populations measured.
+
+``psi`` is the prompt shipped from task 6149 (ψ) until task 7155's step-8,
+kept selectable, though off the D16 axis, for task 9045's 2x2 judge arms.
 """
 from __future__ import annotations
 
@@ -29,6 +32,10 @@ from fused_memory.server.write_triage_judge import (
 WORDING_SHIPPED = 'shipped'
 WORDING_PRE_PSI = 'pre-psi'
 WORDINGS = (WORDING_SHIPPED, WORDING_PRE_PSI)
+WORDING_PSI = 'psi'
+#: The wordings :func:`judge_wording` can hold in force: :data:`WORDINGS`, the
+#: D16 axis with one population fixture report per member, plus ψ.
+SELECTABLE_WORDINGS = (*WORDINGS, WORDING_PSI)
 
 #: The shipped prompt as imported, before any override can be in force.
 _SHIPPED = write_triage_judge.JUDGE_SYSTEM_PROMPT
@@ -124,6 +131,7 @@ PROMPTS_WHILE_PSI_SHIPPED: Mapping[str, str] = MappingProxyType({
 _PROMPTS = {
     WORDING_SHIPPED: _SHIPPED,
     WORDING_PRE_PSI: PRE_PSI_JUDGE_SYSTEM_PROMPT,
+    WORDING_PSI: PSI_JUDGE_SYSTEM_PROMPT,
 }
 
 #: The wording :func:`judge_wording` currently holds in force, if any.
@@ -136,8 +144,13 @@ def system_prompt(wording: str) -> str:
         return _PROMPTS[wording]
     except KeyError:
         raise ValueError(
-            f'unknown judge wording {wording!r}; known wordings are {list(WORDINGS)}',
+            f'unknown judge wording {wording!r}; known wordings are {list(SELECTABLE_WORDINGS)}',
         ) from None
+
+
+def prompt_sha256(wording: str) -> str:
+    """The sha256 of *wording*'s prompt, which a report records as ``judge_system_prompt_sha256``."""
+    return hashlib.sha256(system_prompt(wording).encode()).hexdigest()
 
 
 @contextlib.contextmanager
@@ -149,6 +162,7 @@ def judge_wording(wording: str) -> Iterator[str]:
     """
     global _in_force
     prompt = system_prompt(wording)
+    sha256 = prompt_sha256(wording)
     if _in_force is not None or write_triage_judge.JUDGE_SYSTEM_PROMPT is not _SHIPPED:
         active = _in_force or 'an unrecognised override'
         raise RuntimeError(
@@ -158,7 +172,7 @@ def judge_wording(wording: str) -> Iterator[str]:
     _in_force = wording
     write_triage_judge.JUDGE_SYSTEM_PROMPT = prompt
     try:
-        yield hashlib.sha256(prompt.encode()).hexdigest()
+        yield sha256
     finally:
         write_triage_judge.JUDGE_SYSTEM_PROMPT = _SHIPPED
         _in_force = None

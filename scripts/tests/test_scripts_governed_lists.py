@@ -11,9 +11,13 @@ import check_dashboard_unit_parity
 import governed_list_agreement
 import inline_suppressions
 import merge_lane_cluster
+import pytest
 import sweep_toolcall_markup
 import test_merge_state_vocabulary_consistency as merge_state_vocabulary_consistency
 from shared.governed_exceptions import Debt, Policy, TaskRef, governed_exceptions
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SIZE_CEILING_EXEMPT_LIST = governed_exceptions(
     'scripts.merge_lane_cluster.SIZE_CEILING_EXEMPT',
@@ -21,7 +25,7 @@ SIZE_CEILING_EXEMPT_LIST = governed_exceptions(
     'FILE_LINE_CEILING, because its split into smaller modules is owed by a '
     'follow-up PRD.',
     sorted(merge_lane_cluster.SIZE_CEILING_EXEMPT),
-    default=Debt(TaskRef(7140)),
+    default=Debt(TaskRef(11423)),
     default_covers=1,
 )
 
@@ -43,6 +47,10 @@ MERGE_STATE_PINNED_SITES_LIST = governed_exceptions(
     sorted(merge_state_vocabulary_consistency.PINNED_SITES),
     default=Debt(TaskRef(7136)),
     default_covers=6,
+    dispositions={
+        'ARCHITECTURE.md': Debt(TaskRef(7136)),
+        'OPERATIONS.md': Debt(TaskRef(7136)),
+    },
 )
 
 INLINE_SUPPRESSION_BASELINE = governed_exceptions(

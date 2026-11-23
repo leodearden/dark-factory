@@ -1226,9 +1226,7 @@ class TestBetaVocabularyConformance:
 
         for shape in _mod().ARM_SHAPES:
             for record in _arm(shape):
-                violations = validate_memory_metadata(
-                    dict(record.metadata), enforce_kind_registry=True
-                )
+                violations = validate_memory_metadata(dict(record.metadata))
                 fatal = [v for v in violations if v.fatal]
                 assert not fatal, f'{shape}/{record.record_id}: {fatal}'
 
@@ -4979,8 +4977,8 @@ class TestRunBakeOffWiring:
         The temp queue directory is the run's FIRST acquisition, and the
         service is built right after it — both before the `with`.  A
         `load_cleanup_script()` evaluated in the `with` header therefore sits
-        in the one unprotected window: `_load_sibling_script` raises
-        `FixtureError` when the spec cannot be built, and that raise would
+        in the one unprotected window: a sibling whose body raises on first
+        load propagates out of `load_script`, and that raise would
         leak the queue directory and skip `close()` on a half-built service.
         (It is unreachable TODAY only because `ephemeral_collection_prefix()`
         has already cached the module — an accident of ordering, not a

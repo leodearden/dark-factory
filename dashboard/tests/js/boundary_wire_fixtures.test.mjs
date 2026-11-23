@@ -15,6 +15,7 @@ import {
   escalationRow,
   escalationsPayload,
   mergeQueueBlock,
+  mergeRecentRow,
   openEscalationItem,
   qualityBody,
   qualityComparison,
@@ -107,6 +108,13 @@ test('a MERGE_QUEUE block is built only with keys /merge-queue serves', () => {
   const served = payload('merge_7d').MERGE_QUEUE['dark-factory'];
 
   assertBuiltKeysServed(mergeQueueBlock({ bucketMinutes: 60 }), served, 'MERGE_QUEUE[project]');
+});
+
+test('a MERGE_QUEUE recent row is built only with keys /merge-queue serves on one', () => {
+  const served = payload('merge_7d').MERGE_QUEUE['dark-factory'].recent;
+  assert.ok(served.length > 0, 'the merge_7d body serves no recent rows to check the builder against');
+
+  assertBuiltKeysServed(mergeRecentRow(), served[0], 'MERGE_QUEUE[project].recent[0]');
 });
 
 test('a SCHEDULER snapshot, a lock row and a module included, is built only with keys /scheduler serves', () => {

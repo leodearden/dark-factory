@@ -66,14 +66,14 @@ def _judge_cfg() -> EvalConfig:
 
 
 def _fake_collect_metrics(collect_side_effect: BaseException | None) -> AsyncMock:
-    """A collect_metrics stand-in that honours its role/replay_frame keywords."""
+    """A collect_metrics stand-in that honours its role/replay_frame/sandbox_backend keywords."""
 
-    async def fake_collect(_wf, _wt, _task, *, role, replay_frame=None):
+    async def fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None):
         if collect_side_effect is not None:
             raise collect_side_effect
         return EvalMetrics(
             composite_score=0.9, tests_pass=True,
-            role_under_test=role, replay_frame=replay_frame,
+            role_under_test=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend,
         )
 
     return AsyncMock(side_effect=fake_collect)
@@ -1160,8 +1160,8 @@ def _ofat_task_loader(path: Path) -> dict:
 # wall-clock win φ's failover was added for, which a per-cell gate forfeits.
 #
 # The probe, the sentinels and the assertion bodies live in
-# _campaign_gate_helpers so test_runner_matrix and test_eval_architect pin the
-# same contract from the same code.
+# _campaign_gate_helpers so test_runner_matrix and test_eval_architect_usage_gate
+# pin the same contract from the same code.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -1748,6 +1748,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
         # feeds the REAL resolve_cost_usd (evals/metrics.py) with no manual
         # price seed on `base` — the auto-seed alone must be enough to land on
         # cost_source='price_table'.
+        from orchestrator.agents.token_pricing import TokenUsage
         from orchestrator.evals.configs import MINIMAX_BASE_URL, MINIMAX_MODEL
         from orchestrator.evals.metrics import resolve_cost_usd
         from orchestrator.evals.runner import build_eval_orch_config
@@ -1764,7 +1765,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
         cfg = build_eval_orch_config(proxied, {}, base)
 
         cost, source = resolve_cost_usd(
-            1_000_000, 1_000_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000),
             model=cfg.models.implementer,
             prices=cfg.prices,
             cli_cost_usd=999.0,           # deliberately wrong CLI figure —

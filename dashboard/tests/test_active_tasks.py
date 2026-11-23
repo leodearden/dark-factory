@@ -31,6 +31,7 @@ from _deferral_fixture import (
     status_map,
 )
 from _deferral_fixture import NOW as DEFERRAL_NOW
+from _task_units import measured_unit, rows_in_root_order
 from shared.process_identity import capture
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
@@ -252,16 +253,12 @@ def _stub_snapshot(*, done: int = 0, unreachable: bool = False, rows=()):
 
     For the budget / concurrency / fairness harnesses, which replace the whole
     per-root share and so must hand back the unit it would have acquired.
-
-    *done* is how many done tasks the census reports, built by tallying a real
-    status map through ``build_census`` rather than by constructing a census
-    field by field — a hand-built one could violate the census's own
-    ``sum(counts) == total`` invariant and make a passing test meaningless.
+    A reachable root's unit is ``_task_units.measured_unit``, whose census
+    reports *done* done tasks.
     """
     from types import MappingProxyType
 
-    from dashboard.data.census import build_census
-    from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.datum import Datum
     from dashboard.data.task_snapshot import (
         FRESHNESS_BOUND_SECONDS,
         SnapshotFailure,
@@ -279,19 +276,7 @@ def _stub_snapshot(*, done: int = 0, unreachable: bool = False, rows=()):
             status_map=MappingProxyType({}), failure=SnapshotFailure.UNREACHABLE,
         )
 
-    status_map = {task_id: 'done' for task_id in range(1, done + 1)}
-    return TaskSnapshot(
-        census=Datum(
-            build_census(status_map), _STUB_AS_OF, DatumState.FRESH, None,
-            FRESHNESS_BOUND_SECONDS,
-        ),
-        rows=Datum(
-            list(rows), _STUB_AS_OF, DatumState.FRESH, None,
-            FRESHNESS_BOUND_SECONDS,
-        ),
-        in_progress_live=0, in_progress_stranded=0, skew_seconds=0,
-        status_map=MappingProxyType(status_map), failure=SnapshotFailure.NONE,
-    )
+    return measured_unit(rows, done=done, as_of=_STUB_AS_OF)
 
 
 def _labelled(snapshots, health) -> list[str]:
@@ -406,7 +391,9 @@ def two_project_config(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_collect_tasks_with_counts_filters_to_active_statuses(two_project_config, dummy_client):
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
+    active = rows_in_root_order(
+        await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
+    )
     statuses = {t['status'] for t in active}
     assert statuses <= {'in-progress', 'blocked', 'pending'}
     # Done tasks (17, 15) should not appear.
@@ -417,7 +404,9 @@ async def test_collect_tasks_with_counts_filters_to_active_statuses(two_project_
 
 @pytest.mark.asyncio
 async def test_collect_tasks_with_counts_resolves_deps_with_done_flags(two_project_config, dummy_client):
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
+    active = rows_in_root_order(
+        await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
+    )
     by_id = {t['id']: t for t in active}
     t19 = by_id['dark-factory/T-19']
     assert {d['id']: d['done'] for d in t19['deps']} == {
@@ -431,7 +420,9 @@ async def test_collect_tasks_with_counts_resolves_deps_with_done_flags(two_proje
 
 @pytest.mark.asyncio
 async def test_collect_tasks_with_counts_pulls_metadata_and_loops(two_project_config, dummy_client):
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
+    active = rows_in_root_order(
+        await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
+    )
     t19 = next(t for t in active if t['id'] == 'dark-factory/T-19')
     assert t19['agent'] == 'claude-task-19'
     assert t19['loops'] == 2
@@ -460,7 +451,9 @@ async def test_collect_tasks_with_counts_started_uses_provided_now(tmp_path, mon
     _register_runtime(monkeypatch, {'fixedclock': [_runtime_entry(1, started=created_at)]})
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    active = rows_in_root_order(
+        await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    )
     assert len(active) == 1
     assert active[0]['started'] == 42
 
@@ -500,7 +493,9 @@ async def test_collect_tasks_with_counts_started_uses_provided_now_across_projec
     })
     cfg = DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
 
-    active, _snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    active = rows_in_root_order(
+        await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    )
     started_by_id = {t['id']: t['started'] for t in active}
     assert started_by_id == {'df/T-1': 10, 'reify/T-2': 25}
 
@@ -540,7 +535,7 @@ async def test_collect_tasks_with_counts_stamps_every_snapshot_at_the_provided_n
     monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
     cfg = DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
 
-    _active, snapshots = await collect_tasks_with_counts(
+    snapshots = await collect_tasks_with_counts(
         client=dummy_client, config=cfg, now=fixed,
     )
 
@@ -569,7 +564,7 @@ async def test_collect_tasks_with_counts_handles_missing_worktree_metadata(tmp_p
     # from an offline project (see the runtime-offline tests below).
     _register_runtime(monkeypatch, {'solo': []})
     cfg = DashboardConfig(project_root=root)
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
     assert active == [{
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
         'status': 'pending', 'agent': None,
@@ -617,7 +612,8 @@ async def test_no_task_row_carries_description_or_details(tmp_path, monkeypatch,
     _register_runtime(monkeypatch, {'prose': []})
     cfg = DashboardConfig(project_root=root)
 
-    active, snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(snapshots)
     terminal = shape_terminal_rows(
         'prose',
         [task for task in shaped if task['status'] in ('done', 'cancelled')],
@@ -643,7 +639,8 @@ async def test_collect_tasks_with_counts_surfaces_offline_projects(tmp_path, mon
 
     _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(snapshots)
     assert active == []
     assert _offline(snapshots) == ['offline-project']
 
@@ -679,7 +676,9 @@ async def test_collect_tasks_with_counts_runtime_join_populates_lane_phase_lane_
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    active = rows_in_root_order(
+        await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    )
     assert len(active) == 1
     row = active[0]
     assert row['loops'] == 3
@@ -718,7 +717,7 @@ async def test_collect_tasks_with_counts_runtime_unparseable_started_yields_none
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
     assert len(active) == 1
     row = active[0]
     assert row['started'] is None
@@ -747,7 +746,7 @@ async def test_collect_tasks_with_counts_runtime_offline_snapshot_yields_all_non
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_runtime', _offline_fetch_task_runtime)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
     assert len(active) == 1
     row = active[0]
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
@@ -779,7 +778,7 @@ async def test_collect_tasks_with_counts_no_escalation_url_treated_as_offline(
     _register_runtime(monkeypatch, {})  # no label registered for 'nourl' at all
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
     assert len(active) == 1
     row = active[0]
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
@@ -815,7 +814,7 @@ async def test_collect_tasks_with_counts_runtime_per_task_read_failure_stays_onl
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
     assert len(active) == 1
     row = active[0]
     assert row['loops'] is None
@@ -860,9 +859,9 @@ async def _one_task_row_with_snapshot(
     monkeypatch.setattr(
         'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
     )
-    active, _ = await collect_tasks_with_counts(
+    active = rows_in_root_order(await collect_tasks_with_counts(
         client=dummy_client, config=DashboardConfig(project_root=root),
-    )
+    ))
     assert len(active) == 1
     return active[0]
 
@@ -942,7 +941,7 @@ async def test_collect_tasks_with_counts_includes_merge_deferred_and_train_field
 
     _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
 
     ids = {t['id'] for t in active}
     assert 'trainyard/T-101' in ids, (
@@ -1015,7 +1014,7 @@ async def test_collect_tasks_with_counts_excludes_done_rows(tmp_path, monkeypatc
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
 
     done_rows = [t for t in active if t['status'] == 'done']
     assert done_rows == [], (
@@ -1113,7 +1112,7 @@ async def test_collect_tasks_with_counts_includes_external_deps_with_unknown_sen
     _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
     assert len(active) == 1
     row = active[0]
     assert row['external_deps'] == [
@@ -1142,7 +1141,7 @@ async def test_collect_tasks_with_counts_external_deps_empty_when_absent(
     _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
     assert len(active) == 1
     assert active[0]['external_deps'] == []
 
@@ -1186,9 +1185,9 @@ async def test_collect_tasks_with_counts_resolve_external_overwrites_status(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _fake_ext_statuses)
 
     cfg = DashboardConfig(project_root=root)
-    active, _snapshots = await collect_tasks_with_counts(
+    active = rows_in_root_order(await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
-    )
+    ))
     assert len(active) == 1
     row = active[0]
     assert row['external_deps'] == [
@@ -1227,7 +1226,7 @@ async def test_collect_tasks_with_counts_resolve_external_false_skips_mcp(
 
     cfg = DashboardConfig(project_root=root)
     # Default resolve_external=False — must NOT call fetch_external_statuses.
-    active, _snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
     # Rows keep 'unknown' sentinel (unresolved).
     assert active[0]['external_deps'] == [{'id': 'dark_factory:13', 'status': 'unknown'}]
 
@@ -1300,9 +1299,9 @@ async def test_collect_tasks_with_counts_resolve_external_skips_call_when_no_dep
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _must_not_be_called)
 
     cfg = DashboardConfig(project_root=root)
-    active, _snapshots = await collect_tasks_with_counts(
+    active = rows_in_root_order(await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
-    )
+    ))
     assert active[0]['external_deps'] == []
 
 
@@ -1353,9 +1352,9 @@ async def test_collect_tasks_with_counts_resolve_external_skips_completed_rows(
     _register_runtime(monkeypatch, {})
 
     cfg = DashboardConfig(project_root=root)
-    active, _snapshots = await collect_tasks_with_counts(
+    active = rows_in_root_order(await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
-    )
+    ))
 
     assert calls == [['proj:10']], (
         f"a completed row's deps must not appear in the batched call; got {calls}"
@@ -1395,7 +1394,7 @@ async def test_collect_tasks_with_counts_excludes_cancelled(
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
 
     cancelled_rows = [t for t in active if t['status'] == 'cancelled']
     assert cancelled_rows == [], (
@@ -1451,7 +1450,7 @@ async def test_collect_tasks_with_counts_includes_deferred_via_active_path(
     _register_fetch_tasks(monkeypatch, _fake_fetch)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active = rows_in_root_order(await collect_tasks_with_counts(client=dummy_client, config=cfg))
 
     ids = {t['id'] for t in active}
     assert 'proj/T-30' in ids, (
@@ -1523,9 +1522,9 @@ async def test_collect_tasks_with_counts_resolve_external_offline_marker(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _offline_ext_statuses)
 
     cfg = DashboardConfig(project_root=root)
-    active, _snapshots = await collect_tasks_with_counts(
+    active = rows_in_root_order(await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
-    )
+    ))
 
     assert len(active) == 1
     row = active[0]
@@ -1869,7 +1868,7 @@ class TestShapeOneProjectNarrowing:
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _statuses_fail)
 
         config = self._one_project_config(tmp_path)
-        _active, snapshots = await collect_tasks_with_counts(dummy_client, config)
+        snapshots = await collect_tasks_with_counts(dummy_client, config)
 
         assert _offline(snapshots) == [], 'the row read succeeded — not offline'
         assert _degraded(snapshots) == [], 'the budget was not exceeded — not degraded'
@@ -2018,14 +2017,15 @@ class TestDepsOutsideTheFetchedRows:
 
 
 class TestTheReturnedUnitsCarryTheShapedRows:
-    """``snapshots[label].rows.value`` is what ``/tasks`` serves, and the flat list is joined from it.
+    """``snapshots[label].rows.value`` is that root's shaped rows, which ``/tasks`` serves.
 
     The CACHED unit holds the raw MCP rows, because the next render shapes
     from them. The unit the collector RETURNS must carry the shaped rows, as
-    the shaped ``TaskRow`` list, because that is what goes on the wire. These
-    tests pin that the two exposures (the flat list the scheduler reads and
-    the units ``/tasks`` serves) cannot disagree, and that putting shaped rows
-    on the wire does not use up the raw rows in the cache.
+    the shaped ``TaskRow`` list, because that is what goes on the wire.
+    ``/tasks`` and the scheduler both read the units, so there is no second
+    exposure to keep in agreement. These tests pin that each unit carries its
+    own root's shaped rows, and that putting them on the wire does not use up
+    the raw rows in the cache.
 
     Every read goes through ``dashboard.data.tasks.mcp_tool_call``, so the real
     ``acquire_snapshot`` and its cache run underneath.
@@ -2043,33 +2043,32 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         rows = [_raw_row(1, 'in-progress'), _raw_row(2, 'pending'), _raw_row(3, 'blocked')]
         return rows, {int(row['id']): row['status'] for row in rows}
 
-    async def test_the_flat_list_is_the_units_rows_joined_in_root_order(
+    async def test_each_unit_carries_its_own_roots_shaped_rows(
         self, tmp_path, monkeypatch, dummy_client,
     ):
-        """The flat list is every root's ``rows.value``, concatenated in canonical root order.
-
-        Then the scheduler page, which reads the flat list, and ``/tasks``,
-        which reads the units, cannot disagree.
-        """
+        """Each root's unit carries that root's rows, shaped, in canonical root order."""
         df, reify = self._roots(tmp_path, 'df', 'reify')
         mcp, _calls = _canned_mcp(*self._tree())
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
         config = DashboardConfig(project_root=df, known_project_roots=[reify])
 
-        active, snapshots = await collect_tasks_with_counts(dummy_client, config)
+        snapshots = await collect_tasks_with_counts(dummy_client, config)
 
-        joined = [row for label in ('df', 'reify') for row in _measured_rows(snapshots[label])]
-        assert active == joined
-        assert [row['project'] for row in active] == ['df'] * 3 + ['reify'] * 3
+        assert list(snapshots) == ['df', 'reify']
+        for label in ('df', 'reify'):
+            rows = _measured_rows(snapshots[label])
+            assert [row['project'] for row in rows] == [label] * 3, rows
+            raw = [row['id'] for row in rows if 'metadata' in row]
+            assert raw == [], f'{label} must carry SHAPED rows, but these are raw: {raw}'
 
-    async def test_the_external_dep_overwrite_shows_through_both_exposures(
+    async def test_the_external_dep_overwrite_reaches_the_units_rows(
         self, tmp_path, monkeypatch, dummy_client,
     ):
-        """The unit carries the SAME row objects, not a copy that would drift.
+        """The unit carries the rows the external-dep tail overwrote, not a copy that drifted.
 
         The batched external-dep tail overwrites ``entry['status']`` in place,
         after the per-root walk. It reaches the wire through
-        ``TASKS_SNAPSHOT`` only if both exposures hold one set of dicts.
+        ``TASKS_SNAPSHOT`` only if it overwrites the dicts the unit carries.
         """
         (root,) = self._roots(tmp_path, 'xdeps')
         mcp, _calls = _canned_mcp(
@@ -2083,12 +2082,11 @@ class TestTheReturnedUnitsCarryTheShapedRows:
 
         monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _resolved)
 
-        active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             dummy_client, DashboardConfig(project_root=root), resolve_external=True,
         )
 
         (wire_row,) = _measured_rows(snapshots['xdeps'])
-        assert wire_row is active[0]
         assert wire_row['external_deps'] == [{'id': 'dark_factory:13', 'status': 'done'}]
 
     async def test_an_unmeasured_root_keeps_no_value_rather_than_an_empty_list(
@@ -2110,21 +2108,22 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _mcp)
         config = DashboardConfig(project_root=live, known_project_roots=[dead])
 
-        active, snapshots = await collect_tasks_with_counts(dummy_client, config)
+        snapshots = await collect_tasks_with_counts(dummy_client, config)
 
         assert snapshots['dead'].rows.state is DatumState.UNKNOWN
         assert snapshots['dead'].rows.value is None
-        assert snapshots['live'].rows.value == active
+        live_rows = _measured_rows(snapshots['live'])
+        assert [row['project'] for row in live_rows] == ['live'] * 3, live_rows
 
     async def test_a_root_the_budget_cut_off_holds_no_rows_even_with_a_last_good(
         self, tmp_path, monkeypatch, dummy_client,
     ):
         """A cut-off root's unit keeps ``value is None``, even when it was measured before.
 
-        The render shaped no rows for it, so the flat list gets none, and
-        its unit must agree. The unit could otherwise only carry the last
-        good RAW list, which is unshaped and heavy on the wire, or the empty
-        shaped list, which claims a measured zero at the last good's instant.
+        The render shaped no rows for it, so its unit carries none. The unit
+        could otherwise only carry the last good RAW list, which is unshaped
+        and heavy on the wire, or the empty shaped list, which claims a
+        measured zero at the last good's instant.
         Its census still ages, because a count needs no shaping.
 
         The per-project bound is injected small through ``budget=``, so a
@@ -2137,22 +2136,23 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         healthy, _calls = _canned_mcp(*self._tree())
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', healthy)
         config = DashboardConfig(project_root=root)
-        measured, _ = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
-        assert measured, 'the root must have been measured once, leaving a last good'
+        first_snapshots = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        assert _measured_rows(first_snapshots['df']), (
+            'the root must have been measured once, leaving a last good'
+        )
 
         async def _hangs(client, url, tool, args, **kwargs):
             await asyncio.Event().wait()
 
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _hangs)
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
-        active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             dummy_client, config, now=_STUB_AS_OF + timedelta(seconds=20),
             budget=replace(TASKS_BUDGET, per_project=0.05),
         )
 
         unit = snapshots['df']
         assert classify(unit) is SnapshotHealth.DEGRADED
-        assert active == []
         assert unit.rows.state is DatumState.UNKNOWN
         assert unit.rows.value is None, unit.rows.value
         assert unit.census.state is DatumState.STALE
@@ -2174,14 +2174,13 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
         config = DashboardConfig(project_root=root)
 
-        first, _ = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        first = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
         reads = len(calls)
-        second, snapshots = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        second = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
         cached = await acquire_snapshot(dummy_client, config, config.project_root, now=_STUB_AS_OF)
 
         assert len(calls) == reads, 'both later reads must be served from the cached unit'
-        assert second == first
-        assert snapshots['df'].rows.value == second
+        assert _measured_rows(second['df']) == _measured_rows(first['df'])
         assert cached.rows.value is not None
         assert all('metadata' in row for row in cached.rows.value), (
             'the cached unit must still hold the RAW rows'
@@ -2197,7 +2196,7 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         healthy, _calls = _canned_mcp(*self._tree())
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', healthy)
         config = DashboardConfig(project_root=root)
-        fresh, _ = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        fresh_units = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
 
         async def _rows_read_fails(client, url, tool, args, **kwargs):
             if tool == 'get_tasks':
@@ -2207,13 +2206,13 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _rows_read_fails)
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
         later = _STUB_AS_OF + timedelta(seconds=20)
-        active, snapshots = await collect_tasks_with_counts(dummy_client, config, now=later)
+        snapshots = await collect_tasks_with_counts(dummy_client, config, now=later)
 
         rows = snapshots['df'].rows
         assert rows.state is DatumState.STALE
         assert rows.as_of == _STUB_AS_OF, 'a stale half keeps the instant it was measured'
         assert 'ReadTimeout' in (rows.reason or ''), rows.reason
-        assert rows.value == active == fresh
+        assert rows.value == _measured_rows(fresh_units['df'])
 
     async def test_a_stale_rows_half_is_strand_judged_when_it_was_measured(
         self, tmp_path, monkeypatch, dummy_client,
@@ -2237,7 +2236,8 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         healthy, _calls = _canned_mcp(rows_in, {int(r['id']): r['status'] for r in rows_in})
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', healthy)
         config = DashboardConfig(project_root=root)
-        fresh, fresh_units = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        fresh_units = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        fresh = _measured_rows(fresh_units['df'])
         assert [row['stranded'] for row in fresh if row['status'] == 'in-progress'] == [False]
         assert fresh_units['df'].in_progress_stranded == 0
 
@@ -2249,15 +2249,16 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _rows_read_fails)
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
         much_later = _STUB_AS_OF + DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(minutes=1)
-        active, snapshots = await collect_tasks_with_counts(dummy_client, config, now=much_later)
+        snapshots = await collect_tasks_with_counts(dummy_client, config, now=much_later)
 
         unit = snapshots['df']
         assert unit.rows.state is DatumState.STALE
         assert unit.rows.as_of == _STUB_AS_OF
         assert (unit.in_progress_live, unit.in_progress_stranded) == (1, 0)
-        badged = [row['stranded'] for row in active if row['status'] == 'in-progress']
+        stale = _measured_rows(unit)
+        badged = [row['stranded'] for row in stale if row['status'] == 'in-progress']
         assert badged == [False], 'the badge must be judged at as_of, like the split'
-        assert unit.rows.value == active == fresh
+        assert stale == fresh
 
 
 # ---------------------------------------------------------------------------
@@ -2363,10 +2364,10 @@ class TestCollectTasksBudget:
         """The shipped budget with its total and per-project bounds shrunk."""
         return replace(TASKS_BUDGET, total=total, per_project=per_project)
 
-    async def test_returns_rows_and_one_validated_snapshot_per_root(
+    async def test_returns_one_validated_snapshot_per_root(
         self, monkeypatch, tmp_path, dummy_client
     ):
-        """(a) the return shape is ``(rows, {label: TaskSnapshot})``.
+        """(a) the return shape is ``{label: TaskSnapshot}``, one per configured root.
 
         One entry for EVERY configured root, never a row list beside three
         parallel lists of labels. The three lists are DERIVED from the entries
@@ -2376,13 +2377,11 @@ class TestCollectTasksBudget:
         _register_shaper(monkeypatch, {}, done_counts={'alpha': 3, 'beta': 5})
         config = _budget_config(tmp_path, ['alpha', 'beta'])
 
-        result = await collect_tasks_with_counts(client=dummy_client, config=config)
+        snapshots = await collect_tasks_with_counts(client=dummy_client, config=config)
 
-        assert len(result) == 2, (
-            'expected (active_rows, snapshots_by_label), got '
-            f'{len(result)} elements'
+        assert isinstance(snapshots, dict), (
+            f'expected {{label: TaskSnapshot}}, got {type(snapshots).__name__}'
         )
-        _active, snapshots = result
         assert list(snapshots) == ['alpha', 'beta'], (
             'every configured root must carry an entry, in canonical root '
             f'order; got {list(snapshots)}'
@@ -2428,9 +2427,10 @@ class TestCollectTasksBudget:
             tmp_path, ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
         )
 
-        active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             client=dummy_client, config=config, budget=budget,
         )
+        active = rows_in_root_order(snapshots)
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
         )
@@ -2475,9 +2475,10 @@ class TestCollectTasksBudget:
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
         started = time.monotonic()
-        active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             client=dummy_client, config=config, budget=budget,
         )
+        active = rows_in_root_order(snapshots)
         elapsed = time.monotonic() - started
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
@@ -2510,7 +2511,7 @@ class TestCollectTasksBudget:
         budget = self._tighten(total=10.0, per_project=0.2)
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
-        _active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             client=dummy_client, config=config, budget=budget,
         )
         offline, counts, degraded = (
@@ -2554,9 +2555,10 @@ class TestCollectTasksBudget:
         )
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
-        active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             client=dummy_client, config=config,
         )
+        active = rows_in_root_order(snapshots)
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
         )
@@ -2667,10 +2669,11 @@ class TestCollectTasksBudget:
         config = _budget_config(tmp_path, ['alpha'])
 
         started = time.monotonic()
-        active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             client=dummy_client, config=config, resolve_external=True,
             budget=budget,
         )
+        active = rows_in_root_order(snapshots)
         elapsed = time.monotonic() - started
         offline = _offline(snapshots)
 
@@ -2700,9 +2703,10 @@ class TestCollectTasksBudget:
         # must hold under the values that actually ship.
         config = _budget_config(tmp_path, ['alpha', 'beta'])
 
-        active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             client=dummy_client, config=config,
         )
+        active = rows_in_root_order(snapshots)
 
         assert _degraded(snapshots) == []
         assert _offline(snapshots) == []
@@ -2909,7 +2913,8 @@ class TestCollectTasksWithCountsConcurrency:
             opening, gate = gate, asyncio.Event()
             opening.set()  # let this wave finish, freeing its slots
 
-        active, snapshots = await walk
+        snapshots = await walk
+        active = rows_in_root_order(snapshots)
         degraded = _degraded(snapshots)
 
         assert len(wave_sizes) == math.ceil(9 / width), (
@@ -2933,7 +2938,7 @@ class TestCollectTasksWithCountsConcurrency:
     ):
         """(c) Concurrency must not be allowed to reorder the payload.
 
-        The Tasks tab renders ``all_active`` directly, so completion order
+        The Tasks tab renders the units in payload order, so completion order
         leaking into the payload would reshuffle the table on every 3 s poll.
         The stub finishes roots in REVERSE root order to force the issue.
         """
@@ -2952,7 +2957,7 @@ class TestCollectTasksWithCountsConcurrency:
             'dashboard.data.active_tasks._acquire_and_shape', _stub,
         )
 
-        active, _snapshots = (
+        active = rows_in_root_order(
             await collect_tasks_with_counts(client=dummy_client, config=config)
         )
 
@@ -2991,9 +2996,8 @@ class TestCollectTasksWithCountsConcurrency:
             'dashboard.data.active_tasks._acquire_and_shape', _stub,
         )
 
-        active, snapshots = (
-            await collect_tasks_with_counts(client=dummy_client, config=config)
-        )
+        snapshots = await collect_tasks_with_counts(client=dummy_client, config=config)
+        active = rows_in_root_order(snapshots)
         offline, degraded = _offline(snapshots), _degraded(snapshots)
 
         uids = [row['_task_uid'] for row in active]
@@ -3030,9 +3034,10 @@ class TestCollectTasksWithCountsConcurrency:
         budget = replace(TASKS_BUDGET, per_project=0.05, total=5.0)
 
         with caplog.at_level(logging.WARNING):
-            active, snapshots = await collect_tasks_with_counts(
+            snapshots = await collect_tasks_with_counts(
                 client=dummy_client, config=config, budget=budget,
             )
+            active = rows_in_root_order(snapshots)
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
         )
@@ -3081,9 +3086,8 @@ class TestCollectTasksWithCountsConcurrency:
         _register_runtime(monkeypatch, {})
         self._tracking_stub(monkeypatch, dwell=0.0, offline_for={'proj-02'})
 
-        active, snapshots = (
-            await collect_tasks_with_counts(client=dummy_client, config=config)
-        )
+        snapshots = await collect_tasks_with_counts(client=dummy_client, config=config)
+        active = rows_in_root_order(snapshots)
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
         )
@@ -3119,9 +3123,8 @@ class TestCollectTasksWithCountsConcurrency:
         self._tracking_stub(monkeypatch, dwell=0.0, raise_for={'proj-04'})
 
         with caplog.at_level(logging.WARNING):
-            active, snapshots = (
-                await collect_tasks_with_counts(client=dummy_client, config=config)
-            )
+            snapshots = await collect_tasks_with_counts(client=dummy_client, config=config)
+            active = rows_in_root_order(snapshots)
         offline, degraded = _offline(snapshots), _degraded(snapshots)
 
         assert offline == ['proj-04'], (
@@ -3250,9 +3253,9 @@ class TestCollectTasksWithCountsFairness:
 
         async def _one_render() -> set[str]:
             admissions.clear()  # serve_first counts within ONE render
-            active, _snapshots = await collect_tasks_with_counts(
+            active = rows_in_root_order(await collect_tasks_with_counts(
                 client=dummy_client, config=config, budget=budget,
-            )
+            ))
             return {row['project'] for row in active}
 
         first = await _one_render()
@@ -3328,7 +3331,7 @@ class TestCollectTasksWithCountsFairness:
 
         expected = [f'proj-{i:02d}' for i in range(5)]
         for render in range(4):
-            active, _snapshots = (
+            active = rows_in_root_order(
                 await collect_tasks_with_counts(client=dummy_client, config=config)
             )
             got = [row['project'] for row in active]
@@ -3372,9 +3375,9 @@ class TestDeferredRowsCarryTheirHold:
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', canned)
         root = tmp_path / 'dark-factory'
         root.mkdir(parents=True, exist_ok=True)
-        active, _snapshots = await collect_tasks_with_counts(
+        active = rows_in_root_order(await collect_tasks_with_counts(
             client, DashboardConfig(project_root=root), now=DEFERRAL_NOW,
-        )
+        ))
         return {int(row['id'].rsplit('T-', 1)[-1]): row for row in active}
 
     async def test_a_done_carrier_outside_the_rows_reads_closable(

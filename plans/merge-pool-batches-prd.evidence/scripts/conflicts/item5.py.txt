@@ -1,0 +1,40 @@
+import json,collections,re,statistics as st
+import numpy as np
+rows=json.load(open('/tmp/gate-10069/conflicts/mv_chain.json'))
+by=collections.defaultdict(list); X=[];Y=[]
+for i,ts,tid,d,dur in rows:
+    d=json.loads(d)
+    if d.get('chain_build_ms') is None: continue
+    by[d['chain_items']].append(d['chain_build_ms']/1000); X.append(d['chain_items']);Y.append(d['chain_build_ms']/1000)
+q=lambda v,f: sorted(v)[int(round(f*(len(v)-1)))]
+print('DB chain_build_ms (s) by chain_items: n p50 p90 max')
+for k in sorted(by): v=by[k]; print(k,len(v),round(q(v,.5),1),round(q(v,.9),1),round(max(v),1))
+X=np.array(X);Y=np.array(Y)
+def fit(X,Y,label):
+    A=np.vstack([np.ones_like(X),X]).T; b,res,_,_=np.linalg.lstsq(A,Y,rcond=None)
+    r=Y-A@b; s2=r@r/(len(Y)-2); cov=s2*np.linalg.inv(A.T@A); se=np.sqrt(np.diag(cov))
+    print(f'{label}: n={len(Y)} intercept {b[0]:.2f}s slope {b[1]:.2f}s/item (95% {b[1]-1.96*se[1]:.2f}..{b[1]+1.96*se[1]:.2f}); extrapolated 12: {b[0]+12*b[1]:.1f}s 24: {b[0]+24*b[1]:.1f}s')
+    return b
+fit(X.astype(float),Y,'OLS chain_build_ms~chain_items (all)')
+# median regression proxy: fit on per-size medians
+ks=sorted(by); fit(np.array(ks,float),np.array([st.median(by[k]) for k in ks]),'OLS on per-size medians')
+# syslog split
+L=[l for l in open('/tmp/gate-10069/conflicts/bc_all.txt') if 'merge_ms=' in l]
+DF={'2507122','2382379','234358','1188485','3122652','2245511','2531748','1538594','1218128'}
+pts=[];acq=[];per=collections.defaultdict(list)
+for l in L:
+    m=re.search(r'uv\[(\d+)\].*built=(\d+).*reason=(\S+).*elapsed_ms=(\d+) acquire_ms=(\d+) merge_ms=(\d+)',l)
+    pid,b,reason,el,a,mg=m.groups(); b=int(b); a=int(a)/1000; mg=int(mg)/1000
+    att=b+(0 if reason=='None' else 1)   # merges attempted
+    proj='df' if pid in DF else 'reify'
+    acq.append((proj,a)); per[proj].append((att,mg))
+print('syslog lines with split',len(L), 'first',L[0][:19])
+for proj in ('df','reify'):
+    A=[a for p,a in acq if p==proj]
+    if not A: continue
+    print(proj,'acquire_ms s: n',len(A),'p50',round(q(A,.5),1),'p90',round(q(A,.9),1),'max',round(max(A),1))
+    xs=np.array([x for x,_ in per[proj]],float); ys=np.array([y for _,y in per[proj]])
+    pm=collections.defaultdict(list)
+    for x,y in per[proj]: pm[x].append(y)
+    print('  merge_ms by merges attempted:',{k:(len(v),round(st.median(v),2),round(q(v,.9),2)) for k,v in sorted(pm.items())})
+    if len(set(xs))>1: fit(xs,ys,f'  {proj} merge phase ~ merges attempted')

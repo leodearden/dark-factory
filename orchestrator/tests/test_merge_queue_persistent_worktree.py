@@ -3,9 +3,9 @@
 All tests in this file relate to PRD κ Phase 1 of reify warmer-builds-merge-verify.
 
 The routing tests are real-git and observe the lane through an injected
-``VerifyPort`` (``ScriptedVerifier``).  What that does and does NOT stub of
+``VerifyPort`` (``FakeVerifier``).  What that does and does NOT stub of
 the post-merge gate chain is stated once, with the measurement behind it, in
-``_merge_lane_verifier_doubles.py``'s module docstring.
+``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``'s docstring.
 """
 
 from __future__ import annotations
@@ -16,8 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
-from _merge_lane_fakes import lane_scene_config
-from _merge_lane_verifier_doubles import ScriptedVerifier
+from _merge_lane_fakes import FakeVerifier, lane_scene_config
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -269,7 +268,7 @@ class TestAcquireWarmVerifyWorktree:
     @pytest.mark.asyncio
     async def test_knob_off_returns_ephemeral_unchanged(self, tmp_path: Path):
         """Knob OFF: returns merge_wt unchanged, no reset/cleanup calls."""
-        from orchestrator.merge_lane.worker import _acquire_warm_verify_worktree
+        from orchestrator.merge_lane.liveness import _acquire_warm_verify_worktree
 
         warm_path = tmp_path / '_merge-verify'
         ephemeral = tmp_path / '_merge-abc123'
@@ -287,7 +286,7 @@ class TestAcquireWarmVerifyWorktree:
     @pytest.mark.asyncio
     async def test_knob_on_not_due_swaps_to_warm(self, tmp_path: Path):
         """Knob ON, safety_valve_due=False → resets warm wt, cleans up ephemeral, returns warm path."""
-        from orchestrator.merge_lane.worker import _acquire_warm_verify_worktree
+        from orchestrator.merge_lane.liveness import _acquire_warm_verify_worktree
 
         warm_path = tmp_path / '_merge-verify'
         ephemeral = tmp_path / '_merge-abc123'
@@ -305,7 +304,7 @@ class TestAcquireWarmVerifyWorktree:
     @pytest.mark.asyncio
     async def test_knob_on_due_returns_ephemeral_unchanged(self, tmp_path: Path):
         """Knob ON, safety_valve_due=True → returns merge_wt unchanged (cold throwaway path)."""
-        from orchestrator.merge_lane.worker import _acquire_warm_verify_worktree
+        from orchestrator.merge_lane.liveness import _acquire_warm_verify_worktree
 
         warm_path = tmp_path / '_merge-verify'
         ephemeral = tmp_path / '_merge-abc123'
@@ -323,7 +322,7 @@ class TestAcquireWarmVerifyWorktree:
     @pytest.mark.asyncio
     async def test_knob_on_not_due_none_merge_wt_no_cleanup(self, tmp_path: Path):
         """Knob ON, merge_wt=None (edge case) → no cleanup_merge_worktree call, returns warm path."""
-        from orchestrator.merge_lane.worker import _acquire_warm_verify_worktree
+        from orchestrator.merge_lane.liveness import _acquire_warm_verify_worktree
 
         warm_path = tmp_path / '_merge-verify'
         stub = _make_stub_git_ops(warm_path)
@@ -359,7 +358,7 @@ class TestPersistentWorktreeVerifyRouting:
         wt = await _make_branch_with_file(git_ops, 'warm-test', 'warm.py', 'x = 1\n')
         req = _make_merge_request('warm-test', 'warm-test', wt, cfg)
 
-        verifier = ScriptedVerifier()
+        verifier = FakeVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
@@ -374,11 +373,11 @@ class TestPersistentWorktreeVerifyRouting:
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
         # The warm worktree must have been used for verify
-        assert len(verifier.worktrees) == 1, 'Expected exactly one verify call'
+        assert len(verifier.verify_calls) == 1, 'Expected exactly one verify call'
         warm_path = git_ops.persistent_merge_worktree_path
-        assert verifier.worktrees[0].resolve() == warm_path.resolve(), (
+        assert verifier.verify_calls[0].worktree.resolve() == warm_path.resolve(), (
             f'verify must run in warm worktree {warm_path}; '
-            f'got: {verifier.worktrees[0]}'
+            f'got: {verifier.verify_calls[0].worktree}'
         )
 
         # The warm worktree PERSISTS after a successful advance (cleanup is no-op on it)
@@ -399,7 +398,7 @@ class TestPersistentWorktreeVerifyRouting:
         wt = await _make_branch_with_file(git_ops, 'cold-test', 'cold.py', 'y = 2\n')
         req = _make_merge_request('cold-test', 'cold-test', wt, cfg)
 
-        verifier = ScriptedVerifier()
+        verifier = FakeVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
@@ -414,13 +413,13 @@ class TestPersistentWorktreeVerifyRouting:
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
         # Verify ran in an ephemeral worktree (not _merge-verify)
-        assert len(verifier.worktrees) == 1, 'Expected exactly one verify call'
+        assert len(verifier.verify_calls) == 1, 'Expected exactly one verify call'
         warm_path = git_ops.persistent_merge_worktree_path
-        assert verifier.worktrees[0].resolve() != warm_path.resolve(), (
+        assert verifier.verify_calls[0].worktree.resolve() != warm_path.resolve(), (
             'knob OFF: verify must NOT run in the warm worktree'
         )
-        assert verifier.worktrees[0].name.startswith('_merge-'), (
-            f'expected ephemeral _merge-<uuid>; got: {verifier.worktrees[0].name}'
+        assert verifier.verify_calls[0].worktree.name.startswith('_merge-'), (
+            f'expected ephemeral _merge-<uuid>; got: {verifier.verify_calls[0].worktree.name}'
         )
 
         # No _merge-verify should have been created
@@ -453,7 +452,7 @@ class TestSafetyValveDue:
 
     def test_every_n_zero_always_false(self):
         """every_n=0 (disabled) → always False regardless of attempt_count."""
-        from orchestrator.merge_lane.worker import _safety_valve_due
+        from orchestrator.merge_lane.liveness import _safety_valve_due
 
         for attempt in range(0, 20):
             assert _safety_valve_due(attempt, 0) is False, (
@@ -462,14 +461,14 @@ class TestSafetyValveDue:
 
     def test_every_n_negative_always_false(self):
         """every_n<0 → always False (guard against invalid config)."""
-        from orchestrator.merge_lane.worker import _safety_valve_due
+        from orchestrator.merge_lane.liveness import _safety_valve_due
 
         for attempt in range(0, 10):
             assert _safety_valve_due(attempt, -1) is False
 
     def test_every_n_3_due_on_multiples(self):
         """every_n=3 → True exactly at attempt_count 3, 6, 9; False otherwise."""
-        from orchestrator.merge_lane.worker import _safety_valve_due
+        from orchestrator.merge_lane.liveness import _safety_valve_due
 
         due_at = {3, 6, 9}
         for attempt in range(0, 12):
@@ -480,7 +479,7 @@ class TestSafetyValveDue:
 
     def test_attempt_zero_never_due(self):
         """attempt_count=0 must never trigger the valve (first attempt is 1-based)."""
-        from orchestrator.merge_lane.worker import _safety_valve_due
+        from orchestrator.merge_lane.liveness import _safety_valve_due
 
         for every_n in [1, 2, 3, 5]:
             assert _safety_valve_due(0, every_n) is False, (
@@ -489,7 +488,7 @@ class TestSafetyValveDue:
 
     def test_every_n_1_due_at_every_positive_attempt(self):
         """every_n=1 → True for every positive attempt (cold on every land)."""
-        from orchestrator.merge_lane.worker import _safety_valve_due
+        from orchestrator.merge_lane.liveness import _safety_valve_due
 
         assert _safety_valve_due(0, 1) is False  # attempt 0 never due
         for attempt in range(1, 6):
@@ -523,7 +522,7 @@ class TestSafetyValveIntegration:
         wt = await _make_branch_with_file(git_ops, 'valve-test', 'valve.py', 'z = 3\n')
         req = _make_merge_request('valve-test', 'valve-test', wt, cfg)
 
-        verifier = ScriptedVerifier()
+        verifier = FakeVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
@@ -539,9 +538,9 @@ class TestSafetyValveIntegration:
 
         # With safety_valve_every_n=1, the FIRST verifying attempt (count=1)
         # is due → must bypass the warm swap and use the ephemeral path.
-        assert len(verifier.worktrees) == 1
+        assert len(verifier.verify_calls) == 1
         warm_path = git_ops.persistent_merge_worktree_path
-        assert verifier.worktrees[0].resolve() != warm_path.resolve(), (
+        assert verifier.verify_calls[0].worktree.resolve() != warm_path.resolve(), (
             f'safety_valve_every_n=1: first attempt must use ephemeral, not warm; '
-            f'got: {verifier.worktrees[0]}'
+            f'got: {verifier.verify_calls[0].worktree}'
         )

@@ -1,0 +1,32 @@
+import json,collections,datetime as dt
+P='/tmp/gate-10069/predict/'
+R={r['rid']:r for r in json.load(open(P+'requests.json'))}; TR=json.load(open(P+'trials.json')); tv={t['vid']:t for t in TR}
+chains=sorted([t for t in TR if t['k']>1 and t['members']],key=lambda t:t['t'])
+def follow(rid,t):
+    r=R.get(rid); seq=[]
+    if not r: return 'U',None,'?',seq
+    for v,pos in r['trials']:
+        x=tv[v]
+        if x['t']<=t['t']: continue
+        kind=('solo' if x['k']==1 else 'k%d'%x['k'])+('P' if x['passed'] else ('F' if (x['k']>1 or x['applied']) else 'f(void)'))
+        seq.append((kind,x['vid'],x['ts'][5:16]))
+        if x['k']==1 and x['passed']: return 'P',x,'solo',seq
+        if x['k']==1 and x['applied']: return 'F',x,'solo',seq
+        if x['k']>1 and x['passed']: return 'P',x,'chain',seq
+    return 'U',None,r['final_state'],seq
+out=[]
+for t in chains:
+    if t['passed']: continue
+    mem=[(R[m]['task'] if m in R else m,m)+follow(m,t) for m in t['members']]
+    nU=sum(m[2]=='U' for m in mem)
+    if nU: continue
+    known=sorted(mem,key=lambda m:m[3]['t'])
+    last=known[-1]; others=known[:-1]
+    if all(o[2]=='P' for o in others): st='ELIM last=%s actual=%s'%(last[0],last[2])
+    else: st='no-opp'
+    print(t['vid'],t['ts'][:16],'owner',t['task'],'k',t['k'],t['runner'],t['base_relation'],'spec',t['speculative'],'depth',t['depth'],'sha',t['merge_sha'][:10],'red',t['red_units'],'|',st)
+    for m in mem:
+        print('     ',m[0],m[1],m[2],m[4],' '.join('%s@%s#%s'%s for s in [(a,c,b) for a,b,c in m[5]]))
+    out.append({'vid':t['vid'],'status':st})
+json.dump(out,open('/tmp/gate-10069/forensics/prior15.json','w'))
+print(len(out))

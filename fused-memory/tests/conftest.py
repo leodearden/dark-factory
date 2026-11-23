@@ -35,6 +35,23 @@ from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.llm_client import LLMClient
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd fused-memory && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, beating the
+# inserts below.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
+    reject_unsafe_basetemp,
+)
+
 # Make this file's directory importable by test modules so
 # `from _fm_helpers import ...` resolves regardless of whether pytest
 # is invoked from the subproject root or the workspace root.
@@ -64,17 +81,6 @@ _escalation_src = os.path.join(
 if _escalation_src not in sys.path:
     sys.path.insert(0, _escalation_src)
 
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd fused-memory && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
-# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
-# at sys.path[0] it would make the subproject directories resolve as namespace
-# packages pointing at the project folder instead of src/<pkg>/, beating the
-# inserts above.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
 from _fm_helpers import (  # noqa: E402
     complete_paged_read,
     install_identity_mocks,
@@ -83,15 +89,8 @@ from _fm_helpers import (  # noqa: E402
     resolve_xdist_worker_id,
 )
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
-    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_mock_derived_stray_dirs,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    arm_leaked_drain_process_guard,
-    arm_usage_gate_sweep_confinement,
-    reject_unsafe_basetemp,
+from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
+    fake_clock as fake_clock,
 )
 
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
@@ -109,7 +108,7 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
-    """Session-start hooks: basetemp safety, the drain-leak guard, UsageGate sweep confinement, async-httpx leak tracking.
+    """Session-start hooks: basetemp safety, the suite-wide defences, UsageGate sweep confinement, async-httpx leak tracking.
 
     ``track_async_httpx_clients()`` runs HERE — at session start, before
     collection — rather than lazily from a fixture, so clients constructed at
@@ -126,6 +125,7 @@ def pytest_configure(config):
     when the scratch FalkorDB is unreachable (task 7792).
     """
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
     arm_leaked_drain_process_guard(config)
     from _fm_httpx_leaks import track_async_httpx_clients
     from shared import usage_gate
@@ -304,9 +304,16 @@ def _isolate_fm_config(monkeypatch, tmp_path):
     since mutating ``os.environ`` while iterating it raises.  The YAML's own
     interpolation surface, which pydantic never sees, is covered by the
     path-leaf pin above: ``setenv`` overwrites an inherited value.
+    ``OVERLAY_ENV_VAR`` is a fourth env surface the model-field-derived scrub
+    cannot see, and operators export it during the embedder soak, so it is
+    deleted by name, and imported function-locally for the reason
+    ``pytest_configure``'s docstring gives.
     """
+    from fused_memory.config.overlay import OVERLAY_ENV_VAR
+
     for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
         monkeypatch.delenv(inherited, raising=False)
+    monkeypatch.delenv(OVERLAY_ENV_VAR, raising=False)
 
     for name, layout in _FM_CONFIG_PATH_INTERPOLATIONS.items():
         monkeypatch.setenv(name, str(tmp_path / layout))

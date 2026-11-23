@@ -18,8 +18,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from shared.cli_invoke import (
@@ -276,6 +278,12 @@ def _task_context(task: dict[str, Any] | None) -> _TaskContext:
 # These rules are the first gate, not the write boundary: the boundary is the
 # OS sandbox of _investigation_sandbox_modules. Residual: `git status` may
 # refresh the index's stat cache, which changes no content.
+# The CLI reads no settings file (`--setting-sources ''`): the per-investigation
+# config dir symlinks the host's settings files and the worktree's own .claude/
+# settings belong to the task under investigation, so no ambient allow rule
+# reaches this envelope. _INVESTIGATION_ENV_OVERRIDES restores what the host's
+# settings file used to supply: transcript persistence, which the watchdog and
+# the zero-output retry read, and compaction off.
 _GIT_READS = git_read_rules('log', 'diff', 'status', 'show', 'rev-parse', 'ls-files')
 
 _ALLOWED_TOOLS: list[str] = [
@@ -288,8 +296,10 @@ _ALLOWED_TOOLS: list[str] = [
     'mcp__fused-memory__get_tasks',
 ]
 
-# Defence-in-depth against allow rules the CLI merges from ambient settings
-# files: a deny rule beats an allow rule wherever it came from.
+# With no settings file read, these denies guard against allow rules from
+# managed policy settings (not a settings source, so still applied) and against
+# a future widening of _ALLOWED_TOOLS: a deny rule beats an allow rule wherever
+# it came from.
 _DISALLOWED_TOOLS: list[str] = [
     'Edit',
     'Write',
@@ -316,6 +326,16 @@ _DISALLOWED_TOOLS: list[str] = [
     # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
     'Skill',
 ]
+
+_GRANTED_TOOLS_LINE: str = (
+    f'**Granted tools:** {", ".join(_ALLOWED_TOOLS)}. '
+    'Every Bash command no rule above admits is denied permanently: a retry is denied again.'
+)
+
+_INVESTIGATION_ENV_OVERRIDES: Mapping[str, str] = MappingProxyType({
+    'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',
+    'DISABLE_AUTO_COMPACT': '1',
+})
 
 def _investigation_sandbox_modules(config: Any) -> list[str] | None:
     """``[]`` confines a claude investigation to writing ``<worktree>/.task``, where its config dir lives; ``None`` leaves it unconfined.
@@ -696,7 +716,8 @@ async def run_dry_run_unblock(
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
             f'Detail: {detail or "(none)"}\n'
-            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n\n'
+            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n'
+            f'{_GRANTED_TOOLS_LINE}\n\n'
             f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'
         )
@@ -757,6 +778,8 @@ async def run_dry_run_unblock(
                 sandbox_modules=sandbox_modules,
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
+                setting_sources=[],
+                env_overrides=dict(_INVESTIGATION_ENV_OVERRIDES),
                 mcp_config=mcp_config,
                 output_schema=DRY_RUN_PROPOSAL_SCHEMA,
                 effort=decision.effort,

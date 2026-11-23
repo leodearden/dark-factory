@@ -682,7 +682,7 @@ def _decline_kinds():
     """The REAL decline vocabulary, read off the instrument at collection time.
 
     Never a hard-coded list of five strings. ``DECLINE_KINDS`` derives from
-    metrics.py's single ``_DECLINE_READERS`` map precisely so a sixth architect
+    metrics.py's single ``DECLINE_READERS`` map precisely so a sixth architect
     exit cannot be half-added; parametrizing over the tuple extends that
     discipline to the bander, so a new exit that nobody taught ``band_for_cell``
     about fails here instead of silently banding ``no_plan``. Spelled as a
@@ -1337,7 +1337,7 @@ def test_uniform_corpora_are_unchanged():
 # one line later, RE-DERIVES the same per-candidate marker count itself. The two
 # implementations aggregate over DIFFERENT populations: the report layer counts
 # only the ADMITTED pool (a cap-tainted cell never reaches the count — pinned by
-# ``orchestrator/tests/test_eval_architect.py``'s
+# ``orchestrator/tests/test_eval_plan_quality_report.py``'s
 # ``test_a_keyless_cap_tainted_cell_does_not_poison_the_count``), while this
 # driver's ``_architect_cells`` yields EVERY architect cell, cap-tainted ones
 # included. Measured on ``_cap_tainted_keyless_corpus()`` below:

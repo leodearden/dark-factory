@@ -1769,11 +1769,44 @@ class TestBuildPerProjectMergeQueue:
 
         project = result['/tmp/P']
         assert project['recent'] == []
+        assert project['runs_db_present'] is True, 'a project whose build raised had a db'
         for field in ('speculative', 'recent_total', 'depth_timeseries', 'attempts', 'train_throughput'):
             assert project[field].state is DatumState.UNKNOWN, field
             assert '/tmp/P' in (project[field].reason or ''), field
             assert 'RuntimeError: boom' in (project[field].reason or ''), field
             validate_datum(project[field], now)
+
+    async def test_a_root_with_no_runs_db_file_is_absent_not_unreadable(self, tmp_path):
+        """No file serves ``runs_db_present`` False; a file that did not open stays present."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'real.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/real', conn), ('/tmp/nofile', None), ('/tmp/unopenable', None)],
+                hours=24, now=now, runs_db_absent=frozenset({'/tmp/nofile'}),
+            )
+
+        presence = {pid: project['runs_db_present'] for pid, project in result.items()}
+        assert presence == {'/tmp/real': True, '/tmp/nofile': False, '/tmp/unopenable': True}
+        absent = result['/tmp/nofile']
+        for field in ('depth_timeseries', 'attempts', 'recent_total', 'speculative', 'train_throughput'):
+            assert_unread(absent[field], now, 'no runs.db file')
+        assert (absent['recent'], absent['train_events']) == ([], [])
+        assert_unread(result['/tmp/unopenable']['attempts'], now, 'no runs.db is open')
+        fresh_read(result['/tmp/real']['attempts'], now)
+
+    async def test_absence_is_never_assumed(self):
+        """A caller that names no absent root leaves every None db present, so unread."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        result = await build_per_project_merge_queue([('/tmp/x', None)], hours=24, now=now)
+
+        assert result['/tmp/x']['runs_db_present'] is True
 
     @pytest.mark.asyncio
     async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):

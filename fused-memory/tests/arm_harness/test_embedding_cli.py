@@ -600,6 +600,7 @@ class RunLive:
     base_config: FusedMemoryConfig
     log: list[str] = field(default_factory=list)
     factory_calls: int = 0
+    search_error: Exception | None = None
 
     def __post_init__(self) -> None:
         self.client = doubles.FakeGraphClient(self.log)
@@ -628,7 +629,7 @@ class RunLive:
     async def _open_backend(
         self, spec: EmbeddingArmSpec, base: FusedMemoryConfig, query_embedder: Any
     ) -> AsyncIterator[doubles.FakeSearchBackend]:
-        yield doubles.FakeSearchBackend(self.client, query_embedder)
+        yield doubles.FakeSearchBackend(self.client, query_embedder, search_error=self.search_error)
 
     def _build_embedder(
         self, spec: EmbeddingArmSpec, base: FusedMemoryConfig, *, settings: Any
@@ -805,6 +806,20 @@ def test_embed_run_whose_reference_moved_exits_3_with_no_run_json(
     assert 'frozen-reference-unchanged' in err
     assert not (run_inputs.run_dir / 'run.json').exists()
     assert 'copy' not in run_live.log
+
+
+def test_embed_run_whose_search_times_out_exits_1_naming_the_budget_with_no_run_json(
+    harness, run_live, run_inputs, capsys
+):
+    run_live.search_error = TimeoutError('graphiti search timed out after 30.0s')
+
+    err = _refused(harness, run_inputs.argv(), run_live.factory(harness), capsys,
+                   harness.EXIT_RUN_FAILED)
+
+    assert 'TimeoutError: graphiti search timed out after 30.0s' in err
+    assert not (run_inputs.run_dir / 'run.json').exists()
+    assert run_live.log.count('search') == 1
+    assert 'replica-build' not in run_live.log
 
 
 # --- embed-preregister and embed-compare -----------------------------------------------

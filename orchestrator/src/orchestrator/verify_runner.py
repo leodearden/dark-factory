@@ -80,6 +80,7 @@ from orchestrator.remote_gate import (
     parse_ensure_report,
     reap_script_text,
     shim_suspected,
+    wire_fields,
 )
 from orchestrator.task_verify_spec import (
     TaskVerifySpec,
@@ -91,6 +92,14 @@ from orchestrator.verify import (
     _target_subprocess_env,
     archive_verify_logs,
 )
+from orchestrator.verify_cache.recorder import (
+    CacheRecord,
+    VerifyEvidenceRef,
+    consume_replayed,
+    record_greens,
+)
+from orchestrator.verify_cache.registry import Registry
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
     SSH_SERVER_ALIVE_COUNT_MAX,
@@ -184,7 +193,7 @@ __all__ = [
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
-# VerifyResult so _run_post_merge_verify can branch byte-identically.
+# VerifyResult so merge_lane/post_merge_verify.py::run_post_merge_verify can branch byte-identically.
 UNSCOPED_TYPECHECK_FAILED_CATEGORY = 'unscoped_typecheck_failed'
 UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY = 'unscoped_typecheck_timeout'
 
@@ -327,12 +336,12 @@ class MergeVerifySpec:
                           home (INV-9), and the file to read before assuming what a
                           key here means.
                           The failed-only retry env from
-                          orchestrator/src/orchestrator/merge_lane/worker.py::_build_retry_verify_env
+                          orchestrator/src/orchestrator/merge_lane/retry_verify_env.py::_build_retry_verify_env
                           has path-valued keys that cannot resolve remotely:
                           its nextest filter files are UNTRACKED files in the
                           dispatching host's merge_wt, which the git-pushed merge
                           SHA does not carry. That env is therefore never shipped:
-                          merge_lane/worker.py::_run_post_merge_verify builds it
+                          merge_lane/post_merge_verify.py::run_post_merge_verify builds it
                           only for a LOCAL dispatch (runner is None), so a REMOTE
                           retry runs FULL and is charged to the legacy (full)
                           retry budget, not the narrowed one. Pinned by
@@ -471,8 +480,17 @@ def result_to_dict(vr: VerifyResult) -> dict:
     dict here, and ``json.dumps`` flattens its ``StrEnum`` members to their values and
     its tuple to an array — so this direction still needs no special handling.  The
     asymmetry is entirely on the READ side; see :func:`result_from_dict`.
+
+    Off-wire fields (``remote_gate.wire_fields``) are left out, never walked: a
+    runner's cache record is shipped and recorded only after gamma2 (task 9123)
+    keys ``toolchain.runner``.
     """
-    return dataclasses.asdict(vr)
+    shipped = {f.name for f in wire_fields(VerifyResult)}
+    off_wire = [f.name for f in dataclasses.fields(vr) if f.name not in shipped]
+    wire = dataclasses.asdict(dataclasses.replace(vr, **dict.fromkeys(off_wire)))
+    for name in off_wire:
+        del wire[name]
+    return wire
 
 
 def result_from_dict(d: dict) -> VerifyResult:
@@ -693,6 +711,9 @@ async def run_merge_verify_on_worktree(
         run_scoped=run_scoped,
         run_unscoped=run_unscoped,
         task_id=task_id,
+        # A runner reaches no registry: its units settle UNAVAILABLE, and its
+        # cache record stays off the wire until gamma2 (task 9123).
+        verify_cache=await CacheAccess.on_runner(),
     )
     return await runner.run_merge_verify(merge_sha, spec)
 
@@ -831,6 +852,7 @@ class LocalRunner:
         task_id: str | None = None,
         archive_root: Path | None = None,
         event_store: EventStore | None = None,
+        verify_cache: CacheAccess | None = None,
     ) -> None:
         """Initialise LocalRunner.
 
@@ -855,6 +877,9 @@ class LocalRunner:
         runs where the WORKTREE is and cannot reach the dispatching host's queue,
         so accepting one here only ever invited re-wiring a side-effect onto the
         host that cannot perform it.
+
+        *verify_cache* joins the scoped verify to the verify-result cache
+        (``run_scoped_verification``'s parameter); None leaves it outside.
         """
         self._merge_wt = merge_wt
         self._config = config
@@ -865,6 +890,7 @@ class LocalRunner:
         self._task_id = task_id
         self._archive_root = archive_root
         self._event_store = event_store
+        self._verify_cache = verify_cache
 
     async def health(self) -> bool:
         return True
@@ -906,6 +932,7 @@ class LocalRunner:
             # event_store), which cannot reach the dispatching host's store —
             # None-safe by construction, mirroring merge-flake suppression.
             event_store=self._event_store,
+            verify_cache=self._verify_cache,
         )
         if not scoped.passed:
             # PRD task α: single flake-retry gate. Re-run the named failing tests
@@ -938,6 +965,7 @@ class LocalRunner:
             self._module_configs,
             block_on_timeout=True,
             task_id=self._task_id,
+            executed=scoped,
         )
         if gate.broken:
             failing = gate.failing_subprojects
@@ -968,6 +996,8 @@ class LocalRunner:
                 # The scoped plan did run; the unscoped gate is not one of its units.
                 plan=scoped.plan,
                 units=scoped.units,
+                cache_record=scoped.cache_record,
+                cache_mode=scoped.cache_mode,
             )
 
         return scoped
@@ -2503,6 +2533,11 @@ class VerifyRunnerPool:
     *on_unavailable* is where a remote this pool could not use is reported —
     the merge worker's bench, which classes it by kind (design D6) — so a
     fallback never swallows one.  None reports nowhere.
+
+    *verify_cache_registry* is the dispatcher's verify-result cache: a local
+    verdict that replayed greens has them consumed for its merge sha before
+    its ``merge_verify`` row is written (I6), and its own admitted greens are
+    recorded citing that row.  None keeps the pool outside the cache.
     """
 
     def __init__(
@@ -2513,6 +2548,7 @@ class VerifyRunnerPool:
         task_id: str | None = None,
         archive_root: Path | None = None,
         on_unavailable: RunnerUnavailableSink | None = None,
+        verify_cache_registry: Registry | None = None,
     ) -> None:
         if not runners:
             raise ValueError('VerifyRunnerPool requires at least one runner')
@@ -2533,6 +2569,7 @@ class VerifyRunnerPool:
         # Local (is_local) is the trust anchor and is never quarantined.
         self._quarantined: set[str] = set()
         self._on_unavailable = on_unavailable
+        self._verify_cache_registry = verify_cache_registry
 
     # ------------------------------------------------------------------
     # ι: quarantine API
@@ -2744,14 +2781,16 @@ class VerifyRunnerPool:
                 ),
             )
 
-        if self._event_store is not None:
-            self._event_store.emit(
+        def _emit(verdict: VerifyResult) -> int | None:
+            if self._event_store is None:
+                return None
+            return self._event_store.emit(
                 EventType.merge_verify,
                 task_id=self._task_id,
                 data={
                     'runner': actual_runner.name,
                     'merge_sha': merge_sha,
-                    'passed': result.passed,
+                    'passed': verdict.passed,
                     'duration_ms': duration_ms,
                     'attempt': attempt,
                     'depth': depth,
@@ -2768,10 +2807,44 @@ class VerifyRunnerPool:
                     # spec.verify_env, so a narrowed retry is never miscounted as
                     # a full green gate.
                     **retry_scope_event_fields(spec.verify_env),
-                    **verify_event_fields(result),
+                    **verify_event_fields(verdict),
                 },
             )
 
+        return await self._emit_through_cache(result, actual_runner, merge_sha, _emit)
+
+    async def _emit_through_cache(
+        self,
+        result: VerifyResult,
+        runner: VerifyRunner,
+        merge_sha: str,
+        emit: Callable[[VerifyResult], int | None],
+    ) -> VerifyResult:
+        """Emit *result*'s row through *emit*: for a local verdict in the cache, after
+        consuming what it replayed (I6), and before recording its greens citing that row.
+
+        Only a green rests on its replays, so only a green whose replays could not be
+        consumed becomes a no-verdict; a red keeps its own verdict."""
+        registry = self._verify_cache_registry
+        record = getattr(result, 'cache_record', None)
+        if not runner.is_local or registry is None or not isinstance(record, CacheRecord):
+            emit(result)
+            return result
+        consumed = await consume_replayed(registry, record, landing_sha=merge_sha)
+        if not consumed.backs_every_hit:
+            if result.passed:
+                result = verify.unconsumed_replay_result(result, consumed.reason)
+            else:
+                logger.warning(
+                    'red merge verify of %s keeps its verdict; its replays were not consumed: %s',
+                    merge_sha, consumed.reason,
+                )
+        event_id = emit(result)
+        if isinstance(event_id, int):
+            await record_greens(
+                registry, record, flake_suppressed=result.flake_suppression is not None,
+                evidence=VerifyEvidenceRef(event_id, self._event_store.run_id, merge_sha, result.passed),
+            )
         return result
 
 
@@ -4296,7 +4369,8 @@ class HostAllocator:
     -----------------
     The quarantine set is passed by reference so HostAllocator-driven
     (RunnerUnavailable) and DriftDetector-driven quarantines share one
-    source of truth with the worker's _runner_quarantine set.
+    source of truth with the lane's quarantine set
+    (``merge_lane/host_quarantine.py::HostQuarantine``).
     ``clear_quarantine(name)`` discards from this same set; because it is
     shared by reference the host immediately becomes acquire_remote()-eligible
     again without an orchestrator restart.  This is the re-engagement
@@ -4421,8 +4495,8 @@ class HostAllocator:
         """Remove a host from the shared quarantine set (idempotent).
 
         Mirrors :meth:`VerifyRunnerPool.clear_quarantine`.  Because the
-        quarantine set is shared by reference with the worker's
-        ``_runner_quarantine``, discarding *name* here immediately makes the
+        quarantine set is shared by reference with
+        ``merge_lane/host_quarantine.py::HostQuarantine``, discarding *name* here immediately makes the
         host eligible for :meth:`acquire_remote` again — no restart required.
 
         Clearing a name that is not in the quarantine (including names that
@@ -4480,8 +4554,8 @@ class HostAllocator:
         """Return True if host *name* is currently quarantined.
 
         Mirrors :meth:`VerifyRunnerPool.is_quarantined`.  Because the
-        quarantine set is shared **by reference** with the worker's
-        ``_runner_quarantine``, this reflects every writer of that set — not
+        quarantine set is shared **by reference** with
+        ``merge_lane/host_quarantine.py::HostQuarantine``, this reflects every writer of that set — not
         just :meth:`quarantine_and_release`, but also the DriftDetector-driven
         verdict-divergence quarantines and the land-time per-land cross-check,
         which add names to the worker's set directly without going through the
@@ -4492,7 +4566,7 @@ class HostAllocator:
         a slot lookup, so it answers for unmanaged names too (False for one
         that was never quarantined).  That is precisely why it exists
         alongside :meth:`host_states`: its production caller is
-        ``SpeculativeMergeWorker._host_states_block``'s **orphan** arm (task
+        ``merge_lane/host_quarantine.py::HostQuarantine.host_states``'s **orphan** arm (task
         3275), which classifies RU-tracked hosts that have no slot in this
         allocator.  :meth:`host_states` structurally cannot answer for those —
         it enumerates ``_slots`` — so the two are complementary, not redundant.
@@ -4650,8 +4724,8 @@ class HostAllocator:
         is quarantined.
 
         Used by the auto-reprobe path (task 1795) to identify candidates for
-        health probing: only RU-quarantined hosts (those also in the worker's
-        ``_runner_unavailable`` tracker) are ultimately probed and cleared.
+        health probing: only RU-quarantined hosts (those also in
+        ``merge_lane/host_quarantine.py::HostQuarantine``'s RunnerUnavailable tracker) are ultimately probed and cleared.
         """
         return [
             (name, runner)

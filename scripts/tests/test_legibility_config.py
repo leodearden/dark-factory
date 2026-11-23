@@ -787,7 +787,7 @@ class TestShippedDarkFactoryConfig:
     def test_shipped_config_gates_landing_on_the_tests_that_read_the_live_codebook(self):
         gate = mod.load_config(self.SHIPPED_CONFIG_PATH).census.landing_gate
         assert gate is not None
-        assert 'scripts/tests/test_codebook.py' in gate.argv
+        assert 'scripts/tests/test_live_codebook.py' in gate.argv
         assert 'scripts/tests/test_legibility_coder.py' in gate.argv
 
     def test_shipped_config_landing_gate_names_only_test_files_that_exist(self):

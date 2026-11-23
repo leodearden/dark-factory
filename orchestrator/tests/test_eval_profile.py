@@ -183,8 +183,9 @@ def test_build_eval_orch_config_applies_profile_and_inherits_base(tmp_path):
     D3/D4: the 5 profile fields land False on the built config. D5: a
     base-only field the constructor build never passed through
     (``max_amendment_rounds``) is nonetheless inherited from *base* — proof
-    this derives from base rather than falling back to a pydantic default.
-    Per-run overrides (candidate model, sandbox-off) still apply on top.
+    this derives from base rather than falling back to a pydantic default,
+    and so is the base's sandbox (task 9849). Per-run overrides (candidate
+    model) still apply on top.
     """
     base = OrchestratorConfig(project_root=tmp_path, max_amendment_rounds=7)
     cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
@@ -202,10 +203,10 @@ def test_build_eval_orch_config_applies_profile_and_inherits_base(tmp_path):
     # D5 — inherited from base, not the pydantic default (1) the old
     # constructor build silently fell back to.
     assert result.max_amendment_rounds == 7
+    assert result.sandbox == base.sandbox
 
     # Per-run overrides still applied on top of the profile-resolved base.
     assert result.models.implementer == 'sonnet'
-    assert result.sandbox.enabled is False
 
 
 def _archive_root(cfg: OrchestratorConfig):

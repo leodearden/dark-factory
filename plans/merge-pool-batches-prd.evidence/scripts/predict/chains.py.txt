@@ -1,0 +1,22 @@
+import json,collections,datetime as dt
+P='/tmp/gate-10069/predict/'
+R={r['rid']:r for r in json.load(open(P+'requests.json'))}; TR=json.load(open(P+'trials.json'))
+tv={t['vid']:t for t in TR}
+ch=[t for t in TR if t['k']>1]
+print('chains total',len(ch),'with membership',sum(1 for t in ch if t['members']), 'first with membership',min(t['ts'] for t in ch if t['members']))
+print('chains without membership by day',sorted(collections.Counter(t['ts'][5:10] for t in ch if not t['members']).items()))
+for t in ch:
+    if not t['members']: continue
+    outs=[]
+    for m in t['members']:
+        r=R.get(m)
+        if not r: outs.append('?'); continue
+        # this member's trials after this chain
+        later=[(tv[v],pos) for v,pos in r['trials'] if tv[v]['t']>t['t']]
+        nxt=later[0][0] if later else None
+        s=f"{r['task']}:"
+        if nxt is None: s+=f"none[{r['final_state'][:4]}:{r['final_reason'][:12]}]"
+        else: s+=('solo' if nxt['k']==1 else f"k{nxt['k']}")+('P' if nxt['passed'] else ('F' if (nxt['k']>1 or nxt['applied']) else 'f-void'))
+        outs.append(s)
+    cdr=t['cdr']
+    print(t['ts'][5:16],'k=%d'%t['k'],'PASS' if t['passed'] else 'RED ',t['runner'][:3],str(t['base_relation'])[:7],'%4.0fm'%(t['dur_s']/60),('est=%.2f row=%s'%(cdr['pass_estimate'],cdr['row']) if cdr and cdr.get('pass_estimate') else ''),' | '.join(outs) if not t['passed'] else ','.join(t['member_tasks']))

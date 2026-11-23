@@ -1,0 +1,81 @@
+{
+ "host": "laptop",
+ "label": "x10lap",
+ "started": 10,
+ "answered": 10,
+ "readonly_by_log": 7,
+ "wrote_entry": 3,
+ "no_write": 7,
+ "rows": [
+  {
+   "i": 1,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 2,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 1,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 3,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 1,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 4,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 1,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 5,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 1,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 6,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 1,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 7,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 8,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 1,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 9,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 10,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 1,
+   "err_tail": "   written: 13"
+  }
+ ]
+}

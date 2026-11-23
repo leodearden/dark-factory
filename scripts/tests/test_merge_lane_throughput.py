@@ -595,8 +595,8 @@ def test_landings_corpus_b_known_answer():
 
 
 # ---------------------------------------------------------------------------
-# compute_lead_time — the four-segment split
-#   merge_queued -> merge_dequeued -> sum(merge_verify.data.duration_ms)
+# compute_lead_time — the lead-time split
+#   merge_queued -> merge_dequeued+ -> sum(merge_verify.data.duration_ms)
 #                -> merge_finalized
 #
 # The join is on the LAST merge_queued STRICTLY BEFORE the landing, per task_id
@@ -614,8 +614,10 @@ def test_landings_corpus_b_known_answer():
 #   T6      -     -       -         -    finalized 'blocked' -> not a landing
 # lead     sorted [20,40,60,80] -> p50 50.0, p90 74.0
 # wait     sorted [5,10,15,20]  -> p50 12.5, p90 18.5
+# requeued [0,0,0,0]            -> every T-task has exactly one dispatch
 # verify   sorted [10,15,30]    -> p50 15.0, p90 27.0  (n=3: T2 has no rows)
 # residual sorted [5,20,35,35]  -> p50 27.5, p90 35.0
+# last_verify_to_land sorted [14,35,60] -> p50 35.0   (n=3: T2 has no rows)
 # ---------------------------------------------------------------------------
 
 
@@ -706,7 +708,7 @@ def test_lead_time_verify_sums_the_payload_duration_not_the_column():
     assert result['verify']['n'] == 3
 
 
-def test_lead_time_residual_is_lead_minus_wait_minus_verify():
+def test_lead_time_residual_is_lead_minus_the_other_segments():
     result = _lead_result()
     assert result['residual']['p50'] == 27.5
     assert result['residual']['p90'] == pytest.approx(35.0)
@@ -744,7 +746,8 @@ def test_lead_time_ignores_non_done_finalize_rows():
 
 def test_lead_time_is_empty_but_not_zero_on_an_empty_window():
     result = mlt.compute_lead_time([], [], [], [], CORPUS_LO_DT, CORPUS_HI_DT)
-    for series in ('lead', 'wait', 'verify', 'residual'):
+    for series in ('lead', 'wait', 'requeued', 'verify', 'residual',
+                   'last_verify_to_land'):
         assert result[series]['n'] == 0
         assert result[series]['p50'] is None
         assert result[series]['p90'] is None
@@ -844,6 +847,132 @@ def test_lead_time_counts_a_negative_residual_rather_than_hiding_it():
 
 def test_lead_time_reports_no_negative_residuals_on_the_main_fixture():
     assert _lead_result()['n_negative_residual'] == 0
+
+
+# ---------------------------------------------------------------------------
+# AN INTERNAL RE-QUEUE IS ITS OWN SEGMENT.
+#
+# The lane re-queues a request internally (merge_lane/worker.py::
+# SpeculativeMergeWorker._requeue_request) without emitting merge_queued, so
+# the re-queue shows only as a further merge_dequeued under the same joined
+# queue row. The landing splits at its in-span dispatches D:
+#   lead = wait (D[0]-queued) + requeued (D[-1]-D[0]) + verify + residual
+# and verify counts only the landing attempt, [D[-1], landing).
+#
+# RE-QUEUE FIXTURE, hand-computed (day 11, one task per case, so n=1):
+#   case  rows (hh:mm)                                lead wait  req verify resid v->land
+#   A1    q 00:00, d 00:05, d 01:30, v 02:10 30m,      135    5   85     30    15      5
+#         f 02:15 (the aborted attempt has NO verify row)
+#   A2    q 03:00, d 03:02, v 03:30 25m FAIL, d 03:40,  85    2   38     35    10      5
+#         v 04:20 35m, f 04:25
+#   A3    q 05:00, v 05:30 20m, f 05:35, d 05:35,       35    -    -     20     -      5
+#         d 05:36 (every dequeue is AT or AFTER the landing)
+#   A4    q 06:00, d 06:05, v 06:30 20m FAIL, d 06:40,  60    5   35      -    20      -
+#         f 07:00 (the landing attempt has NO verify row)
+# old first-dequeue-only split: A1 residual 100.0; A3 wait 35.0, residual -20.0
+# ---------------------------------------------------------------------------
+
+_REQUEUE_CASES = {
+    'A1': (
+        [_q('A1', 0, 0)],
+        [_q('A1', 0, 5), _q('A1', 1, 30)],
+        [_v('A1', 2, 10, 1_800_000)],
+        [_f('A1', 2, 15)],
+    ),
+    'A2': (
+        [_q('A2', 3, 0)],
+        [_q('A2', 3, 2), _q('A2', 3, 40)],
+        [_v('A2', 3, 30, 1_500_000, passed=False), _v('A2', 4, 20, 2_100_000)],
+        [_f('A2', 4, 25)],
+    ),
+    'A3': (
+        [_q('A3', 5, 0)],
+        [_q('A3', 5, 35), _q('A3', 5, 36)],
+        [_v('A3', 5, 30, 1_200_000)],
+        [_f('A3', 5, 35)],
+    ),
+    'A4': (
+        [_q('A4', 6, 0)],
+        [_q('A4', 6, 5), _q('A4', 6, 40)],
+        [_v('A4', 6, 30, 1_200_000, passed=False)],
+        [_f('A4', 7, 0)],
+    ),
+}
+
+
+def _requeue_result(case: str) -> dict[str, Any]:
+    q, d, v, f = _REQUEUE_CASES[case]
+    return mlt.compute_lead_time(q, d, v, f, CORPUS_LO_DT, CORPUS_HI_DT)
+
+
+def _only(result: dict[str, Any], series: str) -> float:
+    assert result[series]['n'] == 1
+    return result[series]['p50']
+
+
+def test_lead_time_reports_an_internal_requeue_as_its_own_segment():
+    result = _requeue_result('A1')
+    split = {key: _only(result, key) for key in (
+        'lead', 'wait', 'requeued', 'verify', 'residual', 'last_verify_to_land'
+    )}
+    # REGRESSION PIN: the first-dequeue-only split charged the aborted
+    # attempt's re-queue wait to finalize+CAS and gave residual 100.0 here.
+    assert split == {'lead': 135.0, 'wait': 5.0, 'requeued': 85.0,
+                     'verify': 30.0, 'residual': 15.0,
+                     'last_verify_to_land': 5.0}
+    assert split['lead'] == (
+        split['wait'] + split['requeued'] + split['verify'] + split['residual']
+    )
+
+
+def test_lead_time_verify_counts_only_the_landing_attempt_after_a_requeue():
+    result = _requeue_result('A2')
+    assert _only(result, 'lead') == 85.0
+    assert _only(result, 'wait') == 2.0
+    assert _only(result, 'requeued') == 38.0
+    # 35.0, not 60.0: the 03:30 row is the aborted attempt's, before the last
+    # dispatch. Counting it beside the re-queued interval gives residual -15.0.
+    assert _only(result, 'verify') == 35.0
+    assert _only(result, 'residual') == 10.0
+    assert _only(result, 'last_verify_to_land') == 5.0
+    assert result['n_negative_residual'] == 0
+
+
+def test_lead_time_ignores_a_dequeue_stamped_at_or_after_the_landing():
+    result = _requeue_result('A3')
+    assert _only(result, 'lead') == 35.0
+    # REGRESSION PIN: the unbounded first-at-or-after dequeue took 05:35 as the
+    # wait (35.0 = lead) and gave residual -20.0. The landing bound is
+    # half-open, so the dequeue stamped exactly at it is out of span too.
+    for series in ('wait', 'requeued', 'residual'):
+        assert result[series]['n'] == 0
+    # With no in-span dispatch the verify scope falls back to the joined row.
+    assert _only(result, 'verify') == 20.0
+    assert _only(result, 'last_verify_to_land') == 5.0
+    assert result['n_negative_residual'] == 0
+
+
+def test_lead_time_leaves_an_earlier_attempts_verify_in_requeued():
+    result = _requeue_result('A4')
+    # The 06:30 row is the aborted attempt's: it is before the last dispatch,
+    # so it stays inside re-queued rather than standing in for the landing
+    # attempt's missing verify.
+    for series in ('verify', 'last_verify_to_land'):
+        assert result[series]['n'] == 0
+    assert _only(result, 'lead') == 60.0
+    assert _only(result, 'wait') == 5.0
+    assert _only(result, 'requeued') == 35.0
+    assert _only(result, 'residual') == 20.0
+    assert result['n_negative_residual'] == 0
+
+
+def test_lead_time_main_fixture_has_no_requeue_and_times_verify_to_land():
+    result = _lead_result()
+    assert result['requeued']['p50'] == 0.0
+    assert result['requeued']['max'] == 0.0
+    assert result['requeued']['n'] == 4
+    assert result['last_verify_to_land']['n'] == 3
+    assert result['last_verify_to_land']['p50'] == 35.0
 
 
 # ---------------------------------------------------------------------------
@@ -2162,9 +2291,30 @@ def test_the_renderers_still_format_a_real_value():
 def test_lead_time_renders_an_empty_series_as_n_a_never_zero():
     section = mlt.compute_lead_time([], [], [], [], CORPUS_LO_DT, CORPUS_HI_DT)
     body = '\n'.join(mlt._format_lead_time(section, _NA_WINDOW))
-    # Four segments x p50/p90/min/max, every one unmeasured.
-    assert body.count('n/a') == 16
+    # Six series rows x p50/p90/min/max, every one unmeasured.
+    assert body.count('n/a') == 24
     assert '0.0' not in body
+
+
+def test_lead_time_renders_the_requeue_and_verify_to_land_rows_in_order():
+    bundle = {
+        'project_root': '/nowhere',
+        'runs_db': '/nowhere/data/orchestrator/runs.db',
+        'window': _NA_WINDOW,
+        'error': None,
+        'sections': {'lead_time': _requeue_result('A1')},
+    }
+    lines = mlt.format_report([bundle]).splitlines()
+    labels = ['lead', 'queue wait', 're-queued', 'verify', 'finalize+CAS',
+              'verify->land']
+    positions = [
+        next(i for i, line in enumerate(lines) if line.startswith(f'    {label} '))
+        for label in labels
+    ]
+    assert positions == sorted(positions)
+    p50 = {label: lines[i].split()[-5] for label, i in zip(labels, positions, strict=True)}
+    assert p50['re-queued'] == '85.0'
+    assert p50['verify->land'] == '5.0'
 
 
 def test_queue_depth_renders_an_empty_series_as_n_a_never_zero():

@@ -56,7 +56,7 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     maybe_escalate_preservation_suppression_storm,
     maybe_escalate_unresolved_corroboration,
 )
-from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE1_CYCLE_SUMMARY_RECON_POOL as _STAGE1_CYCLE_SUMMARY_RECON_POOL,
@@ -106,6 +106,7 @@ from fused_memory.reconciliation.summary_pool import (
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    available_tree,
     detect_census_inconsistency,
     format_filtered_task_tree,
 )
@@ -496,9 +497,10 @@ class MemoryConsolidator(BaseStage):
         their ids resolve by construction: they come from a same-cycle Qdrant
         scroll, and the sweep emits no flag unless that scroll returned a row.
         """
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return
-        active_tasks = self.filtered_task_tree.active_tasks
+        active_tasks = tree.active_tasks
         gate_ids = extract_open_gate_task_ids(active_tasks)
         swept = set(gate_ids)
         # Titles for the flag descriptions only; selection stays with extract_open_gate_task_ids.
@@ -636,9 +638,10 @@ class MemoryConsolidator(BaseStage):
         )
 
     def _active_tasks(self) -> list[dict] | None:
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return None
-        return self.filtered_task_tree.active_tasks
+        return tree.active_tasks
 
     def _detect_census_inconsistency(
         self, report: StageReport, events: list[ReconciliationEvent], run_id: str,
@@ -648,7 +651,7 @@ class MemoryConsolidator(BaseStage):
         Skipped when the max is 0 (an empty tree or no parseable id), where every
         id would read as above it: a false-positive flood, not a truncation signal.
         """
-        tree = self.filtered_task_tree
+        tree = available_tree(self.filtered_task_tree)
         if tree is None or tree.max_task_id <= 0:
             return
         event_task_ids = [
@@ -755,9 +758,10 @@ class MemoryConsolidator(BaseStage):
         Stateless: it reads the durable stamp off the active task tree, so it
         needs no Mem0 marker and no LLM finding.
         """
-        if self._escalation_queue is None or self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if self._escalation_queue is None or tree is None:
             return
-        active_tasks = self.filtered_task_tree.active_tasks
+        active_tasks = tree.active_tasks
         now = datetime.now(UTC)
         gate_stalled = extract_stalled_gate_backlog_task_ids(active_tasks, now=now)
         report.stats['stage1_gate_backlog_stalled'] = len(gate_stalled)
@@ -782,7 +786,7 @@ class MemoryConsolidator(BaseStage):
         stats. Absent is honest there, where a False ``enumeration_complete``
         would claim a corpus was observed and found incomplete.
         """
-        terminal_ids = extract_terminal_task_ids(self.filtered_task_tree)
+        terminal_ids = extract_terminal_task_ids(available_tree(self.filtered_task_tree))
         if terminal_ids:
             _publish_sweep_stats(report, _DEGENERATE_SWEEP_STATS, await _await_best_effort(
                 lambda: sweep_degenerate_task_nodes(self.memory, self.project_id, terminal_ids),
@@ -1099,13 +1103,12 @@ class MemoryConsolidator(BaseStage):
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
-1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
+1. Within Mem0: identify duplicates, contradictions and stale entries. PROPOSE a duplicate cluster for consolidation (do not merge it by hand); delete or amend stale and contradicted entries.
 2. Within Graphiti: review entity consistency, superseded temporal facts.
 3. Cross-store: check for contradictions between stores. Promote solidified patterns.
 4. Flag any items that are relevant to task planning for Stage 2.
-5. When you have completed your work, produce your final structured report as your response.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     async def _fetch_status(self) -> dict:
         """Fetch store status, logging a WARNING and tracking degradation on failure.
@@ -1207,13 +1210,12 @@ Review the above data and perform memory consolidation:
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
-1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
+1. Within Mem0: identify duplicates, contradictions and stale entries. PROPOSE a duplicate cluster for consolidation (do not merge it by hand); delete or amend stale and contradicted entries.
 2. Within Graphiti: review entity consistency, superseded temporal facts.
 3. Cross-store: check for contradictions between stores. Promote solidified patterns.
 4. Flag any items that are relevant to task planning for Stage 2.
-5. When you have completed your work, produce your final structured report as your response.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     async def _render_required_sections(self) -> str:
         """Render every inference-bearing payload section, in registry order.
@@ -1283,12 +1285,13 @@ Review the above data and perform memory consolidation:
         the payload tight, matching _build_task_tree_section's pattern.  The
         snapshot is retained for :meth:`run`'s citation guard.  A tree with no
         active task yields a real, empty snapshot, because an absent section
-        tells this stage that no task is live; only an unset tree leaves it
-        None, and the guard inert.  Claimant heartbeats are aged at
+        tells this stage that no task is live; only an unset or unavailable
+        tree leaves it None, and the guard inert.  Claimant heartbeats are aged at
         ``filtered_task_tree_fetched_at``, the instant the tree was read, not
         at render time (task 6027).
         """
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return ''
         claims_read_at = resolve_tree_read_instant(
             self.filtered_task_tree_fetched_at,
@@ -1296,7 +1299,7 @@ Review the above data and perform memory consolidation:
             extra={'project_id': self.project_id},
         )
         self._live_workflow_snapshot = await build_live_workflow_snapshot(
-            self.filtered_task_tree.active_tasks,
+            tree.active_tasks,
             self.scope.project_root,
             claims_read_at=claims_read_at,
         )
@@ -1349,9 +1352,9 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 1. For each finding: investigate the affected IDs, apply the suggested action, verify the fix.
 2. If a finding cannot be resolved, flag it for Stage 2 with an explanation.
 3. Do NOT perform general consolidation — only fix the listed findings.
-4. Report each finding's resolution status in your structured report.
+4. State each finding's resolution status, in the vocabulary of the Remediation Mode rules, in your `complete` summary.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """
 
 

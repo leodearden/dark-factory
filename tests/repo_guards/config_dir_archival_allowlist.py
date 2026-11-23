@@ -422,11 +422,11 @@ NOTES = (
     `_merge-verify` lane (PERSISTENT_MERGE_WORKTREE_NAME). GitOps.acquire_spec_lane
     does only `git worktree add --detach`, `git reset --hard`, `git clean`, and
     a CoW seed-warm-lane.sh reflink; the lane is handed to
-    merge_queue._run_post_merge_verify, which spawns plain verify subprocesses.
+    merge_queue.run_post_merge_verify, which spawns plain verify subprocesses.
     invoke_agent / invoke_with_cap_retry / CLAUDE_CONFIG_DIR / orchestrator.agents
     appear NOWHERE in git_ops.py, merge_liveness.py, verify.py, verify_runner.py,
     merge_queue.py or the merge_* modules. The one agent reachable from
-    merge-verify — merge_queue._spawn_merge_verify_dry_run — passes
+    merge-verify — merge_queue.spawn_merge_verify_dry_run — passes
     `worktree=str(req.worktree)`, the task's OWN retained worktree, never the
     lane.
 

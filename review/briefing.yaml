@@ -285,7 +285,7 @@ subprojects:
       - "Observing merge-queue state — queued merges, halt status, who/why halted"
       - "Inspecting scheduler park state across each module's whole park stack, not only its active top — buried owners, and stranded parks whose owner is no longer live, which the operator can request eviction of"
       - "Steering dispatch from the scheduler tab — setting or clearing a task's priority override and reordering the pin queue"
-      - "Reviewing host load (PSI + verify concurrency/RSS + OCCT queue depth) from the sampler's load-samples.db"
+      - "Reviewing host load (PSI + live verify scopes and their memory + OCCT queue depth) from the sampler's load-samples.db"
       - "Reviewing costs by account / project / role / run, plus burndown and cap history"
       - "Checking memory subsystem health — Graphiti, Mem0, queue status"
       - "Inspecting reconciliation pipeline history — runs, events, judge verdicts"
@@ -381,22 +381,25 @@ subprojects:
     purpose: >
       Host-load sampler: a timer-fired ONE-SHOT (Type=oneshot, every 5s — NOT a daemon)
       that appends one tick of host load (PSI pressure, run-queue load, the factory's
-      own cgroup pressure per cgroup leaf, verify/OCCT process saturation) to
-      data/load-samples.db, giving the factory an always-on load signal without a
-      long-lived process that could hang or leak. The dashboard reads that file for its
-      live system-health panels, and scripts/load-threshold-calibration.py reads it to
-      recommend the shared.psi admission thresholds.
+      own cgroup pressure per cgroup leaf, OCCT queue depth) to data/load-samples.db,
+      and every 30s each consumer's memory, swap, reclaim, stall and CPU (the whole
+      cgroup tree attributed to consumers, sampler/src/sampler/consumers.py) plus the
+      live verify scopes and their memory, giving the factory an always-on load
+      signal without a long-lived process that could hang or leak. The dashboard
+      reads that file for its live system-health panels, and
+      scripts/load-threshold-calibration.py reads it to recommend the shared.psi
+      admission thresholds.
 
     key_scenarios:
       - "Every 5s systemd fires the unit; each admitted collection group's rows land in data/load-samples.db in ONE transaction, so the corpus never holds half a tick; the dashboard /api/load endpoint reads them into sparklines"
-      - "occt_queue_depth shows how many cargo-test-occt-gated bash processes are blocked on the OCCT semaphore; verify_concurrency/RSS show verify.sh saturation"
+      - "occt_queue_depth shows how many cargo-test-occt-gated bash processes are blocked on the OCCT semaphore; every 30s the verify-scope group counts live df-verify-*.scope cgroups (in app.slice or a project's df-<id>.slice) and sums their memory, and the consumer group records every consumer's gauges and interval increments, carrying its counter state between ticks in the store with the rows (sampler/src/sampler/sampler.py::collect_tick)"
       - "Rows are kept for a bounded retention window and pruned at most once a day, and VACUUM runs only when enough of the file is reclaimable; the window, cadences and reclaim threshold live in sampler/src/sampler/store.py (module docstring 'Retention', LoadSampleStore.cleanup_old, LoadSampleStore.maybe_vacuum). The window is sized for threshold calibration, not just the dashboard sparklines"
       - "Degrade-and-continue per collection group: a group whose collector fails, or that emits a key its MetricGroup does not admit (logged at ERROR naming the keys), writes nothing that tick while the other groups are still written, and no collection failure exits non-zero. A store failure is not degraded: opening the store (the leaf-column migration included), the tick write, the retention prune and the VACUUM eligibility check all propagate out of sampler/src/sampler/__main__.py::main and exit non-zero; only a failed VACUUM itself is caught and retried (LoadSampleStore.maybe_vacuum)"
 
     what_working_means:
       - "systemctl --user is-active dark-factory-load-sampler.timer returns active"
       - "data/load-samples.db exists at repo root within ~15s of enabling"
-      - "Rows for every group's host-level metrics appear in the last 30s; assert presence, not a count, because the per-tick row count depends on the host's cgroup leaves (sampler/src/sampler/metrics.py::METRIC_GROUPS). The journal shows `tick ts=… psi={…} process={…} load={…}` lines every 5s, with no exception entries and no group rendered `dropped`"
+      - "Rows for every group's host-level metrics appear in the last 30s; assert presence, not a count, because the per-tick row count depends on the host's cgroup leaves (sampler/src/sampler/metrics.py::METRIC_GROUPS). The journal shows `tick ts=… psi={…} process={…} load={…} consumers=… verify_scopes=…` lines every 5s, where consumers renders `rows:<n> leaves:<k>` on the ticks it is collected and `not-due` between them, with no group rendered `dropped` or `failed:<Class>`"
       - "/api/load returns populated values for every metric it serves (dashboard/src/dashboard/data/load.py::KNOWN_METRICS, a projection of METRIC_GROUPS)"
 
     key_decisions:

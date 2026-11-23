@@ -1,10 +1,11 @@
 """Tests for orchestrator.session_registry module.
 
-Covers: TTL/pid stale-record reaper matrix; the leases; CLI subcommands +
-fail-soft; the bare-shell entrypoint registry; and the G5 two-way boundary
-test (write by a real spawn -> refresh by a simulated hook -> reap), exercised
-jointly with tests/scripts/test_spawn_claude.py's bash-level harness. The
-record schema and store are covered in test_session_records.py.
+Covers: CLI subcommands + fail-soft, the reap and lease-* verbs included; the
+bare-shell entrypoint registry; and the G5 two-way boundary test (write by a
+real spawn -> refresh by a simulated hook -> reap), exercised jointly with
+tests/scripts/test_spawn_claude.py's bash-level harness. The record schema and
+store are covered in test_session_records.py, the lease library in
+test_session_leases.py, the reaper in test_session_reaper.py.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
-import fcntl
 import importlib.util
 import json
 import logging
@@ -21,22 +21,19 @@ import re
 import socket
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 
 import pytest
 from _decision_fixtures import EVIDENCE, make_decision
-from _process_identity_variants import IdentityVariant, own_identity
+from _process_identity_variants import own_identity
 from _reap_report_wait import await_reap_report
-from _session_record_fixtures import make_record
-from shared.process_identity import ProcessIdentity
+from _session_record_fixtures import make_record, set_mtime, write_t3_record
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import decision_registry as dr
-from orchestrator import fleet_files, session_identity, session_records
+from orchestrator import session_leases, session_reaper, session_records
 from orchestrator import session_registry as sr
 
 # ---------------------------------------------------------------------------
@@ -48,847 +45,6 @@ from orchestrator import session_registry as sr
 _DEAD_PID = 2**31 - 1
 
 _NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
-
-
-def _set_mtime(path: Path, now: datetime, age: timedelta) -> None:
-    """Backdate *path*'s mtime to ``now - age`` (reap_stale_records' heartbeat clock)."""
-    ts = (now - age).timestamp()
-    os.utime(path, (ts, ts))
-
-
-# ---------------------------------------------------------------------------
-# Step-7: TTL / pid stale-record reaper matrix
-# ---------------------------------------------------------------------------
-
-
-def test_ttl_constants_are_module_level_timedeltas() -> None:
-    assert timedelta(hours=24) == sr.TERMINAL_TTL
-    assert timedelta(hours=1) == sr.NON_TERMINAL_HEARTBEAT_TTL
-
-
-def test_reap_removes_terminal_record_past_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.EXITED, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, sr.TERMINAL_TTL + timedelta(hours=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert len(reaped) == 1
-    assert reaped[0].session_slug == r.session_slug
-    assert reaped[0].reason == 'terminal_ttl'
-    assert reaped[0].path == record_path.parent
-    assert not record_path.parent.exists()
-
-
-def test_reap_keeps_terminal_record_within_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.EXITED, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, sr.TERMINAL_TTL - timedelta(hours=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert reaped == []
-    assert record_path.is_file()
-
-
-def test_reap_removes_non_terminal_dead_pid_past_heartbeat_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID)
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert len(reaped) == 1
-    assert reaped[0].session_slug == r.session_slug
-    assert reaped[0].reason == 'stale_pid'
-    assert not record_path.parent.exists()
-
-
-def test_reap_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.RUNNING, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert reaped == []
-    assert record_path.is_file()
-
-
-def test_reap_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID)
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert reaped == []
-    assert record_path.is_file()
-
-
-def test_reap_removes_corrupt_body_past_heartbeat_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.LAUNCHING, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    record_path.write_text('{not valid json')
-    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert len(reaped) == 1
-    assert reaped[0].session_slug == r.session_slug
-    assert reaped[0].reason == 'corrupt'
-    assert not record_path.parent.exists()
-
-
-def test_reap_removes_missing_body_past_heartbeat_ttl(tmp_path: Path) -> None:
-    """A slug dir with no record.json at all is still reaped by path identity."""
-    r = make_record(status=session_records.Status.LAUNCHING, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    record_path.unlink()
-    _set_mtime(record_path.parent, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert len(reaped) == 1
-    assert reaped[0].session_slug == r.session_slug
-    assert reaped[0].reason == 'corrupt'
-    assert not record_path.parent.exists()
-
-
-def test_reap_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
-    """The reaper's whole point is sweeping many records in one pass; pin that
-    a kept/terminal_ttl/stale_pid/corrupt mix in a single sessions dir reaps
-    exactly the expected subset in one call and leaves survivors untouched.
-    """
-    kept_running = make_record(
-        session_slug='kept-running', status=session_records.Status.RUNNING, launcher_pid=os.getpid()
-    )
-    kept_recent_terminal = make_record(
-        session_slug='kept-recent-terminal', status=session_records.Status.EXITED, launcher_pid=os.getpid()
-    )
-    reap_terminal = make_record(
-        session_slug='reap-terminal', status=session_records.Status.EXITED, launcher_pid=os.getpid()
-    )
-    reap_stale = make_record(
-        session_slug='reap-stale-pid', status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID
-    )
-
-    for r in (kept_running, kept_recent_terminal, reap_terminal, reap_stale):
-        session_records.write_record(r, root=tmp_path)
-
-    _set_mtime(
-        session_records.record_path_for_slug(kept_running.session_slug, root=tmp_path),
-        _NOW,
-        timedelta(days=30),  # long-lived but a live pid -> kept regardless of age
-    )
-    _set_mtime(
-        session_records.record_path_for_slug(kept_recent_terminal.session_slug, root=tmp_path),
-        _NOW,
-        sr.TERMINAL_TTL - timedelta(hours=1),
-    )
-    _set_mtime(
-        session_records.record_path_for_slug(reap_terminal.session_slug, root=tmp_path),
-        _NOW,
-        sr.TERMINAL_TTL + timedelta(hours=1),
-    )
-    _set_mtime(
-        session_records.record_path_for_slug(reap_stale.session_slug, root=tmp_path),
-        _NOW,
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
-    )
-
-    # A corrupt-body record dir, aged past the heartbeat TTL.
-    corrupt_dir = session_records.sessions_dir(root=tmp_path) / 'reap-corrupt'
-    corrupt_dir.mkdir(parents=True)
-    corrupt_record = corrupt_dir / 'record.json'
-    corrupt_record.write_text('{not valid json')
-    _set_mtime(corrupt_record, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    reaped_by_slug = {r.session_slug: r.reason for r in reaped}
-    assert reaped_by_slug == {
-        'reap-terminal': 'terminal_ttl',
-        'reap-stale-pid': 'stale_pid',
-        'reap-corrupt': 'corrupt',
-    }
-
-    remaining = {p.name for p in session_records.sessions_dir(root=tmp_path).iterdir()}
-    assert remaining == {'kept-running', 'kept-recent-terminal'}
-
-
-def test_reap_continues_sweep_when_one_directory_fails_to_remove(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A single unreapable directory (permission error, a file held open, an
-    ENOTEMPTY race with a concurrent writer) must not abort the sweep -- a
-    later stale directory in the same sessions dir is still reaped.
-    """
-    poison = make_record(session_slug='poison', status=session_records.Status.EXITED, launcher_pid=os.getpid())
-    victim = make_record(session_slug='victim', status=session_records.Status.EXITED, launcher_pid=os.getpid())
-    for r in (poison, victim):
-        session_records.write_record(r, root=tmp_path)
-        _set_mtime(
-            session_records.record_path_for_slug(r.session_slug, root=tmp_path),
-            _NOW,
-            sr.TERMINAL_TTL + timedelta(hours=1),
-        )
-
-    poison_dir = session_records.record_path_for_slug(poison.session_slug, root=tmp_path).parent
-    real_rmtree = sr.shutil.rmtree
-
-    def _flaky_rmtree(path: str | os.PathLike[str], *args: Any, **kwargs: Any) -> None:
-        if Path(path) == poison_dir:
-            raise OSError('simulated ENOTEMPTY race')
-        real_rmtree(path, *args, **kwargs)
-
-    monkeypatch.setattr(sr.shutil, 'rmtree', _flaky_rmtree)
-
-    with caplog.at_level(logging.ERROR):
-        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert {r.session_slug for r in reaped} == {'victim'}
-    assert poison_dir.is_dir()  # left behind, not silently claimed as reaped
-    assert any(r.levelno >= logging.ERROR for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# Task 2511 step-5: mark_orphaned_sessions_exited (liveness sweep, Part 2)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    'status',
-    [session_records.Status.LAUNCHING, session_records.Status.RUNNING, session_records.Status.IDLE, session_records.Status.AWAITING_INPUT],
-)
-def test_mark_orphaned_marks_non_terminal_dead_pid_past_heartbeat_ttl(
-    status: session_records.Status, tmp_path: Path
-) -> None:
-    r = make_record(session_slug='orphan-1', status=status, launcher_pid=_DEAD_PID, exit_code=None)
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert {m.session_slug for m in marked} == {'orphan-1'}
-    assert record_path.parent.is_dir()  # marked, NOT deleted (reap_stale_records' job)
-    assert record_path.is_file()
-    reloaded = session_records.read_record('orphan-1', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-def test_mark_orphaned_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
-    r = make_record(session_slug='kept-live', status=session_records.Status.RUNNING, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert marked == []
-    assert session_records.read_record('kept-live', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_orphaned_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
-    r = make_record(session_slug='kept-recent', status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID)
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert marked == []
-    assert session_records.read_record('kept-recent', root=tmp_path).status == session_records.Status.LAUNCHING
-
-
-def test_mark_orphaned_leaves_already_terminal_record_untouched(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='already-exited', status=session_records.Status.EXITED, exit_code=0, launcher_pid=_DEAD_PID
-    )
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(days=2))
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert marked == []
-    reloaded = session_records.read_record('already-exited', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == 0  # NOT re-stamped with ORPHAN_EXIT_CODE
-
-
-def test_mark_orphaned_preserves_all_other_fields(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='orphan-fields',
-        status=session_records.Status.RUNNING,
-        launcher_pid=_DEAD_PID,
-        role='unblock',
-        project='df',
-        task_id='2085',
-        result_file='/tmp/whatever/result.md',
-        start_ts='2026-07-07T00:00:00+00:00',
-    )
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    reloaded = session_records.read_record('orphan-fields', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-    assert reloaded.role == 'unblock'
-    assert reloaded.project == 'df'
-    assert reloaded.task_id == '2085'
-    assert reloaded.result_file == '/tmp/whatever/result.md'
-    assert reloaded.launcher_pid == _DEAD_PID
-    assert reloaded.start_ts == '2026-07-07T00:00:00+00:00'
-
-
-def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
-    marked_orphan = make_record(
-        session_slug='will-be-marked', status=session_records.Status.RUNNING, launcher_pid=_DEAD_PID
-    )
-    kept_live = make_record(
-        session_slug='kept-live-mix', status=session_records.Status.RUNNING, launcher_pid=os.getpid()
-    )
-    kept_recent = make_record(
-        session_slug='kept-recent-mix', status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID
-    )
-    kept_terminal = make_record(
-        session_slug='kept-terminal-mix',
-        status=session_records.Status.EXITED,
-        exit_code=0,
-        launcher_pid=_DEAD_PID,
-    )
-    for r in (marked_orphan, kept_live, kept_recent, kept_terminal):
-        session_records.write_record(r, root=tmp_path)
-
-    _set_mtime(
-        session_records.record_path_for_slug('will-be-marked', root=tmp_path),
-        _NOW,
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
-    )
-    _set_mtime(
-        session_records.record_path_for_slug('kept-live-mix', root=tmp_path),
-        _NOW,
-        timedelta(days=30),
-    )
-    _set_mtime(
-        session_records.record_path_for_slug('kept-recent-mix', root=tmp_path),
-        _NOW,
-        sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1),
-    )
-    _set_mtime(
-        session_records.record_path_for_slug('kept-terminal-mix', root=tmp_path),
-        _NOW,
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(days=2),
-    )
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert {m.session_slug for m in marked} == {'will-be-marked'}
-    assert session_records.read_record('will-be-marked', root=tmp_path).status == session_records.Status.EXITED
-    assert session_records.read_record('kept-live-mix', root=tmp_path).status == session_records.Status.RUNNING
-    assert session_records.read_record('kept-recent-mix', root=tmp_path).status == session_records.Status.LAUNCHING
-    reloaded_terminal = session_records.read_record('kept-terminal-mix', root=tmp_path)
-    assert reloaded_terminal.status == session_records.Status.EXITED
-    assert reloaded_terminal.exit_code == 0
-
-
-# ---------------------------------------------------------------------------
-# Task 8125: the pid sweeps judge the launcher by its identity
-# ---------------------------------------------------------------------------
-
-def _launcher_slug(variant: IdentityVariant) -> str:
-    return f'launcher-{variant}'
-
-
-_UNQUALIFIED = 'launcher-unqualified'
-_ELSEWHERE = _launcher_slug(IdentityVariant.OTHER_HOST)
-_JUDGED_DEAD = {_launcher_slug(v) for v in IdentityVariant if v.judged_dead}
-_JUDGED_KEPT = {_launcher_slug(v) for v in IdentityVariant if not v.judged_dead} | {_UNQUALIFIED}
-
-
-def _launcher_identities() -> dict[str, ProcessIdentity | None]:
-    """One record slug per identity, all naming this live test process: only the identity can make one dead."""
-    return {_launcher_slug(v): own_identity(v) for v in IdentityVariant} | {_UNQUALIFIED: None}
-
-
-def _seed_stale_launchers(root: Path) -> None:
-    for slug, identity in _launcher_identities().items():
-        record = make_record(
-            session_slug=slug,
-            status=session_records.Status.RUNNING,
-            launcher_pid=os.getpid(),
-            launcher_identity=identity,
-        )
-        session_records.write_record(record, root=root)
-        _set_mtime(
-            session_records.record_path_for_slug(slug, root=root),
-            _NOW,
-            sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
-        )
-
-
-def _logged_other_host_skip(caplog: pytest.LogCaptureFixture, sweep: str, subject: str) -> bool:
-    return any(
-        sweep in r.getMessage() and subject in r.getMessage() and 'reason=other_host' in r.getMessage()
-        for r in caplog.records
-        if r.name == sr.__name__ and r.levelno == logging.INFO
-    )
-
-
-class TestPidSweepsJudgeTheLauncherByIdentity:
-    def test_mark_orphaned_marks_exactly_the_launchers_judged_dead(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _seed_stale_launchers(tmp_path)
-
-        with caplog.at_level(logging.INFO, logger=sr.__name__):
-            marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-        assert {m.session_slug for m in marked} == _JUDGED_DEAD
-        for slug in _JUDGED_KEPT:
-            assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
-        assert _logged_other_host_skip(caplog, 'mark_orphaned_sessions_exited', _ELSEWHERE)
-
-    def test_reap_stale_records_reaps_exactly_the_launchers_judged_dead(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _seed_stale_launchers(tmp_path)
-
-        with caplog.at_level(logging.INFO, logger=sr.__name__):
-            reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-        assert {r.session_slug: r.reason for r in reaped} == dict.fromkeys(
-            _JUDGED_DEAD, 'stale_pid'
-        )
-        for slug in _JUDGED_KEPT:
-            assert session_records.record_path_for_slug(slug, root=tmp_path).is_file()
-        assert _logged_other_host_skip(caplog, 'reap_stale_records', _ELSEWHERE)
-
-
-# ---------------------------------------------------------------------------
-# Task 2934 step-1/2: _normalize_wm_window_id (decimal-vs-hex canonicalization)
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_wm_window_id_decimal_and_padded_hex_collapse_to_same_canonical() -> None:
-    assert sr._normalize_wm_window_id('0x0000001a') == '0x1a'
-    assert sr._normalize_wm_window_id('26') == '0x1a'
-    # The crux: a decimal-captured id and a zero-padded-hex wmctrl id for the
-    # SAME window must compare equal after normalization.
-    assert sr._normalize_wm_window_id('26') == sr._normalize_wm_window_id('0x0000001a')
-
-
-def test_normalize_wm_window_id_already_canonical_round_trips() -> None:
-    assert sr._normalize_wm_window_id('0x1a') == '0x1a'
-
-
-@pytest.mark.parametrize(
-    'raw',
-    [None, '', '   ', '0xZZ', 'nope', '-1'],
-    ids=['none', 'empty', 'whitespace', 'unparseable-hex', 'unparseable-decimal', 'negative'],
-)
-def test_normalize_wm_window_id_unparseable_or_negative_returns_none(raw: str | None) -> None:
-    assert sr._normalize_wm_window_id(raw) is None
-
-
-# ---------------------------------------------------------------------------
-# Task 2934 step-3/4: _wmctrl_live_window_ids (single-probe live-window-id set)
-# ---------------------------------------------------------------------------
-
-
-def _fake_wmctrl_run(
-    stdout_lines: list[str], returncode: int = 0
-) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
-    """Build a fake ``run`` callable returning a canned ``wmctrl -l`` result."""
-
-    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv, returncode=returncode, stdout='\n'.join(stdout_lines)
-        )
-
-    return _run
-
-
-def test_wmctrl_live_window_ids_rc0_multiline_returns_normalized_set() -> None:
-    run = _fake_wmctrl_run(
-        [
-            '0x0000001a  0 host  first window title',
-            '0x2b 1 host second-window-title',
-        ]
-    )
-    assert sr._wmctrl_live_window_ids(run) == {'0x1a', '0x2b'}
-
-
-def test_wmctrl_live_window_ids_collapses_mixed_casing_and_padding() -> None:
-    run = _fake_wmctrl_run(['0X0000002B  0 host  some window'])
-    assert sr._wmctrl_live_window_ids(run) == {'0x2b'}
-
-
-def test_wmctrl_live_window_ids_rc0_empty_stdout_returns_empty_set_not_none() -> None:
-    run = _fake_wmctrl_run([])
-    result = sr._wmctrl_live_window_ids(run)
-    assert result == set()
-    assert result is not None
-
-
-def test_wmctrl_live_window_ids_rc127_missing_binary_returns_none() -> None:
-    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=127)
-    assert sr._wmctrl_live_window_ids(run) is None
-
-
-def test_wmctrl_live_window_ids_rc124_transient_timeout_returns_none() -> None:
-    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=124)
-    assert sr._wmctrl_live_window_ids(run) is None
-
-
-def test_wmctrl_live_window_ids_other_nonzero_rc_returns_none() -> None:
-    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=1)
-    assert sr._wmctrl_live_window_ids(run) is None
-
-
-def test_wmctrl_live_window_ids_run_raising_returns_none() -> None:
-    def _boom(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        raise OSError('wmctrl exploded')
-
-    assert sr._wmctrl_live_window_ids(_boom) is None
-
-
-def test_wmctrl_live_window_ids_titleless_short_line_still_contributes_id() -> None:
-    # No desktop/host/title columns -- id-only leniency: a reaper must fail
-    # toward keeping live sessions, so column-0-only lines still count.
-    run = _fake_wmctrl_run(['0x3c'])
-    assert sr._wmctrl_live_window_ids(run) == {'0x3c'}
-
-
-# ---------------------------------------------------------------------------
-# Task 2934 step-5/6: mark_windowless_wm_sessions_exited (happy path)
-# ---------------------------------------------------------------------------
-
-
-def test_mark_windowless_marks_wm_record_whose_window_id_is_absent(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='windowless-1',
-        status=session_records.Status.AWAITING_INPUT,
-        display=session_records.Display(kind='wm', wm_title='some title', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x0000ff99  0 host  some other window'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert {m.session_slug for m in marked} == {'windowless-1'}
-    record_path = session_records.record_path_for_slug('windowless-1', root=tmp_path)
-    assert record_path.parent.is_dir()  # marked, NOT deleted
-    assert record_path.is_file()
-    reloaded = session_records.read_record('windowless-1', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-def test_mark_windowless_keeps_decimal_captured_id_matching_padded_hex_live_window(
-    tmp_path: Path,
-) -> None:
-    # DECIMAL-vs-hex KEEP: '26' (decimal) is the SAME window as the live,
-    # zero-padded-hex '0x0000001a' wmctrl reports -- must NOT be reaped.
-    r = make_record(
-        session_slug='decimal-kept',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='26'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x0000001a  0 host  live window'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    assert session_records.read_record('decimal-kept', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_preserves_all_other_fields(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='windowless-fields',
-        status=session_records.Status.IDLE,
-        role='unblock',
-        project='df',
-        task_id='2085',
-        launcher_pid=os.getpid(),
-        start_ts='2026-07-07T00:00:00+00:00',
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  other window'])
-
-    sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    reloaded = session_records.read_record('windowless-fields', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-    assert reloaded.role == 'unblock'
-    assert reloaded.project == 'df'
-    assert reloaded.task_id == '2085'
-    assert reloaded.launcher_pid == os.getpid()
-    assert reloaded.start_ts == '2026-07-07T00:00:00+00:00'
-
-
-# ---------------------------------------------------------------------------
-# Task 2934 step-7/8: mark_windowless_wm_sessions_exited fail-soft, scope,
-# and pid/age-independence
-# ---------------------------------------------------------------------------
-
-
-def test_mark_windowless_fail_soft_when_wmctrl_unavailable(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='no-wmctrl',
-        status=session_records.Status.AWAITING_INPUT,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run([], returncode=127)  # missing binary -- no window evidence
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    # A headless run reaps NOTHING, even though this record's window would
-    # (if we could prove it) be gone -- "no evidence" != "window gone".
-    assert session_records.read_record('no-wmctrl', root=tmp_path).status == session_records.Status.AWAITING_INPUT
-
-
-def test_mark_windowless_never_touches_tmux_display(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='tmux-session',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    assert session_records.read_record('tmux-session', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_never_touches_displayless_record(tmp_path: Path) -> None:
-    r = make_record(session_slug='headless', status=session_records.Status.RUNNING, display=None)
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    assert session_records.read_record('headless', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_leaves_already_terminal_wm_record_untouched(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='already-exited-wm',
-        status=session_records.Status.EXITED,
-        exit_code=0,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])  # window gone, but already terminal
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    reloaded = session_records.read_record('already-exited-wm', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == 0  # NOT re-stamped with ORPHAN_EXIT_CODE
-
-
-@pytest.mark.parametrize(
-    'wm_window_id', [None, '0xZZ', 'nope'], ids=['none', 'unparseable-hex', 'unparseable-decimal']
-)
-def test_mark_windowless_skips_unparseable_or_missing_window_id(
-    wm_window_id: str | None, tmp_path: Path
-) -> None:
-    r = make_record(
-        session_slug='no-id',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id=wm_window_id),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    assert session_records.read_record('no-id', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_reaps_regardless_of_live_pid_and_fresh_age(tmp_path: Path) -> None:
-    """THE CRUX: window-gone is definitive death evidence, independent of
-    launcher_pid liveness or record age -- proving this sweep reaps exactly
-    the zombies mark_orphaned_sessions_exited's pid/TTL guards currently keep.
-    """
-    r = make_record(
-        session_slug='live-pid-fresh-but-windowless',
-        status=session_records.Status.AWAITING_INPUT,
-        launcher_pid=os.getpid(),  # ALIVE
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug('live-pid-fresh-but-windowless', root=tmp_path)
-    _set_mtime(record_path, _NOW, timedelta(minutes=1))  # far under NON_TERMINAL_HEARTBEAT_TTL
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert {m.session_slug for m in marked} == {'live-pid-fresh-but-windowless'}
-    reloaded = session_records.read_record('live-pid-fresh-but-windowless', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-def test_mark_windowless_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
-    windowless_wm = make_record(
-        session_slug='mix-windowless',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    present_window_wm = make_record(
-        session_slug='mix-present',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='wm', wm_title='t2', wm_window_id='0x99'),
-    )
-    tmux_session = make_record(
-        session_slug='mix-tmux',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
-    )
-    headless = make_record(session_slug='mix-headless', status=session_records.Status.RUNNING, display=None)
-    terminal_wm = make_record(
-        session_slug='mix-terminal',
-        status=session_records.Status.EXITED,
-        exit_code=0,
-        display=session_records.Display(kind='wm', wm_title='t3', wm_window_id='0x1a'),
-    )
-    for r in (windowless_wm, present_window_wm, tmux_session, headless, terminal_wm):
-        session_records.write_record(r, root=tmp_path)
-
-    run = _fake_wmctrl_run(['0x99  0 host  still-open'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert {m.session_slug for m in marked} == {'mix-windowless'}
-    assert session_records.read_record('mix-windowless', root=tmp_path).status == session_records.Status.EXITED
-    assert session_records.read_record('mix-present', root=tmp_path).status == session_records.Status.RUNNING
-    assert session_records.read_record('mix-tmux', root=tmp_path).status == session_records.Status.RUNNING
-    assert session_records.read_record('mix-headless', root=tmp_path).status == session_records.Status.RUNNING
-    reloaded_terminal = session_records.read_record('mix-terminal', root=tmp_path)
-    assert reloaded_terminal.status == session_records.Status.EXITED
-    assert reloaded_terminal.exit_code == 0
-
-
-def _call_indexed_wmctrl_run(
-    *results: tuple[int, str],
-    on_call: Mapping[int, Callable[[], None]] | None = None,
-) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
-    """A fake ``run`` answering call N with ``results[N]``, repeating the last thereafter.
-
-    ``on_call[N]`` runs inside call N, before it answers -- the hook a test
-    uses to land a record write just after one of the sweep's probes.
-    """
-    calls = 0
-
-    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        nonlocal calls
-        if on_call is not None and calls in on_call:
-            on_call[calls]()
-        returncode, stdout = results[min(calls, len(results) - 1)]
-        calls += 1
-        return subprocess.CompletedProcess(argv, returncode=returncode, stdout=stdout)
-
-    return _run
-
-
-def test_mark_windowless_keeps_a_window_that_appears_after_the_first_probe(
-    tmp_path: Path,
-) -> None:
-    def _set_display_lands() -> None:
-        session_records.write_record(
-            make_record(
-                session_slug='late-window',
-                status=session_records.Status.RUNNING,
-                display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-            ),
-            root=tmp_path,
-        )
-
-    run = _call_indexed_wmctrl_run(
-        (0, '0x99  0 host  other\n'),
-        (0, '0x1a  0 host  late\n0x99  0 host  other\n'),
-        on_call={0: _set_display_lands},
-    )
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert 'late-window' not in {m.session_slug for m in marked}
-    assert session_records.read_record('late-window', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_marks_nothing_when_the_confirming_probe_fails(tmp_path: Path) -> None:
-    session_records.write_record(
-        make_record(
-            session_slug='unconfirmed',
-            status=session_records.Status.RUNNING,
-            display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-        ),
-        root=tmp_path,
-    )
-    run = _call_indexed_wmctrl_run((0, '0x99  0 host  other\n'), (127, ''))
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    reloaded = session_records.read_record('unconfirmed', root=tmp_path)
-    assert reloaded.status == session_records.Status.RUNNING
-    assert reloaded.exit_code is None
-
-
-def test_mark_windowless_leaves_a_record_rebound_to_a_live_window_after_the_pass(
-    tmp_path: Path,
-) -> None:
-    def _write_wm_record(window_id: str) -> None:
-        session_records.write_record(
-            make_record(
-                session_slug='rebound',
-                status=session_records.Status.RUNNING,
-                display=session_records.Display(kind='wm', wm_title='t', wm_window_id=window_id),
-            ),
-            root=tmp_path,
-        )
-
-    _write_wm_record('0x1a')
-    run = _call_indexed_wmctrl_run(
-        (0, '0x99  0 host  other\n'),
-        (0, '0x2b  0 host  resumed\n0x99  0 host  other\n'),
-        on_call={1: lambda: _write_wm_record('0x2b')},
-    )
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    reloaded = session_records.read_record('rebound', root=tmp_path)
-    assert reloaded.status == session_records.Status.RUNNING
-    assert reloaded.display is not None
-    assert reloaded.display.wm_window_id == '0x2b'
 
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +210,75 @@ def test_main_refresh_sets_status(
     assert record.status == session_records.Status.RUNNING
 
 
+@pytest.mark.parametrize('live_status', ['running', 'idle', 'awaiting-input'])
+def test_main_refresh_clears_exit_code_when_record_leaves_terminal_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    live_status: str,
+) -> None:
+    """A live session falsely swept EXITED/ORPHAN_EXIT_CODE then flipped back
+    by a hook must not keep the sweep's terminal exit code."""
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+    slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
+    session_records.update_status(
+        slug, root=tmp_path, status=session_records.Status.EXITED, exit_code=session_reaper.ORPHAN_EXIT_CODE
+    )
+
+    rc = sr.main(['refresh', '--record', record_dir, '--status', live_status])
+
+    assert rc == 0
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status(live_status)
+    assert record.exit_code is None
+
+
+def test_main_refresh_repairs_a_live_record_left_holding_an_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A record already on disk as running/ORPHAN_EXIT_CODE has a non-terminal
+    prior, yet its next refresh still drops the stale exit code."""
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+    slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
+    launched = session_records.read_record(slug, root=tmp_path)
+    session_records.write_record(
+        dataclasses.replace(
+            launched, status=session_records.Status.RUNNING, exit_code=session_reaper.ORPHAN_EXIT_CODE
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['refresh', '--record', record_dir, '--status', 'idle'])
+
+    assert rc == 0
+    record = session_records.read_record(slug, root=tmp_path)
+    assert (record.status, record.exit_code) == (session_records.Status.IDLE, None)
+
+
+def test_main_refresh_keeps_exit_code_while_record_stays_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+    slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
+    session_records.update_status(slug, root=tmp_path, status=session_records.Status.EXITED, exit_code=3)
+
+    rc = sr.main(['refresh', '--record', record_dir, '--status', 'exited'])
+
+    assert rc == 0
+    record = session_records.read_record(slug, root=tmp_path)
+    assert (record.status, record.exit_code) == (session_records.Status.EXITED, 3)
+
+
 def test_main_set_display_stamps_and_is_preserved(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1100,6 +325,40 @@ def test_main_set_display_stamps_and_is_preserved(
     assert exited_record.display is not None
     assert exited_record.display.kind == 'tmux'
     assert exited_record.display.tmux_target == 'fleet-df:2'
+
+
+@pytest.mark.parametrize(
+    ('given', 'stored'),
+    [
+        pytest.param('52428807', '0x03200007', id='decimal'),
+        pytest.param('0x3200007', '0x03200007', id='unpadded-hex'),
+        pytest.param('not-a-window', 'not-a-window', id='unparseable-kept-raw'),
+    ],
+)
+def test_main_set_display_stores_the_one_window_id_form(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    given: str,
+    stored: str,
+) -> None:
+    """set-display is a Display.wm_window_id writer, so it writes the PRD D10 form SessionStart writes.
+
+    session_windows.canonical_window_id's padded ``0x%08x``, or the raw value
+    when it does not parse, as session_hooks keeps an unparseable $WINDOWID.
+    """
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+
+    rc = sr.main(
+        ['set-display', '--record', record_dir, '--kind', 'wm', '--wm-title', 'unblock:df#2085',
+         '--wm-window-id', given]
+    )
+
+    assert rc == 0
+    display = session_records.read_record(Path(record_dir).name, root=tmp_path).display
+    assert display == session_records.Display(kind='wm', wm_title='unblock:df#2085', wm_window_id=stored)
 
 
 # --- identity fallback (parse_spawn_identity) -------------------------------
@@ -1290,17 +549,17 @@ def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_dra
         ),
         root=tmp_path,
     )
-    _set_mtime(
+    set_mtime(
         session_records.record_path_for_slug('orphan-o', root=tmp_path),
         datetime.now(UTC),
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+        session_reaper.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
     )
     _write_aged_exited('old-terminal', tmp_path)
     env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_SPAWN_')}
     env.update(_launching_env(tmp_path))
     slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
 
-    with sr.reap_lock(tmp_path):
+    with session_reaper.reap_lock(tmp_path):
         result = subprocess.run(
             [sys.executable, str(Path(sr.__file__).resolve()), 'launching'],
             env=env,
@@ -1318,7 +577,7 @@ def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_dra
     await_reap_report(tmp_path)
     orphan = session_records.read_record('orphan-o', root=tmp_path)
     assert orphan.status == session_records.Status.EXITED
-    assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
+    assert orphan.exit_code == session_reaper.ORPHAN_EXIT_CODE
     assert not (session_records.sessions_dir(root=tmp_path) / 'old-terminal').exists()
 
 
@@ -1349,7 +608,7 @@ def test_launchings_detached_reap_leaves_the_callers_cwd_and_drains_its_relative
     env.update(_launching_env(fleet))
     env['CLAUDE_FLEET_ROOT'] = 'fleet'
 
-    with sr.reap_lock(fleet):
+    with session_reaper.reap_lock(fleet):
         result = subprocess.run(
             [sys.executable, str(Path(sr.__file__).resolve()), 'launching'],
             cwd=worktree,
@@ -1396,10 +655,10 @@ def test_main_reap_marks_then_deletes(
         session_slug='fresh-orphan', status=session_records.Status.RUNNING, launcher_pid=_DEAD_PID
     )
     session_records.write_record(fresh_orphan, root=tmp_path)
-    _set_mtime(
+    set_mtime(
         session_records.record_path_for_slug('fresh-orphan', root=tmp_path),
         datetime.now(UTC),
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+        session_reaper.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
     )
 
     # A separately-aged terminal record, well past TERMINAL_TTL -- this pass
@@ -1408,10 +667,10 @@ def test_main_reap_marks_then_deletes(
         session_slug='old-terminal', status=session_records.Status.EXITED, exit_code=0, launcher_pid=os.getpid()
     )
     session_records.write_record(old_terminal, root=tmp_path)
-    _set_mtime(
+    set_mtime(
         session_records.record_path_for_slug('old-terminal', root=tmp_path),
         datetime.now(UTC),
-        sr.TERMINAL_TTL + timedelta(hours=1),
+        session_reaper.TERMINAL_TTL + timedelta(hours=1),
     )
 
     rc = sr.main(['reap'])
@@ -1421,7 +680,7 @@ def test_main_reap_marks_then_deletes(
     assert fresh_dir.is_dir()  # marked, NOT deleted, this pass
     fresh_reloaded = session_records.read_record('fresh-orphan', root=tmp_path)
     assert fresh_reloaded.status == session_records.Status.EXITED
-    assert fresh_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+    assert fresh_reloaded.exit_code == session_reaper.ORPHAN_EXIT_CODE
 
     assert not session_records.record_path_for_slug('old-terminal', root=tmp_path).parent.exists()
 
@@ -1430,10 +689,10 @@ def _write_aged_exited(slug: str, root: Path) -> None:
     session_records.write_record(
         make_record(session_slug=slug, status=session_records.Status.EXITED, exit_code=0), root=root
     )
-    _set_mtime(
+    set_mtime(
         session_records.record_path_for_slug(slug, root=root),
         datetime.now(UTC),
-        sr.TERMINAL_TTL + timedelta(hours=1),
+        session_reaper.TERMINAL_TTL + timedelta(hours=1),
     )
 
 
@@ -1450,10 +709,10 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
         make_record(session_slug='drain-orphan', status=session_records.Status.RUNNING, launcher_pid=_DEAD_PID),
         root=tmp_path,
     )
-    _set_mtime(
+    set_mtime(
         session_records.record_path_for_slug('drain-orphan', root=tmp_path),
         datetime.now(UTC),
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+        session_reaper.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
     )
 
     rc = sr.main(['reap'])
@@ -1463,9 +722,9 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
         assert not (session_records.sessions_dir(root=tmp_path) / slug).exists()
     orphan = session_records.read_record('drain-orphan', root=tmp_path)
     assert orphan.status == session_records.Status.EXITED
-    assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
+    assert orphan.exit_code == session_reaper.ORPHAN_EXIT_CODE
 
-    report_path = sr.reap_report_path(tmp_path)
+    report_path = session_reaper.reap_report_path(tmp_path)
     assert report_path.is_file()
     report = json.loads(report_path.read_text())
     requested_at = datetime.fromisoformat(report['requested_at'])
@@ -1499,14 +758,14 @@ def test_main_reap_runs_later_phases_when_one_phase_raises(
     def _boom(*_args: object, **_kwargs: object) -> list[session_records.SessionRecord]:
         raise OSError('mark phase on fire')
 
-    monkeypatch.setattr(sr, 'mark_orphaned_sessions_exited', _boom)
+    monkeypatch.setattr(session_reaper, 'mark_orphaned_sessions_exited', _boom)
     _write_aged_exited('aged-despite-fault', tmp_path)
 
     rc = sr.main(['reap'])
 
     assert rc == 0
     assert not (session_records.sessions_dir(root=tmp_path) / 'aged-despite-fault').exists()
-    phases = json.loads(sr.reap_report_path(tmp_path).read_text())['phases']
+    phases = json.loads(session_reaper.reap_report_path(tmp_path).read_text())['phases']
     [failed] = [phase for phase in phases if phase['name'] == 'mark_orphaned_sessions_exited']
     assert 'OSError' in failed['error']
     assert failed['count'] is None
@@ -1514,7 +773,7 @@ def test_main_reap_runs_later_phases_when_one_phase_raises(
 
 def _write_report_started(root: Path, started_at: datetime) -> str:
     report = json.dumps({'started_at': started_at.isoformat()})
-    sr.reap_report_path(root).write_text(report)
+    session_reaper.reap_report_path(root).write_text(report)
     return report
 
 
@@ -1530,32 +789,13 @@ def test_main_reap_skips_only_when_a_reap_started_after_it_was_requested(
     assert sr.main(['reap']) == 0
 
     assert (session_records.sessions_dir(root=tmp_path) / 'aged').is_dir()
-    assert sr.reap_report_path(tmp_path).read_text() == later
+    assert session_reaper.reap_report_path(tmp_path).read_text() == later
 
     _write_report_started(tmp_path, datetime.now(UTC) - timedelta(hours=1))
 
     assert sr.main(['reap']) == 0
 
     assert not (session_records.sessions_dir(root=tmp_path) / 'aged').exists()
-
-
-def test_reap_lock_is_a_stable_sidecar_under_the_fleet_root(tmp_path: Path) -> None:
-    lock_path = sr.reap_lock_path(tmp_path)
-    with sr.reap_lock(tmp_path):
-        assert lock_path.is_file()
-        assert lock_path.parent == tmp_path
-    assert lock_path.is_file()
-
-
-def test_reap_lock_excludes_another_holder_until_released(tmp_path: Path) -> None:
-    sr.reap_lock_path(tmp_path).touch()
-    fd = os.open(sr.reap_lock_path(tmp_path), os.O_RDWR)
-    try:
-        with sr.reap_lock(tmp_path), pytest.raises(BlockingIOError):
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    finally:
-        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -1575,13 +815,12 @@ def test_main_reap_marks_windowless_wm_session_before_deleting(
         display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
     )
     session_records.write_record(windowless, root=tmp_path)
-
-    def _fake_wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv, returncode=0, stdout='0x99  0 host  still-open window\n'
-        )
-
-    monkeypatch.setattr(sr, '_wmctrl_list', _fake_wmctrl_list)
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    wmctrl = bin_dir / 'wmctrl'
+    wmctrl.write_text("#!/bin/sh\nprintf '0x99  0 host  still-open window\\n'\n")
+    wmctrl.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
 
     rc = sr.main(['reap'])
 
@@ -1592,1020 +831,7 @@ def test_main_reap_marks_windowless_wm_session_before_deleting(
     assert reloaded_dir.is_dir()
     reloaded = session_records.read_record('reap-windowless', root=tmp_path)
     assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-# ---------------------------------------------------------------------------
-# Step-10: role leases (Attention Rail T7)
-# ---------------------------------------------------------------------------
-
-# --- paths / names / contract types -----------------------------------------
-
-
-def test_leases_dir_is_fleet_root_slash_leases(tmp_path: Path) -> None:
-    assert sr.leases_dir(root=tmp_path) == tmp_path / 'leases'
-
-
-def test_lease_path_for_name_joins_leases_dir_and_lease_suffix(tmp_path: Path) -> None:
-    path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    assert path == tmp_path / 'leases' / 'watcher-df.lease'
-
-
-def test_lease_path_for_name_preserves_hash_for_task_scoped_names(tmp_path: Path) -> None:
-    path = sr.lease_path_for_name('unblock-df#2085', root=tmp_path)
-    assert path == tmp_path / 'leases' / 'unblock-df#2085.lease'
-
-
-def test_lease_path_for_name_sanitizes_path_separators(tmp_path: Path) -> None:
-    # A name containing '/' must not escape leases_dir: it still resolves to
-    # a single file directly inside leases_dir (no nested directory, no
-    # traversal), unlike _SLUG_SANITIZE_RE this sanitizer PRESERVES '#'.
-    path = sr.lease_path_for_name('../../etc/passwd', root=tmp_path)
-    assert path.parent == sr.leases_dir(root=tmp_path)
-    assert '/' not in path.name
-
-
-def test_build_lease_name_watcher() -> None:
-    assert sr.build_lease_name('watcher', 'df') == 'watcher-df'
-
-
-def test_build_lease_name_recon_watcher() -> None:
-    assert sr.build_lease_name('recon-watcher', 'df') == 'recon-watcher-df'
-
-
-def test_build_lease_name_unblock_is_task_scoped_with_hash() -> None:
-    assert sr.build_lease_name('unblock', 'df', '2085') == 'unblock-df#2085'
-
-
-def test_lease_policy_has_exactly_stand_down_and_warn_and_proceed() -> None:
-    values = {member.value for member in sr.LeasePolicy}
-    assert values == {'stand-down', 'warn-and-proceed'}
-    assert sr.LeasePolicy.STAND_DOWN.value == 'stand-down'
-    assert sr.LeasePolicy.WARN_AND_PROCEED.value == 'warn-and-proceed'
-
-
-def test_lease_decision_has_exactly_acquired_stand_down_proceed() -> None:
-    values = {member.value for member in sr.LeaseDecision}
-    assert values == {'acquired', 'stand-down', 'proceed'}
-    assert sr.LeaseDecision.ACQUIRED.value == 'acquired'
-    assert sr.LeaseDecision.STAND_DOWN.value == 'stand-down'
-    assert sr.LeaseDecision.PROCEED.value == 'proceed'
-
-
-def test_lease_mutation_has_exactly_applied_forced_absent_refused_faulted() -> None:
-    values = {member.value for member in sr.LeaseMutation}
-    assert values == {'applied', 'forced', 'absent', 'refused', 'faulted'}
-    assert sr.LeaseMutation.APPLIED.value == 'applied'
-    assert sr.LeaseMutation.FORCED.value == 'forced'
-    assert sr.LeaseMutation.ABSENT.value == 'absent'
-    assert sr.LeaseMutation.REFUSED.value == 'refused'
-    assert sr.LeaseMutation.FAULTED.value == 'faulted'
-
-
-def test_lease_mutation_is_a_str_enum_like_its_siblings() -> None:
-    # Mirrors LeasePolicy/LeaseDecision: the CLI prints `.value` directly and
-    # a StrEnum member compares equal to its own string form.
-    assert issubclass(sr.LeaseMutation, str)
-    assert sr.LeaseMutation.REFUSED == 'refused'
-
-
-def test_lease_heartbeat_ttl_is_a_timedelta() -> None:
-    assert isinstance(sr.LEASE_HEARTBEAT_TTL, timedelta)
-
-
-def test_lease_holder_json_round_trip_is_lossless() -> None:
-    holder = sr.LeaseHolder(
-        session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
-    )
-    assert sr.LeaseHolder.from_json(holder.to_json()) == holder
-
-
-def test_lease_holder_dict_round_trip_is_lossless() -> None:
-    holder = sr.LeaseHolder(
-        session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
-    )
-    assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
-
-
-# --- _render_contention_message (task 3994 defect 3) ----------------------
-#
-# The old form was `lease held by <slug> ({alive|dead}, heartbeat <n>s ago)`,
-# which reads as SELF-CONTRADICTORY on its most important branch: "dead,
-# heartbeat 42s ago" invites the reader to conclude the holder is gone and
-# the lease is reclaimable, when a fresh heartbeat means precisely the
-# opposite. That exact string misled the 2026-08-08 rotation into
-# force-releasing a live holder's lease. Liveness and freshness are two
-# INDEPENDENT axes and each must now name itself.
-
-_LIVE_HOLDER = sr.LeaseHolder(
-    session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
-)
-
-
-def test_contention_message_live_holder_names_the_slug_and_the_pid() -> None:
-    msg = sr._render_contention_message(
-        _LIVE_HOLDER, holder_alive=True, age_secs=42.0, policy=sr.LeasePolicy.STAND_DOWN
-    )
-
-    assert 'watcher-df-100' in msg
-    assert '4242' in msg
-    assert 'pid 4242 alive' in msg
-    assert msg.endswith('— standing down')
-
-
-def test_contention_message_dead_pid_but_fresh_heartbeat_says_not_reclaimable() -> None:
-    ttl = timedelta(seconds=7200)
-    msg = sr._render_contention_message(
-        _LIVE_HOLDER,
-        holder_alive=False,
-        age_secs=1200.0,
-        policy=sr.LeasePolicy.STAND_DOWN,
-        ttl=ttl,
-    )
-
-    # The withdrawn string, pinned as an ANTI-assertion.
-    assert '(dead, heartbeat' not in msg
-    lowered = msg.lower()
-    assert 'not running' in lowered  # the pid axis, named
-    assert 'fresh' in lowered  # the heartbeat axis, named
-    assert 'not reclaimable' in lowered  # the decision, explained
-    assert '6000' in msg  # the remaining TTL, in seconds
-
-
-def test_contention_message_remaining_ttl_tracks_the_injected_ttl() -> None:
-    msg = sr._render_contention_message(
-        _LIVE_HOLDER,
-        holder_alive=False,
-        age_secs=100.0,
-        policy=sr.LeasePolicy.STAND_DOWN,
-        ttl=timedelta(seconds=900),
-    )
-    assert '800' in msg
-
-
-def test_contention_message_dead_pid_past_ttl_is_phrased_as_reclaim_eligible() -> None:
-    msg = sr._render_contention_message(
-        _LIVE_HOLDER,
-        holder_alive=False,
-        age_secs=9000.0,
-        policy=sr.LeasePolicy.STAND_DOWN,
-        ttl=timedelta(seconds=7200),
-    )
-
-    assert '(dead, heartbeat' not in msg
-    lowered = msg.lower()
-    assert 'not running' in lowered
-    # Past the TTL the lease WAS reclaim-eligible; we are here only because
-    # the reclaim race was lost to someone else, and the message must say so
-    # rather than implying the holder is still healthy.
-    assert 'reclaim' in lowered
-    assert 'not reclaimable' not in lowered
-
-
-def test_contention_message_corrupt_body_does_not_invent_a_holder() -> None:
-    msg = sr._render_contention_message(
-        None, holder_alive=False, age_secs=42.0, policy=sr.LeasePolicy.STAND_DOWN
-    )
-
-    assert 'unreadable' in msg.lower()
-    assert '42s ago' in msg  # freshness is still reported
-    assert msg.endswith('— standing down')
-
-
-@pytest.mark.parametrize(
-    ('policy', 'suffix'),
-    [
-        (sr.LeasePolicy.STAND_DOWN, '— standing down'),
-        (sr.LeasePolicy.WARN_AND_PROCEED, '— proceeding anyway'),
-    ],
-)
-@pytest.mark.parametrize(
-    ('holder', 'alive', 'age'),
-    [
-        (_LIVE_HOLDER, True, 42.0),
-        (_LIVE_HOLDER, False, 1200.0),
-        (_LIVE_HOLDER, False, 9000.0),
-        (None, False, 42.0),
-    ],
-    ids=['live', 'dead-fresh', 'dead-expired', 'corrupt'],
-)
-def test_contention_message_is_always_one_greppable_line(
-    policy: sr.LeasePolicy,
-    suffix: str,
-    holder: sr.LeaseHolder | None,
-    alive: bool,
-    age: float,
-) -> None:
-    msg = sr._render_contention_message(holder, holder_alive=alive, age_secs=age, policy=policy)
-
-    assert '\n' not in msg
-    assert msg.endswith(suffix)
-
-
-def test_claim_lease_dead_holder_within_ttl_reports_the_non_contradictory_message(
-    tmp_path: Path,
-) -> None:
-    # End-to-end: the branch the 2026-08-08 rotation actually hit.
-    dead = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=dead, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=10))
-
-    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
-
-    assert claim.decision == sr.LeaseDecision.STAND_DOWN
-    assert '(dead, heartbeat' not in claim.message
-    assert 'not reclaimable' in claim.message.lower()
-    assert str(_DEAD_PID) in claim.message
-
-
-# --- claim_lease: free lease --------------------------------------------
-
-
-def test_claim_lease_acquires_a_free_lease(tmp_path: Path) -> None:
-    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
-
-    claim = sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
-
-    assert claim.decision == sr.LeaseDecision.ACQUIRED
-    assert claim.acquired is True
-    assert claim.holder is not None
-    assert claim.holder.session_slug == 'watcher-df-100'
-
-    assert sr.leases_dir(root=tmp_path).is_dir()
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    assert lease_path.is_file()
-    assert sr.LeaseHolder.from_json(lease_path.read_text()) == holder
-
-
-# --- claim_lease: held by a live holder ----------------------------------
-
-
-def test_claim_lease_held_by_live_holder_stand_down_policy(tmp_path: Path) -> None:
-    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, _NOW, timedelta(seconds=42))
-
-    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease(
-        'watcher-df', holder=contender, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
-    )
-
-    assert claim.acquired is False
-    assert claim.decision == sr.LeaseDecision.STAND_DOWN
-    assert claim.holder is not None
-    assert claim.holder.session_slug == 'watcher-df-100'
-    assert claim.holder_alive is True
-    assert claim.heartbeat_age_secs == 42
-    assert claim.message == (
-        f'lease held by watcher-df-100 (pid {os.getpid()} alive, heartbeat 42s ago) '
-        '— standing down'
-    )
-    # No clobber: the on-disk body still names the ORIGINAL holder.
-    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
-
-
-def test_claim_lease_held_by_live_holder_warn_and_proceed_policy(tmp_path: Path) -> None:
-    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
-    sr.claim_lease('unblock-df#2085', holder=original, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('unblock-df#2085', root=tmp_path)
-    _set_mtime(lease_path, _NOW, timedelta(seconds=42))
-
-    contender = sr.LeaseHolder(session_slug='unblock-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease(
-        'unblock-df#2085',
-        holder=contender,
-        policy=sr.LeasePolicy.WARN_AND_PROCEED,
-        root=tmp_path,
-        now=_NOW,
-    )
-
-    assert claim.acquired is False
-    assert claim.decision == sr.LeaseDecision.PROCEED
-    assert claim.holder is not None
-    assert claim.holder.session_slug == 'watcher-df-100'
-    assert 'lease held by watcher-df-100' in claim.message
-    assert 'proceeding' in claim.message
-    # No clobber: the on-disk body still names the ORIGINAL holder.
-    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
-
-
-# --- claim_lease: stale-lease reap-and-reclaim + the AND boundary --------
-
-
-def test_claim_lease_reaps_and_reclaims_a_stale_lease(tmp_path: Path) -> None:
-    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
-
-    assert claim.acquired is True
-    assert claim.decision == sr.LeaseDecision.ACQUIRED
-    assert claim.holder == new_holder
-    assert sr.LeaseHolder.from_json(lease_path.read_text()) == new_holder
-
-
-def test_claim_lease_reap_and_reclaim_emits_structured_warning(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # THREAD 1 hardened detection (task 2796): a reap-and-reclaim displaces
-    # whoever currently held the lease. That holder is SUPPOSED to be dead,
-    # but if the TTL is ever mis-tuned again this same path would silently
-    # steal a live-but-quiet watcher's lease. Make every reap-and-reclaim
-    # loud/greppable so any residual displacement of a supposedly-live holder
-    # is surfaced rather than silent.
-    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    # Backdate past the (new) TTL so the lease IS reap-eligible.
-    age = sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1)
-    _set_mtime(lease_path, _NOW, age)
-
-    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
-    with caplog.at_level(logging.WARNING, logger=sr.logger.name):
-        claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
-
-    # Sanity: the reclaim actually happened (the WARNING is on that path).
-    assert claim.acquired is True
-
-    warnings = [
-        r for r in caplog.records if r.levelno == logging.WARNING and r.name == sr.logger.name
-    ]
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
-    # Names the displaced holder (slug + pid), the observed heartbeat age, and
-    # the new holder's slug.
-    assert 'watcher-df-dead' in message
-    assert str(_DEAD_PID) in message
-    assert f'{age.total_seconds():.0f}' in message
-    assert 'watcher-df-new' in message
-
-
-def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> None:
-    # Proves the reap rule is (age > TTL) AND (pid dead), not either alone:
-    # a dead-pid holder with a still-fresh heartbeat is NOT reaped.
-    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1))
-
-    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
-
-    assert claim.acquired is False
-    assert claim.holder is not None
-    assert claim.holder.session_slug == 'watcher-df-dead'
-    assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
-
-
-def test_claim_lease_keeps_a_quiet_watchers_lease_across_a_full_slice(tmp_path: Path) -> None:
-    # The required "duplicate-through" regression (task 2796 THREAD 1): a live
-    # interactive watcher holds its lease with `--pid $$` (the ephemeral
-    # Bash-tool shell, dead moments after the claim), so pid_alive is
-    # ~always False for a watcher lease and staleness collapses to a pure
-    # heartbeat-TTL check. That watcher heartbeats only once per Main Loop
-    # cycle, bounded by ONE canonical watcher-rearm.sh `--timeout` slice
-    # (3600s). If LEASE_HEARTBEAT_TTL is below that slice, a live-but-quiet
-    # holder's lease goes stale->reap-eligible during any quiet slice and a
-    # duplicate reaps+reclaims it -- the exact code path that let a
-    # live-lease-holder's duplicate spawn through. With TTL raised above the
-    # slice, the duplicate must instead STAND DOWN.
-    original = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    # Backdate the heartbeat by one full canonical wait slice (3600s).
-    _set_mtime(lease_path, _NOW, timedelta(seconds=3600))
-
-    duplicate = sr.LeaseHolder(session_slug='watcher-df-dup', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease(
-        'watcher-df', holder=duplicate, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
-    )
-
-    # RED today: TTL=300s < 3600s slice age, so the live-but-quiet holder's
-    # lease is reaped-and-reclaimed and the duplicate ACQUIRES (claim.acquired
-    # is True) -- the duplicate-through bug. GREEN after TTL is raised: the
-    # duplicate stands down.
-    assert claim.acquired is False
-    assert claim.decision == sr.LeaseDecision.STAND_DOWN
-    assert claim.holder is not None
-    assert claim.holder.session_slug == 'watcher-df-dead'
-    # No clobber / no reap: the on-disk body still names the ORIGINAL holder.
-    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
-
-    # Invariant guard: the whole regression hinges on TTL exceeding one full
-    # canonical slice. If a future edit lowers LEASE_HEARTBEAT_TTL back below
-    # 3600s, this assertion fails loudly rather than silently re-opening the
-    # gap.
-    assert timedelta(seconds=3600) < sr.LEASE_HEARTBEAT_TTL
-
-
-def test_claim_lease_survives_lease_vanishing_between_create_and_stat(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Simulates a concurrent release/reap landing in the narrow window
-    # between our failed O_EXCL create and _read_lease_holder_state's
-    # path.stat() -- this must reclaim the (now-free) lease rather than
-    # propagate an uncaught FileNotFoundError.
-    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-
-    real_stat = Path.stat
-
-    def _vanished_stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
-        if self == lease_path:
-            raise FileNotFoundError('simulated concurrent release')
-        return real_stat(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, 'stat', _vanished_stat)
-
-    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
-
-    assert claim.acquired is True
-    assert claim.decision == sr.LeaseDecision.ACQUIRED
-    assert claim.holder == new_holder
-
-
-def test_claim_lease_does_not_clobber_a_lease_reclaimed_between_stale_check_and_unlink(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Simulates a competitor's reap-and-reclaim landing in the gap between
-    # claim_lease's first staleness read and its re-verify read immediately
-    # before unlinking: the re-verify must see the competitor's fresh, live
-    # holder and skip the unlink rather than clobbering it.
-    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    competitor_holder = sr.LeaseHolder(
-        session_slug='watcher-df-competitor', pid=os.getpid(), start_ts=_NOW.isoformat()
-    )
-    # First read (top of claim_lease) observes the true, stale state; the
-    # re-verify read (immediately before unlinking) reports that a
-    # competitor has already reaped-and-reclaimed it in the gap.
-    responses = iter(
-        [
-            (stale_holder, False, sr.LEASE_HEARTBEAT_TTL.total_seconds() + 60),
-            (competitor_holder, True, 1.0),
-        ]
-    )
-    monkeypatch.setattr(sr, '_read_lease_holder_state', lambda path, *, now: next(responses))
-
-    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
-
-    assert claim.acquired is False
-    assert claim.holder == competitor_holder
-    # unlink() must never have been called: the on-disk body (still the
-    # pre-mock stale_holder written at setup) is untouched, proving the
-    # competitor's (simulated) fresh lease was not clobbered.
-    assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
-
-
-# --- claim_lease: corrupt/unreadable lease body ---------------------------
-
-
-def test_claim_lease_reaps_and_reclaims_a_corrupt_and_aged_lease(tmp_path: Path) -> None:
-    corrupt_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
-    corrupt_path.write_text('{not valid json')
-    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
-
-    assert claim.acquired is True
-    assert claim.decision == sr.LeaseDecision.ACQUIRED
-    assert claim.holder == new_holder
-    assert sr.LeaseHolder.from_json(corrupt_path.read_text()) == new_holder
-
-
-def test_claim_lease_contention_on_corrupt_body_within_ttl_reports_unknown_holder(
-    tmp_path: Path,
-) -> None:
-    corrupt_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
-    corrupt_path.write_text('{not valid json')
-    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1))
-
-    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease(
-        'watcher-df', holder=contender, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
-    )
-
-    assert claim.acquired is False
-    assert claim.decision == sr.LeaseDecision.STAND_DOWN
-    assert claim.holder is None
-    assert claim.holder_alive is False
-    assert '<unknown>' in claim.message
-    assert 'standing down' in claim.message
-    # Not reaped (within TTL): the corrupt body is left exactly as-is.
-    assert corrupt_path.read_text() == '{not valid json'
-
-
-# --- heartbeat_lease / release_lease --------------------------------------
-
-
-def test_heartbeat_lease_advances_mtime(tmp_path: Path) -> None:
-    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, _NOW, timedelta(hours=1))
-    old_mtime = lease_path.stat().st_mtime
-
-    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    assert result is sr.LeaseMutation.APPLIED
-    assert lease_path.stat().st_mtime > old_mtime
-
-
-def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
-    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-
-    result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    assert result is sr.LeaseMutation.APPLIED
-    assert not lease_path.exists()
-
-
-def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
-    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
-
-    first = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-    second = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    assert first is sr.LeaseMutation.APPLIED
-    assert second is sr.LeaseMutation.ABSENT
-
-
-# --- heartbeat_lease: ownership (task 3994 defect 1) -----------------------
-
-
-def _seed_lease(tmp_path: Path, *, slug: str = 'watcher-df-100', pid: int | None = None) -> Path:
-    """Claim `watcher-df` for *slug*/*pid* under tmp_path; return its lease path.
-
-    Shared by the three task-3994 sections below (heartbeat ownership, release
-    ownership, lease_status) -- defined once, here, at its first use.
-    """
-    holder = sr.LeaseHolder(
-        session_slug=slug, pid=os.getpid() if pid is None else pid, start_ts=_NOW.isoformat()
-    )
-    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
-    return sr.lease_path_for_name('watcher-df', root=tmp_path)
-
-
-def test_heartbeat_lease_by_a_stranger_is_refused_and_the_mtime_is_untouched(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    lease_path = _seed_lease(tmp_path)
-    _set_mtime(lease_path, _NOW, timedelta(hours=1))
-    backdated_mtime = lease_path.stat().st_mtime
-
-    with caplog.at_level(logging.ERROR):
-        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path)
-
-    assert result is sr.LeaseMutation.REFUSED
-    # THE assertion: an unrelated caller can no longer keep someone else's
-    # lease structurally unreapable by refreshing its heartbeat clock.
-    assert lease_path.stat().st_mtime == backdated_mtime
-    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert errors
-    blob = ' '.join(r.getMessage() for r in errors)
-    assert 'watcher-df-100' in blob
-    assert 'watcher-df-STRANGER' in blob
-
-
-def test_heartbeat_lease_on_an_absent_lease_is_absent_and_quiet(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    with caplog.at_level(logging.ERROR):
-        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    assert result is sr.LeaseMutation.ABSENT
-    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
-
-
-def test_heartbeat_lease_on_a_reaped_lease_is_absent_and_the_owner_can_re_claim(
-    tmp_path: Path,
-) -> None:
-    """ABSENT on a HEARTBEAT is not the harmless idempotence it is on a release.
-
-    Code backing for the skill contract: the holder's own per-cycle heartbeat
-    reporting ABSENT means its lease is GONE (reaped here; an operator
-    `--force` release does the same), so the session is now running un-leased
-    and any duplicate can take the name freely. The prescribed response is to
-    re-claim, which must actually work — a watcher that kept beating into the
-    void would sit at `result=absent` forever, which is the duplicate-watcher
-    condition the lease exists to prevent.
-    """
-    lease_path = _seed_lease(tmp_path, pid=_DEAD_PID)
-    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
-    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path, now=_NOW)] == ['stale_pid']
-
-    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    assert result is sr.LeaseMutation.ABSENT
-    # ...and re-claiming is the documented recovery, so it must succeed.
-    reclaim = sr.claim_lease(
-        'watcher-df',
-        holder=sr.LeaseHolder(
-            session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat()
-        ),
-        root=tmp_path,
-        now=_NOW,
-    )
-    assert reclaim.acquired
-    assert sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path) is (
-        sr.LeaseMutation.APPLIED
-    )
-
-
-def test_heartbeat_lease_on_a_corrupt_body_is_refused_with_mtime_untouched(
-    tmp_path: Path,
-) -> None:
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    lease_path.parent.mkdir(parents=True, exist_ok=True)
-    lease_path.write_text('{not valid json')
-    _set_mtime(lease_path, _NOW, timedelta(hours=1))
-    backdated_mtime = lease_path.stat().st_mtime
-
-    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    assert result is sr.LeaseMutation.REFUSED
-    assert lease_path.stat().st_mtime == backdated_mtime
-
-
-def test_heartbeat_lease_with_force_overrides_a_stranger_refusal_loudly(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    lease_path = _seed_lease(tmp_path)
-    _set_mtime(lease_path, _NOW, timedelta(hours=1))
-    backdated_mtime = lease_path.stat().st_mtime
-
-    with caplog.at_level(logging.WARNING):
-        result = sr.heartbeat_lease(
-            'watcher-df', slug='watcher-df-STRANGER', force=True, root=tmp_path
-        )
-
-    assert result is sr.LeaseMutation.FORCED
-    assert lease_path.stat().st_mtime > backdated_mtime
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings
-    blob = ' '.join(r.getMessage() for r in warnings)
-    assert 'watcher-df-100' in blob
-    assert 'watcher-df-STRANGER' in blob
-
-
-def test_heartbeat_lease_faults_soft_when_utime_itself_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    _seed_lease(tmp_path)
-
-    def _boom_utime(*_args: object, **_kwargs: object) -> None:
-        raise OSError('simulated permission error')
-
-    monkeypatch.setattr(sr.os, 'utime', _boom_utime)
-
-    with caplog.at_level(logging.ERROR):
-        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    # Fail-soft: a lease-substrate fault never raises into a watcher's loop.
-    assert result is sr.LeaseMutation.FAULTED
-    assert any(r.levelno >= logging.ERROR for r in caplog.records)
-
-
-def test_a_strangers_refused_heartbeat_leaves_a_dead_holders_lease_reapable(
-    tmp_path: Path,
-) -> None:
-    # The structural-unreapability defect, pinned end to end: before task 3994
-    # any caller could bump a dead holder's lease mtime forever, so the
-    # (dead pid AND aged heartbeat) staleness AND-guard could never fire and
-    # the lease outlived its holder indefinitely.
-    lease_path = _seed_lease(tmp_path, slug='watcher-df-dead', pid=_DEAD_PID)
-    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    assert sr.heartbeat_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path) is (
-        sr.LeaseMutation.REFUSED
-    )
-
-    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
-
-    assert {r.lease_name: r.reason for r in reaped} == {'watcher-df': 'stale_pid'}
-    assert not lease_path.exists()
-
-
-# --- release_lease: ownership (task 3994 defect 1) -------------------------
-
-
-def test_release_lease_by_a_stranger_is_refused_and_the_lease_survives(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    lease_path = _seed_lease(tmp_path)
-    original_body = lease_path.read_text()
-
-    with caplog.at_level(logging.ERROR):
-        result = sr.release_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path)
-
-    assert result is sr.LeaseMutation.REFUSED
-    assert lease_path.is_file()
-    # Byte-identical: a refused release must not touch the holder's body.
-    assert lease_path.read_text() == original_body
-    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert errors, 'a refused release must be loud (INV-2 structured-facts-at-failure)'
-    blob = ' '.join(r.getMessage() for r in errors)
-    # Both parties named: the real holder AND the would-be releaser.
-    assert 'watcher-df-100' in blob
-    assert 'watcher-df-STRANGER' in blob
-
-
-def test_release_lease_on_an_absent_lease_is_absent_and_quiet(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    with caplog.at_level(logging.ERROR):
-        result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    assert result is sr.LeaseMutation.ABSENT
-    # An idempotent release is not a failure -- it must not cry ERROR.
-    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
-
-
-def test_release_lease_on_a_corrupt_body_is_refused_and_the_file_survives(
-    tmp_path: Path,
-) -> None:
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    lease_path.parent.mkdir(parents=True, exist_ok=True)
-    lease_path.write_text('{not valid json')
-
-    result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    # Fail TOWARD held, mirroring _read_lease_holder_state's documented rule.
-    assert result is sr.LeaseMutation.REFUSED
-    assert lease_path.read_text() == '{not valid json'
-
-
-def test_release_lease_with_force_overrides_a_stranger_refusal_loudly(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    lease_path = _seed_lease(tmp_path)
-
-    with caplog.at_level(logging.WARNING):
-        result = sr.release_lease(
-            'watcher-df', slug='watcher-df-STRANGER', force=True, root=tmp_path
-        )
-
-    assert result is sr.LeaseMutation.FORCED
-    assert not lease_path.exists()
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings, 'an operator force must be attributable'
-    blob = ' '.join(r.getMessage() for r in warnings)
-    assert 'watcher-df-100' in blob  # the displaced holder
-    assert 'watcher-df-STRANGER' in blob  # who forced it
-
-
-def test_release_lease_with_force_on_a_corrupt_body_removes_it(tmp_path: Path) -> None:
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    lease_path.parent.mkdir(parents=True, exist_ok=True)
-    lease_path.write_text('{not valid json')
-
-    result = sr.release_lease('watcher-df', slug='watcher-df-100', force=True, root=tmp_path)
-
-    assert result is sr.LeaseMutation.FORCED
-    assert not lease_path.exists()
-
-
-def test_release_lease_faults_soft_when_the_unlink_itself_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    lease_path = _seed_lease(tmp_path)
-    real_unlink = Path.unlink
-
-    def _flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
-        if self == lease_path:
-            raise OSError('simulated permission error')
-        real_unlink(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, 'unlink', _flaky_unlink)
-
-    with caplog.at_level(logging.ERROR):
-        result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-
-    # Fail-soft: a lease-substrate fault never raises into a watcher's loop.
-    assert result is sr.LeaseMutation.FAULTED
-    assert lease_path.is_file()
-    assert any(r.levelno >= logging.ERROR for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# reap_stale_leases matrix
-# ---------------------------------------------------------------------------
-
-
-def test_reap_stale_leases_matrix(tmp_path: Path) -> None:
-    live_holder = sr.LeaseHolder(session_slug='kept-live', pid=os.getpid(), start_ts=_NOW.isoformat())
-    sr.claim_lease('kept-live', holder=live_holder, root=tmp_path, now=_NOW)
-    _set_mtime(sr.lease_path_for_name('kept-live', root=tmp_path), _NOW, timedelta(days=30))
-
-    dead_within_ttl = sr.LeaseHolder(
-        session_slug='kept-dead-fresh', pid=_DEAD_PID, start_ts=_NOW.isoformat()
-    )
-    sr.claim_lease('kept-dead-fresh', holder=dead_within_ttl, root=tmp_path, now=_NOW)
-    _set_mtime(
-        sr.lease_path_for_name('kept-dead-fresh', root=tmp_path),
-        _NOW,
-        sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1),
-    )
-
-    dead_past_ttl = sr.LeaseHolder(
-        session_slug='reap-dead-stale', pid=_DEAD_PID, start_ts=_NOW.isoformat()
-    )
-    sr.claim_lease('reap-dead-stale', holder=dead_past_ttl, root=tmp_path, now=_NOW)
-    _set_mtime(
-        sr.lease_path_for_name('reap-dead-stale', root=tmp_path),
-        _NOW,
-        sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1),
-    )
-
-    corrupt_path = sr.lease_path_for_name('reap-corrupt', root=tmp_path)
-    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
-    corrupt_path.write_text('{not valid json')
-    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
-
-    reaped_by_name = {r.lease_name: r.reason for r in reaped}
-    assert reaped_by_name == {
-        'reap-dead-stale': 'stale_pid',
-        'reap-corrupt': 'corrupt',
-    }
-    remaining = {p.stem for p in sr.leases_dir(root=tmp_path).iterdir()}
-    assert remaining == {'kept-live', 'kept-dead-fresh'}
-
-
-def test_reap_stale_leases_continues_sweep_when_one_removal_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    poison_holder = sr.LeaseHolder(session_slug='poison', pid=_DEAD_PID, start_ts=_NOW.isoformat())
-    sr.claim_lease('poison', holder=poison_holder, root=tmp_path, now=_NOW)
-    victim_holder = sr.LeaseHolder(session_slug='victim', pid=_DEAD_PID, start_ts=_NOW.isoformat())
-    sr.claim_lease('victim', holder=victim_holder, root=tmp_path, now=_NOW)
-    for lease_name in ('poison', 'victim'):
-        _set_mtime(
-            sr.lease_path_for_name(lease_name, root=tmp_path),
-            _NOW,
-            sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1),
-        )
-
-    poison_path = sr.lease_path_for_name('poison', root=tmp_path)
-    real_unlink = Path.unlink
-
-    def _flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
-        if self == poison_path:
-            raise OSError('simulated permission error')
-        real_unlink(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, 'unlink', _flaky_unlink)
-
-    with caplog.at_level(logging.ERROR):
-        reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
-
-    assert {r.lease_name for r in reaped} == {'victim'}
-    assert poison_path.is_file()  # left behind, not silently claimed as reaped
-    assert any(r.levelno >= logging.ERROR for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# lease_status / lease-show (task 3994 defect 3)
-#
-# `cat <lease>` CANNOT show freshness: the body carries an immutable
-# `start_ts` and the heartbeat lives only in the file mtime, so the archaeology
-# a human actually needs is `cat` + `stat -c %y` + a TTL comparison done by
-# hand. That is what misled the 2026-08-08 rotation. lease_status computes all
-# of it through the same _read_lease_holder_state claim_lease decides on --
-# one reader, one clock -- and lease-show prints it.
-# ---------------------------------------------------------------------------
-
-
-def test_lease_status_reports_the_holder_and_the_heartbeat_clock(tmp_path: Path) -> None:
-    path = _seed_lease(tmp_path)
-    _set_mtime(path, _NOW, timedelta(minutes=30))
-
-    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-
-    assert status.name == 'watcher-df'
-    assert status.state == 'held'
-    assert status.holder_slug == 'watcher-df-100'
-    assert status.holder_pid == os.getpid()
-    assert status.holder_pid_alive is True
-    # Freshness is derived from the MTIME, the axis `cat` cannot show.
-    assert int(status.heartbeat_age_secs) == 1800
-    # heartbeat_ts is None only for an absent lease; a held one always has one.
-    assert status.heartbeat_ts is not None
-    assert datetime.fromisoformat(status.heartbeat_ts).replace(microsecond=0) == _NOW - timedelta(
-        minutes=30
-    )
-    assert status.reclaimable is False
-
-
-def test_lease_status_heartbeat_age_tracks_the_mtime(tmp_path: Path) -> None:
-    path = _seed_lease(tmp_path)
-
-    for age in (timedelta(seconds=5), timedelta(minutes=17), timedelta(hours=3)):
-        _set_mtime(path, _NOW, age)
-        status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-        assert int(status.heartbeat_age_secs) == int(age.total_seconds())
-
-
-@pytest.mark.parametrize(
-    ('age', 'expected'),
-    [
-        (sr.LEASE_HEARTBEAT_TTL - timedelta(seconds=1), False),
-        (sr.LEASE_HEARTBEAT_TTL, False),
-        (sr.LEASE_HEARTBEAT_TTL + timedelta(seconds=1), True),
-    ],
-)
-def test_lease_status_reclaimable_flips_exactly_at_the_ttl_for_a_dead_pid(
-    tmp_path: Path, age: timedelta, expected: bool
-) -> None:
-    path = _seed_lease(tmp_path, pid=_DEAD_PID)
-    _set_mtime(path, _NOW, age)
-
-    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-
-    assert status.holder_pid_alive is False
-    # Exactly claim_lease/reap_stale_leases' own predicate: staleness needs
-    # BOTH a dead pid AND a heartbeat STRICTLY past the TTL. The display and
-    # the decision cannot disagree, because they are the same computation.
-    assert status.reclaimable is expected
-
-
-def test_lease_status_never_reports_a_live_holder_reclaimable_at_any_age(tmp_path: Path) -> None:
-    path = _seed_lease(tmp_path)  # our own, provably-live, pid
-    _set_mtime(path, _NOW, timedelta(days=30))
-
-    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-
-    assert status.holder_pid_alive is True
-    assert int(status.heartbeat_age_secs) == 30 * 24 * 3600
-    # A live holder is never reclaimable however quiet it has been -- the
-    # inverse reading is the duplicate-spawn incident.
-    assert status.reclaimable is False
-
-
-def test_lease_status_on_an_absent_lease_reports_state_absent(tmp_path: Path) -> None:
-    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-
-    assert status.name == 'watcher-df'
-    assert status.state == 'absent'
-    assert status.holder_slug is None
-    assert status.holder_pid is None
-    assert status.holder_pid_alive is False
-    assert status.reclaimable is False
-
-
-def test_lease_status_on_a_corrupt_body_is_unreadable_but_still_dates_the_heartbeat(
-    tmp_path: Path,
-) -> None:
-    path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{not valid json')
-    _set_mtime(path, _NOW, timedelta(minutes=42))
-
-    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-
-    # Fail-soft: an unreadable body is REPORTED, never raised, and never
-    # rendered as a fake holder -- but its freshness is still real, which is
-    # exactly what decides whether it is reapable.
-    assert status.state == 'unreadable'
-    assert status.holder_slug is None
-    assert status.holder_pid is None
-    assert int(status.heartbeat_age_secs) == 2520
-
-
-def test_lease_status_is_read_only(tmp_path: Path) -> None:
-    path = _seed_lease(tmp_path)
-    _set_mtime(path, _NOW, timedelta(hours=1))
-    mtime_before = path.stat().st_mtime
-    body_before = path.read_text()
-
-    sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-
-    # Inspecting a lease must never be a heartbeat: an operator running
-    # lease-show cannot be allowed to keep a dead holder's lease unreapable.
-    assert path.stat().st_mtime == mtime_before
-    assert path.read_text() == body_before
+    assert reloaded.exit_code == session_reaper.ORPHAN_EXIT_CODE
 
 
 # ---------------------------------------------------------------------------
@@ -2638,7 +864,7 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     # which is what this test is about, rather than silently re-aiming at
     # whatever line happens to be last.
     assert len(lines) == 5
-    assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
+    assert session_leases.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
 def test_main_lease_claim_when_held_by_live_holder_stands_down(
@@ -2674,7 +900,7 @@ def test_main_lease_claim_when_held_by_live_holder_stands_down(
         r'lease held by \S+ \(pid \d+ alive, heartbeat \d+s ago\) — standing down', lines[1]
     )
     # the on-disk holder must still be the ORIGINAL claimant (no clobber).
-    body = sr.lease_path_for_name('watcher-df', root=tmp_path).read_text()
+    body = session_leases.lease_path_for_name('watcher-df', root=tmp_path).read_text()
     assert 'watcher-df-100' in body
     assert 'watcher-df-200' not in body
 
@@ -2686,8 +912,8 @@ def test_main_lease_heartbeat_bumps_mtime(
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())])
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
+    set_mtime(lease_path, _NOW, timedelta(hours=1))
     backdated_mtime = lease_path.stat().st_mtime
 
     rc = sr.main(['lease-heartbeat', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
@@ -2703,7 +929,7 @@ def test_main_lease_release_removes_the_file(
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())])
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     assert lease_path.is_file()
 
     rc = sr.main(['lease-release', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
@@ -2720,7 +946,7 @@ def test_main_lease_release_removes_the_file(
 # because a lease's `session_slug` is a claimant-chosen ownership token
 # (`watcher-<project>-<pid>`) and NOT a session-registry record key, so no
 # production path can ever put a record there (see
-# TestLeaseSlugIsNotASessionRecordKey below). The originally-designed
+# test_session_leases.py::TestLeaseSlugIsNotASessionRecordKey). The originally-designed
 # session-record corroboration was withdrawn for exactly that reason; the
 # emitted values are byte-identical either way.
 
@@ -2771,7 +997,7 @@ def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     lease_path.parent.mkdir(parents=True, exist_ok=True)
     lease_path.write_text('{not valid json')
 
@@ -2785,206 +1011,6 @@ def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
     assert capsys.readouterr().out.splitlines()[2] == 'holder_liveness=held'
 
 
-class TestLeaseSlugIsNotASessionRecordKey:
-    """`read_record(<a lease slug>)` raises — pinned so the withdrawn corroboration cannot return.
-
-    Task 3994 originally corroborated the orphan signal with the holder's own
-    session_registry record, via ``read_record(holder.session_slug)``. That
-    lookup is STRUCTURALLY IMPOSSIBLE, and the tests that appeared to exercise
-    its branches only did so by hand-writing a record under a lease-shaped
-    slug — a state no production path can produce. They were deleted; this
-    class replaces them with the reason.
-
-    MEASURED EVIDENCE (2026-08-15, live fleet root): the real
-    ``~/.claude/fleet/leases/watcher-df.lease`` holds
-    ``session_slug=watcher-df-1894895``, while 0 of the 46,624
-    ``~/.claude/fleet/sessions/`` record dirs begin with ``watcher-``. Real
-    record slugs look like ``architect-dark_factory-3133-25737ee4-...``.
-
-    The namespaces differ in all three segments:
-    - the LEASE slug is ``<lease name>-<session pid>``, built by
-      ``default_lease_slug`` (task 4248 moved it out of shell in the SKILLs and
-      into the CLI, for the reason 3994 moved the pid there);
-    - the RECORD slug comes from ``build_session_slug(role, project, task,
-      <uniqueness token>)``, where the token is a session UUID for a
-      hand-launched session (``session_hooks.hook_session_slug``) and the
-      project token is the registry's project id (``dark_factory``), not the
-      lease's short name (``df``).
-
-    No test here compares a literal this file wrote against
-    ``build_session_slug``'s output, on purpose: the disjointness RATIONALE
-    belongs to (and is recorded in) ``LeaseHolder.session_slug``'s docstring,
-    and such a test cannot fail as a result of any production change. The
-    first test has real coupling — it would break if ``read_record`` ever
-    started resolving a lease slug, which is exactly the reintroduction worth
-    catching. The second pins the pid pointer (task 4237) as the join that
-    does reach the record, side by side with the lookup that cannot.
-    """
-
-    # A hand-launched session's uniqueness token: hook_session_slug passes the
-    # hook's `session_id` (a UUID string) to build_session_slug as that token.
-    # Kept literal so the test is deterministic.
-    SESSION_UUID = '25737ee4-3b1e-4a7f-9f0e-6a1c2d3e4f50'
-
-    def _lease_slug(self, project: str = 'df', pid: int = 1894895) -> str:
-        """The lease slug exactly as production builds it (task 4248).
-
-        Routed through ``default_lease_slug`` rather than hand-building the
-        f-string: the disjointness this class pins is only interesting if the
-        left-hand side is the REAL lease slug, so the helper must break when
-        production's builder changes shape.
-        """
-        slug = sr.default_lease_slug(f'watcher-{project}', {session_identity.SESSION_PID_ENV: str(pid)})
-        assert slug is not None  # pid > 0, so the builder always derives here
-        return slug
-
-    def _record_slug(self, project: str = 'dark_factory') -> str:
-        """The record slug exactly as session_hooks.hook_session_slug builds it."""
-        return session_records.build_session_slug(
-            'session',
-            project,
-            None,
-            self.SESSION_UUID,
-        )
-
-    def test_a_real_record_provably_does_not_live_under_its_lease_slug(
-        self, tmp_path: Path
-    ) -> None:
-        # A well-formed record IS written for this notional session, under the
-        # slug the registry actually keys on...
-        record_slug = self._record_slug()
-        session_records.write_record(make_record(session_slug=record_slug), root=tmp_path)
-        assert session_records.read_record(record_slug, root=tmp_path).session_slug == record_slug
-
-        # ...and read_record(<lease slug>) STILL raises FileNotFoundError. That
-        # is why holder_session_state was a constant 'absent' in production.
-        with pytest.raises(FileNotFoundError):
-            session_records.read_record(self._lease_slug(), root=tmp_path)
-
-    def test_the_pid_pointer_reaches_the_record_the_lease_slug_cannot(
-        self, tmp_path: Path
-    ) -> None:
-        pid = 1894895
-        record_slug = self._record_slug()
-        session_records.write_record(
-            make_record(session_slug=record_slug, claude_owner_pid=pid), root=tmp_path
-        )
-        session_records.write_session_pointer(pid, record_slug, root=tmp_path)
-
-        with pytest.raises(FileNotFoundError):
-            session_records.read_record(self._lease_slug(pid=pid), root=tmp_path)
-        linked = session_records.resolve_session_slug_for_pid(pid, root=tmp_path)
-        assert linked is not None
-        assert session_records.read_record(linked, root=tmp_path).session_slug == record_slug
-
-
-# --- default_lease_slug (task 4248)----------------------------------------
-#
-# 3994 moved the lease PID into code because it depended on every skill doc
-# getting one shell token right. The SLUG stayed in shell -- and 3994 then made
-# it load-bearing, since a mismatch on `lease-heartbeat`/`lease-release` is
-# REFUSED. These tests pin the builder that moves it into code too.
-
-
-def test_default_lease_slug_reproduces_the_measured_production_slug() -> None:
-    """The defaulted slug is BYTE-IDENTICAL to what the WATCHER skills built.
-
-    ``watcher-df-1894895`` is the slug measured in the live fleet root on
-    2026-08-15 and recorded in ``TestLeaseSlugAndRecordSlugAreDisjoint``. This
-    equality is the back-compat oracle FOR THE TWO WATCHER LEASES ONLY --
-    ``watcher-<project>`` and ``recon-watcher-<project>``, whose pre-4248 skill
-    prescription was already ``<name>-${CLAUDE_PID:-$PPID}``. For those, an
-    IN-FLIGHT session that stops passing ``--slug`` keeps its lease with no
-    restart, because the CLI re-derives exactly the token it claimed with.
-
-    It does NOT generalise to ``/unblock`` -- see
-    ``test_the_unblock_lease_slug_shape_changed_at_4248``, which records that
-    asymmetry rather than leaving this docstring to imply it away.
-    """
-    assert sr.default_lease_slug('watcher-df', {session_identity.SESSION_PID_ENV: '1894895'}) == 'watcher-df-1894895'
-    assert (
-        sr.default_lease_slug('recon-watcher-df', {session_identity.SESSION_PID_ENV: '1894895'})
-        == 'recon-watcher-df-1894895'
-    )
-
-
-def test_the_unblock_lease_slug_shape_changed_at_4248() -> None:
-    """The `/unblock` lease slug is NOT back-compatible, and that is recorded here.
-
-    The two watcher skills built ``<lease name>-<pid>``, so deriving from the
-    name reproduces their token exactly. ``/unblock`` did not: its lease NAME
-    is ``unblock-<project>#<TASK_ID>`` (``build_lease_name``'s ``#``) while its
-    skill built the slug with a ``-`` separator and no ``#`` at all. Deriving
-    from the name therefore yields a DIFFERENT token.
-
-    ROLLOUT CONSEQUENCE, stated so nobody rediscovers it from a lingering
-    lease: an `/unblock` session that CLAIMED under the pre-4248 prescription
-    and then releases slug-less gets ``result=refused`` -- non-destructive, but
-    its lease lingers and falsely reports a holder to the next `/unblock` on
-    that task until the 2h ``LEASE_HEARTBEAT_TTL`` ages it out. Such a session
-    must either keep passing its ORIGINAL ``--slug`` on release or accept the
-    TTL wait; ``skills/unblock/SKILL.md`` says so at the release step. Sessions
-    that claim after 4248 are unaffected -- both ends derive the same token.
-    """
-    name = sr.build_lease_name('unblock', 'df', '2085')
-    derived = sr.default_lease_slug(name, {session_identity.SESSION_PID_ENV: '1894895'})
-
-    assert derived == 'unblock-df#2085-1894895'
-    # The exact string the pre-4248 SKILL.md prescribed, for contrast.
-    assert derived != 'unblock-df-2085-1894895'
-
-
-@pytest.mark.parametrize(
-    'env',
-    [
-        {},
-        {'CLAUDE_PID': ''},
-        {'CLAUDE_PID': '   '},
-        {'CLAUDE_PID': 'not-a-pid'},
-        {'CLAUDE_PID': '0'},
-        {'CLAUDE_PID': '-1'},
-    ],
-    ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
-)
-def test_default_lease_slug_refuses_to_derive_when_the_session_pid_is_unresolvable(
-    env: dict[str, str],
-) -> None:
-    """An underivable slug is None -- and specifically NOT ``f'{name}-0'``.
-
-    Same parametrize set as ``resolve_session_pid``'s degradation sweep, on
-    purpose: these are exactly the envs where that function degrades to pid 0.
-
-    THE assertion is the second one. ``resolve_session_pid`` may degrade to 0
-    because a pid is a LIVENESS probe and 0 is provably dead, which keeps a
-    crashed holder's lease reapable. A slug is an IDENTITY, and ``{name}-0``
-    is not unique: two concurrently-degraded sessions contending the same lease
-    name would compute an IDENTICAL slug, so each would pass the other's
-    ``_is_lease_owner`` check and could heartbeat or release the other's lease
-    -- 3994 defect 1 ("any caller may evict/refresh any lease") reopened on the
-    degraded path. Refusing to synthesize a token it cannot make unique is the
-    only answer that keeps the ownership guard honest; the CLI then exits 2 and
-    names ``--slug`` as the escape hatch.
-    """
-    assert sr.default_lease_slug('watcher-df', env) is None
-    assert sr.default_lease_slug('watcher-df', env) != 'watcher-df-0'
-
-
-def test_default_lease_slug_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv('CLAUDE_PID', '424242')
-    assert sr.default_lease_slug('watcher-df') == 'watcher-df-424242'
-
-
-def test_default_lease_slug_passes_a_task_scoped_name_through_verbatim() -> None:
-    """``build_lease_name``'s ``#`` separator survives into the slug untouched.
-
-    A lease slug is never a filesystem path: ``lease_path_for_name`` sanitizes
-    only the NAME, and ``sanitize_slug`` applies only to session-RECORD slugs.
-    A lease slug lives inside the lease's JSON body and is compared for
-    equality alone, so the task-scoped ``unblock-df#2085`` needs no escaping.
-    """
-    name = sr.build_lease_name('unblock', 'df', '2085')
-    assert name == 'unblock-df#2085'
-    assert sr.default_lease_slug(name, {session_identity.SESSION_PID_ENV: '55'}) == 'unblock-df#2085-55'
 
 
 def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(
@@ -3001,17 +1027,17 @@ def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(
     monkeypatch.delenv('CLAUDE_PID', raising=False)
 
     sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-degraded'])
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     assert json.loads(lease_path.read_text())['pid'] == 0
 
     # Fresh: NOT reaped — the heartbeat half of the guard still protects it.
-    _set_mtime(lease_path, _NOW, timedelta(seconds=60))
-    assert sr.reap_stale_leases(root=tmp_path, now=_NOW) == []
+    set_mtime(lease_path, _NOW, timedelta(seconds=60))
+    assert session_leases.reap_stale_leases(root=tmp_path, now=_NOW) == []
     assert lease_path.is_file()
 
     # Aged past the TTL: reaped, exactly as pre-3994 heartbeat-only behaviour.
-    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
-    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+    set_mtime(lease_path, _NOW, session_leases.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    reaped = session_leases.reap_stale_leases(root=tmp_path, now=_NOW)
 
     assert [r.reason for r in reaped] == ['stale_pid']
     assert not lease_path.exists()
@@ -3030,8 +1056,8 @@ def test_main_lease_claim_without_pid_writes_the_resolved_session_pid(
     assert rc == 0
     # The correct pid is STRUCTURAL: it no longer depends on every skill doc
     # getting one shell token right (the `--pid $$` defect).
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
+    assert session_leases.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
 
 
 def test_main_lease_claim_explicit_pid_still_overrides_the_env(
@@ -3046,8 +1072,8 @@ def test_main_lease_claim_explicit_pid_still_overrides_the_env(
 
     assert rc == 0
     # The operator-override path operators already used by hand.
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
+    assert session_leases.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
 
 
 def test_main_lease_claim_without_slug_writes_the_derived_lease_slug(
@@ -3066,9 +1092,9 @@ def test_main_lease_claim_without_slug_writes_the_derived_lease_slug(
     rc = sr.main(['lease-claim', '--name', 'watcher-df'])
 
     assert rc == 0
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     assert (
-        sr.LeaseHolder.from_json(lease_path.read_text()).session_slug
+        session_leases.LeaseHolder.from_json(lease_path.read_text()).session_slug
         == f'watcher-df-{_DEAD_PID}'
     )
 
@@ -3093,7 +1119,7 @@ def test_main_lease_claim_derives_the_body_pid_and_the_slug_pid_from_one_resolut
     rc = sr.main(['lease-claim', '--name', 'watcher-df'])
 
     assert rc == 0
-    holder = sr.LeaseHolder.from_json(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+    holder = session_leases.LeaseHolder.from_json(session_leases.lease_path_for_name('watcher-df', root=tmp_path).read_text())
     assert holder.pid == int(holder.session_slug.rsplit('-', 1)[1])
     assert holder.pid == _DEAD_PID
 
@@ -3125,7 +1151,7 @@ def test_an_explicit_pid_does_not_satisfy_an_underivable_slug(
     err = capsys.readouterr().err
     assert '--pid' in err
     assert '--slug' in err
-    assert not sr.lease_path_for_name('watcher-df', root=tmp_path).exists()
+    assert not session_leases.lease_path_for_name('watcher-df', root=tmp_path).exists()
 
 
 def test_main_lease_claim_explicit_slug_still_overrides_the_derived_default(
@@ -3138,8 +1164,8 @@ def test_main_lease_claim_explicit_slug_still_overrides_the_derived_default(
 
     assert rc == 0
     # An explicit --slug remains a deliberate operator override, never shadowed.
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    assert sr.LeaseHolder.from_json(lease_path.read_text()).session_slug == 'watcher-df-OPERATOR'
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
+    assert session_leases.LeaseHolder.from_json(lease_path.read_text()).session_slug == 'watcher-df-OPERATOR'
 
 
 # --- lease-claim's `slug=` diagnostic line (task 4248) ---------------------
@@ -3220,10 +1246,10 @@ def test_main_lease_claim_prints_the_slug_line_even_when_it_fails_open(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
 
-    def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+    def _boom(*_args: object, **_kwargs: object) -> session_leases.LeaseClaim:
         raise OSError('lease substrate on fire')
 
-    monkeypatch.setattr(sr, 'claim_lease', _boom)
+    monkeypatch.setattr(session_leases, 'claim_lease', _boom)
 
     with caplog.at_level(logging.ERROR):
         rc = sr.main(['lease-claim', '--name', 'watcher-df'])
@@ -3290,7 +1316,7 @@ def test_main_lease_verbs_refuse_loudly_when_the_slug_cannot_be_derived(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
     _claim_via_cli()
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     original_body = lease_path.read_text()
     capsys.readouterr()
 
@@ -3325,7 +1351,7 @@ def test_the_read_only_lease_verbs_stay_usable_when_the_slug_cannot_be_derived(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
     _claim_via_cli()
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     capsys.readouterr()
 
     monkeypatch.delenv('CLAUDE_PID', raising=False)
@@ -3358,7 +1384,7 @@ def test_an_explicit_slug_is_still_the_escape_hatch_under_an_unresolvable_pid(
     rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-degraded'])
 
     assert rc == 0
-    holder = sr.LeaseHolder.from_json(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+    holder = session_leases.LeaseHolder.from_json(session_leases.lease_path_for_name('watcher-df', root=tmp_path).read_text())
     assert holder.session_slug == 'watcher-df-degraded'
     assert holder.pid == 0
 
@@ -3422,7 +1448,7 @@ def test_main_lease_mutating_verbs_still_refuse_a_stranger_with_a_derived_slug(
     monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
     sr.main(['lease-claim', '--name', 'watcher-df'])
     capsys.readouterr()
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     original_body = lease_path.read_text()
 
     # A different session: same lease name, its own (different) session pid.
@@ -3466,7 +1492,7 @@ def test_main_lease_mutating_verbs_refuse_a_stranger_without_changing_rc(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     _claim_via_cli()
     capsys.readouterr()
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     original_body = lease_path.read_text()
 
     rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-STRANGER'])
@@ -3477,7 +1503,10 @@ def test_main_lease_mutating_verbs_refuse_a_stranger_without_changing_rc(
     assert lines[0] == 'result=refused'
     # The human line must name the REAL holder, so an agent reading stdout
     # learns who owns it rather than only that it was told no.
-    assert 'watcher-df-100' in lines[1]
+    assert re.search(
+        rf'held by watcher-df-100 \(pid {os.getpid()} alive, heartbeat \d+s ago\), not by watcher-df-STRANGER ',
+        lines[1],
+    )
     assert lease_path.read_text() == original_body
 
 
@@ -3497,7 +1526,12 @@ def test_main_lease_mutating_verbs_force_overrides_a_stranger_refusal(
     assert rc == 0
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == 'result=forced'
-    assert 'watcher-df-100' in lines[1]
+    # The holder is read BEFORE the mutation: a forced release deletes the
+    # lease body, so a read after it could not name the displaced holder.
+    assert re.search(
+        rf'FORCED by watcher-df-STRANGER over holder watcher-df-100 \(pid {os.getpid()} alive, heartbeat \d+s ago\)$',
+        lines[1],
+    )
 
 
 @pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
@@ -3541,9 +1575,9 @@ def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     _claim_via_cli()
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     before = datetime.now(UTC)
-    _set_mtime(lease_path, before, timedelta(hours=1))
+    set_mtime(lease_path, before, timedelta(hours=1))
     capsys.readouterr()
 
     rc = sr.main(['lease-show', '--name', 'watcher-df'])
@@ -3571,8 +1605,8 @@ def test_main_lease_show_reports_a_dead_and_expired_holder_reclaimable(
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     _claim_via_cli(pid=_DEAD_PID)
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, datetime.now(UTC), sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
+    set_mtime(lease_path, datetime.now(UTC), session_leases.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
     capsys.readouterr()
 
     rc = sr.main(['lease-show', '--name', 'watcher-df'])
@@ -3602,11 +1636,11 @@ def test_main_lease_show_on_a_corrupt_body_is_fail_soft(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
     lease_path.parent.mkdir(parents=True, exist_ok=True)
     lease_path.write_text('{not valid json')
     before = datetime.now(UTC)
-    _set_mtime(lease_path, before, timedelta(hours=1))
+    set_mtime(lease_path, before, timedelta(hours=1))
 
     rc = sr.main(['lease-show', '--name', 'watcher-df'])
     after = datetime.now(UTC)
@@ -3629,8 +1663,8 @@ def test_main_lease_reap_removes_a_stale_lease(
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(_DEAD_PID)])
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    lease_path = session_leases.lease_path_for_name('watcher-df', root=tmp_path)
+    set_mtime(lease_path, _NOW, session_leases.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
 
     rc = sr.main(['lease-reap'])
 
@@ -3646,10 +1680,10 @@ def test_main_lease_claim_is_fail_open_never_stand_down_on_a_fault(
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+    def _boom(*_args: object, **_kwargs: object) -> session_leases.LeaseClaim:
         raise OSError('lease substrate on fire')
 
-    monkeypatch.setattr(sr, 'claim_lease', _boom)
+    monkeypatch.setattr(session_leases, 'claim_lease', _boom)
 
     with caplog.at_level(logging.ERROR):
         rc = sr.main(
@@ -3886,8 +1920,8 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
             'decision_cli.py imports this module at module scope as a bare sibling, '
             'and session_registry.py imports decision_cli the same way, when '
             'skills/spawn/spawn-claude.sh, the watcher SKILL.md verb lines '
-            '(write-decision, reap-decisions, close-decision, reopen-decision, '
-            'migrate-decision-projects) and scripts/sitting/payloads.py run '
+            '(write-decision, reap-decisions, close-decision, file-and-close-decision, '
+            'reopen-decision, migrate-decision-projects) and scripts/sitting/payloads.py run '
             'session_registry.py by absolute path with no venv, no install and no '
             'PYTHONPATH. A non-stdlib import here breaks every decision verb.'
         ),
@@ -3901,9 +1935,10 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         probe='from orchestrator import stop_instruction',
         callers=(
             'session_registry.py imports this module at module scope as a bare '
-            'sibling and hands it the five decision verbs (write-decision, '
-            'reap-decisions, close-decision, reopen-decision, '
-            'migrate-decision-projects) when skills/spawn/spawn-claude.sh, the '
+            'sibling and hands it the six decision verbs (write-decision, '
+            'reap-decisions, close-decision, file-and-close-decision, '
+            'reopen-decision, migrate-decision-projects) when '
+            'skills/spawn/spawn-claude.sh, the '
             'watcher SKILL.md verb lines and scripts/sitting/payloads.py run '
             'session_registry.py by absolute path with no venv, no install and no '
             'PYTHONPATH. A non-stdlib import here breaks every decision verb.'
@@ -3940,6 +1975,56 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
             'session_hooks, spawn_t3_lane, the cockpit and the scripts import '
             'orchestrator.session_records. A non-stdlib import here breaks every '
             'registry verb, and with it every record write a spawn makes.'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='session_leases.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_leases.py',
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=(),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'session_registry.py imports this module at module scope as a bare '
+            'sibling and runs the lease verbs (lease-claim, lease-heartbeat, '
+            'lease-release, lease-show, lease-reap) through it when the watcher '
+            'SKILL.md verb lines run session_registry.py by absolute path with no '
+            'venv, no install and no PYTHONPATH. A non-stdlib import here breaks '
+            'every registry verb, and with it every watcher rotation.'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='session_windows.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_windows.py',
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=(),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'session_reaper.py imports this module at module scope as a bare '
+            'sibling when skills/spawn/spawn-claude.sh and the SKILL.md verb lines '
+            'run session_registry.py by absolute path with no venv, no install and '
+            'no PYTHONPATH, so a non-stdlib import here breaks the reap verb and '
+            'every verb that loads the reaper; and session_hooks.py imports '
+            'orchestrator.session_windows for the SessionStart display, so it also '
+            'breaks every hook.'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='session_reaper.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_reaper.py',
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=(),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'session_registry.py imports this module at module scope as a bare '
+            'sibling and runs the reap verb, and the detached reap every launching '
+            'starts, through it when skills/spawn/spawn-claude.sh and the SKILL.md '
+            'verb lines run session_registry.py by absolute path with no venv, no '
+            'install and no PYTHONPATH. A non-stdlib import here breaks every '
+            'registry verb, and with it every spawn; spawn_t3_lane imports '
+            'orchestrator.session_reaper for its thread sweeps too.'
         ),
     ),
     _BareShellEntrypoint(
@@ -4076,6 +2161,12 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('session_identity.py', 'from orchestrator import stop_instruction'),
     ('session_records.py', 'import pydantic'),
     ('session_records.py', 'from orchestrator import stop_instruction'),
+    ('session_leases.py', 'import pydantic'),
+    ('session_leases.py', 'from orchestrator import stop_instruction'),
+    ('session_windows.py', 'import pydantic'),
+    ('session_windows.py', 'from orchestrator import stop_instruction'),
+    ('session_reaper.py', 'import pydantic'),
+    ('session_reaper.py', 'from orchestrator import stop_instruction'),
 )
 
 
@@ -4310,13 +2401,15 @@ def _first_bare_importable_sibling(probes: _BareShellProbes) -> str | None:
 
 #: The line a payload is injected after, per entrypoint; any other entrypoint
 #: uses ``from __future__ import annotations``.  session_registry's,
-#: session_records', decision_registry's and decision_cli's payloads go after
-#: their last shared import, so each is judged with the module's own shared/src
-#: bootstrap already applied: that is the environment a later module-scope
-#: import in that file really runs in.
+#: session_records', session_leases', session_reaper's, decision_registry's and
+#: decision_cli's payloads go after their last shared import, so each is judged
+#: with the module's own shared/src bootstrap already applied: that is the
+#: environment a later module-scope import in that file really runs in.
 _INJECTION_ANCHORS: dict[str, str] = {
     'session_registry.py': 'from shared.session_liveness import ',
     'session_records.py': 'from shared.process_identity import ',
+    'session_leases.py': 'from shared.proc_liveness import ',
+    'session_reaper.py': 'from shared.session_liveness import ',
     'decision_registry.py': 'from shared.project_id import ',
     'decision_cli.py': 'from shared.project_id import ',
 }
@@ -4423,7 +2516,8 @@ class TestStdlibOnlySelfContainment:
 
     (a) bare-shell executability — ``session_registry``, ``fleet_files``,
         ``decision_registry``, ``decision_cli``, ``session_identity``,
-        ``session_records``, ``session_hooks``, ``session_ownership_probes``,
+        ``session_records``, ``session_leases``, ``session_windows``,
+        ``session_reaper``, ``session_hooks``, ``session_ownership_probes``,
         ``session_self_exit``;
     (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
         ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
@@ -4533,6 +2627,12 @@ class TestStdlibOnlySelfContainment:
                 id='reopen-decision',
             ),
             pytest.param(
+                ['file-and-close-decision', '--id', 'esc-1-1', '--project', 'df', '--text', 'approve?',
+                 '--escalations-dir', _BARE_SHELL_QUEUE, '--state', 'answered', '--evidence', EVIDENCE],
+                None, 'dark_factory-esc-1-1', dr.DecisionState.ANSWERED,
+                id='file-and-close-decision',
+            ),
+            pytest.param(
                 ['reap-decisions', '--project', 'df', '--escalations-dir', _BARE_SHELL_QUEUE],
                 None, '', None,
                 id='reap-decisions',
@@ -4590,11 +2690,60 @@ class TestStdlibOnlySelfContainment:
         if final_state is not None:
             assert [decision.state for decision in dr.list_decisions(root=fleet)] == [final_state]
 
+    def test_bare_shell_runs_the_lease_verbs(self, tmp_path: Path) -> None:
+        """The watcher skills' lease verbs, and ``reap``, run at ``session_registry.py <verb>`` from a bare shell.
+
+        They reach session_leases and the reaper through the bare sibling
+        imports that only a run by absolute path takes, so the in-process
+        ``sr.main`` tests cannot see them break. Runs claim, show, lease-reap
+        and reap in order against one fleet root, as a rotation would.
+        """
+        interpreter = _non_venv_interpreter()
+        if interpreter is None:
+            pytest.skip('no non-venv interpreter available on this host')
+        fleet = tmp_path / 'fleet'
+        holder_pid = str(os.getpid())
+
+        def run_verb(*argv: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [interpreter, str(_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py'), *argv],
+                env={
+                    'PATH': '/usr/bin:/bin',
+                    'HOME': str(tmp_path),
+                    'PYTHONNOUSERSITE': '1',
+                    'PYTHONDONTWRITEBYTECODE': '1',
+                    'CLAUDE_FLEET_ROOT': str(fleet),
+                },
+                # Neutral cwd, LOAD-BEARING for the reasons ``_run_row`` gives.
+                cwd=tmp_path,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+        claim = run_verb('lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', holder_pid)
+        show = run_verb('lease-show', '--name', 'watcher-df')
+        lease_reap = run_verb('lease-reap')
+        reap = run_verb('reap')
+
+        assert claim.returncode == 0, f'stderr:\n{claim.stderr}'
+        assert claim.stdout.splitlines()[0] == 'decision=acquired', f'stderr:\n{claim.stderr}'
+        assert show.returncode == 0, f'stderr:\n{show.stderr}'
+        assert 'state=held' in show.stdout.splitlines(), f'stderr:\n{show.stderr}'
+        assert (lease_reap.returncode, lease_reap.stdout) == (0, ''), f'stderr:\n{lease_reap.stderr}'
+        assert (reap.returncode, reap.stdout) == (0, ''), f'stderr:\n{reap.stderr}'
+        assert 'Traceback' not in lease_reap.stderr + reap.stderr
+        # A live holder's lease survives the sweep.
+        assert (fleet / 'leases' / 'watcher-df.lease').is_file()
+
     def test_the_extracted_modules_import_only_downward(self):
         """Each module extracted from session_registry imports only below it, never session_registry.
 
-        fleet_files <- decision_registry <- decision_cli; session_identity is a
-        leaf; and fleet_files, session_identity <- session_records.
+        fleet_files <- decision_registry <- decision_cli; session_identity and
+        session_windows are leaves; fleet_files, session_identity <-
+        session_records; fleet_files, session_identity, session_records <-
+        session_leases; and fleet_files, session_records, session_windows <-
+        session_reaper.
 
         Under tier-1 session_registry is ``__main__``, so a module below it
         that imported it back would silently load a second copy rather than
@@ -4632,11 +2781,16 @@ class TestStdlibOnlySelfContainment:
             'decision_cli': {'decision_registry'},
             'session_identity': set(),
             'session_records': {'fleet_files', 'session_identity'},
+            'session_leases': {'fleet_files', 'session_identity', 'session_records'},
+            'session_windows': set(),
+            'session_reaper': {'fleet_files', 'session_records', 'session_windows'},
         }
 
         assert {module: sibling_imports(module) for module in expected} == expected
 
-    @pytest.mark.parametrize('extracted', ['session_identity', 'session_records'])
+    @pytest.mark.parametrize(
+        'extracted', ['session_identity', 'session_leases', 'session_reaper', 'session_records', 'session_windows']
+    )
     def test_no_extracted_name_is_re_exported_from_session_registry(self, extracted):
         """A name moved out of session_registry no longer resolves through it.
 
@@ -4666,8 +2820,14 @@ class TestStdlibOnlySelfContainment:
         [
             pytest.param(
                 'session_registry.py',
-                ('decision_cli', 'decision_registry', 'fleet_files', 'session_identity', 'session_records'),
-                ('decision_cli', 'session_identity', 'session_records'),
+                (
+                    'decision_cli', 'decision_registry', 'fleet_files', 'session_identity',
+                    'session_leases', 'session_reaper', 'session_records', 'session_windows',
+                ),
+                (
+                    'decision_cli', 'session_identity', 'session_leases', 'session_reaper', 'session_records',
+                    'session_windows',
+                ),
                 id='session_registry',
             ),
             pytest.param(
@@ -4940,49 +3100,6 @@ class TestClaudeSessionPointers:
         assert not session_records.write_claude_session_pointer(_SID, '..', root=tmp_path)
         assert not session_records.write_claude_session_pointer(_SID, 'a/b', root=tmp_path)
 
-    def test_reap_removes_pointers_no_record_vouches_for(self, tmp_path: Path) -> None:
-        _bound_record(tmp_path, 'vouched', _SID)
-        _bound_record(tmp_path, 'rebound', 'newer-session')
-        session_records.write_claude_session_pointer(_SID, 'vouched', root=tmp_path)
-        session_records.write_claude_session_pointer('old-session', 'rebound', root=tmp_path)
-        session_records.write_claude_session_pointer('orphan-session', 'gone-record', root=tmp_path)
-        pointers = session_records.claude_session_pointers_dir(tmp_path)
-        (pointers / 'bad name').write_text('vouched')
-        fresh_temp = pointers / f'inflight{fleet_files.ATOMIC_WRITE_TEMP_SUFFIX}'
-        fresh_temp.write_text('vouched')
-
-        removed = sr.reap_stale_session_pointers(root=tmp_path)
-
-        assert {path.name for path in removed} == {'old-session', 'orphan-session', 'bad name'}
-        assert sorted(path.name for path in pointers.iterdir()) == sorted([_SID, fresh_temp.name])
-
-
-def _t3_record(
-    tmp_path: Path,
-    slug: str,
-    thread_id: str | None,
-    *,
-    cwd: str,
-    status: session_records.Status = session_records.Status.RUNNING,
-    kind: str = session_records.DisplayKind.T3.value,
-    environment_id: str | None = None,
-    pointer: bool = False,
-) -> None:
-    session_records.write_record(
-        make_record(
-            session_slug=slug,
-            status=status,
-            cwd=cwd,
-            exit_code=None,
-            display=session_records.Display(
-                kind=kind, t3_thread_id=thread_id, t3_environment_id=environment_id
-            ),
-        ),
-        root=tmp_path,
-    )
-    if pointer and thread_id is not None:
-        assert session_records.write_t3_thread_pointer(thread_id, slug, root=tmp_path)
-
 
 _THREAD = '7d1f0c2a-5b3e-4c8d-9a6f-1e2d3c4b5a69'
 _OTHER_THREAD = 'mcp:launch:' + '0f9e8d7c6b5a49388271605f4e3d2c1b' * 2
@@ -4996,7 +3113,7 @@ class TestT3ThreadPointers:
     def test_a_written_pointer_resolves_while_a_live_t3_record_names_the_thread(
         self, tmp_path: Path
     ) -> None:
-        _t3_record(tmp_path, 'session-df-8124-1', _THREAD, cwd=str(tmp_path))
+        write_t3_record(tmp_path, 'session-df-8124-1', _THREAD, cwd=str(tmp_path))
 
         assert session_records.write_t3_thread_pointer(_THREAD, 'session-df-8124-1', root=tmp_path)
         assert session_records.t3_thread_pointer_path(_THREAD, tmp_path).read_text() == 'session-df-8124-1'
@@ -5015,7 +3132,7 @@ class TestT3ThreadPointers:
     def test_a_record_that_does_not_vouch_resolves_none(
         self, tmp_path: Path, thread_id: str, status: session_records.Status, kind: str
     ) -> None:
-        _t3_record(tmp_path, 'held', thread_id, cwd=str(tmp_path), status=status, kind=kind)
+        write_t3_record(tmp_path, 'held', thread_id, cwd=str(tmp_path), status=status, kind=kind)
         session_records.write_t3_thread_pointer(_THREAD, 'held', root=tmp_path)
 
         assert session_records.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) is None
@@ -5037,35 +3154,10 @@ class TestT3ThreadPointers:
         assert not session_records.write_t3_thread_pointer(_THREAD, '..', root=tmp_path)
         assert not session_records.write_t3_thread_pointer(_THREAD, 'a/b', root=tmp_path)
 
-    def test_reap_removes_pointers_no_live_t3_record_vouches_for(self, tmp_path: Path) -> None:
-        ended, gone, moved = (
-            '1a2b3c4d-0000-4000-8000-000000000001',
-            '1a2b3c4d-0000-4000-8000-000000000002',
-            '1a2b3c4d-0000-4000-8000-000000000003',
-        )
-        _t3_record(tmp_path, 'live', _THREAD, cwd=str(tmp_path))
-        _t3_record(tmp_path, 'ended', ended, cwd=str(tmp_path), status=session_records.Status.EXITED)
-        _t3_record(tmp_path, 'moved', _OTHER_THREAD, cwd=str(tmp_path))
-        session_records.write_t3_thread_pointer(_THREAD, 'live', root=tmp_path)
-        session_records.write_t3_thread_pointer(ended, 'ended', root=tmp_path)
-        session_records.write_t3_thread_pointer(gone, 'gone-record', root=tmp_path)
-        session_records.write_t3_thread_pointer(moved, 'moved', root=tmp_path)
-        pointers = session_records.t3_thread_pointers_dir(tmp_path)
-        (pointers / 'bad name').write_text('live')
-        fresh_temp = pointers / f'inflight{fleet_files.ATOMIC_WRITE_TEMP_SUFFIX}'
-        fresh_temp.write_text('live')
-
-        removed = sr.reap_stale_session_pointers(root=tmp_path)
-
-        assert {path.name for path in removed} == {ended, gone, moved, 'bad name'}
-        assert sorted(path.name for path in pointers.iterdir()) == sorted(
-            [_THREAD, fresh_temp.name]
-        )
-
     def test_the_exit_verb_drops_the_pointer_naming_the_exited_record(
         self, tmp_path: Path
     ) -> None:
-        _t3_record(tmp_path, 'held', _THREAD, cwd=str(tmp_path))
+        write_t3_record(tmp_path, 'held', _THREAD, cwd=str(tmp_path))
         session_records.write_t3_thread_pointer(_THREAD, 'held', root=tmp_path)
 
         assert sr.main(['exit', '--record', str(session_records.sessions_dir(tmp_path) / 'held'), '--code', '0']) == 0
@@ -5076,8 +3168,8 @@ class TestT3ThreadPointers:
     def test_the_exit_verb_keeps_a_pointer_another_live_record_holds(
         self, tmp_path: Path
     ) -> None:
-        _t3_record(tmp_path, 'holder', _THREAD, cwd=str(tmp_path))
-        _t3_record(tmp_path, 'bystander', _THREAD, cwd=str(tmp_path))
+        write_t3_record(tmp_path, 'holder', _THREAD, cwd=str(tmp_path))
+        write_t3_record(tmp_path, 'bystander', _THREAD, cwd=str(tmp_path))
         session_records.write_t3_thread_pointer(_THREAD, 'holder', root=tmp_path)
 
         sr.main(['exit', '--record', str(session_records.sessions_dir(tmp_path) / 'bystander'), '--code', '0'])
@@ -5088,298 +3180,10 @@ class TestT3ThreadPointers:
     def test_a_failed_to_start_refresh_drops_the_pointer_naming_the_record(
         self, tmp_path: Path
     ) -> None:
-        _t3_record(tmp_path, 'held', _OTHER_THREAD, cwd=str(tmp_path), pointer=True)
+        write_t3_record(tmp_path, 'held', _OTHER_THREAD, cwd=str(tmp_path), pointer=True)
         record_dir = str(session_records.sessions_dir(tmp_path) / 'held')
 
         assert sr.main(['refresh', '--record', record_dir, '--status', 'failed-to-start']) == 0
 
         assert session_records.read_record('held', root=tmp_path).status == session_records.Status.FAILED_TO_START
         assert not session_records.t3_thread_pointer_path(_OTHER_THREAD, tmp_path).exists()
-
-    def test_folding_a_record_drops_the_pointer_naming_it(self, tmp_path: Path) -> None:
-        _t3_record(tmp_path, 'hand', _THREAD, cwd=str(tmp_path))
-        session_records.write_t3_thread_pointer(_THREAD, 'hand', root=tmp_path)
-
-        assert sr.mark_session_folded('hand', root=tmp_path) is not None
-
-        assert not session_records.t3_thread_pointer_path(_THREAD, tmp_path).exists()
-
-
-_ENVIRONMENT = '3f9a1c2e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'
-_GONE_THREAD = '2c4e6a8b-0d1f-4a3c-9e5b-7d9f1b3d5e70'
-
-
-class _ThreadEnded:
-    """A ``thread_ended`` predicate answering *answer* for every thread, recording each thread asked."""
-
-    def __init__(self, answer: bool = True) -> None:
-        self.answer = answer
-        self.calls: list[str] = []
-
-    def __call__(self, thread_id: str) -> bool:
-        self.calls.append(thread_id)
-        return self.answer
-
-
-class TestMarkT3SessionsExited:
-    def test_marks_only_indexed_records_of_this_environment_whose_thread_is_gone(
-        self, tmp_path: Path
-    ) -> None:
-        foreign_thread, unindexed_thread = (
-            '4e6a8c0d-2f1b-4c5e-8a7d-9b1d3f5a7c92',
-            '6a8c0e2f-4b3d-4e7a-8c9f-1d3f5b7d9e14',
-        )
-        cwd = str(tmp_path)
-        _t3_record(tmp_path, 'listed', _THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
-        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
-        _t3_record(
-            tmp_path, 'foreign', foreign_thread, cwd=cwd, environment_id='env-elsewhere', pointer=True
-        )
-        _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
-
-        marked = sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset({_THREAD}), root=tmp_path, thread_ended=_ThreadEnded()
-        )
-
-        assert marked == ['gone']
-        gone = session_records.read_record('gone', root=tmp_path)
-        assert (gone.status, gone.exit_code) == (session_records.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-        for slug in ('listed', 'foreign', 'unindexed'):
-            assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
-        assert sorted(path.name for path in session_records.t3_thread_pointers_dir(tmp_path).iterdir()) == (
-            sorted([_THREAD, foreign_thread])
-        )
-
-    def test_a_record_with_no_environment_is_this_environments(self, tmp_path: Path) -> None:
-        _t3_record(tmp_path, 'legacy', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
-
-        assert sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded()
-        ) == ['legacy']
-
-    def test_a_worktree_bound_record_is_marked_whatever_its_cwd(self, tmp_path: Path) -> None:
-        worktree = tmp_path / 'proj' / '.worktrees' / '8124'
-        _t3_record(
-            tmp_path,
-            'worktree-bound',
-            _GONE_THREAD,
-            cwd=str(worktree),
-            environment_id=_ENVIRONMENT,
-            pointer=True,
-        )
-
-        assert sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded()
-        ) == ['worktree-bound']
-
-    def test_a_record_written_after_the_listing_is_skipped_unasked(self, tmp_path: Path) -> None:
-        _t3_record(tmp_path, 'just-launched', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
-        listed_at = datetime.now(UTC) - timedelta(minutes=1)
-        thread_ended = _ThreadEnded()
-
-        assert (
-            sr.mark_t3_sessions_exited(
-                _ENVIRONMENT,
-                frozenset(),
-                root=tmp_path,
-                listed_at=listed_at,
-                thread_ended=thread_ended,
-            )
-            == []
-        )
-        assert thread_ended.calls == []
-
-    def test_an_unlisted_thread_not_confirmed_ended_keeps_its_record(self, tmp_path: Path) -> None:
-        _t3_record(
-            tmp_path, 'side-chat', _GONE_THREAD, cwd=str(tmp_path), environment_id=_ENVIRONMENT, pointer=True
-        )
-
-        marked = sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded(answer=False)
-        )
-
-        assert marked == []
-        assert session_records.read_record('side-chat', root=tmp_path).status == session_records.Status.RUNNING
-        assert session_records.resolve_session_slug_for_t3_thread(_GONE_THREAD, root=tmp_path) == 'side-chat'
-
-    def test_only_this_environments_unlisted_indexed_threads_are_confirmed(
-        self, tmp_path: Path
-    ) -> None:
-        foreign_thread, unindexed_thread = (
-            '4e6a8c0d-2f1b-4c5e-8a7d-9b1d3f5a7c92',
-            '6a8c0e2f-4b3d-4e7a-8c9f-1d3f5b7d9e14',
-        )
-        cwd = str(tmp_path)
-        _t3_record(tmp_path, 'listed', _THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
-        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
-        _t3_record(
-            tmp_path, 'foreign', foreign_thread, cwd=cwd, environment_id='env-elsewhere', pointer=True
-        )
-        _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
-        thread_ended = _ThreadEnded()
-
-        sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset({_THREAD}), root=tmp_path, thread_ended=thread_ended
-        )
-
-        assert thread_ended.calls == [_GONE_THREAD]
-
-    def test_one_info_line_reports_the_index_entries_scanned(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        for slug, thread in (
-            ('listed', _THREAD),
-            ('also-listed', _OTHER_THREAD),
-            ('gone', _GONE_THREAD),
-        ):
-            _t3_record(tmp_path, slug, thread, cwd=str(tmp_path), pointer=True)
-
-        with caplog.at_level(logging.INFO, logger='orchestrator.session_registry'):
-            sr.mark_t3_sessions_exited(
-                _ENVIRONMENT,
-                frozenset({_THREAD, _OTHER_THREAD}),
-                root=tmp_path,
-                thread_ended=_ThreadEnded(),
-            )
-
-        [line] = [
-            record.getMessage().replace(str(tmp_path), '<root>')
-            for record in caplog.records
-            if record.name == 'orchestrator.session_registry'
-            and record.levelno == logging.INFO
-            and 'mark_t3_sessions_exited' in record.getMessage()
-        ]
-        assert re.search(r'\b3\b', line), line
-
-    @pytest.mark.parametrize(
-        ('routine', 'ended', 'level'),
-        [
-            pytest.param(False, False, logging.INFO, id='launch-sweep-marking-nothing'),
-            pytest.param(True, True, logging.INFO, id='routine-sweep-marking-one'),
-            pytest.param(True, False, logging.DEBUG, id='routine-sweep-marking-nothing'),
-        ],
-    )
-    def test_only_a_routine_sweep_that_marks_nothing_logs_its_line_at_debug(
-        self,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-        routine: bool,
-        ended: bool,
-        level: int,
-    ) -> None:
-        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
-
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
-            sr.mark_t3_sessions_exited(
-                _ENVIRONMENT,
-                frozenset(),
-                root=tmp_path,
-                thread_ended=_ThreadEnded(answer=ended),
-                routine=routine,
-            )
-
-        assert [
-            record.levelno
-            for record in caplog.records
-            if record.name == 'orchestrator.session_registry'
-            and record.getMessage().startswith('mark_t3_sessions_exited: marked')
-        ] == [level]
-
-
-class TestT3RecordsAreExemptFromPidSweeps:
-    def _stale_t3_record(self, tmp_path: Path, status: session_records.Status) -> Path:
-        _t3_record(tmp_path, 't3-quiet', 'th-1', cwd=str(tmp_path), status=status)
-        record = session_records.read_record('t3-quiet', root=tmp_path)
-        record.launcher_pid = _DEAD_PID
-        session_records.write_record(record, root=tmp_path)
-        path = session_records.record_path_for_slug('t3-quiet', root=tmp_path)
-        _set_mtime(path, _NOW, sr.TERMINAL_TTL + timedelta(hours=1))
-        return path
-
-    def test_mark_orphaned_skips_a_quiet_t3_record_with_a_dead_launcher(
-        self, tmp_path: Path
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.AWAITING_INPUT)
-
-        assert sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW) == []
-        assert session_records.read_record('t3-quiet', root=tmp_path).status == session_records.Status.AWAITING_INPUT
-
-    def test_reap_keeps_a_non_terminal_t3_record_with_a_dead_launcher(self, tmp_path: Path) -> None:
-        path = self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-
-        assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
-        assert path.is_file()
-        assert not session_records.t3_thread_pointers_dir(tmp_path).exists()
-
-    def test_the_reap_indexes_a_t3_record_whose_thread_no_pointer_holds(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-        monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
-
-        assert sr.main(['reap']) == 0
-
-        assert session_records.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 't3-quiet'
-        assert session_records.read_record('t3-quiet', root=tmp_path).status == session_records.Status.RUNNING
-
-    def test_indexing_never_moves_a_held_pointer_or_indexes_a_terminal_record(
-        self, tmp_path: Path
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
-        _t3_record(tmp_path, 'ended', 'th-2', cwd=str(tmp_path), status=session_records.Status.EXITED)
-
-        assert sr.index_unpointed_t3_records(root=tmp_path) == []
-
-        assert session_records.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 'holder'
-        assert not session_records.t3_thread_pointer_path('th-2', tmp_path).exists()
-
-    def test_a_t3_record_displaced_from_its_thread_pointer_is_pid_swept(
-        self, tmp_path: Path
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
-
-        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-        assert [(r.session_slug, r.reason) for r in reaped] == [('t3-quiet', 'stale_pid')]
-        assert session_records.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 'holder'
-
-    def test_mark_orphaned_marks_a_displaced_t3_record_with_a_dead_launcher(
-        self, tmp_path: Path
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.AWAITING_INPUT)
-        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
-
-        marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-        assert [r.session_slug for r in marked] == ['t3-quiet']
-
-    def test_a_failed_index_write_leaves_the_t3_record_exempt(self, tmp_path: Path) -> None:
-        path = self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-        session_records.t3_thread_pointers_dir(tmp_path).parent.mkdir(parents=True, exist_ok=True)
-        session_records.t3_thread_pointers_dir(tmp_path).write_text('not a dir')
-
-        assert sr.index_unpointed_t3_records(root=tmp_path) == []
-        assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
-        assert sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW) == []
-        assert path.is_file()
-        assert session_records.read_record('t3-quiet', root=tmp_path).status == session_records.Status.RUNNING
-
-    def test_reap_still_applies_terminal_ttl_to_a_t3_record(self, tmp_path: Path) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.EXITED)
-
-        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-        assert [(r.session_slug, r.reason) for r in reaped] == [('t3-quiet', 'terminal_ttl')]
-
-
-def test_mark_session_folded_stamps_the_fold_code_once(tmp_path: Path) -> None:
-    session_records.write_record(make_record(session_slug='hand', status=session_records.Status.RUNNING), root=tmp_path)
-
-    folded = sr.mark_session_folded('hand', root=tmp_path)
-
-    assert folded is not None
-    assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, sr.FOLDED_EXIT_CODE)
-    assert sr.mark_session_folded('hand', root=tmp_path) is None

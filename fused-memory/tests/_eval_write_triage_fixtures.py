@@ -116,9 +116,9 @@ PROVENANCE = {
 }
 
 
-def slate(memory_id: str, *, candidates, band_winner_id, band,
+def slate(memory_id: str, *, candidates, band_winner_id, band, routed: str | None = None,
           similarity: float | None = 0.7, canonical_present=True):
-    """A `eval_write_triage_retrieval.Slate`-shaped stand-in.
+    """A `eval_write_triage_retrieval.Slate`-shaped stand-in, routed as banded by default.
 
     Duck-typed rather than imported: the retrieval module reaches the live
     server stack, and everything asserted here is the eval's own handling of
@@ -129,6 +129,7 @@ def slate(memory_id: str, *, candidates, band_winner_id, band,
         candidates=tuple(candidates),
         attach_target_id=band_winner_id,
         band=band,
+        routed=band if routed is None else routed,
         similarity=similarity,
         canonical_present=canonical_present,
         retrieved_count=len(candidates),

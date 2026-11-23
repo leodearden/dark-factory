@@ -32,24 +32,24 @@ Every design question is ruled (PRD §Rulings); the ρ0/ρ blocks stand under ru
 | β | `scripted-runner-fake-exists` | `^class ScriptedGitRunner` present in `orchestrator/tests/_git_runner_fakes.py` | PASS |
 | β | `path-shim-fake-retired` | `orchestrator/tests/_git_fault_shim.py` absent (path check) | PASS |
 | γ | `warm-lane-scripts-port` | `^class WarmLaneScripts` present in `orchestrator/src/orchestrator/warm_lane_scripts.py` | PASS |
-| γ | `callbacks-bundle` | `^class GitOpsCallbacks` present in `orchestrator/src/orchestrator/git_ops.py` | PASS |
-| γ | `limits-dataclass` | `^class GitOpsLimits` present in `orchestrator/src/orchestrator/git_ops.py` | PASS |
+| γ | `callbacks-bundle` | `^class GitOpsCallbacks` present in `orchestrator/src/orchestrator/` (widened 2026-11-22, git-ops split) | PASS |
+| γ | `limits-dataclass` | `^class GitOpsLimits` present in `orchestrator/src/orchestrator/` (widened 2026-11-22, git-ops split) | PASS |
 | γ | `env-override-retired` | `ORCH_WARM_LANE_SCRIPT_DIR` absent in `orchestrator/src/orchestrator/` | PASS |
 | γ | `reexport-shim-retired` | `re-export shim \(test_pool_storage_guard` absent in `orchestrator/src/orchestrator/git_ops.py` | PASS |
 | γ | `post-construction-installs-retired` | `git_ops\.[a-zA-Z_]+ *= [^=]` absent in `orchestrator/src/orchestrator/`, `escalation/src/escalation/` | PASS |
 | δ | `disposition-leaf-exists` | `^class BlockDisposition` present in `orchestrator/src/orchestrator/block_disposition.py` | PASS |
-| δ | `enum-maps-seed-rc` | `def from_seed_rc\(` present in `orchestrator/src/orchestrator/git_ops.py` | PASS |
+| δ | `enum-maps-seed-rc` | `def from_seed_rc\(` present in `orchestrator/src/orchestrator/` (widened 2026-11-22, git-ops split) | PASS |
 | δ | `if-chain-deleted` | `pool_info is WarmLaneUnavailable\.` absent in `orchestrator/src/orchestrator/git_ops.py` | PASS |
 | δ | `steal-retryable-placeholder-deleted` | `_STEAL_RETRYABLE` absent in `orchestrator/src/orchestrator/git_ops.py` | PASS |
 | δ | `workflow-types-rows-derive` | `WarmLane[A-Za-z]* *: *BlockDisposition\(` absent in `orchestrator/src/orchestrator/workflow_types.py` | PASS |
 | ι | `lifecycle-release-method` | `def release\(` present in `orchestrator/src/orchestrator/lane_lifecycle.py` | PASS |
 | ι | `pool-set-lifecycle-retired` | `def set_lane_lifecycle\(` absent in `orchestrator/src/orchestrator/warm_lane_pool.py` | PASS |
 | ι | `no-lifecycle-reach` | `git_ops\._lane_lifecycle` absent in `orchestrator/src/orchestrator/` | PASS |
-| ι | `adopt-lane-owner` | `def adopt_lane\(` present in `orchestrator/src/orchestrator/git_ops.py` | PASS |
+| ι | `adopt-lane-owner` | `def adopt_lane\(` present in `orchestrator/src/orchestrator/` (widened 2026-11-22, git-ops split) | PASS |
 | ι | `pool-slot-state-renamed` | `^class PoolSlotState` present in `orchestrator/src/orchestrator/warm_lane_pool.py` | PASS |
 | ι | `substrate-lifecycle-exists` | `^LEGAL_TRANSITIONS` present in `orchestrator/src/orchestrator/lane_lifecycle.py` | PASS (substrate) |
-| κ | `pool-storage-guard` | `def _ensure_pool_storage\(` present in `orchestrator/src/orchestrator/git_ops.py` | PASS |
-| κ | `route-classifier` | `def _classify_acquire_route\(` present in `orchestrator/src/orchestrator/git_ops.py` | PASS |
+| κ | `pool-storage-guard` | `def (_ensure_pool_storage|ensure)\(` present in `orchestrator/src/orchestrator/git_ops.py` or `orchestrator/src/orchestrator/pool_storage.py` (widened 2026-11-22, git-ops split) | PASS |
+| κ | `route-classifier` | `def _classify_acquire_route\(` present in `orchestrator/src/orchestrator/` (widened 2026-11-22, git-ops split) | PASS |
 | κ | `substrate-acquire-route-enum` | `^class AcquireRoute` present in `orchestrator/src/orchestrator/lane_lifecycle.py` | PASS (substrate) |
 | ε | `git-command-failed-exists` | `^class GitCommandFailed\(GitQueryError\)` present in `orchestrator/src/orchestrator/git_run.py` | PASS |
 | ε | `raising-query-helper` | `^async def query\(` present in `orchestrator/src/orchestrator/git_run.py` | PASS |

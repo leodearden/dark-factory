@@ -18,7 +18,9 @@ from _eval_write_triage_fixtures import aliased_row as _aliased_row
 from _eval_write_triage_fixtures import cases_mod as _cases_mod
 from _eval_write_triage_fixtures import corpus as _corpus
 from _eval_write_triage_fixtures import live as _live
+from _eval_write_triage_fixtures import rec as _rec
 from _eval_write_triage_fixtures import scoring_mod as _scoring
+from _eval_write_triage_fixtures import slate as _slate
 
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
@@ -371,7 +373,7 @@ class TestBuildReport:
     @staticmethod
     def _answering(
         cases: list[dict], label: str, answers, *,
-        production_shape=None, judge_model=None,
+        production_shape=None, routing=None, judge_model=None,
     ) -> dict:
         """*cases* scored with the *label* cases answering in turn from
         *answers* and every other case answering `restated`."""
@@ -387,6 +389,7 @@ class TestBuildReport:
             scored=_scoring().score_cases(cases, verdicts),
             provenance=provenance,
             production_shape=production_shape,
+            routing=routing,
         )
 
     @staticmethod
@@ -423,7 +426,7 @@ class TestBuildReport:
         )
 
     @pytest.mark.parametrize('label_name', _COUNTED_LABELS)
-    def test_the_judged_share_is_named_when_the_band_split_is_known(
+    def test_the_judged_share_is_named_when_the_route_split_is_known(
         self, label_name: str,
     ) -> None:
         label = getattr(_scoring(), label_name)
@@ -432,19 +435,32 @@ class TestBuildReport:
             OUTCOME_RESTATED, OUTCOME_CONTESTED, OUTCOME_CONTESTED,
             OUTCOME_AMENDED, OUTCOME_AMENDED, OUTCOME_AMENDED,
         ]
-        judged = 5
+        middle, judged = 3, 5
         shape = {'band_split': {label: {
+            OUTCOME_RESTATED: 3, OUTCOME_JUDGE: middle, OUTCOME_STORED: 0,
+        }}}
+        routing = {'route_split': {label: {
             OUTCOME_RESTATED: 1, OUTCOME_JUDGE: judged, OUTCOME_STORED: 0,
         }}}
 
         with_split = self._caveat_counting(
+            self._answering(cases, label, answers, production_shape=shape, routing=routing),
+            label,
+        )
+        band_only = self._caveat_counting(
             self._answering(cases, label, answers, production_shape=shape), label,
         )
         without_split = self._caveat_counting(
             self._answering(cases, label, answers), label,
         )
-        added = _inserted_span(with_split, without_split)
-        assert str(judged) in re.findall(r'\d+', added), added
+        assert band_only == without_split, 'the cosine band split names no judged share'
+        added = re.findall(r'\d+', _inserted_span(with_split, without_split))
+        assert str(judged) in added and str(middle) not in added, added
+
+    def test_the_routing_block_is_carried_verbatim(self) -> None:
+        routing = {'route_split': {}, 'judged': {'n': 0, 'correct': 0, 'accuracy': None}}
+        assert self._report(routing=routing)['routing'] == routing
+        assert self._report()['routing'] is None
 
     def test_the_duplicate_caveat_names_the_judge_it_measured(self) -> None:
         label = _scoring().LABEL_DUPLICATE
@@ -645,6 +661,55 @@ class TestRenderMarkdown:
         """Which is the only thing this script could do before retrieval."""
         assert _scoring().caveats_for(None) == _scoring().caveats_for(_scoring().SLATE_SEEDED)
 
+    @staticmethod
+    def _routed_report(*, routing: bool) -> dict:
+        rows = _routing_rows()
+        cases = _cases_mod().build_judge_cases(_corpus(), distractors=2)
+        report = _scoring().build_report(
+            scored=_scoring().score_cases(cases, [OUTCOME_RESTATED] * len(cases)),
+            provenance=dict(_PROVENANCE),
+            production_shape=_scoring().score_attachments(rows),
+            routing=_scoring().score_routing(rows) if routing else None,
+        )
+        return report
+
+    def test_the_route_split_renders_beside_the_band_split(self) -> None:
+        report = self._routed_report(routing=True)
+        section = self._section(_scoring().render_markdown(report), 'Routing')
+        header = next(ln for ln in section.splitlines() if ln.startswith('| class |'))
+        assert self._cells(header) == ['class', *_scoring().EVAL_BANDS]
+        for name in _scoring().EVAL_CLASSES:
+            row = next(ln for ln in section.splitlines() if ln.startswith(f'| {name} |'))
+            counts = report['routing']['route_split'][name]
+            assert self._cells(row)[1:] == [str(counts[band]) for band in _scoring().EVAL_BANDS]
+
+    def test_the_routing_section_states_the_restate_band_and_the_judged_accuracy(self) -> None:
+        report = self._routed_report(routing=True)
+        section = self._section(_scoring().render_markdown(report), 'Routing')
+        restate, judged = report['routing']['restate_band'], report['routing']['judged']
+        restate_lines = [ln for ln in section.splitlines() if 'near-verbatim' in ln]
+        assert any(
+            str(restate['judged']) in ln and str(restate['verbatim']) in ln
+            for ln in restate_lines
+        ), section
+        assert f'{restate["correct"]}/{restate["judged"]} = `{restate["accuracy"]}`' in section
+        assert f'{judged["correct"]}/{judged["n"]} = `{judged["accuracy"]}`' in section
+
+    @pytest.mark.parametrize('absent', ['none', 'missing'])
+    def test_an_unmeasured_routing_says_so(self, absent: str) -> None:
+        report = self._routed_report(routing=False)
+        if absent == 'missing':
+            del report['routing']
+        section = self._section(_scoring().render_markdown(report), 'Routing')
+        assert 'not measured' in section
+
+    def test_the_band_split_names_the_cosine_band(self) -> None:
+        md = _scoring().render_markdown(self._routed_report(routing=True))
+        heading = next(ln for ln in md.splitlines() if ln.startswith('### Band split'))
+        assert 'decide_band' in heading
+        middle = next(ln for ln in md.splitlines() if 'MIDDLE band' in ln)
+        assert '[t_low, t_high)' in middle
+
     def test_renders_a_provenance_bullet_list(self) -> None:
         md = self._md()
         assert '## Provenance' in md
@@ -763,3 +828,77 @@ class TestScoreAttachments:
         scored = _scoring().score_attachments([_aliased_row([_live('new-canon')], 'new-canon')])
         assert scored['duplicate_attach']['strict'] == 1
         assert scored['wrong_record_attach']['n'] == 0
+
+
+def _routing_row(**kwargs) -> dict:
+    """A dump row as `case_row` writes it, routed to the judge unless told otherwise."""
+    return TestScoreAttachments._row(**{'routed': OUTCOME_JUDGE, **kwargs})
+
+
+def _routing_rows() -> list[dict]:
+    """One of each route a restate-band write can take, plus a middle-band and a stored case."""
+    return [
+        _routing_row(memory_id='r-judged-right', band=OUTCOME_RESTATED),
+        _routing_row(memory_id='r-judged-wrong', band=OUTCOME_RESTATED, correct=False,
+                     outcome=OUTCOME_CONTESTED, verdict=OUTCOME_CONTESTED),
+        _routing_row(memory_id='r-verbatim', band=OUTCOME_RESTATED, routed=OUTCOME_RESTATED,
+                     verdict=None, outcome=OUTCOME_RESTATED),
+        _routing_row(memory_id='middle', expected_class='distinct', correct=False),
+        _routing_row(memory_id='floor', expected_class='distinct', band=OUTCOME_STORED,
+                     routed=OUTCOME_STORED, verdict=None, outcome=OUTCOME_STORED),
+    ]
+
+
+class TestScoreRouting:
+    """What `route_band` sent the judge, beside the cosine band that labelled it."""
+
+    def test_a_case_row_carries_its_route_beside_its_band(self) -> None:
+        records = [_rec('canon', 'canon', 'canonical'), _rec('dup', 'canon', 'duplicate')]
+        retrieved = _slate('dup', candidates=[_live('canon')], band_winner_id='canon',
+                           band=OUTCOME_RESTATED, routed=OUTCOME_JUDGE)
+        plan = _cases_mod().plan_from_slates(records, [retrieved], provenance={})
+        row = _scoring().case_row(
+            1, plan.cases[0],
+            _scoring().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
+            plan.candidate_records[0], plan.fixture_by_id,
+        )
+        assert (row['band'], row['routed']) == (OUTCOME_RESTATED, OUTCOME_JUDGE)
+
+    def test_the_route_split_counts_each_class_by_its_route(self) -> None:
+        routing = _scoring().score_routing(_routing_rows())
+        assert routing['route_split']['duplicate'] == {
+            OUTCOME_RESTATED: 1, OUTCOME_JUDGE: 2, OUTCOME_STORED: 0,
+        }
+        assert routing['route_split']['distinct'] == {
+            OUTCOME_RESTATED: 0, OUTCOME_JUDGE: 1, OUTCOME_STORED: 1,
+        }
+        assert set(routing['route_split']) == set(_scoring().EVAL_CLASSES)
+        for counts in routing['route_split'].values():
+            assert tuple(counts) == _scoring().EVAL_BANDS
+        assert routing['route_split_all'] == {
+            OUTCOME_RESTATED: 1, OUTCOME_JUDGE: 3, OUTCOME_STORED: 1,
+        }
+
+    def test_the_restate_band_splits_judged_from_verbatim(self) -> None:
+        routing = _scoring().score_routing(_routing_rows())
+        assert routing['restate_band'] == {
+            'n': 3, 'judged': 2, 'verbatim': 1, 'correct': 1, 'accuracy': 0.5,
+        }
+
+    def test_an_unjudged_restate_band_has_no_accuracy(self) -> None:
+        rows = [_routing_row(band=OUTCOME_RESTATED, routed=OUTCOME_RESTATED,
+                             verdict=None, outcome=OUTCOME_RESTATED)]
+        restate = _scoring().score_routing(rows)['restate_band']
+        assert (restate['judged'], restate['accuracy']) == (0, None)
+
+    def test_judged_covers_every_case_routed_to_the_judge(self) -> None:
+        routing = _scoring().score_routing(_routing_rows())
+        assert routing['judged'] == {'n': 3, 'correct': 1, 'accuracy': 0.3333}
+
+    def test_a_route_outside_the_vocabulary_raises(self) -> None:
+        with pytest.raises(ValueError, match='outside'):
+            _scoring().score_routing([_routing_row(routed='sideways')])
+
+    def test_the_result_round_trips_through_json(self) -> None:
+        routing = _scoring().score_routing(_routing_rows())
+        assert json.loads(json.dumps(routing)) == routing

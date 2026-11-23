@@ -20,10 +20,12 @@ Every project targeted by Dark Factory — this repo included — must expose
 its top-level orchestrator config at
 `<project_root>/dark-factory-orchestrator.yaml`. That is the canonical,
 required filename: it's what the dashboard's escalation-URL discovery
-(`_discover_escalation_urls`) keys on. Legacy spellings (`orchestrator.yaml`,
-`orchestrator-config.yaml`, `orchestrator/config.yaml`) are honored only as
-a discovery fallback for not-yet-migrated projects, not a supported choice
-for new ones.
+(`_discover_escalation_urls`) keys on. Discovery reads no other name (task
+7138 retired the legacy spellings `orchestrator.yaml`,
+`orchestrator-config.yaml` and `orchestrator/config.yaml`). A project still
+using one keeps its dashboard row and its tasks still show, but until renamed
+its escalation-backed views (escalations, merge queue and halt status, task
+runtime state) go dark and its burndown run-slot capacity reads as unknown.
 
 This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
 and most files are not format-clean. Do not file or perform
@@ -71,7 +73,7 @@ the contract §11 human-gate task.
 cd fused-memory/docker && docker-compose up -d
 
 # Python environment
-cd fused-memory && uv sync
+uv sync --all-packages    # from the repo root
 
 # Required env vars (inherit from shell):
 # OPENAI_API_KEY  (for embeddings; ANTHROPIC_API_KEY is NOT needed — agents use OAuth)
@@ -88,7 +90,7 @@ production FalkorDB".
 ### Locating installed code
 
 The uv workspace has ONE root `.venv` per tree — `<project_root>/.venv` (CPython
-3.13.9, uv 0.11.6 in the main checkout). None of the seven workspace members
+3.13.9, uv 0.11.6 in the main checkout). No workspace member
 carries its own. A task worktree gets an INDEPENDENT root `.venv`, not a share
 of main's, once it has been cold-verified — `verify_cold_preprovision_command`
 (`uv sync --all-packages && npm ci …`) runs *inside* the worktree, and such a
@@ -260,7 +262,7 @@ orchestrator/src/orchestrator. Note: your current working directory is
 ## Memory Usage
 
 ### When to read memory
-- **Session start** — search for project context, recent decisions, active conventions
+- **Session start** — build the briefing in `/memory` → "Context Briefing" (`.claude/commands/memory.md`): the conventions of the area you will work in, and the context of your task.
 - **Encountering unfamiliar entities** — `get_entity` to understand relationships
 - **Before architectural decisions** — search for prior decisions and rationale
 - **Tasks with memory_hints** — only if you can actually see them. `metadata.memory_hints`
@@ -351,6 +353,25 @@ type and the Python type its values arrive as, and refuses loudly rather than
 reporting an empty schema. It states no column names of its own, deliberately:
 the store is the only copy of them that cannot be stale.
 
+The reconciliation TICKET store, which holds the `tkt_…` ids `submit_task`
+returns, is a second store with the same two traps. WHERE it is: one
+fused-memory server serves every project on this host, so ONE ticket store
+serves them all, in that server's reconciliation data dir:
+`/home/leo/src/dark-factory/data/reconciliation/tickets.db`. `data/` is
+untracked, so no worktree has one, and `fused-memory/data/tickets.db` is a
+0-byte decoy. The location's one home is
+`fused-memory/src/fused_memory/server/main.py::resolve_data_dir`
+(`reconciliation.data_dir` in `fused-memory/config/config.yaml`, overridable by
+`RECONCILIATION_DATA_DIR`). WHAT SHAPE it is: its key is not a task store's
+`id`, and the same tool answers with `--db`.
+
+<!-- tickets-db-schema-lookup:begin
+     EXECUTED by tests/scripts/test_tasks_db_schema_convention.py, with the
+     store swapped for a fixture. Degrade it into a hand-written sqlite query
+     and that guard goes red. -->
+- **Ticket store shape**: `python scripts/tasks_db_schema.py --db /home/leo/src/dark-factory/data/reconciliation/tickets.db`
+<!-- tickets-db-schema-lookup:end -->
+
 ## Model Routing
 
 The orchestrator resolves `(model, effort, budget_usd, max_turns)` for
@@ -369,8 +390,8 @@ the task-author pin is in `docs/task-authoring.md`.
 ## Session Lifecycle
 
 ### Starting a session
-1. Search memory for project context: `search(query="project overview and current status", project_id="dark_factory")`
-2. Check task tree: `get_tasks(project_root="/home/leo/src/dark-factory")`
+1. Build the context briefing in `/memory` → "Context Briefing" (`.claude/commands/memory.md`). Its query phrasing has one home, `shared/src/shared/briefing_queries.py`; this file does not restate it. There is no project-overview search: for orientation read the documents that section's "Two queries are absent on purpose" paragraph names.
+2. Read task state narrowly, as item 3 of that section says. Never call `get_tasks` without `statuses` and `fields`.
 3. If working on a specific task, read it with `get_task` — and if it carries
    `memory_hints`, execute the hint queries. This works in an **interactive** session;
    an orchestrator-dispatched task agent holds no `get_task` and cannot do it (see
@@ -404,8 +425,10 @@ workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
 Three deliberately orthogonal restart mechanisms act on the fleet:
 watchdog **liveness** probes (revive a wedged unit immediately, no clock),
 the watchdog **staleness** backstop and the merge-landed **coordinator**
-(both invoke `scripts/restart-all-orchestrators.sh` and read one 8h
-fleet-deploy clock). Don't conflate them when debugging a
+(both invoke `scripts/restart-all-orchestrators.sh` and read one 72h
+fleet-deploy clock; the long window is deliberate, amortizing the throughput
+cost of deploys, and deliberate deploy tasks are allowed for high-value
+changes). Don't conflate them when debugging a
 restart, and run `scripts/orchestrator-watchdog.py --report` (strictly
 read-only) before manually restarting anything. Full model, `--report`
 column reference, and the soak signal to watch:
@@ -494,3 +517,4 @@ directly, not just interactive agents.
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
 - **Design invariants**: `docs/legibility/design-invariants.md` — checkable invariants gating `/prd` decompose (G7) and `/review` phase 2
+- **Verify-result cache**: `OPERATIONS.md` §11a "Verify-result cache" — per-role modes, unit outcomes, audit and kill switch, R-cache-1/2 pointers

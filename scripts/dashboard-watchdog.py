@@ -617,10 +617,12 @@ def _prune_restarts(restarts: list[int], now: int) -> list[int]:
 def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
     """File a born-at-L2 escalation reporting the restart ceiling.
 
-    Shells out to ``escalation submit`` through ``uv run --project`` rather
-    than importing it: this script is stdlib-only by design (it must run as a
-    bare ``Type=oneshot`` with no environment of its own), and ``escalation``
-    is not on its import path.
+    Shells out to ``escalation submit`` through ``uv run --no-sync --project``
+    rather than importing it: this script is stdlib-only by design (it must run
+    as a bare ``Type=oneshot`` with no environment of its own), and
+    ``escalation`` is not on its import path. ``--no-sync`` so filing the page
+    never re-syncs the shared root .venv
+    (tests/scripts/test_uv_run_venv_isolation.py).
 
     The argv is built against submit.py's ENFORCED argparse boundary, not
     against convenience. That CLI constructs ``Escalation(level=2, ...)``
@@ -685,6 +687,7 @@ def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
     argv = [
         UV_BIN,
         "run",
+        "--no-sync",
         "--project",
         os.path.join(REPO_DIR, "escalation"),
         "escalation",

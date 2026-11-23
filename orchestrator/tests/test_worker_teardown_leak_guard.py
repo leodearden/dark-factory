@@ -1,7 +1,7 @@
 """No pytest item under orchestrator/tests stops a worker outside a ``finally:``
 whose ``try:`` encloses its every responsive wait: the esc-3980-4 leak
 invariant recorded at _merge_worker_drive.py::stop_merge_worker, as
-_wait_hygiene_scan.py::scan_worker_teardown reads it.
+_wait_hygiene_scan.py::scan_worker_teardown_in reads it.
 
 The sweep is OPT-OUT over every ``orchestrator/tests/**/*.py``, so a new module
 is covered the moment it exists.  ``_UNGUARDED_TEARDOWN_DEBT`` names the items
@@ -23,7 +23,7 @@ from _tree_scan import (
     TreePass,
 )
 from _wait_budget_audit import RESPONSIVE_WAIT_HELPERS
-from _wait_hygiene_scan import WorkerTeardownScan, scan_worker_teardown
+from _wait_hygiene_scan import WorkerTeardownScan, scan_worker_teardown_in
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
@@ -119,7 +119,7 @@ _NOTHING_TO_SCAN = WorkerTeardownScan((), (), ())
 def _module_scan(module: ParsedModule) -> WorkerTeardownScan:
     if not module.may_name(*RESPONSIVE_WAIT_HELPERS):
         return _NOTHING_TO_SCAN
-    return scan_worker_teardown(module.source)
+    return scan_worker_teardown_in(module.tree)
 
 
 ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_TESTS, extract=_module_scan)

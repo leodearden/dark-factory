@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
@@ -130,15 +131,6 @@ class TestScrubSeededLaneTarget:
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 async def _make_registered_lane(repo: Path, lane_name: str = '_lane-0') -> Path:
     """Create a real worktree at <repo>/.worktrees/<lane_name> for seeding tests."""
     worktree_base = repo / '.worktrees'
@@ -190,9 +182,7 @@ class TestSeedWarmLaneScrubsOnSuccess:
     async def test_seed_warm_lane_scrubs_autogen_residue_on_success(
         self, tmp_path: Path,
     ):
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         lane = await _make_registered_lane(repo, '_lane-0')
         residue = _drop_seed_script_with_autogen_residue(lane)
 

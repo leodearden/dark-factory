@@ -55,6 +55,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STREAK_PAYLOAD_KEY,
     STREAK_WINDOW_PAYLOAD_KEY,
 )
+from fused_memory.utils.sqlite_connector import Connector
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,12 @@ MARKER_KINDS = ('stage1_flag_marker', 'stage2_persistence_marker', 'flag_for_sta
 # standing_decision_constants' INV-5 forbids. mem0_tombstone re-exports it, so
 # `from ...mem0_tombstone import RECORD_KIND_MEM0_TOMBSTONE` still resolves.
 RECORD_KIND_MEM0_TOMBSTONE = 'mem0_tombstone'
+
+# The project_id of a row that belongs to no project. It is outside
+# utils/validation.py::validate_project_id's grammar, so no real project can
+# collide with it; every query and gc() filters on project_id, so no project's
+# reads or gc see it.
+SERVICE_SCOPE_PROJECT_ID = '(service)'
 
 # Single-sourced INSERT ... ON CONFLICT used by BOTH upsert() and
 # upsert_many(). Hoisted to module scope so the two write paths cannot drift
@@ -291,8 +298,13 @@ def _streak_row_from_record(record: ReconLedgerRecord) -> SuppressionStreakRow:
 class ReconLedgerStore:
     """SQLite-backed control-plane ledger for recon markers/suppressions/summaries."""
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, *, connect: Connector = connect_daemon) -> None:
+        """*connect* is how ``initialize`` opens the ledger's one connection.
+
+        It is given the database path and defaults to ``connect_daemon``.
+        """
         self._db_path = Path(db_path)
+        self._connect = connect
         self._access: AtomicConnection | None = None
 
     async def initialize(self) -> None:
@@ -323,7 +335,7 @@ class ReconLedgerStore:
         if self._access is not None:
             await self.close()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = await connect_daemon(str(self._db_path))
+        conn = await self._connect(str(self._db_path))
         conn.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
         self._access = AtomicConnection(conn)

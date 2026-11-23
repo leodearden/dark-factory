@@ -38,6 +38,7 @@ from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _install_tool_dispatch_guards
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from fused_memory.server.tools import create_mcp_server
 
 TASK_ID = '7165'
@@ -100,7 +101,12 @@ async def _served_fused_memory(
         await ticket_store.initialize()
     interceptor = TaskInterceptor(backend, None, event_buffer, ticket_store=ticket_store)
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-    _install_tool_dispatch_guards(server, known_projects={})
+    _install_tool_dispatch_guards(
+        server,
+        known_projects={},
+        prefix_resolver=None,
+        residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
+    )
     server_config = ServerConfig()
     server.settings.stateless_http = server_config.stateless_http
     server.settings.json_response = server_config.json_response

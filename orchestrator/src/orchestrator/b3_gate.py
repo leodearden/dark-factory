@@ -27,6 +27,7 @@ from typing import Any
 from shared import safe_io
 from shared.project_layout import escalation_queue_dir, tasks_db
 from shared.safe_io import load_json_or_warn
+from shared.task_tags import DEFAULT_TAG
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 
 from orchestrator.stop_instruction import detect_stop_instruction
@@ -71,11 +72,11 @@ Canonical source: merge_queue.POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
 Re-declared here (not imported) to keep b3_gate dependency-light — b3_gate
 uses stdlib sqlite3 only and imports orchestrator.config lazily; importing
 from merge_queue would pull event_store / git_ops / verify at module load.
-A coherence test in test_b3_gate.py asserts these two constants stay in sync
-so they cannot silently drift (see TestPostMergeRedMainAbort.test_coherence_*).
+A coherence test in test_b3_gate_hard_aborts.py asserts these two constants
+stay in sync so they cannot silently drift (see
+TestPostMergeRedMainAbort.test_coherence_*).
 """
 
-DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
 
@@ -136,7 +137,7 @@ def _load_state(path: Path) -> dict[str, Any]:
 
     Thin backward-compatible wrapper around _load_state_checked that discards
     the ok flag.  Retained **solely** as a test-suite helper — the ~18 call
-    sites in test_b3_gate.py use this shim so they do not need to unpack a
+    sites in test_b3_gate_state.py use this shim so they do not need to unpack a
     (state, ok) tuple.  There are **no production callers**: record_launch,
     charge, and run_check all call _load_state_checked directly so they can
     act on the ok flag and fail CLOSED on corruption.
@@ -406,7 +407,7 @@ def check_proposal(
           block_reason, including any other fence, an unterminated one, and
           whatever follows a stray fence line inside captured output.  Pinned
           by
-          orchestrator/tests/test_b3_gate.py::TestStopScanExcludesCapturedOutput.
+          orchestrator/tests/test_b3_gate_hard_aborts.py::TestStopScanExcludesCapturedOutput.
           Hard-aborted before risk_label/git checks, same shape as 1b, and
           takes precedence even over an otherwise-fresh low-risk entry — a
           stop instruction is the highest-authority human directive and must

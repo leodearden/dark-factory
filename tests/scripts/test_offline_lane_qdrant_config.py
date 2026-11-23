@@ -3,7 +3,7 @@
 Per plans/integration-test-lane-prd.md task beta: dark-factory-orchestrator.yaml
 instantiates the generic config-driven off-hot-path offline lane (schema
 delivered by task 2789/alpha) with a ``qdrant-integration`` command that runs
-``pytest -m integration`` in ``fused-memory/`` — restoring the
+``uv run pytest -m integration`` in ``fused-memory/`` — restoring the
 qdrant-client/mem0 version-compat coverage that task 2773 removes from the
 merge-verify hot path, on the offline lane instead of letting it lapse.
 
@@ -73,9 +73,9 @@ def test_offline_lane_qdrant_config_round_trips_through_config_model(
         "the 'qdrant-integration' offline_lane_commands entry is not a "
         f"LaneCommand instance (got {type(command)!r})"
     )
-    assert command.command == "pytest -m integration", (
+    assert command.command == "uv run pytest -m integration", (
         "the 'qdrant-integration' entry's .command did not round-trip "
-        "'pytest -m integration' from the committed YAML — check for a "
+        "'uv run pytest -m integration' from the committed YAML — check for a "
         "field rename/typo in config.py"
     )
     assert command.cwd == "fused-memory", (
@@ -88,9 +88,9 @@ def test_offline_lane_qdrant_config_round_trips_through_config_model(
         "round-trip 'medium' from the committed YAML — check for a field "
         "rename/typo in config.py"
     )
-    assert command.outage_probe == "python scripts/lane_dependency_probe.py", (
+    assert command.outage_probe == "uv run python scripts/lane_dependency_probe.py", (
         "the 'qdrant-integration' entry's .outage_probe did not round-trip "
-        "'python scripts/lane_dependency_probe.py' from the committed YAML — "
+        "'uv run python scripts/lane_dependency_probe.py' from the committed YAML — "
         "check for a field rename/typo in config.py"
     )
     assert command.enabled is True, (

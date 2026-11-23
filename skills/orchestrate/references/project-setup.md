@@ -30,11 +30,11 @@ Both forms behave identically. When both are set, `--config` wins. If neither is
 | reify | `/home/leo/src/reify/dark-factory-orchestrator.yaml` | `reify` | `/home/leo/src/reify` |
 | autopilot-video | `/home/leo/src/autopilot-video/dark-factory-orchestrator.yaml` | `autopilot_video` | `/home/leo/src/autopilot-video` |
 
-`dark-factory-orchestrator.yaml` (used above by every project) is now the canonical, required top-level config filename for any orchestrator-targeted project — it's the name the dashboard's escalation-URL discovery keys on, and any new project should use it (see "Setting up a new project" below).
+`dark-factory-orchestrator.yaml` (used above by all three) is the canonical, required top-level config filename for any orchestrator-targeted project — it's the only name the dashboard's escalation-URL discovery reads, and any new project should use it (see "Setting up a new project" below). The orchestrator *binary* would run from any filename, since the `--config` flag (or `ORCH_CONFIG_PATH`) always names the file explicitly — but a non-canonical name is not picked up by dashboard discovery at all: there is no legacy fallback and no nudge warning (task 7138 retired both).
 
 ## Setting up a new project
 
-1. **Name the config file `dark-factory-orchestrator.yaml`, at the repo root.** This is the canonical, required filename — it's what the dashboard's escalation-URL discovery keys on. The orchestrator binary itself never auto-discovers the file (`--config`/`ORCH_CONFIG_PATH` always name it explicitly), but only the canonical name is picked up by dashboard discovery without a legacy-fallback warning.
+1. **Name the config file `dark-factory-orchestrator.yaml`, at the repo root.** This is the canonical, required filename — it's what the dashboard's escalation-URL discovery keys on. The orchestrator binary itself never auto-discovers the file (`--config`/`ORCH_CONFIG_PATH` always name it explicitly), but dashboard discovery reads only the canonical name. A project under any other name still shows its tasks, but its escalation-backed views (escalations, merge queue and halt status, task runtime state) go dark and its burndown run-slot capacity reads as unknown.
 
 2. **Write the minimum required keys**:
    ```yaml

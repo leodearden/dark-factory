@@ -12,9 +12,6 @@ import errno
 import logging
 import os
 import signal
-import subprocess
-import sys
-import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -24,6 +21,7 @@ from typing import Any
 import pytest
 from _process_identity_variants import own_identity
 from _process_tree_fakes import claude_process_tree, counting_walks
+from _shared_host_fixtures import REQUIRES_PROC, running_shared_host
 from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
@@ -287,31 +285,11 @@ class TestRefusals:
 
 @pytest.fixture
 def shared_host_pid(tmp_path_factory: pytest.TempPathFactory) -> Iterator[int]:
-    """A live process whose argv is ``<python> agents --inherit-permission-mode ...``."""
-    host_dir = tmp_path_factory.mktemp('agents-host')
-    (host_dir / 'agents').write_text('import time\ntime.sleep(600)\n', encoding='utf-8')
-    proc = subprocess.Popen(
-        [sys.executable, 'agents', '--inherit-permission-mode', 'bypassPermissions'], cwd=host_dir,
-    )
-    try:
-        _await_host_argv(proc.pid)
-        yield proc.pid
-    finally:
-        proc.kill()
-        proc.wait(timeout=10)
+    with running_shared_host(tmp_path_factory.mktemp('agents-host')) as pid:
+        yield pid
 
 
-def _await_host_argv(pid: int) -> None:
-    """Wait until ``/proc/<pid>/cmdline`` shows the host argv; exec publishes it after Popen returns."""
-    cmdline = Path(f'/proc/{pid}/cmdline')
-    deadline = time.monotonic() + 10
-    while cmdline.read_bytes().split(b'\0')[1:2] != [b'agents']:
-        if time.monotonic() > deadline:
-            pytest.fail(f'{cmdline} never showed the `agents` argv')
-        time.sleep(0.01)
-
-
-@pytest.mark.skipif(not Path('/proc/self/cmdline').exists(), reason='host detection reads /proc')
+@REQUIRES_PROC
 def test_a_shared_session_host_is_never_signalled(tmp_path, shared_host_pid):
     armed = _armed(tmp_path, claude_owner_pid=shared_host_pid)
     kill = _KillRecorder(tmp_path)

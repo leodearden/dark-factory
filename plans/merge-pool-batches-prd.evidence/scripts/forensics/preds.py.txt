@@ -1,0 +1,28 @@
+from common import *
+bysha={}
+for v in V: bysha.setdefault(v['merge_sha'],[]).append(v)
+EV=events()
+def near(task,lo,hi,types):
+    out=[]
+    for e in EV:
+        if e['task']==task and e['et'] in types and lo<=e['ts']<=hi:
+            d=e['d']; out.append('%s %s %s'%(e['ts'][11:16],e['et'],(d.get('cause') or d.get('reason') or d.get('state') or d.get('outcome') or '')[:28]+(('/'+d['killer']['site']+':'+str(d['killer']['task_id'])) if d.get('killer') else '')))
+    return out
+for v in V:
+    if v['k']<=1 or v['passed'] or v['ts']<'2026-11-15T11:19': continue
+    k=v['k']; pred=v['layers'][k:]
+    unl=[l for l in pred if not l.get('on_main_now') and l.get('task')]
+    if not unl or v['base_relation']=='main': continue
+    top=pred[0]
+    pv=bysha.get(top['sha'],[])
+    s=[]
+    for w in pv:
+        fs=fset(w)
+        s.append('pred-verify %s owner %s k%d %s %s end %s [%s] (%+.0f min vs chain end)'%(w['vid'],w['task'],w['k'],w['runner'][:3],'PASS' if w['passed'] else 'RED',w['ts'][5:16],','.join(sorted(fs)) if fs else '',(w['end']-v['end'])/60))
+    if not pv: s.append('NO merge_verify row for pred tip %s (owner of that layer: %s)'%(top['sha'][:8],top.get('task')))
+    lo=dt.datetime.fromtimestamp(v['start']-60,dt.timezone.utc).isoformat(); hi=dt.datetime.fromtimestamp(v['end']+3600,dt.timezone.utc).isoformat()
+    print(v['vid'],v['ts'][5:16],'own',v['task'],'k%d'%k,'| pred stack:',','.join(str(l.get('task')) for l in pred[::-1]),'|',' ; '.join(s))
+    # what the lane did to the pred owner afterwards
+    powner=[l for l in pred if l.get('task')][-1]['task'] if not pv else pv[0]['task']
+    print('      pred-owner',powner,'events:',' | '.join(near(powner,lo,hi,('merge_verify_cancelled','verdict_voided','speculative_discard','merge_finalized','merge_attempt'))[:6]))
+    print('      chain-owner',v['task'],'events:',' | '.join(near(v['task'],lo,hi,('merge_verify_cancelled','verdict_voided','speculative_discard','merge_finalized','merge_attempt'))[:6]))

@@ -171,6 +171,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. Recovery archives: every pinned dump present, size + sha256
+# ---------------------------------------------------------------------------
+info "Recovery archive checks"
+if python3 "$REPO_ROOT/scripts/recovery_archive.py" check "$REPO_ROOT"; then
+  check_pass "Recovery archives: every pinned FalkorDB pre-state dump present with its size and sha256"
+else
+  check_fail "Recovery archives: a pinned dump is missing or altered (listed above); restore it from the export's recovery-archive/ (docs/falkordb-recovery-dumps.md)"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Secrets files
 # ---------------------------------------------------------------------------
 info "Secrets checks"
@@ -265,6 +275,7 @@ if [ "$CHECKS_FAILED" -gt 0 ]; then
   echo "    Qdrant:   docker compose -f $COMPOSE_FILE up -d qdrant"
   echo "    fused-memory: systemctl --user start fused-memory"
   echo "    Check import: bash $REPO_ROOT/scripts/import-data.sh <export-dir>"
+  echo "    Recovery archives: python3 $REPO_ROOT/scripts/recovery_archive.py copy <export-dir>/recovery-archive $REPO_ROOT"
   echo ""
   exit 1
 else

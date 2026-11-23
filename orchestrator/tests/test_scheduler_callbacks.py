@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import ANY, AsyncMock, Mock
 
@@ -330,11 +329,12 @@ class TestWorkflowCancelGraceAndActivelyHeld:
         assert scheduler.workflow_cancel_recent('T1') is True
 
     def test_workflow_cancel_recent_false_after_grace_elapses(self):
-        scheduler = Scheduler(OrchestratorConfig())
-        # Tiny grace window so the test doesn't need to sleep 30s.
-        scheduler._RECONCILE_CANCEL_GRACE_S = 0.01
+        clock = {'t': 1000.0}
+        scheduler = Scheduler(OrchestratorConfig(), time_source=lambda: clock['t'])
         scheduler.note_workflow_cancelled('T1')
-        time.sleep(0.05)
+        clock['t'] = 1029.0
+        assert scheduler.workflow_cancel_recent('T1') is True
+        clock['t'] = 1030.0
         assert scheduler.workflow_cancel_recent('T1') is False
 
     def test_clear_workflow_cancel_makes_it_false_immediately(self):
@@ -419,22 +419,18 @@ class TestMergePhaseGraceTracking:
         assert scheduler.merge_phase_grace_active(0.0) is False
         assert scheduler.merge_phase_grace_active(-5.0) is False
 
-    def test_grace_auto_expires_past_grace_window(self, monkeypatch):
-        scheduler = Scheduler(OrchestratorConfig())
+    def test_grace_auto_expires_past_grace_window(self):
         clock = {'t': 1000.0}
-        # scheduler.py stamps via ``time.monotonic()`` — patch the shared
-        # module attribute so the stamp and the read use the same fake clock.
-        monkeypatch.setattr(time, 'monotonic', lambda: clock['t'])
+        scheduler = Scheduler(OrchestratorConfig(), time_source=lambda: clock['t'])
         scheduler.note_merge_phase_entered('T1')  # stamped at t=1000
         clock['t'] = 1000.0 + 50.0  # 50s elapsed, within a 100s grace
         assert scheduler.merge_phase_grace_active(100.0) is True
         clock['t'] = 1000.0 + 150.0  # 150s elapsed, past a 100s grace
         assert scheduler.merge_phase_grace_active(100.0) is False
 
-    def test_grace_active_if_any_tracked_task_is_fresh(self, monkeypatch):
-        scheduler = Scheduler(OrchestratorConfig())
+    def test_grace_active_if_any_tracked_task_is_fresh(self):
         clock = {'t': 1000.0}
-        monkeypatch.setattr(time, 'monotonic', lambda: clock['t'])
+        scheduler = Scheduler(OrchestratorConfig(), time_source=lambda: clock['t'])
         scheduler.note_merge_phase_entered('OLD')  # stamped at t=1000
         clock['t'] = 1000.0 + 500.0
         scheduler.note_merge_phase_entered('FRESH')  # stamped at t=1500

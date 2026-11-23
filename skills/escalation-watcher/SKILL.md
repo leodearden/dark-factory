@@ -1855,7 +1855,7 @@ of record and never writes them; its only files are under `data/sitting/`, plus
 `data/return-brief.md`. Every mutation below is an agent action from a pre-built payload, taken
 only for an item Leo has answered or one that clears the carve-out in "Ruled-elsewhere check
 (answered-but-unrecorded)" above, whose gates it evaluates and does not restate. Run it from the
-project root as `uv run --frozen --project shared python scripts/sitting/prepare_sitting.py
+project root as `uv run --no-sync --project shared python scripts/sitting/prepare_sitting.py
 <subcommand>`.
 
 #### When it runs
@@ -1953,10 +1953,10 @@ enter through `resolve-answers`, with `--source docket` or `--source terminal`.
    record is still pending (see "Sitting markers" below; the REPLACES caution applies).
 3. `resolve_issue(..., resolution_turns=<the value resolve-answers printed>)`.
 4. The `update_task` `x_ruling` payload. Say so when it discloses a value it supersedes.
-5. The pre-built `close-decision` payload, quoting the deciding evidence. `close-decision` requires
-   `--project` and `--escalations-dir` naming the record you READ, and refuses any other record, so
-   run the payload rather than hand-typing the verb. A non-zero exit stops that item's apply; report
-   it to Leo.
+5. The pre-built close payload (`close-decision`, or `file-and-close-decision` for an L2 with no
+   DecisionRecord), quoting the deciding evidence. `close-decision` requires `--project` and
+   `--escalations-dir` naming the record you READ, and refuses any other record, so run the payload
+   rather than hand-typing the verb. A non-zero exit stops that item's apply; report it to Leo.
 6. One `add_memory` as `decisions_and_rationale`, plus a second write carrying the rationale to a
    Mem0 category, because the Graphiti route keeps the conclusion and distills the reasoning away.
 
@@ -1966,12 +1966,14 @@ stops the apply before the registry records an answer. On `park_on_info` the rec
 info-severity: do not retry the park; hold the task with a deferral (AFK shift 1) and report it to
 Leo.
 
-An L2 with no DecisionRecord is filed, then closed, under
-`scripts/sitting/payloads.py::sitting_decision_id`: `<project>-<esc id>`, or `<project>-recon-<esc
-id>` for the recon queue, which is the id `write-decision` stores for the project-local id the
-payload files. Decision ids are fleet-global while escalation numbering restarts per project; see
-"Across *projects*, the same local id is two rows" in "Filing Parked Decisions to the Cockpit
-Registry (C8)".
+An L2 with no DecisionRecord gets a payload of one `file-and-close-decision` run of its
+project-local id (`scripts/sitting/payloads.py::close_decision_argv`): `<esc id>`, or `recon-<esc
+id>` for the recon queue. That run closes the id its own `write-decision` filing landed on:
+`<project>-<local id>`, or a same-project legacy record filed under the bare id before task 4835,
+continued in place. So never hand-split it into `write-decision` plus `close-decision`: the close
+would name an id the filing may not have used. Decision ids are fleet-global while escalation
+numbering restarts per project; see "Across *projects*, the same local id is two rows" in "Filing
+Parked Decisions to the Cockpit Registry (C8)".
 
 #### Findings for another task's owner
 
@@ -2055,6 +2057,7 @@ resolution, and is never a flake.
 **Never auto-resolve** — `manual_intervention` is authoritative. The human has to inspect `project_root`:
 - For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
 - For `unmerged_state`: run `git status` in `project_root`; UU/AA/DD files need `git mergetool`, manual edit, or `git reset` depending on intent.
+- For a record carrying `halt_released_at` (any of the three; on the full record from `mcp__escalation__get_escalation`, not in a compact row): it was re-tested clean at a restart and no longer halts the queue, so it is not `get_merge_halt_status`'s `owner_esc_id`. Read its `halt_release_note`, then give it the disposition its category calls for here — still never auto-resolved. See `OPERATIONS.md` §"Merge-halt semantics" → "Across a restart".
 - For `stash_failed`: inspect the main checkout's uncommitted work and commit it — or get its owner to. **Do not reach for `git stash`**: CLAUDE.md forbids it in *any* dark-factory checkout, `project_root` or task worktree, because `refs/stash` is a single ref shared by every worktree in the checkout (it is not per-worktree) and the merge worker's advance path consumes the same stack — so a stash you push can be popped out from under you, and a pop on a clean tree can apply an unrelated task's WIP into it (incident 13674d3c68). Park WIP as commits on a branch.
   - **Sub-variant:** if the detail/log instead shows `CRITICAL: stale refs/dark-factory/merge-park present`, that's a stale `MERGE_PARK_REF` left over from a prior crash — it holds real, unrecovered WIP that the code deliberately refuses to overwrite. Committing `project_root`'s current dirty files is not enough here: the stale ref itself is what's blocking the next park attempt, so the halt recurs immediately on the next advance. Recovery means inspecting and draining that ref first — e.g. `git branch <recovery-name> refs/dark-factory/merge-park` to make its WIP reachable, then `git update-ref -d refs/dark-factory/merge-park` to free it — before cleaning up `project_root`.
 

@@ -1043,10 +1043,10 @@ def _materialize_b_grouped(
     variable from an authoring-quality variable.
 
     The canonical carries ``canonical: True`` and NO ``kind``: ``'canonical'``
-    is not a member of β's ``KIND_REGISTRY`` and would be a fatal
-    ``unknown_kind`` violation.  Canonicality is expressed by the
-    ``canonical`` key; ``kind`` says what a CHILD is (``amendment`` /
-    ``sighting``), and the two are not interchangeable.
+    is not a member of β's ``KIND_REGISTRY`` and would census as an
+    ``unknown_kind`` violation (an unregistered kind).  Canonicality is
+    expressed by the ``canonical`` key; ``kind`` says what a CHILD is
+    (``amendment`` / ``sighting``), and the two are not interchangeable.
 
     Child ``parent_id`` values are derived from the canonical CLAIM id via
     :func:`_derive_record_id`, never minted randomly, so the
@@ -1869,23 +1869,9 @@ def _load_sibling_script(name: str) -> Any:
     other reflection-based decorators look the defining module up there, so
     a module loaded without registering breaks on the way in.
     """
-    import importlib.util
-    import sys
+    from fused_memory.utils.script_loader import load_script
 
-    if name in sys.modules:
-        return sys.modules[name]
-    path = _SCRIPTS_DIR / f'{name}.py'
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise FixtureError(f'cannot load sibling script {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
-    return module
+    return load_script(_SCRIPTS_DIR / f'{name}.py', name)
 
 
 def load_audit_script() -> Any:
@@ -3805,16 +3791,18 @@ class SeedingError(RuntimeError):
 class MeasurementError(RuntimeError):
     """A query returned nothing measurable, so nothing was measured.
 
-    ``Mem0Client.search`` swallows ``TimeoutError`` and returns ``{}``
-    (``backends/mem0_client.py``), so a network failure and a shape that
-    ranked nothing arrive here as the same empty list — which this module's
-    own rule ("an empty hits list with a real expectation IS a measured
-    zero") would then score as 0.0 recall, 0.0 discoverability, 0.0 guard
-    across the board.  Every arm seeds the SHARED distractor slab, so an
-    empty result list is never a legitimate outcome here: it is unambiguously
-    a failed query, and it is raised rather than recorded.  Silently
-    publishing a network failure as a measured zero in the artifact gate η
-    reads is precisely the silent fail-soft the design invariants forbid.
+    ``Mem0Backend`` reads propagate a read timeout
+    (``backends/mem0_client.py::Mem0Backend._timed_read`` raises
+    ``TimeoutError`` through ``backends/timeout_budget.py::await_within``),
+    so a timeout never reaches here as an empty reply.  An empty response is
+    still a reply that measured nothing, and this module's own rule ("an
+    empty hits list with a real expectation IS a measured zero") would score
+    it as 0.0 recall, 0.0 discoverability, 0.0 guard across the board.  Every
+    arm seeds the SHARED distractor slab, so an empty result list is never a
+    legitimate outcome here: it is unambiguously a failed query, and it is
+    raised rather than recorded.  Silently publishing a failed query as a
+    measured zero in the artifact gate η reads is precisely the silent
+    fail-soft the design invariants forbid.
     """
 
 
@@ -4028,8 +4016,8 @@ async def _search(
             f'{seeded.collection} returned no results for a {limit}-limit '
             f'query. Every arm seeds the shared distractor slab, so an empty '
             f'ranking is not a possible outcome — this is a failed query '
-            f'(mem0 swallows TimeoutError and returns {{}}), and recording it '
-            f'would publish a network failure as a measured zero. '
+            f'(an empty reply, not a raised read timeout), and recording it '
+            f'would publish a failed query as a measured zero. '
             f'Query text: {text[:120]!r}'
         )
     hits: list[ScoredHit] = []
@@ -4102,15 +4090,22 @@ async def fetch_arm(
         MeasurementError: _test_e2_bakeoff_e2_bakeoff_c_peers_main returned no
         results for a 10-limit query
 
-    Hypothesis for that observation: eight concurrent searches queue behind
-    each other in mem0's client and exceed
-    ``config.queue.backend_read_timeout_seconds``, which
-    ``Mem0Client.search`` SWALLOWS — it logs and returns ``{}``.  The read
-    side is therefore the one place where concurrency converts a latency win
-    into a silently-empty ranking, and this script's whole posture is that an
-    empty ranking must never be published as a measured zero.  The write side
-    keeps its bound because ``add`` propagates its timeout instead of
-    swallowing it.
+    That abort is kept here as history.  At the time ``Mem0Backend.search``
+    swallowed its read timeout and returned ``{}``, and the hypothesis was
+    that eight concurrent searches queued behind each other in mem0's client
+    and exceeded ``config.queue.backend_read_timeout_seconds``.  Since task
+    5265 the read timeout raises (``Mem0Backend._timed_read`` raises
+    ``TimeoutError`` via ``await_within``) instead of returning ``{}``, so
+    the same overload would now abort loudly with a ``TimeoutError`` rather
+    than as an empty ranking.
+    Reads stay serial until someone re-measures the concurrent read path;
+    this script's whole posture is that an empty ranking must never be
+    published as a measured zero.  Reads and writes now both raise on a
+    timeout, so propagation is not what separates them: the write side keeps
+    its ``SEED_CONCURRENCY`` concurrency bound because a full live run has
+    completed at that bound (``plans/e2-storage-shape-bakeoff-report.json``
+    records its ``seed_concurrency``), and the concurrent read path has no
+    such run.
 
     Re-derive before re-trying: a smaller bound, or a read timeout raised for
     the run, would both be defensible — but neither is worth a report that
@@ -5671,9 +5666,9 @@ async def run_bake_off(
     # that number is what its docstring exists to forbid.
 
     # Resolved HERE, before the first acquisition below — never in the `with`
-    # header further down.  `load_cleanup_script()` can raise
-    # (`_load_sibling_script` raises `FixtureError` when the spec cannot be
-    # built), and evaluated there it would sit after `mkdtemp` but before the
+    # header further down.  `load_cleanup_script()` can raise (a sibling
+    # whose body raises on first load propagates out of `load_script`), and
+    # evaluated there it would sit after `mkdtemp` but before the
     # `try` — the one window in which a raise leaks the queue directory.  That
     # it is unreachable today (the `ephemeral_collection_prefix` call above
     # has already cached the module) is an accident of ordering

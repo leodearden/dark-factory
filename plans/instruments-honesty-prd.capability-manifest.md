@@ -101,7 +101,7 @@ pattern in the sidecar had 0 matches on main at authoring (polarity: fails now, 
 
 | Capability asserted | Check | Evidence | Verdict |
 |---|---|---|---|
-| Rows 1–21 executable | DAG-direction | all producers upstream through η; rows 3–5 run on a fixture orchestrator by construction (a live pause is not to be induced), the rest on live df and reify stores | PASS |
+| Rows 1–21 executable | DAG-direction | all producers upstream through η; rows 3–5 run on a fixture orchestrator by construction (a live pause is not to be induced); row 8's omit arm is read from α's fixture test, because a fused-memory read migrates a v5 store and so no live store serves rows without the two keys; the rest on live df and reify stores | PASS |
 | Record is appended to the PRD | field-population | the gate writes `## Integration gate record` with observed postconditions; a row whose precondition did not occur in the window is recorded "not yet observed", never seeded (INV-13) | PASS |
 
 ## ι — Seven-day observation  *(leaf; `complexity='simple'`, dated milestone)*

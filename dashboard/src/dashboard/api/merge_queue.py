@@ -16,7 +16,6 @@ so a queue and the sparkline beside it cannot disagree about the present.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Request
@@ -36,8 +35,9 @@ from dashboard.data.merge_queue import (
     resolve_active,
 )
 from dashboard.data.metrics import get_merge_active_series
+from dashboard.data.task_activity import RUNS_DB
 from dashboard.data.task_lookup import lookup_tasks
-from dashboard.project_dbs import _project_scoped_dbs_labeled
+from dashboard.project_dbs import _project_scoped_dbs_labeled, roots_without_file
 
 router = APIRouter()
 
@@ -52,17 +52,14 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     clock = app_clock(request.app)
     render_at = clock()
 
-    project_dbs = await _project_scoped_dbs_labeled(
-        config,
-        pool,
-        Path('data/orchestrator/runs.db'),
-    )
+    project_dbs = await _project_scoped_dbs_labeled(config, pool, RUNS_DB)
     http_client: httpx.AsyncClient = request.app.state.http_client
     projects_raw, halt_status, live_map = await asyncio.gather(
         build_per_project_merge_queue(
             project_dbs,
             hours=window.days * 24,
             now=render_at,
+            runs_db_absent=roots_without_file(config, RUNS_DB),
         ),
         get_merge_halt_status(http_client, config.escalation_urls),
         fetch_live_merge_queues(http_client, config.escalation_urls),

@@ -1,0 +1,66 @@
+"""False-failure rate of solo merge verifies: applied solo fail followed by a pass of unchanged content."""
+import json,collections,subprocess,bisect,datetime as dt
+P='/tmp/gate-10069/predict/'; REPO='/home/leo/src/dark-factory'
+def T(s): return dt.datetime.fromisoformat(s).timestamp()
+E=[json.loads(l) for l in open(P+'events.jsonl')]
+wv=collections.defaultdict(list); landed=[]; mq=collections.defaultdict(list)
+for e in E:
+    e['t']=T(e['ts'])
+    if e['et']=='workflow_verify': wv[e['task']].append(e)
+    elif e['et']=='merge_finalized' and e['d']['state']=='done' and e['d'].get('merge_sha'): landed.append((e['t'],e['d']['merge_sha']))
+    elif e['et']=='merge_queued': mq[e['task']].append(e)
+for v in wv.values(): v.sort(key=lambda e:e['t'])
+landed.sort(); lt=[x[0] for x in landed]
+def main_at(t):
+    i=bisect.bisect_right(lt,t)-1; return landed[i][1] if i>=0 else None
+inv=collections.defaultdict(list)
+for l in open(P+'inv.jsonl'):
+    x=json.loads(l); x['t']=T(x['ts']); inv[x['task']].append(x)
+rows=json.load(open(P+'rows_all.json'))
+by=collections.defaultdict(list)
+for r in rows: by[r['task']].append(r)
+for v in by.values(): v.sort(key=lambda r:r['enq_t'])
+def git(*a):
+    p=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True); return p.returncode,p.stdout.strip()
+_pid={}
+def patch_id(tip,t):
+    if not tip: return None
+    m=main_at(t)
+    if not m: return None
+    k=(tip,m)
+    if k in _pid: return _pid[k]
+    rc,mb=git('merge-base',tip,m)
+    if rc!=0 or not mb: _pid[k]=None; return None
+    p1=subprocess.Popen(['git','-C',REPO,'diff',mb,tip],stdout=subprocess.PIPE)
+    p2=subprocess.run(['git','-C',REPO,'patch-id','--stable'],stdin=p1.stdout,capture_output=True,text=True)
+    out=p2.stdout.split()[0] if p2.stdout.strip() else ('EMPTY' if p2.returncode==0 else None)
+    _pid[k]=out; return out
+def tip_at(task,t):
+    w=[e for e in wv.get(task,()) if e['t']<=t+5]
+    return w[-1]['d'].get('tip_sha') if w else None
+LO=T('2026-10-22T00:00:00+00:00'); D=T('2026-11-19T04:25:50+00:00')
+AGENT={'implementer','debugger','steward','merger','simple_task','architect'}
+res=collections.Counter(); detail=[]
+for task,rs in by.items():
+    for i,r in enumerate(rs):
+        if r['src']!='solo_fail' or r['verdict_t']<LO: continue
+        nxt=next((x for x in rs[i+1:] if x['y'] is not None or True),None)
+        era='post8528' if r['verdict_t']>=D else 'pre8528'
+        if nxt is None: res[(era,'no later request')]+=1; continue
+        a=tip_at(task,r['enq_t']); b=tip_at(task,nxt['enq_t'])
+        same_tip=(a is not None and a==b)
+        pa=patch_id(a,r['enq_t']); pb=patch_id(b,nxt['enq_t'])
+        same_patch=(pa is not None and pa==pb and pa!='EMPTY')
+        n_agent=sum(1 for x in inv.get(task,()) if r['verdict_t']<x['t']<nxt['enq_t'] and x['role'] in AGENT)
+        n_wv=sum(1 for e in wv.get(task,()) if r['verdict_t']<e['t']<=nxt['enq_t']+5)
+        ny={0:'next PASS',1:'next FAIL',None:'next no verdict'}[nxt['y']]
+        content='unchanged(tip)' if same_tip else ('unchanged(patch-id)' if same_patch else ('unknown' if (pa is None or pb is None) else 'changed'))
+        res[(era,ny,content,'agent_ran' if n_agent else 'no_agent')]+=1
+        detail.append((task,r['rid'],nxt['rid'],ny,content,n_agent,n_wv,r['disposition'],(r['block_reason'] or '')[:90]))
+tot=collections.Counter()
+for k,v in sorted(res.items(),key=lambda x:str(x[0])): print(v,k); tot[k[0]]+=v
+print('totals',dict(tot))
+print('\nunchanged-content + next PASS cases:')
+for d in detail:
+    if d[3]=='next PASS' and d[4].startswith('unchanged'): print('  ',d)
+json.dump(detail,open(P+'falsefail_detail.json','w'))

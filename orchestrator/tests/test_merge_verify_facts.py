@@ -2,8 +2,9 @@
 
 ``orchestrator.merge_verify_facts`` is the closed wire vocabulary the
 merge-lane-policy PRD (``plans/merge-lane-policy-prd.md`` D10) keys on:
-``runner_reason`` says why a verify ran on the host it ran on, and
-``base_relation`` says what the verified merge was built on.
+``runner_reason`` says why a verify ran on the host it ran on,
+``base_relation`` says what the verified merge was built on, and
+``chain_depth_reason`` says why the deep policy chose the verify's depth.
 """
 from __future__ import annotations
 
@@ -13,6 +14,9 @@ import pytest
 
 from orchestrator.merge_verify_facts import (
     BaseRelation,
+    ChainDepthBasis,
+    ChainDepthReason,
+    ChainMembers,
     MergeVerifyDispatchFacts,
     RunnerReason,
     classify_base_relation,
@@ -74,12 +78,16 @@ class TestMergeVerifyDispatchFacts:
             base_relation=BaseRelation.STACKED,
         )
         fields = facts.event_fields()
-        assert fields == {'runner_reason': 'remote_busy', 'base_relation': 'stacked'}
-        assert all(type(v) is str for v in fields.values())
+        assert fields == {
+            'runner_reason': 'remote_busy', 'base_relation': 'stacked',
+            'chain_depth_reason': None,
+        }
+        assert type(fields['runner_reason']) is str
+        assert type(fields['base_relation']) is str
 
     def test_event_fields_of_no_facts_are_present_and_null(self) -> None:
         assert MergeVerifyDispatchFacts().event_fields() == {
-            'runner_reason': None, 'base_relation': None,
+            'runner_reason': None, 'base_relation': None, 'chain_depth_reason': None,
         }
 
     def test_as_retry_marks_the_held_host_and_keeps_the_base(self) -> None:
@@ -105,6 +113,87 @@ class TestMergeVerifyDispatchFacts:
         )
 
 
+def _table_row_reason() -> ChainDepthReason:
+    return ChainDepthReason(
+        basis=ChainDepthBasis.PASS_ESTIMATE,
+        pass_estimate=0.95,
+        row=(0.93, 8),
+        queue_depth=12,
+    )
+
+
+class TestChainDepthReason:
+    def test_wire_of_a_table_row_choice(self) -> None:
+        wire = _table_row_reason().wire()
+        assert wire == {
+            'basis': 'pass_estimate',
+            'pass_estimate': 0.95,
+            'row': [0.93, 8],
+            'queue_depth': 12,
+        }
+        assert type(wire['basis']) is str
+
+    def test_wire_of_a_cold_window_has_no_estimate(self) -> None:
+        reason = ChainDepthReason(
+            basis=ChainDepthBasis.NO_ESTIMATE,
+            pass_estimate=None,
+            row=(0.93, 8),
+            queue_depth=3,
+        )
+        assert reason.wire() == {
+            'basis': 'no_estimate',
+            'pass_estimate': None,
+            'row': [0.93, 8],
+            'queue_depth': 3,
+        }
+
+    def test_wire_of_an_estimate_below_every_row_has_no_row(self) -> None:
+        reason = ChainDepthReason(
+            basis=ChainDepthBasis.PASS_ESTIMATE,
+            pass_estimate=0.5,
+            row=None,
+            queue_depth=5,
+        )
+        assert reason.wire() == {
+            'basis': 'pass_estimate',
+            'pass_estimate': 0.5,
+            'row': None,
+            'queue_depth': 5,
+        }
+
+    def test_is_frozen(self) -> None:
+        pytest.raises(
+            dataclasses.FrozenInstanceError, setattr,
+            _table_row_reason(), 'queue_depth', 1,
+        )
+
+
+class TestChainDepthReasonOnTheRow:
+    def test_with_chain_depth_reason_is_a_new_value(self) -> None:
+        original = MergeVerifyDispatchFacts(runner_reason=RunnerReason.REMOTE_BUSY)
+        reasoned = original.with_chain_depth_reason(_table_row_reason())
+        assert reasoned is not original
+        assert original.chain_depth_reason is None
+        assert reasoned.chain_depth_reason == _table_row_reason()
+        assert reasoned.runner_reason is RunnerReason.REMOTE_BUSY
+
+    def test_event_fields_carry_the_wire_shape(self) -> None:
+        facts = MergeVerifyDispatchFacts().with_chain_depth_reason(_table_row_reason())
+        assert facts.event_fields()['chain_depth_reason'] == _table_row_reason().wire()
+
+    def test_reason_survives_covering_and_retry(self) -> None:
+        members = ChainMembers(('mr-a', 'mr-b'), ('101', '102'))
+        facts = (
+            MergeVerifyDispatchFacts(runner_reason=RunnerReason.PREFER_REMOTE_FREE)
+            .with_chain_depth_reason(_table_row_reason())
+            .covering(members)
+            .as_retry()
+        )
+        assert facts.chain_depth_reason == _table_row_reason()
+        assert facts.members == members
+        assert facts.event_fields()['chain_depth_reason'] == _table_row_reason().wire()
+
+
 class TestClosedVocabulary:
     def test_runner_reason_values(self) -> None:
         assert {r.value for r in RunnerReason} == {
@@ -116,4 +205,9 @@ class TestClosedVocabulary:
     def test_base_relation_values(self) -> None:
         assert {b.value for b in BaseRelation} == {
             'main', 'stacked', 'rebased_head', 'stale',
+        }
+
+    def test_chain_depth_basis_values(self) -> None:
+        assert {b.value for b in ChainDepthBasis} == {
+            'pass_estimate', 'no_estimate',
         }

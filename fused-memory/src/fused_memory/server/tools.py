@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import uuid as uuid_mod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import StrictBool
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 from shared.defects import DeclareEvent, MalformedDefectRef, OutcomeEvent
 from shared.delivered_check_polarity import (
@@ -31,7 +32,8 @@ from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_submit import is_ticket_id, looks_like_task_id
-from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
+from shared.uuid_prefix import strip_uuid_prefix_override
+from shared.uuid_prefix_guard import Namespace, PrefixResolver, Resolution, ResolverUnavailable
 
 from fused_memory.backends.defect_records import (
     DefectEventInvalid,
@@ -54,6 +56,8 @@ from fused_memory.backends.task_projection import (
 )
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
+from fused_memory.embedder.endpoint_probe import EmbedderEndpointProbe
+from fused_memory.embedder.status import embedder_identity_status
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
@@ -173,6 +177,7 @@ from fused_memory.server.grouped_read import (
     group_search_results,
 )
 from fused_memory.server.guard_excerpt import excerpt_fields
+from fused_memory.server.manifest_root import resolve_manifest_root
 from fused_memory.server.manifest_stamping import (
     stamp_capability_manifests,
     stamping_action_required,
@@ -274,6 +279,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
+    from fused_memory.server.markup_residue_spool import MarkupResidueSpool
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -621,7 +627,8 @@ Conventions:
   nothing is soft-blocked, the ack carries routed (stored | restated | amended | contested) plus
   canonical_id on an attach, and a restated write becomes a sighting CHILD of the memory it
   restates rather than a standalone entry, so the full text you submitted is kept and the canonical
-  is never edited. There, allow_near_duplicate means force-store (store it standalone, do not
+  is never edited; restated means a near-verbatim repeat that adds nothing, since a write merely
+  about the same thing is judged and filed amended or contested. There, allow_near_duplicate means force-store (store it standalone, do not
   reroute it) rather than bypass-the-reject. Searching first is worth doing either way: it is how
   you find the entry to update instead of restating it.
 - Never write raw MCP envelope markup into a payload. EVERY tool's string parameters are
@@ -725,6 +732,26 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
 #: The refusal a read tool gives a prefix that names several ids; the uuid
 #: prefix guard refuses with the same error_type.
 _AMBIGUOUS_UUID_PREFIX = 'ambiguous_uuid_prefix'
+
+
+def per_use_id_resolver(
+    memory_service: MemoryService, id_resolver: IdResolver | None = None,
+) -> Callable[[], IdResolver]:
+    """The ``IdResolver`` for the NEXT resolution: *id_resolver* when injected, else one built from *memory_service*.
+
+    Built per use: the resolver is stateless and its factory reads the
+    service's CURRENT config, so a hot reload of the Mem0 read timeout or
+    collection prefix applies to the next resolution.
+    """
+    return lambda: id_resolver or IdResolver.for_memory_service(memory_service)
+
+
+def per_use_prefix_resolver(
+    memory_service: MemoryService, id_resolver: IdResolver | None = None,
+) -> PrefixResolver:
+    """:func:`per_use_id_resolver`'s ``resolve_prefix``: the uuid-prefix guard's and /resolve-prefix's resolver."""
+    resolver = per_use_id_resolver(memory_service, id_resolver)
+    return lambda project_id, prefix: resolver().resolve_prefix(project_id, prefix)
 
 
 @dataclass(frozen=True)
@@ -1410,16 +1437,14 @@ def create_mcp_server(
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
     id_resolver: IdResolver | None = None,
+    markup_residue_spool: MarkupResidueSpool | None = None,
+    embedder_probe: EmbedderEndpointProbe | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
 
-    def _resolver() -> IdResolver:
-        # Built per use: the resolver is stateless and its factory reads the
-        # service's CURRENT config, so a hot reload of the read timeout or
-        # collection prefix applies to the next resolution.
-        return id_resolver or IdResolver.for_memory_service(memory_service)
+    _resolver = per_use_id_resolver(memory_service, id_resolver)
     _taskmaster_configured = task_interceptor is not None
     _task_facts_reader: TaskFactsReader | None = task_interceptor
 
@@ -1696,9 +1721,7 @@ def create_mcp_server(
 
     # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
     register_resolve_prefix_route(
-        mcp,
-        lambda project_id, prefix: _resolver().resolve_prefix(project_id, prefix),
-        known_projects=_kp,
+        mcp, per_use_prefix_resolver(memory_service, id_resolver), known_projects=_kp,
     )
 
     # ------------------------------------------------------------------
@@ -3301,7 +3324,10 @@ def create_mcp_server(
         # for _causation_id/source and never forwards it to the store, so the
         # write-time flag cannot reach persistence by this path. Kept so a future
         # metadata pass-through cannot silently start persisting it.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -3515,9 +3541,10 @@ def create_mcp_server(
         is ever soft-blocked, and the response carries two extra fields.
 
         * ``routed`` — what triage did with the write, one of ``stored``
-          (a new standalone memory), ``restated`` (it restates an existing
-          memory), ``amended`` (it adds to one) or ``contested`` (it says
-          one is wrong, outdated or different).
+          (a new standalone memory), ``restated`` (it repeats an existing
+          memory near-verbatim, adding nothing), ``amended`` (it adds to
+          one) or ``contested`` (it says one is wrong, outdated or
+          different).
         * ``canonical_id`` — the memory the write was attached to. Present
           ONLY on an attach outcome; absent entirely for ``stored``.
 
@@ -3526,6 +3553,14 @@ def create_mcp_server(
         rediscovery is counted, and the canonical is never edited. Nothing is
         lost and no write is ever blocked — a retrieval or judge failure
         degrades to a plain ``stored``, never to an error.
+
+        ``restated`` is rare. It means your write repeats an existing memory
+        near-verbatim (the rule is ``server/near_verbatim.py``), which is
+        why a sighting's text can be only counted. A write that is merely
+        about the same thing, however similar, is judged and filed
+        ``amended``, its text then digested into the canonical's grouped
+        document, or ``contested``. So a ``restated`` ack really does mean
+        your write added nothing.
 
         A ``contested`` write becomes an AMENDMENT CHILD flagged as contesting
         its parent. Nothing was blocked and nothing was decided: triage
@@ -3720,7 +3755,10 @@ def create_mcp_server(
         # DF 3083 is the closed predecessor. Only the override STRIP remains a
         # tool-body responsibility, because the guard forwards allow_mcp_markup
         # UNCHANGED to a tool that declares `metadata`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         if (
             category == 'temporal_facts'
             and isinstance(agent_id, str)
@@ -4340,7 +4378,10 @@ def create_mcp_server(
         # the single point where the caller's `metadata` becomes persisted
         # state: stripping here cannot be bypassed by a later edit that adds
         # another persistence path off `cleaned_meta`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
         result = await memory_service.add_system_record(
             content=content,
@@ -6237,7 +6278,10 @@ def create_mcp_server(
         # the single point where the caller's `metadata` becomes persisted
         # state: stripping here cannot be bypassed by a later edit that adds
         # another persistence path off `cleaned_meta`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
 
         # (3) CITATION PRE-FLIGHT over the whole delete set — the same gate
@@ -7777,6 +7821,16 @@ def create_mcp_server(
         recipes probe it (skills/_shared/filing-the-trigger-chain.md §2)
         because it comes from the running process, not from main.
 
+        A top-level ``markup_residue`` field is present when the markup guard's
+        residue floor is wired (task 4809). A non-zero
+        ``preservation_failures`` counts refused payloads this process could
+        not preserve anywhere; ``spooled_files`` counts the payloads waiting in
+        ``spool_dir`` for an operator.
+
+        When the server runs the startup embedder probe, the top-level
+        ``embedder`` block reports the probed endpoint, and ``config_overlay``
+        the active config overlay's provenance.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -7852,6 +7906,19 @@ def create_mcp_server(
 
         if isinstance(result, dict) and 'error' not in result:
             result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
+
+        # task 4809 (INV-4): refused payloads the markup guard lost. Top-level
+        # and present-when-wired for the same reasons as `journal_drops`. The
+        # status lists the spool dir, so it runs off the loop like event_dead.
+        if (
+            markup_residue_spool is not None
+            and isinstance(result, dict)
+            and 'error' not in result
+        ):
+            result['markup_residue'] = await asyncio.to_thread(markup_residue_spool.status)
+
+        if embedder_probe is not None and isinstance(result, dict) and 'error' not in result:
+            result.update(embedder_identity_status(memory_service.config, embedder_probe))
 
         return result
 
@@ -9088,6 +9155,7 @@ def create_mcp_server(
         deferral: dict | None = None,
         expected_stamped_at: str | None = None,
         restamp_only: bool = False,
+        release_holder: StrictBool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
@@ -9179,6 +9247,15 @@ def create_mcp_server(
                 and a ``deferral`` required: refused ``deferral_changed`` unless
                 the row is ``deferred`` now with the record named by
                 ``expected_stamped_at`` (omitted = no record).
+            release_holder: Must be the literal ``true`` for a follow-up holder to go
+                ``done``, ``cancelled`` or ``deferred``; without it that write is refused
+                ``followup_holder_protected`` with the holder's ``held_count``. Releasing the
+                holder releases every held follow-up at once, so it is a human act: each one
+                is promoted by human, with one ``followup_promoted`` event apiece, before
+                targeted reconciliation runs. A promotion failure after the status write is
+                reported in ``post_write_warnings``; passing it again on a holder already at
+                that status releases whatever is still held. Ignored on any other task. See
+                docs/task-authoring.md §3.4.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -9210,6 +9287,7 @@ def create_mcp_server(
             deferral=deferral,
             expected_stamped_at=expected_stamped_at,
             restamp_only=restamp_only,
+            release_holder=release_holder,
             **claimant_kwargs,
         )
 
@@ -9438,7 +9516,10 @@ def create_mcp_server(
         # because the guard forwards allow_mcp_markup UNCHANGED to a tool that
         # declares `metadata` — deleting this line would persist a write-time
         # control flag into the task metadata vocabulary.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
 
         # Lock-charter guard γ: reject directory strings in metadata.files
         # before forwarding to the interceptor. Covers both the normal curator
@@ -10133,6 +10214,7 @@ def create_mcp_server(
         target_status: str = 'pending',
         deferral: dict | None = None,
         agent_id: str | None = None,
+        manifest_root: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Commit a batch of tasks created via ``submit_task(planning_mode=True)``.
@@ -10161,6 +10243,11 @@ def create_mcp_server(
                 is echoed per id as ``deferral``.
             agent_id: Which agent is committing (optional, auto-derived from
                 MCP context); a re-stamp records it as ``stamped_by``.
+            manifest_root: Absolute path of a git worktree of
+                *project_root*'s repository that holds the batch's PRD family
+                (a PRD not yet on main). Its capability-manifest sidecar is
+                the one stamped. Omitted, the sidecar is searched for in
+                *project_root*.
 
         RELEASE RULE (``pending``/``cancelled``): only a ``planning`` hold, or a
         row with no record, is released. Any other hold is refused per id with
@@ -10222,7 +10309,12 @@ def create_mcp_server(
         batch names and attaches the ``manifest_stamping`` report, plus
         ``manifest_stamping_action_required`` when it needs repair; it never
         blocks the flip. The contract is the
-        ``fused_memory.server.manifest_stamping`` module docstring.
+        ``fused_memory.server.manifest_stamping`` module docstring. A
+        ``manifest_root`` that is not an existing worktree of *project_root*'s
+        repository, or that is the main checkout itself, is refused with
+        ``error_type='ManifestRootRefused'`` and a ``reason_code`` before
+        anything is read or flipped; the rules live in
+        ``fused_memory.server.manifest_root``.
 
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
@@ -10263,6 +10355,13 @@ def create_mcp_server(
                     ),
                     'error_type': 'ValidationError',
                 }
+
+        accepted_manifest_root: Path | None = None
+        if manifest_root is not None:
+            accepted = await resolve_manifest_root(project_root, manifest_root)
+            if isinstance(accepted, dict):
+                return accepted
+            accepted_manifest_root = accepted
 
         # Lock-charter guard γ: batch-read all tasks concurrently, then
         # scan for directory entries before flipping status.  asyncio.gather
@@ -10373,16 +10472,18 @@ def create_mcp_server(
             # Best-effort/never-raising (PRD γ, task 2578) — stamps real
             # task_ids + copies MECHANICAL delivered_checks for any batch
             # task carrying prd_path/prd_task_label metadata. Reuses the
-            # already-fetched tasks_data (no extra reads). Only attaches the
-            # report key when a sidecar actually exists on disk, so a batch
-            # with no capability-manifest involvement gets a byte-identical
-            # legacy response.
+            # already-fetched tasks_data (no extra reads). Attaches the report
+            # key whenever a batch task carries prd_path (naming any derived
+            # sidecar absent from the root searched under sidecar_not_found),
+            # so a batch with no capability-manifest involvement gets a
+            # byte-identical legacy response.
             manifest_report = await stamp_capability_manifests(
                 project_root=project_root,
                 ids=ids,
                 tasks_data=list(tasks_data),
                 task_interceptor=task_interceptor,
                 agent_id=agent_id,
+                manifest_root=accepted_manifest_root,
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
@@ -10545,7 +10646,10 @@ def create_mcp_server(
                 Passing it together with ``append=True`` is REJECTED — see
                 ``append`` above.
             status: New status (e.g. "pending"/"in-progress"/"done")
-            dependencies: Replacement list of dependency task ids (top-level only)
+            dependencies: Replacement list of dependency task ids (top-level only).
+                Each entry must exist (one already stored is exempt), must
+                not be the task itself, and must not close a local cycle (the
+                same ``DependencyCycle`` refusal as ``add_dependency``).
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Resolved here for uniform caller-identity attribution
                 across the task write path (task 2175/rho1b); status= writes
@@ -10582,7 +10686,10 @@ def create_mcp_server(
         # matching submit_task call site above. Same reason as there: the text
         # reaches the description parser DF 3083 proved mis-parses silently. Only
         # the override STRIP remains a tool-body responsibility.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
 
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
@@ -10720,6 +10827,13 @@ def create_mcp_server(
         raise ``TaskmasterError`` and surface as
         ``{'error': 'TASKMASTER_TOOL_ERROR: …', 'error_type': 'TaskmasterError'}``.
 
+        A bare-integer edge that would close a dependency cycle is refused, with
+        nothing written. The walk runs over the local ``dependencies`` table at
+        every status, and the reply carries ``{'error': 'dependency_cycle',
+        'error_type': 'DependencyCycle', 'cycle': [A, B, …, A], 'hint': …}``:
+        remove one of the named edges. Qualified ``project:id`` deps are not
+        walked.
+
         Args:
             id: Task ID that will depend on another
             depends_on: Task ID that becomes a dependency.  Either a bare integer
@@ -10760,8 +10874,14 @@ def create_mcp_server(
 
         ``depends_on`` accepts two forms:
 
-        - **Bare integer** (e.g. ``"5"``): issues an unconditional ``DELETE``
-          from the integer ``dependencies`` table — the original behavior.
+        - **Bare integer** (e.g. ``"5"``): deletes the edge from the integer
+          ``dependencies`` table. One exception: removing a held follow-up's
+          holder edge is a human promotion (``by='human'``,
+          ``ref='remove_dependency'``) that also promotes the task's held
+          dependencies; the result then carries ``promoted`` (the promoted ids),
+          and a registered promotion guard can refuse it with error
+          ``followup_promotion_deferred``, nothing written. See
+          docs/task-authoring.md §3.4.
         - **Qualified** (e.g. ``"dark_factory:13"``): removes the canonical
           entry from the dependent task's ``metadata.external_deps`` list.
           ``'-'`` in the project_id is normalised to ``'_'``.  Idempotent —

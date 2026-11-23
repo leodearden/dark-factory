@@ -79,6 +79,7 @@ class EscalationCategory(StrEnum):
     PREEXISTING_MAIN_BREAK = 'preexisting_main_break'
     PROVENANCE_CONFLICT = 'provenance_conflict'
     PROVENANCE_UNATTRIBUTED = 'provenance_unattributed'
+    PROVIDER_BILLING_EXHAUSTED = 'provider_billing_exhausted'
     RECON_AUTO_CONSOLIDATION_BACKLOG = 'recon_auto_consolidation_backlog'
     RECON_AUTO_CONSOLIDATION_REFUSED = 'recon_auto_consolidation_refused'
     RECON_BACKLOG_OVERFLOW = 'recon_backlog_overflow'

@@ -38,7 +38,6 @@ verify.py's has_conftest full-suite fallback for merge-time verify.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import shutil
 from dataclasses import replace
@@ -47,6 +46,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _git_fixtures import seed_repo
 from _lane_test_helpers import (
     acquire_lane,
     add_warm_lane_scripts,
@@ -56,6 +56,7 @@ from _lane_test_helpers import (
     make_plan,
     wire_recovery_scheduler,
 )
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventType
@@ -72,32 +73,11 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 # ── Module-local fixtures + helpers ─────────────────────────────────────
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def ig_git_repo(tmp_path: Path) -> Path:
-    """Temporary git repo with an initial commit + a resolvable warm base.
-
-    Pre-creates the default derived warm-lane base (task 2061 gate) so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK,
-    and marks `.worktrees/.pool-root` present (task 2099 create-once guard) —
-    mirrors test_lane_lifecycle_gitops.py's git_repo / test_warm_lane_
-    integration_gate.py's ig_git_repo fixtures.
-    """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    """Temporary git repo with an initial commit + a resolvable warm base."""
+    repo = seed_repo(tmp_path / 'repo')
+    seed_default_warm_base(repo)
     return repo
 
 

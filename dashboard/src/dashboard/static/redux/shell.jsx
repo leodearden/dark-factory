@@ -1,6 +1,5 @@
 /* App shell: rail nav, topbar, toolbar (filters), live feed */
 const { useState, useEffect, useMemo, useRef } = React;
-const SP_SHELL = window.DF_CHARTS.Sparkline;
 const PIP_AGE_STYLE = window.DF_CHARTS.DATUM_AGE_STYLE;
 // The badge-chip pip's type size, decided here rather than at each call site:
 // the four escalation-subsection pips each carried their own `fontSize: 9`, and

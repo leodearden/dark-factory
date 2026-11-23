@@ -19,6 +19,7 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_wi
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import ARCHITECT
+from orchestrator.agents.token_pricing import TokenUsage
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import _inject_plan_tools_mcp, _meta_root_for_worktree
@@ -87,7 +88,7 @@ def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
     """
     meta_root = _meta_root_for_worktree(worktree)
     return {
-        'mcp_config': _inject_plan_tools_mcp(None, worktree, task_root=meta_root),
+        'mcp_config': _inject_plan_tools_mcp(None, worktree, ARCHITECT, task_root=meta_root),
         'strict_mcp_config': True,
     }
 
@@ -135,6 +136,16 @@ class ArchitectUsage:
     cache_create_tokens: int = 0
     turns: int = 0
     duration_ms: int = 0
+
+    @property
+    def tokens(self) -> TokenUsage:
+        """The four token counts, as the pricing formula takes them."""
+        return TokenUsage(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cache_create_tokens=self.cache_create_tokens,
+        )
 
     @classmethod
     def of(cls, result: AgentResult) -> ArchitectUsage:
@@ -429,10 +440,11 @@ def _architect_cost(
     is_local_model: bool,
 ) -> tuple[float, str]:
     """The architect component's ``(cost_usd, cost_source)`` per Invariant P5."""
-    if not (usage.input_tokens or usage.output_tokens or spent_usd):
+    tokens = usage.tokens
+    if tokens == TokenUsage() and not spent_usd:
         return 0.0, 'cli'
     return resolve_cost_usd(
-        usage.input_tokens, usage.output_tokens, model=model, prices=prices,
+        tokens, model=model, prices=prices,
         cli_cost_usd=spent_usd, is_local_model=is_local_model,
     )
 

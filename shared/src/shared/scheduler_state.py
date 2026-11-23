@@ -107,7 +107,9 @@ class SchedulerStateSnapshot(BaseModel):
     key, while ``current_holders`` names one holder per key, for display.
     ``holder_limits`` maps each held key to the producer lock table's holder
     limit (a very large int for a key taking unlimited holders), so a reader
-    compares ``len(holders) >= limit``.
+    compares ``len(holders) >= limit``. ``successor_of`` maps each early-started
+    dependent to its predecessor; both appear as holders of their shared keys in
+    ``held_by_task``.
 
     Frozen means no field can be reassigned. The mappings are plain dicts that
     validation copies from its input, so a snapshot never aliases its producer's
@@ -126,6 +128,7 @@ class SchedulerStateSnapshot(BaseModel):
     current_holders: Mapping[str, str] = Field(default_factory=dict)
     held_by_task: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
     holder_limits: Mapping[str, int] = Field(default_factory=dict)
+    successor_of: Mapping[str, str] = Field(default_factory=dict)
     lock_depth: StrictInt | None = None
     is_paused: bool = False
     pause_reason: str | None = None

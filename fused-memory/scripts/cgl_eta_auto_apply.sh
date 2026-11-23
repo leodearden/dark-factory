@@ -2,7 +2,9 @@
 # CGL-η auto-apply WRAPPER — the committed before_done=predicate action for the
 # deterministic bulk-apply task (depends on task 2451). Sets up the fused-memory
 # service environment (sourced .env + CONFIG/PROJECT roots), then runs the impl
-# under `uv run` so fused_memory imports resolve. The impl's exit code is the
+# under `uv run` so fused_memory imports resolve. Every `uv run` passes
+# --no-sync, so a predicate run never re-syncs the shared root .venv
+# (tests/scripts/test_uv_run_venv_isolation.py). The impl's exit code is the
 # predicate result: 0 == clean apply (task -> done); non-zero == escalate.
 #
 # Runbook lesson (ops scripts): must run under the SERVICE env, not a bare shell
@@ -54,16 +56,16 @@ export CGL_RUN_STAMP="${CGL_RUN_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 # the halt only withholds OTHER tasks, and resume lands before the runner reads
 # our exit code.
 GATE="$FM/scripts/cgl_eta_scheduler_gate.py"
-resume_schedulers() { "$UV_BIN_RESOLVED" run --project "$FM" python "$GATE" resume || true; }
+resume_schedulers() { "$UV_BIN_RESOLVED" run --no-sync --project "$FM" python "$GATE" resume || true; }
 trap resume_schedulers EXIT INT TERM
 
 echo "[cgl-auto-apply] stamp=$CGL_RUN_STAMP config=$CONFIG_PATH"
-"$UV_BIN_RESOLVED" run --project "$FM" python "$GATE" halt || true
+"$UV_BIN_RESOLVED" run --no-sync --project "$FM" python "$GATE" halt || true
 # set -e: a non-zero impl exit terminates here (trap resumes schedulers, wrapper
 # exits non-zero -> predicate escalates). The finalize line below is reached ONLY
 # on a clean exit 0.
-"$UV_BIN_RESOLVED" run --project "$FM" python "$FM/scripts/cgl_eta_auto_apply_impl.py"
+"$UV_BIN_RESOLVED" run --no-sync --project "$FM" python "$FM/scripts/cgl_eta_auto_apply_impl.py"
 # Clean apply only: auto-close the esc-2273-1 gate (best-effort; never flips the
 # predicate verdict — a finalize miss leaves the L2 for the watcher/operator).
-"$UV_BIN_RESOLVED" run --project "$FM" python "$FM/scripts/cgl_eta_finalize_gate.py" || true
+"$UV_BIN_RESOLVED" run --no-sync --project "$FM" python "$FM/scripts/cgl_eta_finalize_gate.py" || true
 # wrapper exits 0 -> predicate verdict = done (trap resumes schedulers first).

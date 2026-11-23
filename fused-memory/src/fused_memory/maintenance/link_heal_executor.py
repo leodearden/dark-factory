@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
 from collections import Counter
@@ -297,23 +298,27 @@ def adjudicator_storm_escape(
 
 
 def run_report_escape(
-    summary: Mapping[str, Any], report_path: Path, *, unwritten: str | None = None,
+    summary: Mapping[str, Any],
+    report_path: Path,
+    *,
+    unwritten: str | None = None,
+    metrics_unwritten: str | None = None,
 ) -> Escape:
     """The info record that surfaces one sweep run's report; *summary* is the run's
     headline facts, carried as the detail beside the report's path. *unwritten* is
     why the report could not be written, when it could not: the run's facts then
-    reach the operator only through this record and the ledger."""
-    if unwritten is None:
-        return Escape(
-            anchor=RUN_REPORT_ANCHOR,
-            summary=f'link-heal sweep report: {report_path}',
-            detail={**summary, 'report': str(report_path)},
-        )
-    return Escape(
-        anchor=RUN_REPORT_ANCHOR,
-        summary=f'link-heal sweep report could not be written to {report_path}: {unwritten}',
-        detail={**summary, 'report': str(report_path), 'report_unwritten': unwritten},
+    reach the operator only through this record and the ledger. *metrics_unwritten*
+    is why its metrics could not be written, and the record's summary names it too."""
+    headline = (
+        f'link-heal sweep report: {report_path}' if unwritten is None
+        else f'link-heal sweep report could not be written to {report_path}: {unwritten}'
     )
+    if metrics_unwritten is not None:
+        headline = f'{headline}; its metrics could not be written: {metrics_unwritten}'
+    detail = {**summary, 'report': str(report_path)}
+    if unwritten is not None:
+        detail['report_unwritten'] = unwritten
+    return Escape(anchor=RUN_REPORT_ANCHOR, summary=headline, detail=detail)
 
 
 def render_escape_detail(detail: Mapping[str, Any]) -> str:
@@ -770,25 +775,43 @@ class _Adjudicated:
 
     reused: tuple[AdjudicationRow, ...]
     records: tuple[AdjudicationRecord, ...]
+    asked: int
     failed: int
+    capped: int
     storms: tuple[Mapping[str, Any], ...]
 
     def storm_escapes(self, projects: Sequence[str]) -> tuple[Escape, ...]:
         return tuple(adjudicator_storm_escape(storm, projects=projects) for storm in self.storms)
 
 
+def _in_turn_by_project(candidates: Sequence[_Candidate]) -> list[_Candidate]:
+    """*candidates* taken one project at a time in turn, each project's in read order,
+    so a cap on the first N cannot spend itself on one project's backlog."""
+    by_project: dict[str, list[_Candidate]] = {}
+    for candidate in candidates:
+        by_project.setdefault(candidate.state.project_id, []).append(candidate)
+    turns = itertools.chain.from_iterable(itertools.zip_longest(*by_project.values()))
+    return [candidate for candidate in turns if candidate is not None]
+
+
 async def _adjudicate(
-    candidates: Sequence[_Candidate], ledger: LinkHealLedger, adjudicate: LinkAdjudicator,
+    candidates: Sequence[_Candidate],
+    ledger: LinkHealLedger,
+    adjudicate: LinkAdjudicator,
+    *,
+    max_asked: int | None,
 ) -> _Adjudicated:
-    """Reuse each candidate's verdict by *adjudicate* at its current texts; ask about the rest."""
+    """Reuse each candidate's verdict by *adjudicate* at its current texts; ask about
+    the first *max_asked* of the rest taken in turn by project (``None`` asks them all)."""
     reused: list[AdjudicationRow] = []
-    asked: list[_Candidate] = []
+    unjudged: list[_Candidate] = []
     for candidate in candidates:
         row = candidate.judged(ledger, adjudicate)
         if row is None:
-            asked.append(candidate)
+            unjudged.append(candidate)
         else:
             reused.append(row)
+    asked = _in_turn_by_project(unjudged)[:max_asked]
     storms: list[Mapping[str, Any]] = []
     verdicts = (
         await adjudicate([candidate.pair() for candidate in asked], on_failure_storm=storms.append)
@@ -803,7 +826,9 @@ async def _adjudicate(
     return _Adjudicated(
         reused=tuple(reused),
         records=records,
+        asked=len(asked),
         failed=len(verdicts) - len(records),
+        capped=len(unjudged) - len(asked),
         storms=tuple(storms),
     )
 
@@ -822,6 +847,7 @@ async def run_adjudicator_plan(
     created_in: CreatedWindow | None = None,
     filer: EscapeFiler | None = None,
     presence_projects: Sequence[str] = (),
+    max_adjudications: int | None = None,
 ) -> RunReport:
     """A non-writing run of *source* planning heals from the link adjudicator's verdicts.
 
@@ -829,12 +855,14 @@ async def run_adjudicator_plan(
     A parent is looked for in *presence_projects* as well as *projects*.
     The adjudicator is asked only about the links the verdict rows decide and
     that this adjudicator (model and prompt version) has not judged at their
-    current texts, so a model or brief change asks again. Every read
-    and every question is made before the run row exists. The run rests on the
-    adjudications it makes and on those it reuses. A failed verdict is counted,
-    never ledgered. Only heals in *enabled_actions* are staged (``None`` stages
-    every one). A share over its ceiling is recorded as ``would_escape``, never
-    filed; so is a failure storm, unless *filer* is given, which files it and
+    current texts, so a model or brief change asks again. Only the first
+    *max_adjudications* of those, taken in turn by project, are asked (``None``
+    asks them all); the rest are unexamined, counted ``adjudication_capped``, and
+    leave the run partial. Every read and every question is made before the run
+    row exists. The run rests on the adjudications it makes and on those it
+    reuses. A failed verdict is counted, never ledgered. Only heals in
+    *enabled_actions* are staged (``None`` stages every one). A share over its
+    ceiling is recorded as ``would_escape``, never filed; so is a failure storm, unless *filer* is given, which files it and
     discloses it as ``escaped``. A run given a *filer* is about to be applied, so
     for a source in :data:`CALIBRATION_GATED_SOURCES` it first withholds the
     pending heals whose adjudicator has no passing calibration (see
@@ -843,7 +871,9 @@ async def run_adjudicator_plan(
     reads = await read_links(
         store, census, projects, created_in, presence_projects=presence_projects,
     )
-    adjudicated = await _adjudicate(_candidates(reads), ledger, adjudicate)
+    adjudicated = await _adjudicate(
+        _candidates(reads), ledger, adjudicate, max_asked=max_adjudications,
+    )
     run_id = ledger.start_run(source, writes=False)
     new_ids = ledger.add_adjudications(run_id, adjudicated.records)
     ledger.reuse_adjudications(run_id, [row.adjudication_id for row in adjudicated.reused])
@@ -859,6 +889,8 @@ async def run_adjudicator_plan(
         plan.counts,
         adjudications_reused=len(adjudicated.reused),
         adjudication_failed=adjudicated.failed,
+        adjudications_asked=adjudicated.asked,
+        adjudication_capped=adjudicated.capped,
     )
     storms = adjudicated.storm_escapes(projects)
     escaped = () if filer is None else tuple(

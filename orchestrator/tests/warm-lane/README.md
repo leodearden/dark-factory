@@ -497,6 +497,39 @@ alarm. It is the one-to-one mirror of reify's single
 and the pending Block U port rely on that mapping. The partition tried and the
 measurement are in the commit that created `test_warm_lane_gc_native.sh`.
 
+### Delta 11 — `test_warm_lane_audit.sh`: JSON checkers run under `python3 -I` via `_py_json_check`; Block R (3 asserts) (task 10896)
+
+Added by **task 10896**. All eight JSON checkers in the audit suite (H4, H6,
+H7, K6b, L8b, M7, N6b and O8b) now go through one helper,
+`_py_json_check <json> <python3-arg>...`, which pipes `<json>` into
+`python3 -I`. Reify's source runs bare `python3`, so this is a divergence from
+it.
+
+**Why.** Python puts a script's own directory, or for `-c` the cwd, at
+`sys.path[0]`. The checkers are created in the host-shared `/tmp`. importlib's
+`FileFinder` re-lists a `sys.path` directory whenever that directory's mtime
+has changed since its last look, and `/tmp`'s mtime changes whenever any
+process on the host creates or deletes a file there. On 2026-11-19 `/tmp` held
+about 279k entries. `printf '{"a": 1}' | python3 /tmp/probe.py` measured
+17.94s, against 0.03s with `-I`. That cost drove the 900s overruns on
+offline-lane passes `20261119T043112-51e371` and `20261119T072552-5a1f91`,
+whose captured output stopped at H6, H7 and M7. `-I` keeps both the script
+directory and the cwd off `sys.path`, so a checker imports only from the
+stdlib. It also stops a stray `/tmp/json.py` from shadowing the stdlib. The fix
+removes the cause, and `SUBPROC_TIMEOUT` is not widened.
+
+**Block R** pins the mechanism structurally rather than by timing. A private
+`mktemp -d` holds a `json.py` that writes `poisoned json.py imported` to
+stderr and exits 97, beside a checker that imports json. The stderr line
+names the cause in a failing assert's captured-output dump. **R0** is the non-vacuity control: run
+with bare `python3` and `PYTHONSAFEPATH` unset, the checker exits 97, so the
+poison really does shadow json. **R1** runs the checker script through the
+helper, and **R2** runs a `-c` checker through it from the poisoned cwd. Both
+exit 0. The block is NON-VACUOUS by construction: with the helper still
+running bare `python3`, R1 and R2 fail. Its asserts are counted in the floor's
+one home, `test_warm_lane_bash_suite.py::ASSERT_FLOORS`. The block needs only
+`python3`, which `REQUIRED_HOST_TOOLS` already lists.
+
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 
 α's relocation of `provision-warm-lane-fs.sh` changed its `REPO_ROOT` to a
@@ -1006,7 +1039,7 @@ move independently:
 | | edit point | value |
 |---|---|---|
 | (a) | `orchestrator/pyproject.toml` → `[tool.pytest.ini_options] addopts` | `-m 'not warm_lane_bash'` |
-| (b) | `dark-factory-orchestrator.yaml` → `git.offline_lane_commands` | `name: warm-lane-bash`, `command: "pytest -m warm_lane_bash"`, `cwd: "orchestrator"`, `fix_task_priority: "high"` |
+| (b) | `dark-factory-orchestrator.yaml` → `git.offline_lane_commands` | `name: warm-lane-bash`, `command: "uv run pytest -m warm_lane_bash"`, `cwd: "orchestrator"`, `fix_task_priority: "high"` |
 
 `fix_task_priority` is `high` (the `qdrant-integration` entry alongside it is
 `medium`) because leaf **κ** deletes reify's originals on this suite's green: a
