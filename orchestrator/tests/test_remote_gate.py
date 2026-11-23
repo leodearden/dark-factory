@@ -19,6 +19,7 @@ import fcntl
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -1585,10 +1586,55 @@ def test_the_reaper_leaves_an_unmarked_root_alone(gate_root: Path):
 def test_the_reaper_skips_a_sha_whose_build_lock_is_held(gate_root: Path):
     sha = '4' * 40
     idle = _dir(gate_root, sha, days=30)
-    with open(gate_root / f'.build-{sha}.lock', 'w') as lock:
+    lock_path = gate_root / f'.build-{sha}.lock'
+    with open(lock_path, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         assert _reap(gate_root).returncode == 0
+        assert lock_path.exists()
+        assert os.fstat(lock.fileno()).st_ino == lock_path.stat().st_ino
     assert idle.exists()
+
+
+def test_a_reaped_sha_leaves_no_build_lock(gate_root: Path):
+    sha = '1' * 40
+    idle = _dir(gate_root, sha, days=8)
+    lock = gate_root / f'.build-{sha}.lock'
+    lock.touch()
+
+    result = _reap(gate_root)
+
+    assert result.returncode == 0, result.stderr
+    assert not idle.exists()
+    assert not lock.exists()
+
+
+# A `flock` that replaces the file on the fd it is handed (its last argument)
+# before locking it: the reaper's open-to-flock window, held open.
+_REPLACING_FLOCK = r"""#!/usr/bin/env bash
+path=$(readlink "/proc/$$/fd/${!#}")
+unlink "$path"
+: > "$path"
+exec "$REAL_FLOCK" "$@"
+"""
+
+
+def test_a_reaper_whose_lock_file_was_replaced_before_it_locked_reaps_nothing(
+    gate_root: Path, tmp_path: Path,
+):
+    sha = '5' * 40
+    idle = _dir(gate_root, sha, days=30)
+    flockbin = tmp_path / 'flockbin'
+    flockbin.mkdir()
+    (flockbin / 'flock').write_text(_REPLACING_FLOCK)
+    (flockbin / 'flock').chmod(0o755)
+    real_flock = shutil.which('flock')
+    assert real_flock is not None
+
+    result = _reap(gate_root, PATH=f'{flockbin}:{os.environ["PATH"]}', REAL_FLOCK=real_flock)
+
+    assert result.returncode == 0, result.stderr
+    assert idle.exists()
+    assert (gate_root / f'.build-{sha}.lock').exists()
 
 
 def test_the_reaper_rejects_a_relative_root(gate_root: Path):
