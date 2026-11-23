@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from _orch_helpers import HermeticMcpSession
+from _orch_helpers import HermeticMcpSession, wait_responsive
 from _park_test_helpers import make_task
 
 from orchestrator.config import OrchestratorConfig
@@ -68,10 +68,10 @@ def _rig(tmp_path: Path, *tasks: dict, pinned: str | None = None) -> _Rig:
 async def _race(rig: _Rig) -> tuple[str | None, str | None]:
     """Pass A builds its ready list and suspends; pass B runs whole; then A resumes."""
     pass_a = asyncio.create_task(rig.scheduler.acquire_next())
-    await asyncio.wait_for(rig.entered.wait(), timeout=10)
+    await wait_responsive(rig.entered.wait(), label='pass A reaches the landed-outbox hook')
     b = await rig.scheduler.acquire_next()
     rig.release.set()
-    a = await asyncio.wait_for(pass_a, timeout=10)
+    a = await wait_responsive(pass_a, label='pass A finishes after the release')
     return (a.task_id if a else None), (b.task_id if b else None)
 
 
