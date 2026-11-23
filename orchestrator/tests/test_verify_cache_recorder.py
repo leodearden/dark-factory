@@ -163,7 +163,7 @@ class TestLegFacts:
         )
         config = OrchestratorConfig()
 
-        result = await run_verification(tmp_path, config, module, role='merge')
+        result = await run_verification(tmp_path, config, module, role='merge', in_verify_cache=True)
 
         record = result.cache_record
         assert record is not None
@@ -180,6 +180,15 @@ class TestLegFacts:
         )
 
     @pytest.mark.asyncio
+    async def test_a_verify_outside_the_cache_builds_no_record(self, tmp_path):
+        module = ModuleConfig(prefix='alpha', test_command='true', lint_command='true', type_check_command=None)
+
+        result = await run_verification(tmp_path, OrchestratorConfig(), module, role='merge')
+
+        assert result.passed, result.summary
+        assert result.cache_record is None
+
+    @pytest.mark.asyncio
     @pytest.mark.usefixtures('pytest_on_path')
     async def test_a_full_merge_pytest_leg_counts_its_junit_and_its_collection(self, tmp_path):
         suite = tmp_path / 'suite'
@@ -191,7 +200,7 @@ class TestLegFacts:
         )
         config = OrchestratorConfig(merge_verify_breadth='full')
 
-        result = await run_verification(tmp_path, config, module, role='merge')
+        result = await run_verification(tmp_path, config, module, role='merge', in_verify_cache=True)
 
         assert result.passed, result.test_output
         assert result.cache_record is not None

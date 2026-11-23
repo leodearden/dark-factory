@@ -7637,8 +7637,13 @@ async def run_verification(
     segment_chained_test: bool = False,
     admission_request: AdmissionRequest | None = None,
     junit_report: Path | None = None,
+    in_verify_cache: bool = False,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    *in_verify_cache* is True when the verify joined the verify-result cache:
+    only then is the ``cache_record`` built, saying what each leg that ran
+    tells the recorder, from the cost junit reports and the test output.
 
     A caller-named *junit_report* is injected into the test leg at the existing
     chokepoint, cleared before each pytest invocation, and parsed into
@@ -8589,7 +8594,7 @@ async def run_verification(
         if junit_ids is not None:
             failing_test_ids, skipped_test_ids, junit_testcases = junit_ids
     owned_reports = junit.reports_to_archive(attempt.test.segments)
-    if junit.kind == 'cost':
+    if junit.kind == 'cost' and in_verify_cache:
         junit_testcases = await _junit_testcases_of(owned_reports)
     # The report dies with its worktree; the LOG archival above is gated on
     # `not passed`, this deliberately is not. The gzip runs off the event
@@ -8636,7 +8641,7 @@ async def run_verification(
         cache_record=CacheRecord(
             role=role, modes=config.verify_cache,
             legs=_leg_runs(attempt.checks, module_config, junit_testcases=junit_testcases),
-        ),
+        ) if in_verify_cache else None,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -9506,6 +9511,13 @@ async def _execute_with_cache(
     return _settled_against(replay, result)
 
 
+def _joined_cache_access(
+    config: OrchestratorConfig, role: Literal['merge', 'task'], access: CacheAccess | None,
+) -> CacheAccess | None:
+    """*access* when a *role* verify given it is decided by, and records into, the verify-result cache; else None."""
+    return access if access is not None and config.verify_cache.mode_for(role) is not CacheMode.OFF else None
+
+
 async def _replay_plan(
     worktree: Path,
     config: OrchestratorConfig,
@@ -9517,7 +9529,8 @@ async def _replay_plan(
     is_merge_verify: bool,
 ) -> ReplayPlan | None:
     """The cache's decision for this verify; None outside the cache or with *role*'s mode off."""
-    if access is None or config.verify_cache.mode_for(role) is CacheMode.OFF:
+    joined = _joined_cache_access(config, role, access)
+    if joined is None:
         return None
     # A cold tree's .venv is provisioned before keying: read_toolchain keys its interpreter.
     if is_merge_verify or any(_is_verify_cold(worktree, None if mc is None else mc.prefix) for mc in executed):
@@ -9526,7 +9539,7 @@ async def _replay_plan(
             timeout=_resolve_verify_timeout(config, None, is_cold=True, is_merge_verify=is_merge_verify),
         )
     return await plan_replay(
-        worktree, plan, executed, config=config, role=role, access=access,
+        worktree, plan, executed, config=config, role=role, access=joined,
         leg_env=lambda mc: _resolve_verify_env(config, mc, role=role),
         verify_outputs=(MERGE_JUNIT_DIR,),
     )
@@ -9664,6 +9677,7 @@ async def _run_scoped_verification_body(
     and every execution goes through the verify-result cache's funnel."""
     scope_cargo_enabled = config.scope_cargo
     _fanout_sem = _module_fanout_semaphore(config, role)
+    in_verify_cache = _joined_cache_access(config, role, verify_cache) is not None
 
     async def _verify_alone(mc: ModuleConfig | None, scope_kind: str | None = None) -> 'VerifyResult':
         return await run_verification(
@@ -9673,6 +9687,7 @@ async def _run_scoped_verification_body(
             attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
             role=role,
             admission_request=plan_request(admission_plan, None if mc is None else mc.prefix, scope_kind),
+            in_verify_cache=in_verify_cache,
         )
 
     async def _verify_module(mc: ModuleConfig | None, scope_kind: str | None = None) -> 'VerifyResult':
@@ -10256,6 +10271,7 @@ async def _run_scoped_verification_body(
                         # is a lower bound, not the whole chain.
                         segment_chained_test=role != 'merge',
                         admission_request=plan_request(admission_plan, fallback.prefix, fallback_scope_kind),
+                        in_verify_cache=in_verify_cache,
                     )
 
                 fallback_result = await _execute(fallback_plan, [fallback], _verify_fallback)

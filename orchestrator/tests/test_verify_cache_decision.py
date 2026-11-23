@@ -544,6 +544,7 @@ class TestFanOutSeam:
         assert sorted(result.units or (), key=lambda unit: unit.unit) == expected
         assert {unit.reason for unit in expected} == {None}
         assert result.cache_mode is CacheMode.OFF
+        assert result.cache_record is None
         assert result.plan == _full_suite_plan(modules).to_dict()
         assert not (tmp_path / 'verify_cache.db').exists()
 
