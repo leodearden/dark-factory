@@ -1,10 +1,12 @@
 """Lever-C drift-check detective (MQ-refactor task γ).
 
 The drift-check runner (runs a local and a remote leg concurrently through
-:class:`~orchestrator.verify_runner.DriftDetector`, the local leg in a
-throwaway worktree) and the land-hook cadence gate; the remote-pool builder
-lives in :mod:`orchestrator.verify_hosts`.  A due check that cannot get both host slots defers, and the gate
-re-arms it for the next landing.  The local trust-anchor verifies through the
+:class:`~orchestrator.verify_runner.DriftDetector`, the local leg in the lane
+:func:`~orchestrator.merge_lane.liveness.drift_check_lane` picks) and the
+land-hook cadence gate; the remote-pool builder lives in
+:mod:`orchestrator.verify_hosts`.  A due check that cannot get both host slots,
+or a warm lane where a pool is configured, defers, and the gate re-arms it for
+the next landing.  The local trust-anchor verifies through the
 worker's injected :class:`~orchestrator.merge_lane.ports.VerifyPort`; this
 module never imports the worker.
 
@@ -23,11 +25,13 @@ import json
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, WarmSeedUnavailable
+from orchestrator.merge_lane.liveness import drift_check_lane
 from orchestrator.merge_lane.types import MergeRequest
 from orchestrator.verify_runner import (
     DriftDetector,
@@ -84,9 +88,10 @@ class DriftCheckState:
         land_count: Count of successful ('done') lands observed so far.
             Additive across the worker lifetime (never reset or decremented),
             mirroring the in-memory ``worker._drift_land_count`` it supersedes.
-        consecutive_deferrals: Consecutive due checks that could not acquire
-            both host slots.  Greater than 0 means a check is overdue and
-            fires at the next land; reset when a check acquires its slots.
+        consecutive_deferrals: Consecutive due checks that never ran their
+            legs (:class:`DriftDeferralCause`).  Greater than 0 means a check
+            is overdue and fires at the next land; reset when a check starts
+            its legs.
     """
 
     land_count: int = 0
@@ -158,7 +163,7 @@ def _record_drift_deferral(path: Path | None) -> int:
 
 
 def _record_drift_start(path: Path | None) -> int:
-    """Clear the deferral count once a check holds its slots; the count it cleared."""
+    """Clear the deferral count once a check starts its legs; the count it cleared."""
     if path is None:
         return 0
     state = _load_drift_check_state(path)
@@ -236,20 +241,34 @@ async def _acquire_drift_hosts(
         await asyncio.sleep(poll_secs)
 
 
+class DriftDeferralCause(Enum):
+    """Why a due drift check never ran its legs."""
+
+    HOST_SLOTS_BUSY = 'host_slots_busy'
+    NO_WARM_LANE = 'no_warm_lane'
+
+
+_DEFERRAL_LOG_TEXT = {
+    DriftDeferralCause.HOST_SLOTS_BUSY: 'host slots stayed busy',
+    DriftDeferralCause.NO_WARM_LANE: 'no warm lane could be seeded',
+}
+
+
 def _report_drift_deferral(
     event_store: EventStore | None,
     req: MergeRequest,
     merge_commit: str,
     allocator: HostAllocator,
+    cause: DriftDeferralCause,
     consecutive: int,
 ) -> None:
     """Log the deferral (INFO for the first of a run, DEBUG after) and emit its event."""
     hosts = allocator.host_states()
     logger.log(
         logging.INFO if consecutive == 1 else logging.DEBUG,
-        'Drift check deferred for task %s / commit %s: host slots stayed busy '
+        'Drift check deferred for task %s / commit %s: %s '
         '(%d consecutive deferral(s)); re-armed for the next landing. Hosts: %s',
-        req.task_id, merge_commit, consecutive, hosts,
+        req.task_id, merge_commit, _DEFERRAL_LOG_TEXT[cause], consecutive, hosts,
     )
     if event_store is not None:
         event_store.emit(
@@ -259,6 +278,7 @@ def _report_drift_deferral(
                 'merge_sha': merge_commit,
                 'consecutive_deferrals': consecutive,
                 'hosts': hosts,
+                'cause': cause.value,
             },
         )
 
@@ -269,6 +289,114 @@ def _report_drift_start(req: MergeRequest, merge_commit: str, cleared: int) -> N
             'Drift check for task %s / commit %s running after %d deferred landing(s)',
             req.task_id, merge_commit, cleared,
         )
+
+
+async def _run_drift_legs(
+    wt: Path,
+    leases: tuple[HostLease, HostLease],
+    held: _HeldHostLeases,
+    req: MergeRequest,
+    merge_commit: str,
+    escalation_queue: Any,
+    event_store: EventStore | None,
+    quarantine: Callable[[str], None],
+    *,
+    verifier: VerifyPort,
+    on_unavailable: RunnerUnavailableSink | None,
+) -> None:
+    """Run the local leg in *wt* and the remote leg on its lease, and compare them."""
+    local_slot, remote_lease = leases
+    # FULL-GATE drift spec (task 2886 fix 1b, PRD §8δ): the drift check
+    # re-dispatches this spec to BOTH the local trust-anchor and the
+    # eligible remote and alarms on divergence.  Re-dispatching the SAME
+    # scoped/no-source spec that produced a trivial pass would trivially
+    # pass on both hosts and structurally cannot catch the trivial-pass
+    # divergence class.  Forcing task_files=None runs the complete
+    # workspace gate (verify.py task_files=None path) on both hosts so a
+    # genuine divergence is observable.  This deliberately does NOT
+    # derive/scope task_files (unlike merge_lane/post_merge_verify.py::run_post_merge_verify's serial-lane
+    # dispatching-host derivation) — the derivation gate is intentionally
+    # dropped here.  task_files_tuple stays None so BOTH the spec and the
+    # LocalRunner below run the whole suite.
+    task_files_tuple = None
+    spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+    local_runner = LocalRunner(
+        wt, req.config, req.module_configs, task_files_tuple,
+        run_scoped=verifier.run_scoped,
+        run_unscoped=verifier.run_unscoped_typechecks,
+        task_id=req.task_id,
+    )
+    held.seat(local_slot, local_runner)
+    pool = VerifyRunnerPool(
+        [local_runner, remote_lease.runner],
+        event_store=event_store,
+        task_id=req.task_id,
+        on_unavailable=on_unavailable,
+    )
+
+    # Cadence is already enforced upstream in _maybe_run_drift_check
+    # (DriftCheckState.is_due).  DriftDetector.should_sample is
+    # never called on this path, so omitting every_n_lands here keeps a
+    # single source of truth and avoids a dead duplicate cadence value.
+    detector = DriftDetector(
+        pool,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+        task_id=req.task_id,
+    )
+    await detector.check_env_safely(req.config.verify_env_probes)
+    # Capture the eligible remote BEFORE check() so we can propagate its
+    # name even after the pool quarantines it (eligible_remote() returns
+    # None after quarantine).
+    eligible_before = pool.eligible_remote()
+    result = await detector.check(
+        merge_commit, spec, on_leg_done=held.release_leg,
+    )
+    if result.quarantined and eligible_before is not None:
+        quarantine(eligible_before.name)
+
+
+async def _run_drift_check_once(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    escalation_queue: Any,
+    event_store: EventStore | None,
+    quarantine: Callable[[str], None],
+    *,
+    verifier: VerifyPort,
+    allocator: HostAllocator,
+    on_unavailable: RunnerUnavailableSink | None,
+    state_path: Path | None,
+    host_settle_secs: float,
+    host_poll_secs: float,
+) -> DriftDeferralCause | None:
+    """Acquire both host slots and the local leg's lane, then run both legs.
+
+    Returns why the check deferred, or None once its legs ran.  Every slot it
+    took is released before it returns.
+    """
+    held = _HeldHostLeases(allocator)
+    try:
+        leases = await _acquire_drift_hosts(
+            allocator, settle_secs=host_settle_secs, poll_secs=host_poll_secs,
+        )
+        if leases is None:
+            return DriftDeferralCause.HOST_SLOTS_BUSY
+        held.hold(*leases)
+        async with drift_check_lane(git_ops, merge_commit) as wt:
+            _report_drift_start(req, merge_commit, _record_drift_start(state_path))
+            await _run_drift_legs(
+                wt, leases, held, req, merge_commit,
+                escalation_queue, event_store, quarantine,
+                verifier=verifier, on_unavailable=on_unavailable,
+            )
+    except WarmSeedUnavailable as unseeded:
+        logger.debug('Drift check for task %s: %s', req.task_id, unseeded)
+        return DriftDeferralCause.NO_WARM_LANE
+    finally:
+        await held.release_remaining()
+    return None
 
 
 async def _run_drift_check(
@@ -286,29 +414,27 @@ async def _run_drift_check(
     host_settle_secs: float = _DRIFT_HOST_SETTLE_SECS,
     host_poll_secs: float = _DRIFT_HOST_POLL_SECS,
 ) -> None:
-    """Drift detective control: run DriftDetector.check in a throwaway worktree.
+    """Drift detective control: run DriftDetector.check on a local and a remote leg.
 
     Mirrors ``_run_cold_shadow_verify`` / ``_run_shadow_compare`` as an
     off-serial-lane detective control (spawned via :func:`_maybe_run_drift_check`).
-    Waits up to *host_settle_secs* for both host slots, then creates a
-    throwaway verify worktree for the local leg, builds a 2-host pool (local
-    trust-anchor + eligible remote), runs ``DriftDetector.check_env_safely`` and
-    then ``check``, and hands any quarantined remote name to *quarantine*
-    (the lane's ``HostQuarantine.quarantine_divergent``, which takes it out of
-    the shared set the allocator dispatches from).
+    Waits up to *host_settle_secs* for both host slots, then enters the local
+    leg's lane (:func:`~orchestrator.merge_lane.liveness.drift_check_lane`:
+    warm-seeded where a warm-lane pool is configured, else a cold throwaway
+    under its task-3018 lane flock), builds a 2-host pool (local trust-anchor +
+    eligible remote), runs ``DriftDetector.check_env_safely`` and then
+    ``check``, and hands any quarantined remote name to *quarantine* (the
+    lane's ``HostQuarantine.quarantine_divergent``, which takes it out of the
+    shared set the allocator dispatches from).
 
-    Each host slot is released the moment its own leg ends; the ``finally``
-    releases only what is still held, then ``cleanup_merge_worktree``.  If the
-    slots never come free the check DEFERS: it builds no worktree, runs no leg,
-    records the deferral in *state_path* and emits ``drift_check_deferred``.
-    Exceptions are caught and logged so this detective control never crashes
-    the worker.
-
-    The verify body runs under ``merge_verify_lease(lane_dir=wt)`` so a
-    concurrent periodic worktree reap (task 3018) cannot delete the checkout
-    mid-verify; the lease is released before the ``finally`` cleanup — see the
-    inline comment for why that scope is load-bearing.  It is distinct from,
-    and orthogonal to, the allocator's host-slot leases.
+    Each host slot is released the moment its own leg ends; the rest are
+    released before the check returns, and the lane removes its own tree.  The
+    check DEFERS, running no leg, when the slots never come free or, where a
+    pool is configured, no warm lane can be seeded (a deferral there builds no
+    cold tree): it records the deferral in *state_path* and emits
+    ``drift_check_deferred`` naming its :class:`DriftDeferralCause`, after its
+    slots are released.  Exceptions are caught and logged so this detective
+    control never crashes the worker.
 
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
@@ -329,132 +455,24 @@ async def _run_drift_check(
         host_settle_secs: How long to wait for both host slots before deferring.
         host_poll_secs: How often to retry the slots while waiting.
     """
-    # wt is initialised before the try so the finally guard (`if wt is not None`)
-    # is safe even when create_ephemeral_verify_worktree itself raises.  Moving the
-    # creation inside the try ensures the docstring contract ("Exceptions are caught
-    # and logged") holds for all failure modes — disk-full / git errors included.
-    wt = None
-    held = _HeldHostLeases(allocator)
     try:
-        leases = await _acquire_drift_hosts(
-            allocator, settle_secs=host_settle_secs, poll_secs=host_poll_secs,
+        cause = await _run_drift_check_once(
+            git_ops, req, merge_commit, escalation_queue, event_store, quarantine,
+            verifier=verifier, allocator=allocator, on_unavailable=on_unavailable,
+            state_path=state_path,
+            host_settle_secs=host_settle_secs, host_poll_secs=host_poll_secs,
         )
-        if leases is None:
+        if cause is not None:
             _report_drift_deferral(
-                event_store, req, merge_commit, allocator,
+                event_store, req, merge_commit, allocator, cause,
                 _record_drift_deferral(state_path),
             )
-            return
-        held.hold(*leases)
-        _report_drift_start(req, merge_commit, _record_drift_start(state_path))
-        local_slot, remote_lease = leases
-        wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
-        # Hold THIS throwaway lane's flock for the duration of the drift
-        # verify (task 3018).  Three things to know:
-        #
-        # (i) WHY IT IS NEEDED.  Task 3018 promoted
-        #     `reap_orphaned_merge_worktrees` from a startup-only sweep to a
-        #     steady-state one fired from the merge worker's heartbeat, which
-        #     turned RESOURCE_AUDIT_WORKTREE_GRACE_SECS from a *detection*
-        #     threshold into a *destruction* deadline.  This throwaway tree is
-        #     neither registered in `_owned_merge_worktrees` (so the reap's
-        #     owned-ledger skip misses it) nor touched by
-        #     `_touch_owned_merge_worktrees` (so its measured age is real
-        #     elapsed time) — the lane flock consulted by
-        #     `remove_merge_worktree_guarded` is its ONLY liveness protection.
-        #     Holding it makes that protection independent of how long the
-        #     drift verify runs, rather than resting on an age heuristic: a
-        #     concurrent sweep gets 'skipped_lease_held' instead of deleting
-        #     the checkout out from under a running verify.
-        #
-        # (ii) PRECEDENT.  Passing `lane_dir=` an ephemeral `_merge-*`
-        #     worktree (rather than the persistent lane) is established — the
-        #     DF-2822 per-land REMOTE-green cross-check does exactly this
-        #     (merge_queue.py, `lane_dir=merge_wt`).
-        #
-        # (iii) CONTENTION IS NOT A PRACTICAL FAILURE MODE here, so no
-        #     MergeVerifyLeaseContended fail-safe branch is warranted: the
-        #     `_merge-<uuid>` path was just minted by
-        #     create_ephemeral_verify_worktree and is uncontended by
-        #     construction — nobody else knows it.  (Were one ever raised it
-        #     would land in the except-Exception fail-open below, the same
-        #     detective-control degradation as any other drift-check error.)
-        #
-        # (iv) FLOCK ONLY, NO GLOBAL RENDEZVOUS (task 4189).  Because `wt` is
-        #     ephemeral, this lease takes the lane flock and does NOT record
-        #     the single fixed-key global holder-pgid — see
-        #     `merge_verify_lease` for the full argument (it neither defers
-        #     `_run_warm_lane_gc_reclaim` over a lane reclaim would never
-        #     reset, nor strips a concurrent persistent-lane verify's live
-        #     rendezvous on exit).  The `skipped_lease_held` protection in (i)
-        #     is unaffected: it comes from the FLOCK, which is untouched.
-        #
-        # Entered only AFTER the assignment above succeeds — `wt` is still
-        # None if creation raises, and the finally's `if wt is not None` guard
-        # depends on that.  SCOPE IS LOAD-BEARING: the lease wraps only the
-        # verify body and closes before the finally.  If cleanup ran while we
-        # still held the lease, `remove_merge_worktree_guarded`'s NON-BLOCKING
-        # acquire would fail against OURSELVES, return 'skipped_lease_held',
-        # and leak the very tree the finally exists to remove.
-        async with git_ops.merge_verify_lease(lane_dir=wt):
-            # FULL-GATE drift spec (task 2886 fix 1b, PRD §8δ): the drift check
-            # re-dispatches this spec to BOTH the local trust-anchor and the
-            # eligible remote and alarms on divergence.  Re-dispatching the SAME
-            # scoped/no-source spec that produced a trivial pass would trivially
-            # pass on both hosts and structurally cannot catch the trivial-pass
-            # divergence class.  Forcing task_files=None runs the complete
-            # workspace gate (verify.py task_files=None path) on both hosts so a
-            # genuine divergence is observable.  This deliberately does NOT
-            # derive/scope task_files (unlike merge_lane/post_merge_verify.py::run_post_merge_verify's serial-lane
-            # dispatching-host derivation) — the derivation gate is intentionally
-            # dropped here.  task_files_tuple stays None so BOTH the spec and the
-            # LocalRunner below run the whole suite.
-            task_files_tuple = None
-            spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
-            local_runner = LocalRunner(
-                wt, req.config, req.module_configs, task_files_tuple,
-                run_scoped=verifier.run_scoped,
-                run_unscoped=verifier.run_unscoped_typechecks,
-                task_id=req.task_id,
-            )
-            held.seat(local_slot, local_runner)
-            pool = VerifyRunnerPool(
-                [local_runner, remote_lease.runner],
-                event_store=event_store,
-                task_id=req.task_id,
-                on_unavailable=on_unavailable,
-            )
-
-            # Cadence is already enforced upstream in _maybe_run_drift_check
-            # (DriftCheckState.is_due).  DriftDetector.should_sample is
-            # never called on this path, so omitting every_n_lands here keeps a
-            # single source of truth and avoids a dead duplicate cadence value.
-            detector = DriftDetector(
-                pool,
-                event_store=event_store,
-                escalation_queue=escalation_queue,
-                task_id=req.task_id,
-            )
-            await detector.check_env_safely(req.config.verify_env_probes)
-            # Capture the eligible remote BEFORE check() so we can propagate its
-            # name even after the pool quarantines it (eligible_remote() returns
-            # None after quarantine).
-            eligible_before = pool.eligible_remote()
-            result = await detector.check(
-                merge_commit, spec, on_leg_done=held.release_leg,
-            )
-            if result.quarantined and eligible_before is not None:
-                quarantine(eligible_before.name)
     except Exception:
         logger.warning(
             'Drift check failed for task %s / commit %s; ignoring (detective control)',
             req.task_id, merge_commit,
             exc_info=True,
         )
-    finally:
-        await held.release_remaining()
-        if wt is not None:
-            await git_ops.cleanup_merge_worktree(wt)
 
 
 def _advance_land_count(path: Path | None, in_memory_count: int) -> DriftCheckState:
