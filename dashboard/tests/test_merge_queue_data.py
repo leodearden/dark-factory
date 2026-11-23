@@ -20,6 +20,7 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
+from _runs_db_fixture import runs_db_path, write_runs_db
 from shared.testing_virtual_clock import virtual_clock_test
 
 # ---------------------------------------------------------------------------
@@ -143,6 +144,7 @@ from dashboard.data.merge_queue import (  # noqa: E402
     _trailing_minutes_for_window,
     _ts_sort_key,
     enrich_merges_with_titles,
+    landing_rate,
     merge_attempts,
     merge_task_refs,
     queue_depth_timeseries,
@@ -721,6 +723,73 @@ class TestTrailingLandingRates:
 
         assert series['values'][-1] == 1.0
         assert _rate_at(series, RATE_NOW - trailing) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# TestLandingRate — the runs.db leg behind the throughput panel
+# ---------------------------------------------------------------------------
+
+def _done_merge(at: datetime, task_id: str, sha: str):
+    return (at, task_id, 'merge_finalized', {'state': 'done', 'merge_sha': sha})
+
+
+def _train_merged(at: datetime, members: list[str], sha: str):
+    return (at, members[-1], 'train_merged', {
+        'train_id': f'train-{sha}', 'member_task_ids': members,
+        'merge_commit_sha': sha, 'base_sha': 'b',
+    })
+
+
+class TestLandingRate:
+    async def test_train_members_land_one_each_beside_a_solo_merge(self, tmp_path):
+        root = tmp_path / 'proj'
+        write_runs_db(root, [
+            _train_merged(RATE_NOW - timedelta(hours=2), ['21', '22', '23'], 'train-sha'),
+            _done_merge(RATE_NOW - timedelta(hours=5), '24', 'solo-sha'),
+        ])
+
+        series = fresh_read(await landing_rate(root, hours=24, now=RATE_NOW), RATE_NOW)
+
+        assert series['values'][-1] == 4.0
+        assert series['trailing_minutes'] == 1440
+
+    async def test_no_open_runs_db_is_unknown(self):
+        assert_unread(await landing_rate(None, hours=24, now=RATE_NOW), RATE_NOW, 'no runs.db is open')
+
+    async def test_a_root_with_no_runs_db_is_unknown_not_zeros(self, tmp_path):
+        assert_unread(
+            await landing_rate(tmp_path / 'proj', hours=24, now=RATE_NOW), RATE_NOW, 'runs.db',
+        )
+
+    async def test_a_runs_db_with_no_events_table_is_unknown_not_zeros(self, tmp_path):
+        root = tmp_path / 'proj'
+        store = write_runs_db(root, [_done_merge(RATE_NOW - timedelta(hours=1), '31', 'sha')])
+        with sqlite3.connect(store) as conn:
+            conn.execute('DROP TABLE events')
+        conn.close()
+
+        assert_unread(await landing_rate(root, hours=24, now=RATE_NOW), RATE_NOW, 'runs.db')
+
+    async def test_an_unrecognised_train_payload_is_unknown_naming_it(self, tmp_path):
+        root = tmp_path / 'proj'
+        write_runs_db(root, [
+            (RATE_NOW - timedelta(hours=1), '41', 'train_merged', {'train_id': 'x', 'verdict': 'other'}),
+        ])
+
+        assert_unread(
+            await landing_rate(root, hours=24, now=RATE_NOW), RATE_NOW, 'UnrecognisedTrainEvent',
+        )
+
+    async def test_a_readable_runs_db_with_no_landings_reads_measured_zeros(self, tmp_path):
+        root = tmp_path / 'proj'
+        write_runs_db(root, [
+            (RATE_NOW - timedelta(hours=1), '51', 'merge_attempt', {'outcome': 'done'}),
+        ])
+
+        series = fresh_read(await landing_rate(root, hours=24, now=RATE_NOW), RATE_NOW)
+
+        assert series['values']
+        assert set(series['values']) == {0}
 
 
 # ---------------------------------------------------------------------------
@@ -1646,6 +1715,22 @@ class TestBuildPerProjectMergeQueue:
         assert fresh_read(result['/tmp/real']['depth_timeseries'], now)['bucket_minutes'] == 60
         assert_unread(result['/tmp/none']['depth_timeseries'], now)
 
+    async def test_a_real_root_serves_the_landings_its_runs_db_records(self, tmp_path):
+        """The landing rate reads the root the pid names; a train lands once per member."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        root = tmp_path / 'proj'
+        write_runs_db(root, [
+            _done_merge(RATE_NOW - timedelta(hours=3), '11', 'sha-11'),
+            _train_merged(RATE_NOW - timedelta(hours=1), ['12', '13'], 'train-13'),
+        ])
+
+        async with aiosqlite.connect(str(runs_db_path(root))) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue([(str(root), conn)], hours=24, now=RATE_NOW)
+
+        assert fresh_read(result[str(root)]['landing_rate'], RATE_NOW)['values'][-1] == 3.0
+
     async def test_the_outcome_total_is_the_latency_attempt_total(self, tmp_path):
         """Sketch #9, second half: one row set behind the donut and the latency."""
         from dashboard.data.merge_queue import build_per_project_merge_queue
@@ -1811,6 +1896,7 @@ class TestBuildPerProjectMergeQueue:
         ('queue_depth_timeseries', 'depth_timeseries', 'speculative'),
         ('merge_attempts', 'attempts', 'speculative'),
         ('train_throughput_stats', 'train_throughput', 'speculative'),
+        ('landing_rate', 'landing_rate', 'speculative'),
     ])
     async def test_a_raising_leg_serves_unknown_not_zeros(self, tmp_path, leg, field, sibling):
         """A leg that raises is a hole in its own field; its siblings stay measured."""
@@ -1854,7 +1940,10 @@ class TestBuildPerProjectMergeQueue:
         project = result['/tmp/P']
         assert project['recent'] == []
         assert project['runs_db_present'] is True, 'a project whose build raised had a db'
-        for field in ('speculative', 'recent_total', 'depth_timeseries', 'attempts', 'train_throughput'):
+        for field in (
+            'speculative', 'recent_total', 'depth_timeseries', 'attempts', 'train_throughput',
+            'landing_rate',
+        ):
             assert project[field].state is DatumState.UNKNOWN, field
             assert '/tmp/P' in (project[field].reason or ''), field
             assert 'RuntimeError: boom' in (project[field].reason or ''), field
@@ -1877,7 +1966,10 @@ class TestBuildPerProjectMergeQueue:
         presence = {pid: project['runs_db_present'] for pid, project in result.items()}
         assert presence == {'/tmp/real': True, '/tmp/nofile': False, '/tmp/unopenable': True}
         absent = result['/tmp/nofile']
-        for field in ('depth_timeseries', 'attempts', 'recent_total', 'speculative', 'train_throughput'):
+        for field in (
+            'depth_timeseries', 'attempts', 'recent_total', 'speculative', 'train_throughput',
+            'landing_rate',
+        ):
             assert_unread(absent[field], now, 'no runs.db file')
         assert (absent['recent'], absent['train_events']) == ([], [])
         assert_unread(result['/tmp/unopenable']['attempts'], now, 'no runs.db is open')
