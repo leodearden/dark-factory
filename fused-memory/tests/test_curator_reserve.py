@@ -100,7 +100,7 @@ async def landed_served_details(db_path: Path) -> list[dict[str, Any]]:
             details = [json.loads(row[0]) for row in await cursor.fetchall()]
         if details:
             return details
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

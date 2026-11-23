@@ -354,7 +354,7 @@ class TestDrainSitesStepAside:
 async def wait_until(holds: Callable[[], Awaitable[bool]]) -> None:
     """Poll *holds* until it answers True; the per-test timeout is the only deadlock backstop."""
     while not await holds():
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0)
 
 
 async def drive_one_project_loop_cycle(harness: ReconciliationHarness) -> None:

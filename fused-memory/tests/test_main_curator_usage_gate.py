@@ -489,7 +489,7 @@ async def _landed_account_events(db_path: Path) -> list[tuple[str, dict, str]]:
             rows = [(row[0], json.loads(row[1]), row[2]) for row in await cursor.fetchall()]
         if rows:
             return rows
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)
 
 
 class TestCuratorReserveConfig:
