@@ -1163,7 +1163,10 @@ def _report_task_already_done(
 
     The architect calls this when it has determined that the task's work
     is already on main at *commit*.  The workflow validates the claim
-    (commit reachable from main) and sets task status to ``done``.
+    (a full 40-character lowercase hex sha, reachable from main and
+    attributable to this task) and sets task status to ``done``.  Nothing
+    is validated here, so a malformed *commit* is refused only after the
+    session has ended.
     """
     artifacts.write_already_done(commit=commit, evidence=evidence)
     return {'status': 'ok', 'commit': commit}
