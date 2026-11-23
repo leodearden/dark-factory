@@ -35,6 +35,7 @@ import types
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
 from _seed_script_stubs import seed_default_warm_base
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -48,7 +49,7 @@ from orchestrator.task_runtime import build_task_runtime_snapshot
 # ---------------------------------------------------------------------------
 # Sibling-fixture reuse, loaded by explicit file path rather than a bare
 # `from test_task_runtime import ...`. dashboard/tests/test_task_runtime.py
-# shares this module's bare name and defines none of `_init_repo` /
+# shares this module's bare name and defines none of
 # `_make_task_artifacts` / `_warm_config`. Both subprojects' conftest.py
 # insert their own tests/ dir at sys.path[0] (orchestrator/tests/conftest.py,
 # dashboard/tests/conftest.py), so a bare import's resolution is conftest-
@@ -74,7 +75,6 @@ def _load_sibling_test_module(filename: str, unique_name: str):
 _task_runtime_fixtures = _load_sibling_test_module(
     'test_task_runtime.py', '_orchestrator_test_task_runtime_fixtures',
 )
-_init_repo = _task_runtime_fixtures._init_repo
 _make_task_artifacts = _task_runtime_fixtures._make_task_artifacts
 _warm_config = _task_runtime_fixtures._warm_config
 
@@ -88,9 +88,7 @@ _warm_config = _task_runtime_fixtures._warm_config
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit + a resolvable warm base."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     seed_default_warm_base(repo)
     return repo
 

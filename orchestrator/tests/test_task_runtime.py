@@ -8,17 +8,17 @@ provides no shared `git_repo` fixture, so this module owns its own fixture.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
 from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
 from orchestrator.task_runtime import (
     _derive_phase,
@@ -31,15 +31,6 @@ from orchestrator.task_runtime import (
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit + a resolvable warm base.
@@ -48,9 +39,7 @@ def git_repo(tmp_path: Path) -> Path:
     fixture serves both the non-pooled and pooled (TestPooled) scenarios
     below.
     """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     seed_default_warm_base(repo)
     return repo
 
