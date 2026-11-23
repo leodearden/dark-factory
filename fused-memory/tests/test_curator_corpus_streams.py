@@ -206,6 +206,30 @@ def _windowed_embedder() -> _WindowedEmbedder:
     return _WindowedEmbedder(make_config().embedder.dimensions)
 
 
+class _RefusingEmbedder:
+    """An embedder that answers every input with the 400 a deterministic refusal gets."""
+
+    async def create(self, input_data: str) -> list[float]:
+        raise _embedder_refusal()
+
+
+class _FailingEmbedder:
+    """An embedder whose every call raises *exc*."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def create(self, input_data: str) -> list[float]:
+        raise self._exc
+
+
+def _embedder_server_error() -> openai.InternalServerError:
+    response = httpx.Response(
+        500, request=httpx.Request('POST', 'https://api.openai.invalid/v1/embeddings'),
+    )
+    return openai.InternalServerError('Error code: 500', response=response, body=None)
+
+
 @asynccontextmanager
 async def _open_stack(
     project_dir: Path,
@@ -821,3 +845,63 @@ async def test_an_over_long_task_is_recorded_and_found_by_an_over_long_query(tmp
 
     assert count == 1
     assert [hit['task_id'] for hit in hits] == ['1']
+
+
+@pytest.mark.asyncio
+async def test_a_refused_embedding_is_curated_over_the_remaining_streams_not_deferred(
+    tmp_path, caplog,
+):
+    caplog.set_level(logging.WARNING, logger=_CURATOR_LOGGER)
+    prompts: list[str] = []
+    invoke = invoke_by_role(
+        single=_creating_and_recording(prompts),
+        batch=tripwire('one candidate must take the single spec'),
+    )
+    async with _open_stack(
+        tmp_path / 'project', SqliteTaskBackend, invoke=invoke, embedder=_RefusingEmbedder(),
+    ) as stack:
+        prepared = await stack.curator.prepare_candidate(CandidateTask(title='t'), 'p', stack.root)
+        [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
+
+    assert prepared.corpus_error is None
+    assert _unavailable(prepared) == ('embedding',)
+    assert decision.action == 'create'
+    [prompt] = prompts
+    assert _EMBEDDING_UNAVAILABLE in prompt.splitlines()
+    assert decision.to_log_fields()['unavailable_streams'] == ['embedding']
+    assert any(
+        r.name == _CURATOR_LOGGER and r.levelno == logging.WARNING
+        and 'embedding' in r.getMessage() and 'refused' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_embedding_with_a_failed_module_read_still_defers(tmp_path):
+    async with _open_stack(
+        tmp_path / 'project', _ModuleReadFailsBackend, embedder=_RefusingEmbedder(),
+    ) as stack:
+        prepared = await stack.curator.prepare_candidate(
+            CandidateTask(title='t', files_to_modify=[_CANDIDATE_FILE]), 'p', stack.root,
+        )
+        [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
+
+    assert prepared.corpus_error is not None
+    assert 'module' in prepared.corpus_error
+    assert 'embedding' in prepared.corpus_error
+    assert decision.action == 'defer'
+    assert decision.defer_reason == DeferReason.CORPUS_FAILED
+
+
+@pytest.mark.asyncio
+async def test_an_embedder_server_error_on_the_only_stream_still_defers_corpus_failed(tmp_path):
+    async with _open_stack(
+        tmp_path / 'project', SqliteTaskBackend,
+        embedder=_FailingEmbedder(_embedder_server_error()),
+    ) as stack:
+        prepared = await stack.curator.prepare_candidate(CandidateTask(title='t'), 'p', stack.root)
+        [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
+
+    assert prepared.corpus_error is not None
+    assert decision.action == 'defer'
+    assert decision.defer_reason == DeferReason.CORPUS_FAILED
