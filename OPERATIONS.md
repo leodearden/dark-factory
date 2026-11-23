@@ -2417,8 +2417,10 @@ takes no arguments: it always re-reads that process's own
   `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
   keeps the leg's segments on the packages that own marked tests. Every
   module's `lint_command` also runs `tests/scripts/git_history_census.py` over
-  that module's gate test roots, so an unaccounted history reader fails at
-  task verify and in the pre-commit hook rather than first at the merge gate;
+  that module's gate test roots, so an unaccounted history reader, or a
+  registry entry under those roots that is stale or doubles another
+  accounting, fails at task verify and in the pre-commit hook rather than
+  first at the merge gate;
   the throwaway-repo registry now lives at
   `tests/scripts/git_history_census.py::READS_ONLY_THROWAWAY_REPOS`. Green-tier
   for the same reason as `merge_gate_history_pure`.
