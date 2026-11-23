@@ -6,6 +6,8 @@ from the ``mark_step_done`` grant), once each, and its heading constant
 ``BRANCH_HISTORY_HEADING`` is the one the section opens with. The reviewer
 section ``REVIEWER_BRANCH_HISTORY_RULE`` sits in the reviewer CONTRACT of both
 generations, names the WIP subject the harness mints, and reaches no other role.
+The amender turn-prompt points at the writer section by the heading, and that
+pointer has a section to land on.
 
 Every assertion is a containment, count or equality check against a NAMED live
 constant: no regex over prose and no literal wording pin. The standing rule and
@@ -22,6 +24,7 @@ from orchestrator.agents.branch_history_guidance import (
     BRANCH_HISTORY_HEADING,
     REVIEWER_BRANCH_HISTORY_RULE,
 )
+from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import (
     REVIEWER_COMPREHENSIVE,
     REVIEWER_COMPREHENSIVE_CONTEXT_COMPLETE,
@@ -196,4 +199,43 @@ class TestReviewerRule:
         assert BRANCH_HISTORY_GUIDANCE not in role.system_prompt, (
             f'{role.name} carries BRANCH_HISTORY_GUIDANCE, the writer section. '
             'A reviewer gets only REVIEWER_BRANCH_HISTORY_RULE; remove the splice.'
+        )
+
+
+class TestAmenderPointer:
+    """The amender prompt names the writer section rather than restating it."""
+
+    def test_the_pointer_cannot_dangle(self) -> None:
+        """Half the pointer's precondition: IMPLEMENTER carries the section.
+
+        The amender runs under IMPLEMENTER (``workflow.py::TaskWorkflow._amend``),
+        so the heading it names must be a section of IMPLEMENTER's prompt. This
+        pins only that IMPLEMENTER carries the section, not that call site.
+        """
+        assert BRANCH_HISTORY_GUIDANCE in ROLES['implementer'].system_prompt, (
+            'IMPLEMENTER does not carry BRANCH_HISTORY_GUIDANCE, so the amender '
+            "prompt's pointer to that section names nothing. Restore the splice."
+        )
+
+    async def test_a_rewrite_suggestion_meets_the_pointer(
+        self, briefing: BriefingAssembler,
+    ) -> None:
+        prompt = await briefing.build_amender_prompt(
+            plan={'title': 't', 'analysis': 'a'},
+            suggestions=[{
+                'reviewer': 'comprehensive',
+                'category': 'documentation',
+                'location': 'tests/_surface_forms.py:12',
+                'description': 'The WIP commit carries real change but no rationale.',
+                'suggested_fix': 'squash it into the step commit or reword its message',
+            }],
+            locked_modules=['tests/'],
+            context='',
+            task_id='7470',
+        )
+
+        assert BRANCH_HISTORY_HEADING in prompt, (
+            'The amender prompt does not name BRANCH_HISTORY_HEADING, so a '
+            'suggestion to squash or reword a commit meets no rule against it. '
+            'Add the Scope Discipline rule that points at the section.'
         )
