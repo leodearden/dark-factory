@@ -4520,7 +4520,11 @@ per verify role. Each is its own green-tier reload leaf, so
 
 - `off`: no decision, no recording.
 - `log`: every unit still runs and its green is recorded; a unit whose key
-  matched a recorded green is stamped `would_hit`. Nothing is replayed.
+  matched a recorded green is stamped `would_hit`. A matched unit that then
+  runs red is stamped `ran_red` with the matched green's `evidence_event_id`:
+  a red the cache would have landed
+  (`orchestrator/src/orchestrator/verify_evidence.py::VerifyUnit.would_have_leaked`).
+  Nothing is replayed.
 - `on`: a matching unit is replayed and not run.
 
 Each mode rolls out `off` → `log` for three days → `on`, per role and (once
@@ -4531,8 +4535,8 @@ audit (task 5655) lands: the merge gate runs `merge_verify_breadth: "full"`, so
 it still runs every unit a task-role replay skipped, and a task-role false hit
 cannot land a red on main. The merge role (and `remote_merge_mode`) stays
 behind the audit: `merge_mode: on` waits for task 5655. Before flipping a role
-to `on`, check its `log` window for a `would_hit` unit that ran red for a
-cause the branch's own diff explains; spurious reds (infra kill, worker crash,
+to `on`, check its `log` window for a `ran_red` unit carrying an
+`evidence_event_id` for a cause the branch's own diff explains; spurious reds (infra kill, worker crash,
 deploy clock, known load flake) do not block the flip.
 
 A remote dispatch (verify on a `verify_runners` host) runs under the more
@@ -4556,11 +4560,11 @@ re-verify emits its own `workflow_verify` row, distinguished by its site.
 
 | Unit outcome | Meaning |
 |---|---|
-| `ran_green` / `ran_red` | The unit executed, with no cache involvement (`off` mode, a miss, or a never-cache class) |
+| `ran_green` / `ran_red` | The unit executed; nothing was replayed. Without an `evidence_event_id` there was no cache involvement (`off` mode, a miss, or a never-cache class), or the red ran under an `unavailable` or `disabled` decision, which the unit's `reason` names. In `log` mode a `ran_red` may carry `evidence_event_id`, naming the green a replay would have served: that unit is a leak the cache would have landed (`VerifyUnit.would_have_leaked`) |
 | `cache_hit` | Replayed, not run. `evidence_event_id` names the verify event whose green it replays; that event names the host that ran it, so a cross-host replay is traceable through it |
-| `would_hit` | `log` mode: the key matched a recorded green, but the unit ran anyway. A `would_hit` that ran red is a leak the cache would have landed |
-| `unavailable` | The cache could not decide and the unit ran: no registry on this host, an unreadable registry, or a code identity its keys need was missing. The decision's reason is on the unit. It is never an error |
-| `disabled` | The decision when the kill switch is in force: every unit misses and runs. The event shows these units as `unavailable`, with the reason naming the disable deadline |
+| `would_hit` | `log` mode: the key matched a recorded green, and the unit ran anyway and passed. A matched unit that ran red is a `ran_red` with `evidence_event_id` (row above) |
+| `unavailable` | The cache could not decide, and the unit ran and passed: no registry on this host, an unreadable registry, or a code identity its keys need was missing. A red is `ran_red`, with no `evidence_event_id`. The decision's reason is on the unit. It is never an error |
+| `disabled` | A decision, never an event value. Under the kill switch every unit runs, and the event shows it as `unavailable` if green or `ran_red` if red, the unit's `reason` naming the disable deadline (`orchestrator/src/orchestrator/verify_cache/policy.py::_decide`) |
 
 A **no-verdict naming an unbacked cache hit** (γ2) means a remote runner
 returned a `cache_hit` for a `(unit_id, key)` the dispatcher's registry does
