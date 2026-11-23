@@ -578,6 +578,19 @@ def test_the_build_lock_file_is_left_in_place(remote: _Remote):
     assert (remote.root / f'.build-{remote.sha}.lock').is_file()
 
 
+@pytest.mark.parametrize('failure', ['handshake', 'build'])
+def test_a_failed_ensure_unlinks_its_build_lock(remote: _Remote, failure: str):
+    """Both failure routes, die() and a ``set -e`` abort, leave no lock behind."""
+    if failure == 'handshake':
+        result = remote.ensure(FAKE_UV_BROKEN='1')
+    else:
+        (Path(remote.env['PATH'].split(':')[0]) / 'uv').write_text('#!/usr/bin/env bash\nexit 1\n')
+        result = remote.ensure()
+
+    assert result.returncode not in (0, 255), result.stderr
+    assert not (remote.root / f'.build-{remote.sha}.lock').exists()
+
+
 def _a_flock_waits_on(handle: typing.IO[str]) -> bool:
     """Whether some process is blocked in flock on the file *handle* has open.
 
