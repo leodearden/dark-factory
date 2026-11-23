@@ -14608,6 +14608,56 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
     assert taskmaster.add_task.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_batch_combine_pointing_at_refused_candidate_degrades_to_create_and_is_audited(
+    make_curator_interceptor, taskmaster, audit_dir,
+):
+    """A combine into a refused sibling has no task to rewrite: the candidate is
+    created on its own, and the combine it could not make is audited."""
+    refusal = _blocklisted_refusal()
+    mock_curator = curator_always(refusal)
+    mock_curator.curate_prepared = AsyncMock(return_value=[
+        refusal,
+        CuratorDecision(
+            action='combine',
+            target_id=None,
+            batch_target_index=0,  # points at the REFUSED sibling
+            target_fingerprint='Convert FIX C relay-flag deletion',
+            rewritten_task=RewrittenTask(
+                title='Unified', description='both', details='every detail',
+                files_to_modify=[], priority='medium',
+            ),
+            justification='fold into batch 0',
+        ),
+    ])
+    interceptor = make_curator_interceptor(mock_curator)
+    taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'Unrelated sibling'})
+
+    ticket_ids = await submit_as_one_batch(interceptor, mock_curator, [
+        {'title': 'Convert FIX C relay-flag deletion', 'description': 'x'},
+        {'title': 'Unrelated sibling that names t1 as its target', 'description': 'x'},
+    ])
+    refused, sibling = [
+        await interceptor.resolve_ticket(t, '/project', timeout_seconds=10.0)
+        for t in ticket_ids
+    ]
+
+    assert refused['status'] == 'refused', refused
+    assert 'task_id' not in refused, refused
+    assert (sibling['status'], sibling.get('task_id')) == ('created', '77'), sibling
+    assert 'batch-target-not-create' in sibling['reason'], sibling
+    [audit] = _combine_audit_lines(audit_dir)
+    assert {
+        key: audit.get(key)
+        for key in ('refused_reason', 'batch_internal', 'candidate_ticket_id', 'target_id')
+    } == {
+        'refused_reason': 'batch-target-not-create',
+        'batch_internal': True,
+        'candidate_ticket_id': ticket_ids[1],
+        'target_id': None,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # task-3126 step-10 RED: a refusal must not be bypassable by submitting the
 # SAME candidate twice in one batch.
