@@ -7215,7 +7215,7 @@ class Scheduler:
                     heads += 1
                 continue
             modules = self._get_modules(pin.task)
-            if self.lock_table.try_acquire(pin.task_id, modules):
+            if self._claim(pin.task_id, modules):
                 return await self._dispatch_pin(pin, modules)
             if not self.config.pin_reservations_enabled:
                 continue
@@ -7399,8 +7399,7 @@ class Scheduler:
         return sorted(queue, key=lambda pin: pin.pin_order)
 
     async def _dispatch_pin(self, pin: _PinCandidate, modules: list[str]) -> TickOutcome:
-        """Book a pin whose ``try_acquire`` just succeeded, and end the tick."""
-        self._dispatched.add(pin.task_id)
+        """Book a pin whose :meth:`_claim` just succeeded, and end the tick."""
         # Starvation-watchdog settle (tasks 1880, 3821), wrapped so a
         # failure can NEVER abort a successful dispatch (PROPERTY 1).
         try:
@@ -7513,7 +7512,12 @@ class Scheduler:
         # tick can tell that a task has left candidacy.
         if ctx.scope is DispatchScope.ANY:
             self._park_refusals.retain(str(t.get('id', '')) for t in ctx.candidates)
-        scored = self._score_candidates(ctx)
+        # A task started since the ready list was built (by a claim that ran
+        # while this pass was suspended) is neither claimed, counted as
+        # refused, nor passed over as the top (invariant 11).
+        scored = [entry for entry in self._score_candidates(ctx) if entry[1] not in self._dispatched]
+        if not scored:
+            return TickOutcome(None)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
         if logger.isEnabledFor(logging.DEBUG):
@@ -7555,7 +7559,7 @@ class Scheduler:
                     self._note_heavy_deferral(ctx, ctx.psi_hold, task_id)
                     continue
                 modules = self._get_modules(task)
-                acquired = self.lock_table.try_acquire(task_id, modules)
+                acquired = self._claim(task_id, modules)
                 grant: _BackfillGrant | None = None
                 if not acquired:
                     # EASY-backfill (task 3823 / PRD C7): this candidate may be
@@ -7572,7 +7576,7 @@ class Scheduler:
                     # than recorded as a borrow that never happened.
                     grant = self._backfill_admission(task_id, task, modules)
                     if grant is not None:
-                        acquired = self.lock_table.try_acquire(
+                        acquired = self._claim(
                             task_id, modules, admitted_parks=frozenset(grant.park_owners)
                         )
                         if not acquired:
@@ -7581,7 +7585,6 @@ class Scheduler:
                     refused.append(task_id)
                     self._note_park_refusal(ctx, task_id, modules, pri)
                 if acquired:
-                    self._dispatched.add(task_id)
                     self._watchdog_state.note_scan(refused)
                     # Starvation-watchdog settle (tasks 1880, 3821): resolve any
                     # open watchdog escalation and forget the task's watchdog
@@ -7626,6 +7629,22 @@ class Scheduler:
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
         await self._write_snapshot_best_effort()
         return TickOutcome(None)
+
+    def _claim(
+        self, task_id: str, modules: list[str], *, admitted_parks: frozenset[str] = frozenset(),
+    ) -> bool:
+        """The ordinary claim: refuse a started task, else take its keys and mark it started.
+
+        One synchronous step, so nothing can start the task between the check
+        and the mark (invariant 11, PRD §5.4 "Never started twice"); the lock
+        table alone cannot refuse, since it admits a requester's own holds.
+        """
+        if task_id in self._dispatched:
+            return False
+        if not self.lock_table.try_acquire(task_id, modules, admitted_parks=admitted_parks):
+            return False
+        self._dispatched.add(task_id)
+        return True
 
     def _note_park_refusal(
         self, ctx: TickContext, task_id: str, modules: list[str], tier: str
