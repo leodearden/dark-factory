@@ -6,6 +6,8 @@ directory, so a worker built after a restart over the same data directory and
 event journal still dispatches every marked request without members. The row
 runs a first lane until the red tip has been followed by a solo verify, ends
 it, then runs a second lane over the same scene and resubmits the same tasks.
+Their solo verdicts end the marks on disk too, so a third lane chains a
+resubmission again.
 
 The first process ends either killed or gracefully stopped. A graceful stop
 resolves every live request with the shutdown outcome, which is no verdict, so
@@ -85,14 +87,16 @@ class TestMarksSurviveARestart:
         pytest.param(_killed, id='killed'),
         pytest.param(_stopped, id='stopped'),
     ])
-    async def test_marked_requests_dispatch_without_members_after_a_restart(
+    async def test_marked_requests_dispatch_alone_after_a_restart_until_their_verdict(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, end: ProcessEnd,
     ) -> None:
         """S, F1, F2 and F3 ride a red four-item tip, so all four are marked;
         the first process ends, killed or gracefully stopped, while the solo
         verifies are under way. A lane built afterwards, over the same data
         directory and event journal, is handed the same four tasks with G1-G3
-        chainable behind them. Each marked task still dispatches alone."""
+        chainable behind them. Each marked task still dispatches alone. S's
+        solo verdict ends its mark, so a third lane chains S's resubmission
+        with H1."""
         scene = _scene(tmp_path, monkeypatch, merge_deep=_deep(6))
         first = {
             'S': await _high(scene, 'S'), 'F1': await _high(scene, 'F1'),
@@ -105,12 +109,23 @@ class TestMarksSurviveARestart:
         assert _chain_items(scene, 'S')[0] == 4, 'the red tip carried all four members'
 
         verified_before = {name: len(_chain_items(scene, name)) for name in _MARKED}
-        await _run_second_process(scene, first)
+        await _run_process(scene, {
+            **{name: _resubmission(scene, first[name]) for name in _MARKED},
+            **await _requests(scene, 'G1', 'G2', 'G3'),
+        })
         for name in _MARKED:
             after = _chain_items(scene, name)[verified_before[name]:]
             assert after and set(after) == {1}, (
                 f'{name} was batched again after the restart: {after}'
             )
+
+        s_verified = len(_chain_items(scene, 'S'))
+        await _run_process(scene, {
+            'S': _resubmission(scene, first['S']), **await _requests(scene, 'H1'),
+        })
+        assert _chain_items(scene, 'S')[s_verified] == 2, (
+            "S's applied verdict ended its mark on disk, so a later start chains H1"
+        )
 
 
 async def _first_process_ends_while_verifying_alone(
@@ -132,12 +147,11 @@ async def _first_process_ends_while_verifying_alone(
         await end(lane, run)
 
 
-async def _run_second_process(scene: _Scene, first: dict[str, Any]) -> None:
-    resubmitted = {name: _resubmission(scene, first[name]) for name in _MARKED}
-    unmarked = await _requests(scene, 'G1', 'G2', 'G3')
+async def _run_process(scene: _Scene, requests: dict[str, MergeRequest]) -> None:
+    """Put *requests* in order on a fresh lane over *scene*; wait until each resolves."""
     async with _running(
         scene, verifier=_TreeKeyedVerifier(), remotes=[], speculation_depth=2,
     ) as run:
-        run.put(*resubmitted.values(), *unmarked.values())
-        for name, request in {**resubmitted, **unmarked}.items():
+        run.put(*requests.values())
+        for name, request in requests.items():
             await _outcome(request, name)
