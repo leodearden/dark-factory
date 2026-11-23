@@ -185,7 +185,7 @@ the task out of this state.
 | Status | Means exactly | Entry writer(s) | Exit owner | Exit triggers | Bound |
 |---|---|---|---|---|---|
 | `pending` | dispatchable when gates pass | submit/curator; requeue writers; resolution actions; recovery revert | scheduler | dispatch (pending-only by design) | starvation/fairness ladder; dispatch gates are visible per-tick |
-| `deferred` | authored, not yet released | planning_mode submit | planning session (`commit_planning`); recon | commit → `pending` | planning-session lifetime; recon sweeps |
+| `deferred` | parked off the scheduler with a recorded hold (`metadata.deferral`) | `planning_mode` submit (server stamps `planning`); any caller via `set_task_status` with a `deferral` record (`carried_by` / `until_condition` / `held_by_session`) | whoever the record's kind names: the planning session, the carrier's human, the human judging an `until_condition`, the holding session; for a `legacy_unknown` row, the human the census surfaces it to; for a dead holder or lapsed `expires_at`, the deferral sweep (task 6526, not yet landed) | `set_task_status(pending)`, or a direct `done`/`cancelled` write; `commit_planning` for `planning` holds and unrecorded rows; sweep release (not yet landed) | age surfacing by the deferral census (`scripts/deferral_census.py` over `shared/src/shared/task_deferral.py::needs_human`; `/review-briefing` check 6); the holder lease and `expires_at` once the sweep lands. Not tied to a planning session. Kinds, refusals and release rules: `docs/task-authoring.md` §9 "Deferring a task" |
 | `in-progress` | a live claimant owns it (running, or Path-A escalated-waiting) | the dispatching workflow (claim stamp + heartbeat) | the workflow slot | `run()` outcome via its choke point (S1/S2) | heartbeat TTL; steward-wait idle window (task 3170) for the escalated case |
 | `blocked` | parked with an open escalation record or gate marker that owns re-entry (S3) | `_mark_blocked`; Table B `park`; deterministic gate; recovery conversion (S4) | the record's consumer tier (L0 steward / L1 watcher / L2 human); scheduler blocked-redispatch after close | resolve actions (Table B); redispatch when record closed + deps clear | ladder promotion (L0 reaper 600s); watcher supervision + outage tripwire; L2 age surfacing; `park` = explicit unbounded |
 | `merge-deferred` | parked in an atomic train; train worker owns it | train park choke point | group-merge worker | train lands / fails / re-drives | train terminal outcome (worker supervised; queue state durable and rehydrated across restarts — two-layer merge queue) |
@@ -312,7 +312,10 @@ log-mode-first behind a soak, and only after the producer fixes land**
    removal) must not run the cancellation cleanup that unhalts today;
    halt rehydration matches on category at level ≥ 1 (promotion must not
    change rehydration identity), and recovery never re-files a sibling
-   halt-category record.
+   halt-category record. Across a restart the halt is re-asserted only
+   while its project_root predicate measures true or cannot be measured; a
+   record measured clean is stamped released and never re-owns a halt
+   (task 3876; see `OPERATIONS.md` §"Merge-halt semantics").
 
 ## 8. Divergence register (code vs this spec, 2026-08-02)
 

@@ -1,9 +1,10 @@
 """The shadow invocation profile a live shadow cell runs under (task 5386).
 
-``build_shadow_orch_config`` is the corpus eval profile plus exactly one
-divergence: sandboxed roles run under the operator's configured sandbox
-backend. Strict MCP and the null memory sentinel are inherited from
-``EVAL_PROFILE``, never re-set.
+``build_shadow_orch_config`` is the corpus eval config plus its two
+refusals: a memory endpoint and a non-shadow fixture id. It has no
+divergence of its own: the sandbox is the base's, inherited through
+``build_eval_orch_config`` as a corpus cell's is (task 9849). Strict MCP and
+the null memory sentinel are inherited from ``EVAL_PROFILE``, never re-set.
 """
 
 from __future__ import annotations
@@ -19,16 +20,25 @@ import pytest
 from orchestrator.config import OrchestratorConfig, SandboxConfig, diff_config
 from orchestrator.evals import runner
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.fixture_gate import fixture_task_gate
 from orchestrator.evals.live_fixture import build_live_fixture
-from orchestrator.evals.runner import build_eval_orch_config, run_end_to_end, run_eval
+from orchestrator.evals.runner import (
+    CellProfile,
+    build_eval_orch_config,
+    run_end_to_end,
+    run_eval,
+)
 from orchestrator.evals.shadow_invocation import (
+    SHADOW_PROFILE,
     build_shadow_orch_config,
     run_shadow_end_to_end,
     run_shadow_eval,
 )
 from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
+from orchestrator.verify import run_scoped_verification
 
 _IMPL = EvalConfig('probe', 'claude', 'sonnet', 'high')
+_SANDBOXED = SandboxConfig(enabled=True, backend='landlock')
 
 
 def _shadow_fixture(project_root: Path) -> dict:
@@ -57,28 +67,15 @@ def test_strict_mcp_and_null_memory_are_inherited_from_the_eval_profile(tmp_path
     assert result.fused_memory.url == FM_NULL_SENTINEL_URL
 
 
-def test_sandbox_is_enabled_under_the_base_backend(tmp_path: Path) -> None:
-    base = OrchestratorConfig(
-        project_root=tmp_path, sandbox=SandboxConfig(enabled=True, backend='landlock'),
-    )
-
-    result = build_shadow_orch_config(_IMPL, _shadow_fixture(tmp_path), base)
-
-    assert result.sandbox.enabled is True
-    assert result.sandbox.backend == 'landlock'
-
-
 @pytest.mark.usefixtures('code_default_config')
-def test_shadow_diverges_from_the_corpus_eval_profile_only_in_sandbox_enabled(
-    tmp_path: Path,
-) -> None:
-    base = OrchestratorConfig(project_root=tmp_path)
+def test_shadow_config_equals_the_corpus_config(tmp_path: Path) -> None:
+    base = OrchestratorConfig(project_root=tmp_path, sandbox=_SANDBOXED)
     fixture = _shadow_fixture(tmp_path)
 
     shadow = build_shadow_orch_config(_IMPL, fixture, base)
     corpus = build_eval_orch_config(_IMPL, fixture, base)
 
-    assert _changed_leaf_paths(shadow, corpus) == {'sandbox.enabled'}
+    assert _changed_leaf_paths(shadow, corpus) == set()
 
 
 def test_architect_config_passes_through(tmp_path: Path) -> None:
@@ -152,7 +149,7 @@ async def test_run_eval_builds_the_cell_config_with_the_injected_builder(
         await run_eval(
             tmp_path / 'task.json', _IMPL, base,
             worktree_path=tmp_path, memory_endpoint='http://127.0.0.1:54321',
-            judge_config=judge, orch_config_builder=recorder,
+            judge_config=judge, profile=CellProfile(recorder, fixture_task_gate),
         )
 
     assert recorder.calls == [{
@@ -178,7 +175,8 @@ async def test_run_end_to_end_builds_the_cell_config_with_the_injected_builder(
     with pytest.raises(_Sentinel):
         await run_end_to_end(
             tmp_path / 'task.json', architect, _IMPL, base,
-            memory_endpoint='http://127.0.0.1:54321', orch_config_builder=recorder,
+            memory_endpoint='http://127.0.0.1:54321',
+            profile=CellProfile(recorder, fixture_task_gate),
         )
 
     assert recorder.calls == [{
@@ -188,10 +186,10 @@ async def test_run_end_to_end_builds_the_cell_config_with_the_injected_builder(
     }]
 
 
-async def _workflow_config_built_by(
+async def _build_workflow_kwargs_from(
     tmp_path: Path, monkeypatch, run: Callable[[OrchestratorConfig], Awaitable[object]],
-) -> OrchestratorConfig:
-    """The OrchestratorConfig *run* hands ``build_workflow`` for a shadow fixture."""
+) -> dict[str, Any]:
+    """The kwargs *run* hands ``build_workflow`` for a shadow fixture."""
     captured: dict[str, Any] = {}
 
     def stop_at_build_workflow(**kwargs: Any):
@@ -205,60 +203,95 @@ async def _workflow_config_built_by(
     monkeypatch.setattr(runner, 'build_workflow', stop_at_build_workflow)
 
     with pytest.raises(_Sentinel):
-        await run(OrchestratorConfig(project_root=tmp_path))
+        await run(OrchestratorConfig(project_root=tmp_path, sandbox=_SANDBOXED))
 
-    return captured['config']
+    return captured
 
 
 @pytest.mark.asyncio
-async def test_run_eval_under_the_shadow_builder_runs_its_cell_sandboxed(
+async def test_run_eval_under_the_shadow_profile_gates_its_cell_with_productions_scoped_verify(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    config = await _workflow_config_built_by(
+    kwargs = await _build_workflow_kwargs_from(
         tmp_path, monkeypatch,
         lambda base: run_eval(
             tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
-            orch_config_builder=build_shadow_orch_config,
+            profile=SHADOW_PROFILE,
         ),
     )
 
-    assert config.sandbox.enabled is True
+    assert kwargs['task_verify'] is run_scoped_verification
 
 
 @pytest.mark.asyncio
-async def test_run_eval_by_default_runs_its_cell_unsandboxed(tmp_path: Path, monkeypatch) -> None:
-    config = await _workflow_config_built_by(
+async def test_run_eval_by_default_runs_its_cell_under_the_base_sandbox(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = (await _build_workflow_kwargs_from(
+        tmp_path, monkeypatch,
+        lambda base: run_eval(
+            tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
+        ),
+    ))['config']
+
+    assert config.sandbox == _SANDBOXED
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_end_to_end_runs_its_cell_under_the_architect_config(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    architect = EvalConfig('arch', 'claude', 'opus', 'high')
+
+    config = (await _build_workflow_kwargs_from(
+        tmp_path, monkeypatch,
+        lambda base: run_shadow_end_to_end(
+            tmp_path / 'task.json', architect, _IMPL, base, usage_gate=None,
+        ),
+    ))['config']
+
+    assert config.models.architect == 'opus'
+
+
+@pytest.mark.asyncio
+async def test_run_eval_by_default_gates_its_cell_on_the_fixture_gate(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    kwargs = await _build_workflow_kwargs_from(
         tmp_path, monkeypatch,
         lambda base: run_eval(
             tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
         ),
     )
 
-    assert config.sandbox.enabled is False
+    assert kwargs['task_verify'] is fixture_task_gate
 
 
 @pytest.mark.asyncio
-async def test_run_shadow_eval_runs_its_cell_sandboxed(tmp_path: Path, monkeypatch) -> None:
-    config = await _workflow_config_built_by(
+async def test_run_shadow_eval_gates_its_cell_with_productions_scoped_verify(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    kwargs = await _build_workflow_kwargs_from(
         tmp_path, monkeypatch,
         lambda base: run_shadow_eval(
             tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
         ),
     )
 
-    assert config.sandbox.enabled is True
+    assert kwargs['task_verify'] is run_scoped_verification
 
 
 @pytest.mark.asyncio
-async def test_run_shadow_end_to_end_runs_its_cell_sandboxed(tmp_path: Path, monkeypatch) -> None:
+async def test_run_shadow_end_to_end_gates_its_cell_with_productions_scoped_verify(
+    tmp_path: Path, monkeypatch,
+) -> None:
     architect = EvalConfig('arch', 'claude', 'opus', 'high')
 
-    config = await _workflow_config_built_by(
+    kwargs = await _build_workflow_kwargs_from(
         tmp_path, monkeypatch,
         lambda base: run_shadow_end_to_end(
             tmp_path / 'task.json', architect, _IMPL, base, usage_gate=None,
         ),
     )
 
-    assert config.sandbox.enabled is True
-    assert config.models.architect == 'opus'
+    assert kwargs['task_verify'] is run_scoped_verification

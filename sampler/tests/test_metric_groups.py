@@ -11,8 +11,10 @@ import dataclasses
 import pytest
 from shared.psi import RunqueueReading
 
+from sampler.consumers import Figure, FigureKind
 from sampler.metrics import (
     ARM_METRICS,
+    FIGURE_METRICS,
     METRIC_GROUPS,
     TICK_CLOCK,
     GroupName,
@@ -21,6 +23,7 @@ from sampler.metrics import (
     SampleKey,
     arm_metrics,
     collect_load_metrics,
+    every_tick,
     exact_metric_names,
 )
 
@@ -30,7 +33,7 @@ def _no_samples():
 
 
 def _group(name: GroupName, *metrics: MetricSpec, windowed: bool = True) -> MetricGroup:
-    return MetricGroup(name, collect=_no_samples, metrics=metrics, windowed=windowed)
+    return MetricGroup(name, collect=every_tick(_no_samples), metrics=metrics, windowed=windowed)
 
 
 READ_OK = MetricSpec('fixture_read_ok')
@@ -176,9 +179,42 @@ class TestTheLiveTable:
         names = [spec.name for group in METRIC_GROUPS for spec in group.metrics]
         assert len(names) == len(set(names)), sorted(names)
 
-    def test_only_the_kernel_windowed_psi_group_is_recorded_unwindowed(self):
+    def test_the_kernel_windowed_and_the_due_groups_are_recorded_unwindowed(self):
         windowed = {group.name: group.windowed for group in METRIC_GROUPS}
-        assert windowed == {GroupName.PSI: False, GroupName.PROCESS: True, GroupName.LOAD: True}
+        assert windowed == {
+            GroupName.PSI: False,
+            GroupName.PROCESS: True,
+            GroupName.LOAD: True,
+            GroupName.CONSUMERS: False,
+            GroupName.VERIFY_SCOPES: False,
+        }
+
+    def test_the_two_cgroup_walking_groups_are_due_every_30_seconds_together(self):
+        due = {group.name: group.due_seconds for group in METRIC_GROUPS}
+        assert due == {
+            GroupName.PSI: None,
+            GroupName.PROCESS: None,
+            GroupName.LOAD: None,
+            GroupName.CONSUMERS: 30,
+            GroupName.VERIFY_SCOPES: 30,
+        }
+
+    def test_only_the_consumer_group_summarises_its_rows_in_the_tick_line(self):
+        summarised = {group.name for group in METRIC_GROUPS if not group.logs_rows}
+        assert summarised == {GroupName.CONSUMERS}
+
+    def test_the_process_group_records_only_the_occt_queue_depth(self):
+        assert [spec.name for spec in _live(GroupName.PROCESS).metrics] == ['occt_queue_depth']
+
+    @pytest.mark.parametrize('retired', ['verify_concurrency', 'verify_rss_total_bytes'])
+    def test_the_zero_verify_series_are_retired(self, retired):
+        assert retired not in {spec.name for group in METRIC_GROUPS for spec in group.metrics}
+
+    def test_the_verify_scope_group_records_two_host_level_series(self):
+        assert _live(GroupName.VERIFY_SCOPES).exact == {
+            'verify_scopes_live', 'verify_scope_memory_bytes'
+        }
+        assert not _live(GroupName.VERIFY_SCOPES).per_leaf
 
     def test_arm_metrics_is_the_projection_of_the_live_table(self):
         assert dict(ARM_METRICS) == dict(arm_metrics(METRIC_GROUPS))
@@ -187,6 +223,44 @@ class TestTheLiveTable:
         (load,) = [group for group in METRIC_GROUPS if group.name is GroupName.LOAD]
         assert TICK_CLOCK in load.metrics
         assert not TICK_CLOCK.per_leaf
+
+
+def _live(name: GroupName) -> MetricGroup:
+    (group,) = [group for group in METRIC_GROUPS if group.name is name]
+    return group
+
+
+_NOT_FIGURES = {'consumer_members', 'consumer_read_ok'}
+
+
+class TestTheFigureToMetricTable:
+    """sampler.consumers reports Figures; sampler.metrics alone names their metrics."""
+
+    def test_every_figure_has_exactly_one_per_leaf_consumer_spec(self):
+        consumers = _live(GroupName.CONSUMERS)
+
+        for figure in Figure:
+            spec = FIGURE_METRICS[figure].spec
+            assert spec in consumers.metrics, figure
+            assert spec.per_leaf, figure
+        specs = [FIGURE_METRICS[figure].spec for figure in Figure]
+        assert len(specs) == len(set(specs))
+
+    def test_every_per_leaf_consumer_spec_but_members_and_readability_is_a_figure(self):
+        figure_specs = {metric.spec for metric in FIGURE_METRICS.values()}
+        per_leaf = {spec for spec in _live(GroupName.CONSUMERS).metrics if spec.per_leaf}
+
+        assert {spec.name for spec in per_leaf - figure_specs} == _NOT_FIGURES
+
+    def test_every_figure_spec_is_read_through_the_consumer_readability_flag(self):
+        for metric in FIGURE_METRICS.values():
+            assert metric.spec.readability is not None, metric.spec.name
+            assert metric.spec.readability.name == 'consumer_read_ok'
+
+    def test_stall_figures_are_recorded_in_seconds(self):
+        for figure in Figure:
+            scale = FIGURE_METRICS[figure].scale
+            assert scale == (1e-6 if figure.kind is FigureKind.STALL else 1), figure
 
 
 class TestTheTickClockIsEmittedOnEveryCompletedLoadCollection:

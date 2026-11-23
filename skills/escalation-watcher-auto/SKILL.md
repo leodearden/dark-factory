@@ -17,10 +17,10 @@ You are running an autonomous, fully non-interactive level-1 escalation handler.
 - **NO interactive `/unblock` sessions.** Do not spawn Claude Code sessions or any interactive tool.
 - **Tier-1 admin actions ONLY.** You may call `mcp__fused-memory__update_task`, `mcp__fused-memory__add_dependency`, `mcp__escalation__resolve_issue`, `mcp__escalation__promote_to_l2`, `mcp__escalation__stamp_triage` (an ungated triage-ack **annotation**, not a state transition — see [Triage-ack freshness contract](#triage-ack-freshness-contract)), and the filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_ticket` (file a finding as a task and wait for its task id — see [Convert to tracked work](#convert-to-tracked-work-file-and-resolve)). Nothing else mutates state.
 - **No code edits.** Do not use `Edit`, `Write`, or any tool that modifies source files.
-- **No merge-queue interaction.** Do not call merge-queue or git-merge tools. This skill never submits to the merge queue — no `merge_request` call exists anywhere in this flow and none may be added; if merge interaction is ever introduced, it must use the bounded submit→poll protocol (explicit `wait_secs`, `merge_status` polling — see `skills/escalation-watcher/SKILL.md` §"Merge Submissions — Bounded Submit, Then Poll").
+- **No merge-queue mutation.** Never call `merge_request`, `merge_cancel`, `merge_relane`, `halt_merge_queue`, `unhalt_merge_queue` or any git-merge tool. The read-only `mcp__escalation__merge_status` and `mcp__escalation__get_merge_queue` are granted for RCA ([Read-only investigation toolset](#read-only-investigation-toolset)). This skill never submits to the merge queue — no `merge_request` call exists anywhere in this flow and none may be added; if merge interaction is ever introduced, it must use the bounded submit→poll protocol (explicit `wait_secs`, `merge_status` polling — see `skills/escalation-watcher/SKILL.md` §"Merge Submissions — Bounded Submit, Then Poll").
 - **No infra commands.** Do not issue infrastructure commands (docker, systemctl, kill, etc.).
 - **No recovery ref-moves.** NEVER perform red-on-main recovery ref-moves — no `git reset`, `git update-ref refs/heads/main`, or any other direct ref mutation. When main is RED and a recovery ref-move is required, PROMOTE to L2 so the human-driven escalation-watcher can execute the enforce-safe recovery procedure (`skills/escalation-watcher/SKILL.md §"Red-on-main recovery"`). This invariant applies even if a recovery SHA is known — the auto-watcher is read-only and has no sanctioned path to move the main ref.
-- **`resolve_issue` on level ≥ 2 is forbidden, with one narrow, evidence-gated exception.** This was always the contract, and the escalation server **enforces** it structurally (`plans/escalation-connection-capability-guard-prd.md`, narrowed by task 2630's carve-out — `escalation.authority.l2_auto_close_class`): this watcher's supervised MCP connection carries `X-Escalation-Levels: 0,1`, so `resume` / `restart` / `park` / `abandon` against a level-2 escalation are **always** rejected server-side with `{'error': ..., 'code': 'level_forbidden'}` and make **no** state change — that part of the contract is unchanged and cannot succeed. The one exception: `resolve_issue(action='close_only')` on an L2 record now **succeeds** when (a) the record matches one of three allowlisted classes AND (b) your `resolution` text quotes that class's required evidence verbatim — see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) below for the classes, evidence, and the NEVER-allowed set (`design_concern` / `milestone_gate` categories, and any record filed by `orchestrator-deterministic` — the born-at-L2 human-gate sentinel role covering deterministic `always_escalates` / operator / acceptance / milestone-predicate gates — are **never** auto-closable, checked before the allowlist). Every other action at L2, and any L2 record outside the three classes or missing its evidence, still returns `level_forbidden` exactly as before. Resolve L0/L1 admin-class items directly; promote judgement-class and L2-bound items via `promote_to_l2` (which is exempt from the level gate); leave every other L2 pending for the human. The same connection carries `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, which the server stamps onto the archived record's `resolved_by` for every permitted `resolve`/`park`/auto-close — server-attributed and non-spoofable, regardless of the `resolved_by="escalation-watcher-auto"` tool argument used in the call-shape examples throughout this skill.
+- **`resolve_issue` on level ≥ 2 is forbidden, with one narrow, evidence-gated exception.** This was always the contract, and the escalation server **enforces** it structurally (`plans/escalation-connection-capability-guard-prd.md`, narrowed by task 2630's carve-out — `escalation.authority.l2_auto_close_class`): this watcher's supervised MCP connection carries `X-Escalation-Levels: 0,1`, so `resume` / `restart` / `park` / `abandon` against a level-2 escalation are **always** rejected server-side with `{'error': ..., 'code': 'level_forbidden'}` and make **no** state change — that part of the contract is unchanged and cannot succeed. The one exception: `resolve_issue(action='close_only')` on an L2 record now **succeeds** when (a) the record matches one of three allowlisted classes AND (b) your `resolution` text quotes that class's required evidence verbatim — see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) below for the classes, evidence, and the NEVER-allowed set (every born-at-L2 human-judgment category in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`, and any record whose `agent_role` is in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_ROLES` — e.g. `orchestrator-deterministic`, the born-at-L2 human-gate sentinel role covering deterministic `always_escalates` / operator / acceptance / milestone-predicate gates — are **never** auto-closable, checked before the allowlist). Every other action at L2, and any L2 record outside the three classes or missing its evidence, still returns `level_forbidden` exactly as before. Resolve L0/L1 admin-class items directly; promote judgement-class and L2-bound items via `promote_to_l2` (which is exempt from the level gate); leave every other L2 pending for the human. The same connection carries `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, which the server stamps onto the archived record's `resolved_by` for every permitted `resolve`/`park`/auto-close — server-attributed and non-spoofable, regardless of the `resolved_by="escalation-watcher-auto"` tool argument used in the call-shape examples throughout this skill.
 
 When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Every L1 you assess ends resolved, filed-and-resolved or promoted — never parked. [Terminal dispositions](#terminal-dispositions--never-park) is the single statement of this rule and of its exceptions; read it before leaving any L1 pending.
 
@@ -99,14 +99,18 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
 | `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
+| `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
+| `mcp__escalation__get_task_escalation_history` | Every escalation ever filed for one task, archive included, as a `{task_id, count, level_filter, escalations}` envelope. It has no `compact`, so the drain's cross-check keeps `get_task_escalations(compact=True)` ([Draining pending escalations](#draining-pending-escalations)) |
+| `mcp__escalation__merge_status` | One merge request's state, including its `failure_diagnostic` |
+| `mcp__escalation__get_merge_queue` | Live merge-queue snapshot. Its occupancy is lease bookkeeping, never recovery evidence: see `skills/escalation-watcher/SKILL.md` §"`verify_host_unreachable` / `verify_host_skew`" |
 
 The filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_ticket` is not an investigation read: it is a mutating Tier-1 action ([Hard Constraints](#hard-constraints--never-violate)).
 
 **MCP tool names are per-server.** The `mcp__<server>__` prefix names the server that owns a tool.
 
-- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` — the escalation server has no `get_task`. This rotation's escalation reads, `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`) and `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), return escalation records, not task records.
-- **Reading one full escalation record.** Call a non-compact `mcp__escalation__get_pending_escalations(task_id=<its task_id>)` — or `mcp__escalation__get_task_escalations(task_id=<its task_id>)` to include the archive — and pick the row by `id`. Full rows are `Escalation.to_dict()` (`escalation/src/escalation/models.py`) and carry every field, including `detail` and `pin_declared_reason`.
-- **Tools the server lists but this rotation is not granted.** The escalation server's MCP instructions (`escalation/src/escalation/server_instructions.py`) describe what the SERVER offers, including `get_escalation`, `get_task_escalation_history` and `get_task_runtime_state`. None of those three is granted here: this rotation may call only what `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` lists, and an MCP tool outside it is denied (see [Headless-mode permission gotchas](#headless-mode-permission-gotchas-credit-external-pr-4)).
+- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` — the escalation server has no `get_task`. This rotation's escalation reads return escalation records, not task records: `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`), `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), `mcp__escalation__get_task_escalation_history` (the same set as a self-describing envelope) and `mcp__escalation__get_escalation` (one record by id, archive included).
+- **Reading one full escalation record.** Call `mcp__escalation__get_escalation(escalation_id=<id>)`. It is archive-inclusive and returns the full `Escalation.to_dict()` (`escalation/src/escalation/models.py`), which carries every field, including `detail` and `pin_declared_reason`. If `get_escalation` is missing from your toolset or the call is refused (an orchestrator not yet restarted onto the task-3176 grant can still list the tool but deny it), fall back to a non-compact `mcp__escalation__get_pending_escalations(task_id=<its task_id>)` — or `mcp__escalation__get_task_escalations(task_id=<its task_id>)` to include the archive — and pick the row by `id`; those full rows are the same shape. Trying `get_escalation` first is safe: [Graceful Degradation](#graceful-degradation)'s never-a-trial-call rule guards the tools whose call mutates state, and this one is a read.
+- **Tools the server lists but this rotation is not granted.** The escalation server's MCP instructions (`escalation/src/escalation/server_instructions.py`) describe what the SERVER offers. Of the reads it lists, this rotation is not granted `get_task_runtime_state`; it is also not granted `declare_pin` (see [Declared pins](#declared-pins-a-close-can-be-refused-declared_pin_refused)) or any merge-queue mutator ([Hard Constraints](#hard-constraints--never-violate)). The rotation's contract is to call only what `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` lists (see [Headless-mode permission gotchas](#headless-mode-permission-gotchas-credit-external-pr-4)).
 
 **You do NOT have** `df`, `systemctl`, `docker`, `kill`, or any host-health tool — you form infra hypotheses from symptom patterns only.
 
@@ -114,7 +118,7 @@ The filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_t
 
 The top-level rotation runs on sonnet (task 2629) to keep the common case — mechanical triage on a quiet queue — cheap. When a [deepen-on-signal](#when-to-deepen) trigger fires, or an escalation is otherwise hard or investigation-class, spawn an **opus** subagent via the `Task` tool to do the deep RCA rather than deepening in your own (sonnet) context. This keeps the top-level rotation cheap and orchestration-only while still getting opus-quality reasoning exactly where it's needed.
 
-- **Scope the subagent to read-only investigation only.** Its job is RCA and hypothesis formation feeding `promote_to_l2` — gathering evidence with the same [read-only investigation toolset](#read-only-investigation-toolset) above (`Read`/`Glob`/`Grep`, `git log`/`diff`/`show`/`status`, the fused-memory task/search reads) and returning a root-cause hypothesis, supporting evidence, and candidate options as its final message.
+- **Scope the subagent to read-only investigation only.** Its job is RCA and hypothesis formation feeding `promote_to_l2` — gathering evidence with the same [read-only investigation toolset](#read-only-investigation-toolset) above (`Read`/`Glob`/`Grep`, `git log`/`diff`/`show`/`status`, the fused-memory task/search reads, the escalation-record and merge-state reads) and returning a root-cause hypothesis, supporting evidence, and candidate options as its final message.
 - **The subagent inherits every Hard Constraint verbatim.** It must NOT make code edits (no `Edit`/`Write`), NOT touch the merge queue or infra, and NOT perform any main-ref recovery move — those stay forbidden and are promoted to L2 exactly as if you had investigated it yourself. State these constraints explicitly in the subagent's prompt; do not assume a subagent infers them.
 - **You still make the `promote_to_l2` call.** The subagent's findings come back as data, not as an action — you (the top-level rotation) fold them into `root_cause`/`evidence`/`options` and call `promote_to_l2` yourself. The subagent never calls escalation-mutating tools.
 
@@ -295,10 +299,10 @@ Such a record now carries `pin_declared_by` (task 4377). `resolve_issue` refuses
 
 Nothing is mutated on a refusal: the head and every member stay pending and un-archived. Read the structured `declared_pins` payload — don't parse the message.
 
-- **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to re-read the record without `compact`, as **Reading one full escalation record** under [Read-only investigation toolset](#read-only-investigation-toolset) describes. The pending read is sufficient because a declared-pin refusal mutates nothing — the head and every member stay pending.
+- **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to re-read the record without `compact`, as **Reading one full escalation record** under [Read-only investigation toolset](#read-only-investigation-toolset) describes. A declared-pin refusal mutates nothing — the head and every member stay pending — so even that bullet's pending-only fallback read finds the record.
 - **`acknowledge_declared_pins` is NOT a way to make the error go away.** It requires naming *every* blocked id (a partial acknowledgement still refuses, reporting only the remainder), and there is no un-declare verb. The correct response to this refusal is to go **read what `pin_declared_by` names and consult it** — a deviation notice, an operator gate — not to silence it. Acknowledge only when that thing has told you the pin may be spent.
 - **An UNMARKED record is not proof that nothing relies on it.** The marker is opt-in; its absence means "not declared", not "safe".
-- **You cannot declare a pin yourself — PROMOTE a candidate.** `mcp__escalation__declare_pin` is not in this rotation's allowed tools (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` grants `stamp_triage`, not this); declaring is operator/steward-only for now. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: promote it as a 1-member *candidate pin*. A human runs `declare_pin` to make it machine-readable, and this promotion is how the human learns of it.
+- **You cannot declare a pin yourself — PROMOTE a candidate.** This bullet is the one statement of who may declare. `mcp__escalation__declare_pin` is held by the steward role (`orchestrator/src/orchestrator/agents/roles.py::STEWARD`, whose prompt limits it to a dependent the steward itself is filing or recording) and by interactive sessions, and deliberately not by this rotation (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`): a declaration has no un-declare verb, so declaring a pin inferred from prose is a human ratification. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: promote it as a 1-member *candidate pin*. A human runs `declare_pin` to make it machine-readable, and this promotion is how the human learns of it.
   ```python
   mcp__escalation__promote_to_l2(
       task_id=esc["task_id"],
@@ -320,7 +324,7 @@ Why this exists: on 2026-08-08 an L2 cascade close of the homogeneous 11-member 
 
 ### Auto-closing a rubber-stamp L2 (narrow close_only carve-out)
 
-The server carves out one narrow exception to the level-2 authority boundary described in [Hard Constraints](#hard-constraints--never-violate) (task 2630, `escalation.authority.l2_auto_close_class`): `resolve_issue(action='close_only')` on an L2 record succeeds when the record matches one of three allowlisted classes **and** your `resolution` text quotes that class's required evidence. This exists to stop the human from rubber-stamping closes you already pre-triaged — trace analysis found roughly 45% of human `resolve_issue` clicks were exactly that, and recommendations were rotting while pending (one RCA was 21h stale by the time it was closed). It changes **nothing** else: `resume` / `restart` / `park` / `abandon` at L2 are still always `level_forbidden`, and `design_concern` / `milestone_gate` categories and any record filed by `orchestrator-deterministic` (the born-at-L2 human-gate sentinel — deterministic `always_escalates`, operator/acceptance gates, milestone-predicate gates) are **NEVER** auto-closable no matter how good the evidence looks — the server checks this denylist before the allowlist.
+The server carves out one narrow exception to the level-2 authority boundary described in [Hard Constraints](#hard-constraints--never-violate) (task 2630, `escalation.authority.l2_auto_close_class`): `resolve_issue(action='close_only')` on an L2 record succeeds when the record matches one of three allowlisted classes **and** your `resolution` text quotes that class's required evidence. This exists to stop the human from rubber-stamping closes you already pre-triaged — trace analysis found roughly 45% of human `resolve_issue` clicks were exactly that, and recommendations were rotting while pending (one RCA was 21h stale by the time it was closed). It changes **nothing** else: `resume` / `restart` / `park` / `abandon` at L2 are still always `level_forbidden`, and every category in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES` (the born-at-L2 human-judgment categories) and any record whose `agent_role` is in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_ROLES` (e.g. `orchestrator-deterministic`, the born-at-L2 human-gate sentinel — deterministic `always_escalates`, operator/acceptance gates, milestone-predicate gates) are **NEVER** auto-closable no matter how good the evidence looks — the server checks this denylist before the allowlist.
 
 The three classes, and the evidence each requires you to **quote verbatim in `resolution`** (the server only checks that the text is present — it trusts you to have actually verified it, since it cannot itself run git or probe infra):
 
@@ -368,7 +372,7 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
    b. get_pending_escalations(level=2, compact=True) → pending_l2s
    c. already_promoted = ⋃ member_ids over pending_l2s ∪ stranded, where stranded =
       candidates listed only by a resolved/dismissed L2, found by the ARCHIVE-INCLUSIVE
-      cross-check get_task_escalations(task_id=tid, level=2, status=None, compact=True),
+      cross-check get_task_escalations(task_id=tid, level=2, compact=True),
       one call per DISTINCT candidate task_id
    d. work_batch = [e for e in candidate_l1s if e["id"] not in already_promoted]
    e. Close each stranded member (its L2's cascade missed it) — see Draining pending escalations
@@ -408,7 +412,7 @@ On startup and after each watcher fire:
 
 1. Fetch L1 candidates: `mcp__escalation__get_pending_escalations(level=1)` → `candidate_l1s`, in FULL shape
 2. Fetch pending L2s: `mcp__escalation__get_pending_escalations(level=2, compact=True)` → `pending_l2s`
-3. Build the **already-promoted set**: the union of `member_ids` over every pending L2, plus every **stranded** candidate — one listed in the `member_ids` of a resolved or dismissed L2 that the **archive-inclusive cross-check** returns (one `mcp__escalation__get_task_escalations(task_id=tid, level=2, status=None, compact=True)` call per DISTINCT candidate `task_id`), and in no pending L2's
+3. Build the **already-promoted set**: the union of `member_ids` over every pending L2, plus every **stranded** candidate — one listed in the `member_ids` of a resolved or dismissed L2 that the **archive-inclusive cross-check** returns (one `mcp__escalation__get_task_escalations(task_id=tid, level=2, compact=True)` call per DISTINCT candidate `task_id`), and in no pending L2's
 4. Set `work_batch` = L1 candidates whose `id` is **not** in the already-promoted set
 5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at` — treating `updated_at is None` as "not newer", never comparing `None` directly against a timestamp string — note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule. **Carve-out — never skip a path-guard synthetic-anchor record on triage freshness:** if the item matches the path-guard discriminator (`category == "scope_violation"` AND (`agent_role == "fused-memory/path-guard"` OR id starts with `esc-task-path-guard`)), keep it in `work_batch` **however fresh its `triaged_at` is**. Rationale in the contract below — a stamp cannot end the respawn loop these records cause, so skipping one merely defers the only action that can.
 
@@ -420,11 +424,11 @@ pending_l2s   = mcp__escalation__get_pending_escalations(level=2, compact=True) 
 
 pending_member_ids = {mid for l2 in pending_l2s for mid in l2.get("member_ids", [])}
 
-# ARCHIVE-INCLUSIVE cross-check: status=None scans queue root + archive/<date>/.
+# ARCHIVE-INCLUSIVE cross-check: status is omitted, so the read scans queue root + archive/<date>/.
 # Issue these calls in parallel, in one turn.
 dispositioned_l2_of = {}   # member L1 id -> a resolved/dismissed L2 row that lists it
 for tid in {e["task_id"] for e in candidate_l1s if e.get("task_id")}:
-    for l2 in mcp__escalation__get_task_escalations(task_id=tid, level=2, status=None, compact=True):
+    for l2 in mcp__escalation__get_task_escalations(task_id=tid, level=2, compact=True):
         if l2["status"] != "pending":
             dispositioned_l2_of |= dict.fromkeys(l2.get("member_ids", []), l2)
 
@@ -441,7 +445,8 @@ work_batch = [e for e in candidate_l1s if e["id"] not in already_promoted]
 - **Why the archive read.** `get_pending_escalations` is pending-only BY DESIGN: a resolved or dismissed L2 is archived and invisible to it. Member L1s stay `status == "pending"` at L1 after promotion, and the L2→member resolve cascade is best-effort (a member that fails to resolve is logged and skipped). Without this read, a member a human already dispositioned re-enters `work_batch` and is re-triaged. `get_task_escalations` is the archive-inclusive counterpart.
 - **Call shape.**
   - The lookup is keyed on `task_id` with NO time dimension, so the current tool needs one call per DISTINCT candidate `task_id`; issue them in parallel, in one turn. Each call scans the whole archive; a bulk read that serves the drain from one scan is task 6004. A date-windowed archive scan bounds the wrong axis and is not used.
-  - `level=2` narrows to promotion targets. `status=None` is what makes the read archive-inclusive; `status='pending'` would reproduce the blindness.
+  - `level=2` narrows to promotion targets. `status` is omitted because the tool is archive-inclusive by default (`escalation/src/escalation/server.py::get_task_escalations`); `status='pending'` would reproduce the blindness.
+  - An optional filter you do not want is left out of the call entirely. Never write it as a key with an empty value, such as `"status": ,`: the harness rejects that as unparseable JSON, and the turn is lost.
   - Every L2 read is `compact=True`, so both unions read one key, `member_ids`.
   - The L1 candidate read stays FULL: the compact projection drops `agent_role` and `detail`, which step 5's carve-out and the category handlers read.
   - `get_task_escalation_history` is the wrong tool here: it has no `compact`, and it returns the full `detail` on every row.
@@ -953,7 +958,7 @@ A done task's step-commit was flagged as an **orphan** by the harness orphan-L0 
 - `agent_role == "harness-orphan-reaper"`
 - `summary` contains the substring `"is orphaned and could not be auto-reconciled against WIP tip"`
 
-Match on the **summary signature**, never on `suggested_action` — the promoted record's `suggested_action == "manual_intervention"` is shared by many unrelated escalation classes across the harness and cannot discriminate this one by itself. The reaper wraps the original summary as `"Orphan L0 (<age>s old, no active workflow): <original summary>"`, so use a substring match, not an exact match — the signature survives the wrap.
+Match on the **summary signature**, never on `suggested_action`. The promoted record carries the L0's own `suggested_action`, falling back to `"manual_intervention"` when the L0 has none, but every record promoted before task 7385 carries `"manual_intervention"`, a value shared by many unrelated escalation classes across the harness, so the field cannot discriminate this class across the archive. The reaper wraps the original summary as `"Orphan L0 (<age>s old, no active workflow): <original summary>"`, so use a substring match, not an exact match — the signature survives the wrap.
 
 **Extraction.** Recover from `esc["detail"]`:
 - `stale_commit` (the full 40-hex SHA) and `step_id`, from the line `"Step <step_id> recorded commit <stale_commit>, which is no longer reachable from HEAD..."`. Always read the SHA from `detail`, never from `summary` — `summary` truncates it to 10 characters.
@@ -1076,6 +1081,20 @@ category. If `disposition == "integration_skew"`:
   main" path above; `branch_bug` and `indeterminate` are handled exactly as before
   (no disposition-specific change).
 
+**A block reason starting `Plan files not touched by branch` is a claim about a
+measured range: check that the range measured this task before promoting.** Run
+`git rev-list --count <own-work base>..<branch>` and
+`git diff --name-only <own-work base>..<branch>`, where the own-work base is
+`git merge-base <branch> main`. A PARTIAL not-touched list is a suspected
+mis-measurement, not evidence of partial delivery. Also check for sibling refs
+`task/<id>-*` that carry the declared work, a rebase in progress in the worktree,
+and uncommitted edits to the declared files. One exception for sibling refs: a
+ref is NOT where the work lives when the task's `metadata.recut_executed` names
+it as `parked_branch`, or when its tip predates `recut_executed.executed_at`.
+Such a ref is the prior incarnation a human re-cut ruling forbids resuming, and
+does not count. While any of those conditions holds, never offer "restart the
+task" as an option.
+
 1. Fetch the current proposal (if any):
    ```python
    task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
@@ -1100,6 +1119,30 @@ category. If `disposition == "integration_skew"`:
    )
    ```
 4. Add to digest: `PROMOTED (L2 <id>): task_failure — <task_id> — <summary>` (include proposal snippet if present)
+
+#### `plan_delivery_unmeasured`
+
+**Producer.** `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._block_if_delivery_unmeasured`
+blocks the task when the pre-merge plan-files gate failed on a range that never
+measured the task's own work, as found by
+`merge_lane/unmeasured_delivery.py::diagnose_unmeasured_branch` (causes inside the
+worktree) or `merge_lane/unmeasured_delivery.py::find_work_on_sibling_ref` (work on
+a sibling ref, for a task branch with no commit of its own). The reason starts
+`Plan-file delivery not measured` and names the cause and its remedy
+(`merge_lane/unmeasured_delivery.py::UnmeasuredCause`): an unreadable history
+(`retry_merge`), a stopped rebase, merge, cherry-pick or revert
+(`finish_or_abort_operation`), uncommitted declared edits (`commit_worktree_edits`),
+or the work on a sibling ref (`recover_work_from_sibling_ref`). The record's `suggested_action` carries the same
+value. [Promote](#promote-to-l2) with `category="plan_delivery_unmeasured"` and the
+reason's remedy as option A. Never offer "restart the task" or "narrow the plan": nothing was
+measured, so neither is supported by evidence.
+
+Before promoting `recover_work_from_sibling_ref` as option A, confirm the named ref
+is not superseded by an executed re-cut ruling (the rule's home is
+`orchestrator/src/orchestrator/recut_ruling.py::RecutSupersession`; read the task's
+`metadata.recut_executed`). If it is superseded, the finding is a defect: promote
+WITHOUT the recover option and let the ruling decide. A restart may then be the
+right option.
 
 #### `workflow_exit_contract`
 
@@ -1292,7 +1335,7 @@ Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <
 ```
 
 **Recover and route each `workflow_blocked=False` strand** (Leo's tier-10 grant of 2026-10-22, moved to L1 by §3.12):
-1. Recover the dismissed note: `mcp__escalation__get_task_escalations(task_id=<strand task_id>, status=None)` (archive-inclusive, full rows), and pick the row by id. Not found → routing failure.
+1. Recover the dismissed note: `mcp__escalation__get_task_escalations(task_id=<strand task_id>)` (archive-inclusive by default, full rows), and pick the row by id. Not found → routing failure.
 2. `mcp__fused-memory__get_task(<strand task_id>)`. Owner `status == "pending"` → append the note, opening with its natural key `strand <esc_id>, recovered from stale-L0 sweep <record id>:`. First look for that key in the `details` of the `get_task` result you already hold. Present → an earlier rotation appended it before it was killed: record the note as appended and skip the call. Absent → `mcp__fused-memory__update_task(id=<strand task_id>, details="strand <esc_id>, recovered from stale-L0 sweep <record id>: <summary + detail verbatim>", append=True, project_root=<project_root>)`. Pending only: task text is never re-read after dispatch.
 3. Otherwise (owner dispatched, terminal, or absent, such as a synthetic anchor) → [Convert to tracked work](#convert-to-tracked-work-file-and-resolve) steps 1–2 for that note, with `spawned_from` = the strand task id or `'N/A'` and R4 `escalation_id` = the strand's own esc id. Convert's exclusions still bind: the tier-10 grant decides where a note is routed and lifts neither of them. Without a pending owner, both of these are routing failures:
    - a curator-origin note (`fused-memory/task-curator` / `fused-memory/ticket-janitor`), which is never filed ([Curator-origin records](#curator-origin-records--promote-never-re-file));

@@ -40,6 +40,7 @@ MOVED_GUARDS = (
     'test_reify_closure_staleness_sweep_retired.py',
     'test_design_invariants_consistency.py',
     'TestCheckedInManifestCorpus',
+    'TestCheckedInManifestTwins',
     'TestCheckedInOpenVerdictEvidence',
     'TestCheckedInScriptCheckTargets',
     'test_committed_exemplar_sidecar_validates',

@@ -28,6 +28,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _open_l1_fixtures import submit_l1
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MOCK_WORKFLOW_PROJECT_ROOT,
@@ -46,9 +47,11 @@ from orchestrator.git_ops import WorktreeConflictError
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.rebase_drops import DroppedCommit
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
     StewardInterrupted,
+    StewardOutcome,
     StewardReescalatedL1,
     StewardResolved,
     StewardTerminalDecision,
@@ -92,6 +95,7 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
 
     scheduler = MagicMock()
     git_ops = MagicMock()
+    git_ops.own_delta_cut = AsyncMock(return_value=None)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -163,7 +167,7 @@ def _stub_architect(
     """
     invocations: list[object] = []
 
-    async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
+    async def fake_invoke(role, prompt, cwd, **_kw):
         invocations.append(role)
         assert wf.artifacts is not None
         wf.artifacts.write_plan({'files': list(files)})
@@ -199,10 +203,12 @@ class _CheckSequence:
     def __init__(self, results: list[PlanFilesTouchedResult]) -> None:
         self.results = list(results)
         self.calls = 0
+        self.call_kwargs: list[dict] = []
 
     async def __call__(self, *args, **kwargs) -> PlanFilesTouchedResult:
         idx = min(self.calls, len(self.results) - 1)
         self.calls += 1
+        self.call_kwargs.append(kwargs)
         return self.results[idx]
 
 
@@ -275,7 +281,7 @@ async def _drive_merge_submission(
         check_seq,
     )
 
-    async def fake_run(cmd, **kwargs):  # noqa: ARG001
+    async def fake_run(cmd, **kwargs):
         return 0, 'fake_head_sha\n', ''
     monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -505,7 +511,7 @@ class TestSubmitToMergeQueuePlanTightening:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -547,7 +553,7 @@ class TestSubmitToMergeQueuePlanTightening:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -611,11 +617,11 @@ class TestSubmitToMergeQueueCrossRepo:
         ``plan_files_not_touched`` escalation (the RED behaviour), giving a
         clean assertion failure rather than an ``await MagicMock`` crash.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             return PlanFilesTouchedResult(not_touched=['__unreached__'])
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -684,6 +690,27 @@ class TestSubmitToMergeQueueCrossRepo:
         self._assert_cross_repo(outcome, events, narrow, mark_blocked)
 
 
+def _wire_plan_files_gate(wf, monkeypatch, results, *, narrowed=False):
+    """Stub the plan-files gate with *results* and the architect narrowing pass with *narrowed*; return the gate's call recorder, the event store and the _mark_blocked mock."""
+    check_seq = _CheckSequence(results)
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+        check_seq,
+    )
+
+    async def fake_run(cmd, **kwargs):
+        return 0, 'fake_head_sha\n', ''
+    monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+    events = _RecordingEventStore()
+    wf.event_store = events
+
+    monkeypatch.setattr(wf, '_try_narrow_plan', AsyncMock(return_value=narrowed))
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+    return check_seq, events, mark_blocked
+
+
 @pytest.mark.asyncio
 class TestSubmitToMergeQueueStalePathMessage:
     """The failure message must not claim about the branch what it never
@@ -701,26 +728,6 @@ class TestSubmitToMergeQueueStalePathMessage:
     """
 
     _NEVER_TOUCHED_SENTENCE = 'no commit on the branch touched them'
-
-    def _wire(self, wf, monkeypatch, results):
-        """Stub the gate with *results*, record events and the block reason."""
-        check_seq = _CheckSequence(results)
-        monkeypatch.setattr(
-            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
-            check_seq,
-        )
-
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
-            return 0, 'fake_head_sha\n', ''
-        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-
-        events = _RecordingEventStore()
-        wf.event_store = events
-
-        wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-        return events, mark_blocked
 
     @staticmethod
     def _reason_of(mark_blocked) -> str:
@@ -744,7 +751,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             missing_from_tree=[stale],
             resolved_renames={stale: resolved},
         )
-        events, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, events, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -780,7 +787,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             not_touched=[real, stale],
             missing_from_tree=[stale],
         )
-        _, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, _, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -813,7 +820,7 @@ class TestSubmitToMergeQueueStalePathMessage:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.plan = {'files': ['a.py']}
         result = PlanFilesTouchedResult(not_touched=['a.py'], missing_from_tree=[])
-        _, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, _, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -821,6 +828,61 @@ class TestSubmitToMergeQueueStalePathMessage:
         assert self._NEVER_TOUCHED_SENTENCE in reason
         assert 'has not delivered against the plan' in reason
         assert 'does not exist in the tree' not in reason.lower()
+
+
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueRebaseDroppedMessage:
+    """A plan file a rebase dropped is not an implementation gap (task 4669).
+
+    ``git rebase`` drops a branch commit whose change main already carries
+    (the 3490 cache-buster bump), so the gate's ``base..HEAD`` read sees the
+    file untouched.  The gate is handed the branch, attributes the entry to
+    the dropped commit, and the block reason says so instead of claiming
+    "Implementation has not delivered".  Routing is unchanged.  When the
+    architect narrowing pass reports a narrowed plan, the gate runs a second
+    time, and that re-check is handed the branch too.
+    """
+
+    _SHA = 'c2e8f8c14d' + '0' * 30
+    _SUBJECT = 'chore(3490): bump the redux cache-buster uniformly, 43 -> 44'
+
+    @pytest.mark.parametrize(
+        ('narrowed', 'gate_calls'), [(False, 1), (True, 2)],
+        ids=['no-narrowing', 'post-narrowing-recheck'],
+    )
+    async def test_dropped_entry_is_attributed_with_routing_unchanged(
+        self, tmp_path: Path, monkeypatch, narrowed: bool, gate_calls: int,
+    ):
+        from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.plan = {'files': ['index.html']}
+        result = PlanFilesTouchedResult(
+            not_touched=['index.html'],
+            dropped_by_rebase={'index.html': (
+                DroppedCommit(sha=self._SHA, subject=self._SUBJECT, paths=('index.html',)),
+            )},
+        )
+        check_seq, events, mark_blocked = _wire_plan_files_gate(
+            wf, monkeypatch, [result, result], narrowed=narrowed,
+        )
+
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        mark_blocked.assert_awaited_once()
+        args, kwargs = mark_blocked.call_args
+        reason = args[0] if args else kwargs['reason']
+        assert reason.startswith(PLAN_FILES_NOT_TOUCHED_REASON_PREFIX)
+        assert 'c2e8f8c14d00' in reason
+        assert self._SUBJECT in reason
+        assert 'dropped by a rebase' in reason
+        assert 'Implementation has not delivered' not in reason
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
+        assert kwargs.get('escalate_to_human') is True
+        assert [kw.get('branch') for kw in check_seq.call_kwargs] == [
+            f'{wf.config.git.branch_prefix}2656',
+        ] * gate_calls
 
 
 _PASSING_VERIFY_RESULT = VerifyResult(
@@ -1010,7 +1072,7 @@ class TestRunMergeDeferredGuard:
         submitting to the merge queue.  The execute/verify/review pipeline
         still runs (stubbed via _execute_verify_review_loop).
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -1034,7 +1096,7 @@ class TestRunMergeDeferredGuard:
         """A task without metadata.train must NOT call _enter_merge_deferred and
         must proceed to _submit_to_merge_queue — the pre-γ₁ merge path unchanged.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -1245,7 +1307,7 @@ class TestMergePhaseGraceStampLifecycle:
         window the self-redeploy must not cancel)."""
         wf = _make_workflow(tmp_path=tmp_path, task_id='2656')
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -2190,7 +2252,7 @@ class TestHandleSoftCancelOutcome:
         assignment.task = {'id': '99', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        from _orch_helpers import pydantic_spec  # noqa: PLC0415
+        from _orch_helpers import pydantic_spec
 
         _spec = pydantic_spec(OrchestratorConfig)
         config = MagicMock(spec_set=_spec)
@@ -2615,7 +2677,7 @@ class _RecordingFakeSteward:
 
     instances: list[_RecordingFakeSteward] = []
 
-    def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+    def __init__(self, wt_path, cfg_dir):
         self.outcome_channel = None
         self.wip_probe = None
         type(self).instances.append(self)
@@ -2722,9 +2784,9 @@ class TestAwaitStewardCompletionReturnsOutcome:
 
 
 # ---------------------------------------------------------------------------
-# _await_steward_completion drains multi-outcome bursts and re-asserts
-# has_open_l1 before returning a requeue-producing outcome (review fix,
-# task 2248 / W9-delta, step-13/14)
+# _await_steward_completion drains multi-outcome bursts and re-asserts the
+# open-L1 hand-off override before returning a requeue-producing outcome
+# (review fix, task 2248 / W9-delta, step-13/14)
 # ---------------------------------------------------------------------------
 
 
@@ -2737,12 +2799,28 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
     on the channel). A single ``channel.get()`` only ever saw the leading
     outcome. ``_await_steward_completion`` now (1) drains every outcome
     already queued and reduces to the most-severe disposition, and (2)
-    re-asserts ``escalation_queue.has_open_l1`` as a source-of-truth
-    backstop before returning any requeue-producing outcome — catching the
+    re-checks the escalation queue through the open-L1 hand-off override
+    before returning any requeue-producing outcome — catching the
     publish-timing race where a follow-on L1 is filed but its outcome has
     not yet landed on the channel. ``_mark_blocked`` itself is untouched —
     it still branches once on whatever this method returns.
     """
+
+    @staticmethod
+    def _workflow(
+        tmp_path: Path, *outcomes: StewardOutcome, status: str = 'blocked',
+    ) -> tuple[TaskWorkflow, EscalationQueue]:
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        for n, outcome in enumerate(outcomes, start=1):
+            wf._steward_outcome_channel.put_nowait(
+                PublishedStewardOutcome(f'esc-{n}', outcome),
+            )
+        wf.scheduler.get_status = AsyncMock(return_value=status)
+        queue = EscalationQueue(tmp_path / 'queue')
+        wf.escalation_queue = queue
+        return wf, queue
 
     async def test_drains_multiple_outcomes_and_returns_most_severe(
         self, tmp_path: Path,
@@ -2750,23 +2828,18 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         """[StewardResolved, StewardReescalatedL1] queued together reduces
         to the more-severe StewardReescalatedL1 — draining both, not just
         the first ``get()``."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardResolved(resolution_text='fixed it'),
-        ))
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-2', StewardReescalatedL1(esc_id='L1'),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        wf, _queue = self._workflow(
+            tmp_path,
+            StewardResolved(resolution_text='fixed it'),
+            StewardReescalatedL1(esc_id='L1'),
+        )
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
-        assert wf._steward_outcome_channel.empty(), (
+        channel = wf._steward_outcome_channel
+        assert channel is not None
+        assert channel.empty(), (
             'both queued outcomes must be drained, not just the first'
         )
 
@@ -2775,40 +2848,19 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
     ):
         """A lone StewardResolved is overridden by an open L1 — the
         source-of-truth backstop for the publish-timing race."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardResolved(resolution_text='fixed it'),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
-        wf.escalation_queue.get_by_task = MagicMock(
-            return_value=[MagicMock(id='L1')],
-        )
+        wf, queue = self._workflow(tmp_path, StewardResolved(resolution_text='fixed it'))
+        l1 = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
-        assert outcome == StewardReescalatedL1(esc_id='L1')
-        wf.escalation_queue.get_by_task.assert_called_once_with(
-            wf.task_id, status='pending', level=1,
-        )
+        assert outcome == StewardReescalatedL1(esc_id=l1.id)
 
     async def test_no_open_l1_returns_resolved_unchanged(
         self, tmp_path: Path,
     ):
         """Without an open L1, a clean StewardResolved requeue is preserved
         unchanged — the override is conditional, not unconditional."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardResolved(resolution_text='fixed it'),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        wf, _queue = self._workflow(tmp_path, StewardResolved(resolution_text='fixed it'))
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
@@ -2820,37 +2872,24 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         """StewardInterrupted(wip=True) is also requeue-producing (task-2060
         resume-plan branch) and is likewise gated by an open L1 — not just
         StewardResolved."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardInterrupted('attempt_cap', wip_commits_present=True),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
-        wf.escalation_queue.get_by_task = MagicMock(
-            return_value=[MagicMock(id='L1')],
+        wf, queue = self._workflow(
+            tmp_path, StewardInterrupted('attempt_cap', wip_commits_present=True),
         )
+        l1 = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
-        assert outcome == StewardReescalatedL1(esc_id='L1')
+        assert outcome == StewardReescalatedL1(esc_id=l1.id)
 
     async def test_terminal_status_still_wins_over_open_l1(
         self, tmp_path: Path,
     ):
         """Terminal precedence is unconditional: a steward-driven 'done'
         status overrides even when an L1 happens to be open."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardResolved(resolution_text='fixed it'),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='done')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        wf, queue = self._workflow(
+            tmp_path, StewardResolved(resolution_text='fixed it'), status='done',
+        )
+        submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 

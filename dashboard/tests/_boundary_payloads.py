@@ -35,6 +35,7 @@ from _prd_lanes_tree import (
     tree_tasks,
 )
 from _prd_tree import prd_tree_tasks
+from _quality_fixture import GitRepo
 from _quality_rows import (
     NO_COST,
     NO_OUTCOMES,
@@ -45,6 +46,7 @@ from _quality_rows import (
     write_marker_state_db,
     write_quality_db,
 )
+from _quality_snapshots import snapshot_doc, write_snapshot
 from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
 from _served_reads import forget_escalation_corpus, forget_served_reads
 from escalation.archive import archive_dir_for_date
@@ -61,13 +63,18 @@ from shared.task_statuses import TaskStatus
 
 import dashboard.data.task_snapshot as snapshot_mod
 from dashboard.app import app
+from dashboard.asset_build import app_asset_build
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
+from dashboard.data.quality_marker_sampler import refresh_markers
 from dashboard.data.quality_markers import Marker, MarkerKind, MarkerSource, SourceType
 from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS
+from dashboard.data.quality_snapshot_sampler import refresh_snapshots
+from dashboard.data.quality_snapshots import BASELINE_HOME
 from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
+from dashboard.loops import _QualityStore
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 """The instant every scenario's first render is served at."""
@@ -82,6 +89,7 @@ MEMORY_GRAPHS = '/api/v2/dashboard/memory-graphs'
 SCHEDULER = '/api/v2/dashboard/scheduler'
 PRDS = '/api/v2/dashboard/prds'
 QUALITY = '/api/v2/dashboard/quality'
+QUALITY_SNAPSHOT_DIFF = '/api/v2/dashboard/quality/snapshot-diff'
 
 # in_flight 43 (running 25), backlog 1310, terminal 4106: total 5459.
 DARK_FACTORY_COUNTS: Mapping[TaskStatus, int] = {
@@ -390,7 +398,9 @@ def _cap_every_root(cap: int) -> None:
     """Give every configured root an orchestrator config capping it at *cap* concurrent tasks."""
     config: DashboardConfig = app.state.config
     for root in (config.project_root, *config.known_project_roots):
-        (root / 'dark-factory-orchestrator.yaml').write_text(f'max_concurrent_tasks: {cap}\n')
+        (root / 'dark-factory-orchestrator.yaml').write_text(
+            f'max_concurrent_tasks: {cap}\nmain_health_fix_reserved_slots: 0\n'
+        )
 
 
 def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:
@@ -1048,6 +1058,88 @@ def _quality_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     return bodies
 
 
+QUALITY_SNAPSHOT_TIMES = (
+    datetime(2026, 10, 8, 18, 30, tzinfo=UTC),
+    datetime(2026, 11, 5, 2, 0, tzinfo=UTC),
+    datetime(2026, 11, 6, 2, 0, tzinfo=UTC),
+)
+"""The committer dates of the snapshot scenario's three shas: the baseline's, then two nightly
+points', the nightly ones inside the window of the landings the scenario also stores."""
+QUALITY_SNAPSHOT_SCANNED_AT = QUALITY_AT - timedelta(minutes=5)
+
+
+def _dated_commits(root: Path, times: Iterable[datetime]) -> list[str]:
+    """A git repository at *root* with one commit per instant in *times*, committed then; its shas."""
+    repo = GitRepo(root)
+    shas: list[str] = []
+    for index, at in enumerate(times):
+        with patch.dict(os.environ, {'GIT_AUTHOR_DATE': at.isoformat(), 'GIT_COMMITTER_DATE': at.isoformat()}):
+            shas.append(repo.commit({'a.txt': f'{index}\n'}, f'commit {index}') if shas else repo.init())
+    return shas
+
+
+async def _scan_snapshots(config: DashboardConfig, root: Path, *, markers: bool) -> None:
+    """The quality loop's snapshot tick over *root*, then its marker tick when *markers*."""
+    async with _QualityStore(config.quality_db) as store:
+        await refresh_snapshots(store.connection, [root], nightly_dir=config.quality_metrics_dir,
+                                now=QUALITY_SNAPSHOT_SCANNED_AT)
+        if markers:
+            await refresh_markers(store.connection, [root], now=QUALITY_SNAPSHOT_SCANNED_AT)
+
+
+def _quality_snapshot_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Quality sketch row 20: a schema-2 baseline then two schema-3 nightly snapshots at three
+    shas, with one params change, through the real snapshot and marker ticks over a project whose
+    landings are stored too, so its instrument marker also sits on the landing axis; the same
+    files with the baseline and the first nightly at one commit; and a root that holds neither
+    home.
+    """
+    assert client.portal is not None, 'the quality ticks run inside a live TestClient'
+    bodies: dict[str, Any] = {}
+
+    root = _quality_root(workdir / 'quality_snapshots')
+    baseline_sha, *nightly_shas = _dated_commits(root, QUALITY_SNAPSHOT_TIMES)
+    landings = _quality_history(QUALITY_STORED)
+    write_landing_events(root, landings)
+    _store_quality(client, root, landings, sampled_at=QUALITY_SNAPSHOT_SCANNED_AT)
+    config = app.state.config
+    write_snapshot(root / BASELINE_HOME / 'review-all-dark_factory-20261008.json',
+                   snapshot_doc(2, as_of_sha=baseline_sha, run_id='review-all-dark_factory-20261008'))
+    for sha in nightly_shas:
+        write_snapshot(config.quality_metrics_dir / project_id_for_root(root) / f'{sha}.json',
+                       snapshot_doc(3, as_of_sha=sha, run_id=f'nightly-{sha[:10]}'))
+    client.portal.call(partial(_scan_snapshots, config, root, markers=True))
+    served = _render_quality(client, QUALITY_AT)
+    bodies['quality_snapshots'] = served
+    second = served['QUALITY_SNAPSHOTS']['value']['points'][1]['id']
+    bodies['quality_snapshot_diff'] = _get(client, QUALITY_SNAPSHOT_DIFF, project='dark_factory', point=second)
+
+    root = _quality_root(workdir / 'quality_snapshots_same_commit')
+    shared_sha, later_sha = _dated_commits(root, QUALITY_SNAPSHOT_TIMES[1:])
+    write_landing_events(root, landings)
+    _store_quality(client, root, landings, sampled_at=QUALITY_SNAPSHOT_SCANNED_AT)
+    config = app.state.config
+    write_snapshot(root / BASELINE_HOME / 'review-all-dark_factory-20261105.json',
+                   snapshot_doc(2, as_of_sha=shared_sha, run_id='review-all-dark_factory-20261105'))
+    for sha in (shared_sha, later_sha):
+        write_snapshot(config.quality_metrics_dir / project_id_for_root(root) / f'{sha}.json',
+                       snapshot_doc(3, as_of_sha=sha, run_id=f'nightly-{sha[:10]}'))
+    client.portal.call(partial(_scan_snapshots, config, root, markers=True))
+    served = _render_quality(client, QUALITY_AT)
+    bodies['quality_snapshots_same_commit'] = served
+    nightly = served['QUALITY_SNAPSHOTS']['value']['points'][1]['id']
+    bodies['quality_snapshots_same_commit_diff'] = _get(
+        client, QUALITY_SNAPSHOT_DIFF, project='dark_factory', point=nightly,
+    )
+
+    root = _quality_root(workdir / 'quality_no_snapshot')
+    _dated_commits(root, QUALITY_SNAPSHOT_TIMES[:1])
+    client.portal.call(partial(_scan_snapshots, app.state.config, root, markers=False))
+    bodies['quality_no_snapshot'] = _render_quality(client, QUALITY_AT)
+
+    return bodies
+
+
 def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
     """Every row the real sampler wrote in the ragged scenario, oldest first.
 
@@ -1058,6 +1150,22 @@ def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute('SELECT * FROM snapshots ORDER BY ts, project_id').fetchall()
     return [{**dict(row), 'project': Path(row['project_id']).name} for row in rows]
+
+
+def _asset_build_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """The build identities a real route stamps on its response, beside the ones the app holds."""
+    resp = client.get(MEMORY_GRAPHS)
+    assert resp.status_code == 200, resp.text
+    build = app_asset_build(app)
+    assert build is not None
+    return {
+        'asset_build_served': {
+            'path': MEMORY_GRAPHS,
+            'headers': dict(resp.headers),
+            'body': resp.json(),
+            'expected': {'started': build.started, 'onDisk': build.on_disk()},
+        },
+    }
 
 
 def build_all(workdir: Path) -> dict[str, Any]:
@@ -1075,4 +1183,6 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **prd_view_family(client, workdir),
             **prd_lanes_family(client, workdir),
             **_quality_family(client, workdir),
+            **_quality_snapshot_family(client, workdir),
+            **_asset_build_family(client, workdir),
         }

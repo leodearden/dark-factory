@@ -623,7 +623,7 @@ def load_manifest_checks(
     for path in manifest_paths(project_root):
         try:
             doc = load_capability_manifest(path)
-        except Exception:  # noqa: BLE001 - counted, never silent; see docstring
+        except Exception:  # counted, never silent; see docstring
             unloadable += 1
             continue
         rel = str(path.relative_to(project_root))

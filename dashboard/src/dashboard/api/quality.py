@@ -9,8 +9,11 @@ over the whole project (blank or absent serves every landing). QUALITY_MARKERS i
 stored marker derivation plus the curated markers in its scope, placed on its
 stored landing axis; its regime events are what the QUALITY statistics split at
 and exclude. Before the project's first derivation, the curated markers in its
-scope still are. The snapshot datum is unknown until its producer lands
-(plans/quality-dashboard-prd.md leaf ι).
+scope still are. QUALITY_SNAPSHOTS is the stored scan of the project's two
+snapshot homes (dashboard.data.quality_snapshots). ``/quality/snapshot-diff``
+serves one point's cached instrument ``--diff`` text, PLAIN and on demand; it
+answers state 'absent' with a reason, never an error status, when there is
+nothing to serve.
 """
 
 from __future__ import annotations
@@ -41,7 +44,13 @@ from dashboard.data.quality_markers import (
     regime_events,
 )
 from dashboard.data.quality_series import QUALITY_FRESHNESS_BOUND_SECONDS, read_quality_series
-from dashboard.data.quality_store import landing_axis, read_marker_state
+from dashboard.data.quality_snapshots import ServedDiff, SnapshotSeries, snapshot_datum
+from dashboard.data.quality_store import (
+    landing_axis,
+    read_marker_state,
+    read_snapshot_diff,
+    read_snapshot_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +62,7 @@ _QUALITY_WINDOWS: dict[str, int | None] = {
     'all': None,
 }
 
-_NO_SNAPSHOTS = (
-    'no producer has written here: the nightly quality-metrics snapshot series has no '
-    'writer yet (quality-dashboard PRD leaf ι)'
-)
+_NO_POINT = 'no snapshot point was named: pass ?point=<snapshot point id>'
 
 
 def _project_root(config: DashboardConfig, token: str) -> Path | None:
@@ -85,22 +91,27 @@ def _unresolved_reason(token: str | None) -> str:
 _T = TypeVar('_T')
 
 
+def _read_failure(what: str, root: Path, exc: Exception, served_as: str) -> str:
+    """Log why *what* could not be read for *root*, which is served as *served_as*; the reason it
+    is served with."""
+    if isinstance(exc, sqlite3.Error):
+        logger.warning('quality.db unreadable for %s', root, exc_info=exc)
+        return f'quality.db unreadable: {type(exc).__name__}: {exc}'
+    if isinstance(exc, DatumContractError):
+        logger.warning('%s for %s breaks the %s invariant and is served as %s; this is a '
+                       'BUG, not an outage', what, root, exc.invariant.value, served_as, exc_info=exc)
+        return f'{what} broke the {exc.invariant.value} invariant: {exc}'
+    logger.warning('unexpected error while reading %s for %s, which is served as %s for '
+                   'this render; this is a BUG, not an outage', what, root, served_as, exc_info=exc)
+    return f'unexpected error while reading {what}: {type(exc).__name__}: {exc} (see the WARNING and its traceback)'
+
+
 async def _served(what: str, root: Path, read: Callable[[], Awaitable[Datum[_T]]]) -> Datum[_T]:
     """*read*'s datum, or an unknown one naming why *what* could not be read; never raises."""
     try:
         return await read()
-    except sqlite3.Error as exc:
-        logger.warning('quality.db unreadable for %s', root, exc_info=True)
-        return _unknown(f'quality.db unreadable: {type(exc).__name__}: {exc}')
-    except DatumContractError as broken:
-        logger.warning('%s for %s breaks the %s invariant and is served as UNKNOWN; this is a '
-                       'BUG, not an outage', what, root, broken.invariant.value, exc_info=broken)
-        return _unknown(f'{what} broke the {broken.invariant.value} invariant: {broken}')
     except Exception as exc:
-        logger.warning('unexpected error while reading %s for %s, which is served as UNKNOWN for '
-                       'this render; this is a BUG, not an outage', what, root, exc_info=True)
-        return _unknown(f'unexpected error while reading {what}: {type(exc).__name__}: {exc} '
-                        f'(see the WARNING and its traceback)')
+        return _unknown(_read_failure(what, root, exc, 'UNKNOWN'))
 
 
 async def _marker_stream(
@@ -123,6 +134,15 @@ def _regime_events(
     return regime_events(curated.for_project(project_id))
 
 
+async def _snapshot_series(
+    config: DashboardConfig, pool: DbPool, project_id: str, now: datetime,
+) -> Datum[SnapshotSeries]:
+    db = await pool.get(config.quality_db)
+    stored = None if db is None else await read_snapshot_state(db, project_id)
+    return snapshot_datum(project_id, stored, now=now,
+                          freshness_bound_seconds=QUALITY_FRESHNESS_BOUND_SECONDS)
+
+
 async def _quality_series(
     config: DashboardConfig, pool: DbPool, root: Path, window_landings: int | None,
     now: datetime, events: Sequence[RegimeEvent], module: str | None,
@@ -142,7 +162,7 @@ async def api_quality(request: Request) -> JSONResponse:
     token = request.query_params.get('project')
     root = _project_root(config, token) if token else None
     if root is None:
-        quality = markers = _unknown(_unresolved_reason(token))
+        quality = markers = snapshots = _unknown(_unresolved_reason(token))
     else:
         project_id = project_id_for_root(root)
         curated = await asyncio.to_thread(load_curated_markers)
@@ -152,12 +172,44 @@ async def api_quality(request: Request) -> JSONResponse:
         module = request.query_params.get('module') or None
         quality = await _served('the quality series', root, lambda: _quality_series(
             config, pool, root, window.landings, now, events, module))
+        snapshots = await _served('the quality snapshot series', root,
+                                  lambda: _snapshot_series(config, pool, project_id, now))
     datums: dict[str, Datum[Any]] = {
         'QUALITY': quality,
         'QUALITY_MARKERS': markers,
-        'QUALITY_SNAPSHOTS': _unknown(_NO_SNAPSHOTS),
+        'QUALITY_SNAPSHOTS': snapshots,
     }
     for datum in datums.values():
         validate_datum(datum, now)
     payload = {key: datum.to_wire() for key, datum in datums.items()}
     return JSONResponse(with_window({**payload, 'served_at': now.isoformat()}, window))
+
+
+async def _stored_diff(config: DashboardConfig, pool: DbPool, root: Path, point_id: str) -> ServedDiff:
+    """*point_id*'s stored diff in *root*'s project; ABSENT naming why when none can be read."""
+    project_id = project_id_for_root(root)
+    try:
+        db = await pool.get(config.quality_db)
+        stored = None if db is None else await read_snapshot_diff(db, project_id, point_id)
+    except Exception as exc:
+        what = f'the diff of snapshot point {point_id!r}'
+        return ServedDiff.absent(point_id, _read_failure(what, root, exc, 'absent'))
+    return ServedDiff.of(project_id, point_id, stored)
+
+
+@router.get('/api/v2/dashboard/quality/snapshot-diff')
+async def api_quality_snapshot_diff(request: Request) -> JSONResponse:
+    """QUALITY_SNAPSHOT_DIFF for ?project= and ?point=: one snapshot point's diff against the
+    point before it, as the snapshot tick stored it."""
+    config: DashboardConfig = request.app.state.config
+    pool: DbPool = request.app.state.db
+    token = request.query_params.get('project')
+    point_id = request.query_params.get('point') or None
+    root = _project_root(config, token) if token else None
+    if root is None:
+        served = ServedDiff.absent(point_id, _unresolved_reason(token))
+    elif point_id is None:
+        served = ServedDiff.absent(None, _NO_POINT)
+    else:
+        served = await _stored_diff(config, pool, root, point_id)
+    return JSONResponse({'QUALITY_SNAPSHOT_DIFF': served.to_wire()})

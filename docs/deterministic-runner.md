@@ -166,10 +166,12 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   re-fetch fails or is deferred past the per-tick fetch budget
   (`orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_backfill_terminal_dep_records`).
   A dep never yet cached that the budget defers makes its dependents wait
-  (verdict `unknown`) until a later tick fetches it: after a restart the
-  cold cache takes ceil(terminal deps / `delivered_checks.max_checks_per_tick`)
-  ticks to warm.  Only a never-cached dep whose fetch fails outright fails
-  open, for that tick.  Accepted residual: an RP-4 submit that itself failed
+  (verdict `unknown`) until a later tick fetches it.  A held re-validation
+  never takes the last slot from a never-cached dep, so after a restart the
+  cold cache takes ceil(terminal deps / max(1, budget − held re-validations))
+  ticks to warm while fetches succeed, the budget being
+  `delivered_checks.max_record_fetches_per_tick`.  Only a never-cached dep
+  whose fetch fails outright fails open, for that tick.  Accepted residual: an RP-4 submit that itself failed
   reads as `verified`.
 - If scheduling succeeds (`rc == 0`) and `always_escalates=True`
   (act-then-ask): fall through directly to section 3 (the gate) WITHOUT
@@ -249,7 +251,10 @@ deploy is driven on the script's exit code alone:
 - `rc == 0`: hand off to `_writeback_deploy_success` (empty
   `new_state`, `pid=0` — the same helper the named-target path uses)
   unless `always_escalates=True`, in which case fall through to the
-  gate (act-then-ask) instead, since the script already ran.
+  gate (act-then-ask) instead, since the script already ran. The done
+  write records `done_provenance.kind='deterministic-deploy-unverified'`,
+  with no unit or timestamp evidence; the crash, human-resolution and
+  gate resumes keep that kind (`_deploy_done_kind`).
 - `rc != 0`, the default runner's own per-script timeout
   (`ScriptTimeout` — reported as which signal the teardown actually
   dispatched, carrying an exit code only when the script really produced
@@ -388,7 +393,33 @@ verdict.  The runner meets it like this (tasks 4065 / 4252):
 - Set task status to `blocked`.
 - Return BLOCKED (B2).
 
-**Resuming a pure gate** — the proof ladder has TWO rungs, not one:
+**Resuming a pure gate** — a `resume` runs the runner at resolution time
+(task 3638). Before, it re-pended the gate and only a dispatch slot closed
+it, so a resolved gate could sit `pending` for days.
+`orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member`
+runs its usual gates first (infra-hold, status, claimant liveness, the
+re-block guard, the corroborating read), then hands the row to
+`Harness._run_held_pure_gate_inline`, which runs this same runner through
+`orchestrator/src/orchestrator/pure_gate_resolution.py`: the same proof
+ladder, the same re-hold check, and the runner makes every status write.
+It falls back to the re-pend whenever dispatch would still make the gate
+wait: a local dependency not yet terminal, any `external_deps` entry or
+delivered-check dependency (the inline path holds neither cache, so both
+answer unknown), a milestone that has not fired, or a `deferred_watch`
+whose `trigger_met` is unset. It also falls back when the runner raises,
+so the worst case is the old wait. `close_only` still changes no status.
+The inline run does not wait on a dispatch pause: a paused scheduler holds
+back slots, and this run takes none. Each inline run is recorded in runs.db
+`task_results`, as a deterministic slot run is. Neither path emits an
+events.db `task_completed` row.
+
+The two gate stamps end with the episode: fused-memory removes
+`gate_escalated_at` and `gate_escalated_preconditions` on any status write
+that enters or leaves `done`/`cancelled`
+(`fused-memory/src/fused_memory/middleware/gate_stamp_lifecycle.py`). A
+reopened gate therefore files afresh on its next dispatch.
+
+The proof ladder has TWO rungs, not one:
 
 (i) An archive-inclusive, role-scoped escalation record must exist (task
 2954). This proves a gate was established and is no longer pending. An

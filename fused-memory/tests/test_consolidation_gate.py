@@ -1249,7 +1249,7 @@ class TestUnstampedProbeBudget:
         """A partial probe that said nothing would read as \'no strays\'.  The
         WARNING is the disclosure, and it is emitted HERE — in the one shared
         derivation — so the CLI and the seam cannot disclose differently."""
-        import logging  # noqa: PLC0415
+        import logging
 
         limit = consolidation_gate._UNSTAMPED_PROBE_LIMIT
         strays = self._strays(limit + 1)
@@ -1274,7 +1274,7 @@ class TestUnstampedProbeBudget:
     async def test_under_the_cap_says_nothing(self, caplog):
         """The measured corpus is 2-6 observed members: the common path must
         not emit an operational warning."""
-        import logging  # noqa: PLC0415
+        import logging
 
         with caplog.at_level(logging.WARNING, logger=consolidation_gate.__name__):
             await consolidation_gate.resolve_unstamped_live_ids(

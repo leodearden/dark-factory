@@ -1,7 +1,8 @@
-"""Bounded asyncio wait barriers that replace fixed sleeps in tests.
+"""Bounded wait barriers that replace fixed sleeps in tests.
 
-Three barrier primitives -- poll_until (liveness), poll_until_stable (settle)
-and retry_until_observed (observation) -- plus poll_until_dead, the
+Three asyncio barrier primitives -- poll_until (liveness), poll_until_stable
+(settle) and retry_until_observed (observation) -- plus poll_until_sync,
+poll_until's blocking twin for sync callers, and poll_until_dead, the
 durable-queue dead-count waiter built on poll_until.
 
 Lives outside conftest.py, imported by name, under the convention stated in
@@ -10,6 +11,7 @@ _fm_helpers' module docstring.
 
 import asyncio
 import inspect
+import time
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -77,6 +79,27 @@ async def poll_until(
         if loop.time() >= deadline:
             raise AssertionError(message or f'poll_until: condition not met within {timeout}s')
         await asyncio.sleep(interval)
+
+
+def poll_until_sync(
+    predicate: Callable[[], Any],
+    *,
+    timeout: float,
+    interval: float = 0.05,
+    message: str | None = None,
+) -> Any:
+    """poll_until's contract for a synchronous caller, such as a sync pytest fixture.
+
+    It blocks between polls, so never call it from inside a running event loop.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        result = predicate()
+        if result:
+            return result
+        if time.monotonic() >= deadline:
+            raise AssertionError(message or f'poll_until_sync: condition not met within {timeout}s')
+        time.sleep(interval)
 
 
 # ---------------------------------------------------------------------------

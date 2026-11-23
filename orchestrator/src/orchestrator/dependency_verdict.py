@@ -14,11 +14,13 @@ scheduler's logger.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
+from itertools import islice
 
+from shared.declared_checks import declared_checks
 from shared.task_fields import dependency_ids
 from shared.task_metadata import parse_metadata
 
@@ -45,10 +47,15 @@ class DepState(StrEnum):
 
 @dataclass(frozen=True)
 class DepsVerdict:
-    """A dependency answer; ``kind`` names the arm iff the answer is not SATISFIED."""
+    """A dependency answer; ``kind`` names the arm iff the answer is not SATISFIED.
+
+    ``waiting_predecessor`` names the waiting predecessor of an early-start
+    answer (:meth:`waiting_on`), which is otherwise UNSATISFIED/LOCAL.
+    """
 
     state: DepState
     kind: DepKind | None = None
+    waiting_predecessor: str | None = None
 
     def __post_init__(self) -> None:
         if (self.kind is None) != (self.state is DepState.SATISFIED):
@@ -56,10 +63,25 @@ class DepsVerdict:
                 f'a {self.state} dependency verdict cannot carry kind {self.kind}: '
                 'a kind names the arm of an unsatisfied or unknown verdict only'
             )
+        if self.waiting_predecessor is not None and (
+            not self.waiting_predecessor
+            or self.state is not DepState.UNSATISFIED
+            or self.kind is not DepKind.LOCAL
+        ):
+            raise ValueError(
+                f'a {self.state} dependency verdict of kind {self.kind} cannot name '
+                f'waiting predecessor {self.waiting_predecessor!r}: only an unsatisfied '
+                'local verdict names one, by a non-empty task id'
+            )
 
     @classmethod
     def unsatisfied(cls, kind: DepKind) -> DepsVerdict:
         return cls(DepState.UNSATISFIED, kind)
+
+    @classmethod
+    def waiting_on(cls, predecessor: str) -> DepsVerdict:
+        """The early-start answer: unsatisfied on the local arm, waiting on *predecessor*."""
+        return cls(DepState.UNSATISFIED, DepKind.LOCAL, predecessor)
 
     @classmethod
     def unknown(cls, kind: DepKind) -> DepsVerdict:
@@ -119,6 +141,7 @@ def deps_verdict(
     delivered_check_cache: dict[str, bool] | None = None,
     terminal_dep_records: dict[str, dict] | None = None,
     deferred_terminal_deps: Collection[str] = frozenset(),
+    waiting_predecessors: Collection[str] = frozenset(),
 ) -> DepsVerdict:
     """THE dependency predicate: are *task*'s dependencies satisfied?
 
@@ -168,7 +191,7 @@ def deps_verdict(
     **Delivered checks** (capability-delivered-checks PRD, task delta):
     consulted only when *delivered_check_cache* is not ``None`` AND
     *tasks_by_id* is supplied.  Each TERMINAL (done/cancelled) local dep whose
-    record carries a truthy ``metadata.delivered_checks`` must resolve to
+    record declares any ``metadata.delivered_checks`` must resolve to
     exactly ``True`` in *delivered_check_cache* (keyed by dep task id) — this
     applies to a ``cancelled`` dep just as much as a ``done`` one, since the
     check trusts the state of ``main``, not the status label.  ``False`` (the
@@ -190,6 +213,14 @@ def deps_verdict(
     dep is absent from BOTH, the arm skips it, except that the scheduled-deploy
     arm waits on a dep in *deferred_terminal_deps* (above).
 
+    **Waiting predecessors** (early start,
+    ``plans/early-start-on-predecessor-branch-prd.md`` section 7, "Dependency
+    test"): an opt-in input, and a caller that omits it gets the answers
+    above.  When the only unfinished local dep is in *waiting_predecessors*
+    and every other arm passes with that dep set aside, the answer is
+    :meth:`DepsVerdict.waiting_on` it: still UNSATISFIED/LOCAL, so never
+    satisfied, and naming the predecessor.
+
     Dependency ids are read by ``shared/src/shared/task_fields.py::dependency_ids``.
 
     Emits a DEBUG log when a dependency blocks dispatch, naming the dep ID
@@ -197,30 +228,80 @@ def deps_verdict(
     Emits a separate DEBUG log when the intra-train allowance fires.
     """
     dep_ids = dependency_ids(task)
-    arms = (
-        partial(_local_verdict, task, dep_ids, status_map, tasks_by_id),
-        partial(
-            _scheduled_deploy_verdict,
-            task, dep_ids, status_map, tasks_by_id, terminal_dep_records,
-            deferred_terminal_deps,
-        ),
-        partial(_external_verdict, task, external_status_cache, external_resolver_failed),
-        partial(
-            _delivered_check_verdict,
-            task, dep_ids, status_map, tasks_by_id,
-            delivered_check_cache, terminal_dep_records,
-        ),
+    # The one walk of the local deps, so each logs once: the local arm needs
+    # the first unfinished dep, the early-start answer the first two.
+    unfinished = list(islice(
+        _unfinished_local_deps(task, list(dict.fromkeys(dep_ids)), status_map, tasks_by_id),
+        2 if waiting_predecessors else 1,
+    ))
+    arms = partial(
+        _arm_verdicts,
+        task=task,
+        status_map=status_map,
+        tasks_by_id=tasks_by_id,
+        external_status_cache=external_status_cache,
+        external_resolver_failed=external_resolver_failed,
+        delivered_check_cache=delivered_check_cache,
+        terminal_dep_records=terminal_dep_records,
+        deferred_terminal_deps=deferred_terminal_deps,
     )
-    return DepsVerdict.combine(arm() for arm in arms)
+    verdict = DepsVerdict.combine(arms(dep_ids, unfinished_local=unfinished))
+    if not waiting_predecessors or len(unfinished) != 1:
+        return verdict
+    (predecessor,) = unfinished
+    if predecessor not in waiting_predecessors:
+        return verdict
+    set_aside = [dep_id for dep_id in dep_ids if dep_id != predecessor]
+    if DepsVerdict.combine(arms(set_aside, unfinished_local=())).satisfied:
+        return DepsVerdict.waiting_on(predecessor)
+    return verdict
 
 
-def _local_verdict(
+def _arm_verdicts(
+    dep_ids: list[str],
+    *,
+    unfinished_local: Collection[str],
+    task: dict,
+    status_map: dict[str, str],
+    tasks_by_id: dict[str, dict] | None,
+    external_status_cache: dict[str, str] | None,
+    external_resolver_failed: bool,
+    delivered_check_cache: dict[str, bool] | None,
+    terminal_dep_records: dict[str, dict] | None,
+    deferred_terminal_deps: Collection[str],
+) -> Iterator[DepsVerdict]:
+    """Each arm's verdict over *dep_ids*, lazily and in order: the one home of :func:`deps_verdict`'s arm list.
+
+    *unfinished_local* is the caller's walk of :func:`_unfinished_local_deps`
+    over *dep_ids*; the local arm reads it rather than walking again.
+    """
+    yield _local_verdict(unfinished_local)
+    yield _scheduled_deploy_verdict(
+        task, dep_ids, status_map, tasks_by_id, terminal_dep_records, deferred_terminal_deps,
+    )
+    yield _external_verdict(task, external_status_cache, external_resolver_failed)
+    yield _delivered_check_verdict(
+        task, dep_ids, status_map, tasks_by_id, delivered_check_cache, terminal_dep_records,
+    )
+
+
+def _local_verdict(unfinished_local: Collection[str]) -> DepsVerdict:
+    """The local arm of :func:`deps_verdict`: SATISFIED or UNSATISFIED, never UNKNOWN.
+
+    UNSATISFIED when any dep is unfinished, as :func:`_unfinished_local_deps` decides.
+    """
+    if not unfinished_local:
+        return DEPS_SATISFIED
+    return DepsVerdict.unsatisfied(DepKind.LOCAL)
+
+
+def _unfinished_local_deps(
     task: dict,
     dep_ids: list[str],
     status_map: dict[str, str],
     tasks_by_id: dict[str, dict] | None,
-) -> DepsVerdict:
-    """The local arm of :func:`deps_verdict`: SATISFIED or UNSATISFIED, never UNKNOWN."""
+) -> Iterator[str]:
+    """Each dep of *dep_ids* that is neither terminal nor allowed by the intra-train rule, logging why."""
     task_id = str(task.get('id', '?'))
     # Resolve this task's train id once (None if not a train member).
     # Coerce empty string to None so that '' does not accidentally match
@@ -261,8 +342,7 @@ def _local_verdict(
             dep_id,
             dep_status,
         )
-        return DepsVerdict.unsatisfied(DepKind.LOCAL)
-    return DEPS_SATISFIED
+        yield dep_id
 
 
 def _dep_record(
@@ -383,7 +463,7 @@ def _delivered_check_verdict(
             # never gated here, rather than fail-safe-blocking a dependent
             # whose dep record may never be fetchable.
             continue
-        if not (dep_task.get('metadata') or {}).get('delivered_checks'):
+        if declared_checks(dep_task.get('metadata')).is_empty:
             continue
         confirmed = delivered_check_cache.get(dep_id)
         if confirmed is True:

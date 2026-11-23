@@ -47,10 +47,19 @@ class SourceUnreadable(Exception):
         self.reason = reason
 
 
+def compose_owner(service: str) -> str:
+    return f"compose service {service}"
+
+
 @dataclasses.dataclass(frozen=True)
 class OwnedPort:
     port: int
     owner: str
+    optional_service: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.optional_service is not None and self.owner != compose_owner(self.optional_service):
+            raise ValueError(f"owner {self.owner!r} is not optional service {self.optional_service!r}")
 
 
 Sockaddr: TypeAlias = tuple[str, int] | tuple[str, int, int, int]
@@ -84,11 +93,21 @@ LOOPBACK: Final = HostAddress(ip="127.0.0.1", family=socket.AF_INET, scope_id=0,
 COMPOSE_PUBLISHED_PORTS: Final[Mapping[int, str]] = types.MappingProxyType(
     {6379: "falkordb", 6380: "falkordb-scratch", 6333: "qdrant", 6334: "qdrant", 8002: "fused-mcp", 8420: "embedder"}
 )
+# Services fused-memory starts without (a `-` ExecStartPre `docker compose up` in
+# scripts/fused-memory.service.template, pinned there by the tests); while one has no container its
+# loopback refusal is noted, not failed. Why: OPERATIONS.md §8 "Network exposure check".
+OPTIONAL_COMPOSE_SERVICES: Final[frozenset[str]] = frozenset({"embedder"})
+# Compose's default project name, the compose file's directory; pinned by the tests.
+COMPOSE_PROJECT: Final = "docker"
 RECON_REPORT_PORT: Final = 8003
 
 STATIC_PORTS: Final[tuple[OwnedPort, ...]] = (
     *(
-        OwnedPort(port=port, owner=f"compose service {service}")
+        OwnedPort(
+            port=port,
+            owner=compose_owner(service),
+            optional_service=service if service in OPTIONAL_COMPOSE_SERVICES else None,
+        )
         for port, service in COMPOSE_PUBLISHED_PORTS.items()
     ),
     OwnedPort(
@@ -98,12 +117,12 @@ STATIC_PORTS: Final[tuple[OwnedPort, ...]] = (
 )
 
 
-def merge_owners(*sources: Iterable[OwnedPort]) -> dict[int, tuple[str, ...]]:
+def merge_owners(*sources: Iterable[OwnedPort]) -> dict[int, tuple[OwnedPort, ...]]:
     """Port -> every owner of it, once each in source order, sorted by port."""
-    owners: dict[int, dict[str, None]] = {}
+    owners: dict[int, dict[OwnedPort, None]] = {}
     for source in sources:
         for owned in source:
-            owners.setdefault(owned.port, {})[owned.owner] = None
+            owners.setdefault(owned.port, {})[owned] = None
     return {port: tuple(owners[port]) for port in sorted(owners)}
 
 
@@ -183,7 +202,8 @@ class ExposureExit(enum.IntEnum):
     """What the check's exit status means.
 
     LOOPBACK_ONLY: every probed port refused every off-loopback connect and
-    accepted on 127.0.0.1, and both sources were read.
+    either accepted on 127.0.0.1 or is noted [no-container], and every source
+    was read.
     FINDING: anything else, including a source that could not be read.
 
     2 is never produced under the [network_exposure] tag: it belongs to
@@ -235,8 +255,8 @@ def probe(family: socket.AddressFamily, sockaddr: Sockaddr, timeout: float) -> P
     return ProbeResult(Outcome.ACCEPTED)
 
 
-def read_json_source(argv: tuple[str, ...]) -> object:
-    """Run *argv* and parse its stdout as JSON, or raise SourceUnreadable saying why not."""
+def read_source_text(argv: tuple[str, ...]) -> str:
+    """Run *argv* and return its stdout, or raise SourceUnreadable saying why not."""
     try:
         completed = subprocess.run(
             argv,
@@ -254,10 +274,29 @@ def read_json_source(argv: tuple[str, ...]) -> object:
         raise SourceUnreadable(argv, f"could not start ({_errno_name(exc)})") from None
     if completed.returncode != 0:
         raise SourceUnreadable(argv, f"exited {completed.returncode}: {completed.stderr.strip()}")
+    return completed.stdout
+
+
+def read_json_source(argv: tuple[str, ...]) -> object:
+    """Run *argv* and parse its stdout as JSON, or raise SourceUnreadable saying why not."""
+    text = read_source_text(argv)
     try:
-        return json.loads(completed.stdout)
+        return json.loads(text)
     except json.JSONDecodeError as exc:
         raise SourceUnreadable(argv, f"output is not JSON ({exc})") from None
+
+
+def compose_container_argv(service: str) -> tuple[str, ...]:
+    return (
+        "docker", "container", "ls", "--all", "--quiet",
+        "--filter", f"label=com.docker.compose.project={COMPOSE_PROJECT}",
+        "--filter", f"label=com.docker.compose.service={service}",
+    )
+
+
+def has_container(service: str) -> bool:
+    """Whether docker holds a container of *service* in this compose project, in any state."""
+    return bool(read_source_text(compose_container_argv(service)).split())
 
 
 class FindingKind(enum.Enum):
@@ -266,6 +305,12 @@ class FindingKind(enum.Enum):
     TIMED_OUT = "timed-out"
     UNVERIFIED = "unverified"
     NOT_LISTENING = "not-listening"
+    NO_CONTAINER = "no-container"
+
+    @property
+    def fails(self) -> bool:
+        """A line of this kind fails the run; NO_CONTAINER is the one informational kind."""
+        return self is not FindingKind.NO_CONTAINER
 
 
 _OFF_LOOPBACK_FINDINGS: Final = {
@@ -290,16 +335,21 @@ class Target:
 class Finding:
     kind: FindingKind
     target: Target
-    owners: tuple[str, ...]
+    owners: tuple[OwnedPort, ...]
     result: ProbeResult
 
     def render(self) -> str:
-        subject = f"port {self.target.port} ({', '.join(self.owners)})"
+        subject = f"port {self.target.port} ({', '.join(owned.owner for owned in self.owners)})"
         label = self.target.address.label
         if self.kind is FindingKind.EXPOSED:
             text = f"{subject} accepted a connect on {label}"
         elif self.kind is FindingKind.NOT_LISTENING:
             text = f"{subject}: a connect on {label} {self.result.description}, so nothing serves it on loopback"
+        elif self.kind is FindingKind.NO_CONTAINER:
+            text = (
+                f"{subject}: a connect on {label} {self.result.description} and no container of the service exists, "
+                "so nothing is expected to serve it yet; noted, not failed"
+            )
         else:
             text = f"{subject}: a connect on {label} {self.result.description} instead of being refused"
         return _finding_line(self.kind, text)
@@ -312,7 +362,7 @@ def _port_targets(port: int, addresses: Sequence[HostAddress]) -> list[Target]:
     ]
 
 
-def _finding(target: Target, owners: tuple[str, ...], result: ProbeResult) -> Finding | None:
+def _finding(target: Target, owners: tuple[OwnedPort, ...], result: ProbeResult) -> Finding | None:
     if target.loopback:
         kind = None if result.outcome is Outcome.ACCEPTED else FindingKind.NOT_LISTENING
     else:
@@ -345,6 +395,37 @@ def _source_error_line(error: SourceUnreadable) -> str:
     return _finding_line(FindingKind.SOURCE_ERROR, f"{' '.join(error.command)}: {error.reason}")
 
 
+def _sole_optional_services(finding: Finding) -> frozenset[str]:
+    """The optional services that alone own a port refused on loopback; empty for every other finding."""
+    refused_on_loopback = (
+        finding.kind is FindingKind.NOT_LISTENING
+        and finding.target.loopback
+        and finding.result.outcome is Outcome.REFUSED
+    )
+    optional = [owned.optional_service for owned in finding.owners if owned.optional_service is not None]
+    if not refused_on_loopback or len(optional) < len(finding.owners):
+        return frozenset()
+    return frozenset(optional)
+
+
+def _note_uncreated(findings: Sequence[Finding]) -> tuple[list[Finding], list[SourceUnreadable]]:
+    """Each finding, made NO_CONTAINER when its only owners are optional services docker has no container of."""
+    candidates = [_sole_optional_services(finding) for finding in findings]
+    uncreated: set[str] = set()
+    errors: list[SourceUnreadable] = []
+    for service in sorted({service for services in candidates for service in services}):
+        try:
+            if not has_container(service):
+                uncreated.add(service)
+        except SourceUnreadable as exc:
+            errors.append(exc)
+    noted = [
+        dataclasses.replace(finding, kind=FindingKind.NO_CONTAINER) if services and services <= uncreated else finding
+        for finding, services in zip(findings, candidates, strict=True)
+    ]
+    return noted, errors
+
+
 def run(
     *,
     static_ports: Sequence[OwnedPort] = STATIC_PORTS,
@@ -358,22 +439,24 @@ def run(
     owners = merge_owners(socket_ports, static_ports)
     targets = [target for port in owners for target in _port_targets(port, addresses)]
     results = _probe_all(targets, connect_timeout)
-    findings = [
+    findings, container_errors = _note_uncreated([
         finding
         for target, result in zip(targets, results, strict=True)
         if (finding := _finding(target, owners[target.port], result)) is not None
-    ]
+    ])
     emit(TOOL, f"probing {len(owners)} port(s) on {len(addresses)} non-loopback address(es) and 127.0.0.1", out=out)
-    return _report([*map(_source_error_line, errors), *(finding.render() for finding in findings)], out)
+    return _report([*errors, *container_errors], findings, out)
 
 
-def _report(failure_lines: Sequence[str], out: TextIO) -> ExposureExit:
-    for line in failure_lines:
+def _report(errors: Sequence[SourceUnreadable], findings: Sequence[Finding], out: TextIO) -> ExposureExit:
+    for line in [*map(_source_error_line, errors), *(finding.render() for finding in findings)]:
         emit(TOOL, line, out=out)
-    if failure_lines:
-        emit(TOOL, f"[finding] {len(failure_lines)} finding(s) above", out=out)
+    failures = len(errors) + sum(1 for finding in findings if finding.kind.fails)
+    if failures:
+        emit(TOOL, f"[finding] {failures} finding(s) above", out=out)
         return ExposureExit.FINDING
-    emit(TOOL, "[ok] every probed port refuses off-loopback connects and accepts on 127.0.0.1", out=out)
+    unless_noted = " unless noted above" if findings else ""
+    emit(TOOL, f"[ok] every probed port refuses off-loopback connects and accepts on 127.0.0.1{unless_noted}", out=out)
     return ExposureExit.LOOPBACK_ONLY
 
 
@@ -381,8 +464,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Exit 0 only if every factory port refuses TCP connects on every "
-            "non-loopback address of this host and accepts on 127.0.0.1; "
-            "every report line is tagged [network_exposure]."
+            "non-loopback address of this host and accepts on 127.0.0.1, or, "
+            "as an optional compose service with no container, is noted "
+            "[no-container]; every report line is tagged [network_exposure]."
         )
     )
     parser.add_argument(

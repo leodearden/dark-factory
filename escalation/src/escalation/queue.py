@@ -605,16 +605,21 @@ def read_escalation_for_scan(
     file in this package was audited when this helper was introduced; the
     asymmetry below is deliberate, not an oversight.
 
-    FIXED -- the unlocked scans, all seven reads routed through this helper:
+    FIXED -- the unlocked scans, all eight reads routed through this helper:
     ``shadow_ruling.py::agreement_report`` (task 5374; the weekly shadow-ruling
     count, which the watcher skill points at the LIVE ``data/escalations``
     tree and which passes a WIDER ``parse_errors`` tuple than the default --
     it adds ``ValueError`` so a truncated file's ``UnicodeDecodeError`` costs
     one record rather than the whole measurement),
+    ``refile_absorption.py::absorbing_resolutions`` (task 4915; the operator
+    listing of resolutions absorbing refiles, also run over the live tree and
+    passing its own wider tuple with ``ValueError`` for the same reason, plus
+    ``AttributeError`` for a file holding valid JSON that is not an object),
     ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
-    ``queue.py::EscalationQueue.find_terminal_by_citation``,
+    ``queue.py::EscalationQueue.newest_terminal_by_task`` (which also backs
+    ``find_terminal_by_citation``),
     ``sweep.py::reap_loose_archive_files``, and BOTH of ``sweep.py::sweep``'s
     reads -- the root file, and the ARCHIVE copy its reconciliation branch
     compares that file against.  The second one is not a glob-then-read but an
@@ -675,7 +680,7 @@ def read_escalation_for_scan(
     reproduces each module's pre-existing behaviour exactly: queue.py's
     ``(JSONDecodeError, KeyError, TypeError)`` does not match it, so it still
     propagates at ``get_by_task`` / ``get_pending`` /
-    ``find_terminal_by_citation``; sweep.py's tuple carries a bare
+    ``newest_terminal_by_task``; sweep.py's tuple carries a bare
     ``ValueError`` and does match it, so both sweep sites count it as
     unparsable, warn once, and continue the pass.  Hard-coding
     ``except UnicodeDecodeError`` instead would silently overturn the queue-side
@@ -1209,6 +1214,10 @@ class EscalationQueue:
 
         Level-1 is the handed-to-human tier: the presence of one signals that
         the workflow must not auto-requeue the task — a human will unblock.
+        This method counts EVERY pending L1 whatever its severity; the
+        workflow's hand-off gates instead admit an open L1 only when
+        ``escalation.pins.is_queue_handoff`` calls it a hand-off, so an info
+        L1 never holds a task there.
 
         ``category``, when given, restricts the check to open L1s whose
         ``.category`` matches — a signature filter (task 2757).  This lets a NEW
@@ -1298,13 +1307,34 @@ class EscalationQueue:
         ``find_dedupe_parent`` falsy-key convention.  An absent identity is not
         an identity, and suppressing on one would collapse unrelated findings.
 
+        The scan itself, and why it is targeted, is ``newest_terminal_by_task``.
+
+        A *category* outside ``escalation.categories.EscalationCategory`` raises
+        ``UnregisteredEscalationCategory``.
+        """
+        require_registered_category(category)
+        if not citation_sha:
+            return None
+        return self.newest_terminal_by_task(
+            task_id, category, lambda esc: esc.citation_sha == citation_sha,
+        )
+
+    def newest_terminal_by_task(
+        self, task_id: str, category: str, matches: Callable[[Escalation], bool],
+    ) -> Escalation | None:
+        """Newest TERMINAL record of *task_id* and *category* that *matches* accepts, or None.
+
+        A PURE READ.  Terminal means ``resolved`` or ``dismissed``; a pending
+        record is never returned, whatever *matches* says.  The caller states
+        only its own identity rule in *matches*; newest is by ``resolved_at``.
+
         Cost — why the TARGETED per-task glob (``esc-{task_id}-*.json`` over
         the queue root plus ``_iter_archive_paths``, the shape
         ``_recover_seq_from_disk`` already uses) rather than
-        ``get_by_task``'s full-archive ``esc-*.json`` rglob: this runs on the
-        REJECT path, which is exactly the path that recurs every tick in the
-        storm case being fixed, over an archive shared across 7+ projects.  An
-        O(whole-archive) parse per tick would be the wrong bound.
+        ``get_by_task``'s full-archive ``esc-*.json`` rglob: callers run it on
+        paths that recur every tick or cycle in the storm case they suppress,
+        over an archive shared across 7+ projects.  An O(whole-archive) parse
+        per tick would be the wrong bound.
 
         The ``.json`` suffix is load-bearing for the same three reasons
         ``_recover_seq_from_disk`` lists: it excludes the
@@ -1318,8 +1348,6 @@ class EscalationQueue:
         ``UnregisteredEscalationCategory``.
         """
         require_registered_category(category)
-        if not citation_sha:
-            return None
 
         pattern = f'esc-{task_id}-*.json'
         newest: Escalation | None = None
@@ -1328,7 +1356,7 @@ class EscalationQueue:
             self.queue_dir.glob(pattern), self._iter_archive_paths(pattern),
         ):
             esc, reason = read_escalation_for_scan(
-                path, context='queue.find_terminal_by_citation',
+                path, context='queue.newest_terminal_by_task',
             )
             if reason != 'ok' or esc is None:
                 continue
@@ -1337,16 +1365,14 @@ class EscalationQueue:
                 continue
             if esc.category != category:
                 continue
-            if esc.citation_sha != citation_sha:
-                continue
-            if esc.status not in ('resolved', 'dismissed'):
+            if esc.status not in ('resolved', 'dismissed') or not matches(esc):
                 continue
             # Malformed stamps sort OLDEST (never dropped, never displacing a
             # well-formed newer match) and are logged loudly, not swallowed.
             ts, _ = parse_timestamp_or_warn(
                 esc.resolved_at,
                 fallback=datetime.min.replace(tzinfo=UTC),
-                context='queue.find_terminal_by_citation',
+                context='queue.newest_terminal_by_task',
             )
             # Strictly-newer displaces, so a TIE keeps the incumbent — and the
             # queue root is scanned first, matching get_by_task's "queue_dir
@@ -2338,9 +2364,10 @@ class EscalationQueue:
         "changed since I triaged it" re-assess rule — are, exhaustively:
         ``add_members_to_l2`` (a real member append, severity promotion or
         recorded amendment; guarded, since a true no-op must not bump),
-        ``amend`` (a recorded explicit amendment; guarded the same way) and
+        ``amend`` (a recorded explicit amendment; guarded the same way),
         ``attach_dedupe_child`` (a dedupe fold; unconditional, since every
-        successful call appends a child and increments ``dedupe_count``).
+        successful call appends a child and increments ``dedupe_count``) and
+        ``release_merge_halt`` (a first release stamp; a repeat is a no-op).
 
         Returns the updated ``Escalation``, or ``None`` when *escalation_id*
         is not found in the queue root, fails to parse, or is not pending
@@ -2428,6 +2455,34 @@ class EscalationQueue:
                 'claim_policy_class: %s claimed %s as %s', claimed_by, escalation_id, policy_class,
             )
             return ClaimResult(record=esc, refusal=None)
+
+    def release_merge_halt(self, escalation_id: str, *, note: str) -> Escalation | None:
+        """Record that a pending merge-halt record stopped owning the queue halt (task 3876).
+
+        The sole writer of ``halt_released_at`` / ``halt_release_note``. It bumps
+        ``updated_at``: the record no longer halts the merge queue, a substantive
+        change the watcher's "changed since I triaged it" rule must see.
+
+        It has :meth:`stamp_triage`'s write shape: serialized per id by
+        ``escalation_id_lock``, queue root only, pending only, so a closed
+        record is refused rather than resurrected. Idempotent: a released record
+        is returned unchanged, keeping its first stamp. ``None`` when there is no
+        pending record to release.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
+                return None
+            if esc.halt_released_at is not None:
+                return esc
+
+            now = datetime.now(UTC).isoformat()
+            esc.halt_released_at = now
+            esc.updated_at = now
+            esc.halt_release_note = note
+            self._rewrite(escalation_id, esc)
+            logger.info('release_merge_halt: released the merge halt owned by %s', escalation_id)
+            return esc
 
     def amend(
         self, escalation_id: str, *, root_cause: str = '', summary: str = '',
@@ -2818,13 +2873,14 @@ class EscalationQueue:
         non-zero only on already-adjudicated records has no business inflating
         every pending row.
 
-        The residual gap is DISCOVERY, not access: the counter accrues only on
-        RESOLVED/DISMISSED records, which no triage surface lists, so reading it
-        means knowing the id to ask about.  The suppression WARNING in
-        ``file_unattributed_landing_escalation`` names that id on every
-        suppression, which is the intended entry point; a listing surface or a
-        named operator query for "resolutions absorbing refiles" is genuine
-        follow-up work and is filed as such rather than being silently assumed.
+        DISCOVERY is a separate surface from access: the counter accrues only
+        on RESOLVED/DISMISSED records, which no triage surface lists.  The
+        suppression WARNING in ``file_unattributed_landing_escalation`` names
+        the id on every suppression; the listing of every record with a
+        non-zero counter is
+        ``escalation/src/escalation/refile_absorption.py::absorbing_resolutions``,
+        run as the named operator query in OPERATIONS.md §"Which resolutions
+        are absorbing refiles?".
 
         Locking: the whole read-modify-write runs under ``escalation_id_lock``
         — a concurrent same-id bump from another harness/worker process must not

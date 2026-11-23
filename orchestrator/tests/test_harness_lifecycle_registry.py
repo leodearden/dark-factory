@@ -31,14 +31,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _escalation_server_capture import create_server_kwargs
-from _git_fixtures import seed_repo
-from _merge_lane_fakes import branch_merge_request, lane_scene_config
+from _startup_harness import journal_merge_request, merge_lane_harness_factory
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
-from test_harness_startup_steps import _STUBBED_STEPS, _SYNC_STEPS, _UNSTUBBED_STEPS
 
 from orchestrator.background_service import BackgroundService, ManagedService
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_debt_drain import STALE_DUE_ESCALATION_SENTINEL
 from orchestrator.flake_ledger import (
@@ -433,59 +431,13 @@ class TestFlakeDebtDrainPass:
 # constructed at 1b; its loop is launched only after finish_startup()
 # ---------------------------------------------------------------------------
 
-_SCENE_GIT = GitConfig(
-    main_branch='main', branch_prefix='task/', remote='origin',
-    worktree_dir='.worktrees', push_after_advance=False,
-)
-#: The startup-table steps run for real here: the merge worker's construction
-#: and the recovery that journals into its queue.
-_REAL_STARTUP_STEPS = _UNSTUBBED_STEPS | {'1c0a'}
-
-
 class _ProcessKillingFault(BaseException):
     """Escapes the startup-step runner, which catches only ``Exception``."""
 
 
 @pytest.fixture
 def make_merge_lane_harness(tmp_path: Path) -> Callable[[], Harness]:
-    """Build Harnesses over ONE seeded repo, each running the real 1b and 1c0a.
-
-    A later Harness sees the journal and runs.db an earlier one left.
-    """
-    repo = seed_repo(tmp_path / 'repo')
-
-    def make() -> Harness:
-        with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
-             patch('orchestrator.harness.Scheduler'), \
-             patch('orchestrator.harness.BriefingAssembler'):
-            h = Harness(lane_scene_config(repo, _SCENE_GIT))
-        mock_mcp_cls.return_value.start = AsyncMock()
-        mock_mcp_cls.return_value.stop = AsyncMock()
-
-        async def start_escalation_server() -> None:
-            h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
-
-        h._start_escalation_server = AsyncMock(side_effect=start_escalation_server)
-        h._stop_escalation_server = AsyncMock()
-        for step, attr in _STUBBED_STEPS:
-            if step not in _REAL_STARTUP_STEPS:
-                setattr(h, attr, MagicMock() if attr in _SYNC_STEPS else AsyncMock())
-        h._tag_task_modules = AsyncMock()
-        h._tag_prd_metadata = AsyncMock()
-
-        h.scheduler = MagicMock()
-        h.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
-        h.scheduler.set_task_status = AsyncMock()
-        return h
-
-    return make
-
-
-async def journal_merge_request(h: Harness, task_id: str) -> str:
-    """Journal a real merge of task *task_id*'s new branch, as the live enqueue does; its id."""
-    request = await branch_merge_request(h.git_ops, h.config, task_id, filename=f'{task_id}.txt')
-    h._merge_store.record(request)
-    return request.request_id
+    return merge_lane_harness_factory(tmp_path)
 
 
 def _drain_queued(h: Harness) -> list:
@@ -542,7 +494,7 @@ class TestMergeWorkerLaunchedAfterStartup:
 
         h._recover_crashed_tasks = recover_crashed_tasks
 
-        async def first_acquire() -> None:
+        async def first_acquire(*_args: object) -> None:
             loops_at_first_acquire.extend(_merge_worker_loops())
             raise RuntimeError('__stop_sentinel__')
 

@@ -40,7 +40,7 @@ import pytest
 # keys (REIFY_WARM_LANE_MOUNT, GIT_DIR, GIT_WORK_TREE) that git hooks and
 # `git rebase --exec` export — without which a passing result here could be an
 # artifact of the ambient checkout instead of the synthetic mount.
-from test_warm_lane_scripts_shipped import (  # noqa: E402
+from test_warm_lane_scripts_shipped import (
     WARM_LANE_SCRIPT_DIR,
     _sanitized_env,
 )

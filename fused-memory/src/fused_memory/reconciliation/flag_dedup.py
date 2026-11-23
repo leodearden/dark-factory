@@ -382,10 +382,6 @@ from fused_memory.reconciliation.task_corroboration import (
     corroborate_task_lookups,
     safe_get_task,
 )
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    SNAPSHOT_PRUNED_STAT_KEY,
-    SNAPSHOT_WRITTEN_STAT_KEY,
-)
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
@@ -2170,7 +2166,8 @@ async def write_suppression_record(
 
 #: Per-cycle task-count drift bound used by filter_stale_count_snapshot_corrections.
 #:
-#: Rationale: in normal operation the authoritative ## Active Task Tree header advances
+#: Rationale: in normal operation the authoritative Active Task Tree header
+#: (fused-memory/src/fused_memory/reconciliation/task_filter.py::ACTIVE_TASK_TREE_HEADER) advances
 #: by at most one task between consecutive snapshot writes (one task created or
 #: completed per recon cycle).  The incident (run 929b4135 finding 2ebc814c) showed
 #: a drift of exactly +1/+1, consistent with one task-creation event between the edge
@@ -4313,10 +4310,10 @@ async def _discover_foreign_fix_task_citations(
 
 
 # --------------------------------------------------------------------------- #
-# Blocked-snapshot finding filter for Stage 3 (task-1840)
+# Task-count snapshot finding filter for Stage 3
 # --------------------------------------------------------------------------- #
 
-#: Categories that are subject to blocked-snapshot suppression.  Only flags
+#: Categories that are subject to snapshot suppression.  Only flags
 #: in these categories whose text matches the task-count-snapshot signature are
 #: dropped; all other categories pass through unchanged (fail-open).
 _SUPPRESSED_SNAPSHOT_CATEGORIES: frozenset[str] = frozenset({
@@ -4621,53 +4618,27 @@ async def acknowledge_resolved_flags(
     return total
 
 
-def filter_blocked_snapshot_findings(
+def filter_task_count_snapshot_findings(
     flags: list[dict[str, Any]],
-    project_id: str,
 ) -> list[dict[str, Any]]:
-    """Drop Stage-3 false-positive findings about blocked task-count snapshot edges.
+    """Drop Stage-3 findings that a task-count snapshot is missing or stale.
 
-    For projects in :data:`SNAPSHOT_WRITE_BLOCKED_PROJECTS`, the ABSENCE or
-    staleness of a task-count snapshot temporal_fact edge is the CORRECT state
-    (both write paths are blocked-by-design).  Stage 3 findings asserting the
-    edge is missing or stale are false positives and must be suppressed.
-
-    A flag is DROPPED iff **all three** conditions hold:
-    1. ``project_id`` is in :data:`SNAPSHOT_WRITE_BLOCKED_PROJECTS`.
-    2. ``flag['category']`` is in :data:`_SUPPRESSED_SNAPSHOT_CATEGORIES`
-       (``missing_knowledge`` or ``memory_stale``).
-    3. :func:`_is_task_count_snapshot_finding` returns ``True`` for the flag.
-
-    All other flags pass through unchanged (fail-open).  The blast radius is
-    tight: only registered projects × two categories × matching signature.
-
-    A ``logger.debug`` line is emitted per dropped flag for observability.
-
-    Args:
-        flags: List of flag dicts from Stage 3 ``items_flagged``.
-        project_id: The project being reconciled.
-
-    Returns:
-        Filtered list with false-positive blocked-snapshot findings removed.
+    No project writes a task-count snapshot (task 10081), so such a finding is
+    a false positive everywhere. A flag is dropped iff its ``category`` is in
+    :data:`_SUPPRESSED_SNAPSHOT_CATEGORIES` and
+    :func:`_is_task_count_snapshot_finding` matches it; every other flag passes
+    through, with a ``logger.debug`` line per drop.
     """
-    from fused_memory.reconciliation.policies import is_snapshot_write_blocked
-
-    if not is_snapshot_write_blocked(project_id):
-        # Fail-open: project is not in the blocked set; return all flags unchanged.
-        return list(flags)
-
     kept: list[dict[str, Any]] = []
     for flag in flags:
         category = flag.get('category') or ''
         if category in _SUPPRESSED_SNAPSHOT_CATEGORIES and _is_task_count_snapshot_finding(flag):
             logger.debug(
-                'filter_blocked_snapshot_findings: dropping %s finding for task_id=%s '
-                '(snapshot writes blocked-by-design for project %s)',
+                'filter_task_count_snapshot_findings: dropping %s finding for task_id=%s '
+                '(no project keeps a task-count snapshot)',
                 category,
                 flag.get('task_id'),
-                project_id,
             )
-            # do NOT append — flag is dropped
         else:
             kept.append(flag)
 
@@ -4725,54 +4696,6 @@ def filter_contamination_ceiling_findings(
                 project_id,
             )
             # do NOT append — flag is dropped
-        else:
-            kept.append(flag)
-
-    return kept
-
-
-#: Stage 2's Mem0-only snapshot stats, taken from their defining module so a
-#: stat rename moves this gate with it instead of silently disabling it.
-_MEM0_SNAPSHOT_STAT_KEYS: tuple[str, ...] = (
-    SNAPSHOT_WRITTEN_STAT_KEY,
-    SNAPSHOT_PRUNED_STAT_KEY,
-)
-
-#: Wordings a Stage-3 finding uses for a Graphiti temporal_facts edge.
-_GRAPHITI_TEMPORAL_EDGE_MARKERS: tuple[str, ...] = (
-    'temporal_fact',
-    'temporal fact',
-    'graphiti edge',
-    'graphiti temporal',
-)
-
-
-def filter_snapshot_stat_edge_findings(
-    flags: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Drop Stage-3 findings that pair a snapshot stat with a Graphiti edge.
-
-    Per Snapshot Discipline a task-count snapshot is never persisted as a
-    Graphiti ``temporal_facts`` edge, for ANY project, so a finding reading a
-    Mem0-only snapshot stat as evidence of a missing or rejected edge is a
-    false positive (task 3487).  A flag is dropped iff its ``description`` +
-    ``suggested_action`` text names one of :data:`_MEM0_SNAPSHOT_STAT_KEYS`
-    AND one of :data:`_GRAPHITI_TEMPORAL_EDGE_MARKERS` (case-insensitive);
-    everything else passes through (fail-open), with a ``logger.debug`` line
-    per drop.
-    """
-    kept: list[dict[str, Any]] = []
-    for flag in flags:
-        text = f"{flag.get('description') or ''} {flag.get('suggested_action') or ''}"
-        if contains_any_casefolded(text, _MEM0_SNAPSHOT_STAT_KEYS) and contains_any_casefolded(
-            text, _GRAPHITI_TEMPORAL_EDGE_MARKERS,
-        ):
-            logger.debug(
-                'filter_snapshot_stat_edge_findings: dropping %s finding for task_id=%s '
-                '(snapshot stats are Mem0-only; no Graphiti edge is ever written)',
-                flag.get('category'),
-                flag.get('task_id'),
-            )
         else:
             kept.append(flag)
 

@@ -40,7 +40,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import sys
@@ -50,7 +49,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.backends.falkor_read_only import PagedQuery, ReadOnlyGraphReader
 from fused_memory.backends.paged_read import PagedRead
@@ -64,6 +63,14 @@ from fused_memory.services.completion_claim_gate import (
     extract_completion_claims,
 )
 from fused_memory.services.overreach_guard import EPISODE_CLASSIFIERS, LABELS
+from fused_memory.utils.script_loader import load_script
+
+_SCRIPTS = Path(__file__).resolve().parent
+
+if TYPE_CHECKING:
+    import write_triage_stats as _stats
+else:
+    _stats = load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
 
 # --------------------------------------------------------------------------- #
 # Records
@@ -606,11 +613,8 @@ Row = Mapping[str, Any]
 
 
 def _wilson(p: float, n: float) -> tuple[float, float]:
-    z2 = WILSON_Z ** 2
-    denominator = 1 + z2 / n
-    centre = (p + z2 / (2 * n)) / denominator
-    half = WILSON_Z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denominator
-    return (round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4))
+    low, high = _stats.wilson_bounds(p, n, z=WILSON_Z)
+    return (round(low, 4), round(high, 4))
 
 
 def wilson_interval(k: int, n: int) -> tuple[float, float] | None:
@@ -1121,7 +1125,7 @@ def _resolve_uri(args: argparse.Namespace) -> str | None:
     if env_uri := os.environ.get('FALKORDB_URI'):
         return env_uri
     try:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         return getattr(getattr(FusedMemoryConfig().graphiti, 'falkordb', None), 'uri', None)
     except Exception:

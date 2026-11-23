@@ -31,5 +31,5 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 # shellcheck disable=SC2086  # CHECK_SANDBOX_SOAK_PY is a command word list.
-exec ${CHECK_SANDBOX_SOAK_PY:-uv run --frozen --project "$REPO_ROOT/orchestrator" python -m orchestrator.sandbox_soak} \
+exec ${CHECK_SANDBOX_SOAK_PY:-uv run --no-sync --project "$REPO_ROOT/orchestrator" python -m orchestrator.sandbox_soak} \
     --repo-root "$REPO_ROOT" "$@"

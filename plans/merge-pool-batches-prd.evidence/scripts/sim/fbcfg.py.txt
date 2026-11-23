@@ -1,0 +1,48 @@
+"""Cells and policies of the unscannable-fallback run (gate 10069, sixth run)."""
+QS = (0.05, 0.08, 0.14, 0.20)
+MS = (0.05, 0.10, 0.16, 0.25)
+FBS = (('F1 alone', 'alone'), ('F2 halve', 'halve'), ('F3 inference', 'infer'), ('F4 bisect', 'bisect'))
+F3B = dict(sus_noscan=True)
+NOEV = 0.01
+
+
+def U(**kw):
+    return dict(base='U', e_pol=0.009, theta=0.9, strict_conv=True, **kw)
+
+
+def base_cfg(q, dur='W1', **extra):
+    cfg = dict(q=q, e=0.01, dur=dur, horizon=144.0, warm=24.0, closed_N=75, mainred=True, restarts=True, cascade='all')
+    cfg.update(extra)
+    return cfg
+
+
+def scan_pair(m=0.0, model='coin', fb='infer', mode='solo', t1=True, t2=False, t3=1, t4=True, ct=0.05, rule_ct=None, miss_trees=2, pol_extra=None, conc=1):
+    """(engine cfg additions, policy spec) of U+S with the corrections chosen."""
+    ec = dict(ct=ct, mode=mode, miss=m, miss_model=model, flake='pass', confirm=t1, first_only=t2, offhost=t3, miss_trees=miss_trees, conc=conc)
+    if rule_ct is None:
+        rule_ct = 0.0 if t3 else ct      # an off-host scan costs the verify hosts nothing
+    pk = dict(scan=dict(ct=rule_ct, mode=mode, variant='A', flake='pass', pred_ct=(ct if (pol_extra or {}).get('scan_pred') == 'rule' else None)), rider_only=12, fb=fb, fb_m=m, fb_model=model,
+              confirm=t1, first_only=t2, noev=NOEV if t4 else 0.0, miss_trees=miss_trees)
+    if pol_extra:
+        pk.update(pol_extra)
+    if pk.get('scan_pred') == 'rule':
+        pk['lookahead'] = True
+    return dict(scan=ec, noev=NOEV if t4 else 0.0), U(**pk)
+
+
+DEFAULT_S = (dict(scan=dict(ct=0.05, mode='lin', miss=0.0, flake='pass')), U(scan=dict(ct=0.05, mode='lin', variant='A', flake='pass'), rider_only=12))
+
+
+def scanoff_pair(fb):
+    """X1: a project that cannot scan at all (no re-run of anything: a false failure stands)."""
+    ec = dict(scan=dict(ct=0.0, mode='lin', miss=1.0, miss_model='coin', flake='stand', miss_trees=0, offhost=0), noev=0.0)
+    return ec, U(scan=dict(ct=0.0, mode='lin', variant='A', flake='stand'), fb=fb, fb_m=1.0, fb_model='coin', lookahead=fb not in ('alone', 'alone_u'))
+
+
+def never_pair(fb):
+    """X2: the corrected lane (flake re-run, T4) that never scans a red batch."""
+    ec = dict(scan=dict(ct=0.05, mode='solo', miss=1.0, miss_model='coin', flake='pass', confirm=True, offhost=1, miss_trees=0), noev=NOEV)
+    if fb == 'infer':
+        return ec, U()
+    return ec, U(scan=dict(ct=0.0, mode='solo', variant='A', flake='pass'), rider_only=12, fb=fb, fb_m=1.0, fb_model='coin',
+                 confirm=True, noev=NOEV, miss_trees=0, lookahead=fb not in ('alone', 'alone_u'))

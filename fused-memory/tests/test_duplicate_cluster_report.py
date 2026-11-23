@@ -77,6 +77,36 @@ def _with_fitness(data: dict, **changes: object) -> dict:
     return {**data, 'recall_caveat': {**caveat, 'fitness': {**caveat['fitness'], **changes}}}
 
 
+# A well-formed adjudicator_measurements entry. Every number is synthetic.
+_ADJUDICATOR_ENTRY = {
+    'measured_at': '2099-01-02',
+    'detector': 'fake-arm+claims',
+    'scan_set': {'setting': 'fixture_only', 'records': 17},
+    'candidate_generation': {'top_k': 3, 'caught': 5, 'of': 7},
+    'operating_threshold': 0.4242,
+    'paraphrase_band_recall': {'caught': 4, 'of': 7, 'rate': 4 / 7, 'wilson_95': [0.25, 0.84]},
+    'precision_at_operating_point': {'flagged': 6, 'rate': 4 / 6, 'wilson_95': [0.3, 0.9]},
+    'hard_negative_flagged': {'flagged': 1, 'of': 2},
+    'auc_true_vs_hard_negative': {
+        'value': 0.61, 'n_true': 7, 'n_hard_negative': 2, 'hanley_mcneil_95': [0.2, 1.0],
+    },
+    'meets_proposed_gate': False,
+    'source': 'tests/fake-report.json',
+}
+
+
+def _with_caveat(data: dict, **changes: object) -> dict:
+    return {**data, 'recall_caveat': {**data['recall_caveat'], **changes}}
+
+
+def _with_adjudicator_entry(data: dict, **changes: object) -> dict:
+    return _with_caveat(data, adjudicator_measurements=[{**_ADJUDICATOR_ENTRY, **changes}])
+
+
+def _with_adjudicator_block(data: dict, block: str, **changes: object) -> dict:
+    return _with_adjudicator_entry(data, **{block: {**_ADJUDICATOR_ENTRY[block], **changes}})
+
+
 _BAD_CONFIGS = {
     'missing_key': lambda d: _without(d, 'scan_limit'),
     'unknown_key': lambda d: _with(d, gate_cap=3),
@@ -90,7 +120,101 @@ _BAD_CONFIGS = {
     'zero_detector_timeout': lambda d: _with(d, detector_timeout_secs=0),
     'zero_resweep_interval': lambda d: _with_cadence(d, resweep_interval_days=0),
     'fitness_outside_its_vocabulary': lambda d: _with_fitness(d, gate_filing='maybe'),
+    'adjudicator_measurements_missing': lambda d: _with(
+        d, recall_caveat=_without(d['recall_caveat'], 'adjudicator_measurements'),
+    ),
+    'adjudicator_entry_unknown_key': lambda d: _with_adjudicator_entry(d, verdict='pass'),
+    'adjudicator_entry_negative_caught': lambda d: _with_adjudicator_entry(
+        d, paraphrase_band_recall={**_ADJUDICATOR_ENTRY['paraphrase_band_recall'], 'caught': -1},
+    ),
+    'adjudicator_entry_zero_of': lambda d: _with_adjudicator_entry(
+        d, paraphrase_band_recall={**_ADJUDICATOR_ENTRY['paraphrase_band_recall'], 'of': 0},
+    ),
+    'adjudicator_entry_non_bool_verdict': lambda d: _with_adjudicator_entry(
+        d, meets_proposed_gate='yes',
+    ),
+    'adjudicator_entry_rate_above_one': lambda d: _with_adjudicator_block(
+        d, 'precision_at_operating_point', rate=1.4,
+    ),
+    'adjudicator_entry_auc_above_one': lambda d: _with_adjudicator_block(
+        d, 'auc_true_vs_hard_negative', value=1.2,
+    ),
+    'adjudicator_entry_recall_caught_over_of': lambda d: _with_adjudicator_block(
+        d, 'paraphrase_band_recall', caught=8,
+    ),
+    'adjudicator_entry_recall_rate_not_caught_over_of': lambda d: _with_adjudicator_block(
+        d, 'paraphrase_band_recall', rate=0.5,
+    ),
+    'adjudicator_entry_reversed_interval': lambda d: _with_adjudicator_block(
+        d, 'paraphrase_band_recall', wilson_95=[0.84, 0.25],
+    ),
+    'adjudicator_entry_interval_excludes_rate': lambda d: _with_adjudicator_block(
+        d, 'paraphrase_band_recall', wilson_95=[0.6, 0.84],
+    ),
+    'adjudicator_entry_auc_interval_excludes_value': lambda d: _with_adjudicator_block(
+        d, 'auc_true_vs_hard_negative', hanley_mcneil_95=[0.7, 1.0],
+    ),
+    'adjudicator_entry_precision_rate_not_caught_over_flagged': lambda d: _with_adjudicator_block(
+        d, 'precision_at_operating_point', rate=0.5,
+    ),
+    'adjudicator_entry_generation_caught_over_of': lambda d: _with_adjudicator_block(
+        d, 'candidate_generation', caught=8,
+    ),
+    'adjudicator_entry_generation_of_is_not_recall_of': lambda d: _with_adjudicator_block(
+        d, 'candidate_generation', of=8,
+    ),
+    'adjudicator_entry_recall_beyond_generation': lambda d: _with_adjudicator_block(
+        d, 'candidate_generation', caught=3,
+    ),
+    'adjudicator_entry_auc_counts_exceed_labels': lambda d: _with_adjudicator_block(
+        d, 'auc_true_vs_hard_negative', n_true=8,
+    ),
+    'adjudicator_entry_threshold_without_precision': lambda d: _with_adjudicator_entry(
+        d, precision_at_operating_point=None,
+    ),
+    'adjudicator_entry_caught_without_operating_point': lambda d: _with_adjudicator_entry(
+        d, operating_threshold=None, precision_at_operating_point=None,
+        hard_negative_flagged={'flagged': 0, 'of': 2},
+    ),
+    'adjudicator_entry_hard_negatives_beyond_false_positives': lambda d: _with_adjudicator_entry(
+        d, hard_negative_flagged={'flagged': 3, 'of': 3},
+    ),
+    'adjudicator_entry_hard_negative_flagged_over_of': lambda d: _with_adjudicator_entry(
+        d, hard_negative_flagged={'flagged': 3, 'of': 2},
+    ),
 }
+
+
+class TestAdjudicatorMeasurements:
+    def test_a_well_formed_entry_loads(self, tmp_path: Path) -> None:
+        path = _write_yaml(tmp_path, _with_adjudicator_entry(_committed_yaml()))
+
+        caveat = report.load_config(path).recall_caveat
+
+        assert caveat.adjudicator_measurements[0].detector == 'fake-arm+claims'
+
+    def test_an_unreachable_precision_floor_loads_as_nulls(self, tmp_path: Path) -> None:
+        path = _write_yaml(tmp_path, _with_adjudicator_entry(
+            _committed_yaml(), operating_threshold=None, precision_at_operating_point=None,
+            paraphrase_band_recall={'caught': 0, 'of': 7, 'rate': 0.0, 'wilson_95': [0.0, 0.35]},
+            hard_negative_flagged={'flagged': 0, 'of': 2},
+        ))
+
+        (entry,) = report.load_config(path).recall_caveat.adjudicator_measurements
+
+        assert entry.operating_threshold is None
+        assert entry.precision_at_operating_point is None
+
+    def test_every_report_carries_the_entries_verbatim(self, tmp_path: Path) -> None:
+        path = _write_yaml(tmp_path, _with_adjudicator_entry(_committed_yaml()))
+        carrying = report.load_config(path)
+
+        rep = _build(carrying, [('plan-pk.json', _plan([]))])
+
+        assert rep['recall_caveat']['adjudicator_measurements'] == [
+            entry.model_dump(mode='json')
+            for entry in carrying.recall_caveat.adjudicator_measurements
+        ]
 
 
 class TestConfigRejections:

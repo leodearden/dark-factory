@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 from _eval_write_triage_fixtures import ALIASES_PATH, FIXTURE_PATH, committed_records
-from _eval_write_triage_fixtures import cli_mod as _mod
 from _eval_write_triage_fixtures import scoring_mod as _scoring
 
 
@@ -54,7 +53,7 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
     @staticmethod
     @functools.cache
     def _committed():
-        import yaml  # noqa: PLC0415
+        import yaml
 
         cls = TestCommittedJudgeAccuracyReportIsTraceable
         block = yaml.safe_load(cls.CONFIG_PATH.read_text()).get('write_triage') or {}
@@ -195,7 +194,7 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         Still no assertion on any accuracy VALUE — this is about whether a
         run happened, never about whether it scored well.
         """
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         _block, report, _resolved = self._committed()
         assert report is not None
@@ -355,7 +354,7 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         Unlike `judge_candidate_count`, which the sibling test above
         deliberately leaves unbound to the shipped config.
         """
-        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        from fused_memory.server.write_triage_judge import (
             JUDGE_SYSTEM_PROMPT,
         )
 
@@ -396,7 +395,15 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         assert cases.exists(), f'{provenance["cases_path"]} is not committed'
         rows = [json.loads(line) for line in cases.read_text().splitlines()]
         assert len(rows) == provenance['case_count']
-        assert _mod().score_attachments(rows) == report['production_shape']
+        assert _scoring().score_attachments(rows) == report['production_shape']
+
+    def test_the_committed_routing_is_the_score_of_the_committed_cases(self) -> None:
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        assert report.get('routing') is not None, 'the committed arbiter measured no routing'
+        cases = Path(__file__).parent.parent / report['provenance']['cases_path']
+        rows = [json.loads(line) for line in cases.read_text().splitlines()]
+        assert _scoring().score_routing(rows) == report['routing']
 
     def test_no_retrieval_came_back_degraded(self) -> None:
         """Each degraded retrieval is a fail-open that measured nothing."""

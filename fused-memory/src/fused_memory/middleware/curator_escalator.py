@@ -32,6 +32,12 @@ Routing policy (keyed off orchestrator liveness):
   escalation carries the remediation rather than just the symptom. Also
   never raises.
 
+* **Guard registry failed to load** (``report_registry_load_failed``) —
+  raised by the curator's startup self-check. That guard fails open, so
+  curation looks like a healthy curator with an empty registry. Folds into
+  one pending record per project and registry label across restarts, and
+  never raises.
+
 * **Post-ZOT duplicate finding** (``report_zot_duplicate``) — one level-1
   ``curator_zot_duplicate`` record per (new task, near-duplicate) pair,
   cross-referencing the live zero-output-hang record. Filed only when an
@@ -75,6 +81,8 @@ if TYPE_CHECKING:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
+    from fused_memory.middleware.curator_registry import RegistryHealth
+
 # ``escalation`` is a sibling workspace package. The main reconciliation
 # harness also imports it defensively (harness.py:38-46) because historical
 # deployments could lack the package. Mirror that pattern here so the
@@ -115,6 +123,11 @@ _ZOT_DUPLICATE_CATEGORY = 'curator_zot_duplicate'
 # key. It carries no root_cause: its cause is unknown by design.
 _DEGRADED_STREAK_CATEGORY = 'curator_consecutive_degraded'
 _DEGRADED_STREAK_FOLD_KEY = 'curator-degraded-streak'
+
+# A guard registry that failed to load folds per project AND registry label, so
+# every fused-memory restart re-running the self-check does not mint a new L1.
+_REGISTRY_LOAD_FAILED_CATEGORY = 'curator_registry_load_failed'
+_REGISTRY_LOAD_FAILED_FOLD_KEY_PREFIX = 'curator-registry-load-failed'
 
 # The curator-bucket SUBJECT pseudo-task id, shared deliberately with ticket_janitor
 # so every curator-subsystem escalation lands in one task history; pinned equal by
@@ -1007,6 +1020,82 @@ class CuratorEscalator:
             'curator_escalator: queued backend-binary-unresolvable L1 escalation '
             '%s for project %s — binary_spec=%r PATH=%s',
             escalation_id, project_id, binary_spec, search_path,
+        )
+
+    async def report_registry_load_failed(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        health: RegistryHealth,
+    ) -> None:
+        """Alarm on a curator guard registry that failed to load.
+
+        That guard fails open, so its curations look exactly like a healthy
+        curator with an empty registry. Like
+        :meth:`report_backend_binary_unresolvable`: never raises (the caller is
+        curator startup) and never touches ``_failure_log``. Folds per project
+        and registry label, so a restart re-running the self-check counts as a
+        recurrence instead of a new record.
+        """
+        if not HAS_ESCALATION:
+            logger.warning(
+                'curator_escalator: %s registry failed to load (%s) and the '
+                'escalation package is unavailable — alarm not queued for project %s',
+                health.label, health.error, project_id,
+            )
+            return
+
+        if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
+            logger.error(
+                'curator_escalator: %s registry failed to load (%s) and no '
+                'orchestrator is running — alarm not queued for project %s',
+                health.label, health.error, project_id,
+            )
+            return
+
+        detail = '\n'.join([
+            f'project_id={project_id!r}',
+            f'label={health.label}',
+            f'config_key={health.config_key}',
+            f'path={health.path}',
+            f'error={health.error}',
+            f'failures={health.failures}',
+            '',
+            f'CONSEQUENCE: the curator\'s {health.label} guard is disabled and '
+            'fails open. Its curations look exactly like a healthy curator '
+            'with an empty registry, so candidates it exists to refuse or route '
+            'are filed as ordinary tasks for as long as this holds.',
+            '',
+            f'FIX: make CuratorConfig.{health.config_key} name a readable YAML '
+            'list, absolute or relative to the curator cwd. A fix to the file '
+            'at the path above is picked up by the next retry '
+            '(curator.registry_load_retry_seconds); a change to the configured '
+            'path needs a fused-memory restart. Confirm via get_curator_state: '
+            f'registries[{health.label}].state == loaded.',
+        ])
+
+        outcome = await _file_folding_logged(
+            project_root,
+            kind='registry-load-failed',
+            project_id=project_id,
+            category=_REGISTRY_LOAD_FAILED_CATEGORY,
+            fold_key=f'{_REGISTRY_LOAD_FAILED_FOLD_KEY_PREFIX}:{health.label}',
+            summary=(
+                f'curator {health.label} registry failed to load — that guard '
+                f'fails open, so curation looks like a healthy curator with an '
+                f'empty registry. Config break; see detail.'
+            ),
+            detail=detail,
+        )
+        if outcome is None:
+            return
+
+        logger.error(
+            'curator_escalator: %s registry load failure for project %s %s L1 '
+            'escalation %s — config_key=%s path=%s error=%s',
+            health.label, project_id, 'folded into' if outcome.folded else 'queued',
+            outcome.escalation_id, health.config_key, health.path, health.error,
         )
 
     async def _submit_zero_output_timeout(

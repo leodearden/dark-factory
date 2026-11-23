@@ -1965,7 +1965,7 @@ class TestAllAccountsCappedException:
 
     def test_default_constants_accessible(self):
         """Module-level defaults are accessible from cli_invoke."""
-        from shared.cli_invoke import _DEFAULT_CAP_WAIT_SANITY_SECS  # noqa: PLC0415
+        from shared.cli_invoke import _DEFAULT_CAP_WAIT_SANITY_SECS
         assert _DEFAULT_CAP_WAIT_SANITY_SECS == 14 * 86400  # 1_209_600
 
 

@@ -34,10 +34,18 @@ from orchestrator.task_priority import TaskPriorityLookup
 logger = logging.getLogger('orchestrator.merge_lane')
 
 MERGE_WORKER_SHUTDOWN_REASON = 'Merge worker shutting down'
-"""Reason string set on MergeOutcome('blocked') by stop() and the _merger_loop
-finally block.  Used by MergeIntake.buffer_owned_request._on_terminal to
-distinguish a graceful-stop / crash path (keep in journal for recovery) from a
-deterministic terminal failure (remove — not retried on restart)."""
+"""The reason :func:`is_merge_worker_shutdown` matches."""
+
+
+def is_merge_worker_shutdown(outcome: MergeOutcome) -> bool:
+    """Whether *outcome* is the merge worker's graceful-stop / crash outcome.
+
+    stop() and the _merger_loop finally block resolve a still-live request with
+    it. The journal keeps such a request (MergeIntake.buffer_owned_request's
+    _on_terminal) so the next start restores it, unlike a deterministic
+    terminal failure, which is removed and not retried on restart.
+    """
+    return outcome.status == 'blocked' and outcome.reason == MERGE_WORKER_SHUTDOWN_REASON
 
 _COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX = '__merge_coalesce_live_original__'
 
@@ -391,7 +399,7 @@ class MergeIntake:
         if self._merge_store is not None:
             try:
                 self._merge_store.record(item)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     'merge_queue: _buffer_owned_request: store.record failed for %s',
                     item.request_id,
@@ -408,10 +416,8 @@ class MergeIntake:
                     # graceful-stop / crash path — branch is still live, recovery
                     # should retry:
                     #   • fut.cancelled() — explicitly cancelled future; keep.
-                    #   • result.status == 'blocked' AND reason == SHUTDOWN_REASON
-                    #     — stop() and the _merger_loop finally block both set this
-                    #     exact reason; a true process crash leaves the future
-                    #     unresolved so the callback never fires regardless.
+                    #   • is_merge_worker_shutdown(result); a true process crash
+                    #     leaves the future unresolved so the callback never fires.
                     #
                     # REMOVE from journal for ALL other terminals, including other
                     # 'blocked' outcomes (drop-guard, ENOSPC, merge conflict, merger
@@ -429,16 +435,12 @@ class MergeIntake:
                         if fut.cancelled():
                             return  # explicitly cancelled: keep in journal
                         try:
-                            result = fut.result()
-                            if (
-                                result.status == 'blocked'
-                                and result.reason == MERGE_WORKER_SHUTDOWN_REASON
-                            ):
+                            if is_merge_worker_shutdown(fut.result()):
                                 return  # crash / graceful-stop path: keep for recovery
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             pass  # exception-set future: fall through to remove
                         self._merge_store.remove(_rid)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'merge_queue: _on_terminal: store.remove failed for %s',
                             _rid,

@@ -262,7 +262,7 @@ class TestAlarmSerialLaneBreach:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Breached → exactly one WARNING naming the numbers, and one event."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         from orchestrator.merge_lane.liveness import (
             alarm_serial_lane_breach,
@@ -320,7 +320,7 @@ class TestAlarmSerialLaneBreach:
         control MUST filter both channels — do not "helpfully" loosen this one
         or tighten that one to match.
         """
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         from orchestrator.merge_lane.liveness import (
             alarm_serial_lane_breach,
@@ -567,7 +567,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig, caplog: pytest.LogCaptureFixture
     ) -> None:
         """POSITIVE CONTROL: one local dispatch at bound=1 must not trip."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -583,7 +583,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig, caplog: pytest.LogCaptureFixture
     ) -> None:
         """PRD §9 row 10: the second concurrent local verify is the C4 breach."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -617,7 +617,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig
     ) -> None:
         """PRD C4 'no hard block': both entries land, nothing raised, returns None."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -638,7 +638,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig
     ) -> None:
         """Every breach reports — no dedup, no rate-limit, no streak gate."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -655,7 +655,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig
     ) -> None:
         """Only LOCAL leases count — the sanctioned local+remote overlap is legal."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -687,7 +687,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         test-passing, production-dead detector is the worst possible outcome for
         a detection net.
         """
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)

@@ -230,10 +230,9 @@ async def _collect_snapshots(
     """Every root's unit, through the collector *projection* names."""
     if projection is TasksProjection.CENSUS:
         return await collect_census_snapshots(client, config, now=now)
-    _, snapshots = await collect_tasks_with_counts(
+    return await collect_tasks_with_counts(
         client, config, resolve_external=True, now=now,
     )
-    return snapshots
 
 
 @router.get('/api/v2/dashboard/tasks')

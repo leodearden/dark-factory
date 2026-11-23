@@ -392,10 +392,12 @@ one `_settle_own_l0s(disposition)` with a per-disposition scope (ruled: OQ-5, S9
 
 **The L0 settle check (π).** Before ε lands, π puts a read-only script on main that counts, over two
 N-day windows of the escalation archive, blocking L0s filed, stranded (reaper promotions plus `stale-strand`
-restart dismissals), wrongly dismissed by the reaper's dismiss arm, wrongly dismissed by the startup sweep
-(reported, not judged), and blocking L0s pending longer than 24 hours (C10). Once π is on main the lead
-files a deterministic check task that runs it 14 days after ε is done. ε depends on π, so the check is
-filed before ε lands and its pre-landing window is clean.
+restart dismissals), wrongly dismissed by the reaper's dismiss arm, wrongly dismissed by any dismissal
+that is neither a promotion nor the startup sweep (judged against the pre window; ruled: Leo 2026-11-22,
+esc-9351-2 (L2 item 656), option B-prime; amends R40 / S9-7 for the non-startup paths), wrongly dismissed
+by the startup sweep (reported, not judged), and blocking L0s pending longer than 24 hours (C10). Once π
+is on main the lead files a deterministic check task that runs it 14 days after ε is done. ε depends on
+π, so the check is filed before ε lands and its pre-landing window is clean.
 
 **`_invoke` (ζ1, ζ2).**
 
@@ -1001,6 +1003,7 @@ Invariants: exiting `run()` without a terminal report raises a named invariant e
 ```text
 scripts/check_l0_settle_outcomes.py --queue-dir DIR --window-days N
     --baseline-stranded-per-100 F --ratio R --min-stranded K
+    --baseline-non-startup-wrong-per-100 G --min-non-startup-wrong J
     --max-reaper-wrong M --max-pending-hours H
 reads:   DIR/archive/<day>/*.json (resolved records, 30-day retention) and DIR's live pending records; writes nothing
 windows: post = the last N days; pre = the N days before them
@@ -1008,21 +1011,29 @@ counts per window, blocking L0s on numeric task ids only (info L0s excluded):
   filed; stranded = reaper promotions ('Auto-promoted to level 1') + startup-sweep 'stale-strand' dismissals;
   reaper_wrong = reaper dismiss-arm closes later resolved late, or followed within 24 h by a same-task,
                  same-category escalation;
-  startup_wrong = the same rule over startup-sweep dismissals (reported, never judged);
+  non_startup_wrong = the same rule over every dismissal (status 'dismissed', the dismiss arm) that is
+                 neither a promotion nor the startup sweep, whatever resolver or text closed it: the
+                 reaper's dismiss arm, the workflow's auto-dismissals and any other resolver's dismissal;
+                 judged against the pre window (ruled: Leo 2026-11-22, esc-9351-2 (L2 item 656),
+                 option B-prime; amends R40 / S9-7 for the non-startup paths);
+  startup_wrong = the same rule over startup-sweep dismissals only (reported, never judged);
   pending_over_H = blocking L0s pending longer than H hours now
 stdout:  human lines, then one trailing JSON object carrying every count and rate
 exit 1:  post stranded per 100 >= R * max(pre per 100, F) and post stranded >= K
+         or post non_startup_wrong per 100 >= R * max(pre per 100, G) and post non_startup_wrong >= J
          or post reaper_wrong >= M
          or pending_over_H > 0
          the last line then names the follow-up: open the joint L0 end-of-life redesign with the harness plan (S8)
-exit 0:  otherwise; exit 2 on an unreadable queue directory (INV-11: never a silent pass)
+exit 0:  otherwise; exit 2 on an unreadable queue directory, including a record whose status is not
+         pending, resolved or dismissed (INV-11: never a silent pass)
          the runner treats any rc != 0 (75 aside) as a verdict, so exit 2 also files milestone_check_failed;
          its last line names the unreadable path, not the redesign
 ```
 
 Invariants: the script is read-only and executable (the deterministic guard refuses a non-executable
-`before_done.script`); its rules are the ones `digests/discussion/S9.md` §S9-7 measured the 3.6-per-100
-baseline with, so the baseline and the check count the same thing.
+`before_done.script`); its stranded rules are the ones `digests/discussion/S9.md` §S9-7 measured the
+3.6-per-100 baseline with, and the non-startup floor G was measured with the script's own rule, so each
+baseline and the check count the same thing.
 
 The lead-filed check task (a lead action, filed once π is on main): title "Check stranded and wrongly
 dismissed L0s 14 days after the steward-decides-outcome change landed"; `task_kind='deterministic'`;
@@ -1030,10 +1041,16 @@ dismissed L0s 14 days after the steward-decides-outcome change landed"; `task_ki
 `metadata.milestone={"mode": "delayed", "after_secs": 1209600}`;
 `metadata.before_done={"kind": "predicate", "script": "scripts/check_l0_settle_outcomes.py", "args":
 ["--queue-dir", "data/escalations", "--window-days", "14", "--baseline-stranded-per-100", "3.6", "--ratio",
-"2.0", "--min-stranded", "8", "--max-reaper-wrong", "3", "--max-pending-hours", "24"], "timeout_secs": 120}`;
+"2.0", "--min-stranded", "8", "--baseline-non-startup-wrong-per-100", "6.8", "--min-non-startup-wrong", "15",
+"--max-reaper-wrong", "3", "--max-pending-hours", "24"], "timeout_secs": 120}`;
 `metadata.source='review-all'`, `metadata.x_finding_run` this run, `metadata.x_finding_key=[fk-bab6058b23c8,
 fk-e39550272df9]`. A non-zero exit makes the runner file a born-at-L2 `milestone_check_failed` carrying the
 script's JSON and blocks the check task; the human files the redesign on resolving it.
+The non-startup values come from the 2026-11-22 live measurement in task 9351's commit message: the
+30-day rate, 32 wrong of 474 filed (6.75 per 100), rounds to the floor 6.8, and 15 is the count that floor
+predicts for a typical 14-day window of about 221 filed. The filed check task, 9923, has its args amended
+by the watcher (ruled: Leo 2026-11-22, esc-9351-2 (L2 item 656), option B-prime; amends R40 / S9-7 for the
+non-startup paths).
 
 ## Boundary-test sketch
 

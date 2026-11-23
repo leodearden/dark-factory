@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
+from shared.task_metadata import parse_metadata
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult
@@ -127,7 +128,7 @@ def _persisted_metadata(update_task: AsyncMock) -> dict:
 def _fake_run(*, head: str = 'HEAD-SHA', rc: int = 0):
     """Return an async stand-in for orchestrator.workflow._run (git rev-parse)."""
 
-    async def _run(cmd, cwd=None, **kwargs):  # noqa: ARG001
+    async def _run(cmd, cwd=None, **kwargs):
         if rc == 0:
             return (0, head + '\n', '')
         return (rc, '', 'fatal: bad revision')
@@ -144,6 +145,7 @@ class TestStampHelper:
     @pytest.mark.asyncio
     async def test_stamp_persists_entered_at_iso(self):
         f = _make(metadata={'retry_ledger': {'x': 1}})
+        pre_stamp_keys = set(f.wf.task['metadata'])
 
         await f.wf._stamp_merge_phase_entered()
 
@@ -160,6 +162,14 @@ class TestStampHelper:
         assert meta['retry_ledger'] == {'x': 1}
         # (c) in-memory task metadata mirrors the persisted stamp.
         assert f.wf.task['metadata']['merge_phase_liveness'] == stamp
+        # (d) every key the stamp added is blessed, whatever the writer names
+        # it (task 5281).
+        added_keys = set(meta) - pre_stamp_keys
+        _, warnings = parse_metadata(meta, direction='read')
+        assert [
+            w.field for w in warnings
+            if w.code == 'unknown_key' and w.field in added_keys
+        ] == []
 
     @pytest.mark.asyncio
     async def test_stamp_overlays_backend_sibling_keys(self):
@@ -463,7 +473,7 @@ class TestEntryOrdering:
         wf.config.max_merge_retries = 1
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -590,7 +600,7 @@ class TestEntryReadCoalescing:
         wf.config.max_merge_retries = 1
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -668,7 +678,7 @@ class TestRetryLoopReStamp:
         wf.config.max_merge_retries = 2
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)

@@ -40,8 +40,12 @@ Each entry: `{diff_id, language, source, description, project?, split?}`.
 - `language` — `"python" | "rust" | "typescript"`.
 - `source` — `"synthetic"` (planted mutation) | `"real_world"` (hand-picked
   real bug, pre-task-2495) | `"mined"` (task-2495 FN mining, see below).
-- `project` — optional; selects the working directory a reviewer would see
-  around the diff (`corpus._PROJECT_CWD_MAP`). All mined diffs use
+- `project` — optional; selects the checkout a fixture is read from
+  (`CorpusDiff.source_dir`). `"dark-factory"` fixtures, and those with no
+  `project`, use this repository's main checkout. Other projects use their
+  `DASHBOARD_KNOWN_PROJECT_ROOTS` entry (`"reify-gui"` is reify's `gui/`). A
+  fixture whose project has no registered root is reported as not
+  materialisable, never reviewed in dark-factory. All mined diffs use
   `"dark-factory"`.
 - `split` — `"train" | "selection" | "test"`, assigned by
   `mining.assign_split()` (see "Split" below). Every diff has one.
@@ -154,8 +158,9 @@ skipped.
 ### Frontier labeling
 
 Ground truth for a mined diff is **proposed by a frontier model** (opus, via
-`mining.propose_labels_frontier()` — reuses the `scorer.match_issues`
-`invoke_agent` pattern with `effort="high"`), never fabricated by the mining
+`mining.propose_labels_frontier()` — runs through
+`evals/measurement.py::measured_call` (stage `label_proposer`), like
+`scorer.match_issues`, with `effort="high"`), never fabricated by the mining
 script itself. The model is prompted with the diff text (truncated to the
 first 10K characters — see "Known limitation" below) and the FN context (task
 title + `signal_reason`), and asked to list concrete issues.
@@ -164,6 +169,12 @@ A candidate is only added to the corpus if the frontier model proposes at
 least one issue; candidates with an empty proposal are skipped (not added,
 but eligible to be retried by a future `mine` run since they were never
 recorded as "in the corpus").
+
+A proposal that did not measure (a refused or capped call, an answer with no
+usable issues list, or a raised call) is not an empty proposal: `mine`
+reports it on its own progress line and counts it in the run summary's
+"Unmeasured proposals". Like an empty proposal, it is not added, and the
+next `mine` run retries it.
 
 **Known limitation:** many mined merge-commit diffs are far larger than the
 10K-character prompt window (they bundle a task's full implementation, not
@@ -378,9 +389,9 @@ still in flight. Re-running with a higher `--target-total` extends the
 corpus further; the `--limit` option caps how many *new* candidates a single
 invocation attempts (useful for a small validation run before a full batch).
 
-`--runs-db`, `--escalations-dir`, and `--repo-path` default to this
-deployment's on-disk paths in the main repo checkout, and can be overridden
-either via the flag or via the `REVIEWER_TRIAL_RUNS_DB` /
-`REVIEWER_TRIAL_ESCALATIONS_DIR` / `REVIEWER_TRIAL_REPO_ROOT` env vars. If
-`--runs-db` doesn't point at a real file, `mine` fails fast with a clear
+`--runs-db`, `--escalations-dir`, and `--repo-path` default to the main
+repo checkout's runs.db, escalation queue and the checkout itself (derived
+from wherever this code runs, even a linked worktree), and are overridden
+only by the flags; `mine` prints the sources it resolved before it starts.
+If `--runs-db` doesn't point at a real file, `mine` fails fast with a clear
 error rather than letting `sqlite3` silently create an empty database.

@@ -366,7 +366,7 @@ def registry():
 
 
 def _guard_cluster_phrases() -> set[str]:
-    from fused_memory.config.schema import _default_topic_guard_clusters  # noqa: PLC0415
+    from fused_memory.config.schema import _default_topic_guard_clusters
 
     return {
         phrase.strip().lower()
@@ -542,7 +542,7 @@ def census_report() -> dict:
 
 @pytest.fixture(scope='module')
 def guard_clusters():
-    from fused_memory.config.schema import _default_topic_guard_clusters  # noqa: PLC0415
+    from fused_memory.config.schema import _default_topic_guard_clusters
 
     return _default_topic_guard_clusters()
 
@@ -911,7 +911,7 @@ class TestDerivationIsPure:
     def test_no_live_store_is_constructed(self, monkeypatch, calibration_rows,
                                           census_report, guard_clusters):
         """Derivation must not reach for Qdrant, an embedder or MemoryService."""
-        import socket  # noqa: PLC0415
+        import socket
 
         def _boom(*a, **kw):
             raise AssertionError('derivation opened a socket')
@@ -1889,7 +1889,7 @@ class TestBuildSeries:
 
     def test_the_series_validates_unchanged(self):
         """(a) The artifact must satisfy the shared schema as built."""
-        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import validate_metric_series
 
         validate_metric_series(_build())
 
@@ -2166,7 +2166,7 @@ class TestBuildSeries:
 
     def test_the_tripwire_points_at_the_report_beside_it(self):
         """An operator following an artifact must reach the prose."""
-        from shared.memory_eval_metrics import report_artifact_path  # noqa: PLC0415
+        from shared.memory_eval_metrics import report_artifact_path
 
         series = _build(stamp='20260730T101500Z')
         tripwire = {m.metric_id: m for m in series.metrics}['topic-canonical-present']
@@ -2181,7 +2181,7 @@ class TestBuildSeries:
         By the time the dashboard reads the artifact there is nobody left to
         tell, so the tamper below must not be writable to disk.
         """
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             MetricSchemaError,
             serialize_metric_series,
             write_metric_series,
@@ -2200,7 +2200,7 @@ class TestBuildSeries:
 
     def test_build_series_validates_its_own_output(self):
         """A bug in aggregation must surface here, not in the evaluator."""
-        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import validate_metric_series
 
         for observations in (
             _observations(),
@@ -2211,7 +2211,7 @@ class TestBuildSeries:
 
     def test_round_trip_through_the_artifact_is_lossless(self, tmp_path):
         """(h) Written where M1 says, and read back identical."""
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             load_metric_series,
             write_metric_series,
         )
@@ -2387,7 +2387,7 @@ class TestDegradedSearchDisclosure:
     @pytest.mark.asyncio
     async def test_a_wholly_degraded_run_still_emits_a_valid_artifact(self, tmp_path):
         """(d) Silence is never a healthy signal."""
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             load_metric_series,
             validate_metric_series,
         )
@@ -2795,7 +2795,7 @@ class TestProbeReport:
 
     def test_the_shared_report_format_is_included_not_reimplemented(self):
         """(e) The M1 companion stays the shared module's format."""
-        from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+        from shared.memory_eval_metrics import render_report
 
         series = _report_series()
         shared_text = render_report(series)
@@ -3023,7 +3023,7 @@ def _install_double(monkeypatch, double):
     function (the D8 pattern), so patching the module attribute is enough to
     drive the real argparse/main/emit path end to end.
     """
-    import fused_memory.services.memory_service as ms  # noqa: PLC0415
+    import fused_memory.services.memory_service as ms
 
     monkeypatch.setattr(ms, 'MemoryService', lambda config: double)
 
@@ -3055,7 +3055,7 @@ class TestReadOnlyGuarantee:
         """The guarantee is only worth what the double's tripwires are worth."""
         double = _ServiceDouble()
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         for name in (
             'initialize', 'add_memory', 'add_episode', 'add_system_record',
@@ -3068,7 +3068,7 @@ class TestReadOnlyGuarantee:
     def test_the_emitted_artifact_validates_and_the_report_lands(
         self, monkeypatch, tmp_path,
     ):
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             load_metric_series,
         )
 
@@ -3076,7 +3076,7 @@ class TestReadOnlyGuarantee:
         registry = _probe_registry()
         double = _ServiceDouble(by_query=_canned_hits(registry))
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         outcome = asyncio.run(m.run_probe(
             double, registry,
@@ -3105,7 +3105,7 @@ class TestReadOnlyGuarantee:
         concurrent reader falls into. Asserted by failing the write
         mid-flight: the previously-written report must survive intact.
         """
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
         registry = _probe_registry()
@@ -3132,7 +3132,7 @@ class TestReadOnlyGuarantee:
 
     def test_the_report_on_disk_is_the_widened_one_not_the_shared_one(self, tmp_path):
         """The atomic path must still actually replace the file."""
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
         registry = _probe_registry()
@@ -3151,7 +3151,7 @@ class TestReadOnlyGuarantee:
         registry = _probe_registry(project_id='_test_mem0_qdrant_integration_gw0')
         double = _ServiceDouble(by_query=_canned_hits(registry))
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         outcome = asyncio.run(m.run_probe(
             double, registry,
@@ -3171,7 +3171,7 @@ class TestReadOnlyGuarantee:
         ))
         double = _ServiceDouble(by_query=_canned_hits(registry))
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         asyncio.run(m.run_probe(
             double, registry,
@@ -3199,7 +3199,7 @@ class TestReadOnlyGuarantee:
         ))
         double = _ServiceDouble(by_query=_canned_hits(registry))
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         outcome = asyncio.run(m.run_probe(
             double, registry,
@@ -3280,8 +3280,8 @@ class TestRegistrySearchScope:
     def test_a_scoped_entry_searches_scoped_and_an_unscoped_one_does_not(
         self, tmp_path,
     ):
-        import asyncio  # noqa: PLC0415
-        from dataclasses import replace  # noqa: PLC0415
+        import asyncio
+        from dataclasses import replace
 
         m = _mod()
         scoped = replace(
@@ -3391,7 +3391,7 @@ def _split_obs(topic, phrasing, *, k=5, hit=False, rank=None, matched_by=None,
 
 
 def _split_registry():
-    from dataclasses import replace  # noqa: PLC0415
+    from dataclasses import replace
 
     entries = []
     for topic in sorted((
@@ -3713,7 +3713,7 @@ class TestTripwireCensusSplit:
     # -- the run band and the CLI --------------------------------------------
 
     def test_run_probe_threads_the_split_into_the_outcome_and_the_report(self, tmp_path):
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
         registry = _probe_registry()
@@ -3731,7 +3731,7 @@ class TestTripwireCensusSplit:
         assert m.SECTION_TRIPWIRE_BY_CENSUS in {s.key for s in outcome.sections}
 
     def test_run_probe_without_a_census_carries_no_split(self, tmp_path):
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
         outcome = asyncio.run(m.run_probe(
@@ -3837,7 +3837,7 @@ class TestCorpusCounting:
         registry = _probe_registry()
         double = _ServiceDouble(by_query=_canned_hits(registry), counts=counts)
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         outcome = asyncio.run(m.run_probe(
             double, registry,
@@ -3849,7 +3849,7 @@ class TestCorpusCounting:
         return double, outcome
 
     def test_the_category_list_is_the_stores_own(self):
-        from fused_memory.models.enums import (  # noqa: PLC0415
+        from fused_memory.models.enums import (
             GRAPHITI_PRIMARY,
             MEM0_PRIMARY,
         )
@@ -4060,7 +4060,7 @@ class TestEmptyProjectSelectionIsFatal:
         return registry, path
 
     def test_run_probe_raises_rather_than_measuring_nothing(self, tmp_path):
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
         registry = _probe_registry()
@@ -4081,7 +4081,7 @@ class TestEmptyProjectSelectionIsFatal:
         guard keys on "nothing to probe", not on "a selection filtered
         everything out".
         """
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
         empty = topic_registry.TopicRegistry(schema_version=1, entries=())
@@ -4097,7 +4097,7 @@ class TestEmptyProjectSelectionIsFatal:
         assert not list(tmp_path.rglob('metrics-*.json'))
 
     def test_the_message_names_what_was_asked_and_what_exists(self, tmp_path):
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
 
@@ -4181,7 +4181,7 @@ class TestRunStampOverride:
         assert (eval_dir / 'report-20260731T000000Z.txt').exists()
 
     def test_the_stamp_is_the_shared_modules_not_a_local_one(self, monkeypatch):
-        from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
+        from shared.memory_eval_metrics import run_stamp
 
         monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260101T010101Z')
 
@@ -4467,9 +4467,9 @@ def probe_config(mock_config, probe_project_id):
 @pytest.fixture
 def clean_probe_collection(probe_config, probe_project_id):
     """Delete the seeded collection before AND after the test."""
-    from qdrant_client import QdrantClient  # noqa: PLC0415
+    from qdrant_client import QdrantClient
 
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     collection = Scope(project_id=probe_project_id).mem0_collection_name(
         probe_config.mem0.collection_prefix,
@@ -4486,7 +4486,7 @@ def clean_probe_collection(probe_config, probe_project_id):
 @contextlib.asynccontextmanager
 async def _seeded_memory_service(probe_config):
     """An initialized MemoryService over the ephemeral collection, closed on exit."""
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService
 
     memory = MemoryService(probe_config)
     await memory.initialize()
@@ -4511,7 +4511,7 @@ class TestSeededInducedRegression:
         this module's docstring and the merge lane's ``-m 'not integration'``
         selection. ``mem0_collection_name`` is pure, so ask it directly.
         """
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
+        from fused_memory.models.scope import Scope
 
         collection = Scope(project_id=probe_project_id).mem0_collection_name(
             probe_config.mem0.collection_prefix,
@@ -4635,7 +4635,7 @@ def _seeded_briefing_registry(project_id: str):
     Claim queries are dropped: their needles name live-corpus text, and the
     question here is the tripwire alone.
     """
-    from dataclasses import replace  # noqa: PLC0415
+    from dataclasses import replace
 
     committed = topic_registry.load_topic_registry(REGISTRY_PATH).by_topic
     return topic_registry.TopicRegistry(schema_version=1, entries=tuple(
@@ -4923,7 +4923,7 @@ class TestStoresServedDisclosure:
         and the registered count rides along because comparable << registered
         is itself the signal that most pairs are not coming back at all.
         """
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
         base = _probe_entry()
@@ -4953,7 +4953,7 @@ class TestStoresServedDisclosure:
 
     def test_the_probe_band_threads_the_served_stores_through(self):
         """The wiring, not just the dataclass field."""
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         m = _mod()
         entry = _probe_entry()
@@ -5050,7 +5050,7 @@ class TestNonDefaultKKeepsThePinnedMetrics:
             by_query=_canned_hits(registry),
         )
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         return double, asyncio.run(m.run_probe(
             double, registry,
@@ -5111,7 +5111,7 @@ class TestNonDefaultKKeepsThePinnedMetrics:
 
     def test_the_operators_actual_path_through_the_cli(self, monkeypatch, tmp_path):
         """(e) --k 7 is a supported flag, so the fix has to hold through main()."""
-        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import load_metric_series
 
         m = _mod()
         registry = _probe_registry()
@@ -5179,7 +5179,7 @@ class TestObservationDepthIsHonest:
             {}, default_factory=lambda: _healthy(_filler(10)),
         )
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         asyncio.run(m.probe_topic(search, entry, registry, ks, observations))
         return observations
@@ -5227,7 +5227,7 @@ class TestInversionFamilyIsPinnedToScoredDepth:
         results[successor_rank - 1] = _R(content='new text', id='NEW')
         search = _search_returning({}, default_factory=lambda: _healthy(results))
 
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         asyncio.run(m.probe_topic(search, entry, registry, ks, observations))
         return observations

@@ -13,10 +13,11 @@ fresh process group).
 
 Usage
 -----
-The pgid MUST be captured by the caller immediately after spawn::
+Spawn through ``spawn_group_leader``, which forces ``start_new_session=True``;
+the pgid MUST be captured by the caller immediately after spawn::
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, ..., start_new_session=True,
+    proc = await spawn_group_leader(
+        *cmd, kill_group=lambda proc: terminate_process_group(proc, proc.pid), ...,
     )
     pgid = proc.pid  # start_new_session guarantees pgid == pid at spawn
 
@@ -63,7 +64,8 @@ If a grandchild calls ``setsid()`` on its own it will escape into a new
 session and process group, making it invisible to ``killpg``.  This is
 acceptable for the current codebase because cargo/rustc do not call
 ``setsid``.  ``shared.git_async``'s children are group-killed through
-``sigkill_process_group`` when interrupted (task 4155).
+``sigkill_process_group`` when interrupted (task 4155), through a leader
+pidfd held from spawn (task 6251).
 """
 
 from __future__ import annotations
@@ -72,12 +74,15 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import signal
 import time
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from enum import Enum, auto
 from pathlib import Path
-from typing import NamedTuple
+from typing import IO, Any, NamedTuple, NewType, Protocol
+
+from shared.pidfd import P_PIDFD, PIDFD_SIGNAL_PROCESS_GROUP, pidfd_open, pidfd_send_signal
 
 logger = logging.getLogger(__name__)
 
@@ -124,10 +129,16 @@ class StatFields(NamedTuple):
 class MalformedStatLine(ValueError):
     """A ``/proc/<pid>/stat`` that was read but does not parse."""
 
-    def __init__(self, path: Path, text: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        text: str,
+        reason: str = "not a 'pid (comm) state ppid pgrp ...' stat line",
+    ) -> None:
         self.path = path
         self.text = text
-        super().__init__(f"{path}: not a 'pid (comm) state ppid pgrp ...' stat line: {text!r}")
+        self.reason = reason
+        super().__init__(f'{path}: {reason}: {text!r}')
 
 
 def _stat_tail(path: Path, text: str) -> tuple[str, list[str]]:
@@ -198,6 +209,21 @@ def read_session_id(entry: Path) -> int | None:
         return session
     except (OSError, ValueError):
         return None
+
+
+def parse_start_ticks(path: Path, text: str) -> int:
+    """Start time (stat field 22, clock ticks after boot) of *text*, read from *path*.
+
+    Raises MalformedStatLine unless the field is a non-negative decimal integer.
+    """
+    _comm, fields = _stat_tail(path, text)
+    # stat field 22, counted from the pid; fields[0] is field 3, state.
+    start_ticks = fields[19] if len(fields) > 19 else ''
+    if not start_ticks.isdecimal():
+        raise MalformedStatLine(
+            path, text, f'stat field 22 (start_ticks) is {start_ticks!r}, not a decimal integer'
+        )
+    return int(start_ticks)
 
 
 def unified_cgroup_path(cgroup_text: str) -> str | None:
@@ -483,18 +509,162 @@ async def terminate_process_group(
         await _group_terminated_within(proc, pgid, grace_secs)
 
 
+async def spawn_group_leader(
+    *cmd: str,
+    kill_group: Callable[[asyncio.subprocess.Process], Awaitable[None]],
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+    stdin: int | IO[Any] | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+) -> asyncio.subprocess.Process:
+    """Spawn *cmd* as the leader of a new session, so its pgid == ``proc.pid``.
+
+    ``start_new_session`` is forced.  asyncio's own cleanup for a spawn
+    interrupted after the fork SIGKILLs only the direct child, then waits with
+    no bound for every pipe to close, which a surviving group member holds
+    open (tasks 6346, 11044).  So the spawn
+    runs shielded: an interrupted spawn is waited out and its Process handed
+    to *kill_group* before the original exception propagates.  A spawn
+    failure never replaces the interruption.
+    """
+    spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        env=env,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        start_new_session=True,
+    ))
+    try:
+        return await asyncio.shield(spawn)
+    except BaseException:
+        proc = await _spawn_outcome(spawn)
+        if proc is not None:
+            await kill_group(proc)
+        raise
+
+
+async def _spawn_outcome(
+    spawn: asyncio.Future[asyncio.subprocess.Process],
+) -> asyncio.subprocess.Process | None:
+    """Wait *spawn* out, absorbing cancellations: its Process, or None if it failed.
+
+    Never raises the spawn's own failure, so it cannot replace the exception
+    that interrupted the caller.
+    """
+    while not spawn.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait((spawn,))
+    if spawn.cancelled() or spawn.exception() is not None:
+        return None
+    return spawn.result()
+
+
 class SigkillDispatch(Enum):
     """Which SIGKILL :func:`sigkill_process_group` dispatched — never what died."""
 
-    #: ``os.killpg`` returned: the whole group was signalled.
+    #: The whole group was signalled, by ``os.killpg`` or through the leader's pidfd.
     GROUP_KILLED = auto()
     #: Only ``proc.kill()``, after the group kill was refused or failed.
     DIRECT_KILLED = auto()
-    #: Nothing: the leader was already reaped.
+    #: Nothing: the leader was already reaped and no held pidfd reached a surviving member.
     NOT_SIGNALLED = auto()
 
 
-def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> SigkillDispatch:
+#: A pidfd :func:`open_leader_pidfd` verified names this process's unreaped
+#: child, the leader of its own process group: the only fd
+#: :func:`sigkill_process_group` will send a group SIGKILL through.
+LeaderPidfd = NewType('LeaderPidfd', int)
+
+
+class SpawnedChild(Protocol):
+    """What :func:`open_leader_pidfd` reads of a child: its pid, and whether it is reaped."""
+
+    @property
+    def pid(self) -> int: ...
+
+    @property
+    def returncode(self) -> int | None: ...
+
+
+@contextlib.contextmanager
+def open_leader_pidfd(proc: SpawnedChild) -> Iterator[LeaderPidfd | None]:
+    """Hold a pidfd naming *proc*, this process's unreaped child, for the block.
+
+    Yields None instead when *proc* is already reaped, when its pid now names
+    a process that is not this process's child, when *proc* does not lead its
+    own process group (a group send through its pidfd would reach nobody), or
+    when the kernel lacks pidfds; a leader reaped before the caller regains
+    control from its spawn therefore yields None.  Each None leaves one debug
+    log line naming its cause.  The pidfd is closed when the block exits.
+    """
+    fd = _child_leader_pidfd(proc)
+    try:
+        yield fd
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _child_leader_pidfd(proc: SpawnedChild) -> LeaderPidfd | None:
+    """A pidfd for *proc* once confirmed our unreaped child and the leader of its own group."""
+    if proc.returncode is not None:
+        return _no_leader_pidfd(proc.pid, f'already reaped, returncode {proc.returncode}')
+    try:
+        fd = pidfd_open(proc.pid)
+    except OSError as exc:
+        return _no_leader_pidfd(proc.pid, f'pidfd_open: {type(exc).__name__}: {exc}')
+    refusal = _leader_pidfd_refusal(fd, proc.pid)
+    if refusal is not None:
+        os.close(fd)
+        return _no_leader_pidfd(proc.pid, refusal)
+    return LeaderPidfd(fd)
+
+
+def _no_leader_pidfd(pid: int, reason: str) -> None:
+    logger.debug('open_leader_pidfd: no pidfd for pid %s (%s)', pid, reason)
+
+
+def _leader_pidfd_refusal(fd: int, pid: int) -> str | None:
+    """Why pidfd *fd*, opened on *pid*, cannot stand for a group *pid* leads; None if it can.
+
+    ``waitid(WNOWAIT)`` confirms the child unreaped only after ``getpgid`` has
+    read it, so *pid* still named the pidfd's process when its group was read.
+    """
+    try:
+        pgid = os.getpgid(pid)
+        os.waitid(P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except OSError as exc:
+        return f'{type(exc).__name__}: {exc}'
+    if pgid != pid:
+        return f'it is a member of group {pgid}, not the leader of its own'
+    return None
+
+
+def _sigkill_group_through_pidfd(leader_pidfd: LeaderPidfd, pgid: int) -> SigkillDispatch | None:
+    """SIGKILL the group *leader_pidfd* names; None if this kernel cannot signal a group so."""
+    try:
+        pidfd_send_signal(leader_pidfd, signal.SIGKILL, flags=PIDFD_SIGNAL_PROCESS_GROUP)
+    except ProcessLookupError:
+        logger.debug('sigkill_process_group: group %s has no member left to signal', pgid)
+        return SigkillDispatch.NOT_SIGNALLED
+    except OSError as exc:
+        logger.debug(
+            'sigkill_process_group: cannot signal group %s through its leader pidfd '
+            '(%s: %s) — falling back to killpg',
+            pgid,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    return SigkillDispatch.GROUP_KILLED
+
+
+def sigkill_process_group(
+    proc: asyncio.subprocess.Process, pgid: int, *, leader_pidfd: LeaderPidfd | None = None
+) -> SigkillDispatch:
     """SIGKILL group *pgid* at once; signal-only, never raises, never reaps.
 
     *pgid* must be the value frozen at a ``start_new_session=True`` spawn of
@@ -504,13 +674,26 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> Sigkil
     No SIGTERM grace, unlike :func:`terminate_process_group`: for a caller
     that wants the group dead now and reaps it itself.
 
-    An already-reaped *proc* gets no signal (its pid may be recycled), so any
-    grandchildren still running are deliberately forgone: refusing to kill a
-    stranger beats reaping an orphan.  A refused or failed group kill degrades
-    to a direct ``proc.kill()``, which is safe while the pid is unreaped.
+    A held *leader_pidfd*, from :func:`open_leader_pidfd`, is tried first,
+    once *pgid* passes the same :func:`unsafe_pgid_reason` check as the path
+    below, and reaches the group even after *proc* is reaped, because it names
+    the group itself rather than its recyclable number.  Only a refused *pgid*
+    or a kernel that cannot signal a group through a pidfd (before Linux 6.9)
+    falls back to the path below.
+
+    Without one, an already-reaped *proc* gets no signal (its pid may be
+    recycled), so any grandchildren still running are deliberately forgone:
+    refusing to kill a stranger beats reaping an orphan.  A refused or failed
+    group kill degrades to a direct ``proc.kill()``, which is safe while the
+    pid is unreaped.
 
     Returns the :class:`SigkillDispatch` naming which of those it dispatched.
     """
+    reason = unsafe_pgid_reason(pgid, proc.pid)
+    if leader_pidfd is not None and reason is None:
+        dispatch = _sigkill_group_through_pidfd(leader_pidfd, pgid)
+        if dispatch is not None:
+            return dispatch
     if proc.returncode is not None:
         logger.debug(
             'sigkill_process_group: proc %s already reaped — not signalling '
@@ -519,7 +702,6 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> Sigkil
         )
         return SigkillDispatch.NOT_SIGNALLED
 
-    reason = unsafe_pgid_reason(pgid, proc.pid)
     if reason is not None:
         logger.error(
             'sigkill_process_group: refusing to killpg — %s. '
@@ -555,8 +737,8 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> Sigkil
 # subtree, and reap them". reify ships these primitives; the orchestrator's
 # GitOps wires the path + knob and invokes them off the event loop.
 #
-# Linux-specific: depends on /proc/<pid>/{stat,cwd,fd/*,maps}. The whole
-# module already assumes Linux (os.killpg / os.getpgrp), so this is fine.
+# Linux-specific: depends on /proc/<pid>/{stat,cwd,fd/*,maps,ns/mnt,mountinfo,root}.
+# The whole module already assumes Linux (os.killpg / os.getpgrp), so this is fine.
 # ---------------------------------------------------------------------------
 
 
@@ -654,8 +836,133 @@ def _path_at_or_under(candidate: str, root: str) -> bool:
     return candidate == root or candidate.startswith(root + os.sep)
 
 
-def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
-    """True if the pid at *entry* (=/proc/<pid>) touches a path at-or-under root.
+def _path_at_or_under_mount_point(candidate: str, mount_point: str) -> bool:
+    """:func:`_path_at_or_under` for a mount point, where ``/`` covers every absolute path.
+
+    A scan's root bound as a namespace's own root has the mount point ``/``. Only a
+    resolved mount point gets this rule; a queried root of ``/`` keeps the plain one.
+    """
+    if mount_point == os.sep:
+        return candidate.startswith(os.sep)
+    return _path_at_or_under(candidate, mount_point)
+
+
+class _RootNames(NamedTuple):
+    """The paths by which one process names a scan's root: root, and its mount points there."""
+
+    root: str
+    mount_points: tuple[str, ...] = ()
+
+    def cover(self, candidate: str) -> bool:
+        """True iff *candidate* is at-or-under root or one of the mount points binding it."""
+        return _path_at_or_under(candidate, self.root) or any(
+            _path_at_or_under_mount_point(candidate, mp) for mp in self.mount_points
+        )
+
+
+class _FileIdentity(NamedTuple):
+    """What makes a file itself to ``os.stat``: its device and inode."""
+
+    dev: int
+    ino: int
+
+
+def _file_identity(path: str | Path) -> _FileIdentity | None:
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return _FileIdentity(st.st_dev, st.st_ino)
+
+
+def _mount_namespace(entry: Path) -> _FileIdentity | None:
+    """The mount namespace of the pid at *entry*, identified the way namespaces(7) compares them."""
+    return _file_identity(entry / 'ns/mnt')
+
+
+#: proc(5): mountinfo escapes space, tab, newline and backslash as ``\ooo`` octal.
+_MOUNTINFO_ESCAPE = re.compile(rb'\\([0-3][0-7]{2})')
+
+
+def _mount_points_on_device(mountinfo: bytes, major: int, minor: int) -> list[str]:
+    """The unescaped mount points (field 5) of the mountinfo lines whose field 3 is *major:minor*."""
+    mount_points: list[str] = []
+    for line in mountinfo.split(b'\n'):
+        fields = line.split(b' ')
+        if len(fields) < 5:
+            continue
+        line_major, colon, line_minor = fields[2].partition(b':')
+        try:
+            on_device = colon == b':' and (int(line_major), int(line_minor)) == (major, minor)
+        except ValueError:
+            continue
+        if on_device:
+            raw = _MOUNTINFO_ESCAPE.sub(lambda m: bytes([int(m.group(1), 8)]), fields[4])
+            mount_points.append(os.fsdecode(raw))
+    return mount_points
+
+
+def _mount_points_bound_to(entry: Path, identity: _FileIdentity) -> tuple[str, ...] | None:
+    """The mount points at which the namespace of the pid at *entry* shows the file *identity*.
+
+    None when that namespace's root cannot be read. Only the mounts on *identity*'s device
+    are stat'ed, so an unrelated (possibly hung) filesystem is never touched; each is then
+    confirmed by device and inode through ``/proc/<pid>/root``. Not measured on btrfs, where a
+    subvolume's ``st_dev`` may differ from mountinfo's maj:min; there none would be kept, which
+    fails open.
+    """
+    root = entry / 'root'
+    try:
+        os.stat(root)
+        mountinfo = (entry / 'mountinfo').read_bytes()
+    except OSError:
+        return None
+    candidates = _mount_points_on_device(mountinfo, os.major(identity.dev), os.minor(identity.dev))
+    return tuple(mp for mp in candidates if _file_identity(root / mp.lstrip('/')) == identity)
+
+
+class _RootViews:
+    """The paths that name one scan's root to each process (PRD decision 16, C11).
+
+    ``plans/canonical-build-path-shared-cache-prd.md`` decision 16 holds the rationale. A
+    process in the scanner's own mount namespace, or one whose namespace cannot be
+    identified, sees root only as root. A process in a foreign namespace also sees it at
+    each mount point binding root there, resolved once per namespace for this scan. A
+    namespace whose root cannot be read adds no view, and its next pid tries again.
+    *resolve_bindings* finds those mount points through one pid of the namespace.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        resolve_bindings: Callable[
+            [Path, _FileIdentity], tuple[str, ...] | None
+        ] = _mount_points_bound_to,
+    ) -> None:
+        self._root = root
+        self._identity = _file_identity(root)
+        self._own_namespace = _mount_namespace(_PROC_ROOT / 'self')
+        self._resolve_bindings = resolve_bindings
+        self._by_namespace: dict[_FileIdentity, _RootNames] = {}
+
+    def of(self, entry: Path) -> _RootNames:
+        """The names of root for the pid at *entry*."""
+        only_root = _RootNames(self._root)
+        if self._identity is None or self._own_namespace is None:
+            return only_root
+        namespace = _mount_namespace(entry)
+        if namespace is None or namespace == self._own_namespace:
+            return only_root
+        if namespace not in self._by_namespace:
+            bound = self._resolve_bindings(entry, self._identity)
+            if bound is None:
+                return only_root
+            self._by_namespace[namespace] = _RootNames(self._root, bound)
+        return self._by_namespace[namespace]
+
+
+def _pid_references_path_at_or_under(entry: Path, names: _RootNames) -> bool:
+    """True if the pid at *entry* (=/proc/<pid>) touches a path at-or-under any of root's *names*.
 
     Short-circuits cheapest-first: cwd, then open fds, then mmap'd pathnames
     from ``maps``.  Every per-pid I/O is wrapped so a vanished or
@@ -667,7 +974,7 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
     """
     # 1. cwd — the most common and cheapest signal (cargo/rustc run in the tree).
     with contextlib.suppress(OSError):
-        if _path_at_or_under(os.readlink(entry / 'cwd'), root):
+        if names.cover(os.readlink(entry / 'cwd')):
             return True
 
     # 2. open fds — an open build artifact / lockfile under the tree.
@@ -677,7 +984,7 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
                 target = os.readlink(fd_entry)
             except OSError:
                 continue
-            if _path_at_or_under(target, root):
+            if names.cover(target):
                 return True
 
     # 3. mmap'd pathnames — an mmap'd .rlib / .so living under the tree.
@@ -695,7 +1002,7 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
         pathname = parts[5]
         if not pathname.startswith('/'):
             continue
-        if _path_at_or_under(pathname, root):
+        if names.cover(pathname):
             return True
     return False
 
@@ -713,6 +1020,7 @@ def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[in
     except OSError:
         return result
 
+    views = _RootViews(root)
     for entry in entries:
         if not entry.name.isdigit():
             continue
@@ -727,7 +1035,7 @@ def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[in
             # skip the expensive fd/maps inspection.
             continue
 
-        if _pid_references_path_at_or_under(entry, root):
+        if _pid_references_path_at_or_under(entry, views.of(entry)):
             result.add(pgrp)
 
     return result
@@ -743,7 +1051,9 @@ def scan_process_groups_under_path(
 
     Walks ``/proc``; for each pid parses its process-group id and checks
     whether it references *root* (or any descendant).  *exclude_pgids* drops
-    the caller's own group so the scan never targets itself.
+    the caller's own group so the scan never targets itself.  A process in
+    another mount namespace also references *root* through any mount point
+    binding it there (:class:`_RootViews`).
 
     Never raises — every per-pid I/O is wrapped, and the whole walk is
     belt-and-suspenders-wrapped so a vanishing pid, a permission-denied read,
@@ -761,8 +1071,8 @@ def scan_process_groups_under_path(
         return set()
 
 
-def _cpu_ticks_if_under(entry: Path, root: str, exclude: frozenset[int]) -> int | None:
-    """The CPU ticks of the pid at *entry* if its cwd is at-or-under *root*, outside *exclude*."""
+def _cpu_ticks_if_under(entry: Path, views: _RootViews, exclude: frozenset[int]) -> int | None:
+    """The CPU ticks of the pid at *entry* if its cwd is at-or-under root's *views*, outside *exclude*."""
     fields = read_stat_fields(entry, skip_malformed=True)
     if fields is None or fields.pgrp in exclude:
         return None
@@ -770,7 +1080,7 @@ def _cpu_ticks_if_under(entry: Path, root: str, exclude: frozenset[int]) -> int 
         cwd = os.readlink(entry / 'cwd')
     except OSError:
         return None
-    return read_cpu_ticks(entry) if _path_at_or_under(cwd, root) else None
+    return read_cpu_ticks(entry) if views.of(entry).cover(cwd) else None
 
 
 def _cpu_ticks_under_path_unsafe(root: str, exclude: frozenset[int]) -> int | None:
@@ -779,9 +1089,10 @@ def _cpu_ticks_under_path_unsafe(root: str, exclude: frozenset[int]) -> int | No
         entries = list(_PROC_ROOT.iterdir())
     except OSError:
         return None
+    views = _RootViews(root)
     total: int | None = None
     for entry in entries:
-        ticks = _cpu_ticks_if_under(entry, root, exclude) if entry.name.isdigit() else None
+        ticks = _cpu_ticks_if_under(entry, views, exclude) if entry.name.isdigit() else None
         if ticks is not None:
             total = ticks + (total or 0)
     return total
@@ -794,11 +1105,14 @@ def cpu_ticks_under_path(
 ) -> int | None:
     """Sum :func:`read_cpu_ticks` over the pids whose cwd is at-or-under *root*.
 
+    The cwd is matched through the scan's mount-namespace views (:class:`_RootViews`), so a
+    process that sees *root* at a bind-mount point in another namespace counts too.
+
     None when no such pid is found or /proc is unavailable, so "no process"
     is never read as "an idle process".  The sum is not monotonic: a process
     exiting removes its ticks, so callers compare samples for CHANGE.
 
-    Deliberately cwd-only: a stat read and a readlink per pid, cheaper than
+    Deliberately cwd-only: a stat read, a namespace stat and a readlink per pid, cheaper than
     :func:`scan_process_groups_under_path`'s fd and maps walk.  Verify
     subprocesses (bash, pytest and its xdist workers, cargo/rustc) run with
     their cwd inside the worktree.  Never raises, like that scan.

@@ -51,6 +51,7 @@ from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.escalation_rulings import Ruling
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.review_lineage import RetiredReview
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -87,6 +88,7 @@ class _RulingRecordingBriefing(FakeBriefing):
         *, include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
         rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         self._record('build_architect_prompt', rulings)
         return await super().build_architect_prompt(task, worktree, context)

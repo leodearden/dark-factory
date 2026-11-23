@@ -1,11 +1,13 @@
-"""Unit tests for the completion-claim gate's non-assertive-mood filter (task 6677).
+"""Unit tests for the completion-claim gate's non-assertive-mood filter (tasks 6677 and 6824).
 
 A completion marker only makes a claim when the writer ASSERTS it. Quoted
 text, modal forms, conditional/interrogative/imperative scopes, present-tense
 temporal clauses and attributive participles mention a task's landing without
 asserting it, and the reify escalations behind this task
 (esc-unverified-claim-5471-*, -7407-3, -8246-5, -6020-2, -5023-2) were each
-tagged for exactly that confusion.
+tagged for exactly that confusion. Refs governed by a contingency, necessity or
+simulation head are covered too, as are premise notes whose 'dependency N' is
+the marker's true subject.
 
 Only the public :func:`extract_completion_claims` is driven here.
 """
@@ -19,7 +21,9 @@ from fused_memory.services.completion_claim_gate import (
     extract_completion_claims,
 )
 
-_KNOWN = frozenset({'reify', 'dark_factory', 'solar_challenge', 'solar_challenge_platform'})
+_KNOWN = frozenset({
+    'reify', 'dark_factory', 'solar_challenge', 'solar_challenge_platform', 'scoping_intake',
+})
 
 # Verbatim from reify memory 4e6fb418. The quotation spans the '...' clause
 # boundary, so the clause holding 'shipped' has no closing quote of its own.
@@ -53,6 +57,47 @@ _ESC_1053_1_MEMORY = (
     'tests/unit/test_load_reproducibility.py, while docs/prds/rng-hand-off.md C7 '
     'deliberately keeps quoting the old "richardsonpy stochastic generation failed" text as '
     'a historical record.'
+)
+
+
+# Verbatim from solar_challenge memory a51fb7b9 (esc-unverified-claim-1125-1). 'need task
+# 1125 landed first' states a precondition; nothing in the record says 1125 landed.
+_ESC_1125_1_MEMORY = (
+    "Ordering facts for task 1125 (validate config reads a fleet file's finance: block), "
+    'checked 2026-10-29 at main 716a8eb. Its required row, bristol-phase1-flex.yaml with '
+    "event_hours: .inf exiting 1, needs task 862's EventWindow refusal, so 1125 was "
+    "reported blocked on task 862. Task 862's plan adds a tests/unit/test_cli_validate.py "
+    "test on a scenario: document whose docstring says a fleet file's finance: block is not "
+    'read (esc-862-1), and 1125 must restate it. Task 957 (S6 γ) later rewrites '
+    "cli/validate.py's _homes_defined_by onto load_scenarios/parse_scenario, which reads "
+    "finance, seg and flex_band for every document form, so 1125's validate.py code is "
+    'interim and its rows pin behaviour 957 must keep. Task 866 (S4 ε)\'s C3 rows through '
+    'validate config on that fleet file need task 1125 landed first, but 866 does not '
+    'depend on 1125.'
+)
+
+
+# The claimed clause of scoping_intake esc-unverified-claim-433-1, verbatim; it is also
+# the whole text of scoping-intake task 440. What merged is a mock of the planned edits.
+_ESC_433_1_CLAIM = (
+    'Measured: `git merge-file` of the prototype against a mock of task 433\'s planned '
+    "edits merged cleanly, and so did a merge against a mock of task 422's"
+)
+
+
+# A verbatim excerpt of the claimed clause of scoping_intake esc-unverified-claim-506-1
+# (memory dd0410c1). 'task 506's merged tree' here is the tree of branch task/506 with main
+# merged into it; task 506 itself had not landed.
+_ESC_506_1_CLAIM = (
+    'measured on 2026-11-02 the full suite on task 506\'s merged tree took 692 s '
+    'for 5778 tests under host load ~100 on 32 cores (604 s for 5737 at 17:20 the same day)'
+)
+
+
+# Verbatim from dark_factory esc-unverified-claim-6670-1: 6671 was folded INTO task 6670, pending when written.
+_ESC_6670_1_CLAIM = (
+    'The harness/workflow wiring, including on_host_readmitted → HostPool.note_readmitted, '
+    'is owned by pending task 6670 (6671 δ2 was merged into it 2026-11-01)'
 )
 
 
@@ -376,6 +421,317 @@ class TestNonAssertiveScopes:
         )
         assert _triples(text, 'solar_challenge') == [('disposition', 'task', '359')]
 
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(
+                'task 5422 is conditional on #6020 having landed', 'reify',
+                id='conditional-on',
+            ),
+            pytest.param(
+                'conditional upon task 6020 having merged', 'reify', id='conditional-upon',
+            ),
+            pytest.param(
+                'contingent on task 6020 having landed', 'reify', id='contingent-on',
+            ),
+            pytest.param(
+                'the rollout is contingent upon task 6020 having shipped', 'reify',
+                id='contingent-upon',
+            ),
+            pytest.param(
+                'dependent on task 6020 having landed', 'reify', id='dependent-on',
+            ),
+            pytest.param('the fix is gated on task 6020 landed', 'reify', id='gated-on'),
+            pytest.param(
+                'task 5422 stays blocked on task 6020 merged', 'reify', id='blocked-on',
+            ),
+            pytest.param('subject to task 6020 having shipped', 'reify', id='subject-to'),
+            pytest.param('provided that task 6020 has landed', 'reify', id='provided-that'),
+            pytest.param('provided task 6020 has landed', 'reify', id='provided'),
+            pytest.param('assuming task 6020 has landed', 'reify', id='assuming'),
+            pytest.param('assuming that task 6020 has landed', 'reify', id='assuming-that'),
+            pytest.param(
+                'Depends on task 5707 having landed (jsx_open_tag_end must exist on main)',
+                'dark_factory',
+                id='depends-on-70528099',
+            ),
+            pytest.param(
+                'Depends on task 4317 (param-before-let fix) being merged first', 'reify',
+                id='depends-on-4e700da5',
+            ),
+            pytest.param(
+                'DEPENDS ON task 826 being merged, because times.Clock lands there',
+                'scoping_intake',
+                id='depends-on-b028e795',
+            ),
+            pytest.param(
+                'Do not skip S1 work assuming Task 1648 was cancelled', 'reify',
+                id='assuming-c33dbed7',
+            ),
+            pytest.param(
+                "Rationale: The task's two branches assume that task 222 is either "
+                'unplanned or landed',
+                'solar_challenge',
+                id='esc-unverified-claim-222-2',
+            ),
+            pytest.param(
+                'depends on dark_factory task 5707 having landed', 'reify', id='qualified-ref',
+            ),
+        ],
+    )
+    def test_a_ref_governed_by_a_contingency_head_is_not_claimed(self, text, project):
+        assert _triples(text, project) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'claim'),
+        [
+            pytest.param(
+                'depends on task 5707 and task 5708 having landed',
+                ('applied_work', 'task', '5708'),
+                id='coordinated-object',
+            ),
+            pytest.param(
+                'Depends on: task 5707 having landed',
+                ('applied_work', 'task', '5707'),
+                id='colon-after-the-head',
+            ),
+        ],
+    )
+    def test_a_head_not_directly_before_the_ref_is_a_known_residual(self, text, claim):
+        # Known residual, unchanged by task 6824 and unmeasured: the head is read only
+        # directly before the ref, so a second coordinated object or a colon escapes it.
+        assert _triples(text) == [claim]
+
+    @pytest.mark.parametrize(
+        ('text', 'project', 'claim'),
+        [
+            pytest.param(
+                'task 1543 depends on cancelled task 1542', 'reify',
+                ('disposition', 'task', '1542'),
+                id='forward-bound-attributive',
+            ),
+            pytest.param(
+                'Task 445 (test_web_chart_colours.py palette-edit guard no longer depends on '
+                'a hand-listed set of chart builders) landed via merge c63fb49c15 touching '
+                'tests/unit/test_web_chart_colours.py',
+                'solar_challenge',
+                ('applied_work', 'task', '445'),
+                id='head-inside-a-parenthetical',
+            ),
+            # 'pending' is left out of the heads by measurement: its status-adjective reading dominates.
+            pytest.param(
+                'Pending task 1686 is filed the same way: task_kind normal, and no dependency '
+                'on the task 1523 merge it waits for',
+                'solar_challenge',
+                ('filing_dispatch', 'task', '1686'),
+                id='pending-is-not-a-head',
+            ),
+            pytest.param(
+                'task 5423 is blocked on task 5422 which merged yesterday', 'reify',
+                ('applied_work', 'task', '5422'),
+                id='relative-clause-after-the-object',
+            ),
+            pytest.param(
+                'task 5422 depends on task 5421 which has since landed', 'reify',
+                ('applied_work', 'task', '5421'),
+                id='relative-clause-has-since',
+            ),
+        ],
+    )
+    def test_a_contingency_head_governs_only_its_own_object(self, text, project, claim):
+        assert _triples(text, project) == [claim]
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(
+                _ESC_1125_1_MEMORY, 'solar_challenge', id='esc-unverified-claim-1125-1',
+            ),
+            pytest.param(
+                'It needs task 465 merged, since make_fleet_results_of must exist on main',
+                'solar_challenge',
+                id='needs',
+            ),
+            pytest.param(
+                'This needs task 506 merged first, because the public harness names exist '
+                'only on task/506 until then',
+                'solar_challenge',
+                id='needs-first',
+            ),
+            pytest.param(
+                'Deferred actions (require task 3543 branch merged to main first):', 'reify',
+                id='require',
+            ),
+            pytest.param(
+                'Both modules need task 736 merged first, because as_read must exist',
+                'scoping_intake',
+                id='need',
+            ),
+            pytest.param('wants task 5422 landed before the cut', 'reify', id='wants'),
+        ],
+    )
+    def test_a_ref_governed_by_a_necessity_verb_is_not_claimed(self, text, project):
+        assert _triples(text, project) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'claim'),
+        [
+            pytest.param(
+                'Task 2320 branch needs rebase onto main after task 2330 merged',
+                ('applied_work', 'task', '2330'),
+                id='necessity-object-is-not-the-ref',
+            ),
+            pytest.param(
+                "task 2682 required a fused-memory restart to load task 2697's merged fix",
+                ('applied_work', 'task', '2697'),
+                id='necessity-verb-earlier-in-the-clause',
+            ),
+            pytest.param(
+                'it required task 5422 which landed', ('applied_work', 'task', '5422'),
+                id='relative-clause-after-the-object',
+            ),
+            pytest.param(
+                'the required task 5422 has landed', ('applied_work', 'task', '5422'),
+                id='attributive-participle',
+            ),
+        ],
+    )
+    def test_a_necessity_verb_governs_only_its_own_object(self, text, claim):
+        assert _triples(text) == [claim]
+
+    def test_a_trial_merge_against_a_mock_claims_neither_task(self):
+        claimed = {ref for _, _, ref in _triples(_ESC_433_1_CLAIM, 'scoping_intake')}
+        assert claimed.isdisjoint({'433', '422'})
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('a dry run of task 5422 merged cleanly', id='dry-run-of'),
+            pytest.param('a trial merge of task 5422 merged cleanly', id='trial-merge-of'),
+            pytest.param('a mock of the task 5422 edits merged cleanly', id='mock-of-the'),
+        ],
+    )
+    def test_a_ref_governed_by_a_simulation_head_is_not_claimed(self, text):
+        assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('The prototype of task 5422 merged at abc1234', id='prototype-of'),
+            pytest.param('the stub of task 5422 landed in abc1234', id='stub-of'),
+        ],
+    )
+    def test_a_stand_in_head_no_specimen_evidences_still_claims(self, text):
+        assert _triples(text) == [('applied_work', 'task', '5422')]
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(
+                '- 195: branch task/195 (6e75730) is merged up to aca7236 and waits on a '
+                'stale L2 escalation',
+                'solar_challenge',
+                id='esc-unverified-claim-195-2',
+            ),
+            pytest.param('branch task/5422 is merged up with main', 'reify', id='merged-up-with'),
+            pytest.param('task/5422 was merged up to abc1234', 'reify', id='merged-up-to-sha'),
+        ],
+    )
+    def test_a_catch_up_merge_into_a_branch_is_not_a_claim(self, text, project):
+        assert _triples(text, project) == []
+
+    def test_a_merge_into_main_is_still_a_claim(self):
+        assert _triples('task 5422 was merged into main') == [('applied_work', 'task', '5422')]
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(_ESC_6670_1_CLAIM, 'dark_factory', id='esc-unverified-claim-6670-1'),
+            pytest.param(
+                'branch task/5422 with main merged into it', 'reify',
+                id='main-merged-into-the-branch',
+            ),
+            pytest.param(
+                'task 5422 and task 5423 (5421 was merged into them)', 'reify',
+                id='merged-into-them',
+            ),
+        ],
+    )
+    def test_a_merge_into_a_pronoun_does_not_claim_its_antecedent(self, text, project):
+        assert _triples(text, project) == []
+
+    def test_a_merge_into_a_possessive_still_claims(self):
+        # Unlike 'it', 'its' can corefer with the marker's own subject.
+        assert _triples('task 5422 was merged into its target branch') == [
+            ('applied_work', 'task', '5422'),
+        ]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('task 5422 was merged into it', id='task'),
+            pytest.param('commit abc1234 was merged into it', id='commit'),
+        ],
+    )
+    def test_a_merged_into_it_on_the_subject_ref_is_an_accepted_residual(self, text):
+        # Accepted residual (task 8600): 'it' cannot be the subject itself, so this is a real landing
+        # claim the gate gives up. Over 96,955 Mem0 records and 42,351 Episodic nodes (2026-11-22),
+        # each of the 13 'merged into it/them' hits names the destination.
+        assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('task 5422 merged into it as commit abc1234', id='as-complement'),
+            pytest.param('the fix was merged into it in commit abc1234', id='in-adjunct'),
+        ],
+    )
+    def test_a_commit_bound_forward_from_merged_into_it_is_an_accepted_residual(self, text):
+        # Blanking 'merged' also gives up the commit the merge produced, which the pronoun never
+        # names and a git probe would settle cheaply; the same corpus holds no such hit.
+        assert _triples(text) == []
+
+    def test_a_possessive_merged_tree_is_an_accepted_residual(self):
+        # Accepted residual (task 6824): over 93,986 Mem0 records (2026-11-16) about 39 of 42 possessive
+        # participle claims assert the landing ('task 4105's landed fix'), so the gate keeps the reading;
+        # see TestAttributiveMarkersBindForwardOnly::test_a_possessive_lead_still_claims_its_owner.
+        assert _triples(_ESC_506_1_CLAIM, 'scoping_intake') == [('applied_work', 'task', '506')]
+
+
+class TestPremiseNotesClaimTheirDependency:
+
+    @pytest.mark.parametrize(
+        ('text', 'project', 'claim'),
+        [
+            pytest.param(
+                'Analysis: PREMISES, verified on task/432 == main == a106cd8 '
+                '(dependency 327 merged at a106cd8):',
+                'solar_challenge',
+                ('applied_work', 'task', '327'),
+                id='esc-unverified-claim-432-2',
+            ),
+            pytest.param(
+                'Dependency 6399 (L8a) is done (merged 4b891fe407)', 'dark_factory',
+                ('applied_work', 'task', '6399'),
+                id='dependency-00a117d0',
+            ),
+        ],
+    )
+    def test_a_bare_dependency_ref_takes_the_marker(self, text, project, claim):
+        assert _triples(text, project) == [claim]
+
+    def test_a_dependency_ref_honours_a_project_qualifier(self):
+        claims = _extract('dark_factory dependency 6020 has landed', 'reify')
+        assert [(c.ref, c.project_id) for c in claims] == [('6020', 'dark_factory')]
+
+    def test_a_hash_dependency_ref_is_claimed_once(self):
+        assert _triples('dependency #6020 has landed') == [('applied_work', 'task', '6020')]
+
+    def test_a_dependency_version_is_not_a_ref(self):
+        assert _triples("task 5422's dependency 2.0 upgrade landed") == [
+            ('applied_work', 'task', '5422'),
+        ]
+
 
 _ESC_5471_1 = (
     '(3) PRD2 ε #5471 owns the shipped Bool-balance and stock-size examples, '
@@ -392,6 +748,18 @@ class TestAttributiveMarkersBindForwardOnly:
             pytest.param(
                 'task 5578 is merge-deferred with a queued carrier branch',
                 id='queued-carrier',
+            ),
+            pytest.param(
+                "This task's cite lands under merge task_id=9207, so #9236 gets no "
+                'landed-outbox hit',
+                id='esc-unverified-claim-9236-3',
+            ),
+            pytest.param('task 5422 has no landed fix yet', id='negative-determiner'),
+            pytest.param(
+                '#7129 fixed the eval half and #6577 the compile half, so keeping the member '
+                'read would leave the demo showing a workaround, and #6577\'s Type::Field '
+                'typing arm with no shipped-example coverage',
+                id='no-shipped-example',
             ),
         ],
     )

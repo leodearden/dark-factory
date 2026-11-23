@@ -61,8 +61,7 @@ function fromBody(bodyKey, spec) {
 // endpoint is registered here by searching this shipped source for `'KEY'` or
 // `"KEY"`. Unquoting them is silent: the registry still works and those four
 // tests fail with "add it as the mapped key", naming a key that is in fact
-// already present. Same reasoning as DEFAULT_TIMEOUT_MS further down, which
-// two other Python tests parse straight out of this file.
+// already present.
 function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
@@ -98,14 +97,15 @@ const NARROWED_POLL_URLS = Object.freeze({
 });
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
-// by the one value its caller already holds. Three declared rows today:
+// by the one value its caller already holds. Four declared rows today:
 // `terminal`, through which tab_tasks.jsx and, via
 // task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
 // `?terminal=<project>`; `taskProse`, a task's description/details
 // addressed by its row's own uid (`<project>/T-<id>`), which the Task Detail
 // pane reads for the selected task and the Escalations drawer for the linked
-// one; and `quality`, the Quality tab's one read, addressed by the canonical
-// query qualityQuery builds.
+// one; `quality`, the Quality tab's one read, addressed by the canonical
+// query qualityQuery builds; and `qualitySnapshotDiff`, one snapshot point's
+// instrument --diff text, addressed by the query snapshotDiffQuery builds.
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -157,6 +157,15 @@ const ON_DEMAND_KEYS = {
     fields: Object.freeze(['QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS']),
     retain: 4,
   },
+  // The point the Quality tab's snapshot selector shows. PLAIN: the diff is
+  // the instrument's report text, not a measurement.
+  qualitySnapshotDiff: {
+    url: query => `/api/v2/dashboard/quality/snapshot-diff?${query}`,
+    key: (query, field = 'QUALITY_SNAPSHOT_DIFF') => `${field}:${query}`,
+    spec: PLAIN,
+    fields: Object.freeze(['QUALITY_SNAPSHOT_DIFF']),
+    retain: 8,
+  },
 };
 
 // A task row's uid, `<project>/T-<id>`: the taskProse param. It restates
@@ -170,6 +179,15 @@ function taskUid(project, id) {
 function qualityQuery({ project, window: landingWindow, module: moduleName }) {
   const parts = [['project', project], ['window', landingWindow]];
   if (moduleName !== null && moduleName !== undefined && moduleName !== '') parts.push(['module', moduleName]);
+  return encodedQuery(parts);
+}
+
+// The qualitySnapshotDiff param, in one fixed key order as qualityQuery's is.
+function snapshotDiffQuery({ project, point }) {
+  return encodedQuery([['project', project], ['point', point]]);
+}
+
+function encodedQuery(parts) {
   return parts.map(([name, value]) => `${name}=${encodeURIComponent(value)}`).join('&');
 }
 
@@ -257,7 +275,7 @@ window.DF_DATA = {
   //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
   //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
-  //   active_spark, halt, train_events:
+  //   runs_db_present, active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
   //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
   //   every recent and active row's title is a Datum. The payload's top-level
@@ -274,10 +292,9 @@ window.DF_DATA = {
     // counts+rates, cap-hit rate, $/done, plus per-role turn-cap saturation.
     by_model_role: { rows: [], turn_cap_saturation: {} },
   },
-  // in_progress_live + in_progress_stranded band the in_progress census; the
-  // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
-  // a cold client renders empty bands and no banner, never `undefined` ones.
-  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
+  // The parity_* fields are the server's cap-breach verdict (task 3543). Seeded
+  // so a cold client renders empty bands and no banner, never `undefined` ones.
+  BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
@@ -388,8 +405,8 @@ window.DF_DATA = {
   // Do not reintroduce it.
   __stale: {},
   // Per-endpoint RECEIPTS, keyed by the same flow-control key __stale uses:
-  // each entry is `{servedAt, receivedAt, window, pacingHoldMs}`, published by
-  // refreshOne on the SUCCESS path only. datum.js::plainDatum reads this to
+  // each entry is `{servedAt, receivedAt, window, pacingHoldMs, assetBuild}`,
+  // published by refreshOne on the SUCCESS path only. datum.js::plainDatum reads this to
   // give a value that is not yet served as a Datum the provenance it does have.
   //
   // `pacingHoldMs` is the slowness-pacing hold this success imposed, measured
@@ -404,6 +421,11 @@ window.DF_DATA = {
   // it did not replace. (It also could not be a registry key: four endpoints
   // share the body key, and a registry key is both the body key and the
   // DF_DATA key.) window_chip.js::windowEcho validates it at read.
+  //
+  // `assetBuild` records WHICH server build served these values: `{started,
+  // onDisk}`, the raw values of the two RECEIPT_ASSET_BUILD_HEADERS, each null
+  // when absent. It shares the success-only lifetime for the same reason as
+  // `window`, and asset_skew.js validates it at read, as windowEcho does.
   //
   // DELIBERATELY NOT MERGED WITH __stale, which sits three lines above it.
   // The two answer different questions and have different lifetimes. __stale
@@ -572,12 +594,7 @@ const JITTER_MAX_MS = 1500;
 // with an abort deadline; timing out is treated exactly like a thrown
 // fetch error (counts toward backoff, clears in-flight in `finally`).
 //
-// LEAVE THIS EXACTLY AS IT IS — same name, same literal, same assignment
-// shape. Two Python structural tests parse it straight out of this shipped
-// source with /DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/ — test_tasks_budget.py and
-// test_fetch_tasks_whole_operation_budget.py — where it is the ONLY ceiling
-// on the server-side budgets. Renaming it, or tidying it into a computed
-// expression, fails both loudly.
+// The server-side budget tests read the delay refreshOne arms through dashboard/tests/js/_abort_delay_probe.mjs.
 const DEFAULT_TIMEOUT_MS = 30000; // 10x the poll interval
 
 // A shorter deadline for an endpoint that has already demonstrated it is
@@ -647,6 +664,22 @@ function publishStaleness(stateKey, st) {
   window.DF_DATA.__stale[stateKey] = {
     failures: st.failures,
     lastSuccessAt: st.lastSuccessAt,
+  };
+}
+
+// The response headers naming the static/redux build the serving process
+// started with and the one on disk now (dashboard/src/dashboard/asset_build.py).
+const RECEIPT_ASSET_BUILD_HEADERS = Object.freeze({
+  started: 'X-DF-Asset-Build-Started',
+  onDisk: 'X-DF-Asset-Build-On-Disk',
+});
+
+function assetBuildOfResponse(resp) {
+  const headers = resp.headers;
+  if (!headers || typeof headers.get !== 'function') return { started: null, onDisk: null };
+  return {
+    started: headers.get(RECEIPT_ASSET_BUILD_HEADERS.started),
+    onDisk: headers.get(RECEIPT_ASSET_BUILD_HEADERS.onDisk),
   };
 }
 
@@ -806,7 +839,13 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     // from `receivedAt` by however long the applies took.
     const receivedAt = deps.now();
     const pacingHoldMs = slownessPacingHoldMs(deps, receivedAt - startedAt);
-    const receipt = { servedAt: body.served_at ?? null, receivedAt, window: body.WINDOW ?? null, pacingHoldMs };
+    const receipt = {
+      servedAt: body.served_at ?? null,
+      receivedAt,
+      window: body.WINDOW ?? null,
+      pacingHoldMs,
+      assetBuild: assetBuildOfResponse(resp),
+    };
     Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[(spec && spec.bodyKey) || k], spec, receipt));
     recordSuccess(st, startedAt, receivedAt, pacingHoldMs);
     publishReceipt(stateKey, receipt);
@@ -1182,6 +1221,7 @@ const DF_DATA_LOADER_API = {
   ON_DEMAND_KEYS,
   taskUid,
   qualityQuery,
+  snapshotDiffQuery,
   requestOnDemand,
   onDemandReceipt,
   REFRESH_OUTCOMES,

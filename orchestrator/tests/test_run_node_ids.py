@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _poll_responsive import poll_responsive
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_node_ids
@@ -388,3 +390,85 @@ def test_ids_are_mapped_and_keyed_one_by_one(tmp_path):
     assert dict(statuses) == {
         A_OK: 'pass', a_ok_module_relative: 'pass', unmappable: 'error', B_BAD: 'fail',
     }
+
+
+_SPINNING_BODY = """\
+import os
+import pathlib
+import signal
+import time
+
+
+def test_ok():
+    if IGNORE_TERM:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    written = pathlib.Path(PID_FILE + '.tmp')
+    written.write_text(str(os.getpid()))
+    written.rename(PID_FILE)
+    while True:
+        time.sleep(0.02)
+"""
+_SPAWN_RETURN_SECS = 0.5
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _spinning_pids(pids: Path) -> dict[str, int]:
+    return {module: int((pids / module).read_text()) for module in TWO_MODULES if (pids / module).exists()}
+
+
+def test_a_cancelled_concurrent_run_returns_only_after_a_group_only_sigkill_ends(tmp_path):
+    """pkg_a's test ignores SIGTERM, so only terminate_process_group's SIGKILL ends it.
+
+    The cancel lands ``_SPAWN_RETURN_SECS`` after both tests have started, so
+    after both spawns returned: asyncio kills a child itself when a cancel
+    lands inside its spawn.
+    """
+    pids = tmp_path / 'pids'
+    pids.mkdir()
+
+    def spinning_test_file(module: str) -> str:
+        return f'PID_FILE = {str(pids / module)!r}\nIGNORE_TERM = {module == "pkg_a"!r}\n' + _SPINNING_BODY
+
+    tree = _make_two_module_tree(tmp_path, spinning_test_file)
+
+    async def cancel_once_both_spin() -> list[bool]:
+        call = asyncio.create_task(run_node_ids(
+            tree, _make_config(tree), [_module_config(module) for module in TWO_MODULES],
+            [A_OK, B_OK], concurrent_groups=True,
+        ))
+        def both_spinning() -> bool:
+            if len(_spinning_pids(pids)) == len(TWO_MODULES):
+                return True
+            if call.done():
+                call.result()
+                raise AssertionError('run_node_ids finished before both tests had started')
+            return False
+
+        await poll_responsive(both_spinning, label='both groups\' tests have written their pids')
+        await asyncio.sleep(_SPAWN_RETURN_SECS)
+        stubborn = _spinning_pids(pids)['pkg_a']
+        alive_at_return: list[bool] = []
+        call.add_done_callback(lambda _call: alive_at_return.append(_alive(stubborn)))
+
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(30.0):
+                await call
+        return alive_at_return
+
+    try:
+        alive_at_return = asyncio.run(cancel_once_both_spin())
+
+        assert alive_at_return == [False]
+        assert not _alive(_spinning_pids(pids)['pkg_b'])
+    finally:
+        for pid in _spinning_pids(pids).values():
+            if _alive(pid):
+                os.kill(pid, signal.SIGKILL)

@@ -19,6 +19,7 @@ import subprocess
 import sys
 
 import pytest
+from _census_helpers import census_lines
 from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 
 
@@ -401,13 +402,7 @@ class TestPureGateRoutingNotice:
         assert pure_gate_routing_notice(metadata) == {}
 
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_SOURCE = 'source=operational_routing_guard'
-
-
-def _discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+_SOURCE = 'operational_routing_guard'
 
 
 class TestUnreadableMetadataIsDiscardedLoudly:
@@ -421,7 +416,7 @@ class TestUnreadableMetadataIsDiscardedLoudly:
         original = '{not json'
         with caplog.at_level(logging.WARNING):
             assert inject_operational_routing(original) is original
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     @pytest.mark.parametrize('metadata', [None, ''])
     def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
@@ -431,7 +426,7 @@ class TestUnreadableMetadataIsDiscardedLoudly:
 
         with caplog.at_level(logging.WARNING):
             assert inject_operational_routing(metadata) is metadata
-        assert _discard_lines(caplog) == []
+        assert census_lines(caplog, _SOURCE) == []
 
 
 def test_coercion_runs_without_loading_the_interceptor():

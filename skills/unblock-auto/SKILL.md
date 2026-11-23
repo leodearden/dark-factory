@@ -30,6 +30,11 @@ You have been invoked because a task transitioned to `blocked`. The caller has p
 - `**Reviews directory:**` — the absolute path of the task's reviewer verdict files,
   which live in task-scoped storage outside the worktree; `(unavailable: <reason>)`
   means no such path exists for this task, so skip the reviews scan
+- `**Granted tools:**` — the tools and Bash command rules your run holds, rendered from
+  the CLI envelope itself. Any shell command no rule there admits — `cat`, `head`,
+  `tail`, `ls`, `find`, a shell `grep`, or any command with a pipe or a redirection — is
+  denied for the whole session, and a retry is denied again. Read a file with `Read`,
+  search file contents with `Grep`, and list paths with `Glob`
 - the blocked task's own record, rendered as `**Title:**`, `**Description:**` and
   `**Details:**` — each capped per field, with an oversized field clipped and marked
   `... [<field> truncated] ...` so you can see when you are reading a partial value
@@ -63,7 +68,7 @@ Read <worktree>/.task/iterations.jsonl  # execution log: what each agent attempt
 Also scan the `**Reviews directory:**` path from your prompt for reviewer verdict files (`*.json`).
 
 ### 1b. Git state (read-only commands only)
-You run with the task worktree as your working directory, and any command outside your read-only allowlist is denied without a prompt.
+You run with the task worktree as your working directory. The `**Granted tools:**` line lists every Bash command rule you hold: any shell command outside it is denied without a prompt.
 ```bash
 git log --oneline -15
 git diff main...HEAD --stat

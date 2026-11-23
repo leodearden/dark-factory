@@ -43,6 +43,7 @@ from orchestrator.offline_lane_episode_state import (
     CommandRecord,
     EpisodeStore,
     PassEffect,
+    effect_records_debts,
 )
 from orchestrator.offline_lane_records import (
     FailureRecord,
@@ -53,6 +54,13 @@ from orchestrator.offline_lane_records import (
     records_root,
 )
 from shared.project_layout import escalation_queue_dir
+
+# The de-flake owner's metadata keys, by their PRD section 5.6 names: flake_ledger spells them
+# inline (orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata) with no public constant.
+DEBT_TEST_KEY = 'flake_debt_test'
+DEBT_CYCLE_KEY = 'flake_debt_open_count'
+DEBT_CALL_SITE_KEY = 'flake_debt_call_site'
+DEBT_TRIGGER_KEY = 'flake_debt_trigger'
 
 _BEGINNING = datetime.min.replace(tzinfo=UTC)
 _LATEST = datetime.max.replace(tzinfo=UTC)
@@ -65,11 +73,25 @@ class Unjudgeable:
     reason: str
 
 
+@dataclass(frozen=True)
+class MetadataMatches:
+    """The id of every task, any status, whose top-level ``metadata[key]`` equals a value, in id order;
+    *unreadable_ids* the tasks whose metadata is not an object, so the store cannot say whether they match."""
+
+    task_ids: tuple[str, ...]
+    unreadable_ids: tuple[str, ...]
+
+
 class TaskReader(Protocol):
     """``flake_ledger.FlakeLedgerTaskClient.get_task``'s convention: ``(task, None)`` read,
-    ``(None, None)`` a corroborated absence, ``(None, error)`` a failed read."""
+    ``(None, None)`` a corroborated absence, ``(None, error)`` a failed read.
+
+    :meth:`metadata_matches` answers the :class:`MetadataMatches` of *key* and *value*, or
+    ``(None, error)`` for a failed read."""
 
     async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]: ...
+
+    async def metadata_matches(self, key: str, value: str) -> tuple[MetadataMatches | None, Exception | None]: ...
 
 
 class ToolClient(Protocol):
@@ -80,6 +102,34 @@ class ToolClient(Protocol):
 
 _TASK_NOT_FOUND = 'TaskNotFoundError'
 _FAILED_CALL_ERRORS = (httpx.HTTPError, RuntimeError, ValueError, AttributeError, KeyError, TypeError)
+# The server's cap on one lookup page (fused-memory/src/fused_memory/server/tools.py::find_tasks_by_metadata).
+_LOOKUP_PAGE = 100
+
+
+@dataclass(frozen=True)
+class _LookupPage:
+    task_ids: tuple[str, ...]
+    unreadable_ids: tuple[str, ...]
+    has_more: bool
+
+
+def _lookup_page(reply: Any) -> _LookupPage | str:
+    """One ``find_tasks_by_metadata`` page, or why the reply is not one.  The tool sends
+    ``malformed_metadata_ids`` only when some task's metadata is not an object."""
+    problem = write_failure_reason(reply)
+    if problem is not None:
+        return problem
+    rows = reply.get('results')
+    pagination = reply.get('pagination')
+    has_more = pagination.get('has_more') if isinstance(pagination, Mapping) else None
+    unreadable = reply.get('malformed_metadata_ids', [])
+    if not isinstance(rows, list) or not all(isinstance(row, Mapping) and 'task_id' in row for row in rows):
+        return 'the reply carries no list of task rows'
+    if not isinstance(has_more, bool):
+        return 'the reply carries no boolean pagination.has_more'
+    if not isinstance(unreadable, list) or not all(isinstance(task_id, int | str) for task_id in unreadable):
+        return 'the reply carries a malformed_metadata_ids that is not a list of task ids'
+    return _LookupPage(tuple(str(row['task_id']) for row in rows), tuple(map(str, unreadable)), has_more)
 
 
 class FusedMemoryTaskReader:
@@ -91,6 +141,9 @@ class FusedMemoryTaskReader:
     failure, a JSON-RPC error (RuntimeError), a body that is not JSON (ValueError), or one
     that is not a JSON-RPC object (AttributeError, KeyError or TypeError, from reading it as
     one).  Any other exception propagates.
+
+    :meth:`metadata_matches` reads ``find_tasks_by_metadata`` page by page, and answers a
+    failed reply, a reply that is not a page of task rows, or such a raise as a failed read.
     """
 
     def __init__(self, client: ToolClient, project_root: str) -> None:
@@ -108,6 +161,30 @@ class FusedMemoryTaskReader:
         if problem is not None:
             return None, RuntimeError(f'get_task {task_id}: {problem}')
         return reply, None
+
+    async def metadata_matches(self, key: str, value: str) -> tuple[MetadataMatches | None, Exception | None]:
+        task_ids: list[str] = []
+        unreadable_ids: dict[str, None] = {}
+        has_more = True
+        while has_more:
+            page = await self._lookup(key, value, offset=len(task_ids))
+            if isinstance(page, Exception):
+                return None, page
+            task_ids.extend(page.task_ids)
+            unreadable_ids.update(dict.fromkeys(page.unreadable_ids))
+            has_more = page.has_more and bool(page.task_ids)
+        return MetadataMatches(tuple(task_ids), tuple(unreadable_ids)), None
+
+    async def _lookup(self, key: str, value: str, *, offset: int) -> _LookupPage | Exception:
+        arguments = {
+            'project_root': self._project_root, 'key': key, 'value': value, 'limit': _LOOKUP_PAGE, 'offset': offset,
+        }
+        try:
+            reply: Any = await self._client.call_tool('find_tasks_by_metadata', arguments)
+        except _FAILED_CALL_ERRORS as exc:
+            return exc
+        page = _lookup_page(reply)
+        return RuntimeError(f'find_tasks_by_metadata {key}={value}: {page}') if isinstance(page, str) else page
 
 
 @dataclass(frozen=True)
@@ -181,18 +258,30 @@ class EscalationReads:
 
 
 @dataclass(frozen=True)
+class CycleOwners:
+    """*by_test* maps each offered test to every de-flake task naming it, one per debt cycle;
+    *unreadable* the tasks whose metadata is not an object, any of which may be an owner missing there."""
+
+    by_test: Mapping[str, tuple[str, ...]]
+    unreadable: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SoakInputs:
     """*tasks* maps each task read to its body, or None for a corroborated absence; *failures* maps
     (command, test) to that test's failure records over every stored pass of the selected commands;
-    *record_bytes* is the size of every file under the run-record root."""
+    *record_bytes* is the size of every file under the run-record root.  *ledger_cut_over* is
+    :func:`_ledger_cut_over` over every stored pass, whatever the window and commands."""
 
     since: datetime
+    ledger_cut_over: datetime | None
     now: datetime
     commands: tuple[str, ...]
     passes: tuple[WindowPass, ...]
     episodes: Mapping[str, CommandRecord]
     tasks: Mapping[str, Mapping[str, Any] | None]
     ledger: LedgerReads
+    cycle_owners: CycleOwners
     failures: Mapping[tuple[str, str], tuple[FailureRecord, ...]]
     escalations: EscalationReads
     record_bytes: int
@@ -255,10 +344,12 @@ def _missing_store(stores: StoreLocations) -> Unjudgeable | None:
     return None
 
 
-def _cut_over(every_pass: Sequence[StoredPass]) -> datetime | None:
-    """The earliest pass-id start of a pass carrying an effect block, over every command."""
+def _ledger_cut_over(every_pass: Sequence[StoredPass]) -> datetime | None:
+    """The earliest pass-id start, over every command, of a STORED pass whose effect block records
+    its debts: ε2's go-live while a pre-ε2 record survives retention, otherwise the oldest surviving
+    ε2-era pass.  Either way no stored pass before it wrote ledger rows."""
     return min(
-        (p.started_at for p in every_pass if p.record is not None and p.record.effect is not None),
+        (p.started_at for p in every_pass if p.record is not None and effect_records_debts(p.record.effect)),
         default=None,
     )
 
@@ -287,10 +378,15 @@ def _failures(every_pass: Sequence[StoredPass], selected: Collection[str]) -> di
     return {key: tuple(failures) for key, failures in found.items()}
 
 
+def _offered_tests(window: Sequence[WindowPass]) -> list[str]:
+    """The distinct tests the windowed effect blocks list in debts_offered, in first-seen order."""
+    return list(dict.fromkeys(debt.node for p in window if p.effect is not None for debt in p.effect.debts_offered))
+
+
 def _read_ledger(
     db: Path, *, since: datetime, now: datetime, window: Sequence[WindowPass],
 ) -> LedgerReads | Unjudgeable:
-    offered = dict.fromkeys(debt.node for p in window if p.effect is not None for debt in p.effect.debts_offered)
+    offered = _offered_tests(window)
     summary = summarize_due(db, stale_before=now - DUE_ITEM_STALE_AFTER)
     due_items = None if summary is None else read_due_items(db, now=_LATEST, limit=summary.size)
     if summary is None or due_items is None:
@@ -312,13 +408,32 @@ def episode_bindings(episodes: Mapping[str, CommandRecord]) -> dict[tuple[str, s
     }
 
 
-def _task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandRecord], ledger: LedgerReads) -> list[str]:
+def _task_ids(
+    window: Sequence[WindowPass],
+    episodes: Mapping[str, CommandRecord],
+    ledger: LedgerReads,
+    cycle_owners: CycleOwners,
+) -> list[str]:
     """The ids the windowed effect blocks filed, the tasks the stored episodes are bound to now,
-    and the owners of the offered tests' debts."""
+    the owners of the offered tests' debts, and every cycle's owner of each offered test."""
     filed = [task_id for p in window if p.effect is not None for task_id in p.effect.tasks_filed]
     bound = episode_bindings(episodes).values()
     owners = [row.owner_task_id for row in ledger.debts.values() if row.owner_task_id is not None]
-    return list(dict.fromkeys((*filed, *bound, *owners)))
+    every_cycle = [task_id for task_ids in cycle_owners.by_test.values() for task_id in task_ids]
+    return list(dict.fromkeys((*filed, *bound, *owners, *every_cycle)))
+
+
+async def _cycle_owners(tests: Sequence[str], task_reader: TaskReader) -> CycleOwners | Unjudgeable:
+    """Every de-flake task naming each test; a failed lookup leaves nothing to judge."""
+    owners: dict[str, tuple[str, ...]] = {}
+    unreadable: dict[str, None] = {}
+    for test in tests:
+        matches, error = await task_reader.metadata_matches(DEBT_TEST_KEY, test)
+        if error is not None or matches is None:
+            return Unjudgeable(f'task store unreadable: {DEBT_TEST_KEY}={test}: {error}')
+        owners[test] = matches.task_ids
+        unreadable.update(dict.fromkeys(matches.unreadable_ids))
+    return CycleOwners(owners, tuple(unreadable))
 
 
 def _is_lane_regression(escalation: Escalation, since: datetime) -> bool:
@@ -464,7 +579,7 @@ async def load_inputs(
     now: datetime,
     task_reader: TaskReader,
 ) -> SoakInputs | Unjudgeable:
-    """The soak inputs since *since* (default: the cut-over) for *commands* (names; default every command with passes)."""
+    """The soak inputs since *since* (default: the ledger cut-over) for *commands* (names; default every command with passes)."""
     stores = StoreLocations.of(project_root)
     missing = _missing_store(stores)
     if missing is not None:
@@ -474,10 +589,14 @@ async def load_inputs(
         every_pass = list(record_store.stored_passes_since(_BEGINNING))
     except OSError as exc:
         return Unjudgeable(f'run records unreadable: {stores.records}: {exc}')
+    ledger_cut_over = _ledger_cut_over(every_pass)
     if since is None:
-        since = _cut_over(every_pass)
-        if since is None:
-            return Unjudgeable('no pass record carries an effect block, so the cut-over is unknown; pass --since')
+        if ledger_cut_over is None:
+            return Unjudgeable(
+                'no pass record carries an effect block recording its debts (task 6865, ε2), so the ledger '
+                'cut-over is unknown; pass --since',
+            )
+        since = ledger_cut_over
     in_window = [p for p in every_pass if p.started_at >= since]
     selected = {command_key(name) for name in commands} or {p.command_key for p in in_window}
     window = tuple(_window_pass(p) for p in in_window if p.command_key in selected)
@@ -489,7 +608,10 @@ async def load_inputs(
     episodes = _episodes(project_root, stores.episodes, now, selected)
     if isinstance(episodes, Unjudgeable):
         return episodes
-    tasks = await _read_tasks(_task_ids(window, episodes, ledger), task_reader)
+    cycle_owners = await _cycle_owners(_offered_tests(window), task_reader)
+    if isinstance(cycle_owners, Unjudgeable):
+        return cycle_owners
+    tasks = await _read_tasks(_task_ids(window, episodes, ledger, cycle_owners), task_reader)
     if isinstance(tasks, Unjudgeable):
         return tasks
     escalations = _read_escalations(stores.escalations, since=since, episodes=episodes, window=window)
@@ -497,12 +619,14 @@ async def load_inputs(
         return escalations
     return SoakInputs(
         since=since,
+        ledger_cut_over=ledger_cut_over,
         now=now,
         commands=tuple(sorted(selected)),
         passes=window,
         episodes=episodes,
         tasks=tasks,
         ledger=ledger,
+        cycle_owners=cycle_owners,
         failures=_failures(every_pass, selected),
         escalations=escalations,
         record_bytes=_directory_bytes(stores.records),

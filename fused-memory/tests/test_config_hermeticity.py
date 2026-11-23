@@ -29,6 +29,11 @@ from pathlib import Path
 import pytest
 
 from fused_memory.config.checkout_anchor import CHECKOUT_ROOT
+from fused_memory.config.overlay import (
+    OVERLAY_ENV_VAR,
+    ConfigOverlayRefused,
+    OverlayRefusalReason,
+)
 from fused_memory.config.schema import FusedMemoryConfig
 
 #: A value nothing in the tracked config or the schema could ever produce, so
@@ -304,6 +309,45 @@ class TestAmbientEnvCannotRewriteTheConfig:
 
         assert taskmaster is not None
         assert taskmaster.project_root != PWNED
+
+
+class TestAmbientOverlayCannotReachTheConfig:
+    """The config overlay variable is an env surface the field-derived scrub cannot see.
+
+    ``OVERLAY_ENV_VAR`` names no ``FusedMemoryConfig`` field, so
+    ``_reads_as_a_config_override`` never matches it, yet the YAML source reads
+    it on every construction.  Operators export it during the embedder soak,
+    so a pytest launched from that shell would merge, or be refused by, an
+    overlay the test never asked for.
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def _ambient_overlay(self, tmp_path_factory):
+        """Plant the variable AMBIENTLY, at an absolute path to no file.
+
+        Class scope for the same reason as ``_ambient_taskmaster`` above: the
+        variable is already in the environment when the function-scoped
+        isolation runs.  A missing file makes a leak loud: it would refuse
+        construction rather than quietly merge.
+        """
+        absent = tmp_path_factory.mktemp('ambient-overlay') / 'absent.yaml'
+        ambient = pytest.MonkeyPatch()
+        ambient.setenv(OVERLAY_ENV_VAR, str(absent))
+        yield absent
+        ambient.undo()
+
+    def test_an_ambient_overlay_variable_does_not_reach_the_loader(self):
+        assert FusedMemoryConfig().config_overlay is None
+
+    def test_a_test_body_overlay_variable_still_reaches_the_loader(
+        self, monkeypatch, _ambient_overlay,
+    ):
+        monkeypatch.setenv(OVERLAY_ENV_VAR, str(_ambient_overlay))
+
+        with pytest.raises(ConfigOverlayRefused) as excinfo:
+            FusedMemoryConfig()
+
+        assert excinfo.value.refusal.reason is OverlayRefusalReason.FILE_MISSING
 
 
 class TestTheScrubStaysNarrow:

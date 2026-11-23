@@ -89,7 +89,7 @@ def build_bwrap_command(
     2026-08-11 (task 4003): recon's config dir sat under
     <data_dir>/recon-config/, outside every bind above, so every recon
     stage was told where to write its transcript and then denied the write.
-    Note this branch drops a writable_extra that is not an existing dir
+    Note this branch drops a writable_extra that is not an existing file or dir
     (see below), so a mistimed grant is vacuous here too — logged, not
     silent, and landlock_exec._add_path now prints the same signal for its
     --writable list, so the two backends degrade equally loudly.
@@ -126,23 +126,18 @@ def build_bwrap_command(
     os.makedirs(task_dir, exist_ok=True)
     cmd.extend(['--bind', task_dir, task_dir])
 
-    # Extra writable directories
+    # Extra writable files and directories
     if writable_extras:
         for extra in writable_extras:
-            if os.path.isdir(extra):
+            if os.path.isdir(extra) or os.path.isfile(extra):
                 cmd.extend(['--bind', extra, extra])
             else:
-                # bwrap cannot --bind a nonexistent path, and compute_write_set
-                # is intentionally pure (no makedirs) — existence/creation is
-                # the backend's job, but this backend does not create extras
-                # (unlike the writable_modules/.task loops above, which do).
-                # Silently dropping the bind would let a requested writable
-                # path (e.g. ~/.claude/fleet on first run) go missing with no
-                # signal, contrary to the loud-over-silent-degradation norm —
-                # so surface it instead of degrading silently.
+                # bwrap cannot --bind a nonexistent path and this backend does
+                # not create extras, so say so rather than degrade silently.
                 logger.warning(
-                    'build_bwrap_command: writable extra %r is not a directory '
-                    '— skipping bind (path missing or not created yet)', extra,
+                    'build_bwrap_command: writable extra %r is not an existing '
+                    'file or directory — skipping bind (path missing or not '
+                    'created yet)', extra,
                 )
 
     cmd.append('--')

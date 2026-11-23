@@ -13,16 +13,28 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar
 
+from shared.claude_endpoint import ClaudeEndpoint
+from shared.claude_executable import ClaudeLaunchSurface, claude_executable, override_var
 from shared.cost_store import CapReason
-from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.proc_group import (
+    snapshot_process_group,
+    spawn_group_leader,
+    terminate_process_group,
+)
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
-from shared.secret_env import agent_subprocess_env
+from shared.secret_env import (
+    AGENT_CREDENTIAL_VAR,
+    AGENT_ENDPOINT_VARS,
+    ENDPOINT_BASE_URL_VAR,
+    agent_subprocess_env,
+    is_secret_env_name,
+)
 from shared.spawn_temp_files import MCP_CONFIG_TEMP_NAME, SYSPROMPT_TEMP_NAME
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
@@ -34,6 +46,7 @@ except ImportError:  # pragma: no cover - exercised only when aiohttp absent
     _VllmBridgeRuntime = None
 
 if TYPE_CHECKING:
+    from shared.account_reserve import WorkClassSource
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
     from shared.usage_gate import PoolFrozen, UsageGate
@@ -113,25 +126,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Claude backend binary resolution.
-#
-# WHY THIS EXISTS: argv[0] used to be the hardcoded bare PATH name 'claude',
-# resolved by the kernel against whatever PATH the spawning process happened
-# to inherit. On 2026-08-13→08-18 the fused-memory systemd user unit pinned no
-# Environment=PATH=, its inherited user-manager PATH lacked ~/.local/bin, and
-# so every curator LLM call raised FileNotFoundError for 80+ hours — with no
-# log line naming the binary that could not be found.
-#
-# _CLAUDE_BINARY_ENV_VAR is the operator escape hatch: an absolute path here
-# removes PATH from the equation entirely, and is the remediation the
-# unresolvable-binary escalation recommends.
-# ─────────────────────────────────────────────────────────────────────────────
-_CLAUDE_BINARY_ENV_VAR = 'CLAUDE_BINARY'
-# The historical argv[0]. Kept as the fallback so an environment that never
-# sets _CLAUDE_BINARY_ENV_VAR and does have `claude` on PATH is byte-identical
-# to the pre-task-4448 behaviour.
-_DEFAULT_CLAUDE_BINARY = 'claude'
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -212,11 +206,12 @@ __all__ = [
 
 
 def claude_binary_spec() -> str:
-    """Return the Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
+    """Return the fleet's Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
 
-    An empty ``CLAUDE_BINARY`` is treated as unset rather than as an empty
-    argv[0], so ``CLAUDE_BINARY=`` in a systemd unit or a shell profile
-    degrades to the default instead of producing an unspawnable command.
+    The fleet surface of ``shared/src/shared/claude_executable.py::claude_executable``
+    over ``os.environ``; an empty ``CLAUDE_BINARY`` counts as unset there, so
+    ``CLAUDE_BINARY=`` in a systemd unit or a shell profile degrades to the
+    default instead of producing an unspawnable argv[0].
 
     The spec may be a bare name (resolved against PATH) or an absolute path.
     Setting it to an absolute path is the remediation for the 2026-08-13→08-18
@@ -226,7 +221,7 @@ def claude_binary_spec() -> str:
 
     Never raises.
     """
-    return os.environ.get(_CLAUDE_BINARY_ENV_VAR) or _DEFAULT_CLAUDE_BINARY
+    return claude_executable(ClaudeLaunchSurface.FLEET, os.environ)
 
 
 def resolve_claude_binary() -> str | None:
@@ -264,7 +259,9 @@ class AllAccountsCappedException(Exception):
     - ``pool_frozen``: the gate's ``PoolFrozen`` when the deadline was spent
       parked, else ``None``.  It says which accounts were capped and which
       AUTH_FAILED, and the message is built from it, because a pool frozen on
-      rejected credentials is not a cap and will not clear at a reset.
+      rejected credentials is not a cap and will not clear at a reset; nor is
+      a caller refused the allowance reserve (``pool_frozen.reserved_account``
+      set), whose message names the reserve and its release time instead.
     """
 
     def __init__(
@@ -280,10 +277,13 @@ class AllAccountsCappedException(Exception):
         self.label = label
         self.pool_frozen = pool_frozen
         spent = f'after {retries} retries ({elapsed_secs:.1f}s elapsed)'
-        super().__init__(
-            f'{label}: all accounts capped {spent}' if pool_frozen is None
-            else f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
-        )
+        if pool_frozen is None:
+            message = f'{label}: all accounts capped {spent}'
+        elif pool_frozen.reserved_account is not None:
+            message = f'{label}: {pool_frozen} (patience spent waiting {spent})'
+        else:
+            message = f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
+        super().__init__(message)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,10 +372,10 @@ class AgentResult:
       salvaged — see
       ``test_is_error_with_non_dict_structured_output_not_salvaged`` — whereas
       a dict payload would already have flipped the result to success before a
-      caller ever saw the failure). Measured (CLI 2.1.236/2.1.241, via
-      ``fused-memory/scripts/probe_schema_max_turns.py`` — added by task 3241,
-      unmerged as of this writing; the path resolves once that branch lands):
-      ``error_max_turns`` almost never carries a completed JSON schema
+      caller ever saw the failure). Measured by
+      ``fused-memory/scripts/probe_schema_max_turns.py``, whose docstring
+      records the runs and the CLI versions they used: ``error_max_turns``
+      almost never carries a completed JSON schema
       tool-use turn — the model spent its turns on prose and never invoked
       the schema tool — so at that boundary salvage is rarely a backstop and
       usually has nothing to recover. Re-run the probe to re-check this claim
@@ -387,8 +387,9 @@ class AgentResult:
       flaky candidate.  ``success`` stays False (NOT salvaged); callers should
       raise a loud, un-suppressed escalation so the substitution gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
-      background task it started was still pending — a ``run_in_background``
-      Bash or a confirmed Monitor arm, never subsequently REAPED, where a reap
+      background task it started was still pending — a confirmed background
+      launch (see ``detect_ended_awaiting_background`` for the contract), never
+      subsequently REAPED, where a reap
       is a ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill, a tool_use
       of any kind whose input references the launch's id / output-file path as
       recorded in its tool_result (task 3639), OR a delivered task-notification
@@ -789,6 +790,11 @@ _BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
 _MIN_BG_TOKEN_LEN = 6
 
 
+def _is_usable_token(value: object) -> TypeGuard[str]:
+    """True when *value* can identify a background task (see ``_MIN_BG_TOKEN_LEN``)."""
+    return isinstance(value, str) and len(value) >= _MIN_BG_TOKEN_LEN
+
+
 _FieldT = TypeVar('_FieldT')
 
 
@@ -904,22 +910,29 @@ def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
     """
     tur = record.get('toolUseResult')
     if isinstance(tur, dict):
-        task_id = tur.get('backgroundTaskId')
-        if isinstance(task_id, str) and len(task_id) >= _MIN_BG_TOKEN_LEN:
+        task_id = tur.get(_BASH_LAUNCH_ID_FIELD)
+        if _is_usable_token(task_id):
             tokens.add(task_id)
     for text in _iter_result_texts(record):
         for match in _BG_LOG_PATH_RE.findall(text):
-            if len(match) >= _MIN_BG_TOKEN_LEN:
+            if _is_usable_token(match):
                 tokens.add(match)
 
 
 _MONITOR_TOOL = 'Monitor'
+# The ``toolUseResult`` field in which the CLI reports the id of the task a
+# launch call started: a confirmed Monitor arm, a backgrounded Bash.
+_MONITOR_LAUNCH_ID_FIELD = 'taskId'
+_BASH_LAUNCH_ID_FIELD = 'backgroundTaskId'
 _TASK_NOTIFICATION = 'task-notification'
 
 
 class _BackgroundEvent(enum.Enum):
     LAUNCH = 'launch'
     REAP = 'reap'
+    # A terminal verdict submission: a reap that also outranks a launch whose
+    # call it follows, however late that launch is confirmed.
+    SUBMISSION = 'submission'
 
 
 def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
@@ -928,26 +941,28 @@ def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
     return any(token in text for text in texts for token in tokens)
 
 
-def _monitor_arm_task_id(record: dict, monitor_call_ids: set[str]) -> str | None:
-    """Return the armed task's id when *record* confirms a Monitor arm, else None.
+def _confirmed_launch(record: dict, launch_calls: Mapping[str, str]) -> tuple[str, str] | None:
+    """Return ``(call id, started task's id)`` when *record* confirms a launch,
+    else None.
 
-    A confirmation answers one of *monitor_call_ids* with a tool_result and
-    carries a structured ``toolUseResult.taskId`` that is a usable token (see
-    ``_MIN_BG_TOKEN_LEN``).  A rejected call carries no such field.  Never
+    A confirmation is a tool_result answering a call in *launch_calls* (call id
+    → confirming field, from ``_launch_call``) whose ``toolUseResult`` holds
+    that field as a usable token (see ``_MIN_BG_TOKEN_LEN``).  A call the CLI
+    ran in the foreground anyway, or rejected, carries no such field.  Never
     raises.
     """
     tur = record.get('toolUseResult')
     if not isinstance(tur, dict):
         return None
-    task_id = tur.get('taskId')
-    if not isinstance(task_id, str) or len(task_id) < _MIN_BG_TOKEN_LEN:
-        return None
     for block in _content_blocks(record):
         if not isinstance(block, dict) or block.get('type') != 'tool_result':
             continue
         call_id = block.get('tool_use_id')
-        if isinstance(call_id, str) and call_id in monitor_call_ids:
-            return task_id
+        if not isinstance(call_id, str) or call_id not in launch_calls:
+            continue
+        task_id = tur.get(launch_calls[call_id])
+        if _is_usable_token(task_id):
+            return call_id, task_id
     return None
 
 
@@ -987,35 +1002,46 @@ def _delivered_notification_texts(record: dict) -> list[str] | None:
     return None
 
 
-def _monitor_call_id(block: dict) -> str | None:
-    """Return the id of a ``Monitor`` tool_use *block*, else None."""
+def _launch_call(block: dict) -> tuple[str, str] | None:
+    """Return ``(call id, confirming field)`` when tool_use *block* asks the CLI
+    to start a background task, else None.
+
+    A ``Monitor`` call is confirmed by ``_MONITOR_LAUNCH_ID_FIELD``, and a
+    ``Bash`` call with a truthy ``input.run_in_background`` by
+    ``_BASH_LAUNCH_ID_FIELD``.  A block whose ``id`` is not a ``str`` is never
+    a launch call.  Never raises.
+    """
     call_id = block.get('id')
-    if block.get('name') == _MONITOR_TOOL and isinstance(call_id, str):
-        return call_id
+    if not isinstance(call_id, str):
+        return None
+    name = block.get('name')
+    if name == _MONITOR_TOOL:
+        return call_id, _MONITOR_LAUNCH_ID_FIELD
+    if name == 'Bash':
+        inp = block.get('input')
+        if isinstance(inp, dict) and inp.get('run_in_background'):
+            return call_id, _BASH_LAUNCH_ID_FIELD
     return None
 
 
 def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None:
-    """Classify one tool_use *block* as a launch, a reap, or neither.
+    """Classify one tool_use *block* as a submission, a reap, or neither.
 
-    Branch order is load-bearing: launch → ``Monitor`` call → named reap tool →
-    token reference.  A ``run_in_background`` Bash that mentions an earlier
-    token is a LAUNCH, and a ``Monitor`` call is neither: only its confirmed
-    arm (``_monitor_arm_task_id``) is a launch, so a Monitor naming a pending
-    launch's token does not reap it.
+    A launch is never classified at its call: it is positioned at the result
+    that confirms it (``_confirmed_launch``).  Branch order is load-bearing:
+    ``Monitor`` call → terminal submission → named reap tool → token
+    reference.  A ``Monitor`` call is neither, so a Monitor naming a pending
+    launch's token does not reap it; any other call naming one, a backgrounded
+    Bash included, does.
     """
     name = block.get('name')
     if not isinstance(name, str):
         name = ''  # a malformed name matches no tool and must not raise on lookup
-    if name == 'Bash':
-        inp = block.get('input')
-        if isinstance(inp, dict) and inp.get('run_in_background'):
-            return _BackgroundEvent.LAUNCH
-    elif name == _MONITOR_TOOL:
+    if name == _MONITOR_TOOL:
         return None
-    elif name in _BACKGROUND_REAP_TOOLS or (
-        _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
-    ):
+    if _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS:
+        return _BackgroundEvent.SUBMISSION
+    if name in _BACKGROUND_REAP_TOOLS:
         return _BackgroundEvent.REAP
     if tokens and _mentions_token(_iter_input_strings(block.get('input')), tokens):
         return _BackgroundEvent.REAP
@@ -1023,13 +1049,16 @@ def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None
 
 
 def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
-    """Yield the background LAUNCH and REAP events of *records*, in record order.
+    """Yield the background events of *records*, in record order.
 
-    Owns the identity tokens of the launches seen so far and the ids of the
-    Monitor calls awaiting confirmation.
+    Owns the identity tokens harvested so far, the launch calls seen so far
+    (each mapped to the ``toolUseResult`` field that would confirm it), and the
+    launch calls a terminal submission followed, which no later confirmation
+    makes a launch.
     """
     tokens: set[str] = set()
-    monitor_call_ids: set[str] = set()
+    launch_calls: dict[str, str] = {}
+    submitted_after_calls: set[str] = set()
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -1040,41 +1069,46 @@ def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
             continue
         if record.get('type') == 'user':
             _collect_bg_tokens(record, tokens)
-            task_id = _monitor_arm_task_id(record, monitor_call_ids)
-            if task_id is not None:
+            confirmed = _confirmed_launch(record, launch_calls)
+            if confirmed is not None:
+                call_id, task_id = confirmed
                 tokens.add(task_id)
-                yield _BackgroundEvent.LAUNCH
+                if call_id not in submitted_after_calls:
+                    yield _BackgroundEvent.LAUNCH
             continue
         if record.get('type') != 'assistant':
             continue
         for block in _content_blocks(record):
             if not isinstance(block, dict) or block.get('type') != 'tool_use':
                 continue
-            call_id = _monitor_call_id(block)
-            if call_id is not None:
-                monitor_call_ids.add(call_id)
+            launch_call = _launch_call(block)
+            if launch_call is not None:
+                call_id, confirming_field = launch_call
+                launch_calls[call_id] = confirming_field
             event = _classify_tool_use(block, tokens)
+            if event is _BackgroundEvent.SUBMISSION:
+                submitted_after_calls.update(launch_calls)
             if event is not None:
                 yield event
 
 
 def detect_ended_awaiting_background(records: list[dict]) -> bool:
     """Return True when the transcript's final background event was an unreaped
-    launch — i.e. the agent ended its turn while a background task it started (a
-    ``run_in_background`` Bash or a confirmed Monitor arm) was still pending,
-    silently abandoning the work (the Reify-5164 RCA).
+    launch — i.e. the agent ended its turn while a background task it started
+    was still pending, silently abandoning the work (the Reify-5164 RCA).
 
     Contract (high-precision, no fragile parsing).  Over the ordered transcript
     *records*:
 
-    - a **launch** = either of:
-
-      * a ``Bash`` tool_use whose ``input.run_in_background`` is truthy;
-      * a CONFIRMED ``Monitor`` arm, positioned at its confirming ``user``
-        record: a tool_result answering an earlier ``Monitor`` call, carrying a
-        structured ``toolUseResult.taskId`` of at least ``_MIN_BG_TOKEN_LEN``
-        characters.  A rejected call, or a call with no confirmed arm, is not a
-        launch, and the ``Monitor`` call itself is neither a launch nor a reap;
+    - a **launch** = a CONFIRMED background start, positioned at its
+      confirming ``user`` record: a tool_result answering an earlier
+      ``run_in_background`` ``Bash`` call or ``Monitor`` call, whose structured
+      ``toolUseResult`` carries the started task's id (``backgroundTaskId`` /
+      ``taskId``) of at least ``_MIN_BG_TOKEN_LEN`` characters.  Not a launch:
+      a call the CLI ran in the foreground anyway, a rejected or errored call,
+      a call with no result, and the call itself.  A ``Bash`` call can still
+      reap by token like any tool_use; a ``Monitor`` call is neither a launch
+      nor a reap;
 
     - a **reap** = any of:
 
@@ -1096,13 +1130,23 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
       * a terminal verdict submission (one of ``_TERMINAL_SUBMISSION_TOOLS``,
         matched on the segment after the last ``__``) — calling one writes the
         role's whole deliverable to ``verdicts/<role>.json``, so the session has
-        finished its job and cannot still be waiting on anything.
+        finished its job and cannot still be waiting on anything.  It also
+        outranks a launch whose call it follows, even one confirmed after it.
 
     Fire (True) iff the final background event is a launch — the session's
     final background event was a launch never followed by a reap.  Any
     engagement with a background task (a reap of any kind after it) clears the
     verdict, keeping precision high and avoiding fragile shell-id /
     result-text parsing that differs across CLI versions.
+
+    Ordering in a parallel batch: the CLI writes every tool_use of a message
+    before any tool_result, so a reap issued beside a launch call sits before
+    that launch's confirmation.  It cannot engage a task not yet started, so
+    the launch outranks it.  A terminal submission is the exception, since it
+    ends the job whatever is still pending.  Both verdicts are pinned:
+    shared/tests/test_cli_invoke_background.py::TestBashLaunchNeedsConfirmation::test_reap_beside_the_launch_call_does_not_outrank_it
+    and
+    shared/tests/test_cli_invoke_background.py::TestVerdictSubmissionClearsVerdict::test_submission_beside_the_launch_call_is_false.
 
     RCA for the second reap clause (task 3639): the original vocabulary named
     only the three background-management tools, so the very common shape of
@@ -1122,6 +1166,13 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     no CLI-issued token exists to key on and parsing the command's redirection
     target would reintroduce exactly the fragility this rule avoids.  That
     shape keeps today's (firing) behaviour.
+
+    ACCEPTED gap: a foreground ``Bash`` the CLI auto-moved to the background
+    after its timeout answers no launch call, so it is not a launch, and a
+    session that ends waiting on it → False.  Counting it was measured and
+    rejected by task 11122; the numbers live at
+    shared/tests/test_cli_invoke_background.py::TestBashLaunchNeedsConfirmation::test_auto_backgrounded_foreground_bash_is_false_documented_gap,
+    and the census behind the confirmed-launch rule in that class's docstring.
 
     Fail-safe / conservative by construction — a ``success``→failure downgrade
     must NEVER re-run a genuinely complete task on ambiguous data:
@@ -1148,6 +1199,9 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     Reaps are positional, not per launch (accepted on the same grounds): an
     earlier launch's delivered completion that lands after a later launch
     clears the verdict while that later launch is still pending → False.
+    Per-launch tracking was measured and rejected by task 7127; the numbers
+    live at
+    shared/tests/test_cli_invoke_background.py::TestDeliveredNotificationIsAReap::test_earlier_completion_after_later_launch_is_false_documented_gap.
     """
     if not records:
         return False
@@ -1333,8 +1387,8 @@ def ended_awaiting_background_for_session(
     session_id: str,
 ) -> bool:
     """Return True when *session_id*'s on-disk transcript ended its turn with a
-    still-pending background task (a run_in_background Bash or a confirmed
-    Monitor arm).
+    still-pending background task (a confirmed background launch; see
+    ``detect_ended_awaiting_background`` for the contract).
 
     Mirrors ``count_transcript_turns``' shape: delegate to
     ``read_transcript_records``; if it returns None (transcript not located or a
@@ -2273,8 +2327,9 @@ class SubprocessResult:
     transcript_turns: int | None = None
     ended_awaiting_background: bool = False
     """True when the normal-exit transcript ended its turn with a still-pending
-    background task (a run_in_background Bash or a confirmed Monitor arm);
-    carried into AgentResult and used by
+    background task (a confirmed background launch; see
+    ``detect_ended_awaiting_background`` for the contract); carried into
+    AgentResult and used by
     parse_claude_output to downgrade success→failure.  Never set on the
     timeout path (a timed-out run is already non-success)."""
     model_id: str | None = None
@@ -2354,6 +2409,7 @@ async def invoke_with_cap_retry(
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
+    work_class: WorkClassSource | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2417,6 +2473,15 @@ async def invoke_with_cap_retry(
     to park and lets ``PoolFrozen`` propagate unconverted, for a caller that
     must defer rather than wait and must tell a cap from rejected
     credentials, which will not clear at a reset (task 6042).
+
+    *work_class* is the caller's class for the allowance reserve
+    (plans/allowance-reserve-by-account-prd.md §6.1): a ``WorkClass`` or a
+    function returning one, forwarded to ``usage_gate.invoke_slot`` only when
+    given, so a gate or double that knows nothing of it is called as before.
+    ``None`` is background work, recorded as unclassified. A wait on the
+    reserve happens inside the gate's park, so it counts nothing toward
+    *max_cap_retries*, and a spent park allowance names the reserve and its
+    release time rather than a cap.
 
     Only FAILED results are offered to the cap detector.
     ``UsageGate.detect_cap_hit`` classifies a synthetic ``success=False``
@@ -2711,22 +2776,28 @@ async def invoke_with_cap_retry(
                     None if cap_wait_deadline is None
                     else max(0.0, cap_wait_deadline - time.monotonic())
                 )
+                slot_kwargs = {} if work_class is None else {'work_class': work_class}
                 try:
                     slot = await slot_exit.enter_async_context(
                         usage_gate.invoke_slot(
                             scope=scope,
                             park=park_on_frozen_pool,
                             max_wait_secs=park_allowance,
+                            **slot_kwargs,
                         ),
                     )
                 except PoolFrozen as frozen:
                     if not park_on_frozen_pool:
                         raise
                     elapsed = time.monotonic() - retry_start
+                    why = (
+                        f'patience spent after {elapsed:.1f}s parked: {frozen}'
+                        if frozen.reserved_account is not None
+                        else f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
+                        f'after {elapsed:.1f}s: {frozen}'
+                    )
                     raise _cap_patience_spent(
-                        f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
-                        f'after {elapsed:.1f}s: {frozen}',
-                        consecutive_cap_hits, elapsed, pool_frozen=frozen,
+                        why, consecutive_cap_hits, elapsed, pool_frozen=frozen,
                     ) from frozen
                 # Consulted inside the acquired slot, after any cooldown or
                 # park, and before attribution and credentials: a declined
@@ -3494,7 +3565,7 @@ def build_claude_argv(
             'claude binary %r does not resolve on PATH — spawning it will fail. '
             'Set %s to an absolute path, or pin Environment=PATH= in the unit. '
             'PATH=%s',
-            _spec, _CLAUDE_BINARY_ENV_VAR, os.environ.get('PATH'),
+            _spec, override_var(ClaudeLaunchSurface.FLEET), os.environ.get('PATH'),
         )
     cmd = [_resolved or _spec, '--print', '--output-format', 'json']
 
@@ -3660,6 +3731,17 @@ def apply_spawn_env(env: dict[str, str], spawn_env: dict[str, str] | None) -> No
     env.pop('CLAUDE_SPAWN_LAUNCHER_PID', None)
 
 
+def _require_endpoint_is_sole_route(oauth_token: str | None, env_overrides: dict[str, str] | None) -> None:
+    """Refuse a second route alongside an explicit endpoint: one child, one endpoint, one credential."""
+    if oauth_token:
+        raise ValueError('an endpoint carries its own credential; oauth_token cannot be combined with it')
+    clashing = sorted(
+        name for name in env_overrides or {} if name in AGENT_ENDPOINT_VARS or is_secret_env_name(name)
+    )
+    if clashing:
+        raise ValueError(f'an endpoint cannot be combined with env_overrides setting {", ".join(clashing)}')
+
+
 async def _invoke_claude(
     prompt: str,
     system_prompt: str,
@@ -3689,6 +3771,7 @@ async def _invoke_claude(
     setting_sources: list[str] | None = None,
     resume_prior_total_cost_usd: float | None = None,
     *,
+    endpoint: ClaudeEndpoint | None = None,
     runner: CliRunner,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
@@ -3696,6 +3779,8 @@ async def _invoke_claude(
     # files: a blank prompt can never produce a useful run, so failing here
     # leaves nothing to clean up and never spawns a subprocess.
     require_non_blank_prompt(prompt, context='_invoke_claude')
+    if endpoint is not None:
+        _require_endpoint_is_sole_route(oauth_token, env_overrides)
     cmd, temp_files = build_claude_argv(
         model=model,
         max_budget_usd=max_budget_usd,
@@ -3735,7 +3820,10 @@ async def _invoke_claude(
     apply_spawn_env(env, spawn_env)
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
-        env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+        env[AGENT_CREDENTIAL_VAR] = oauth_token
+    if endpoint is not None:
+        env.pop(AGENT_CREDENTIAL_VAR, None)
+        env.update(endpoint.env())
     # Per-task config dir: credential file + session isolation
     if config_dir:
         env['CLAUDE_CONFIG_DIR'] = str(config_dir)
@@ -3750,16 +3838,16 @@ async def _invoke_claude(
     # any partially-initialised AppRunner resources.
     bridge: VllmBridge | None = None
     try:
-        if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
+        if env_overrides and env_overrides.get(ENDPOINT_BASE_URL_VAR):
             BridgeCls = VllmBridge
             if BridgeCls is None:
                 raise RuntimeError(
                     'ANTHROPIC_BASE_URL is set but aiohttp is not installed; '
                     'install dark-factory-shared with the vllm extras to use VllmBridge.'
                 )
-            bridge = BridgeCls(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
+            bridge = BridgeCls(upstream_url=env_overrides[ENDPOINT_BASE_URL_VAR])
             await bridge.start()
-            env['ANTHROPIC_BASE_URL'] = bridge.url
+            env[ENDPOINT_BASE_URL_VAR] = bridge.url
 
         # The runner applies the caller-supplied sandbox wrap (e.g. Landlock or
         # bwrap confinement) once, before spawning, after the temp files above
@@ -4146,7 +4234,7 @@ def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
     fallback would instead give up the invariant itself, which is why that one
     raises.
     """
-    # noqa SIM115: a context manager is exactly wrong here — the fd must
+  # SIM115: a context manager is exactly wrong here — the fd must
     # OUTLIVE this call.  It is handed to create_subprocess_exec so the child
     # can dup it, and the caller closes the parent's handle immediately after
     # spawn (that close is what delivers EOF to the child).
@@ -4204,6 +4292,14 @@ async def _kill_group_on_flat_timeout(
         duration_ms=int(time.monotonic() * 1000) - start_ms,
         timed_out=True,
     )
+
+
+_CANCEL_KILL_GRACE_SECS = 5.0
+
+
+async def _terminate_cancelled_group(proc: asyncio.subprocess.Process) -> None:
+    logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
+    await terminate_process_group(proc, proc.pid, grace_secs=_CANCEL_KILL_GRACE_SECS)
 
 
 async def run_cli_subprocess(
@@ -4272,14 +4368,14 @@ async def run_cli_subprocess(
     # stdin_data is None must still yield stdin=None (inherited).
     stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await spawn_group_leader(
             *spawn_cmd,
+            kill_group=_terminate_cancelled_group,
             cwd=str(cwd),
             env=spawn_env,
             stdin=stdin_file,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
         )
     finally:
         # Close the parent's handle as soon as the child has its own dup — this
@@ -4704,8 +4800,7 @@ async def run_cli_subprocess(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm_task
         if proc.returncode is None:
-            logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+            await _terminate_cancelled_group(proc)
         raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -4737,9 +4832,9 @@ async def run_cli_subprocess(
     #     classification lost the turn-count signal (carried None); deriving it
     #     from the records we already parse here restores it at zero extra I/O.
     #   • ended_awaiting_background — a run that exited subtype=success but whose
-    #     transcript tail launched a still-pending background task (a
-    #     run_in_background Bash or a confirmed Monitor arm) silently abandoned
-    #     the work.  Symmetric to the timeout path's
+    #     transcript tail launched a still-pending background task (a confirmed
+    #     background launch; see detect_ended_awaiting_background for the
+    #     contract) silently abandoned the work.  Symmetric to the timeout path's
     #     transcript re-read above; parse_claude_output owns the actual
     #     success→failure downgrade.
     #   • model_id — the exact CLI-served model id, which the caller's alias
@@ -4811,6 +4906,7 @@ async def invoke_claude_agent(
     setting_sources: list[str] | None = None,
     resume_prior_total_cost_usd: float | None = None,
     *,
+    endpoint: ClaudeEndpoint | None = None,
     runner: CliRunner = run_cli_subprocess,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
@@ -4857,7 +4953,15 @@ async def invoke_claude_agent(
     with *resume_session_id* — when both are set, *resume_session_id* wins.
 
     *env_overrides*, when set, are merged into the subprocess environment.
-    Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``.
+    Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``,
+    which routes the child through a ``VllmBridge``.
+
+    *endpoint*, when set, sends the child straight to that Anthropic-protocol
+    endpoint (e.g. ``shared.cli_proxy.proxy_endpoint``), with no bridge and
+    with the endpoint's client key as its only credential: an inherited
+    ``CLAUDE_CODE_OAUTH_TOKEN`` is dropped.  It cannot be combined with
+    *oauth_token*, nor with endpoint or credential variables in
+    *env_overrides*.
 
     *spawn_env*, when set, carries ``CLAUDE_SPAWN_*`` spawn-identity vars
     (role/project/task/parent) for the SessionStart hook.  Merged into the
@@ -4918,5 +5022,6 @@ async def invoke_claude_agent(
         available_tools=available_tools,
         setting_sources=setting_sources,
         resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+        endpoint=endpoint,
         runner=runner,
     )

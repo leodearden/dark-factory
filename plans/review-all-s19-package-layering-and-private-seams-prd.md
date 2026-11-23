@@ -628,13 +628,14 @@ WMCTRL_TIMEOUT_SECS: int
 def run_wmctrl(argv: list[str]) -> subprocess.CompletedProcess[str]: ...   # never raises; rc 127 = wmctrl missing
 @dataclass(frozen=True)
 class WmWindow: window_id: str; desktop: str; host: str; title: str     # window_id canonical
-def parse_wmctrl_list(stdout: str) -> tuple[WmWindow, ...]: ...          # lines with < 4 columns skipped
+def parse_wmctrl_list(stdout: str) -> tuple[WmWindow, ...]: ...          # a line whose first column is not a window id is skipped; missing columns are ''
 def canonical_window_id(raw: str | int | None) -> str | None: ...        # '0x%08x'; None if blank/unparseable/negative
 def window_id_int(raw: str | int | None) -> int | None: ...
 def live_window_ids(run=run_wmctrl) -> frozenset[str] | None: ...        # None = cannot prove; callers keep, never reap
 def resolve_window_id_by_title(title: str, *, run=run_wmctrl, sleep=time.sleep, attempts: int = ...) -> str | None: ...
 @dataclass(frozen=True)
 class WindowProbe: live_window_ids: Callable[[], frozenset[str] | None]; resolve_by_title: Callable[[str], str | None]
+def wmctrl_window_probe(*, run=run_wmctrl, sleep=time.sleep) -> WindowProbe: ...  # the live probe; every consumer's default
 ```
 
 **C7 — `shared.cli_invoke` public runner** (ι):

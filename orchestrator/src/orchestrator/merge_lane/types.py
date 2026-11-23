@@ -30,6 +30,7 @@ from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
+from orchestrator.merge_verify_facts import ChainDepthReason
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
@@ -922,6 +923,34 @@ class QueuedBranch:
         return cls(bare_id=bare_id, full_name=full_name)
 
 
+@dataclass(frozen=True)
+class MergeContent:
+    """A merge request's submit-time facts, replaced whole by its one writer (PRD
+    ``plans/one-merge-request-per-task-prd.md`` D5/D11).
+
+    ``content_seq`` counts those replacements; it is distinct from
+    :attr:`MergeRequest.generation`, which counts auto-chained merges.
+    """
+
+    branch: QueuedBranch
+    tip: str
+    worktree: Path
+    task_files: tuple[str, ...] | None
+    module_configs: tuple[ModuleConfig, ...]
+    pre_rebased: bool
+    content_seq: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.tip:
+            raise ValueError(
+                f'MergeContent needs a tip (D7: every request has one); got tip={self.tip!r}',
+            )
+        if self.content_seq < 1:
+            raise ValueError(
+                f'MergeContent content_seq starts at 1; got content_seq={self.content_seq}',
+            )
+
+
 @dataclass
 class MergeRequest:
     """A request to merge a task branch into main."""
@@ -968,7 +997,7 @@ class MergeRequest:
     Threaded from ``merge_request(retry_failed_only=...)`` (escalation server)
     onto the ``MergeRequest`` the merge worker dequeues, so it is visible on
     ``req`` inside the worker's post-merge verify retry path
-    (:func:`orchestrator.merge_lane.worker._run_post_merge_verify`).
+    (:func:`orchestrator.merge_lane.post_merge_verify.run_post_merge_verify`).
 
     When set, DF BUILDS THE SUBSET ITSELF (task 3059): on a classified
     infra-transient attempt-0 red it derives the {did-not-pass} set from that
@@ -1541,10 +1570,25 @@ class ChainResult:
 
         Off by one from the ``chain_items`` telemetry field on purpose: the
         dispatching item is chain item #1 and is not a link, so γ emits
-        ``1 + depth`` (merge_queue.py, ``_run_inflight_verify``'s chain arm).
+        ``1 + depth`` (merge_lane/inflight_verify.py::InflightVerifyRun._resolve_target's chain arm).
         A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
         """
         return len(self.links)
+
+
+@dataclass(frozen=True)
+class DeepPlacement:
+    """What the deep gate decided for one dispatch: the chain it built, if
+    any, and why the policy chose its depth (``None`` when it was not asked).
+
+    A non-``None`` *chain* holds its scratch lane (see :class:`ChainResult`).
+    """
+
+    chain: ChainResult | None
+    depth_reason: ChainDepthReason | None
+
+
+NO_DEEP_PLACEMENT = DeepPlacement(chain=None, depth_reason=None)
 
 
 class InflightStatus(StrEnum):
@@ -1616,6 +1660,7 @@ class OutcomeKind(StrEnum):
     plan_files_narrowed = 'plan_files_narrowed'
     plan_files_cross_repo = 'plan_files_cross_repo'
     plan_files_already_landed = 'plan_files_already_landed'
+    plan_files_unmeasured = 'plan_files_unmeasured'
     cas_retry = 'cas_retry'
     gate_retry = 'gate_retry'
     post_merge_generation_chained = 'post_merge_generation_chained'
@@ -1658,7 +1703,7 @@ class ItemLifecycleState(StrEnum):
 
     Normalizes today's FOUR redundant state encodings — container
     membership across the five queues (``_queue``/the lane buffers/
-    ``_verifier_queue``/the redispatch park/``_dispatch_item``), the free-form
+    ``_verifier_queue``/the redispatch park/``VerifyDispatcher.dispatch``), the free-form
     ``InflightEntry.phase: str`` field (deleted by task lambda / task 2173 —
     phase is now derived via ``SpeculativeMergeWorker._entry_phase()``), the
     :class:`InflightStatus` sentinel enum above, and the four worker transient side-fields
@@ -1671,7 +1716,7 @@ class ItemLifecycleState(StrEnum):
     Members are ``str`` instances (mirrors :class:`InflightStatus` /
     :class:`OutcomeKind` above). Only THREE members share a wire value with
     an existing live phase string today — ``VERIFYING`` ('verifying', set in
-    ``_run_inflight_verify``), ``GATE_REVERIFY`` ('gate_reverify'), and
+    ``VerifyDispatcher.run_inflight_verify``), ``GATE_REVERIFY`` ('gate_reverify'), and
     ``FINALIZING`` ('finalizing') (the latter two set in
     ``_finalize_inflight``) — so ``==``/``in`` comparisons against THOSE
     THREE raw strings keep working unchanged. The other seven members are
@@ -1679,7 +1724,7 @@ class ItemLifecycleState(StrEnum):
     that never had a phase-string form, so there is no existing raw string
     for them to stay compatible with.
 
-    The live pipeline (``_dispatch_item``) also sets phase values this enum
+    The live pipeline (``VerifyDispatcher.dispatch``) also sets phase values this enum
     does NOT model, so task kappa's downstream repoint is a value REMAP for
     these, not a mechanical rename:
 
@@ -1718,10 +1763,10 @@ class ItemLifecycleState(StrEnum):
 
 @dataclass
 class VerifyWorktreeHandle:
-    """The worktree ``_run_inflight_verify`` is ACTUALLY verifying in (task 3186).
+    """The worktree ``VerifyDispatcher.run_inflight_verify`` is ACTUALLY verifying in (task 3186).
 
     A one-field mutable box, and the shape is forced by construction order:
-    ``_dispatch_item`` creates the verify task BEFORE it builds the
+    ``VerifyDispatcher.dispatch`` creates the verify task BEFORE it builds the
     :class:`InflightEntry` that wraps it, so the coroutine cannot simply be
     handed the entry to write back into.  The box is created first, passed to
     the verify as a keyword-only kwarg, and stored on the entry — so both ends
@@ -1979,10 +2024,10 @@ class InflightEntry:
     item           : the SpeculativeItem being verified
     lease          : the HostLease held for this verify (None for passthroughs,
                      and once the verify released it at its verdict)
-    verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
+    verify_task    : the asyncio.Task wrapping VerifyDispatcher.run_inflight_verify (None for passthroughs)
     merge_wt       : the merge worktree path.  The PRE-verify fact UNTIL δ's
                      adoption publishes the post-verify one onto it (task
-                     3186): ``_run_inflight_verify`` never writes this field,
+                     3186): ``VerifyDispatcher.run_inflight_verify`` never writes this field,
                      so for every non-adopted entry it stays the ephemeral
                      ``_merge-<uuid>`` the item was merged in, and the
                      post-verify path is ``vr.merge_wt``.
@@ -2001,7 +2046,7 @@ class InflightEntry:
                          them in submission order
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
     status         : optional sentinel.  ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH are
-                     set by _dispatch_item; DROPPED / REQUEUED by the entry's own verify
+                     set by VerifyDispatcher.dispatch; DROPPED / REQUEUED by the entry's own verify
                      when it vacates the entry (see :attr:`vacated`, task 4582);
                      VERIFIED_PENDING_LANDING by the verify when it releases the
                      lease at its verdict (task 8526).
@@ -2014,9 +2059,9 @@ class InflightEntry:
                      SpeculativeMergeWorker._land_chain_prefix (task 3186, PRD
                      δ), the in-order CAS walk that lands ``links`` once the
                      tip has passed; a red or errored tip still adopts nothing
-                     (see _run_inflight_verify's chain arm).  NOTE the lane
+                     (see VerifyDispatcher.run_inflight_verify's chain arm).  NOTE the lane
                      referenced here is already RELEASED by the time
-                     _finalize_inflight sees this entry: _run_inflight_verify
+                     _finalize_inflight sees this entry: VerifyDispatcher.run_inflight_verify
                      returns it to the pool in its own ``finally``, so this
                      field is never a release handle.
     chain_adopted  : ``True`` when δ (task 3186) claimed THIS entry for a
@@ -2126,7 +2171,7 @@ class InflightEntry:
 
 @dataclass(frozen=True)
 class NoHost:
-    """``_dispatch_item`` found no free verify host: park ``item``.
+    """``VerifyDispatcher.dispatch`` found no free verify host: park ``item``.
 
     ``item`` is what the dispatch produced, so a dispatch-time re-merge's
     replacement rather than the item it superseded, and its merger-ahead cap
@@ -2148,7 +2193,7 @@ class InflightEntrySlot:
     """The :class:`InflightEntry` wrapping a verify, handed to that verify (task 4582).
 
     Built empty before the verify task for the reason
-    :class:`VerifyWorktreeHandle` gives, and filled by ``_dispatch_item`` once
+    :class:`VerifyWorktreeHandle` gives, and filled by ``VerifyDispatcher.dispatch`` once
     the entry exists, before the verify first runs, so a verify that requeues
     or drops its request vacates its OWN entry, and publishes its base facts
     onto it.
@@ -2353,7 +2398,7 @@ UNTRACKED_HOST_WIRE: Mapping[str, None] = MappingProxyType(dict.fromkeys((
 
 @dataclass
 class InflightVerifyResult:
-    """Result returned by SpeculativeMergeWorker._run_inflight_verify.
+    """Result returned by VerifyDispatcher.run_inflight_verify.
 
     Fields
     ------

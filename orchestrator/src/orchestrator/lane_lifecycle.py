@@ -489,7 +489,7 @@ class LaneLifecycle:
         if self._escalation_queue is None:
             return
         try:
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
 
             sentinel_task_id = f'lane-lifecycle-{Path(lane).name}'
             esc = Escalation(

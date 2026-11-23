@@ -1,0 +1,441 @@
+prd: plans/consolidation-adjudicator-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 10605
+  title: Predicate and ledger shape (K1 class table, K2 waivers, K6 ledger states and outcome fields)
+  capabilities:
+  - name: predicate-and-ledger-substrate
+    binding: "`grep:fused-memory/src/fused_memory/reconciliation/consolidation_auto.py::AutoReasonCode` `grep:fused-memory/src/fused_memory/reconciliation/consolidation_auto.py::evaluate_auto_predicate` `grep:fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py::_evaluate` `grep:fused-memory/src/fused_memory/reconciliation/consolidation_proposal.py::ProposalOutcome.from_payload` wired: the closed reason-code enum K1 classifies, the pure predicate K2 extends and its one executor caller, and the outcome decoder K6 widens"
+    verdict: PASS
+  - name: reason-code-class-table
+    binding: built here — K1's one table from AutoReasonCode to class (no-op, repair, retry, refuse, adjudicator) in consolidation_auto.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '(ADJUDICATOR|[Aa]djudicator)'
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto.py
+      expect: present
+  - name: every-reason-code-classified
+    binding: built here — a test pins that every AutoReasonCode member has exactly one class
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Enum completeness is a property of the table's keys against the enum, which a grep cannot express; α's own test pins it and the merge gate runs it.
+  - name: predicate-takes-waived
+    binding: built here — evaluate_auto_predicate gains the keyword argument waived (frozenset of (code, member id)) and raises on a waiver outside the adjudicator class
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'waived *:'
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto.py
+      expect: present
+  - name: proposal-state-dropped
+    binding: built here — ProposalState gains dropped
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '= *[''"]dropped[''"]'
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_proposal.py
+      expect: present
+  - name: proposal-state-unresolved
+    binding: built here — ProposalState gains unresolved
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '= *[''"]unresolved[''"]'
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_proposal.py
+      expect: present
+  - name: outcome-members-key
+    binding: built here — ProposalOutcome gains members_key (and kept_ids, repaired, effective_claim, effective_category, reused_from, adjudication), each read with a default so pre-change rows decode
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'members_key'
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_proposal.py
+      expect: present
+- label: β
+  task_id: 10606
+  title: Adjudicator, self-calibration, shared OpenAI helper, config (K3, K5, K7)
+  capabilities:
+  - name: transport-and-config-substrate
+    binding: "`grep:fused-memory/src/fused_memory/server/write_triage_judge.py::_call_openai_responses` `grep:fused-memory/src/fused_memory/server/write_triage_judge.py::_call_llm` `grep:fused-memory/src/fused_memory/config/schema.py::ConsolidationAutoConfig` `grep:fused-memory/src/fused_memory/config/reload.py::RELOADABLE_FIELDS` wired: the judge reaches the Responses transport through _call_llm (β parameterises it into the shared helper); the config block and the hot-reload allowlist K7 edits"
+    verdict: PASS
+  - name: eval-set-committed
+    binding: "`grep:fused-memory/calibration/consolidation_adjudicator_eval_set.jsonl` committed with the PRD (N6); β pins its sha256 as a module constant and resolves it from the package"
+    verdict: PASS
+  - name: k1-class-table-and-ledger-states
+    binding: 'producer: α (upstream: β ← α) — K1''s class table (calibration applies the case-decidable rules first) and the ledger kinds the calibration record needs'
+    verdict: PASS
+  - name: adjudicator-module
+    binding: built here — fused-memory/src/fused_memory/reconciliation/consolidation_adjudicator.py (prompt, schema, validation, identity, keep rule, call); imports no executor code
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_adjudicator.py
+      expect: present
+  - name: calibration-entry-point
+    binding: built here — consolidation_adjudicator_calibration.py::run_calibration with the E7 bounds as module constants
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'def run_calibration\('
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_adjudicator_calibration.py
+      expect: present
+  - name: adjudications-budget
+    binding: built here — ConsolidationAutoConfig.max_adjudications_per_cycle (default 6), one of the eight new hot-reloadable leaves
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^ +max_adjudications_per_cycle *:'
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: present
+- label: γ
+  task_id: 10607
+  title: Executor flow (K4 memo, repair, adjudicate, apply, revert; K6 records and stats); gate filing removed
+  capabilities:
+  - name: executor-call-site
+    binding: "`grep:fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py::MemoryConsolidator._run_auto_consolidation` wired: awaits run_auto_consolidation on full cycles only"
+    verdict: PASS
+  - name: subset-execute-and-revert-substrate
+    binding: "`grep:fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py::apply_auto_verdict` `grep:fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py::revert_auto_consolidation` exist: apply takes claim and verdict.retain_ids; revert has no production caller today"
+    verdict: PASS
+  - name: predicate-waivers-ledger-and-adjudicator
+    binding: 'producer: α, β (upstream: γ ← α, β) — K1/K2 table and waivers, K6 states and outcome fields; K3 adjudicator call, keep rule, identity, K5 calibration'
+    verdict: PASS
+  - name: hazard-gate-filing-removed
+    binding: built here — E3 deletes _gate_hazard, _gate_unclosed and _file_hazard_gate with their tests
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'def (_gate_hazard|_gate_unclosed|_file_hazard_gate)\('
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py
+      expect: absent
+  - name: identity-stats-key
+    binding: built here — auto_consolidation_initial_stats publishes auto_consolidation_adjudicator_identity on every Stage 1 cycle, staged or not (read by Γ)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'auto_consolidation_adjudicator_identity'
+      paths:
+      - fused-memory/src/fused_memory
+      expect: present
+  - name: repair-keep-rule-refusal
+    binding: built here — a proposal that fails the keep rule after repair is refused with too_few_members_after_repair (A7)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'too_few_members_after_repair'
+      paths:
+      - fused-memory/src/fused_memory
+      expect: present
+  - name: closure-failure-reverts
+    binding: built here — K4 step 8, the executor calls revert_auto_consolidation on a closure failure (its first production caller)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '(await|return|[=(:,]) *revert_auto_consolidation\('
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py
+      expect: present
+  - name: gate-filings-budget-retired
+    binding: built here — max_gate_filings_per_cycle leaves the schema and the reload allowlist once the executor no longer reads it (K7)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^ +max_gate_filings_per_cycle *:|''consolidation_auto\.max_gate_filings_per_cycle'''
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      - fused-memory/src/fused_memory/config/reload.py
+      expect: absent
+- label: η
+  task_id: 10608
+  title: 'Integration gate: boundary rows A1–A21 as e2e tests through the real ledger, executor and calibration'
+  capabilities:
+  - name: executor-flow
+    binding: 'producer: γ (upstream: η ← γ ← α, β) — the executor flow, records and stats the rows assert'
+    verdict: PASS
+  - name: e2e-harness
+    binding: "`grep:fused-memory/tests/test_auto_consolidation_e2e.py::build_world` exists: the real-ledger World harness the parent's B-rows use; A-rows join it"
+    verdict: PASS
+  - name: a2-bannered-members-kept
+    binding: built here — A2, test named test_a2_<slug>
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'def test_a2_'
+      paths:
+      - fused-memory/tests/test_auto_consolidation_e2e.py
+      expect: present
+  - name: a12-adjudicator-down
+    binding: built here — A12, test named test_a12_<slug>
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'def test_a12_'
+      paths:
+      - fused-memory/tests/test_auto_consolidation_e2e.py
+      expect: present
+  - name: a14-calibration-fails-twice
+    binding: built here — A14, test named test_a14_<slug>
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'def test_a14_'
+      paths:
+      - fused-memory/tests/test_auto_consolidation_e2e.py
+      expect: present
+  - name: a21-eval-set-tampered
+    binding: built here — A21, test named test_a21_<slug>
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'def test_a21_'
+      paths:
+      - fused-memory/tests/test_auto_consolidation_e2e.py
+      expect: present
+  - name: a1-to-a21-mapped-to-tests
+    binding: built here — every row A1–A21 has a test named test_a<N>_<slug> in fused-memory/tests/test_auto_consolidation_e2e.py (the mapping table in the .md twin), and the file passes
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Twenty-one present-greps would be disproportionate and the four above sample the contract; η's reviewer confirms all twenty-one prefixes and the merge gate runs the file.
+- label: χ
+  task_id: 10609
+  title: 'Check surfaces: scripts/check_auto_consolidation.py (code-live, live-clean, rejections) and consolidation-review.yaml'
+  capabilities:
+  - name: real-ledger-harness
+    binding: 'producer: η (upstream: χ ← η) — the harness whose real ledgers χ''s tests run the checks over; χ also depends on ζ (task 5242), for ordering only'
+    verdict: PASS
+  - name: check-script
+    binding: built here — scripts/check_auto_consolidation.py, standard library only; each check exits 0 or 1 and prints one JSON line saying why
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/check_auto_consolidation.py
+      expect: present
+  - name: check-code-live
+    binding: built here — the code-live check Γ runs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'code-live'
+      paths:
+      - scripts/check_auto_consolidation.py
+      expect: present
+  - name: check-live-clean
+    binding: built here — the live-clean check φ runs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'live-clean'
+      paths:
+      - scripts/check_auto_consolidation.py
+      expect: present
+  - name: check-rejections
+    binding: built here — the rejections check ρ2 runs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'rejections'
+      paths:
+      - scripts/check_auto_consolidation.py
+      expect: present
+  - name: review-thresholds-home
+    binding: built here — fused-memory/config/consolidation-review.yaml, the alarm thresholds' one home, with the §10 ρ2 filing values
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - fused-memory/config/consolidation-review.yaml
+      expect: present
+  - name: standard-library-only
+    binding: built here — the script imports nothing outside the standard library, so the gate's bare python3 subcheck runs it
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: An expect-absent grep for third-party imports is vacuous while the file does not exist (polarity lint rejects it); χ's reviewer confirms the imports and Γ's subcheck exercises it under bare python3.
+- label: Γ
+  task_id: 10610
+  title: 'Gate: the adjudicator code is the code running'
+  note: Deterministic predicate task. Its before_done predicate is the same script with the same args as the delivered_check below; a re-base edits both.
+  capabilities:
+  - name: predicate-wrapper
+    binding: "`grep:scripts/check_write_triage_readiness_gate.py::check_subcheck` wired: runs the --subcheck command shlex-split with no shell, exit 0 required; any failing subcheck makes the wrapper exit 1"
+    verdict: PASS
+  - name: stats-reach-stage1-summary
+    binding: "`grep:fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py::run_auto_consolidation` `grep:fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py::write_stage1_cycle_summary` wired: the executor merges its stats into report.stats in a finally (unstaged projects included); Stage 1 writes them to the cycle_summary row with flag_type memory_consolidator"
+    verdict: PASS
+  - name: identity-key-published
+    binding: 'producer: γ (upstream: Γ ← χ ← η ← γ) — auto_consolidation_adjudicator_identity in the Stage 1 stats'
+    verdict: PASS
+  - name: code-live-check
+    binding: 'producer: χ (upstream: Γ ← χ) — scripts/check_auto_consolidation.py code-live'
+    verdict: PASS
+  - name: gamma-adjudicator-code-running
+    binding: built here — the gate's own predicate, re-run so a cancelled Γ cannot release ε
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_write_triage_readiness_gate.py
+      args:
+      - --gate
+      - Gamma
+      - --subcheck
+      - python3 scripts/check_auto_consolidation.py code-live
+      - --on-pass
+      - 'epsilon may stage dark_factory: fused-memory runs the adjudicator code'
+      - --on-fail
+      - 'hold: newest dark_factory Stage 1 cycle_summary lacks auto_consolidation_adjudicator_identity; the new code is not running'
+      timeout_secs: 120
+- label: ε
+  task_id: 10611
+  title: Switch on dark_factory
+  capabilities:
+  - name: commented-config-block
+    binding: "`grep:fused-memory/config/config.yaml` holds the consolidation_auto: block commented out (enabled_projects: [] , enabled: false), with the comment 'All fourteen leaves' β updates"
+    verdict: PASS
+  - name: staging-leaves-reloadable
+    binding: "`grep:fused-memory/src/fused_memory/config/schema.py::ConsolidationAutoConfig` `grep:fused-memory/src/fused_memory/config/reload.py::RELOADABLE_FIELDS` wired: enabled and enabled_projects are schema leaves on the hot-reload allowlist"
+    verdict: PASS
+  - name: block-uncommented
+    binding: 'built here — consolidation_auto: is a live top-level key in fused-memory/config/config.yaml'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^consolidation_auto:'
+      paths:
+      - fused-memory/config/config.yaml
+      expect: present
+  - name: dark-factory-staged
+    binding: 'built here — enabled_projects: [''dark_factory''] (flow-list form, as the PRD writes it)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^ +enabled_projects:.*dark_factory'
+      paths:
+      - fused-memory/config/config.yaml
+      expect: present
+  - name: writes-on
+    binding: 'built here — enabled: true in the same block'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: An 'enabled true' line under one block is a multi-line YAML fact git grep cannot anchor (other blocks carry the same line); ε's review confirms it, φ confirms the project is no longer skipped, and ρ1 reads the executed rows.
+- label: φ
+  task_id: 10612
+  title: 'Gate: calibrated, live and clean'
+  note: Deterministic predicate task. Its before_done predicate is the same script with the same args as the delivered_check below; a re-base edits both.
+  capabilities:
+  - name: project-staged
+    binding: 'producer: ε (upstream: φ ← ε) — dark_factory in enabled_projects'
+    verdict: PASS
+  - name: live-clean-check
+    binding: 'producer: χ (upstream: φ ← ε ← Γ ← χ) — scripts/check_auto_consolidation.py live-clean'
+    verdict: PASS
+  - name: calibration-record-and-findings
+    binding: 'producer: β, γ (upstream: φ ← … ← η ← γ ← β) — the consolidation_adjudicator_calibration ledger row (K5) and the blocking finding records (K6)'
+    verdict: PASS
+  - name: predicate-wrapper
+    binding: "`grep:scripts/check_write_triage_readiness_gate.py::check_subcheck` wired: runs the --subcheck command, exit 0 required"
+    verdict: PASS
+  - name: phi-calibrated-live-clean
+    binding: built here — the gate's own predicate, re-run so a cancelled φ cannot release ρ1 or ρ2
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_write_triage_readiness_gate.py
+      args:
+      - --gate
+      - phi
+      - --subcheck
+      - python3 scripts/check_auto_consolidation.py live-clean
+      - --on-pass
+      - 'rho1 and rho2 may proceed: dark_factory is staged, calibrated pass, no blocking adjudicator record open'
+      - --on-fail
+      - 'hold: the live-clean JSON line names the failing condition; never cancel this gate'
+      timeout_secs: 120
+- label: ρ1
+  task_id: 10613
+  title: First review of rejections and executions (one week after φ)
+  capabilities:
+  - name: report-json-with-shown-text
+    binding: 'producer: ζ (task 5242; upstream: ρ1 ← φ ← … ← χ ← ζ) — scripts/report_auto_consolidations.py --json carrying each row''s shown text'
+    verdict: PASS
+  - name: thresholds-file
+    binding: 'producer: χ (upstream: ρ1 ← φ ← … ← χ) — fused-memory/config/consolidation-review.yaml with the filing values'
+    verdict: PASS
+  - name: review-log
+    binding: built here — docs/auto-consolidation-reviews.md with ρ1's dated entry
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - docs/auto-consolidation-reviews.md
+      expect: present
+  - name: thresholds-set-with-reasoning
+    binding: built here — consolidation-review.yaml's thresholds replaced by ρ1's values, reasoning in the dated entry
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: The new values are ρ1's judgement and may equal the filing values; no pattern distinguishes them. The reviewer reads the diff and the dated entry.
+  - name: findings-and-follow-ups
+    binding: built here — findings written to fused-memory; a task or escalate_info for anything significant, including whether to stage reify
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Memory writes and filed follow-ups are not repository content.
+- label: ρ3
+  task_id: 10614
+  title: Second review (one month after ρ1)
+  capabilities:
+  - name: first-review-landed
+    binding: 'producer: ρ1 (upstream: ρ3 ← ρ1) — docs/auto-consolidation-reviews.md and the thresholds ρ1 set'
+    verdict: PASS
+  - name: report-json-with-shown-text
+    binding: 'producer: ζ (task 5242; upstream through ρ1) — scripts/report_auto_consolidations.py --json'
+    verdict: PASS
+  - name: second-dated-entry
+    binding: built here — a second dated entry appended to docs/auto-consolidation-reviews.md
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: The file exists once ρ1 lands, so a path check is vacuous; the entry's date heading is not fixed by the PRD. The reviewer reads the appended entry.
+  - name: next-review-decision
+    binding: built here — the entry says whether further agent reviews are warranted and files the next one if so
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: A judgement plus an optional filed task; nothing in the repository to check.
+- label: ρ2
+  task_id: 10615
+  title: Monthly rejection alarm (recurring chain consolidation-rejection-review)
+  capabilities:
+  - name: rejections-check-and-thresholds
+    binding: 'producer: χ (upstream: ρ2 ← χ) — scripts/check_auto_consolidation.py rejections and fused-memory/config/consolidation-review.yaml'
+    verdict: PASS
+  - name: recurring-chain-carrier
+    binding: "`grep:docs/task-authoring.md` §6.1 Recurring chains (metadata.recurrence), interval_secs 2592000, seed link dated 2027-01-20"
+    verdict: PASS
+  - name: predicate-wrapper
+    binding: "`grep:scripts/check_write_triage_readiness_gate.py::check_subcheck` wired: runs the --subcheck command, exit 0 required"
+    verdict: PASS
+  - name: monthly-link
+    binding: built here — each link runs the rejections predicate; a fail reaches Leo as an L2 escalation carrying the digest
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: A recurring chain link delivers no repository artifact and has no dependents; its predicate is its before_done, re-run by every link.
+signal_leaves:
+- η
+- φ

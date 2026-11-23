@@ -16,20 +16,18 @@ import click
 from shared.project_layout import CheckoutRootError, default_project_root
 
 
-def env_or_main_checkout(
-    env_var: str | None, derive: Callable[[Path], Path], *, flag: str | None = None,
-) -> Path:
+def env_or_main_checkout(env_var: str, derive: Callable[[Path], Path]) -> Path:
     """``$env_var`` when set, else *derive* applied to the main checkout.
 
-    Raises CheckoutRootError naming *flag* and *env_var* when neither resolves.
+    Raises CheckoutRootError naming *env_var* when neither resolves.
     """
-    override = os.environ.get(env_var) if env_var else None
+    override = os.environ.get(env_var)
     if override:
         return Path(override)
     try:
         root = default_project_root()
     except CheckoutRootError as exc:
-        raise _unavailable(flag, env_var, exc) from exc
+        raise _unavailable(None, env_var, exc) from exc
     return derive(root)
 
 
@@ -45,9 +43,10 @@ def _unavailable(flag: str | None, env_var: str | None, cause: CheckoutRootError
     )
 
 
-def cli_default(flag: str, derive: Callable[[Path], Path], *, env_var: str | None = None) -> Path:
-    """:func:`env_or_main_checkout` for an omitted click *flag*, failing as a usage error."""
+def cli_default(flag: str, derive: Callable[[Path], Path]) -> Path:
+    """*derive* applied to the main checkout for an omitted click *flag*, failing as a usage error."""
     try:
-        return env_or_main_checkout(env_var, derive, flag=flag)
+        root = default_project_root()
     except CheckoutRootError as exc:
-        raise click.UsageError(str(exc)) from exc
+        raise click.UsageError(str(_unavailable(flag, None, exc))) from exc
+    return derive(root)

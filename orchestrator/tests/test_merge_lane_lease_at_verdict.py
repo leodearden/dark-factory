@@ -146,7 +146,7 @@ class TestLaptopReleasedAtVerdict:
             git_ops, verifier=verifier, event_store=store,
             speculation_depth=3, remote_runners=[laptop.runner],
         ) as (lane, queue):
-            lane.VERIFY_ABANDON_POLL_SECS = 0.02
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
             try:
                 reqs = [await _submitted(git_ops, config, tid) for tid in ('lv-a', 'lv-b', 'lv-c')]
                 for req in reqs:
@@ -236,7 +236,7 @@ class TestPersistentMergeLaneKeepsItsLease:
             git_ops, verifier=verifier, event_store=store,
             speculation_depth=3, remote_runners=[laptop.runner],
         ) as (lane, queue):
-            lane.VERIFY_ABANDON_POLL_SECS = 0.02
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
             try:
                 req_h = await _submitted(git_ops, config, 'pl-h')
                 req_a = await _submitted(git_ops, config, 'pl-a')

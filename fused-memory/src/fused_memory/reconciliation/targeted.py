@@ -13,7 +13,12 @@ from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claima
 from shared.task_fields import dependency_ids as task_dependency_ids
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import (
+    RECONCILIATION_COMPLETION_ECHO_MARKER,
+    TARGETED_RECONCILIATION_SOURCE,
+    is_reconciliation_completion_echo,
+    normalize_supersedes,
+)
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.middleware.task_interceptor import (
     _extract_metadata_files,
@@ -34,7 +39,7 @@ from fused_memory.reconciliation.reconciler_escalation import (
     INSTALLED_ESCALATION_QUEUE_FACTORY,
     EscalationQueueFactory,
     file_reconciler_l1,
-    pending_escalations,
+    pinning_escalation_ids_by_task,
 )
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     retire_flag_markers_for_terminal_task,
@@ -81,11 +86,6 @@ _SNAPSHOT_CONTRADICTING_TRANSITIONS: frozenset[str] = frozenset(
 # ``claimant_clear`` (see TargetedReconciler._clear_claimant_before_unblock).
 ClaimantClearOutcome = Literal['cleared', 'not_needed', 'claimant_live', 'rejected', 'failed']
 
-# Metadata `source` value stamped on the completion-echo memory written by
-# _on_task_done's fast path.  Single-sourced so _is_authoritative_resolution
-# and the fast-path write can't drift out of sync (task 1984).
-_ECHO_SOURCE = 'targeted_reconciliation'
-
 # Per-verdict framing for the codebase-verification memory written by
 # _on_task_done (task 4723 / PRD D7).  Both verdicts previously shared ONE
 # completion-framed template, so a `contradicted` verdict — the codebase
@@ -127,7 +127,7 @@ _AUTHORITATIVE_PRECHECK_LIMIT = 25
 # _delete_stale_completion_echoes (task 2433). Mirrors
 # _AUTHORITATIVE_PRECHECK_LIMIT's bounded-scroll rationale immediately above,
 # but narrower: the scroll's server-side filter already restricts matches to
-# source == _ECHO_SOURCE AND transition == 'done' (task 2433 review
+# RECONCILIATION_COMPLETION_ECHO_MARKER (task 2433 review
 # amendment — efficiency_robustness), so this cap bounds ONLY this
 # reconciler's own completion echoes for the task, not every task_id-tagged
 # memory — memory_hints, stage1/stage2 markers, etc. never compete for the
@@ -156,11 +156,11 @@ _STALE_ECHO_DELETE_LIMIT = 25
 # drift if the prompt wording changes without a matching update here.
 #
 # Second writer (task 2642): _on_task_done's own fast-path completion echo
-# ALSO stamps this key unconditionally (source=_ECHO_SOURCE), so Stage 2's
+# ALSO stamps this key unconditionally (source=TARGETED_RECONCILIATION_SOURCE), so Stage 2's
 # count_memories_by_metadata({'task_id': ..., 'stage2_suppress': True}) gate
 # recognizes a targeted-reconciliation completion record and skips its own
 # redundant completion-summary write. _is_authoritative_resolution still
-# requires `source != _ECHO_SOURCE` for the stage2_suppress branch, so a
+# requires `source != TARGETED_RECONCILIATION_SOURCE` for the stage2_suppress branch, so a
 # targeted self-echo carrying this key satisfies Stage 2's external count
 # gate WITHOUT becoming authoritative to _on_task_done's own pre-echo guard
 # — preserving the task-1984 "a task's own earlier echoes never trigger
@@ -630,15 +630,14 @@ class TargetedReconciler:
                         content += f"\nDetails: {fit_at_word(details, 500)}"
 
             write_metadata: dict[str, Any] = {
-                'source': _ECHO_SOURCE,
+                **RECONCILIATION_COMPLETION_ECHO_MARKER,
                 'task_id': task_id,
-                'transition': 'done',
                 # Task 2642: seed Stage 2's "Completion-Note Suppression
                 # Pre-Check" count gate (prompts/stage2.py) on every
                 # completion echo, so a task completed via
                 # TargetedReconciliation is recognized and Stage 2 skips
                 # writing its own redundant completion summary.
-                # _is_authoritative_resolution's source != _ECHO_SOURCE
+                # _is_authoritative_resolution's source != TARGETED_RECONCILIATION_SOURCE
                 # discriminator (above) keeps this self-stamp from making
                 # the echo authoritative to THIS reconciler's own pre-echo
                 # guard, preserving the task-1984 invariant.
@@ -916,7 +915,7 @@ class TargetedReconciler:
                         category='observations_and_summaries',
                         project_id=scope.project_id,
                         metadata={
-                            'source': 'targeted_reconciliation',
+                            'source': TARGETED_RECONCILIATION_SOURCE,
                             'task_id': task_id,
                             'verification_verdict': verification.verdict,
                         },
@@ -1012,8 +1011,8 @@ class TargetedReconciler:
         cached value — that fix alone left the OLD echo behind; this sweep
         removes it.
 
-        Matches ONLY memories whose metadata carries both
-        ``source == _ECHO_SOURCE`` and ``transition == 'done'`` — i.e.
+        Matches ONLY memories whose metadata carries
+        ``RECONCILIATION_COMPLETION_ECHO_MARKER`` — i.e.
         exactly the completion echoes `_on_task_done`'s fast path writes —
         so memory_hints, stage1/stage2 markers, and any other task_id-tagged
         memory are never touched. The match is enforced twice (task 2433
@@ -1021,7 +1020,7 @@ class TargetedReconciler:
         scroll's ``filters`` — Mem0 stores ``add_memory(metadata=...)`` keys
         as top-level Qdrant payload fields and ``scroll_by_metadata``
         matches ALL filter keys (see mem0_client.py's docstring), so passing
-        ``source``/``transition`` alongside ``task_id`` narrows the scroll
+        the marker's keys alongside ``task_id`` narrows the scroll
         itself rather than sharing ``_STALE_ECHO_DELETE_LIMIT`` with every
         other task_id-tagged memory; and client-side, as a cheap defensive
         re-check that costs nothing once the result set is already this
@@ -1032,14 +1031,12 @@ class TargetedReconciler:
         """
         memories = await self.memory.get_memories_by_metadata(
             project_id=scope.project_id,
-            filters={'task_id': task_id, 'source': _ECHO_SOURCE, 'transition': 'done'},
+            filters={'task_id': task_id, **RECONCILIATION_COMPLETION_ECHO_MARKER},
             limit=_STALE_ECHO_DELETE_LIMIT,
         )
         stale = [
             m for m in memories
-            if isinstance(m, dict)
-            and (m.get('metadata') or {}).get('source') == _ECHO_SOURCE
-            and (m.get('metadata') or {}).get('transition') == 'done'
+            if isinstance(m, dict) and is_reconciliation_completion_echo(m.get('metadata') or {})
         ]
         deleted_ids: list[str] = []
         for m in stale:
@@ -2009,8 +2006,8 @@ class TargetedReconciler:
         # rest of the sweep. Empty list = not yet attempted; single-element
         # list holds the value, or None/{} when it could not be built.
         #
-        # queue_memo: {task_id: [escalation_id, ...]} over all PENDING
-        #   escalations, scanned ONCE (targeted.py::_escalation_pin_index_for)
+        # queue_memo: {task_id: (pinning escalation_id, ...)}, from the
+        #   pending queue scanned ONCE (targeted.py::_escalation_pin_index_for)
         #   instead of one get_by_task glob-and-parse per dependent, which
         #   made the veto a D x E filesystem scan on the reconciliation hot
         #   path for a task with D blocked dependents and E open escalations.
@@ -2053,24 +2050,25 @@ class TargetedReconciler:
 
     async def _escalation_pin_index_for(
         self, project_root: ProjectRoot, queue_memo: list,
-    ) -> dict[str, list[str]] | None:
-        """Build the ``{task_id: [escalation_id, ...]}`` pin index used by the
-        dependent-unblock veto, memoizing the result (success OR failure) in
-        *queue_memo* so the escalation store is scanned at most once per sweep.
+    ) -> dict[str, tuple[str, ...]] | None:
+        """Build the pin index used by the dependent-unblock veto, memoizing
+        the result (success OR failure) in *queue_memo* so the escalation
+        store is scanned at most once per sweep.
 
-        Scans ONCE via ``escalation/queue.py::EscalationQueue.get_pending``
-        rather than calling ``get_by_task(dep_id, status='pending')`` per
-        dependent: both read the same ``queue_dir/esc-*.json`` glob and apply
-        the same ``status == 'pending'`` filter, so one scan plus a dict
-        lookup is equivalent to D scans while turning a D x E parse into
-        1 x E. Construction and scan run in one ``asyncio.to_thread`` hop
-        because ``EscalationQueue`` is synchronous blocking filesystem I/O and
-        this coroutine runs on the shared fused-memory event loop.
+        The index maps each task to the ids of its pending escalations that
+        PIN it, as decided by
+        ``reconciler_escalation.py::pinning_escalation_ids_by_task``. One
+        pending scan plus a dict lookup replaces a per-dependent
+        ``get_by_task`` scan, turning a D x E parse into 1 x E. Construction,
+        scan and classification run in one ``asyncio.to_thread`` hop because
+        ``EscalationQueue`` is synchronous blocking filesystem I/O and this
+        coroutine runs on the shared fused-memory event loop.
 
         Returns the index, or ``None`` when the store is unavailable -- there
         is no escalation-queue factory, construction raised, or the scan
         itself raised (the latter two logged at warning with
-        ``exc_info=True``). Every such arm vetoes rather than flips: a store
+        ``exc_info=True``; a classification failure counts as the scan
+        raising). Every such arm vetoes rather than flips: a store
         you cannot read cannot prove "no open escalation", and a false
         negative would unblock a task the orchestrator (or a human)
         deliberately parked -- the same fail-safe direction
@@ -2090,17 +2088,11 @@ class TargetedReconciler:
         if factory is None:
             queue_memo.append(None)
             return None
-        index: dict[str, list[str]] | None
+        index: dict[str, tuple[str, ...]] | None
         try:
-            index = {}
-            for esc in await asyncio.to_thread(pending_escalations, factory, project_root):
-                # str() both sides of what get_by_task compared with ==, so an
-                # int-typed task_id still pins its dependent rather than
-                # silently missing the lookup.
-                pinned = str(getattr(esc, 'task_id', '') or '')
-                esc_id = str(getattr(esc, 'id', '') or '')
-                if pinned:
-                    index.setdefault(pinned, []).append(esc_id)
+            index = await asyncio.to_thread(
+                pinning_escalation_ids_by_task, factory, project_root,
+            )
         except Exception:
             logger.warning(
                 'sweep: could not read the escalation store for the '
@@ -2195,9 +2187,8 @@ class TargetedReconciler:
             # Escalation-pin veto (task 4903): a task the orchestrator (or a
             # human) blocked *and* pinned with an open escalation must not be
             # unblocked here, or this sweep would immediately undo that park.
-            # See _escalation_pin_index_for for the fail-safe rationale and
-            # for why only PENDING escalations are indexed (resolved and
-            # dismissed ones pin nothing).
+            # An info record never pins (escalation.pins link 1). See
+            # _escalation_pin_index_for for the fail-safe rationale.
             pin_index = await self._escalation_pin_index_for(project_root, queue_memo)
             if pin_index is None:
                 return {
@@ -2207,15 +2198,15 @@ class TargetedReconciler:
                     'satisfied_by': satisfied_by,
                     'reason': 'escalation_store_unavailable',
                 }
-            open_escalations = pin_index.get(dep_id) or []
-            if open_escalations:
+            pinning_ids = pin_index.get(dep_id, ())
+            if pinning_ids:
                 return {
                     'type': 'dependent_unblock_vetoed',
                     'task_id': dep_id,
                     'title': dependent.get('title'),
                     'satisfied_by': satisfied_by,
                     'reason': 'escalation_pinned',
-                    'escalation_ids': list(open_escalations),
+                    'escalation_ids': list(pinning_ids),
                 }
 
             # Live status re-read -- the TOCTOU guard described in this
@@ -2645,7 +2636,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
       non-authoritative — a list whose only member is empty is not a
       supersession edge; or
     - a truthy ``_STAGE2_SUPPRESS_KEY`` (``stage2_suppress``) marker whose
-      ``source`` is NOT this reconciler's own echo (``source != _ECHO_SOURCE``)
+      ``source`` is NOT this reconciler's own echo (``source != TARGETED_RECONCILIATION_SOURCE``)
       — Stage 2's real, task_id-scoped "Completion-Note Suppression Pre-Check
       (stage2_suppress guard)" write side (prompts/stage2.py) is one writer of
       this key; TargetedReconciliation's own fast-path completion echo
@@ -2665,7 +2656,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     branch dead code (dead_trigger_correctness finding) — replaced here with
     the real ``stage2_suppress`` marker.
 
-    Plain prior targeted echoes (``source=_ECHO_SOURCE``, no ``supersedes``, no
+    Plain prior targeted echoes (``source=TARGETED_RECONCILIATION_SOURCE``, no ``supersedes``, no
     ``stage2_suppress``) are deliberately NOT authoritative, so a task's own
     earlier echoes never trigger suppression or oscillation — see
     _on_task_done's pre-echo guard (task 1984).
@@ -2678,8 +2669,8 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     check, that would make a task's own prior echo authoritative to THIS
     pre-check too — silently regressing the task-1984 invariant above on a
     re-done transition. So the ``stage2_suppress`` branch requires
-    ``source != _ECHO_SOURCE``: Stage 2's real guard writes (which carry
-    ``stage2_suppress`` without ``source=_ECHO_SOURCE``) stay authoritative,
+    ``source != TARGETED_RECONCILIATION_SOURCE``: Stage 2's real guard writes (which carry
+    ``stage2_suppress`` without ``source=TARGETED_RECONCILIATION_SOURCE``) stay authoritative,
     while a targeted self-echo carrying ``stage2_suppress`` stays
     non-authoritative to this pre-check — even though it still satisfies
     Stage 2's separate, external count gate.
@@ -2688,7 +2679,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
         return False
     if any(normalize_supersedes(metadata.get('supersedes'))):
         return True
-    return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != _ECHO_SOURCE
+    return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != TARGETED_RECONCILIATION_SOURCE
 
 
 # Bounds on the evidence pointers carried by the contradicted-verdict L1

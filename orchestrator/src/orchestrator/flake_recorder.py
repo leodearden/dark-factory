@@ -128,7 +128,7 @@ def _emit_merge_flake_suppressed(
     """
     if event_store is None:
         return
-    from orchestrator.event_store import EventType  # noqa: PLC0415 — lazy, avoid cycle
+    from orchestrator.event_store import EventType  # lazy, avoid cycle
 
     event_store.emit(
         EventType.merge_flake_suppressed,
@@ -291,7 +291,7 @@ def _file_storm_escalation(
     """File the storm escalation naming the window's *sites*, unless one is open.
 
     Modeled on
-    ``orchestrator/src/orchestrator/merge_lane/worker.py::_alarm_verify_worktree_contention``:
+    ``orchestrator/src/orchestrator/merge_lane/verify_failure_outcome.py::_alarm_verify_worktree_contention``:
     a born-at-L2 escalation (``severity='critical'``, ``level=2``,
     ``agent_role='orchestrator-merge-flake-monitor'`` — the ``orchestrator-``
     prefix marks it a harness sentinel so the escalation server never downgrades
@@ -301,7 +301,7 @@ def _file_storm_escalation(
     a deduped window's call sites reach only the log, since the open L2 names the
     window that filed it.
     """
-    from escalation.models import Escalation  # noqa: PLC0415 — local, escalation optional dep
+    from escalation.models import Escalation  # local, escalation optional dep
 
     sentinel = _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
     # Dedup: don't re-alarm while an open L2 already exists for the storm

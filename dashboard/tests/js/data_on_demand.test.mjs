@@ -1,5 +1,5 @@
 // data.js's on-demand seam: the ON_DEMAND_KEYS rows (terminal, taskProse,
-// quality);
+// quality, qualitySnapshotDiff);
 // requestOnDemand with its joining and retention; REFRESH_OUTCOMES; and what a
 // requesting caller reads back (onDemandView, onDemandDatum). Run via
 // `node --test`; dashboard/tests/test_graph_layout_js.py globs it.
@@ -164,7 +164,13 @@ test('on-demand: flow-control and staleness are recorded under the request\'s OW
   assert.equal(state.get(TASKS_PATH), undefined, 'the on-demand request took over the POLLED tasks entry');
   assert.ok(win.DF_DATA.__stale[TERMINAL_STATE_KEY], 'the on-demand request published no staleness of its own');
   assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, "the on-demand request wrote the polled endpoint's __stale");
-  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77, window: null, pacingHoldMs: 0 });
+  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], {
+    servedAt: '2026-09-20T09:00:01+00:00',
+    receivedAt: 77,
+    window: null,
+    pacingHoldMs: 0,
+    assetBuild: { started: null, onDisk: null },
+  });
   assert.equal(win.DF_DATA.__receipt[TASKS_PATH], undefined, "the on-demand receipt landed on the polled endpoint's path");
 });
 
@@ -894,5 +900,73 @@ test('quality: the route is on demand only, never in the polled registry', () =>
   for (const win of ['24h', '7d', '30d', 'all']) {
     const paths = Object.keys(api.endpointsFor(win)).map(api.pollKey);
     assert.equal(paths.includes(QUALITY_PATH), false, `endpointsFor('${win}') polls ${QUALITY_PATH}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// qualitySnapshotDiff — one snapshot point's instrument --diff text (task 8465)
+//
+// /api/v2/dashboard/quality/snapshot-diff answers with a FIXED body key,
+// QUALITY_SNAPSHOT_DIFF, whose value depends on the query, so it lands under
+// `QUALITY_SNAPSHOT_DIFF:<query>`. PLAIN: the diff is the instrument's report
+// text, not a measurement. The query is built once, by snapshotDiffQuery.
+// ---------------------------------------------------------------------------
+
+const SNAPSHOT_DIFF_PATH = '/api/v2/dashboard/quality/snapshot-diff';
+const SERVED_DIFF = Object.freeze({
+  point_id: 'nightly-2', previous_id: 'nightly-1', state: 'ready', text: 'params differ: python_version\n', reason: null,
+});
+
+test('snapshotDiffQuery: fixed key order and URL-encoded', () => {
+  const { api } = loadDataJs();
+  const { snapshotDiffQuery } = api;
+
+  assert.equal(snapshotDiffQuery({ project: 'dark_factory', point: 'nightly-2' }), 'project=dark_factory&point=nightly-2');
+  assert.equal(
+    snapshotDiffQuery({ point: 'review-all dark/factory&2', project: 'a b' }),
+    'project=a%20b&point=review-all%20dark%2Ffactory%262',
+  );
+  assert.equal(
+    snapshotDiffQuery({ project: 'p', point: 'x' }),
+    snapshotDiffQuery({ point: 'x', project: 'p' }),
+    'equal inputs give equal params, whatever their key order',
+  );
+});
+
+test('qualitySnapshotDiff: the row builds its url from the query and keys its one plain field under it', () => {
+  const { api } = loadDataJs();
+  const row = api.ON_DEMAND_KEYS.qualitySnapshotDiff;
+  const q = api.snapshotDiffQuery({ project: 'p', point: 'nightly-2' });
+
+  assert.ok(row, 'ON_DEMAND_KEYS.qualitySnapshotDiff must be declared');
+  assert.equal(row.url(q), `${SNAPSHOT_DIFF_PATH}?${q}`);
+  assert.equal(row.key(q), `QUALITY_SNAPSHOT_DIFF:${q}`);
+  assert.deepEqual([...row.fields], ['QUALITY_SNAPSHOT_DIFF']);
+  assert.equal(row.spec.kind, 'plain');
+  assert.equal(row.retain, 8);
+});
+
+test('qualitySnapshotDiff: one fetch stores the served diff verbatim under its query-scoped key', async () => {
+  const { api, window: win } = loadDataJs();
+  const q = api.snapshotDiffQuery({ project: 'p', point: 'nightly-2' });
+  const fetchUrls = [];
+  const deps = {
+    fetchImpl: url => { fetchUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ QUALITY_SNAPSHOT_DIFF: SERVED_DIFF }) }); },
+    now: () => 5,
+  };
+
+  const outcome = await api.requestOnDemand('qualitySnapshotDiff', q, { state: api.createPollState(), deps });
+
+  assert.equal(outcome, api.REFRESH_OUTCOMES.applied);
+  assert.deepEqual(fetchUrls, [`${SNAPSHOT_DIFF_PATH}?${q}`]);
+  assert.deepEqual(win.DF_DATA[api.ON_DEMAND_KEYS.qualitySnapshotDiff.key(q)], SERVED_DIFF);
+  assert.equal(win.DF_DATA.QUALITY_SNAPSHOT_DIFF, undefined, 'nothing lands under the bare body key');
+});
+
+test('qualitySnapshotDiff: the route is on demand only, never in the polled registry', () => {
+  const { api } = loadDataJs();
+  for (const win of ['24h', '7d', '30d', 'all']) {
+    const paths = Object.keys(api.endpointsFor(win)).map(api.pollKey);
+    assert.equal(paths.includes(SNAPSHOT_DIFF_PATH), false, `endpointsFor('${win}') polls ${SNAPSHOT_DIFF_PATH}`);
   }
 });

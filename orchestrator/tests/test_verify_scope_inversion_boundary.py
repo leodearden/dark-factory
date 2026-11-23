@@ -22,7 +22,7 @@ main before this task started:
   ``cached_main_baseline_failing_ids`` / ``diff_new_failures`` (verify.py);
   junit ``failing_test_ids`` on ``VerifyResult``; the merge worker cites
   NEW-only ids vs routing MAIN_HEALTH_RED (merge_queue.py
-  ``_classify_main_health_red`` / ``_run_post_merge_verify``).
+  ``_classify_main_health_red`` / ``run_post_merge_verify``).
 - ν (2591): infra-transient outcomes consume zero attempts at both the
   workflow ``_verify_debugfix_loop`` and merge accounting
   (``INFRA_TRANSIENT_CATEGORIES``, verify_categories.py).
@@ -34,20 +34,21 @@ Row    Name                                        Seam(s) driven
 =====  =========================================  ===============================================
 1      source-only sibling break rejected          producer: ``run_scoped_verification`` (merge+full
                                                      widens to the untouched sibling module); consumer:
-                                                     ``_run_post_merge_verify`` (real merge gate, BLOCKED
+                                                     ``run_post_merge_verify`` (real merge gate, BLOCKED
                                                      citing the sibling's failing id)
 2      task-role signal                            producer+observable: ``run_scoped_verification``
                                                      (role='task' — the floor never widens beyond the
                                                      owning module)
-3      docs-only trivial, both roles                producer+consumer: ``run_scoped_verification`` at
-                                                     both role='task'/'merge' (TRIVIAL short-circuit,
-                                                     zero commands)
-4      new-vs-preexisting baseline attribution      consumer: ``_run_post_merge_verify`` (mixed
+3      prose-only trivial, both roles;              producer+consumer: ``run_scoped_verification`` at
+       behavioural artifact routed at task role     both role='task'/'merge' (TRIVIAL short-circuit,
+                                                     zero commands); a behavioural artifact runs its
+                                                     consumer tests at role='task'
+4      new-vs-preexisting baseline attribution      consumer: ``run_post_merge_verify`` (mixed
                                                      baseline — blocked citing only the NEW id)
-5      wholly pre-existing + cache hit              consumer: ``_run_post_merge_verify`` x2 (MAIN_HEALTH_RED
+5      wholly pre-existing + cache hit              consumer: ``run_post_merge_verify`` x2 (MAIN_HEALTH_RED
                                                      routing, no branch charge, one probe across two merges)
 6      infra non-consumption, both consumers        task-verify: ``TaskWorkflow._verify_debugfix_loop``;
-                                                     merge-verify: ``_run_post_merge_verify`` accounting
+                                                     merge-verify: ``run_post_merge_verify`` accounting
 7      train amortization                           ``MergeLane`` train merge (exactly one broad,
                                                      per-module merge-role verify of the train tip)
 8      rollback path (breadth='scoped')              producer: ``run_scoped_verification`` (byte-identical
@@ -64,7 +65,7 @@ Harness approach — drive REAL seams both ways, fake runners, no ssh (the
 ``orchestrator.verify.run_verification`` (never a real subprocess) and
 inspects the executed ``ModuleConfig``(s) / ``VerifyResult.plan`` /
 ``VerifyResult.summary``. The CONSUMER/merge-gate side drives the REAL
-``_run_post_merge_verify`` chokepoint (merge_queue.py), opting OUT of the
+``run_post_merge_verify`` chokepoint (merge_queue.py), opting OUT of the
 autouse ``_mock_merge_queue_verification`` stub via
 ``@pytest.mark.exercise_merge_verify`` so ``orchestrator.merge_lane.worker.
 run_scoped_verification`` stays bound to the REAL function — which, in turn,
@@ -105,6 +106,16 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _merge_lane_fakes import lane_scene_config, merge_through_lane
+from _verify_artifact_fixtures import (
+    ARTIFACT_MODULES,
+    ARTIFACT_ORCH_MC,
+    ROOT_YAML,
+    SKILL_PROMPT_CONSUMERS,
+    SPAWN_CONSUMERS,
+    SPAWN_SH,
+    UNBLOCK_SKILL,
+    registry_config,
+)
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
 from test_verify import _real_worktree_reader
@@ -124,12 +135,10 @@ from orchestrator import verify, verify_plan
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
-    TRANSIENT_INFRA_REASON_PREFIX,
-    MergeOutcome,
-    _run_post_merge_verify,
-)
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER, MergeOutcome
 from orchestrator.verify import (
     VerifyResult,
     _mc_attr_for_run_or_none,
@@ -166,10 +175,10 @@ MODB_SIBLING_TEST_CONTENT: str = (
 # modB — shaped like a real junit-derived id (VerifyResult.failing_test_ids).
 MODB_FAILING_TEST_ID: str = 'modb/tests/test_sibling.py::test_sibling_contract'
 
-# Row 3's docs-only diff — no `.py`/`.rs` extension, so it can never satisfy
-# verify_plan._has_source_files; the ScopeKind.TRIVIAL short-circuit fires
-# ahead of both the module-config and fallback branches, independent of role
-# or merge_verify_breadth (R2).
+# Row 3's prose-only diff — no `.py`/`.rs` source and no behavioural artifact,
+# so verify_plan.is_trivial_diff holds; the ScopeKind.TRIVIAL short-circuit
+# fires ahead of both the module-config and fallback branches, independent of
+# role or merge_verify_breadth (R2).
 DOCS_ONLY_PATH: str = 'skills/foo.md'
 DOCS_ONLY_CONTENT: str = '# foo\n'
 
@@ -273,7 +282,7 @@ async def _drive_merge_gate(
     timeouts: dict[str, int] | None = None,
     enospc_retries: dict[str, int] | None = None,
 ) -> MergeOutcome | None:
-    """Drive the REAL merge-gate consumer chokepoint, ``_run_post_merge_verify``.
+    """Drive the REAL merge-gate consumer chokepoint, ``run_post_merge_verify``.
 
     Builds a merge+full ``OrchestratorConfig`` (with *module_configs_registry*
     installed as its module registry — mirrors ``_two_module_registry``'s
@@ -290,7 +299,7 @@ async def _drive_merge_gate(
 
     *task_files_content* (``{relative path: file content}``) is written into
     the MERGE worktree (``merge_wt`` — the actual worktree
-    ``_run_post_merge_verify`` scopes against), not the outer *tmp_path*
+    ``run_post_merge_verify`` scopes against), not the outer *tmp_path*
     scratch dir. Omitting this (an empty dict, or a path *task_files* names
     but *task_files_content* doesn't cover) leaves ``merge_wt`` without the
     touched file on disk, which degrades plan derivation to the TRIVIAL
@@ -313,7 +322,7 @@ async def _drive_merge_gate(
     expensive worktree-probe fallback is what the cache actually elides.
 
     *timeouts* / *enospc_retries* let a caller inspect the merge-side
-    attempt-accounting dicts ``_run_post_merge_verify`` mutates in place
+    attempt-accounting dicts ``run_post_merge_verify`` mutates in place
     (the timeout loop-breaker and the shared ENOSPC/classified-infra retry
     budget, respectively) — default ``None`` builds fresh empty dicts
     per-call (byte-identical to every pre-existing call site, which never
@@ -345,10 +354,11 @@ async def _drive_merge_gate(
     req.module_configs = list(touched_module_configs)
 
     with patch.object(verify, 'run_verification', new=run_verification_fake):
-        return await _run_post_merge_verify(
+        return await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
             max_timeouts=3, max_enospc=1,
+            verifier=PRODUCTION_VERIFIER,
         )
 
 
@@ -393,7 +403,7 @@ async def _drive_producer(
 # ---------------------------------------------------------------------------
 # Row 1: "the hole, closed" — source-only sibling break rejected at the
 # merge gate. Builds the shared row-1 harness (instrumented fake
-# run_verification + the _run_post_merge_verify consumer driver), reused
+# run_verification + the run_post_merge_verify consumer driver), reused
 # unmodified by rows 4 and 5.
 # ---------------------------------------------------------------------------
 
@@ -514,13 +524,13 @@ class TestRow2TaskRoleSignal:
 
 
 # ---------------------------------------------------------------------------
-# Row 3: "docs-only trivial, both roles" — R2 parity survives the inversion.
-# A `.md`-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at the
+# Row 3: "prose-only trivial, both roles" — R2 parity survives the inversion.
+# A prose-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at the
 # PRODUCER seam (``run_scoped_verification`` with is_merge_verify=False) for
 # BOTH role='task'/'merge', breadth-independent — zero commands.
 #
 # INV-1 (task 2883) UPDATE: the CONSUMER seam is the *adoptable* merge verdict
-# (``_run_post_merge_verify`` → is_merge_verify=True). INV-1 abolishes the
+# (``run_post_merge_verify`` → is_merge_verify=True). INV-1 abolishes the
 # no-evidence trivial pass there: a docs-only ('no_source_files') diff at the
 # real merge gate no longer trivially passes — it escalates to the project's
 # full gate when a full-gate command exists (see
@@ -535,17 +545,22 @@ class TestRow2TaskRoleSignal:
 ROW3_MAIN_SHA: str = 'r3main0000000000000000000000000000000000'
 
 
-class TestRow3DocsOnlyTrivialBothRoles:
-    """Row 3 (PRD boundary-test sketch): a docs-only diff (no ``.py``/``.rs``
-    file) short-circuits to ``ScopeKind.TRIVIAL`` ahead of BOTH the
-    module-config and fallback branches (verify_plan.derive_verify_plan) —
-    zero ``run_verification`` calls, independent of role or
+class TestRow3ProseOnlyTrivialBothRoles:
+    """Row 3 (PRD boundary-test sketch): a prose-only diff (no ``.py``/``.rs``
+    and no behavioural artifact; see
+    ``orchestrator/src/orchestrator/verify_artifact_consumers.py::BEHAVIOURAL_ARTIFACTS``)
+    short-circuits to ``ScopeKind.TRIVIAL`` ahead of BOTH the module-config
+    and fallback branches (verify_plan.derive_verify_plan) — zero
+    ``run_verification`` calls, independent of role or
     ``merge_verify_breadth`` (R2). This row pins that the inversion (κ/λ)
     never regresses this pre-existing invariant at the PRODUCER
     (``run_scoped_verification``, is_merge_verify=False) seam.
 
+    A behavioural-artifact diff at role='task' is NOT trivial: it runs its
+    consumer tests (task 5296). Merge role is unchanged.
+
     INV-1 (task 2883) amends the CONSUMER seam: the adoptable merge verdict
-    (``_run_post_merge_verify`` → is_merge_verify=True) no longer trivially
+    (``run_post_merge_verify`` → is_merge_verify=True) no longer trivially
     passes a no-evidence resolution. A docs-only diff at the real merge gate
     now escalates to the project's full gate (a ``trivial_pass_escalated``
     event with reason='no_source_files', resolution='full_gate') and runs the
@@ -603,6 +618,140 @@ class TestRow3DocsOnlyTrivialBothRoles:
             f'to the global full gate and run it exactly once (never a '
             f'no-evidence trivial pass); got {consumer_fake.await_count} call(s)'
         )
+
+    @staticmethod
+    def _write_artifact(tmp_path: Path, path: str) -> list[str]:
+        full = tmp_path / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('# artifact\n')
+        return [path]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('artifact', 'consumers'),
+        [
+            pytest.param(SPAWN_SH, SPAWN_CONSUMERS, id='spawn-sh'),
+            pytest.param(UNBLOCK_SKILL, {'orchestrator': SKILL_PROMPT_CONSUMERS}, id='unblock-skill'),
+            pytest.param(ROOT_YAML, {'tests/scripts': None}, id='root-yaml-full-suite'),
+        ],
+    )
+    async def test_behavioural_artifact_runs_its_consumers_at_task_role(
+        self, tmp_path: Path, artifact: str, consumers: dict[str, tuple[str, ...] | None],
+    ) -> None:
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        files = self._write_artifact(tmp_path, artifact)
+
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='task',
+        )
+
+        assert not result.trivial
+        assert set(executed) == set(consumers)
+        for prefix, tests in consumers.items():
+            mc = executed[prefix]
+            assert (mc.lint_command, mc.type_check_command) == (None, None), prefix
+            if tests is None:
+                assert mc.test_command == config.module_configs_or_empty[prefix].test_command
+            else:
+                assert mc.test_command is not None
+                assert all(test in mc.test_command for test in tests), mc.test_command
+        assert result.plan is not None
+        assert all(run['scope_kind'] != 'trivial' for run in result.plan['runs'])
+
+    @pytest.mark.asyncio
+    async def test_artifact_beside_unowned_source_keeps_the_full_fan_out(self, tmp_path: Path) -> None:
+        """Adding an artifact to an unowned-source diff never shrinks coverage (monotonicity)."""
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        source_only = self._write_artifact(tmp_path, 'conftest.py')
+        with_artifact = [*source_only, *self._write_artifact(tmp_path, UNBLOCK_SKILL)]
+
+        _r, baseline, _f = await _drive_producer(
+            tmp_path, config, [ARTIFACT_ORCH_MC], task_files=source_only, role='task',
+        )
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [ARTIFACT_ORCH_MC], task_files=with_artifact, role='task',
+        )
+
+        assert not result.trivial
+        assert baseline == {'orchestrator': ARTIFACT_ORCH_MC}
+        assert executed == baseline
+
+    @pytest.mark.asyncio
+    async def test_unowned_source_fan_out_takes_in_the_artifact_consumer_modules(
+        self, tmp_path: Path,
+    ) -> None:
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        files = [*self._write_artifact(tmp_path, 'conftest.py'), *self._write_artifact(tmp_path, SPAWN_SH)]
+
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [ARTIFACT_ORCH_MC], task_files=files, role='task',
+        )
+
+        assert not result.trivial
+        assert executed == {mc.prefix: mc for mc in ARTIFACT_MODULES}
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_source_file_never_suppresses_a_present_artifact(
+        self, tmp_path: Path,
+    ) -> None:
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        deleted = 'skills/factory-init/scripts/find_escalation_port.py'
+        files = [deleted, *self._write_artifact(tmp_path, UNBLOCK_SKILL)]
+
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='task',
+        )
+
+        assert not result.trivial
+        assert set(executed) == {'orchestrator'}
+        test_command = executed['orchestrator'].test_command
+        assert test_command is not None
+        assert all(test in test_command for test in SKILL_PROMPT_CONSUMERS), test_command
+
+    @pytest.mark.asyncio
+    async def test_prose_stays_trivial_beside_a_consumer_registry(self, tmp_path: Path) -> None:
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        files = self._write_artifact(tmp_path, 'README.md')
+
+        result, executed, fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='task',
+        )
+
+        assert result.trivial
+        assert fake.await_count == 0
+        assert executed == {}
+
+    @pytest.mark.asyncio
+    async def test_behavioural_artifact_stays_trivial_at_merge_role(self, tmp_path: Path) -> None:
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        files = self._write_artifact(tmp_path, SPAWN_SH)
+
+        result, _executed, fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='merge', is_merge_verify=False,
+        )
+
+        assert result.passed
+        assert result.trivial
+        assert fake.await_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('path', [SPAWN_SH, UNBLOCK_SKILL, ROOT_YAML, 'README.md'])
+    async def test_run_scoped_verification_and_verify_plan_agree_on_trivial(
+        self, tmp_path: Path, path: str,
+    ) -> None:
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        files = self._write_artifact(tmp_path, path)
+
+        result, _executed, _fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='task',
+        )
+        plan = verify_plan.derive_verify_plan(
+            files, verify_plan.with_artifact_consumer_modules(config, [], files, 'task'),
+            config, _real_worktree_reader(tmp_path), role='task',
+        )
+
+        plan_is_trivial = len(plan.runs) == 1 and plan.runs[0].scope_kind is verify_plan.ScopeKind.TRIVIAL
+        assert result.trivial is plan_is_trivial
 
 
 # ---------------------------------------------------------------------------
@@ -738,7 +887,7 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
         shared_git_ops = _make_git_ops(tmp_path)
         probe_spy = AsyncMock(wraps=verify_failure_is_preexisting_on_main)
         with patch(
-            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
             new=probe_spy,
         ):
             outcome1 = await _drive_merge_gate(
@@ -890,7 +1039,7 @@ class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
         assert wf._infra_hold_info.get('category') == 'infra_issue'
         assert wf._infra_hold_info.get('escalate_to_human') is True
 
-        # -- MERGE-verify side: drive the REAL merge gate (_run_post_merge_verify)
+        # -- MERGE-verify side: drive the REAL merge gate (run_post_merge_verify)
         # with the SAME persistent infra-transient category. A single touched,
         # unregistered-sibling module keeps the aggregate category exactly
         # ROW6_INFRA_CATEGORY (no widening to muddy the classification).
@@ -938,7 +1087,7 @@ class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
 # Row 7: "train amortization" (λ/σ, T1). A 3-member line-stacked Python
 # train lands via exactly ONE broad, per-module merge-role verify of the
 # TIP — the amortization win — driven through the REAL
-# ``MergeLane`` -> ``_do_train_merge`` -> ``_run_post_merge_verify``
+# ``MergeLane`` -> ``_do_train_merge`` -> ``run_post_merge_verify``
 # chokepoint chain. Adapts test_train_integration.py's real-git train harness
 # (``make_stacked_member`` / ``build_group_merge_request`` / ``_SpyEventStore``)
 # driven through ``MergeLane``, to non-cargo Python modules with an

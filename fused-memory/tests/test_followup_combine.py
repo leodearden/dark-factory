@@ -18,10 +18,10 @@ from _submit_stack import curator_script as curator_script
 from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
 from _submit_stack import stack as stack
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, derive_declared_scope
+from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, item_key, legacy_item, observed_item
 
 from fused_memory.middleware.curator_types import CuratorDecision, RewrittenTask
-from fused_memory.middleware.followup_hold import FOLLOWUP_HOLDER_METADATA_KEY
 
 _FILES = ['src/app/a.py', 'src/app/b.py', 'src/app/c.py']
 _A = {'summary': 'The retry loop swallows the timeout', 'files': ['src/app/a.py']}

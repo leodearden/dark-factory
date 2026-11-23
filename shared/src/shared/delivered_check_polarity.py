@@ -140,6 +140,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
+from shared.declared_checks import declared_checks
 from shared.delivered_check_scope import (
     GIT_PROBE_FAILURES,
     GIT_TIMEOUT_SECS,
@@ -614,7 +615,7 @@ def _lint_grep_check(
                 manifest_path=check.get('manifest_path'),
             )
             message = _vacuous_present_refined_message(code, name, pattern, ref, sites)
-        except Exception:  # noqa: BLE001 - a refinement must never lose the reject
+        except Exception:  # a refinement must never lose the reject
             logger.warning(
                 'delivered_check polarity: refinement failed for check %r '
                 '(pattern=%r, ref=%s, repo_root=%s); reporting the unrefined '
@@ -643,7 +644,7 @@ def _lint_grep_check(
             return _absent_overbroad_finding(
                 name, pattern, paths, files=files, repo_root=repo_root, ref=sha
             )
-    except Exception:  # noqa: BLE001 - these are advisory; never fail the lint
+    except Exception:  # these are advisory; never fail the lint
         # Degrading here loses only a diagnosis, never a rejection: the 2x2
         # has already declared this check healthy. Logged rather than
         # swallowed so the gate's own coverage gaps stay visible.
@@ -809,10 +810,10 @@ def _stale_scope_findings(
 # Diagnostic refinements, and the two rules the 2x2 cannot see
 # ---------------------------------------------------------------------------
 
-#: Mirrors ``fused_memory.server.manifest_stamping._SIDECAR_SUFFIX`` and
+#: Mirrors ``shared/src/shared/capability_manifest.py::SIDECAR_SUFFIX``, as does
 #: ``shared/tests/cross_suite_helpers/capability_manifest_corpus.py::MANIFEST_SUFFIX``.
-#: Re-declared rather than imported for the same reason the latter does it:
-#: ``shared`` must not depend on ``fused_memory``.
+#: Restated rather than imported until task 6764 (S25 ι in
+#: ``plans/review-all-s25-scripts-instruments-prd.md``) switches both to it.
 _MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
 #: A match line in a non-markdown file starting (after leading whitespace)
@@ -1234,16 +1235,14 @@ def extract_delivered_checks(metadata: object) -> list[dict[str, Any]]:
     * ``''`` → ``[]`` (benign-absent, not a discard)
     * ``str`` → ``json.loads``; on failure, or a non-object result → ``[]``
     * anything else (list, int, ...) → ``[]``
-    * no ``delivered_checks`` key, or a non-list value → ``[]``
-    * non-dict entries inside the list are filtered out
+    * the decoded mapping → the ``checks`` of
+      ``shared/src/shared/declared_checks.py::declared_checks``
 
-    That function is the SPEC this is kept in sync with, and it is
+    ``extract_files`` is the SPEC this is kept in sync with, and it is
     DUPLICATED rather than imported for one structural reason: it lives in
     ``fused_memory``, and ``shared`` must not import ``fused_memory`` (the
     dependency runs the other way — this module exists in ``shared``
     precisely so both ``fused_memory`` and ``orchestrator`` can reach it).
-    ``capability_manifest_corpus.MANIFEST_SUFFIX`` re-declares a
-    ``fused_memory`` constant for the same reason.
 
     The one deliberate divergence: ``extract_files`` routes its ``str``
     branch through ``shared.task_metadata.parse_metadata`` to emit a
@@ -1266,10 +1265,7 @@ def extract_delivered_checks(metadata: object) -> list[dict[str, Any]]:
     if parsed is None:
         return []
 
-    checks = parsed.get('delivered_checks')
-    if not isinstance(checks, list):
-        return []
-    return [c for c in checks if isinstance(c, dict)]
+    return list(declared_checks(parsed).checks)
 
 
 #: The remedy every measured repair actually used. Stated POSITIVELY on

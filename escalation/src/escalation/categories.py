@@ -6,8 +6,9 @@ producer, a live reader, an agent/skill instruction, or a record still pending
 in some queue.
 
 Enforced by :func:`require_registered_category` at ``EscalationQueue.submit``,
-``submit_resolved``, ``has_open_l1`` and ``find_terminal_by_citation``, and by
-the ``escalate_blocker``, ``escalate_info`` and ``promote_to_l2`` tools.
+``submit_resolved``, ``has_open_l1``, ``find_terminal_by_citation`` and
+``newest_terminal_by_task``, and by the ``escalate_blocker``, ``escalate_info``
+and ``promote_to_l2`` tools.
 Rehydrating a stored record is never checked. ``escalation/tests/
 test_category_census.py`` fails verify on a filer passing an unregistered one.
 """
@@ -32,6 +33,7 @@ class EscalationCategory(StrEnum):
     CURATOR_BACKEND_BINARY_UNRESOLVABLE = 'curator_backend_binary_unresolvable'
     CURATOR_CONSECUTIVE_DEGRADED = 'curator_consecutive_degraded'
     CURATOR_FAILURE = 'curator_failure'
+    CURATOR_REGISTRY_LOAD_FAILED = 'curator_registry_load_failed'
     CURATOR_SCHEMA_TOOL_DENIED = 'curator_schema_tool_denied'
     CURATOR_ZERO_OUTPUT_HANG = 'curator_zero_output_hang'
     CURATOR_ZOT_DUPLICATE = 'curator_zot_duplicate'
@@ -72,10 +74,12 @@ class EscalationCategory(StrEnum):
     MISSING_PREMISE = 'missing_premise'
     OUT_OF_SCOPE = 'out_of_scope'
     PLANNING_STALLED = 'planning_stalled'
+    PLAN_DELIVERY_UNMEASURED = 'plan_delivery_unmeasured'
     POST_MERGE_VERIFY = 'post_merge_verify'
     PREEXISTING_MAIN_BREAK = 'preexisting_main_break'
     PROVENANCE_CONFLICT = 'provenance_conflict'
     PROVENANCE_UNATTRIBUTED = 'provenance_unattributed'
+    PROVIDER_BILLING_EXHAUSTED = 'provider_billing_exhausted'
     RECON_AUTO_CONSOLIDATION_BACKLOG = 'recon_auto_consolidation_backlog'
     RECON_AUTO_CONSOLIDATION_REFUSED = 'recon_auto_consolidation_refused'
     RECON_BACKLOG_OVERFLOW = 'recon_backlog_overflow'

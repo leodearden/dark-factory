@@ -1,0 +1,2 @@
+PASS — 193 passed, 0 failed (doctests: 0 passed, 1 ignored), CARGO_EXIT=0. The tail showed only one test binary's summary line, so that count doesn't cover any earlier binaries.
+is_error False turns 2 cost 0.1609628

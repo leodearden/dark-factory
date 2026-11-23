@@ -21,6 +21,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _CODEBOOK = 'docs/legibility/confusion-codebook.yaml'
 _CENSUS_STATE = 'docs/legibility/census-state.json'
 _HEAD_CODEBOOK = b'version: 2\nentries: []\n'
@@ -140,20 +141,21 @@ def test_roll_back_never_touches_the_checkout_when_the_quarantine_cannot_be_writ
     assert (repo / _CODEBOOK).read_bytes() == _REFUSED
 
 
-def test_roll_back_keeps_the_quarantine_when_the_restore_fails(tmp_path):
+def _incomplete_rollback(tmp_path: Path) -> unlanded.Rollback:
     not_a_repo = tmp_path / 'not-a-repo'
     not_a_repo.mkdir()
     (not_a_repo / 'written.yaml').write_bytes(_REFUSED)
+    return unlanded.roll_back(not_a_repo, ['written.yaml'], project_id='proj', label='trickle-2026-07-13')
 
-    rb = unlanded.roll_back(
-        not_a_repo, ['written.yaml'], project_id='proj', label='trickle-2026-07-13',
-    )
+
+def test_roll_back_keeps_the_quarantine_when_the_restore_fails(tmp_path):
+    rb = _incomplete_rollback(tmp_path)
 
     assert rb.restored is False
     assert rb.failure
     assert rb.quarantine_dir is not None
     assert (rb.quarantine_dir / 'written.yaml').read_bytes() == _REFUSED
-    assert (not_a_repo / 'written.yaml').read_bytes() == _REFUSED
+    assert (tmp_path / 'not-a-repo' / 'written.yaml').read_bytes() == _REFUSED
     assert str(rb.quarantine_dir) in rb.describe()
     assert rb.failure in rb.describe()
 
@@ -220,6 +222,30 @@ def test_describe_names_the_quarantine_and_the_restored_paths(tmp_path):
     assert str(rb.quarantine_dir) in description
     assert _CODEBOOK in description
     assert _CENSUS_STATE in description
+
+
+def _restored_rollback(tmp_path: Path) -> unlanded.Rollback:
+    repo = _repo(tmp_path)
+    (repo / _CODEBOOK).write_bytes(_REFUSED)
+    return unlanded.roll_back(repo, [_CODEBOOK], project_id='proj', label='census-2026-07-14')
+
+
+@pytest.mark.parametrize(
+    ('make_rollback', 'restored'),
+    [(_restored_rollback, True), (_incomplete_rollback, False)],
+    ids=['restored', 'incomplete'],
+)
+def test_describe_points_at_the_recovery_runbook_section(tmp_path, make_rollback, restored):
+    rb = make_rollback(tmp_path)
+
+    assert rb.restored is restored
+    assert f'dark-factory:OPERATIONS.md §"{unlanded.RUNBOOK_SECTION}"' in rb.describe()
+
+
+def test_runbook_section_is_an_operations_heading():
+    operations = (_REPO_ROOT / 'OPERATIONS.md').read_text(encoding='utf-8').splitlines()
+
+    assert f'### {unlanded.RUNBOOK_SECTION}' in operations
 
 
 # ---------------------------------------------------------------------------

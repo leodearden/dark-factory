@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EventType(StrEnum):
@@ -20,6 +20,11 @@ class EventType(StrEnum):
     task_deleted = 'task_deleted'
     deferral_restamped = 'deferral_restamped'
     task_text_amended = 'task_text_amended'
+    followup_held = 'followup_held'
+    followup_hold_backfilled = 'followup_hold_backfilled'
+    followup_holder_protected = 'followup_holder_protected'
+    followup_promoted = 'followup_promoted'
+    followup_promotion_deferred = 'followup_promotion_deferred'
 
 
 class EventSource(StrEnum):
@@ -167,13 +172,12 @@ class ReconciliationRun(BaseModel):
     status: RunStatus = RunStatus.running
     triggered_by: str | None = None  # parent run_id for remediation runs
     instance_id: str | None = None  # EventBuffer.instance_id of the harness that started the run
-    # CLI session id minted for the in-flight stage subprocess (cleared between
-    # stages). Best-effort: reflects the value minted before launch and may be
-    # stale after an internal cap retry regenerates the session. See
-    # ReconciliationJournal.record_run_session.
+    # Legacy run-row fields (task 2744), unwritten since task 8745. They surface
+    # a pre-8745 row's values via get_run; their columns stay to avoid a
+    # column-drop migration.
     session_id: str | None = None
-    stage_cursor: str | None = None  # StageId.value of the in-flight stage (cleared between stages)
-    attempt: int = 0  # monotonic count of stage invocations for this run (not subprocess spawns; a cap retry doesn't bump it)
+    stage_cursor: str | None = None
+    attempt: int = 0
 
     @field_validator('project_id', mode='before')
     @classmethod
@@ -332,3 +336,19 @@ class JudgeVerdict(BaseModel):
     severity: VerdictSeverity
     findings: list[dict] = Field(default_factory=list)
     action_taken: VerdictAction = VerdictAction.none
+
+
+class JudgeInvocation(BaseModel):
+    """One claude_cli judge invocation's turn-cap and rejected-tool-call outcome (task 6573).
+
+    Both counts are None when unknown, never a fabricated 0.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    completed_at: datetime
+    ended_error_max_turns: bool
+    schema_salvaged: bool
+    num_turns: int | None = Field(ge=1)
+    rejected_tool_calls: int | None = Field(ge=0)

@@ -64,6 +64,7 @@ from legibility import (  # noqa: E402
     layout,
     session_ledger,
     session_runner,
+    sighting_fit,
     synthesis,
     task_store,
     unlanded,
@@ -89,10 +90,13 @@ own components can be a confusion's fix surface. Its project_root names the
 MAIN checkout even when the census runs from a worktree."""
 
 
-def _synthesis_prompt(brief: synthesis.Brief, *, quality_block: str) -> str:
+def synthesis_prompt(brief: synthesis.Brief, *, quality_block: str) -> str:
     """Prompt for the real Fable synthesize_fn: observations on this run's new
     and re-observed findings (*brief*), as the C6 document ``synthesis.parse``
-    validates, judged against *quality_block* (``code_quality.guidance``)."""
+    validates, judged against *quality_block* (``code_quality.guidance``).
+
+    The opening sentence is restated, lowercased, as
+    ``reingestion.CENSUS_SYNTHESIS_PROMPT_OPENER``; tests hold the two in step."""
     return (
         "You are the periodic-census synthesis writer for the dark-factory "
         "agent-confusion codebook (plans/census-incremental-prd.md C6). You have "
@@ -124,7 +128,7 @@ def build_synthesize_fn(invoke):
     quality_block = code_quality.guidance()
 
     def _synthesize_fn(brief: synthesis.Brief, *, model: str) -> str:
-        return invoke(_synthesis_prompt(brief, quality_block=quality_block), model)
+        return invoke(synthesis_prompt(brief, quality_block=quality_block), model)
 
     return _synthesize_fn
 
@@ -387,7 +391,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     # passed relative by an operator. An unresolved relative root would make
     # the stage cwd binding below vacuous (cwd="." IS the launcher's cwd —
     # exactly the bug that binding exists to close) and would silently falsify
-    # census_verify.py::_verify_prompt's "ABSOLUTE paths only" contract, since it
+    # census_verify.py::verify_prompt's "ABSOLUTE paths only" contract, since it
     # interpolates str(project_root) straight into the prompt. One resolve()
     # at the CLI boundary makes the prompt text, the subprocess cwd and all
     # four output paths name the same absolute tree.
@@ -415,7 +419,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
 
     try:
         cfg = config.load_config(config_path)
-    except Exception as exc:  # noqa: BLE001 - a broken/missing config fails loud at CLI startup
+    except Exception as exc:  # a broken/missing config fails loud at CLI startup
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
@@ -530,6 +534,9 @@ def _run_configured_census(
                     census_headroom.preflight_headroom, verify_invoke, model=cfg.models.trickle,
                 ),
             ),
+            # A pure classifier over text in its prompt, so it rides the
+            # mining stage; the census_verify model is passed per call.
+            fit_fn=sighting_fit.build_fit_fn(mining_invoke),
             synthesize_fn=build_synthesize_fn(synthesis_invoke),
             embedder=embeddings.Embedder(
                 embed_fn=embeddings.openai_embed, cache_path=embeddings.cache_path(cfg.project_id),

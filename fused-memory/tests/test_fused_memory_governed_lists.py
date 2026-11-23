@@ -54,6 +54,15 @@ WALL_CLOCK_DEADLINE_BASELINE = governed_exceptions(
     default_covers=1,
 )
 
+TIMING_DEPENDENCE_BASELINE = governed_exceptions(
+    'fused_memory_scripts._timing_dependence_debt.TIMING_DEPENDENCE_DEBT',
+    'Per-file budgets of timing-dependence (Rule D) violations grandfathered when the '
+    'rule was adopted; each budget may only fall.',
+    ['fused-memory/scripts/_timing_dependence_debt.py::TIMING_DEPENDENCE_DEBT'],
+    default=Debt(TaskRef(9513)),
+    default_covers=1,
+)
+
 CANCELLED_PREMISE_BLOCKLIST = governed_exceptions(
     'fused_memory_config.cancelled_premise_blocklist.yaml',
     'A premise that was tried, shipped and reverted, whose re-proposal the task curator '
@@ -162,4 +171,12 @@ def test_the_wall_clock_baseline_unit_still_has_a_baseline() -> None:
         'check_bare_magicmock_config._WALL_CLOCK_DEADLINE_DEBT has been burned down or '
         'deleted, so WALL_CLOCK_DEADLINE_BASELINE (its key and list_id) must be deleted '
         'with it.'
+    )
+
+
+def test_the_timing_dependence_baseline_unit_still_has_a_baseline() -> None:
+    debt = load_script_module(_PACKAGE_ROOT / 'scripts' / '_timing_dependence_debt.py')
+    assert debt.TIMING_DEPENDENCE_DEBT, (
+        '_timing_dependence_debt.TIMING_DEPENDENCE_DEBT has been burned down or emptied, so '
+        'TIMING_DEPENDENCE_BASELINE (its key and list_id) must be deleted with it.'
     )

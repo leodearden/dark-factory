@@ -14,10 +14,11 @@ import inspect
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import types
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
@@ -27,6 +28,7 @@ import pytest
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.psi import PsiSample
+from shared.python_env import without_python_env_selection
 from shared.usage_gate import AccountState, UsageGate
 
 from orchestrator.config import ModuleConfig
@@ -194,14 +196,6 @@ def wire_live_status_from_get_task(scheduler_mock: MagicMock) -> None:
 # add a second copy -- import this one.
 PYPROJECT_DEFAULT_TIMEOUT = 420
 
-# Headroom a per-test ceiling must keep over its family's measured-under-load
-# worst case.  8x rather than 2x: the breaches these ceilings exist to prevent
-# (xdist worker deaths, in the thread era before task 6354) were observed at
-# loadavg 250-423, one inflation step past the load at which any measurement
-# has been taken.  Rationale and corpus:
-# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-UNDER_LOAD_HEADROOM_FACTOR = 8
-
 # task 5147: the per-test budget VERIFY passes -- the `--timeout` token in
 # orchestrator/orchestrator.yaml's `test_command`.  A slow test loosens safely
 # by spelling `@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`; the band it
@@ -211,9 +205,10 @@ UNDER_LOAD_HEADROOM_FACTOR = 8
 # runs tighter than a bare local `pytest` -- and a slow test's marker must
 # clear the one that gates its merge.
 #
-# A LITERAL: marks read it at import, and the guard's _SANCTIONED_TIMEOUT_NAMES
-# and TestSanctionedNameMirrors resolve it only through literal arithmetic.
-# Held to the yaml by
+# A LITERAL: marks read it at import,
+# _sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES imports it, and
+# test_timeout_marker_inversion_guard.py::TestSanctionedNameMirrors re-derives
+# it from this line through literal arithmetic only.  Held to the yaml by
 # test_timeout_marker_inversion_guard.py::TestVerifyCliBudgetConstant, whose
 # docstring records why that pin is deliberately loud on a retune.
 VERIFY_CLI_PER_TEST_TIMEOUT = 300
@@ -248,7 +243,7 @@ VERIFY_CLI_PER_TEST_TIMEOUT = 300
 # the same arithmetic in test_merge_queue_deep_integration_gate.py -- a module
 # that cannot import a test module without coupling the two suites' collection
 # order.  Pinned, along with a guard against a second copy growing back, by
-# test_timeout_marker_inversion_guard.py::TestSpawnBoundSizingModel.
+# test_spawn_budget_guard.py::TestSpawnBoundSizingModel.
 MEASURED_SPAWN_LATENCY_SECS = 4.71
 
 
@@ -311,14 +306,14 @@ class SpawnBudget(NamedTuple):
 
     A BUNDLE, never a second definition: every number here is read from the
     module-level scalar that defines it.  Those scalars stay the single home
-    of each value, so a marker, ``_SANCTIONED_TIMEOUT_NAMES`` and this
+    of each value, so a marker, ``_sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES`` and this
     descriptor cannot drift into three readings of one figure.  The constant
     names are spelled as strings because a name cannot refer to itself.
 
     THE STRINGS ARE RESOLVED BACK, so a rename cannot leave a stale name in a
     failure message: every descriptor's two names are looked up on this module
     and compared against the scalars it carries
-    (test_timeout_marker_inversion_guard.py::TestSpawnBudgetVerdict::
+    (test_spawn_budget_guard.py::TestSpawnBudgetVerdict::
     test_each_descriptors_constant_names_resolve_to_its_numbers).  Also pinned
     there is the property the messages depend on -- that each caller's verdict
     names ITS OWN pair and neither of the other's
@@ -335,7 +330,7 @@ class SpawnBudget(NamedTuple):
 # (test_merge_queue_deep_integration_gate.py) is ALLOWED to cost, and the
 # per-test timeout derived from it.  This comment is the SINGLE home of that
 # derivation; the class points HERE rather than restating it, and
-# test_timeout_marker_inversion_guard.py::TestDeepGateSceneBudget re-derives
+# test_spawn_budget_guard.py::TestDeepGateSceneBudget re-derives
 # the second constant from the first at runtime so neither literal can drift.
 #
 # MEASURED, 2026-09-14 at main 99ab62335a, by counting
@@ -447,7 +442,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # test_merge_queue_deep_landing.py are ALLOWED to cost, and the per-test
 # timeout derived from it.  This comment is the SINGLE home of that
 # derivation; those classes point HERE rather than restating it, and
-# test_timeout_marker_inversion_guard.py::TestDeepLandingSceneBudget
+# test_spawn_budget_guard.py::TestDeepLandingSceneBudget
 # re-derives the third constant from the first two at runtime so no literal
 # can drift from its inputs.
 #
@@ -1318,7 +1313,7 @@ async def reap_leaked_claimant_heartbeats() -> int:
     un-retrieved ``TypeError`` from ``asyncio.sleep(<MagicMock>)`` onto the
     shared loop. Either way pytest attributes the fallout to a later, innocent
     test (observed victim: ``TestB7SingleHostNewPath``'s serial-order
-    assertion, which sees a spurious extra ``_dispatch_item`` call).
+    assertion, which sees a spurious extra ``VerifyDispatcher.dispatch`` call).
 
     Like ``reap_leaked_ticket_workers`` (task 2737) — and unlike
     ``MergeWorker.run`` (task 1907) — the loop just blocks on ``asyncio.sleep``
@@ -2118,6 +2113,24 @@ def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
     return env
 
 
+def env_resolving_running_interpreter(environ: Mapping[str, str]) -> dict[str, str]:
+    """*environ* with a bare ``python3`` / ``pytest`` bound to THIS test's interpreter.
+
+    A child that names a tool by bare name (a copied hook's ``python3``, a
+    ``LaneCommand``'s ``pytest``) resolves it through PATH. ``uv run`` and the
+    orchestrator daemon both put their venv's ``bin`` on PATH, so the merge gate
+    finds the workspace's interpreter there; ``.venv/bin/python -m pytest`` from a
+    plain shell does not, and the child silently gets the system interpreter,
+    which cannot import ``shared`` and has no ``pytest``. Scrubbed of the caller's
+    own selection first (``shared/src/shared/python_env.py::
+    without_python_env_selection``) so the result does not depend on which venv
+    the launching shell had active.
+    """
+    env = without_python_env_selection(environ)
+    env['PATH'] = os.pathsep.join(filter(None, (str(Path(sys.executable).parent), env.get('PATH'))))
+    return env
+
+
 # ===========================================================================
 # Pytest-invocation helpers: subproject paths, probe environments, inifile
 # guards (task 4075 review amendment)
@@ -2144,6 +2157,10 @@ def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
 #: pinned against either path must hold identically under both.
 ORCH_DIR = Path(__file__).resolve().parents[1]
 ORCH_PYPROJECT = ORCH_DIR / 'pyproject.toml'
+#: The per-module merge-verify config whose ``test_command`` and
+#: ``verify_command_timeout_secs`` the timeout guards read, resolved like its
+#: siblings from this file and never from the CWD.
+ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
 
 #: Environment keys stripped from a pytest/git subprocess probe by
 #: :func:`sanitized_probe_env`. Each one can silently turn a probe's result

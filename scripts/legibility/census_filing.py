@@ -1,4 +1,6 @@
-"""Which clusters a census run files, and the submit_task payloads it files them with."""
+"""Which clusters a census run files, the submit_task payloads it files them
+with, and which entries a run whose filing did not land leaves owed for the
+next run to re-offer."""
 from __future__ import annotations
 
 import json
@@ -17,8 +19,11 @@ from legibility import (
     census_report,
     census_verdicts,
     codebook,
+    codebook_lifecycle,
     disposition,
     filing_policy,
+    sighting_fit,
+    task_store,
 )
 from legibility import verdict as verdict_mod
 from shared.toolcall_markup import escape_envelope_literals
@@ -145,9 +150,10 @@ def cluster_record(
 
 
 def distinct_sessions(record: Mapping[str, Any]) -> int:
-    """How many distinct sessions *record*'s own sightings carry, whatever its
-    disposition or status: the singleton gate asks only whether a confusion
-    recurred, and this run's verifier has already judged whether it is real."""
+    """How many distinct sessions candidate *record*'s own sightings carry,
+    whatever its disposition: the singleton gate asks only whether a
+    confusion recurred, and this run's verifier has already judged whether it
+    is real. An entry's count is ``sighting_fit.counted_sessions``."""
     return len(set(codebook.sessions_of(record)))
 
 
@@ -167,21 +173,23 @@ def filing_gate(cluster: dict, sighting_count: int) -> tuple[bool, filing_policy
 
 
 _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
-"""Entry statuses a withheld entry may still be filed from: a fixed or
-retired confusion needs no ticket."""
+"""Entry statuses a withheld or owed entry may still be filed from: a fixed,
+retired or accepted confusion needs no ticket."""
 
 
-def entry_cluster(cb: dict, entry: dict) -> dict:
+def entry_cluster(cb: Mapping[str, Any], entry: Mapping[str, Any]) -> dict:
     """A fileable cluster rebuilt from codebook *entry*, by ``codebook.entry_field``;
-    its severity and finding identity are the entry's own."""
+    its severity and finding identity are the entry's own. Its evidence is
+    quoted only from the sessions ``sighting_fit.counted_sessions`` counts."""
     sightings = list(entry.get("sightings") or [])
+    counted = sighting_fit.counted_sessions(cb, entry)
     cluster = cluster_record(
         title=entry["title"],
         cause=codebook.entry_field(cb, entry, "cause"),
         area=codebook.entry_field(cb, entry, "area"),
         origin_phase=entry["origin_phase"],
         manifested_phase=entry["manifested_phase"],
-        evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote")],
+        evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote") and s.get("session") in counted],
         sightings=sightings,
     )
     return {
@@ -193,13 +201,14 @@ def entry_cluster(cb: dict, entry: dict) -> dict:
 
 @dataclass(frozen=True)
 class PendingFiling:
-    """One cluster to file this run. Work routed for it releases the withheld
-    codebook entry *withheld_entry_id* names, if any; its back-link lands on
-    *entry_id*. *verified_present*: this run's verifier found it present at
-    as_of_sha; *supersedes_task*: the done task a re-filing supersedes."""
+    """One cluster to file this run. Work routed for it clears the re-offer
+    marker (withheld or owed) of the codebook entry *reoffered_entry_id*
+    names, if any, to filed; its back-link lands on *entry_id*.
+    *verified_present*: this run's verifier found it present at as_of_sha;
+    *supersedes_task*: the done task a re-filing supersedes."""
 
     cluster: dict
-    withheld_entry_id: str | None = None
+    reoffered_entry_id: str | None = None
     entry_id: str | None = None
     verified_present: bool = False
     supersedes_task: int | None = None
@@ -218,42 +227,130 @@ class PendingFiling:
         return filing if self.supersedes_task is None else filing.superseding(self.supersedes_task)
 
 
+def _open_entries_marked(cb: Mapping[str, Any], marker: str) -> list[dict]:
+    return [
+        entry for entry in cb.get("entries") or []
+        if entry.get(codebook.ENTRY_FILING_KEY) == marker
+        and entry.get("status") in _RELEASABLE_ENTRY_STATUSES
+    ]
+
+
+def _withheld_releasable(cb: Mapping[str, Any]) -> list[dict]:
+    return _open_entries_marked(cb, codebook.ENTRY_FILING_WITHHELD)
+
+
+def _owed_reofferable(cb: Mapping[str, Any]) -> list[dict]:
+    return _open_entries_marked(cb, codebook.ENTRY_FILING_OWED)
+
+
+def _unlanded(fileable: Sequence[tuple[dict, str | None]], entries: Sequence[dict]) -> list[dict]:
+    """Those of *entries* no *fileable* cluster, given with the id of the
+    entry it landed on, landed on."""
+    landed = {entry_id for _cluster, entry_id in fileable}
+    return [entry for entry in entries if entry["id"] not in landed]
+
+
+def withheld_awaiting_count(fileable: Sequence[tuple[dict, str | None]], cb: Mapping[str, Any]) -> list[dict]:
+    """The withheld entries of *cb* still open to filing that no *fileable*
+    cluster, given with the id of the entry it landed on, releases: the ones
+    only their own sighting count can release."""
+    return _unlanded(fileable, _withheld_releasable(cb))
+
+
+def entry_releases(cb: Mapping[str, Any], entry: Mapping[str, Any], sighting_count: int) -> bool:
+    """Whether the gate files withheld *entry* at *sighting_count* counted
+    sessions (``sighting_fit.Releases``)."""
+    return filing_policy.is_fileable(entry_cluster(cb, entry), sighting_count=sighting_count)
+
+
 def filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[PendingFiling]:
     """Every cluster to file this run, from the post-merge codebook *cb*.
 
     Each *fileable* cluster, given with the id of the entry it landed on --
     promoted to this run, the standing promotion its recurrence was routed
-    to, or a key attach -- or None, releases that entry when it is releasable
-    withheld, so a recurrence files one ticket for its entry, not two. Every
-    other releasable withheld entry that ``filing_policy.is_fileable`` now
-    accepts at its own distinct-session count follows. An entry withheld THIS
-    run is never among them: the gate that withheld it used that same count.
+    to, or a key attach -- or None, re-offers that entry when it is a
+    releasable withheld or owed entry, so a recurrence files one ticket for
+    its entry, not two. Every other releasable withheld entry that
+    ``entry_releases`` now accepts at its ``sighting_fit.counted_sessions``
+    count follows. An entry withheld THIS run is never among them: the gate
+    that withheld it counted the same founding sessions. Every other owed
+    entry still open follows unconditionally: it passed the gate when its
+    filing was first offered, and that filing never landed.
 
-    Each is paired with the entry its back-link lands on: the withheld entry
-    it releases, else the entry it was promoted to. A *fileable* cluster was
-    verified present at as_of_sha this run; a released withheld entry was
-    verified by an earlier run, so it is not."""
-    releasable = [
-        entry for entry in cb.get("entries") or []
-        if entry.get(codebook.ENTRY_FILING_KEY) == codebook.ENTRY_FILING_WITHHELD
-        and entry.get("status") in _RELEASABLE_ENTRY_STATUSES
-    ]
-    releasable_ids = {entry["id"] for entry in releasable}
+    Each is paired with the entry its back-link lands on. A *fileable*
+    cluster was verified present at as_of_sha this run; a re-offered entry
+    rebuilt by ``entry_cluster`` was verified by an earlier run, so it is
+    not."""
+    withheld = _withheld_releasable(cb)
+    owed = _owed_reofferable(cb)
+    reofferable_ids = {entry["id"] for entry in (*withheld, *owed)}
 
     queue = []
-    for cluster, promoted_entry_id in fileable:
-        withheld_entry_id = promoted_entry_id if promoted_entry_id in releasable_ids else None
-        queue.append(PendingFiling(
-            cluster, withheld_entry_id, withheld_entry_id or promoted_entry_id, verified_present=True,
-        ))
-    paired = {pending.withheld_entry_id for pending in queue}
-    for entry in releasable:
-        if entry["id"] in paired:
-            continue
-        cluster = entry_cluster(cb, entry)
-        if filing_policy.is_fileable(cluster, sighting_count=distinct_sessions(entry)):
-            queue.append(PendingFiling(cluster, entry["id"], entry["id"]))
+    for cluster, landed_entry_id in fileable:
+        reoffered_entry_id = landed_entry_id if landed_entry_id in reofferable_ids else None
+        queue.append(PendingFiling(cluster, reoffered_entry_id, landed_entry_id, verified_present=True))
+    for entry in _unlanded(fileable, withheld):
+        if entry_releases(cb, entry, len(sighting_fit.counted_sessions(cb, entry))):
+            queue.append(PendingFiling(entry_cluster(cb, entry), entry["id"], entry["id"]))
+    for entry in _unlanded(fileable, owed):
+        queue.append(PendingFiling(entry_cluster(cb, entry), entry["id"], entry["id"]))
     return queue
+
+
+def with_owed_after_filing(cb: dict, disposal: disposition.Disposal, *, dry_run: bool) -> dict:
+    """*cb* with every entry whose filing this run reached no work marked owed:
+    the entries of decisions that routed nothing, and those of filings the
+    protocol never decided (the dedup store was unreachable), less every entry
+    some routed decision of this run covers. A *dry_run*'s undecided filings
+    are not owed: its payloads file is their one handle
+    (``write_dry_run_payloads``)."""
+    routed = {decision.filing.entry_id for decision in disposal.decisions if decision.routed}
+    stranded = [decision.filing.entry_id for decision in disposal.decisions if not decision.routed]
+    if not dry_run:
+        stranded += [filing.entry_id for filing in disposal.unfiled]
+    return _owe(cb, [entry_id for entry_id in stranded if entry_id not in routed])
+
+
+def with_owed_after_resolving(cb: dict, resolutions: disposition.Resolutions) -> dict:
+    """*cb* with the entry of every ticket the curator never decided marked
+    owed: one resolved FAILED (expired, server restart). REFUSED and
+    CANCELLED are decisions a re-filing would override, and an undecided
+    ticket never reaches ``Resolutions.resolved``."""
+    return _owe(cb, [
+        resolved.entry_id
+        for resolved in resolutions.resolved
+        if resolved.outcome.status is task_store.TicketStatus.FAILED
+    ])
+
+
+def _owe(cb: dict, entry_ids: Sequence[str | None]) -> dict:
+    """*cb* with each of *entry_ids* marked owed, unless ``Transition.OWE`` is
+    illegal from its marker (a withheld or owed marker already re-offers it)
+    or a C1 back-link routes it (``disposition.entry_routed``): that task or
+    pending ticket already carries the finding, and the L5 outcome loop or the
+    ticket pass decides it."""
+    entries = cb.get("entries") or []
+    owed = [
+        entry_id
+        for entry_id in dict.fromkeys(entry_id for entry_id in entry_ids if entry_id is not None)
+        if _owable(codebook.record_by_id(entries, entry_id, kind="entry"))
+    ]
+    for entry_id in owed:
+        cb = codebook_lifecycle.mark_entry_owed(cb, entry_id)
+    if owed:
+        logger.warning(
+            "census: %d codebook entr(ies) whose filing reached no work are marked owed; "
+            "the next census re-offers them: %s",
+            len(owed), owed,
+        )
+    return cb
+
+
+def _owable(entry: Mapping[str, Any]) -> bool:
+    return (
+        codebook_lifecycle.allows(entry, codebook_lifecycle.Transition.OWE)
+        and not disposition.entry_routed(entry)
+    )
 
 
 def _carrying(pending: PendingFiling, refiling: disposition.Refiling) -> PendingFiling:
@@ -320,12 +417,12 @@ def write_dry_run_payloads(
     requested_path: Path,
     payloads: list[dict],
     *,
-    withheld_offered: int,
+    reoffered: int,
     write_text: Callable[[Path, str], object],
 ) -> census_report.DryRunFiling:
     """Write *payloads* -- what a real run would hand ``submit_fn`` -- for a
     human to review, at *requested_path* or its free sibling, and say so
-    loudly; *withheld_offered* of them release earlier-withheld entries."""
+    loudly; *reoffered* of them re-offer withheld or owed entries."""
     resolved_path = _free_payloads_path(requested_path)
     if resolved_path != requested_path:
         logger.warning(
@@ -350,12 +447,12 @@ def write_dry_run_payloads(
         "matches, not candidates, and their sessions are ledgered as coded).",
         len(payloads), resolved_path,
     )
-    if withheld_offered:
+    if reoffered:
         logger.warning(
-            "census: --dry-run-filing -- %d of those payload(s) are withheld "
-            "codebook entries that have since recurred; they stay marked "
-            "withheld, so the next real census re-offers them.",
-            withheld_offered,
+            "census: --dry-run-filing -- %d of those payload(s) re-offer "
+            "withheld or owed codebook entries; they keep their marker, so "
+            "the next real census re-offers them.",
+            reoffered,
         )
     # Every downstream consumer -- the report's Filed Tasks section, the
     # commit paths and the outcome -- reads the path off this one object,

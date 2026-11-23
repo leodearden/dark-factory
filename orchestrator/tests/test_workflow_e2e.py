@@ -34,8 +34,9 @@ from _workflow_helpers import (
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
+from shared.usage_gate import SessionBudgetExhausted
 
-from orchestrator import session_registry
+from orchestrator import session_records
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
@@ -1483,7 +1484,7 @@ def _build_workflow_no_merge_worker(
     config: OrchestratorConfig,
     git_ops: GitOps,
     assignment: TaskAssignment,
-    agent_stub: AgentStub,  # noqa: ARG001
+    agent_stub: AgentStub,
     tmp_path: Path,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Thin delegate over `_build_workflow_with_escalation(spawn_merge_worker=False)`.
@@ -1510,13 +1511,13 @@ def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
     from escalation.models import Escalation
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -1569,7 +1570,7 @@ def _make_resolve_then_dismiss_chained_steward(
     Neither waiter reaches ESCALATED through that trailing publication.
     ``_mark_blocked``'s wait is scoped to its own L0 (task 5563), so the
     chained outcome is foreign and discarded; ESCALATED comes from the
-    ``has_open_l1`` source-of-truth override in
+    open-L1 hand-off override in
     ``TaskWorkflow._await_steward_completion``, which replaces the in-scope
     ``StewardResolved``.  ``run()``'s ESCALATED wait never routes on the
     channel at all: its tail reads the open L1 from the escalation queue.
@@ -1577,13 +1578,13 @@ def _make_resolve_then_dismiss_chained_steward(
     from escalation.models import Escalation
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -3005,8 +3006,8 @@ class TestMarkBlockedFalseDoneGuard:
 
         The steward's ``StewardReescalatedL1`` is about the chained L0, so
         ``_mark_blocked``'s scoped wait discards it (task 5563) and receives
-        only its own L0's ``StewardResolved``.  The ``has_open_l1``
-        source-of-truth override in ``_await_steward_completion`` turns that
+        only its own L0's ``StewardResolved``.  The open-L1 hand-off
+        override in ``_await_steward_completion`` turns that
         would-be requeue into ``StewardReescalatedL1``, which
         ``_mark_blocked``'s single isinstance dispatch (SO-1) routes to
         ESCALATED — no re-pend, no duplicate L1.  This still exercises the
@@ -3098,7 +3099,7 @@ class TestMarkBlockedFalseDoneGuard:
         invocations: list[str] = []
 
         class _SpyStewardFactory:
-            def __call__(self, wt_path, cfg_dir):  # noqa: ARG002
+            def __call__(self, wt_path, cfg_dir):
                 invocations.append('init')
                 return _SpyStewardFactory.Steward()
 
@@ -3294,10 +3295,8 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_lane.worker import (
-            TRANSIENT_INFRA_REASON_PREFIX,
-            MergeOutcome,
-        )
+        from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -5553,13 +5552,13 @@ def _make_l1_escalating_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -6802,8 +6801,6 @@ class TestSessionBudgetExhaustionEscalation:
         self, config, git_ops, task_assignment, monkeypatch, tmp_path
     ):
         """L1 escalation summary carries budget limit and cost-spent figures."""
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6863,8 +6860,6 @@ class TestSessionBudgetExhaustionEscalation:
         Before step-4 impl, the detail defaults to the summary string (no separate
         detail is passed to _mark_blocked), so the metric-label assertions fail.
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6930,8 +6925,6 @@ class TestFirstInvocationBudgetExhaustion:
           (iii) detail contains 'last_completed_role=n/a'  (new label + default fallback)
           (iv)  summary contains 'last completed role: n/a'  (new summary wording)
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6991,13 +6984,13 @@ def _make_done_setting_steward(
     'done' is terminal, mirroring ``_make_status_setting_steward``.
     """
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -8001,7 +7994,7 @@ class TestMergeRetryLoopSoftCancelExits:
 
         GREEN once step-2 lands (SOFT_CANCELLED enum + _handle_soft_cancel update).
         """
-        import logging as _logging  # noqa: PLC0415
+        import logging as _logging
 
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
@@ -8071,9 +8064,9 @@ class TestMergeRetryLoopSoftCancelExits:
         RED before step-4 (loop retries on REQUEUED regardless of cancel_event).
         GREEN after step-4 (cancel re-check exits before "retrying merge" log).
         """
-        import logging as _logging  # noqa: PLC0415
+        import logging as _logging
 
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig
 
         # Use max_merge_retries=2 so the RED path exhausts in 2 iters, not 3.
         config_2 = OrchestratorConfig(
@@ -8147,7 +8140,7 @@ class TestDryRunUnblockE2EGuardOptOut:
 
     async def test_stub_raises_assertion_error_on_call(self):
         """Calling run_dry_run_unblock without opt-in raises a descriptive AssertionError."""
-        import orchestrator.workflow as _wf  # noqa: PLC0415
+        import orchestrator.workflow as _wf
 
         # The guard installs a synchronous stub (not a coroutine), so the call
         # raises AssertionError immediately.  Pin the marker name as the stable
@@ -8177,7 +8170,7 @@ class TestDryRunUnblockE2EGuardOptIn:
 
     async def test_async_mock_installed_when_marker_present(self):
         """run_dry_run_unblock is an AsyncMock when mocks_dry_run_unblock marker is set."""
-        import orchestrator.workflow as _wf  # noqa: PLC0415
+        import orchestrator.workflow as _wf
 
         assert isinstance(_wf.run_dry_run_unblock, AsyncMock), (
             f'Expected AsyncMock, got {type(_wf.run_dry_run_unblock)!r}'
@@ -8772,7 +8765,7 @@ class TestBuildSpawnEnv:
         (_architect_spawn_session_id stashed), a post-architect role's
         CLAUDE_SPAWN_PARENT_ID is the architect's reconstructed
         SessionStart-hook registry slug -- built via the exact same
-        session_registry.build_session_slug the architect's own hook uses,
+        session_records.build_session_slug the architect's own hook uses,
         so it matches that real record precisely."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         workflow._architect_spawn_session_id = 'arch-uuid-xyz'
@@ -8780,11 +8773,11 @@ class TestBuildSpawnEnv:
         env = workflow._build_spawn_env(IMPLEMENTER)
 
         assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            'arch-uuid-xyz',  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            'arch-uuid-xyz',
         )
 
     async def test_architect_still_receives_workflow_root_when_stashed(
@@ -8835,11 +8828,13 @@ class TestBuildSpawnEnv:
         implementer_kwargs = captured_calls[1]
         implementer_spawn_env = implementer_kwargs['spawn_env']
         assert implementer_spawn_env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+        architect_session_id = workflow._architect_spawn_session_id
+        assert architect_session_id is not None
+        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            workflow._architect_spawn_session_id,  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            architect_session_id,
         )
 
 

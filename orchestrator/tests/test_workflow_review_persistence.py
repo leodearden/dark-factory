@@ -13,8 +13,8 @@ Two mechanisms drive ``_execute_verify_review_loop``:
    the whole task lifetime, not each dispatch.
 
 These tests drive the loop with ``_execute_iterations`` /
-``_verify_debugfix_loop`` / ``_review`` stubbed, mirroring the
-``_make_workflow`` harness in ``test_workflow.py``.
+``_verify_debugfix_loop`` / ``_review`` stubbed, via the shared
+``orchestrator/tests/_review_loop_harness.py::review_loop_workflow`` harness.
 """
 
 from __future__ import annotations
@@ -26,96 +26,11 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _review_loop_harness import review_loop_workflow
 
-from orchestrator.agents.review_briefing import ReviewBriefing
-from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.artifacts import ReviewAggregation
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
-from orchestrator.workflow import (
-    TaskWorkflow,
-    WorkflowOutcome,
-)
-
-
-def _make_workflow(
-    *,
-    tmp_path: Path,
-    task_id: str = '2749',
-    modules: list[str] | None = None,
-    max_amendment_rounds: int = 1,
-    max_review_cycles: int = 2,
-) -> TaskWorkflow:
-    """Minimal TaskWorkflow harness for driving _execute_verify_review_loop."""
-    assignment = MagicMock()
-    assignment.task_id = task_id
-    assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
-    assignment.modules = modules if modules is not None else ['src/foo']
-
-    _spec = pydantic_spec(OrchestratorConfig)
-    config = MagicMock(spec_set=_spec)
-    config.fused_memory.project_id = 'dark_factory'
-    config.fused_memory.url = 'http://localhost:8002'
-    config.max_review_cycles = max_review_cycles
-    config.max_amendment_rounds = max_amendment_rounds
-    config.lock_depth = 2
-    config.project_root = tmp_path / 'proj'
-    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
-    # Real reviewer model string so _reviewer_config_fingerprint() (task 2749
-    # amendment) yields a deterministic, non-None digest instead of choking on
-    # an unserialisable auto-child MagicMock.  The fingerprint reads the
-    # reviewer* → 'reviewer' collapsed config key (the resolver's _config_key).
-    config.models = MagicMock()
-    config.models.reviewer = 'sonnet'
-
-    scheduler = MagicMock()
-    git_ops = MagicMock()
-
-    wf = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=scheduler,
-        briefing=MagicMock(),
-        mcp=MagicMock(),
-    )
-    worktree = tmp_path / 'wt'
-    worktree.mkdir(parents=True, exist_ok=True)
-    artifacts = TaskArtifacts(worktree)
-    artifacts.init(task_id, 'T', 'd')
-    wf.artifacts = artifacts
-    wf.worktree = worktree
-
-    # Loop sub-steps default to success; the REVIEW branch is what each test
-    # exercises, so stub EXECUTE/VERIFY to DONE.
-    wf._execute_iterations = AsyncMock(return_value=WorkflowOutcome.DONE)
-    wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)
-
-    # Tree-hash source: a stable committed tree hash.
-    wf.git_ops.get_head_tree_hash = AsyncMock(return_value='TREE1')
-    # Post-amendment delta source (task 2750): fail-open empty delta keeps the
-    # pre-2750 behaviour (all suggestions routed on the DONE path) so these
-    # counter/verdict tests are unaffected by delta scoping.
-    wf.git_ops.get_new_side_changed_line_ranges = AsyncMock(return_value={})
-    # task 2760: the post-amendment WIP guard awaits git_ops.has_uncommitted_work
-    # before re-entering VERIFY/REVIEW.  A clean tree short-circuits it to a
-    # no-op so these counter/verdict tests are unaffected (dedicated coverage in
-    # test_workflow_amendment_wip_guard.py).
-    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
-
-    # Spies on the REVIEW-branch side effects.
-    wf._review = AsyncMock(
-        return_value=ReviewAggregation(
-            has_blocking_issues=False,
-            blocking_issues=[],
-            suggestions=[],
-            reviews={},
-        )
-    )
-    wf._route_review_suggestions_to_curator = AsyncMock()
-    wf._write_suggestions_to_memory = AsyncMock()
-    wf._amend = AsyncMock(return_value=True)
-    return wf
+from orchestrator.workflow import WorkflowOutcome
 
 
 @pytest.mark.asyncio
@@ -125,7 +40,7 @@ class TestVerdictCacheSkip:
     async def test_cached_verdict_skips_review_and_routing(
         self, tmp_path: Path
     ):
-        wf = _make_workflow(tmp_path=tmp_path)
+        wf = review_loop_workflow(tmp_path)
         # Simulate a prior dispatch that already recorded a suggestions_only
         # verdict (and routed its suggestions) for this committed tree — under
         # the SAME reviewer config (fingerprint matches), so the skip fires.
@@ -153,7 +68,7 @@ class TestReviewerConfigFingerprint:
     """
 
     async def test_stale_fingerprint_forces_review(self, tmp_path: Path):
-        wf = _make_workflow(tmp_path=tmp_path)
+        wf = review_loop_workflow(tmp_path)
         assert wf.artifacts is not None
         # A verdict recorded under a DIFFERENT reviewer config (e.g. a model
         # re-pin) — the fingerprint no longer matches the current config.
@@ -184,7 +99,7 @@ class TestReviewerConfigFingerprint:
     async def test_missing_fingerprint_forces_review(self, tmp_path: Path):
         # A pre-amendment record (no reviewer_fingerprint field) can never
         # satisfy the positive-match requirement → full review, not a skip.
-        wf = _make_workflow(tmp_path=tmp_path)
+        wf = review_loop_workflow(tmp_path)
         assert wf.artifacts is not None
         wf.artifacts.record_review_verdict('TREE1', 'suggestions_only', True)
         wf._review = AsyncMock(
@@ -204,7 +119,7 @@ class TestReviewerConfigFingerprint:
     async def test_fingerprint_stable_across_calls(self, tmp_path: Path):
         # The digest must be deterministic within a fixed config, or the
         # cross-dispatch cache would never hit.
-        wf = _make_workflow(tmp_path=tmp_path)
+        wf = review_loop_workflow(tmp_path)
         fp1 = wf._reviewer_config_fingerprint()
         fp2 = wf._reviewer_config_fingerprint()
         assert fp1 is not None
@@ -213,7 +128,7 @@ class TestReviewerConfigFingerprint:
     async def test_model_repin_changes_fingerprint(self, tmp_path: Path):
         # A per-role model re-pin (config.models change) must change the
         # digest so a byte-identical tree re-reviews.
-        wf = _make_workflow(tmp_path=tmp_path)
+        wf = review_loop_workflow(tmp_path)
         fp_before = wf._reviewer_config_fingerprint()
         wf.config.models.reviewer = 'opus'
         fp_after = wf._reviewer_config_fingerprint()
@@ -223,7 +138,7 @@ class TestReviewerConfigFingerprint:
     async def test_metadata_override_changes_fingerprint(self, tmp_path: Path):
         # A metadata.model_overrides pin on a reviewer role must change the
         # digest (the reviewer's named scenario).
-        wf = _make_workflow(tmp_path=tmp_path)
+        wf = review_loop_workflow(tmp_path)
         fp_before = wf._reviewer_config_fingerprint()
         wf.task['metadata'] = {
             'model_overrides': {'reviewer_comprehensive': 'opus'}
@@ -248,7 +163,7 @@ class TestVerdictRecording:
     """The non-blocking DONE path records a tree-hash-keyed verdict."""
 
     async def test_suggestions_only_verdict_recorded(self, tmp_path: Path):
-        wf = _make_workflow(tmp_path=tmp_path)
+        wf = review_loop_workflow(tmp_path)
         # One OUT-OF-scope suggestion: no amend (nothing in-scope), routed to
         # the curator, DONE.
         wf._review = AsyncMock(
@@ -272,7 +187,7 @@ class TestVerdictRecording:
         assert rec['suggestions_routed'] is True
 
     async def test_pass_verdict_recorded(self, tmp_path: Path):
-        wf = _make_workflow(tmp_path=tmp_path)
+        wf = review_loop_workflow(tmp_path)
         wf._review = AsyncMock(
             return_value=ReviewAggregation(
                 has_blocking_issues=False,
@@ -293,7 +208,7 @@ class TestVerdictRecording:
         assert rec['suggestions_routed'] is False
 
     async def test_blocking_verdict_not_recorded(self, tmp_path: Path):
-        wf = _make_workflow(tmp_path=tmp_path, max_review_cycles=1)
+        wf = review_loop_workflow(tmp_path, max_review_cycles=1)
         wf._review = AsyncMock(
             return_value=ReviewAggregation(
                 has_blocking_issues=True,
@@ -307,14 +222,13 @@ class TestVerdictRecording:
             )
         )
         wf._escalate_review_issues = MagicMock()
-        wf._replan = AsyncMock()
 
         outcome = await wf._execute_verify_review_loop()
 
         # max_review_cycles=1 → escalate on the first blocking cycle,
         # before any replan.
         assert outcome == WorkflowOutcome.ESCALATED
-        wf._replan.assert_not_called()
+        cast(AsyncMock, wf._replan).assert_not_called()
         # Blocking verdicts are NEVER cached.
         assert wf.artifacts is not None
         assert wf.artifacts.get_cached_verdict('TREE1') is None
@@ -338,7 +252,7 @@ class TestLifetimeCounters:
 
     async def test_amendment_counter_seeded_and_persisted(self, tmp_path: Path):
         # Fresh task (amendment_rounds_total=0), one in-scope suggestion.
-        wf = _make_workflow(tmp_path=tmp_path, max_amendment_rounds=1)
+        wf = review_loop_workflow(tmp_path, max_amendment_rounds=1)
         wf._review = AsyncMock(
             return_value=ReviewAggregation(
                 has_blocking_issues=False,
@@ -360,7 +274,7 @@ class TestLifetimeCounters:
     async def test_amendment_cap_exhausted_across_lifetime(self, tmp_path: Path):
         # Pre-seed the persisted total at the cap — a prior dispatch already
         # used the one allowed amendment round.
-        wf = _make_workflow(tmp_path=tmp_path, max_amendment_rounds=1)
+        wf = review_loop_workflow(tmp_path, max_amendment_rounds=1)
         assert wf.artifacts is not None
         wf.artifacts.set_review_counters(amendment_rounds_total=1)
         wf._review = AsyncMock(
@@ -384,7 +298,7 @@ class TestLifetimeCounters:
     ):
         # Pre-seed the persisted review-cycle total at the cap; a blocking
         # review must escalate without a fresh replan.
-        wf = _make_workflow(tmp_path=tmp_path, max_review_cycles=1)
+        wf = review_loop_workflow(tmp_path, max_review_cycles=1)
         assert wf.artifacts is not None
         wf.artifacts.set_review_counters(review_cycles_total=1)
         wf._review = AsyncMock(
@@ -400,12 +314,11 @@ class TestLifetimeCounters:
             )
         )
         wf._escalate_review_issues = MagicMock()
-        wf._replan = AsyncMock()
 
         outcome = await wf._execute_verify_review_loop()
 
         assert outcome == WorkflowOutcome.ESCALATED
-        wf._replan.assert_not_called()
+        cast(AsyncMock, wf._replan).assert_not_called()
         assert wf.artifacts is not None
         assert wf.artifacts.get_review_cycles_total() >= 1
 
@@ -416,7 +329,7 @@ class TestLifetimeCounters:
         # this blocking review hits the cap exit with a re-flag of a concern
         # that round settled.  The cap exit must suppress it exactly as the
         # DONE exit would, rather than file it again and count it.
-        wf = _make_workflow(tmp_path=tmp_path, max_review_cycles=1)
+        wf = review_loop_workflow(tmp_path, max_review_cycles=1)
         wf.config.suppress_resettled_review_suggestions = True
         assert wf.artifacts is not None
         wf.artifacts.set_review_counters(amendment_rounds_total=1, review_cycles_total=1)

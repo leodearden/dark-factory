@@ -10,10 +10,12 @@ import assert from 'node:assert/strict';
 import { loadClient, payload } from './_boundary_client.mjs';
 import {
   burndownBlock,
+  burndownProjectBlock,
   escalationAnalytics,
   escalationRow,
   escalationsPayload,
   mergeQueueBlock,
+  mergeRecentRow,
   openEscalationItem,
   qualityBody,
   qualityComparison,
@@ -22,6 +24,8 @@ import {
   qualityMetric,
   qualityModuleRow,
   qualityPayload,
+  qualitySnapshotPoint,
+  qualitySnapshots,
   schedulerLockRow,
   schedulerModule,
   schedulerSnapshot,
@@ -86,7 +90,7 @@ test('a burndown block is built only with keys /burndown serves, in the aggregat
 
   assertBuiltKeysServed(burndownBlock(vocab, 2, { ...verdict, projects: ['A'] }), served.BURNDOWN, 'BURNDOWN');
   for (const [project, block] of Object.entries(served.BURNDOWN_BY_PROJECT)) {
-    assertBuiltKeysServed(burndownBlock(vocab, 2, verdict), block, `BURNDOWN_BY_PROJECT.${project}`);
+    assertBuiltKeysServed(burndownProjectBlock(vocab, 2, 3, verdict), block, `BURNDOWN_BY_PROJECT.${project}`);
   }
 });
 
@@ -104,6 +108,13 @@ test('a MERGE_QUEUE block is built only with keys /merge-queue serves', () => {
   const served = payload('merge_7d').MERGE_QUEUE['dark-factory'];
 
   assertBuiltKeysServed(mergeQueueBlock({ bucketMinutes: 60 }), served, 'MERGE_QUEUE[project]');
+});
+
+test('a MERGE_QUEUE recent row is built only with keys /merge-queue serves on one', () => {
+  const served = payload('merge_7d').MERGE_QUEUE['dark-factory'].recent;
+  assert.ok(served.length > 0, 'the merge_7d body serves no recent rows to check the builder against');
+
+  assertBuiltKeysServed(mergeRecentRow(), served[0], 'MERGE_QUEUE[project].recent[0]');
 });
 
 test('a SCHEDULER snapshot, a lock row and a module included, is built only with keys /scheduler serves', () => {
@@ -220,4 +231,30 @@ test('a QUALITY_MARKERS stream and its derived marker are built with exactly the
   assertSameKeys(built.prompt_coverage, served.value.prompt_coverage, 'QUALITY_MARKERS.value.prompt_coverage');
   assertSameKeys(built.markers[0], servedMarker, 'QUALITY_MARKERS.value.markers[0]');
   assertSameKeys(built.markers[0].source, servedMarker.source, 'QUALITY_MARKERS.value.markers[0].source');
+});
+
+test('a QUALITY_SNAPSHOTS series and its point are built with exactly the keys /quality serves', () => {
+  const served = payload('quality_snapshots').QUALITY_SNAPSHOTS.value;
+  const [servedPoint, servedNightly] = served.points;
+  const built = qualitySnapshotPoint();
+
+  assertSameKeys(qualitySnapshots([built]), served, 'QUALITY_SNAPSHOTS.value');
+  assertSameKeys(qualitySnapshots([built]).pending, served.pending, 'QUALITY_SNAPSHOTS.value.pending');
+  assertSameKeys(built, servedPoint, 'QUALITY_SNAPSHOTS.value.points[0]');
+  for (const key of ['members', 'h14', 'cycles', 'diff']) {
+    assertSameKeys(built[key], servedPoint[key], `QUALITY_SNAPSHOTS.value.points[0].${key}`);
+  }
+  assertSameKeys(built.members.rows[0], servedPoint.members.rows[0], 'QUALITY_SNAPSHOTS.value.points[0].members.rows[0]');
+  // The default builder is a schema-3 nightly point, so its params are held to the served one's.
+  assert.equal(servedNightly.baseline, false);
+  assertBuiltKeysServed(built, servedNightly, 'QUALITY_SNAPSHOTS.value.points[1]');
+});
+
+test('the no-snapshot body is built as the unknown Datum a scan that found neither home serves', () => {
+  const served = payload('quality_no_snapshot').QUALITY_SNAPSHOTS;
+  const built = qualityBody({ quality: qualityPayload({ axis: [], metrics: {} }) }).QUALITY_SNAPSHOTS;
+
+  assertSameKeys(built, served, 'the QUALITY_SNAPSHOTS Datum');
+  assert.equal(built.state, served.state);
+  assert.ok(built.reason.startsWith('no snapshot yet') && served.reason.startsWith('no snapshot yet'));
 });

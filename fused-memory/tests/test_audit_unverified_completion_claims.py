@@ -1720,7 +1720,7 @@ class TestProbeBuilders:
         no longer goes through TicketStore, so schema agreement is exactly what
         could silently drift.
         """
-        from fused_memory.middleware.ticket_store import TicketStore  # noqa: PLC0415
+        from fused_memory.middleware.ticket_store import TicketStore
 
         db_path = tmp_path / 'tickets.db'
         store = TicketStore(db_path)
@@ -1758,7 +1758,7 @@ class TestProbeBuilders:
         every store with, so this test fails if the read's SQL ever drifts from
         the schema the backend writes — the silent-all-unverifiable regression.
         """
-        import sqlite3  # noqa: PLC0415
+        import sqlite3
 
         root = tmp_path / 'proj'
         db_path = tasks_db(root)

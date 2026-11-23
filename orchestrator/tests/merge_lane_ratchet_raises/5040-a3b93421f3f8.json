@@ -1,0 +1,18 @@
+{
+  "task_id": "5040",
+  "reason": "Move, not growth: the in-flight verify's collaborators (run_post_merge_verify, release_chain_build_lane) are now patched where merge_lane/verify_dispatch.py and merge_lane/inflight_verify.py resolve them, while the train path keeps resolving its own in worker.py, so two patch targets name the new homes (test-side half of task 5040 step-11).",
+  "measures": [
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/_merge_deep_scene.py",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "total:patch_targets",
+      "key": "<cluster>",
+      "baseline": 63,
+      "current": 65
+    }
+  ]
+}

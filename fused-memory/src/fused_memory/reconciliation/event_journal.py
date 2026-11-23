@@ -16,8 +16,8 @@ contract — its sole production caller, ``TaskInterceptor._journal``, invokes i
 without ``await``, as do ~all existing tests). A synchronous method cannot
 ``await`` an aiosqlite coroutine, so a durable write that must complete *before*
 ``enqueue`` returns has to use synchronous ``sqlite3``. A WAL + FULL commit is
-genuinely synchronous (~1-5 ms) and applies the *same* durability pragmas as
-:func:`shared.async_sqlite_base.apply_full_durability_pragmas`.
+genuinely synchronous (~1-5 ms); the durability pragmas are applied through
+:func:`shared.sqlite_sync_base.apply_full_durability_pragmas_sync`.
 
 Threading invariant
 -------------------
@@ -45,16 +45,13 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
+
 from fused_memory.models.reconciliation import ReconciliationEvent
 
 logger = logging.getLogger(__name__)
 
-# Same durability triad as shared.async_sqlite_base.apply_full_durability_pragmas
-# (WAL + synchronous=FULL + wal_autocheckpoint=100 + journal_size_limit=64 MiB),
-# applied to a synchronous sqlite3 connection.  Kept in sync with that helper.
 _JOURNAL_BUSY_TIMEOUT_MS = 5000
-_JOURNAL_WAL_AUTOCHECKPOINT = 100
-_JOURNAL_SIZE_LIMIT_BYTES = 67_108_864  # 64 MiB
 
 _JOURNAL_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS event_journal (
@@ -84,31 +81,9 @@ class EventJournal:
         # asyncio.to_thread worker.  sqlite3 serializes access internally.
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._closed = False
-        self._apply_pragmas()
+        apply_full_durability_pragmas_sync(self._conn, busy_timeout_ms=_JOURNAL_BUSY_TIMEOUT_MS)
         self._conn.executescript(_JOURNAL_SCHEMA_SQL)
         self._conn.commit()
-
-    def _apply_pragmas(self) -> None:
-        """Apply the WAL + full-durability pragma set to the sync connection.
-
-        Mirrors :func:`shared.async_sqlite_base.apply_full_durability_pragmas`:
-        WAL journal mode, ``synchronous=FULL`` (per-commit fsync),
-        ``wal_autocheckpoint=100``, and a 64 MiB ``journal_size_limit``, plus a
-        ``busy_timeout``. The WAL result is verified (loud-over-silent) — the
-        journal is always file-backed, so WAL must succeed.
-        """
-        cur = self._conn.execute('PRAGMA journal_mode=WAL')
-        row = cur.fetchone()
-        if row is None or str(row[0]).lower() != 'wal':
-            got = row[0] if row is not None else None
-            raise RuntimeError(
-                f'EventJournal: failed to enable WAL journal mode (got {got!r}) '
-                f'for {self._path}'
-            )
-        self._conn.execute(f'PRAGMA busy_timeout={_JOURNAL_BUSY_TIMEOUT_MS}')
-        self._conn.execute('PRAGMA synchronous=FULL')
-        self._conn.execute(f'PRAGMA wal_autocheckpoint={_JOURNAL_WAL_AUTOCHECKPOINT}')
-        self._conn.execute(f'PRAGMA journal_size_limit={_JOURNAL_SIZE_LIMIT_BYTES}')
 
     def append(self, event: ReconciliationEvent) -> None:
         """Durably persist *event* (INSERT OR REPLACE + commit).

@@ -635,7 +635,7 @@ def reclaim_worktrees(
                 outcome.reclaimed.append(path)
             else:
                 outcome.failed.append(path)
-        except Exception as err:  # noqa: BLE001 — never let one record abort the sweep
+        except Exception as err:  # never let one record abort the sweep
             logger.warning(
                 '%s unexpected error reclaiming %s: %s — counting as failed',
                 _LOG_PREFIX,

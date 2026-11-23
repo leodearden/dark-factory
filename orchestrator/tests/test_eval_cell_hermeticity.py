@@ -24,6 +24,7 @@ from shared.project_layout import escalation_queue_dir, runs_db
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals import runner
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.fixture_gate import fixture_task_gate
 from orchestrator.evals.hermeticity import EvalHermeticityError, ProductionWriters
 from orchestrator.evals.runner import _cell_workflow, build_eval_orch_config
 from orchestrator.event_store import EventStore
@@ -71,7 +72,7 @@ def cell(tmp_path: Path, code_default_config: None) -> _Cell:
 def _build(cell: _Cell, **writers: ProductionWriters) -> TaskWorkflow:
     return _cell_workflow(
         cell.task, cell.orch_config, cell.worktree, None,
-        replay_framed=False, usage_gate=None, **writers,
+        replay_framed=False, usage_gate=None, task_gate=fixture_task_gate, **writers,
     )
 
 

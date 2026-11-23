@@ -82,16 +82,17 @@ follows is still a dated audit, not a live guarantee -- the check enforces
 the RULE, not this prose, and it is call-shaped only. See below for what
 that still misses.
 
-GUARDED, as of task 7397 -- ``amend_stale_resume_cwd_records``,
+GUARDED, as of task 10081 -- ``amend_stale_resume_cwd_records``,
 ``audit_duplicate_memories``, ``backfill_entity_standing_decision``,
 ``cleanup_count_snapshots``, ``cleanup_pin_queue_edges``,
 ``clear_false_dependency_invalidations``, ``clear_malformed_empty_memory``,
-``consolidate_namespace_families``, ``invalidate_fabricated_shipping_edges``,
+``consolidate_namespace_families``, ``delete_task_count_snapshots``,
+``invalidate_fabricated_shipping_edges``,
 ``lane_dependency_probe``, ``migrate_cross_graph_leak``, ``normalize_topic_slugs``,
 ``prune_recon_cycle_summaries``, ``purge_knowlive_namespace``,
 ``replay_failed_mem0_intents``, ``retro_stamp_topics``,
 ``sweep_orphan_flag_markers``, ``sweep_toolcall_xml_leak``,
-``tag_cgl_eta_rehome_scope`` (19 call sites).
+``tag_cgl_eta_rehome_scope`` (20 call sites).
 This column IS exhaustive, because CALLING this function is what "guarded"
 MEANS: ``grep -rln 'assert_store_mutation_allowed(' fused-memory/scripts/
 --include='*.py'`` re-derives it, and re-dates it, in one line.
@@ -286,7 +287,7 @@ def _mem0_configured_history_db_path() -> str:
     contract hermetically without paying that cost or touching a real
     ``~/.mem0``.
     """
-    from mem0.configs.base import MemoryConfig  # noqa: PLC0415
+    from mem0.configs.base import MemoryConfig
 
     return MemoryConfig().history_db_path
 

@@ -1,0 +1,26 @@
+import sys, collections
+sys.path.insert(0,'/tmp/gate-10069/critic5')
+from rule6 import fb_release, cost
+def conv(q,r,t,u,scan,mf=12,mt=24,n=120):
+    a_f,a_c=1.0,1/mt
+    for i in range(n):
+        na_c=min(cost(0,c,q,r,t,u,a_f,a_c,fb_release,scan)/c for c in range(1,mt+1))
+        na_f=min(cost(f,0,q,r,t,u,a_f,na_c,fb_release,scan)/f for f in range(1,mf+1))
+        if abs(na_c-a_c)<1e-9 and abs(na_f-a_f)<1e-9: return True,i
+        a_f,a_c=na_f,na_c
+    return False,n
+bad=collections.Counter(); tot=collections.Counter(); mx=0
+for scan in ('auto','on','off'):
+  for q in (1e-6,0.001,0.01,0.05,0.08,0.14,0.2,0.3,0.5):
+    for r in (0.0,0.005,0.01,0.05):
+      if r>q: continue
+      for u in (0.0,0.07,0.16,0.5,1.0):
+        for t in (0.0,0.01,0.05,0.1,0.2,0.3,0.35,0.4,0.45,0.5,0.6,0.8,1.5):
+          ok,i=conv(q,r,t,u,scan); tot[(scan,t)]+=1; mx=max(mx,i if ok else 0)
+          if not ok: bad[(scan,t)]+=1
+print('max iterations when converged:',mx)
+for scan in ('auto','on','off'):
+    print(scan, {t:(bad[(scan,t)],tot[(scan,t)]) for (s,t) in sorted(tot) if s==scan})
+# r == q corner and q tiny
+for q in (0.05,0.14):
+    print('r=q',q, conv(q,q,0.05,0.07,'auto'), conv(q,q,0.05,0.07,'on'))

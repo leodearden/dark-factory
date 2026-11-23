@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,7 @@ from _link_heal_harness import (
 
 from fused_memory.maintenance import link_heal_executor
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure, LinkPair
-from fused_memory.maintenance.link_heal import BasisSource, HealAction, Verdict
+from fused_memory.maintenance.link_heal import BasisSource, HealAction, Report, Verdict
 from fused_memory.maintenance.link_heal_executor import (
     ADJUDICATOR_ANCHOR,
     CORRECTS_SHARE_ANCHOR,
@@ -54,6 +55,7 @@ from fused_memory.maintenance.link_heal_executor import (
 from fused_memory.maintenance.link_heal_ledger import (
     ActionState,
     AdjudicationRecord,
+    Disposition,
     LinkHealLedger,
     RunSource,
 )
@@ -104,6 +106,8 @@ async def adjudicated_plan(
     adjudicate: FakeAdjudicator,
     plan_path: Path,
     limits: RunLimits = LIMITS,
+    *,
+    max_adjudications: int | None = None,
 ) -> RunReport:
     return await run_adjudicator_plan(
         adjudicate=adjudicate,
@@ -113,6 +117,7 @@ async def adjudicated_plan(
         limits=limits,
         projects=PROJECTS,
         plan_path_for=lambda _run_id: plan_path,
+        max_adjudications=max_adjudications,
     )
 
 
@@ -370,6 +375,115 @@ class TestAFailedAdjudication:
         assert report.counts.unexamined == 1
         assert report.counts.planned == 0
         assert report.counts.complete is False
+
+
+def asked_keys(fake: FakeAdjudicator) -> set[str]:
+    return {pair.key for pair in fake.pairs}
+
+
+class TestTheAdjudicationCap:
+    @pytest.mark.asyncio
+    async def test_only_the_capped_number_of_pairs_is_asked_and_the_rest_are_unexamined(
+        self, harness, ledger, tmp_path,
+    ):
+        children = seed_sightings(harness, 5)
+        fake = always(Verdict.EXTENDS)
+
+        report = await adjudicated_plan(
+            harness, ledger, fake, tmp_path / 'p.json', max_adjudications=2,
+        )
+
+        assert len(fake.pairs) == 2
+        assert report.counts.adjudications_asked == 2
+        assert report.counts.adjudication_capped == 3
+        assert report.counts.unexamined == 3
+        assert report.counts.complete is False
+        asked = asked_keys(fake)
+        unasked = [
+            record for record in ledger.run_records(report.run_id)
+            if f'{DF}:{record.child_id}' not in asked
+        ]
+        assert sorted(record.child_id for record in unasked) == sorted(
+            child for child in children if f'{DF}:{child}' not in asked
+        )
+        for record in unasked:
+            assert record.decision is Report.UNEXAMINED
+            assert record.disposition is Disposition.REPORTED
+            assert record.action_id is None
+
+    @pytest.mark.asyncio
+    async def test_reused_verdicts_do_not_count_against_the_cap(self, harness, ledger, tmp_path):
+        seed_sightings(harness, 5)
+        first_fake, second_fake, third_fake = (always(Verdict.EXTENDS) for _ in range(3))
+        await adjudicated_plan(
+            harness, ledger, first_fake, tmp_path / 'a.json', max_adjudications=2,
+        )
+
+        second = await adjudicated_plan(
+            harness, ledger, second_fake, tmp_path / 'b.json', max_adjudications=2,
+        )
+        third = await adjudicated_plan(
+            harness, ledger, third_fake, tmp_path / 'c.json', max_adjudications=2,
+        )
+
+        assert second.counts.adjudications_reused == 2
+        assert second.counts.adjudications_asked == 2
+        assert second.counts.adjudication_capped == 1
+        assert asked_keys(second_fake).isdisjoint(asked_keys(first_fake))
+        assert second.counts.complete is False
+        assert third.counts.adjudications_reused == 4
+        assert third.counts.adjudications_asked == 1
+        assert third.counts.adjudication_capped == 0
+        assert asked_keys(third_fake).isdisjoint(asked_keys(first_fake) | asked_keys(second_fake))
+        assert third.counts.complete is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_verdict_still_counts_as_asked(self, harness, ledger, tmp_path):
+        seed_sightings(harness, 5)
+        answers = iter([AdjudicationFailure.PARSE_FAILURE])
+        fake = FakeAdjudicator(lambda _text: next(answers, Verdict.EXTENDS))
+
+        report = await adjudicated_plan(
+            harness, ledger, fake, tmp_path / 'p.json', max_adjudications=2,
+        )
+
+        assert report.counts.adjudications_asked == 2
+        assert report.counts.adjudication_failed == 1
+        assert report.counts.adjudication_capped == 3
+
+    @pytest.mark.asyncio
+    async def test_the_cap_is_shared_in_turn_by_project(self, harness, ledger, tmp_path):
+        seed_sightings(harness, 5)
+        for n in range(2):
+            harness.seed_link(
+                kind=SIGHTING_KIND, child=_id('cccccccc', n), parent=_id('dddddddd', n),
+                child_text=f'reify sighting {n}', project=REIFY,
+            )
+        fake = always(Verdict.EXTENDS)
+
+        report = await adjudicated_plan(
+            harness, ledger, fake, tmp_path / 'p.json', max_adjudications=4,
+        )
+
+        assert len(fake.pairs) == 4
+        assert report.counts.adjudication_capped == 3
+        unasked = Counter(
+            record.project_id for record in ledger.run_records(report.run_id)
+            if record.decision is Report.UNEXAMINED
+        )
+        assert unasked == {DF: 3}
+
+    @pytest.mark.asyncio
+    async def test_an_uncapped_plan_asks_every_unjudged_pair(self, harness, ledger, tmp_path):
+        seed_sightings(harness, 5)
+        fake = always(Verdict.EXTENDS)
+
+        report = await adjudicated_plan(harness, ledger, fake, tmp_path / 'p.json')
+
+        assert len(fake.pairs) == 5
+        assert report.counts.adjudications_asked == 5
+        assert report.counts.adjudication_capped == 0
+        assert report.counts.complete is True
 
 
 class TestAPlanRunRecordsEscapesAndFilesNone:

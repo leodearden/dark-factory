@@ -13,6 +13,7 @@ import dataclasses
 import logging
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -89,11 +90,14 @@ def _emit_merge_queued(
     omitted when None so the shape remains backward-compatible with existing
     consumers.  The keys of
     ``orchestrator/src/orchestrator/merge_pool_facts.py::queued_request_fields``
-    are always present, null when unknown; *priority* supplies their tier and pin.
+    are always present, null when unknown; *priority* supplies their tiers, pin and age anchor.
     """
     if event_store is None:
         return
-    data: dict = {'branch': req.branch.bare_id, **queued_request_fields(req, priority)}
+    data: dict = {
+        'branch': req.branch.bare_id,
+        **queued_request_fields(req, priority, now=datetime.now(UTC)),
+    }
     if reason is not None:
         data['reason'] = reason
     if queue_depth is not None:
@@ -158,7 +162,7 @@ async def enqueue_merge_request(
     )
     queued_at = time.monotonic()
 
-    def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
+    def _on_finalized(fut: asyncio.Future) -> None:
         # --- derive terminal state -------------------------------------------
         superseded_by: str | None = None
         reason: str | None = None
@@ -177,7 +181,7 @@ async def enqueue_merge_request(
                 superseded_by = outcome.superseded_by
                 reason = outcome.reason or None
                 landed_via_chain = outcome.landed_via_chain
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'enqueue_merge_request: _on_finalized could not derive terminal '
                 'state for request_id=%s task_id=%s',
@@ -200,7 +204,7 @@ async def enqueue_merge_request(
                     reason=reason,
                     landed_via_chain=landed_via_chain,
                 ))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     'enqueue_merge_request: _on_finalized retention.record failed '
                     'for request_id=%s task_id=%s',
@@ -231,7 +235,7 @@ async def enqueue_merge_request(
                         'queue_to_land_secs': round(time.monotonic() - queued_at, 3),
                     },
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     'enqueue_merge_request: _on_finalized event_store.emit failed '
                     'for request_id=%s task_id=%s',

@@ -79,6 +79,7 @@ import inspect
 import re
 
 import pytest
+from escalation.categories import EscalationCategory
 
 # ``harness`` is a pytest FIXTURE (a real Harness wrapping a real
 # EscalationQueue); importing it binds it as a module-level name so pytest
@@ -106,18 +107,36 @@ from orchestrator.harness import Harness
 # prose drifted three times.
 _GATE_PATTERN = r'esc\.category in \{([^}]*)\}'
 
-# Category-shaped tokens in the rule prose, for the REVERSE coherence check.
-# Deliberately suffix-anchored rather than a hand-listed vocabulary: the
-# escalation ``category`` field is a free-form ``str`` (escalation/models.py
-# notes the vocabulary is "prose, not a checked contract"), so there is no
-# vocabulary constant to compare against.
-_CATEGORY_TOKEN_PATTERN = r'\b[a-z][a-z0-9_]*_(?:conflict|state|failed)\b'
+# ``escalation.categories.EscalationCategory`` is the registered vocabulary,
+# enforced at ``EscalationQueue.submit``; the REVERSE checks below bind to it.
+_REGISTERED_CATEGORIES: frozenset[str] = frozenset(
+    c.value for c in EscalationCategory
+)
+_SNAKE_CASE_TOKEN_PATTERN = r'\b[a-z][a-z0-9_]*_[a-z0-9]+\b'
+_HALT_CATEGORY_SUFFIXES: frozenset[str] = frozenset(
+    c.rsplit('_', 1)[1] for c in MERGE_HALT_ESCALATION_CATEGORIES
+)
 
 # A category the gate does NOT hold, for the negative behavioural case.  Real
 # (``orchestrator/src/orchestrator/merge_queue.py`` files it) and deliberately
 # merge-adjacent: a category that merely *sounds* unrelated would not
 # discriminate a gate that had been widened to "anything merge-ish".
 _NON_HALT_CATEGORY = 'verify_host_unreachable'
+
+
+def _registered_categories_named_in(text: str) -> set[str]:
+    return {
+        c for c in _REGISTERED_CATEGORIES
+        if re.search(rf'\b{re.escape(c)}\b', text)
+    }
+
+
+def _unregistered_halt_shaped_tokens(text: str) -> set[str]:
+    return {
+        token for token in re.findall(_SNAKE_CASE_TOKEN_PATTERN, text)
+        if token.rsplit('_', 1)[1] in _HALT_CATEGORY_SUFFIXES
+        and token not in _REGISTERED_CATEGORIES
+    }
 
 
 def _scrape_gate_categories() -> set[str]:
@@ -277,23 +296,66 @@ def test_safety_rule_names_no_category_outside_the_tuple() -> None:
     exists.  That is the same stale-framing class this file exists to end,
     pointed the other way.
 
-    Suffix-anchored on ``_conflict`` / ``_state`` / ``_failed`` rather than
-    listing a vocabulary: a future category with a different suffix is caught
-    by the gate anchor and the forward containment test, so the coverage gap
-    here is bounded and deliberate.
+    The scan is every registered ``EscalationCategory`` value, matched
+    word-bounded against the prose, so a stale or wrong category of ANY suffix
+    is caught.  A misspelt category is not registered and so is invisible
+    here; that direction belongs to
+    ``test_safety_rule_names_no_unregistered_halt_shaped_token``.
     """
-    named = set(re.findall(_CATEGORY_TOKEN_PATTERN, MERGE_HALT_SAFETY_RULE))
-    stale = sorted(named - set(MERGE_HALT_ESCALATION_CATEGORIES))
+    stale = sorted(
+        _registered_categories_named_in(MERGE_HALT_SAFETY_RULE)
+        - set(MERGE_HALT_ESCALATION_CATEGORIES)
+    )
     assert stale == [], (
-        f'MERGE_HALT_SAFETY_RULE names category-shaped token(s) {stale} that '
-        f'are not in MERGE_HALT_ESCALATION_CATEGORIES '
+        f'MERGE_HALT_SAFETY_RULE names registered EscalationCategory value(s) '
+        f'{stale} that are not in MERGE_HALT_ESCALATION_CATEGORIES '
         f'{sorted(MERGE_HALT_ESCALATION_CATEGORIES)}.  Either the category was '
         'dropped from the harness gate and its name is now stale prose in the '
         "steward's rule -- delete it -- or the rule gained a category the gate "
         'does not actually halt on, which tells the steward to hands-off an '
-        'escalation that never stops the merge queue.  Do NOT silence this by '
-        'widening the tuple; the tuple must equal the gate.'
+        'escalation that never stops the merge queue.  Or, if neither the gate '
+        'nor the rule changed, a newly registered EscalationCategory value '
+        'coincides with an identifier or word the rule already uses -- rename '
+        'the category or reword the rule.  Do NOT silence this by widening the '
+        'tuple; the tuple must equal the gate.'
     )
+
+
+def test_safety_rule_names_no_unregistered_halt_shaped_token() -> None:
+    """THE MISSPELLING DIRECTION: every halt-shaped token is a real category.
+
+    A token is halt-shaped when its final ``_segment`` is the final segment of
+    a ``MERGE_HALT_ESCALATION_CATEGORIES`` member; that suffix set is derived
+    from the tuple, never hand-listed.  A misspelt halt category is otherwise
+    invisible to every other check here whenever a correct mention of the same
+    category survives elsewhere in the rule.
+    """
+    unregistered = sorted(_unregistered_halt_shaped_tokens(MERGE_HALT_SAFETY_RULE))
+    assert unregistered == [], (
+        f'MERGE_HALT_SAFETY_RULE names token(s) {unregistered} shaped like a '
+        'merge-halt category -- each shares a final segment with a member of '
+        f'{sorted(MERGE_HALT_ESCALATION_CATEGORIES)} -- but none is a '
+        'registered escalation.categories.EscalationCategory value.  It is '
+        'most likely a misspelling the steward would copy into '
+        'escalate_blocker(..., category=...), which EscalationQueue.submit '
+        'then rejects.  Fix the spelling in the rule.'
+    )
+
+
+def test_registry_scan_finds_a_registered_category_of_any_suffix() -> None:
+    text = (
+        f'`{_NON_HALT_CATEGORY}` then x{MERGE_HALT_ESCALATION_CATEGORIES[0]} '
+        f'and {MERGE_HALT_ESCALATION_CATEGORIES[1]}y'
+    )
+    assert _registered_categories_named_in(text) == {_NON_HALT_CATEGORY}
+
+
+def test_halt_shaped_scan_flags_only_unregistered_spellings() -> None:
+    member = MERGE_HALT_ESCALATION_CATEGORIES[0]
+    head, tail = member.rsplit('_', 1)
+    prefixed, doubled = f'x{member}', f'{head}__{tail}'
+    text = f'`{prefixed}` `{doubled}` `{member}` project_root'
+    assert _unregistered_halt_shaped_tokens(text) == {prefixed, doubled}
 
 
 class TestHaltCategoriesAreBehaviourallyLoadBearing:
@@ -317,8 +379,9 @@ class TestHaltCategoriesAreBehaviourallyLoadBearing:
     automatically required to behave like a halt owner.
     """
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('category', MERGE_HALT_ESCALATION_CATEGORIES)
-    def test_each_category_restores_the_halt(
+    async def test_each_category_restores_the_halt(
         self, harness: Harness, category: str
     ) -> None:
         """A pending level-1 escalation of each member re-owns the halt."""
@@ -329,7 +392,7 @@ class TestHaltCategoriesAreBehaviourallyLoadBearing:
 
         esc = _make_wip_esc(queue, '4130', category=category)
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert result == esc.id, (
             f'A preserved level-1 `{category}` L1 did not re-own the merge '
@@ -342,7 +405,8 @@ class TestHaltCategoriesAreBehaviourallyLoadBearing:
         assert worker.is_wip_halted is True
         assert worker.halt_owner_esc_id == esc.id
 
-    def test_a_non_member_category_does_not_restore_the_halt(
+    @pytest.mark.asyncio
+    async def test_a_non_member_category_does_not_restore_the_halt(
         self, harness: Harness
     ) -> None:
         """The negative half: a non-member L1 leaves the queue running.
@@ -366,7 +430,7 @@ class TestHaltCategoriesAreBehaviourallyLoadBearing:
 
         _make_wip_esc(queue, '4130', category=_NON_HALT_CATEGORY)
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert result is None
         assert worker.is_wip_halted is False, (

@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _transcript_fixtures import assistant_record, bash_launch, bg_launch_result
 
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
@@ -931,7 +932,7 @@ class TestCallerInitiatedResume:
 
     async def test_caller_resume_substitutes_continuation_prompt_and_restores_real_prompt_on_fresh_fallback(self):
         """cli_invoke swaps in CRASH_RECOVERY_RESUME_PROMPT then restores real prompt on fallback."""
-        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT  # noqa: PLC0415
+        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT
 
         gate = make_gate_mock(
             account_count=1,
@@ -1935,7 +1936,7 @@ class TestRunSubprocessTimedOut:
 
         call_count = 0
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -4102,6 +4103,24 @@ class TestReadTranscriptRecords:
 
 # ── Two-regime liveness watchdog tests ──────────────────────────────────────
 
+def _kill_decision_clock():
+    """snapshot_process_group side_effect recording time.monotonic() per call.
+
+    run_cli_subprocess calls snapshot_process_group as the first statement of
+    its TimeoutError handler, right after the watchdog decides to kill, so
+    each recorded time is a kill decision and excludes post-kill teardown.
+    """
+    import time as _time
+
+    decided_at: list[float] = []
+
+    def _side_effect(pgid):
+        decided_at.append(_time.monotonic())
+        return f'snapshot_process_group({pgid}): stubbed'
+
+    return _side_effect, decided_at
+
+
 @pytest.mark.asyncio
 class TestRunSubprocessWatchdog:
     """Two-regime liveness watchdog tests for run_cli_subprocess.
@@ -4122,7 +4141,7 @@ class TestRunSubprocessWatchdog:
         """Return (proc, call_count_ref) where communicate hangs on call 1, raises TimeoutError on call 2."""
         call_count = [0]
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 # Hang until the watchdog cancels comm_task — CancelledError is raised here.
@@ -4143,8 +4162,9 @@ class TestRunSubprocessWatchdog:
         """Startup wedge (0 turns) is killed at startup_grace_secs, not the 12s ceiling.
 
         With startup_grace_secs=0.05 and timeout_seconds=12.0, the watchdog
-        should detect 0 turns after ~0.05s and kill fast.  Wall-clock must be
-        well under the 12s ceiling, proving the kill happened at the grace bound.
+        should detect 0 turns after ~0.05s and kill fast.  The kill decision
+        time must be well under the 12s ceiling, proving the kill happened at
+        the grace bound.
         """
         import time as _time
 
@@ -4154,6 +4174,7 @@ class TestRunSubprocessWatchdog:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4161,6 +4182,7 @@ class TestRunSubprocessWatchdog:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', return_value=0),
         ):
             t0 = _time.monotonic()
@@ -4169,22 +4191,15 @@ class TestRunSubprocessWatchdog:
                 backend='claude', model='opus', timeout_seconds=12.0,
                 transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         terminate_pg_mock.assert_called_once()
-        # Discriminates the correct ~0.05s-grace kill from the WRONG 12.0s ceiling
-        # (widened from 5.0s — task 2723). The wedge kill itself fires near the grace
-        # bound (see the "Startup wedge detected" log); wall additionally captures
-        # real post-kill teardown — an UNMOCKED snapshot_process_group /proc walk,
-        # comm_task cancellation/await, the second (SIGTERM-window) communicate()
-        # call, and event-loop scheduling — which under parallel verify/host load has
-        # been observed to drift to ~3.3s. 7.0s keeps full discriminating power
-        # against the 12.0s wrong ceiling while comfortably tolerating that teardown
-        # latency — same load-drift de-flake shape as the sibling absolute-cap-vs-
-        # idle-bound and UNREADABLE-DEGRADE tests in this class (commits
-        # f1aae9678e, fda97df621af).
-        assert wall < 7.0, f'Expected fast kill (<7s), got {wall:.3f}s — wedge not killed at grace bound'
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
+        # The bounds time the kill decision, not the teardown after it, so 6.0s
+        # separates the ~0.05s grace kill from the wrong 12.0s ceiling under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.05, f'Expected wedge kill at the 0.05s grace bound, killed too early at {decision:.3f}s'
+        assert decision < 6.0, f'Expected wedge kill at the ~0.05s grace bound, not the 12.0s ceiling ({decision:.3f}s)'
 
     async def test_none_transcript_degrades_to_ceiling_not_grace(self, tmp_path):
         """B7 conservative degrade: unreadable/absent transcript (None) must NOT trigger
@@ -4417,7 +4432,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             f'or a valve trip is reported as a kill instead of by the reads witness'
         )
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             await asyncio.sleep(delay_secs)
             deadline = _time.monotonic() + _EXTENSION_READS_VALVE_SECS
             while len(reads_observed) < min_reads and _time.monotonic() < deadline:
@@ -4440,7 +4455,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         """
         call_count = [0]
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 await asyncio.Event().wait()
@@ -4485,24 +4500,6 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             return value
 
         return _side_effect
-
-    @staticmethod
-    def _kill_decision_clock():
-        """snapshot_process_group side_effect recording time.monotonic() per call.
-
-        run_cli_subprocess calls snapshot_process_group as the first statement of
-        its TimeoutError handler, right after the watchdog decides to kill, so
-        each recorded time is a kill decision and excludes post-kill teardown.
-        """
-        import time as _time
-
-        decided_at: list[float] = []
-
-        def _side_effect(pgid):
-            decided_at.append(_time.monotonic())
-            return f'snapshot_process_group({pgid}): stubbed'
-
-        return _side_effect, decided_at
 
     @classmethod
     def _recorded_with_held_read(cls, turns_side_effect, reads, *, held_secs):
@@ -4606,6 +4603,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4613,6 +4611,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', side_effect=self._grow_then_plateau_turns(3)),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
@@ -4623,33 +4622,21 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 backend='claude', model='opus', timeout_seconds=0.05,
                 transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.02, working_idle_secs=0.3, absolute_cap_secs=20.0),
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         terminate_pg_mock.assert_called_once()
-        # idle_bound = max(0.3, 0.05) = 0.3s of no-progress, on top of the ~0.06s
-        # growth phase → kill at ~0.36s.  Well past the old 0.05s ceiling (proves
-        # it wasn't killed there) and well under the 20s absolute cap (proves it
-        # wasn't killed there either; widened 5.0s → 10.0s in task 2723, then
-        # 10.0s → 20.0s in task 4234 — see the teardown-drift note below).
-        assert wall >= 0.2, (
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
+        # idle_bound = max(0.3, 0.05) = 0.3s of no progress after the ~0.06s growth
+        # phase → kill at ~0.36s.  The bounds time the kill decision, not the
+        # teardown after it, so they separate it from the old 0.05s ceiling and
+        # from the wrong 20.0s absolute cap under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.2, (
             f'Expected idle-kill at ~0.36s (after progress stalls), '
-            f'killed too early at {wall:.3f}s — looks like the old ceiling fired'
+            f'killed too early at {decision:.3f}s — looks like the old ceiling fired'
         )
-        # Discriminates the correct ~0.36s idle-kill from the WRONG 20.0s absolute
-        # cap. wall additionally captures real post-kill teardown (unmocked
-        # snapshot_process_group /proc walk, comm_task cancellation/await, the
-        # second communicate() call, event-loop scheduling), which under a full
-        # parallel verify run drifts far past the kill itself: ~2.5s when this
-        # bound was last widened (519331f59f), then 6.215s observed during task
-        # 4234's verify attempt-1 — with the captured log confirming the watchdog
-        # fired correctly at 0.4s, so every excess second was teardown, not a
-        # missed kill. 10.0s keeps full discriminating power against the 20.0s
-        # wrong ceiling while tolerating that teardown latency — same load-drift
-        # de-flake shape as the sibling tests in this class (commits fda97df621af,
-        # 2b2916a663, 519331f59f).
-        assert wall < 10.0, (
-            f'Expected idle-kill well under the 20s absolute cap, got {wall:.3f}s'
+        assert decision < 10.0, (
+            f'Expected idle-kill at ~0.36s, not at the 20.0s absolute cap ({decision:.3f}s)'
         )
 
     async def test_b6_long_synchronous_tool_call_survives_between_ceiling_and_idle_bound(self, tmp_path):
@@ -4722,7 +4709,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
-        snapshot_side_effect, decided_at = self._kill_decision_clock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4770,7 +4757,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
-        snapshot_side_effect, decided_at = self._kill_decision_clock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -5102,7 +5089,7 @@ class TestUnreadableTranscriptEscapeWiring:
             'session_id': 'sess-escape',
         }).encode()
 
-        async def _communicate(input=None):  # noqa: A002
+        async def _communicate(input=None):
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(release.wait(), timeout=release_timeout_secs)
             return (payload, b'')
@@ -5652,7 +5639,7 @@ class TestMaterializeStdin:
         stated directly, and immune to an unrelated fd opened by pytest between
         the two counts.
         """
-        # noqa SIM115: the whole point is a handle that outlives the `with` —
+  # SIM115: the whole point is a handle that outlives the `with` —
         # it must still be inspectable (`.closed`) after the call under test.
         real = tempfile.TemporaryFile()  # noqa: SIM115
         try:
@@ -5913,31 +5900,16 @@ def _sigkill_proc() -> MagicMock:
 
 
 # Two assistant turns served by a real model, the second of which launches a
-# background Bash command that is never reaped — so ONE transcript yields all
-# three normal-exit signals at once: transcript_turns == 2,
+# background Bash command the CLI confirms and nothing reaps — so ONE transcript
+# yields all three normal-exit signals at once: transcript_turns == 2,
 # ended_awaiting_background is True, model_id == 'claude-opus-5'.
 _MODEL_AND_ABANDONED_LAUNCH_RECORDS = [
     {'type': 'user', 'message': {'role': 'user', 'content': 'go'}},
-    {
-        'type': 'assistant',
-        'message': {
-            'model': 'claude-opus-5',
-            'role': 'assistant',
-            'content': [{'type': 'text', 'text': 'kick off the long build'}],
-        },
-    },
-    {
-        'type': 'assistant',
-        'message': {
-            'model': 'claude-opus-5',
-            'role': 'assistant',
-            'content': [{
-                'type': 'tool_use',
-                'name': 'Bash',
-                'input': {'command': './long-build.sh', 'run_in_background': True},
-            }],
-        },
-    },
+    assistant_record(
+        [{'type': 'text', 'text': 'kick off the long build'}], model='claude-opus-5'
+    ),
+    assistant_record([bash_launch(command='./long-build.sh')], model='claude-opus-5'),
+    bg_launch_result(),
 ]
 
 

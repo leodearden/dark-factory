@@ -33,6 +33,7 @@ escalation = { workspace = true }
 markers = [
     "integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'",
     "reads_git_history: the test reads the checkout's git history (log, merge-base, rev-list, describe), so a byte-identical tree under a new parent can verify differently; re-run alone on the merge gate's same-tree path by merge_gate_history_test_command. Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
 ]
 pythonpath = ["src", "../orchestrator/src"]
 asyncio_mode = "strict"

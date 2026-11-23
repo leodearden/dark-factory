@@ -860,8 +860,11 @@ collection, no new predicate:
 
 ```
 plan_rate     = (n_admitted - no_plan) / n_admitted
-cost_per_plan = (spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
+cost_per_plan = (candidate spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
 ```
+
+Candidate spend is defined in "A plan-only cell's cost is its candidate's
+spend (task 3848)" under "The composite report (task 3099)" below.
 
 | Figure | Composite row key | θ aggregate key | Rendered column |
 |---|---|---|---|
@@ -1340,6 +1343,33 @@ and fast precisely because it failed. That closes only the intra-group route.
 The cross-group route needs the composite hard gate. Both are set out in "The
 plan-production predicate (task 3302)" above.
 
+**A plan-only cell's cost is its candidate's spend (task 3848).** Every cost
+figure on a row reads `cell_admission.py::candidate_cost_usd`: both floors, the
+cost ratio, `cost_usd` and `ci95.cost`, and the `cost_per_plan` numerator. For a
+plan-only cell that is `cost_usd - judge_cost_usd`. The plan judge is a fixed
+opus / `effort='max'` OFAT pin (`judge.py::judge_plan_quality`), identical for
+every architect candidate. Folding its spend in compresses the spread the
+composite ranks on, and lets a cell written before task 3629 set a floor that
+later cells pay the judge against. Those older cells persisted
+`judge_cost_usd = 0.0` beside an architect-only `cost_usd`, so the subtraction
+measures the same thing on both vintages without a vintage marker. The latency
+axis already excluded the judge, so the two efficiency axes now agree.
+
+- The judge's spend stays on the row's `judge.cost_usd`, a SUM over every
+  trial (unmeasurable ones included); `cost_usd` is a per-trial MEAN over the
+  measured trials, so the two do not add. A plan-only row's measured spend is
+  `cost_usd × ci95.cost.n + judge.cost_usd` when no unmeasurable trial carries
+  judge spend. Compose a judge-inclusive figure, such as D11's $/usable-plan
+  (`plans/fable-architect-trial-v2-prd.md`), that way or from the cells.
+- A workflow cell keeps its completion-judge spend: that judge's verdict
+  changes the run's own course, and that path has no vintage split.
+- A plan-only `cost_source` of `mixed` still names the persisted
+  two-component sum (`metrics.py::compose_cost_source`), since nothing
+  persisted says which non-CLI source the architect component had.
+- A judge spend above the cell's `cost_usd` breaks the subset invariant
+  `metrics.py::EvalMetrics` declares, and raises a `ValueError` naming the
+  cell rather than clamping it to a free run.
+
 **One admission decision for every measured pool.** An unmeasurable plan-only
 trial (`cell_admission.py::is_unmeasurable`) leaves the plan-quality, composite,
 quality, cost and latency pools, the efficiency floors and the `cost_source`
@@ -1692,7 +1722,7 @@ would become the floor for full-workflow cells, and it would fabricate a 100%
 Code: `orchestrator/src/orchestrator/evals/eval_gate.py`
 (`build_eval_usage_gate`, `owned_usage_gate`, `campaign_usage_gate`,
 `GATE_UNSET`, `InjectedGate`). Consumers:
-`runner.py`'s three executors and stage fan-outs, `cli.py::_run_single_eval`
+`runner.py`'s three executors and stage fan-outs, `evals/cli.py::_run_single_eval`
 and `reviewer_trial/__main__.py::campaign`.
 
 **Why an eval invoke is gated at all (eval-revival φ).** Ungated, a capped
@@ -1777,7 +1807,7 @@ build, yield and teardown have one implementation. It builds from
 `EVAL_PROFILE` nor the update dict mentioning `usage_cap`. The leaf is
 inherited verbatim and the campaign gate is identical to the one each cell
 would have built. That equivalence is emergent across two files, so
-`test_eval_architect.py::TestCampaignGatePremise` pins it as a tripwire. A
+`test_eval_architect_usage_gate.py::TestCampaignGatePremise` pins it as a tripwire. A
 `None` base config yields `None` without building: there is nothing to build
 from, and every stage function defaults it. A `None` yield, from that or from
 a degraded build, must be threaded to cells as an explicit `usage_gate=None`,

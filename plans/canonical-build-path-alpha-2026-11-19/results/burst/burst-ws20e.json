@@ -1,0 +1,151 @@
+{
+ "host": "workstation",
+ "label": "ws20e",
+ "started": 20,
+ "answered": 20,
+ "readonly_by_log": 0,
+ "wrote_entry": 20,
+ "no_write": 0,
+ "rows": [
+  {
+   "i": 1,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 2,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 3,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 4,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 5,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 6,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 7,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 8,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 9,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 10,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 11,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 12,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 13,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 14,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 15,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 16,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 17,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 18,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 19,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 20,
+   "readonly_log": false,
+   "writes": 1,
+   "write_errors": 0,
+   "err_tail": ""
+  }
+ ]
+}

@@ -38,9 +38,12 @@ from typing import Any
 
 from shared.eval_lane import eval_lane_provenance
 from shared.mcp_markup_middleware import (
+    MARKUP_BOUNDARY_STORM_CATEGORY,
     MARKUP_RECURRENCE_ROUTING,
     MARKUP_RESIDUE_ERROR_TYPES,
+    MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
 )
 from shared.project_layout import escalation_queue_dir
 
@@ -49,14 +52,6 @@ logger = logging.getLogger(__name__)
 #: Rendered as the subject when there is no plan to read it from and the
 #: worktree has no name either. Never a guess — an explicit "nobody knows".
 MARKUP_UNATTRIBUTED_SUBJECT = 'unattributed'
-
-#: The REFUSAL residue kind and the burst kind. Matched by name rather than by
-#: shape: a record kind that grew a key later must not silently start taking
-#: the other branch. Residue is dispatched on the middleware's own
-#: ``MARKUP_RESIDUE_ERROR_TYPES`` set, which also holds FORWARD_REPAIR's
-#: dropped-slice kind.
-MARKUP_RESIDUE_ERROR_TYPE = 'mcp_markup_unrepairable'
-MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
 #: The ERROR line for a record the queue could not take: why, what it cost
 #: (:func:`_loss_account`), and whose call it was.
@@ -91,15 +86,16 @@ _LOSS_PROSE: Mapping[LossCause, str] = {
 MARKUP_RECORD_LOST_FACT = 'markup_record_lost'
 MARKUP_RECORD_LOST_OUTCOME = 'lost'
 
-#: The burst alarm's OWN category and level, because the middleware's storm
-#: record declares neither — unlike the residue record, which carries both and
-#: whose vocabulary is therefore never re-decided here (INV-7).
+#: The burst alarm's level — this sink's OWN decision, because the
+#: middleware's storm record declares none. Its category is not decided here:
+#: it is the middleware's ``MARKUP_BOUNDARY_STORM_CATEGORY``, one spelling for
+#: every registration site. The residue record carries both and its vocabulary
+#: is therefore never re-decided here (INV-7).
 #:
 #: ``level=1`` matches ``markup_tripwire``'s storm record, the in-repo
 #: precedent for a burst alarm filed from an MCP server process: it is an
 #: operator-facing heads-up about a leak that is running now, not a hold on one
 #: caller's data.
-MARKUP_STORM_CATEGORY = 'mcp_markup_boundary_storm'
 MARKUP_STORM_LEVEL = 1
 
 #: The storm detail's SUBJECT line, spelled ONCE: :func:`storm_detail` writes it
@@ -329,7 +325,7 @@ def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
 def _residue_outcome(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
     """What happened to the call, in the record kind's OWN terms."""
     error_type = record.get('error_type')
-    if error_type == MARKUP_RESIDUE_ERROR_TYPE:
+    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
         return (
             f'The {spec.server_label} MCP boundary guard refused this tool call: '
             'the value below carries raw tool-call envelope markup whose own '
@@ -614,7 +610,7 @@ def file_storm(
         existing = []
     open_alarms = [
         esc for esc in existing
-        if getattr(esc, 'category', None) == MARKUP_STORM_CATEGORY
+        if getattr(esc, 'category', None) == MARKUP_BOUNDARY_STORM_CATEGORY
     ]
     if open_alarms:
         open_subject = _recorded_subject(open_alarms[0])
@@ -654,7 +650,7 @@ def file_storm(
         task_id=spec.storm_anchor_task_id,
         agent_role=spec.agent_role,
         severity='blocking',
-        category=MARKUP_STORM_CATEGORY,
+        category=MARKUP_BOUNDARY_STORM_CATEGORY,
         # PREFIXED exactly as ``file_residue`` prefixes its own: the queue's
         # task_id is the burst anchor, so a reader scanning summaries alone
         # would otherwise have no way to tell whose calls leaked — and the L2

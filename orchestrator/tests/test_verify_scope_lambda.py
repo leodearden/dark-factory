@@ -220,7 +220,7 @@ class TestForceWorkspaceBreadthExecutionGoldens:
     replaces the single OPAQUE global ``&&``-chain with a per-module
     full-suite fan-out across every REGISTERED module (mirroring the
     module_configs-branch merge+full expansion ``TestRoleBreadthExecutionGoldens``
-    pins above); breadth='scoped' (the shipped default) stays byte-identical
+    pins above); breadth='scoped' (the per-project opt-down) stays byte-identical
     to the pre-λ legacy single global call (R4).
 
     This is the ``merge_verify_workspace=True`` routing
@@ -300,8 +300,8 @@ class TestForceWorkspaceBreadthExecutionGoldens:
     async def test_force_workspace_merge_scoped_stays_single_opaque_global_call(
         self, tmp_path: Path,
     ):
-        """(b) force_workspace=True + breadth='scoped' (the shipped
-        default): byte-identical legacy — exactly ONE global
+        """(b) force_workspace=True + breadth='scoped' (the per-project
+        opt-down): byte-identical legacy — exactly ONE global
         run_verification call carrying NO ModuleConfig (the opaque
         workspace command), never a per-module fan-out (R4 rollback
         golden)."""

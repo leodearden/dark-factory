@@ -78,7 +78,12 @@ def install_fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def steward(make_steward):
     """A real steward under the production lifetime cap, whose queue resolves each record."""
     built = make_steward(
-        config_overrides={'steward_lifetime_budget': 20.0},
+        config_overrides={
+            'steward_lifetime_budget': 20.0,
+            # This module characterises the resume arm's session bookkeeping; the
+            # default arm is covered in test_steward_session_mode.py.
+            'steward_session_mode': 'resume',
+        },
         event_store=MagicMock(),
     )
     built.escalation_queue.get.side_effect = lambda escalation_id: dataclasses.replace(
@@ -100,6 +105,7 @@ def _max_budget(argv: list[str]) -> str:
     return argv[argv.index('--max-budget-usd') + 1]
 
 
+@pytest.mark.spawns_agent_cli
 @pytest.mark.asyncio
 class TestStewardSessionCost:
     async def test_each_continuation_is_charged_its_own_spend(

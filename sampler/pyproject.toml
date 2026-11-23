@@ -46,6 +46,9 @@ indent-style = "space"
 docstring-code-format = true
 
 [tool.pytest.ini_options]
+markers = [
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
+]
 asyncio_mode = "auto"
 # Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
 # updating a stale value: until task 5442 this config declared neither key, so

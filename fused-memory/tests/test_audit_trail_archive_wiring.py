@@ -67,7 +67,7 @@ class _RecordingMemoryService:
 
 
 def _wire(memory_service):
-    from fused_memory.server.main import _wire_audit_trail_archive  # noqa: PLC0415
+    from fused_memory.server.main import _wire_audit_trail_archive
 
     interceptor = _RecordingInterceptor()
     _wire_audit_trail_archive(interceptor, memory_service)

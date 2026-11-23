@@ -2698,7 +2698,7 @@ class TestCommittedCalibrationIsTraceable:
     @staticmethod
     @functools.cache
     def _committed():
-        import yaml  # noqa: PLC0415
+        import yaml
 
         block = yaml.safe_load(
             TestCommittedCalibrationIsTraceable.CONFIG_PATH.read_text()
@@ -2783,7 +2783,7 @@ class TestCommittedPerCategoryEvidenceIsRecorded:
     @staticmethod
     @functools.cache
     def _committed():
-        import yaml  # noqa: PLC0415
+        import yaml
 
         cls = TestCommittedPerCategoryEvidenceIsRecorded
         block = yaml.safe_load(cls.CONFIG_PATH.read_text()).get('write_triage') or {}

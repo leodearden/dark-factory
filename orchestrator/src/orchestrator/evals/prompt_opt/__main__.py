@@ -82,11 +82,6 @@ _AUDIT_CHECKS = (
 )
 
 
-def _fused_memory_default_tickets_db(root: Path) -> Path:
-    """Under fused-memory's default reconciliation.data_dir, a location shared.project_layout does not own."""
-    return root / 'data' / 'reconciliation' / 'tickets.db'
-
-
 # Documented PRD §9 calibration STARTING points -- both the window lengths
 # below and the per-metric threshold defaults sourced from CanaryThresholds()
 # are starting points to be tuned against real runs.db baseline variance,
@@ -159,8 +154,8 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 
 @cli.command('build-curator-corpus')
 @click.option('--db-path', default=None, type=click.Path(path_type=Path),
-              help='Path to the offline tickets.db (env: CURATOR_TICKETS_DB; '
-                   "default: the main checkout's data/reconciliation/tickets.db)")
+              help="Path to the offline tickets.db (default: the main checkout's "
+                   'data/reconciliation/tickets.db)')
 @click.option('--n', default=_DEFAULT_N, type=int,
               help='Max labeled decisions to sample (stratified by recorded action)')
 @click.option('--seed', default=_DEFAULT_SEED, type=int, help='Deterministic sampling/split seed')
@@ -184,9 +179,7 @@ def build_curator_corpus_cmd(
     adjudication_log.jsonl under *out*'s directory. Prints an
     audit_curator_corpus PASS/FAIL summary and exits non-zero on FAIL.
     """
-    db_path = db_path or cli_default(
-        '--db-path', _fused_memory_default_tickets_db, env_var='CURATOR_TICKETS_DB',
-    )
+    db_path = db_path or cli_default('--db-path', project_layout.reconciliation_tickets_db)
 
     from .curator_corpus import (
         FrontierLabel,
@@ -202,8 +195,8 @@ def build_curator_corpus_cmd(
                 '  This is an offline generation tool that reads the gitignored '
                 'reconciliation ticket store (data/reconciliation/tickets.db in the '
                 'MAIN repo checkout, not a task worktree -- see '
-                'curator_replay_corpus/README.md). Pass --db-path, or set '
-                'CURATOR_TICKETS_DB, to point at a real tickets.db.',
+                'curator_replay_corpus/README.md). Pass --db-path to point at a '
+                'real tickets.db.',
                 err=True,
             )
             return 1
@@ -262,8 +255,7 @@ def build_curator_corpus_cmd(
 
 @cli.command('canary')
 @click.option('--runs-db', default=None, type=click.Path(path_type=Path),
-              help='Path to the offline orchestrator runs.db (env: PROMPT_OPT_RUNS_DB; '
-                   "default: the main checkout's runs.db)")
+              help="Path to the offline orchestrator runs.db (default: the main checkout's runs.db)")
 @click.option('--deploy-at', default=None,
               help='ISO-8601 deploy timestamp. Required unless --prompt-id/--executor-model/'
                    '--harness-version are all given (resolves it from T1 provenance instead)')
@@ -328,7 +320,7 @@ def canary(
     feeds: pin -> watch this command -> unpin (T1
     PromptArtifactStore.unpin) on regress.
     """
-    runs_db = runs_db or cli_default('--runs-db', project_layout.runs_db, env_var='PROMPT_OPT_RUNS_DB')
+    runs_db = runs_db or cli_default('--runs-db', project_layout.runs_db)
 
     if deploy_at is None:
         if not (prompt_id and executor_model and harness_version):
@@ -366,8 +358,7 @@ def canary(
         click.echo(
             f'runs.db not found at {runs_db}\n'
             '  This reads the gitignored orchestrator run history, which lives in '
-            'the MAIN repo checkout, not a task worktree. Pass --runs-db, or set '
-            'PROMPT_OPT_RUNS_DB.',
+            'the MAIN repo checkout, not a task worktree. Pass --runs-db.',
             err=True,
         )
         sys.exit(_USAGE_ERROR_EXIT_CODE)
@@ -502,7 +493,7 @@ def smoke(artifacts_root: Path | None, split_seed: int) -> None:
         except KeyboardInterrupt:
             click.echo('\nInterrupted.')
             sys.exit(130)
-        except Exception as exc:  # noqa: BLE001 -- surface ANY run failure as a non-zero gate
+        except Exception as exc:  # surface ANY run failure as a non-zero gate
             click.echo(click.style(
                 f'Acceptance smoke FAILED to run: {exc!r}', fg='red', bold=True,
             ), err=True)

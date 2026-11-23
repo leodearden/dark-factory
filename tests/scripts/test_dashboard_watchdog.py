@@ -958,8 +958,8 @@ DASHBOARD_SERVICE_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard.servi
 #: The orchestrator config — the only other place in the repo that names the
 #: escalation queue directory the watchdog writes its born-at-L2 into.
 #: ``dark-factory-orchestrator.yaml`` is the canonical required basename (the
-#: dashboard's escalation-URL discovery keys on it); the legacy spellings are a
-#: discovery fallback for unmigrated projects, not a name to accept here.
+#: dashboard's escalation-URL discovery keys on it); discovery reads no legacy
+#: spelling (retired, task 7138), and none is a name to accept here.
 ORCH_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
 #: The deep, DB-touching endpoint the retired inline shell probed. Used to
@@ -1567,6 +1567,27 @@ def test_b4_ceiling_escalation_argv_is_the_born_at_l2_contract(
     assert _argv_value(argv, "--category") == "infra_issue"
     assert _argv_value(argv, "--agent-role") == "harness-dashboard-watchdog"
     assert _argv_value(argv, "--agent-role").startswith("harness-")
+
+
+def test_b4_ceiling_escalation_runs_uv_without_syncing_the_shared_venv(
+    monkeypatch, state_env, queue_env
+):
+    """The restart-ceiling page must not reinstall into the shared root .venv the dashboard runs from.
+
+    Rationale: tests/scripts/test_uv_run_venv_isolation.py.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        seed_state=_at_ceiling_state(mod),
+    )
+
+    argv = rec.escalations[0]
+    assert argv[:2] == [mod.UV_BIN, "run"]
+    run_flags = argv[2:argv.index("escalation")]
+    assert "--no-sync" in run_flags, f"argv={argv}"
+    assert not {"--frozen", "--locked"} & set(run_flags), f"argv={argv}"
 
 
 def test_b4_escalation_summary_carries_the_measured_evidence(

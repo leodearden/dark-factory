@@ -20,6 +20,11 @@ from typing import NamedTuple
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.testing_ceiling_anchors import (
+    MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS,
+    MAGICMOCK_REPO_SCAN_TEST_TIMEOUT,
+)
+from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 from shared.testing_xdist_groups import single_xdist_group
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -33,6 +38,7 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_bare_magicmock_c
 _checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config')
 find_violations = _checker.find_violations
 _lint_cli = load_script_module(SCRIPT_PATH.with_name('_lint_cli.py'))
+_timing_debt = load_script_module(SCRIPT_PATH.with_name('_timing_dependence_debt.py'))
 Violation = _lint_cli.Violation
 
 
@@ -583,6 +589,8 @@ class TestCliBoundary:
         rule_b_file.write_text(_TASK_3980_SHAPE)
         rule_c_file = tmp_path / 'test_rule_c.py'
         rule_c_file.write_text(_RULE_C_SOURCE)
+        rule_d_file = tmp_path / 'test_rule_d.py'
+        rule_d_file.write_text(_RULE_D_SOURCE)
         (tmp_path / 'test_clean.py').write_text(_CLEAN_SOURCE)
 
         result = subprocess.run(
@@ -601,12 +609,16 @@ class TestCliBoundary:
         reported = result.stdout.splitlines()
         rule_b_report = [line for line in reported if line.startswith(f'{rule_b_file}:')]
         rule_c_report = [line for line in reported if line.startswith(f'{rule_c_file}:')]
+        rule_d_report = [line for line in reported if line.startswith(f'{rule_d_file}:')]
         for needle in ('bare-dataclass-double', 'VerifyResult', 'fake_verify_result', 'verify_skipped'):
             assert any(needle in line for line in rule_b_report), (
                 f'expected {needle!r} on a {rule_b_file.name} line; got: {result.stdout!r}'
             )
         assert any('wall-clock-deadline' in line for line in rule_c_report), (
             f'expected a wall-clock-deadline report for {rule_c_file.name}; got: {result.stdout!r}'
+        )
+        assert any('timing-dependence' in line for line in rule_d_report), (
+            f'expected a timing-dependence report for {rule_d_file.name}; got: {result.stdout!r}'
         )
         assert 'test_clean.py' not in result.stdout
 
@@ -634,7 +646,7 @@ class TestHooksIntegration:
         only asserts the gate block (selection through invocation, non-comment
         portions) actually expands that array.
         """
-        import re as _re  # noqa: PLC0415 — avoid polluting module namespace
+        import re as _re  # avoid polluting module namespace
 
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
@@ -1257,17 +1269,8 @@ class TestRuleBIsUnconditional:
         )
 
 
-# Each repo-wide scan sweeps all seven packages' tests/; 61.52s x 8 = 492.16, rounded up to a
-# whole minute. Family rationale: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
-MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540
-
 # Both scan classes run on one loadgroup worker, so `repo_test_scan` is built once per run.
 _REPO_SCAN_GROUP_NAME = 'bare_magicmock_repo_scan'
-
-# Worst root-bound wall clock of these scans under real load, task 5442; corpus is plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-_REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE = 61.52
-# Canonical home is orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR; fused-memory's tests cannot import orchestrator's test helpers.
-_UNDER_LOAD_HEADROOM_FACTOR = 8
 
 
 def _timeout_seconds(marker: pytest.Mark | None) -> float | None:
@@ -1286,18 +1289,22 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
     in the task-role whole-tree guard family. Family rationale:
     shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
     """
-    scan_classes = (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity)
+    scan_classes = (
+        TestAllScannedTestDirsClean,
+        TestWallClockDeadlineBaselineIntegrity,
+        TestTimingDependenceBaselineIntegrity,
+    )
     scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
     if not scan_items:
         pytest.skip('no repo-wide scan item is selected in this session')
     ini_default = float(request.config.getini('timeout'))
-    measured_need = _REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE * _UNDER_LOAD_HEADROOM_FACTOR
+    measured_need = MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS * UNDER_LOAD_HEADROOM_FACTOR
     required = max(measured_need, ini_default)
     ceilings = {item.nodeid: _timeout_seconds(item.get_closest_marker('timeout')) for item in scan_items}
     short = {nodeid: ceiling for nodeid, ceiling in ceilings.items() if ceiling is None or ceiling < required}
     assert short == {}, (
         f'repo-wide scan items resolve a timeout below {required}s, the larger of the measured '
-        f'{_REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE}s x headroom {_UNDER_LOAD_HEADROOM_FACTOR} '
+        f'{MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS}s x headroom {UNDER_LOAD_HEADROOM_FACTOR} '
         f'and the {ini_default}s ini default (None = no mark): {short}. Bind '
         '@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT) on the scan class; a closer mark '
         'on a scan test REPLACES it.'
@@ -1311,7 +1318,11 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
 
 
 def test_the_repo_wide_scans_share_one_xdist_worker(request):
-    scan_classes = (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity)
+    scan_classes = (
+        TestAllScannedTestDirsClean,
+        TestWallClockDeadlineBaselineIntegrity,
+        TestTimingDependenceBaselineIntegrity,
+    )
     scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
     if not scan_items:
         pytest.skip('no repo-wide scan item is selected in this session')
@@ -1320,22 +1331,18 @@ def test_the_repo_wide_scans_share_one_xdist_worker(request):
 
 
 class _ScannedTestFile(NamedTuple):
-    """What the two repo-wide scans need from one scanned file; its tree is not kept."""
+    """What the repo-wide scans need from one scanned file; its tree is not kept.
+
+    The two counts are the raw, pre-budget numbers each debt baseline records, from
+    the same ``check_bare_magicmock_config.py::scan_tree`` walk as the gate's verdict.
+    """
 
     path: Path
     relpath: str
     gate_violations: tuple[Violation, ...]
     rule_c_count: int
+    timing_count: int
     syntax_error: SyntaxError | None
-
-
-def _rule_c_count(tree: ast.Module, lines: list[str], entry: str) -> int:
-    """Count *tree*'s Rule C violations at every node, before any debt budget, as
-    ``check_bare_magicmock_config.py::_wall_clock_deadline_violations`` dispatches on node type."""
-    return sum(
-        len(_checker._wall_clock_deadline_violations(node, lines, entry))
-        for node in ast.walk(tree)
-    )
 
 
 def _scan_test_file(path: Path, relpath: str) -> _ScannedTestFile:
@@ -1343,12 +1350,16 @@ def _scan_test_file(path: Path, relpath: str) -> _ScannedTestFile:
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
-        return _ScannedTestFile(path, relpath, gate_violations=(), rule_c_count=0, syntax_error=exc)
+        return _ScannedTestFile(
+            path, relpath, gate_violations=(), rule_c_count=0, timing_count=0, syntax_error=exc
+        )
+    scan = _checker.scan_tree(tree, source, str(path))
     return _ScannedTestFile(
         path,
         relpath,
-        gate_violations=tuple(_checker.find_violations_in_tree(tree, source, str(path))),
-        rule_c_count=_rule_c_count(tree, source.splitlines(), relpath),
+        gate_violations=tuple(scan.violations),
+        rule_c_count=scan.debt.wall_clock_deadline,
+        timing_count=scan.debt.timing_dependence,
         syntax_error=None,
     )
 
@@ -1356,7 +1367,7 @@ def _scan_test_file(path: Path, relpath: str) -> _ScannedTestFile:
 def _scan_repo_test_dirs(
     repo_root: Path, scanned_dirs: Iterable[str]
 ) -> tuple[_ScannedTestFile, ...]:
-    """Parse every file the lint call sites scan ONCE, for both the gate and the Rule C census.
+    """Parse every file the lint call sites scan ONCE, for the gate and both debt censuses.
 
     The file set, the strict utf-8 read and the filename are run_cli's, so the gate
     sees what the CLI would. Facts, not trees: every ast.Module of seven packages'
@@ -1382,7 +1393,8 @@ class TestAllScannedTestDirsClean:
 
     The checker is wired into seven package ``orchestrator.yaml`` lint_commands,
     ``dark-factory-orchestrator.yaml``, and ``hooks/project-checks``.  Adding Rule B
-    — and then Rule C (task 4246) — put a hot, position-blind rule in front of all of
+    — and then Rule C (task 4246) and Rule D (task 8254) — put a hot, position-blind rule
+    in front of all of
     them at once, so a single unhandled site turns a package's lint_command red and
     stalls the merge lane repo-wide.
 
@@ -1426,6 +1438,9 @@ class TestAllScannedTestDirsClean:
             '  bare-magicmock        → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
             '  bare-dataclass-double → fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
             '  wall-clock-deadline   → wait_responsive(...) or poll_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
+            '                          or, for a debt-baseline slack report, lower the named budget\n'
+            '  timing-dependence     → wait on the event / fake_clock / virtual_clock_test / testing_own_time,\n'
+            '                          or @pytest.mark.timing(reason=...) when a deadline is the behaviour under test,\n'
             '                          or, for a debt-baseline slack report, lower the named budget\n'
             f'Scanned: {present}\n'
             'Violations:\n'
@@ -1842,6 +1857,7 @@ class TestWallClockDeadlineMessage:
 # One call, BOTH Rule C offence kinds — so a single suppression check at the site
 # is provably suppressing both, not just the one that happens to be reported first.
 _RULE_C_SOURCE = 'asyncio.wait_for(req_a.result, timeout=25.0)\n'
+_RULE_D_SOURCE = 'time.sleep(0.1)\n'
 
 
 class TestWallClockDeadlineExemption:
@@ -2042,7 +2058,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_restart_hook.py',
     'orchestrator/tests/test_offline_lane_records.py',
     'orchestrator/tests/test_remote_gate.py',
-    'orchestrator/tests/test_task_verify_host_race.py',
     'orchestrator/tests/test_verify.py',
     'orchestrator/tests/test_verify_admission_cancel_release.py',
     'orchestrator/tests/test_verify_admission_executor_bypass.py',
@@ -2051,7 +2066,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_verify_admission_watch.py',
     'orchestrator/tests/test_verify_hosts.py',
     'orchestrator/tests/test_verify_plan_latch.py',
-    'orchestrator/tests/test_verify_run_cmd_reap.py',
     'orchestrator/tests/test_workflow_halt_owner.py',
     'dashboard/tests/test_db.py',
     'dashboard/tests/test_mcp_fanout.py',
@@ -2130,12 +2144,13 @@ def _live_rule_c_debt_entry() -> tuple[str, int]:
     debt = _checker._WALL_CLOCK_DEADLINE_DEBT
     if not debt:
         pytest.fail(
-            'the Rule C debt baseline is empty: every file is migrated. Retire the '
-            'debt machinery in this same change: _WALL_CLOCK_DEADLINE_DEBT, '
-            '_debt_entry, _DebtEntry, _apply_debt_budget, _wall_clock_overrun_msg '
-            'and _wall_clock_slack_msg in check_bare_magicmock_config.py, and the '
-            'tests that call '
-            '_live_rule_c_debt_entry here'
+            'the Rule C debt baseline is empty: every file is migrated. Retire '
+            "Rule C's debt items in this same change: _WALL_CLOCK_DEADLINE_DEBT, "
+            '_WALL_CLOCK_DEADLINE_BUDGETS, _wall_clock_overrun_msg and '
+            '_wall_clock_slack_msg in check_bare_magicmock_config.py, and the '
+            'tests that call _live_rule_c_debt_entry here. The shared DebtEntry, '
+            'DebtBaseline and apply_debt_budget in _lint_cli.py stay: Rule D '
+            'uses them'
         )
     return max(debt.items(), key=lambda item: item[1])
 
@@ -2360,38 +2375,6 @@ class TestWallClockDeadlineDebtBaseline:
                 f'the Rule C overrun message must cite {citation!r}; got {overrun.message!r}'
             )
 
-    def test_both_budget_builders_are_required_and_keyword_only(self):
-        """A future Rule D must not be able to inherit another rule's remedy by omission.
-
-        The overrun parameter briefly carried ``= None`` falling back to Rule B's own
-        builder. Both call sites passed it, so the fallback was dead — but a
-        fourth rule calling ``_apply_debt_budget(found, budget)`` would have
-        silently prescribed a mock-double remedy for a wall-clock overrun, with
-        no type error and no failing test. The slack builder (task 6202) carries the
-        same guard. Requiredness is the whole guard, so it is pinned here rather
-        than trusted.
-
-        Every call passes entry None, so no debt entry is ever built here.
-        """
-
-        def _builder(_entry, _found) -> str:
-            return ''
-
-        builders = {'build_overrun_msg': _builder, 'build_slack_msg': _builder}
-        assert (
-            _checker._apply_debt_budget([], None, filename=_NON_DEBT_FILE, **builders) == []
-        ), 'the complete call must succeed, so each TypeError below has one cause'
-        for name in builders:
-            others = {key: value for key, value in builders.items() if key != name}
-            with pytest.raises(TypeError):
-                _checker._apply_debt_budget([], None, filename=_NON_DEBT_FILE, **others)
-            with pytest.raises(TypeError):
-                _checker._apply_debt_budget(
-                    [], None, _builder, filename=_NON_DEBT_FILE, **others
-                )
-        with pytest.raises(TypeError):
-            _checker._apply_debt_budget([], None, _NON_DEBT_FILE, _builder, _builder)
-
 
 class TestWallClockDeadlineDebtSlack:
     """A debt file carrying FEWER violations than its budget is reported by the lint itself.
@@ -2499,14 +2482,16 @@ class TestWallClockDeadlineDebtSlack:
 
         Scans ``<tmp>/<pkg>/tests`` exactly as a package lint_command scans its tests
         dir.  Removing one wait without the budget edit exits 1 naming the edit;
-        applying the count the edit records exits 0.
+        applying the count the edit records exits 0.  The file also carries exactly
+        its Rule D budget, if it has one, so Rule C's is the only budget under test.
         """
         entry, budget = self._live_entry_of_at_least_2()
         debt_file = tmp_path / entry
         debt_file.parent.mkdir(parents=True)
         argv = [str(tmp_path.joinpath(*PurePosixPath(entry).parts[:2]))]
+        rule_d_at_budget = _RULE_D_SOURCE * _timing_debt.TIMING_DEPENDENCE_DEBT.get(entry, 0)
 
-        debt_file.write_text(_RULE_C_ONE_HIT * (budget - 1))
+        debt_file.write_text(_RULE_C_ONE_HIT * (budget - 1) + rule_d_at_budget)
         removed_exit = _checker.main(argv)
         removed = capsys.readouterr()
         assert removed_exit == 1, (
@@ -2518,7 +2503,7 @@ class TestWallClockDeadlineDebtSlack:
             f'the package lint must name the edit {edit!r}; got {removed.out!r}'
         )
 
-        debt_file.write_text(_RULE_C_ONE_HIT * budget)
+        debt_file.write_text(_RULE_C_ONE_HIT * budget + rule_d_at_budget)
         exact_exit = _checker.main(argv)
         exact = capsys.readouterr()
         assert exact_exit == 0, (
@@ -2558,7 +2543,7 @@ class TestWallClockDeadlineBaselineIntegrity:
     offending file the census missed is reported only as a wall of lint output.
 
     The per-file comparison of count against budget does NOT live here: the
-    checker's own ``_apply_debt_budget`` makes it at every lint call site (and
+    checker's ``_lint_cli.py::apply_debt_budget`` makes it at every lint call site (and
     TestAllScannedTestDirsClean runs that lint over every scanned dir), so a
     removal reds the owning package's lint_command naming the edit (task 6202).
     What a per-file lint cannot see is a debt file that no longer exists, which
@@ -2601,6 +2586,185 @@ class TestWallClockDeadlineBaselineIntegrity:
         )
 
 
+@pytest.mark.xdist_group(_REPO_SCAN_GROUP_NAME)
+@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
+class TestTimingDependenceBaselineIntegrity:
+    """The Rule D baseline names only real files, and every scanned file it must.
+
+    The same two complements as TestWallClockDeadlineBaselineIntegrity, over
+    ``_timing_dependence_debt.py::TIMING_DEPENDENCE_DEBT``. There is no literal
+    expected-paths set: at some 400 entries it would only restate the baseline
+    (INV-5), and each file's exact count is enforced by the lint's own budget at
+    every call site.
+
+    Known gap: ``repo_test_scan`` reads TestAllScannedTestDirsClean._SCANNED_DIRS,
+    which omits client-feed/tests although the dark-factory-orchestrator.yaml
+    lint_command scans it. A client-feed file missing from the baseline is caught
+    by that lint, not here.
+    """
+
+    def test_every_debt_entry_resolves_to_an_existing_file(self):
+        """A deleted or renamed file must not leave a stale budget behind."""
+        missing = [
+            entry
+            for entry in _timing_debt.TIMING_DEPENDENCE_DEBT
+            if not (_REPO_ROOT / entry).is_file()
+        ]
+        assert missing == [], (
+            f'Rule D debt baseline entries no longer exist in the repo: {missing}. '
+            'A stale entry would grandfather a NEW file created at that path. Remove them.'
+        )
+
+    def test_no_scanned_file_outside_the_baseline_carries_an_uncovered_site(self, repo_test_scan):
+        """The baseline is complete: every scanned file with an uncovered site is listed."""
+        listed = set(_timing_debt.TIMING_DEPENDENCE_DEBT)
+        unlisted = []
+        for record in repo_test_scan:
+            if record.relpath in listed:
+                continue
+            if record.syntax_error is not None:
+                raise record.syntax_error
+            if record.timing_count:
+                unlisted.append(f'{record.relpath}: {record.timing_count}')
+        assert unlisted == [], (
+            'These scanned files carry uncovered timing-dependence sites but are NOT on '
+            'the baseline, so their package lint_command is RED:\n  ' + '\n  '.join(unlisted)
+        )
+
+
+# ===========================================================================
+# Rule D — timing-dependence, composed into the one walk (task 8254)
+# ===========================================================================
+
+
+def _rule_d(source: str, filename: str = _NON_DEBT_FILE) -> list:
+    """Return only the Rule D violations find_violations reports for *source*."""
+    return [
+        v
+        for v in find_violations(source, filename)
+        if 'timing-dependence' in v.message
+    ]
+
+
+# A written bound Rule C ignores: the awaited call is no load-bearing wait.
+_UNBOUND_FETCH_WAIT = 'asyncio.wait_for(client.fetch(), timeout=5)\n'
+
+_TIMEOUT_BLOCK_ON_A_BARRIER = (
+    'import asyncio\n'
+    '\n'
+    '\n'
+    'async def test_case(ev):\n'
+    '    async with asyncio.timeout(5):\n'
+    '        await ev.wait()\n'
+)
+_SLEEP_IN_THE_BLOCK = '        await asyncio.sleep(0.1)\n'
+_SLEEP_IN_THE_BLOCK_LINENO = _TIMEOUT_BLOCK_ON_A_BARRIER.count('\n') + 1
+
+
+class TestTimingDependenceComposition:
+    """Rule D runs in the checker's one walk, and Rule C has precedence on a shared node.
+
+    A node Rule C reports, before its budget, is not also a Rule D literal-deadline
+    site: one site gets one code and one remedy. A Rule C noqa means Rule C reports
+    nothing, so Rule D still sees the literal. Sleeps are separate nodes and are
+    never deferred. Rule D's own legs are tested beside its module, in
+    test_timing_dependence.py.
+    """
+
+    def test_a_load_bearing_literal_wait_is_rule_c_alone(self):
+        assert len(_rule_c(_RULE_C_SOURCE)) == 2
+        assert _rule_d(_RULE_C_SOURCE) == []
+
+    def test_a_literal_wait_rule_c_ignores_is_one_rule_d_site(self):
+        assert _rule_c(_UNBOUND_FETCH_WAIT) == []
+        assert len(_rule_d(_UNBOUND_FETCH_WAIT)) == 1
+
+    def test_a_rule_c_exempted_wait_is_still_a_rule_d_site(self):
+        source = '# noqa: wall-clock-deadline — Process.wait()\n' + _RULE_C_SOURCE
+
+        assert _rule_c(source) == []
+        assert len(_rule_d(source)) == 1
+
+    def test_a_timeout_block_rule_c_reports_is_not_a_rule_d_site(self):
+        assert _rule_c(_TIMEOUT_BLOCK_ON_A_BARRIER) != []
+        assert _rule_d(_TIMEOUT_BLOCK_ON_A_BARRIER) == []
+
+    def test_a_sleep_inside_that_block_is_still_a_rule_d_site(self):
+        source = _TIMEOUT_BLOCK_ON_A_BARRIER + _SLEEP_IN_THE_BLOCK
+
+        [sleep] = _rule_d(source)
+
+        assert sleep.lineno == _SLEEP_IN_THE_BLOCK_LINENO
+        assert _rule_c(source) != []
+
+    def test_a_clock_plus_literal_argument_of_a_reported_block_is_not_a_rule_d_site(self):
+        source = _TIMEOUT_BLOCK_ON_A_BARRIER.replace(
+            'asyncio.timeout(5)', 'asyncio.timeout_at(asyncio.get_running_loop().time() + 5)'
+        )
+
+        assert _rule_c(source) != []
+        assert _rule_d(source) == []
+
+
+_ALL_FOUR_RULES = (
+    _RULE_A_SOURCE + _RULE_B_SOURCE + _RULE_C_SOURCE + _UNBOUND_FETCH_WAIT + _RULE_D_SOURCE
+)
+
+_COVERED_SLEEP = (
+    'import pytest\n'
+    'import time\n'
+    '\n'
+    '\n'
+    "@pytest.mark.timing(reason='the grace period is the behaviour under test')\n"
+    'def test_grace():\n'
+    '    time.sleep(0.1)\n'
+)
+
+
+def _debt_counts(source: str, filename: str = _NON_DEBT_FILE):
+    return _checker.count_debt_in_tree(ast.parse(source), source, filename)
+
+
+class TestCountDebtInTree:
+    """The raw, pre-budget counts each debt baseline records, from the walk the gate runs."""
+
+    def test_counts_name_each_budgeted_rule(self):
+        assert _debt_counts(_RULE_C_SOURCE + _RULE_D_SOURCE) == _checker.DebtCounts(
+            wall_clock_deadline=2, timing_dependence=1
+        )
+
+    def test_on_a_non_debt_file_the_counts_are_the_reported_violations(self):
+        counts = _debt_counts(_ALL_FOUR_RULES)
+
+        assert counts == (len(_rule_c(_ALL_FOUR_RULES)), len(_rule_d(_ALL_FOUR_RULES)))
+        assert counts == (2, 2)
+
+    def test_a_debt_budget_does_not_change_the_count(self):
+        entry, budget = _live_rule_c_debt_entry()
+
+        counts = _debt_counts(_RULE_C_ONE_HIT * (budget + 1), entry)
+
+        assert counts.wall_clock_deadline == budget + 1
+
+    def test_a_covered_timing_site_is_not_counted(self):
+        assert _debt_counts(_COVERED_SLEEP) == (0, 0)
+
+
+class TestScanTree:
+    """One walk yields the budgeted verdict and the raw counts; the narrow seams project it."""
+
+    def test_on_a_debt_file_the_verdict_is_budgeted_and_the_counts_are_raw(self):
+        entry, budget = _live_rule_c_debt_entry()
+        source = _RULE_C_ONE_HIT * (budget + 1)
+        tree = ast.parse(source)
+
+        scan = _checker.scan_tree(tree, source, entry)
+
+        assert scan.violations == find_violations(source, entry) != []
+        assert scan.debt == _checker.count_debt_in_tree(tree, source, entry)
+        assert scan.debt.wall_clock_deadline == budget + 1
+
+
 def _assert_the_tree_seam_agrees(source: str, filename: str) -> list:
     expected = find_violations(source, filename)
     tree = ast.parse(source, filename=filename)
@@ -2621,6 +2785,7 @@ class TestFindViolationsInTree:
             ),
             pytest.param(_RULE_B_SOURCE, id='rule-b'),
             pytest.param(_RULE_C_SOURCE, id='rule-c'),
+            pytest.param(_RULE_D_SOURCE, id='rule-d'),
         ],
     )
     def test_agrees_with_find_violations_on_each_rule(self, source: str):
@@ -2638,6 +2803,14 @@ class TestFindViolationsInTree:
         violations = _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
 
         assert [v.lineno for v in violations] == [1, 2, 3, 3]
+
+    def test_agrees_with_find_violations_on_a_source_carrying_all_four(self):
+        source = _RULE_A_SOURCE + _RULE_B_SOURCE + _RULE_C_SOURCE + _RULE_D_SOURCE
+
+        violations = _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
+
+        assert [v.lineno for v in violations] == [1, 2, 3, 3, 4]
+        assert 'timing-dependence' in violations[-1].message
 
 
 class TestScanRepoTestDirs:
@@ -2703,6 +2876,17 @@ class TestScanRepoTestDirs:
         ]
         assert record.rule_c_count == 2
         assert record.rule_c_count == len(reported)
+
+    def test_timing_count_is_the_reported_rule_d_count_in_a_debt_free_file(self, tmp_path: Path):
+        relpath = 'pkg_a/tests/_poll_helper.py'
+        path = tmp_path / relpath
+        path.parent.mkdir(parents=True)
+        path.write_text(_RULE_C_POLL_LEGS, encoding='utf-8')
+
+        [record] = _scan_repo_test_dirs(tmp_path, ('pkg_a/tests',))
+
+        assert record.timing_count == 2
+        assert record.timing_count == len(_rule_d(_RULE_C_POLL_LEGS, relpath))
 
     def test_a_syntax_error_is_recorded_with_no_gate_violation(self, fake_repo: Path):
         by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}

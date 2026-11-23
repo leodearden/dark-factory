@@ -249,7 +249,7 @@ def _wire_resolve_callback(queue: EscalationQueue, workflow: TaskWorkflow) -> No
     the ONLY thing that wakes ``_wait_for_resolution`` in production, so a test
     that omits it does not reproduce the production wake path at all.
     """
-    def _on_resolved(esc) -> None:  # noqa: ARG001 — signature parity with harness
+    def _on_resolved(esc) -> None:  # signature parity with harness
         event = workflow._escalation_event
         if event is not None:
             event.set()
@@ -347,7 +347,7 @@ def _make_silent_steward() -> type:
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -391,7 +391,7 @@ def _make_dismiss_and_publish_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.give_up_task: asyncio.Task | None = None
@@ -721,6 +721,7 @@ def _make_steward_config(project_root: Path) -> MagicMock:
     cfg.steward_completion_timeout = 300.0
     cfg.steward_max_timeouts_per_escalation = 3
     cfg.steward_max_empty_outputs_per_escalation = 2
+    cfg.steward_session_mode = OrchestratorConfig.model_fields['steward_session_mode'].default
     cfg.timeouts.steward = 1800.0
     return cfg
 
@@ -919,7 +920,7 @@ def _make_slow_healthy_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.give_up_task: asyncio.Task | None = None
@@ -1139,7 +1140,7 @@ def _make_progressing_steward(
             self.subprocess_attempts = 0
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.metrics = _Metrics()
@@ -1431,7 +1432,7 @@ def _make_silent_marking_steward(
             self.invocations = 0
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.metrics = _Metrics()
@@ -1540,7 +1541,7 @@ def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 

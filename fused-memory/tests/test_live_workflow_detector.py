@@ -1930,7 +1930,7 @@ def _scheduler_corroborates(
 
 
 class TestSchedulerHoldersOrParksCorroboration:
-    """The scheduler signal: task_id is a parks key OR a current-holders value."""
+    """The scheduler signal: task_id is a parks key OR a lock holder the snapshot names."""
 
     def test_true_when_task_id_is_parks_key(self):
         state = _snap(parks={_CORROB_TASK_ID: {'modules': ['x']}})
@@ -1941,8 +1941,24 @@ class TestSchedulerHoldersOrParksCorroboration:
         state = _snap(current_holders={'reconciliation': _CORROB_TASK_ID})
         assert _scheduler_corroborates(_CORROB_TASK_ID, state) is True
 
+    @pytest.mark.parametrize('named', ['A', 'B'])
+    def test_true_for_every_holder_of_a_shared_key(self, named):
+        state = _snap(
+            current_holders={'OPERATIONS.md': named},
+            held_by_task={'A': ['OPERATIONS.md'], 'B': ['OPERATIONS.md']},
+        )
+        assert _scheduler_corroborates('A', state) is True
+        assert _scheduler_corroborates('B', state) is True
+
+    def test_int_task_id_matches_a_held_by_task_key(self):
+        assert _scheduler_corroborates(2763, _snap(held_by_task={'2763': ['m']})) is True
+
     def test_false_when_in_neither(self):
-        state = _snap(parks={'9999': {}}, current_holders={'mod': '9999'})
+        state = _snap(
+            parks={'9999': {}},
+            current_holders={'mod': '9999'},
+            held_by_task={'9999': ['mod']},
+        )
         assert _scheduler_corroborates(_CORROB_TASK_ID, state) is False
 
     def test_false_when_state_none(self):

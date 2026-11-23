@@ -13,6 +13,7 @@ from typing import Any
 
 from escalation.models import Escalation
 from shared.briefing_queries import BriefingScope
+from shared.declared_checks import DeclaredChecks, declared_checks
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
@@ -25,6 +26,13 @@ from orchestrator.agents.review_briefing import (
     render_context_complete_review,
     review_action_section,
 )
+from orchestrator.agents.steward_digest import (
+    EarlierAttempts,
+    HandledL0,
+    render_earlier_attempts,
+    render_handled_digest,
+)
+from orchestrator.artifacts import format_issue_section
 from orchestrator.config import OrchestratorConfig
 from orchestrator.escalation_rulings import (
     Ruling,
@@ -34,6 +42,7 @@ from orchestrator.escalation_rulings import (
 )
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
+from orchestrator.review_lineage import RetiredReview
 from orchestrator.scope_drift import ScopeDriftReport
 
 logger = logging.getLogger(__name__)
@@ -196,6 +205,45 @@ _TEXT_DRIFT_NOTICES = {
 
 
 
+def _retired_review_section(retired: Sequence[RetiredReview]) -> str:
+    """The review rounds a quarantine retired with their branch, for the architect to re-derive; '' for none."""
+    if not retired:
+        return ''
+    lineages = '\n'.join(_retired_lineage_block(review) for review in retired)
+    return (
+        '## Review Rounds Answered On A Quarantined Branch — Re-Derive The Responses\n\n'
+        'A quarantine renamed this task\'s reviewed branch aside, and this dispatch '
+        'cut a fresh branch from main. The review suggestions below fell inside this '
+        'task\'s modules and were handed to an amendment pass on the parked branch. '
+        'None of that branch\'s commits are on this branch. Suggestions from those '
+        'rounds that fall outside this task\'s modules are left out here, so do not '
+        'plan them. This branch\'s review allowance was reset, and its reviewer may '
+        'not re-raise the ones below, so plan for them here.\n\n'
+        'Protocol:\n\n'
+        '1. Check each suggestion against the current code; main may already carry an '
+        'equivalent change.\n'
+        '2. Run the `git log` command named for its branch, then `git show <sha>`, to '
+        'see how the parked branch answered it.\n'
+        '3. Plan a step for each suggestion still open, or call `add_design_decision` '
+        'recording why it is moot.\n\n'
+        f'{lineages}\n'
+    )
+
+
+def _retired_lineage_block(review: RetiredReview) -> str:
+    answered_by = review.tip_sha or review.branch
+    tip = f' (tip `{review.tip_sha}`)' if review.tip_sha else ''
+    return (
+        f'### `{review.branch}`{tip}\n\n'
+        f'- Parked at: `{review.parking}`\n'
+        f'- Answered there: {review.amendment_rounds_total} amendment round(s), '
+        f'{review.review_cycles_total} review cycle(s)\n'
+        f'- Retired review archive: `{review.archive}`\n'
+        f'- How it was answered: `git log --oneline main..{answered_by}`\n\n'
+        + format_issue_section('#### In-scope suggestions amended on that branch\n', review.suggestions, issue_level=5)
+    )
+
+
 def _integrity_refusal_section(verdict: DoneStepIntegrityVerdict | None) -> str:
     """The refused done-step changes of a prior revalidation pass, or ''."""
     if verdict is None:
@@ -239,11 +287,11 @@ the meaning rather than a bare ``[]`` keeps the bullet readable for an agent.
 """
 
 
-def _format_delivered_checks(checks: object) -> str:
+def _format_delivered_checks(declared: DeclaredChecks) -> str:
     """Render a task's ``metadata.delivered_checks`` as an agent-readable block.
 
-    Returns '' for a falsy input so ``BriefingAssembler._format_task`` can omit
-    the whole section on the common path (most tasks declare no capability).
+    Returns '' when nothing is declared so ``BriefingAssembler._format_task`` can
+    omit the whole section on the common path (most tasks declare no capability).
 
     One bullet per descriptor, field-labelled so the rendered text names every
     field of :class:`shared.capability_manifest.DeliveredCheckMeta` — a field
@@ -253,22 +301,11 @@ def _format_delivered_checks(checks: object) -> str:
     "…and N more" line, the never-silent-truncation convention
     :func:`_format_commit_bullets` documents.
 
-    ``metadata`` is persisted, untyped data and ``_format_task`` runs on every
-    dispatch, so this fails OPEN the way
-    ``BriefingAssembler._format_prior_proposal`` does for ``files_referenced``:
-    a bare dict is accepted as a one-element list (a shape ``parse_metadata``
-    accepts, so a real task can carry one), ``paths``/``args`` elements are
-    ``str()``-coerced, and an entry whose ``kind`` is missing or unrecognised
-    degrades to a VISIBLE partial bullet rather than being dropped — dropping it
-    would reproduce this section's own reason for existing one level down, since
-    an unseen check still blocks mark-done. An element that is not a dict at all
-    cannot be given a bullet, so it is COUNTED visibly instead and the section is
-    still emitted: ``parse_metadata`` preserves a wrong-shaped slice with only a
-    ``SchemaWarning``, ``run_delivered_check`` maps such an entry to ERRORED, and
-    the gate turns that into a withheld mark-done — so returning '' would block a
-    task from ever stamping done while showing its agent no gate at all. '' is
-    reserved for a value that is neither a dict nor a list/tuple, i.e. genuinely
-    nothing to show.
+    The reading rule is ``shared/src/shared/declared_checks.py::declared_checks``'s,
+    and within it this fails OPEN because an unseen entry still withholds
+    mark-done: an unrecognised ``kind`` gets a VISIBLE partial bullet,
+    ``paths``/``args`` elements are ``str()``-coerced, and every unreadable entry
+    is COUNTED visibly.
 
     The gate's own arming is CONDITIONAL (``delivered_checks.enabled``,
     green-tier hot-reloadable), and this renderer is pure with no view of
@@ -286,30 +323,27 @@ def _format_delivered_checks(checks: object) -> str:
     a teach-to-the-test hazard unless the same text tells it that matching the
     pattern without delivering the behaviour is a defect.
     """
-    if not checks:
-        return ''
-    if isinstance(checks, dict):
-        checks = [checks]
-    if not isinstance(checks, (list, tuple)):
+    if declared.is_empty:
         return ''
 
-    entries = [check for check in checks if isinstance(check, dict)]
-    dropped = len(checks) - len(entries)
-
-    shown = entries[:DELIVERED_CHECK_BULLET_LIMIT]
+    shown = declared.checks[:DELIVERED_CHECK_BULLET_LIMIT]
     lines = [_delivered_check_bullet(check) for check in shown]
-    hidden = len(entries) - len(shown)
+    hidden = len(declared.checks) - len(shown)
     if hidden > 0:
         lines.append(
             f'- …and {hidden} more declared check(s) (not shown — read the full '
             f'list from this task\'s `metadata.delivered_checks`)'
         )
-    if dropped > 0:
-        noun = 'entry' if dropped == 1 else 'entries'
+    unreadable = len(declared.unreadable)
+    if unreadable:
+        noun, what = (
+            ('entry', 'is not a check descriptor') if unreadable == 1
+            else ('entries', 'are not check descriptors')
+        )
         lines.append(
-            f'- ⚠ {dropped} malformed {noun} on this task\'s '
-            f'`metadata.delivered_checks` could not be rendered here — still '
-            f'evaluated by the gate, so read the raw list from the task record.'
+            f'- ⚠ {unreadable} malformed {noun} on this task\'s '
+            f'`metadata.delivered_checks` {what} and can never pass the gate — '
+            f'repair the task record, or escalate if this task cannot.'
         )
     bullets = '\n'.join(lines)
 
@@ -590,8 +624,13 @@ class BriefingAssembler:
         include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
         rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         """Build prompt for the architect agent.
+
+        The plan-tools recipe lives in
+        ``orchestrator/src/orchestrator/agents/roles.py::ARCHITECT_PLAN_TOOLS_RECIPE``,
+        which ARCHITECT.system_prompt carries, so this briefing only points at it.
 
         Args:
             include_prior_proposals: When True, surface the task's most
@@ -611,6 +650,7 @@ class BriefingAssembler:
                 byte-identical to the pre-γ baseline, so nothing is added on
                 the common path.
             rulings: rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
+            retired_reviews: the lock-scoped view, ``orchestrator/workflow.py::TaskWorkflow._retired_reviews_since``.
         """
         preamble = await self._task_preamble(
             task, 'architect', context, include_files=False,
@@ -665,17 +705,9 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 {preamble}
 
 {prior_proposal_section}{committed_section}
-{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
+{_retired_review_section(retired_reviews)}{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
 
-1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
-2. Produce a TDD implementation plan using the plan-tools MCP tools:
-   a. Call `create_plan(task_id, title, analysis, files)` with your analysis.
-   b. Call `add_prerequisite(prereq_id, description)` for any setup work needed before TDD steps.
-   c. Call `add_plan_step(step_id, step_type, description)` for each TDD step, in order. Alternate test/impl.
-   d. Call `add_design_decision(decision, rationale)` for non-obvious choices.
-   e. Call `add_reuse_item(what, where, how)` for existing code/patterns being reused.
-   f. Call `confirm_plan()` as your FINAL action, once every step is added, to mark the plan complete. Without it the plan is treated as incomplete and will not advance.
-3. List ALL files (or directory paths) you expect to create or modify in the `files` parameter of `create_plan` — this drives concurrency locks and the phantom-done gate, so be exhaustive and precise.
+Build the plan using the plan-tools MCP tools, as your role instructions direct, and follow their rules.
 """
 
     async def build_revalidation_prompt(
@@ -689,6 +721,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         text_drift: TaskTextDrift | None = None,
         integrity_refusal: DoneStepIntegrityVerdict | None = None,
         rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         """Build prompt for the architect to revalidate a plan after blast-radius requeue.
 
@@ -697,7 +730,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         merged).  The architect reviews the existing plan against the changes
         and either confirms, updates, or recreates it.
 
-        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience;
+        *retired_reviews* are the lock-scoped view, ``orchestrator/workflow.py::TaskWorkflow._retired_reviews_since``.
         """
         preamble = await self._task_preamble(task, 'architect', context)
         prior_proposal_section = self._format_prior_proposal(task)
@@ -758,7 +792,7 @@ and either confirm it, update it, or recreate it from scratch.
 
 {files_section}
 
-{refusal_section}{rulings_section}## Action
+{refusal_section}{_retired_review_section(retired_reviews)}{rulings_section}## Action
 
 1. Read the overlapping files (if any) to understand what changed.
 2. Decide whether your plan is still valid.
@@ -766,7 +800,7 @@ and either confirm it, update it, or recreate it from scratch.
    a. **Plan still valid**: call `confirm_plan()`.
    b. **Plan needs updates**: use `update_plan_metadata(files=...)`,
       `remove_plan_step(step_id)`, `replace_plan_step(step_id, step_type, description)`,
-      and/or `add_plan_step(step_id, step_type, description)` to adjust the plan in place.
+      and/or `add_plan_step(...)` to adjust the plan in place.
    c. **Plan is invalid**: call `create_plan(...)` to start fresh, then add steps as usual.
 4. Ensure the `files` list is exhaustive — it drives concurrency locks.
 5. Keep every step with status "done" with its commit. If the revised plan
@@ -786,7 +820,7 @@ and either confirm it, update it, or recreate it from scratch.
         self,
         task: dict,
         partial_plan: dict,
-        worktree: Path | None = None,  # noqa: ARG002 — interface symmetry
+        worktree: Path | None = None,  # interface symmetry
         context: str | None = None,
         *,
         rulings: Sequence[Ruling] = (),
@@ -861,7 +895,7 @@ to start over from nothing.
         task: dict,
         plan: dict,
         not_touched: list[str],
-        worktree: Path | None = None,  # noqa: ARG002 — interface symmetry
+        worktree: Path | None = None,  # interface symmetry
         context: str | None = None,
     ) -> str:
         """Architect narrowing pass after the pre-merge plan-files gate.
@@ -997,10 +1031,10 @@ here — read the file in full.
 
 1. Read `.task/plan.json` in full.
 2. Record its existing step content with the plan-tools:
-   `add_prerequisite(prereq_id, description)` for setup work and
-   `add_plan_step(step_id, step_type, description)` for each TDD step, in the
-   plan's own order, carrying each description across unchanged. If `files`
-   is missing or empty, set it with `update_plan_metadata(files=[...])`.
+   `add_prerequisite(...)` for setup work and `add_plan_step(...)` for each
+   TDD step, in the plan's own order, carrying each description across
+   unchanged. If `files` is missing or empty, set it with
+   `update_plan_metadata(files=[...])`.
 3. Restructure only: do not redesign the plan or explore beyond what
    restructuring needs. Do not call `create_plan` — it replaces the document
    wholesale and would discard the analysis and decisions you are
@@ -1043,9 +1077,8 @@ The implementation was reviewed and blocking issues were found.
 
 1. Read `.task/plan.json` for the current plan and each step's status — it
    is not reproduced here.
-2. Add the steps that address the blocking issues with
-   `add_plan_step(step_id, step_type, description)`, using step ids not
-   already in the plan. New steps are recorded as pending.
+2. Add the steps that address the blocking issues with `add_plan_step(...)`,
+   using step ids not already in the plan. New steps are recorded as pending.
 3. If those steps touch files the plan does not list, call
    `update_plan_metadata(files=[...])` with the full widened list.
 4. Keep every existing step in place, in order: do not remove or reorder
@@ -1661,11 +1694,18 @@ change. Do not edit `.task/plan.json`.
         escalation: dict,
         pending_escalations: list[dict],
         worktree: Path,
+        *,
+        handled: Sequence[HandledL0],
+        earlier_attempts: EarlierAttempts,
     ) -> str:
-        """Build full briefing prompt for the steward's first invocation.
+        """Build the full briefing prompt for a fresh steward session.
 
-        Includes memory context, task details, escalation info, and action
-        instructions.  Used for the initial session and after cap-hit resets.
+        Includes memory context, task details, the escalation, the sessions
+        that already ran on it without concluding it (*earlier_attempts*), the
+        other pending escalations, the digest of L0s this steward already
+        concluded (*handled*), and action instructions.  Both histories are
+        rendered by ``orchestrator/agents/steward_digest.py``, and an empty one
+        renders nothing.
         """
         preamble = await self._task_preamble(task, 'steward', None)
         esc_block = self._format_escalation(escalation)
@@ -1689,7 +1729,7 @@ change. Do not edit `.task/plan.json`.
 # Escalation
 
 {esc_block}
-{pending_block}
+{render_earlier_attempts(earlier_attempts)}{pending_block}{render_handled_digest(handled)}
 # Parameters
 
 - **project_id:** `{self.project_id}`
@@ -1884,7 +1924,7 @@ A prior block-time investigation concluded the following; verify against the cur
         body = '\n'.join(lines) if lines else json.dumps(dict(task), indent=2)
         blocks = (
             body,
-            _format_delivered_checks(metadata.get('delivered_checks')),
+            _format_delivered_checks(declared_checks(metadata)),
             _format_followup_items(metadata.get(FOLLOWUP_ITEMS_METADATA_KEY)),
         )
         return '\n\n'.join(block for block in blocks if block)

@@ -54,6 +54,8 @@ class RawGraph(Protocol):
 
     def execute_command(self, *args: Any) -> Awaitable[Any]: ...
 
+    def delete(self) -> Awaitable[Any]: ...
+
 
 class GraphHandle(Protocol):
     """One group's graph, every call budgeted and named by its ``op``."""
@@ -73,6 +75,10 @@ class GraphHandle(Protocol):
 
     async def ro_query_compact(self, cypher: str, *, op: str) -> Any:
         """A compact-transport read; values are inlined, because this transport binds no params."""
+        ...
+
+    async def delete(self, *, op: str) -> None:
+        """GRAPH.DELETE this graph's key, under the write budget."""
         ...
 
 
@@ -128,6 +134,11 @@ class BudgetedGraph(GraphHandle):
         return await await_within(
             self._raw.execute_command(_COMPACT_READ_COMMAND, self._name, cypher, _COMPACT_FLAG),
             store=STORE, op=op, budget_s=self._read_budget_s,
+        )
+
+    async def delete(self, *, op: str) -> None:
+        await await_within(
+            self._raw.delete(), store=STORE, op=op, budget_s=self._write_budget_s,
         )
 
 

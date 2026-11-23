@@ -18,7 +18,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
 
@@ -197,28 +197,28 @@ def _apply_cross_project_routing_guard(finding: dict) -> dict:
 # description/suggested_action/category) is ever capped.  severity is not
 # capped because it is not free text: add_finding rejects any value outside
 # FINDING_SEVERITY_SET, so a length cap on it would be moot.
-_MAX_FINDING_TEXT_CHARS = 10_000
-_TRUNCATION_MARKER = '…[truncated]'
+MAX_FINDING_TEXT_CHARS: Final = 10_000
+RECON_TEXT_TRUNCATION_MARKER: Final = '…[truncated]'
 # Cap on description/suggested_action inside a cite_task fold's purge record
 # (task 4865).  Deliberately far below the finding cap: _persist_run
 # re-serializes every reachable entry of the run on EVERY mutation, so each
 # record's text is rewritten to SQLite again on every later write.
-_MAX_PURGED_TEXT_CHARS = 2_000
+MAX_PURGED_TEXT_CHARS: Final = 2_000
 # Records kept per entry before later purges only count as overflow.  Worst
 # case ~20 x 2 x 2_000 chars of text per entry, plus citation lists; the
 # fold's WARNING stays the unbounded channel, firing for every purge.
-_MAX_PURGED_FINDINGS = 20
+MAX_PURGED_FINDINGS: Final = 20
 
 
 def _truncate_field(value: str, cap: int, *, field: str) -> tuple[str, bool]:
-    """``(value cut by clip_text, was_truncated)``, marked with the uncounted ``_TRUNCATION_MARKER``.
+    """``(value cut by clip_text, was_truncated)``, marked with the uncounted ``RECON_TEXT_TRUNCATION_MARKER``.
 
     The marker stays uncounted because truncated text is persisted and feeds the null-null description dedup hash.
     """
     clip = clip_text(value, cap, field=field)
     if clip.fact is None:
         return clip.text, False
-    return clip.text + _TRUNCATION_MARKER, True
+    return clip.text + RECON_TEXT_TRUNCATION_MARKER, True
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ class _ReportEntry:
     # ReconReportState._record_cite_task_fold_purge).  Persisted, but not
     # part of get_assembled_report's contract.
     purged_findings: list[dict] = field(default_factory=list)
-    # Folds whose structured copy the _MAX_PURGED_FINDINGS cap dropped: the
+    # Folds whose structured copy the MAX_PURGED_FINDINGS cap dropped: the
     # operator's cue that the log is the only copy of that many purges.
     purged_findings_overflow: int = 0
 
@@ -1223,11 +1223,11 @@ class ReconReportState:
         delete/refile stays consistent with no separate change there.
 
         ``description``/``suggested_action``/``category`` are truncated to
-        ``_MAX_FINDING_TEXT_CHARS`` BEFORE dedup hashing (task-2410;
+        ``MAX_FINDING_TEXT_CHARS`` BEFORE dedup hashing (task-2410;
         see :func:`_truncate_field`).  One consequence for the null-null
         (no task_id/flag_type) path: the description-hash dedup key is
         computed from the POST-truncation string, so two null-null findings
-        that are identical for the first ``_MAX_FINDING_TEXT_CHARS``
+        that are identical for the first ``MAX_FINDING_TEXT_CHARS``
         characters and differ only in the truncated-away tail collapse into
         a single finding. This is an accepted tradeoff at today's generous
         10_000-char cap — revisit only if the cap is ever tightened.
@@ -1364,20 +1364,20 @@ class ReconReportState:
         # the way description's is.
         warnings: list[str] = []
         description, description_truncated = _truncate_field(
-            description, _MAX_FINDING_TEXT_CHARS, field='description'
+            description, MAX_FINDING_TEXT_CHARS, field='description'
         )
         if description_truncated:
-            warnings.append(f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars')
+            warnings.append(f'description truncated to {MAX_FINDING_TEXT_CHARS} chars')
         suggested_action, suggested_action_truncated = _truncate_field(
-            suggested_action, _MAX_FINDING_TEXT_CHARS, field='suggested_action'
+            suggested_action, MAX_FINDING_TEXT_CHARS, field='suggested_action'
         )
         if suggested_action_truncated:
-            warnings.append(f'suggested_action truncated to {_MAX_FINDING_TEXT_CHARS} chars')
+            warnings.append(f'suggested_action truncated to {MAX_FINDING_TEXT_CHARS} chars')
         category, category_truncated = _truncate_field(
-            category, _MAX_FINDING_TEXT_CHARS, field='category'
+            category, MAX_FINDING_TEXT_CHARS, field='category'
         )
         if category_truncated:
-            warnings.append(f'category truncated to {_MAX_FINDING_TEXT_CHARS} chars')
+            warnings.append(f'category truncated to {MAX_FINDING_TEXT_CHARS} chars')
 
         # In-run dedup: two separate namespaces in the run's finding index,
         # scoped to this run_id across ALL stages.
@@ -2179,7 +2179,7 @@ class ReconReportState:
           ``store.delete_run``), so it does not outlive log retention.
 
         The record is bounded: an entry keeps the FIRST
-        ``_MAX_PURGED_FINDINGS`` records, and each later purge only increments
+        ``MAX_PURGED_FINDINGS`` records, and each later purge only increments
         ``record_entry.purged_findings_overflow`` — the count of folds for
         which the log is the only copy. Not a ring buffer: keep-first-N is
         deterministic and needs no shifting, and dropping a later copy loses
@@ -2201,9 +2201,9 @@ class ReconReportState:
         :func:`_serialize_entry` persists findings with, so every
         ``_Finding`` field is captured without a second field list — with
         ``description`` / ``suggested_action`` capped to
-        ``_MAX_PURGED_TEXT_CHARS``; ``truncated_fields`` names the ones that
+        ``MAX_PURGED_TEXT_CHARS``; ``truncated_fields`` names the ones that
         were cut. The WARNING carries them uncapped: :meth:`add_finding`
-        already bounded both to ``_MAX_FINDING_TEXT_CHARS``. No timestamp:
+        already bounded both to ``MAX_FINDING_TEXT_CHARS``. No timestamp:
         this module's clock is the monotonic loop clock, which is not
         comparable across restarts, so append order is the ordering.
 
@@ -2235,7 +2235,7 @@ class ReconReportState:
         has no other record to cross-check against. Keeping them named makes
         that class of mistake unrepresentable rather than merely untested.
         """
-        kept = len(record_entry.purged_findings) < _MAX_PURGED_FINDINGS
+        kept = len(record_entry.purged_findings) < MAX_PURGED_FINDINGS
         logger.warning(
             'recon_report: cite_task fold purged finding %r (%s fold) — its content is '
             'dropped from the report. structural_copy=%s (purged_findings on the '
@@ -2268,7 +2268,7 @@ class ReconReportState:
         truncated_fields: list[str] = []
         for name in ('description', 'suggested_action'):
             snapshot[name], was_truncated = _truncate_field(
-                snapshot[name], _MAX_PURGED_TEXT_CHARS, field=name
+                snapshot[name], MAX_PURGED_TEXT_CHARS, field=name
             )
             if was_truncated:
                 truncated_fields.append(name)
@@ -2973,11 +2973,11 @@ class ReconReportState:
         if self._memory_service is None:
             return _ERR_SERVICE_UNAVAILABLE.copy()
 
-        from fused_memory.reconciliation.standing_decision_writer import (  # noqa: PLC0415
+        from fused_memory.reconciliation.standing_decision_writer import (
             EvidenceGateRejected,
             LedgerUnavailable,
         )
-        from fused_memory.reconciliation.standing_decision_writer import (  # noqa: PLC0415
+        from fused_memory.reconciliation.standing_decision_writer import (
             write_entity_standing_decision as _write_helper,
         )
 

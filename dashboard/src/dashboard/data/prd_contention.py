@@ -30,7 +30,7 @@ from dashboard.data.datum import (
     aged_at,
     unknown_datum,
 )
-from dashboard.data.lock_contention import holder_of, lock_wanters
+from dashboard.data.lock_contention import KeyHolders, key_holders_in, lock_wanters
 from dashboard.data.prd_view import (
     HIGH_PRIORITIES,
     InputState,
@@ -69,15 +69,17 @@ CONTENTION_RULES: MappingProxyType[ContentionFigure, str] = MappingProxyType({
     ContentionFigure.TOP: (
         f"The {CONTENTION_TOP_N} lock keys wanted by the most ready tasks (ready as the PRD rows "
         "count it), most wanted first, ties by key; each ready task counts once per key its "
-        "metadata.files name. Each key's holder is the task holding a lock that conflicts with "
-        "it (one key a path prefix of the other), with its status in the store, which can be "
-        "pending; no holder when none does. The Scheduler tab counts every active row, not the "
-        "ready set, so its counts differ by design."
+        "metadata.files name. Each key's holders are every task holding a lock that conflicts "
+        "with it (one key a path prefix of the other), each with its status in the store, which "
+        "can be pending; none when no task does. at_holder_limit says whether they fill the "
+        "key's holder limit, so no other task can take it now; a key taking unlimited holders "
+        "never fills. The Scheduler tab counts every active row, not the ready set, so its "
+        "counts differ by design."
     ),
     ContentionFigure.HELD_SHARE: (
         "Per priority band (a missing priority is unrecorded), how many ready tasks there are "
-        "and how many of them name at least one lock key someone holds now. Counted over the "
-        "ready set, not every active row."
+        "and how many of them name at least one lock key whose holders fill its holder limit, "
+        "the task not being one of them. Counted over the ready set, not every active row."
     ),
     ContentionFigure.NEVER_STARTED: (
         "Ready tasks at high or critical priority with no task_started event in this project's "
@@ -122,29 +124,31 @@ class Holder:
 
 @dataclass(frozen=True, slots=True)
 class LockKey:
-    """One lock key, how many ready tasks want it, and who holds it."""
+    """One lock key, how many ready tasks want it, who holds it, and whether they fill its limit."""
 
     key: str
     wanted_by_ready: int
-    holder: Holder | None
+    holders: tuple[Holder, ...]
+    at_holder_limit: bool
 
     def to_wire(self) -> dict[str, object]:
         return {
             'key': self.key,
             'wanted_by_ready': self.wanted_by_ready,
-            'holder': None if self.holder is None else self.holder.to_wire(),
+            'holders': [holder.to_wire() for holder in self.holders],
+            'at_holder_limit': self.at_holder_limit,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class BandShare:
-    """One priority band's ready tasks, and how many of them name a held key."""
+    """One priority band's ready tasks, and how many of them name a key at its holder limit."""
 
     ready: int
-    naming_held_key: int
+    naming_full_key: int
 
     def to_wire(self) -> dict[str, object]:
-        return {'ready': self.ready, 'naming_held_key': self.naming_held_key}
+        return {'ready': self.ready, 'naming_full_key': self.naming_full_key}
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +171,13 @@ class NeverStarted:
 
 @dataclass(frozen=True, slots=True)
 class Contention:
-    """One root's contention line (PRD §5.5's ``Contention``)."""
+    """One root's contention line: PRD §5.5's ``Contention`` as task 10211 reshaped it.
+
+    That PRD still shows ``top[].holder`` and ``held_share[].naming_held_key``.
+    Each ``top`` entry now names every holder (``holders``) and whether they
+    fill the key's limit (``at_holder_limit``), and ``held_share`` counts
+    ``naming_full_key``.
+    """
 
     lock_depth: int
     snapshot_at: datetime
@@ -218,7 +228,7 @@ def build_contention(inputs: ContentionInputs, *, now: datetime) -> Datum[Conten
         reason = '; '.join(filter(None, (cause, degradation_reason(aged))))
         return unknown_datum(reason, inputs.scheduler.freshness_bound_seconds)
     ready = [row for row in rows if is_ready(row['id'], row, inputs.status_map, now=now)]
-    wants = _wants(ready, snapshot.lock_depth, snapshot.current_holders)
+    wants = _wants(ready, snapshot.lock_depth, snapshot)
     contention = Contention(
         lock_depth=snapshot.lock_depth,
         snapshot_at=snapshot.snapshot_at,
@@ -236,28 +246,34 @@ def build_contention(inputs: ContentionInputs, *, now: datetime) -> Datum[Conten
 
 @dataclass(frozen=True, slots=True)
 class _Wants:
-    """The lock keys each ready task wants, how many want each key, and each key's holder."""
+    """The lock keys each ready task wants, how many want each key, and each key's holders."""
 
     keys: Mapping[int, tuple[str, ...]]
     wanted: Mapping[str, int]
-    holders: Mapping[str, str | None]
+    holders: Mapping[str, KeyHolders]
 
-    def names_held_key(self, task_id: int) -> bool:
-        return any(self.holders[key] is not None for key in self.keys[task_id])
+    def names_full_key(self, task_id: int) -> bool:
+        return any(self.holders[key].blocks(str(task_id)) for key in self.keys[task_id])
 
 
 def _wants(
-    ready: Sequence[Mapping[str, Any]], lock_depth: int, current_holders: Mapping[str, str],
+    ready: Sequence[Mapping[str, Any]], lock_depth: int, snapshot: SchedulerStateSnapshot,
 ) -> _Wants:
     keys = {row['id']: _lock_keys(row, lock_depth) for row in ready}
     wanted = lock_wanters(keys.values())
-    return _Wants(keys, wanted, {key: holder_of(key, current_holders) for key in wanted})
+    holders_of = key_holders_in(snapshot)
+    return _Wants(keys, wanted, {key: holders_of(key) for key in wanted})
 
 
 def _top(wants: _Wants, status_map: Mapping[int, str]) -> tuple[LockKey, ...]:
     ranked = sorted(wants.wanted.items(), key=lambda item: (-item[1], item[0]))
     return tuple(
-        LockKey(key, count, _holder(wants.holders[key], status_map))
+        LockKey(
+            key,
+            count,
+            tuple(_holder(holder_id, status_map) for holder_id in wants.holders[key].holders),
+            wants.holders[key].at_limit,
+        )
         for key, count in ranked[:CONTENTION_TOP_N]
     )
 
@@ -271,9 +287,7 @@ def _lock_keys(row: Mapping[str, Any], lock_depth: int) -> tuple[str, ...]:
     return tuple(files_to_modules((path for path in files if isinstance(path, str)), lock_depth))
 
 
-def _holder(holder_id: str | None, status_map: Mapping[int, str]) -> Holder | None:
-    if holder_id is None:
-        return None
+def _holder(holder_id: str, status_map: Mapping[int, str]) -> Holder:
     task_id = parse_task_id(holder_id)
     return Holder(holder_id, None if task_id is None else status_map.get(task_id))
 
@@ -281,9 +295,9 @@ def _holder(holder_id: str | None, status_map: Mapping[int, str]) -> Holder | No
 def _held_share(ready: Sequence[Mapping[str, Any]], wants: _Wants) -> Mapping[str, BandShare]:
     """Each band's share, the band with the most ready tasks first, ties by band."""
     by_band = Counter(priority_of(row) for row in ready)
-    held_by_band = Counter(priority_of(row) for row in ready if wants.names_held_key(row['id']))
+    full_by_band = Counter(priority_of(row) for row in ready if wants.names_full_key(row['id']))
     return MappingProxyType({
-        band: BandShare(count, held_by_band[band])
+        band: BandShare(count, full_by_band[band])
         for band, count in sorted(by_band.items(), key=lambda item: (-item[1], item[0]))
     })
 

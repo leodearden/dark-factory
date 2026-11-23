@@ -382,7 +382,7 @@ def _reconstruct_module_configs(
     * ``module_prefixes == []`` (explicitly persisted empty) -> ``[]``.
       The task genuinely had no assigned modules, so the global-fallback path
       is the correct gate and
-      ``orchestrator.merge_lane.worker::_merge_boundary_module_configs``' deliberate
+      ``orchestrator.merge_lane.post_merge_verify::merge_boundary_module_configs``' deliberate
       no-widen policy is preserved.  Deliberately NOT widened to the registry.
     * ``module_prefixes`` non-empty -> one ``ModuleConfig`` per prefix via
       ``orchestrator.config::OrchestratorConfig.for_module`` (a longest-prefix
@@ -711,7 +711,7 @@ async def recover_pending_merges(
 
             # Branch exists, is not yet merged, and worktree is present.
             survivors.append((record, qb))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'merge_queue_store: error recovering %s: %s',
                 record.request_id,
@@ -736,7 +736,7 @@ async def recover_pending_merges(
                     record.request_id,
                     qb.full_name,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'merge_queue_store: error recovering %s: %s',
                     record.request_id,
@@ -869,7 +869,7 @@ async def recover_pending_merges(
                     winner_qb.full_name,
                     len(group) - 1,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'merge_queue_store: error collapsing branch group %s: %s',
                 bare_id,

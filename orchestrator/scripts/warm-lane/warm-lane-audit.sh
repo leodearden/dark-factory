@@ -908,8 +908,9 @@ for entry in "$MOUNT"/*/; do
     live="$(_probe_live "$MOUNT/$name.lock")"
 
     # Independent of `live`: the pool's own reservation truth (A5). ONE read
-    # publishes the state, its UNKNOWN cause, and the record's task_id, so
-    # all three describe the same instant of the same record.
+    # publishes the state, its UNKNOWN cause, the record's task_id and its
+    # updated_at (the age_min clock), so all four describe the same instant of
+    # the same record; do not add a second read for any of them.
     _read_lane_assignment "$name"
     assigned_state="$LANE_ASSIGNED_STATE"
 

@@ -36,7 +36,7 @@
 # `--apply` could manufacture exactly the violations this census exists to
 # count. Committing the stamps stays an operator decision:
 #
-#   uv run --frozen --project fused-memory python \
+#   uv run --no-sync --project fused-memory python \
 #       fused-memory/scripts/retro_stamp_topics.py --apply
 #
 # NO STEP CAN ABORT ANOTHER, AND THE WRAPPER ALWAYS EXITS 0. A recurring
@@ -70,7 +70,9 @@
 # COVERAGE_CENSUS_CMD / RETRO_STAMP_CMD override the two interpreter prefixes
 # (tests inject fake recorders here to assert argument construction and
 # ordering without touching uv, live Qdrant or the live corpus) -- mirrors the
-# FLAG_MARKER_SWEEP_CMD / REIFY_CLOSURE_SWEEP_CMD seam convention. REPO is
+# FLAG_MARKER_SWEEP_CMD / REIFY_CLOSURE_SWEEP_CMD seam convention. The default
+# prefix passes --no-sync, not --frozen, so a timer run never re-syncs the
+# shared root .venv (tests/scripts/test_uv_run_venv_isolation.py). REPO is
 # similarly overridable so tests can point it at a tmp dir with no `.env` (a
 # no-op source). CENSUS_COMMIT=0 measures and rehearses but lands nothing;
 # CENSUS_LANDING_TIMEOUT_SECS bounds the wait for the landing.
@@ -135,7 +137,7 @@ CENSUS_CMD=(${COVERAGE_CENSUS_CMD:-})
 STAMP_CMD=(${RETRO_STAMP_CMD:-})
 if [ "${#CENSUS_CMD[@]}" -eq 0 ] || [ "${#STAMP_CMD[@]}" -eq 0 ]; then
     UV_RESOLVED="$(require_uv_bin)" || exit $?
-    UV_PYTHON=("$UV_RESOLVED" run --frozen --project "$FM" python)
+    UV_PYTHON=("$UV_RESOLVED" run --no-sync --project "$FM" python)
     [ "${#CENSUS_CMD[@]}" -eq 0 ] && CENSUS_CMD=("${UV_PYTHON[@]}")
     [ "${#STAMP_CMD[@]}" -eq 0 ] && STAMP_CMD=("${UV_PYTHON[@]}")
 fi

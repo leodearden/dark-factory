@@ -6,10 +6,18 @@
 complete, tested, deterministic drain of dead-weight `stage1_flag_marker`
 records — orphan / taskless / stale / terminal-task predicates, plus
 targeted `--delete-ids` correction. Task 2596 shipped the script but never
-wired it into anything that actually runs it, so the backlog only grew
-(reconfirmed at 42 records before this task). Task 2693 wires the existing
-script into an automated, recurring systemd-timer drain so the backlog
-stays non-growing without any human running it by hand.
+wired it into anything that actually runs it, so the backlog only grew —
+**historically**, to the 42 records measured in the pre-2853, pre-2966
+world that task 2693 was filed against. Task 2693 wires the existing script
+into an automated, recurring systemd-timer drain so the backlog stays
+non-growing without any human running it by hand.
+
+Both marker pools now have an unconditional in-cycle collector of their own
+(see "Scope" below), so this nightly timer is a scheduled **adjunct** to
+one of them rather than the sole collector for anything, and its normal
+result is zero deletions. A zero is not self-certifying, though — see
+"Reading the output" for how to tell "there was nothing" from "saw
+nothing".
 
 ### Scope: which pool this timer actually drains (tasks 3897, 3923)
 
@@ -47,7 +55,9 @@ cannot move the verdict either way.
 
 Those predicates are deliberately **retained, not retired**: they are
 still the script's delete-set contract, still reachable via `--delete-ids`,
-still the only collector for any project not yet probed, and the blind-spot
+still the only collector for dead weight the in-cycle 14-day age GC never
+reaches (orphan, taskless or terminal-task markers that are younger than 14
+days or undated, and any id named in `--delete-ids`), and the blind-spot
 cross-check below is *defined* as the comparison between that `source`
 enumeration and the adjacent population.
 
@@ -62,6 +72,31 @@ which runs unconditionally per-project every reconciliation cycle and
 age-GCs on a rolling 14-day window. Those records are **not** uncollected,
 and this script deliberately counts them without ever deleting them — see
 "Why the relay pool is censused, never deleted" below.
+
+**Nor is this timer the only collector for the `source` pool it *does*
+target.** That pool is also drained in-cycle by
+`_sweep_stale_mem0_flag_markers` (task 2853), in the same
+`task_knowledge_sync.py` module and via the same shared
+`_sweep_stale_mem0_pool` helper as the 2966 relay collector above. It is
+called unconditionally every reconciliation cycle and age-GCs at 14 days.
+It enumerates **both** spellings of the pool, `{'source': 'stage1_flag_marker'}`
+and `{'kind': 'stage1_flag_marker'}`, unioned by id
+(`_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS`, task 3915), and passes
+`pool_kind=` so that a record declaring a foreign `kind` is withheld — see
+[The in-cycle collector applies the same arm](#the-in-cycle-collector-applies-the-same-arm-task-6241).
+That is a strictly wider enumeration than this script's: a `kind`-only legacy
+record (task 3915's `know_live` class) is enumerated in-cycle, but neither
+this script's `source` scroll nor its `cross_check` census ever counts it.
+Project coverage does not separate the two collectors: since task 2917 this
+timer also loops over every registered project (see "Schedule", and "When
+coverage is not fleet-wide" for when the registry degrades). They differ in
+cadence — every reconciliation cycle versus nightly at 03:30 — and in what
+they enumerate. Records whose `created_at` is missing or unparseable
+are skipped by that helper's fail-safe KEEP-on-uncertainty filter, so they
+persist by design rather than by neglect. So **both** pools have an
+automatic in-cycle collector, and this timer is a scheduled adjunct to one
+of them. Reading this document without that fact is what produced task
+3498's premise that the script might be redundant; the answer is below.
 
 ### Why the relay pool is censused, never deleted
 
@@ -428,10 +463,83 @@ the enumeration is corrected. Silencing it with `--no-fail-on-blind-spot`
 restores exactly the vacuous pass this change exists to eliminate: that
 flag is **census-only, never a gate configuration**.
 
-Whether `sweep_orphan_flag_markers.py` should survive at all remains **task
-3498**'s call; this decision answers its stated precondition ("check for
-live consumers of the `--check` gate before removing anything") with: there
-are none, and 2902 was the only one there ever was.
+Whether `sweep_orphan_flag_markers.py` should survive at all was **task
+3498**'s call, answered immediately below; this decision answers its stated
+precondition ("check for live consumers of the `--check` gate before
+removing anything") with: there are none, and 2902 was the only one there
+ever was.
+
+## Decision (task 3498): the script survives as a census instrument
+
+**Verdict: (a) KEEP.** `fused-memory/scripts/sweep_orphan_flag_markers.py`
+stays — but on materially different grounds than the question assumed.
+
+**The drain-side argument for keeping it does not hold.** Task 3498 was
+filed on the premise that the in-cycle drains cover the bulk predicates
+while the script still owns a targeted surface the drains do not reach:
+`--delete-ids` and `--terminal-drain`. That premise is false. Both consume
+`members` — the `{'source': 'stage1_flag_marker'}`-filtered scroll — exactly
+as `find_orphan_markers`, `find_taskless_markers`, `find_stale_markers` and
+`find_terminal_task_markers` do; `--delete-ids` is an *intersection* with
+that scroll (`targeted = [m for m in members if m['id'] in delete_ids]`),
+not an independent path around it. Against a filter measuring 0 in every
+project probed, the entire delete side is a structural no-op. Those
+capabilities are uncovered by the in-cycle drains *and* unreachable — which
+is not a retention argument.
+
+**What is load-bearing is the census.** Task 3897's `cross_check` block and
+`enumeration_blind_spot` are the only instrument in this subsystem that
+renders `orphan_count: 0` legible as "saw nothing" rather than "there was
+nothing", and task 3923 armed `--check` to exit 1 on an observed blind
+spot. Retiring the script would delete the sole detector for the exact
+blind spot the two preceding tasks were spent building. The census has a
+bound: `cross_check` compares the `source` count against the
+`flag_for_stage2` relay pool and never counts the `kind`-only spelling, so
+only the in-cycle collector enumerates that cohort. The cohort measured 0 in
+every project probed by the task-6241 census, and its create path is closed
+by `enforce_flag_record_write_contract` (see
+[The in-cycle collector applies the same arm](#the-in-cycle-collector-applies-the-same-arm-task-6241)).
+That bound narrows what the census proves without reversing the verdict, and
+it strengthens the drain-side conclusion above: the in-cycle drain already
+sees a superset of what the script's delete side sees.
+
+**(b) "narrow it to the targeted predicates" is foreclosed, not
+re-decided.** Task 3897 work item (c) already adjudicated those predicates
+as MEASURED-ZERO, RETAINED, for the reasons recorded under "Scope" above. A
+sibling task's landed ruling was not task 3498's to reopen.
+
+**(c) retire is refused.** The task-3923 finding above retires the *gate* —
+it does not retire the *script*. The census role has no consumer-count
+objection to answer, and the nightly timer is enabled and firing.
+
+**The price of retention, paid by task 3498.** The read-only counterpart
+`scripts/fused-memory-flag-marker-check.sh` had zero tests when this task
+was planned (task 4591 has since added its uv-resolution tests), and its header
+claim — "this performs NO deletions ... so resolve/resume re-runs are
+harmless" — was unenforced prose. The wrapper passes caller args straight
+through and `--check --apply` parses fine (verified: `apply=True
+check=True`), so the "read-only" wrapper was a live deletion vector into a
+`delete_orphan_markers` path that, at the time, lacked the
+`is_protected_mirror_record` guard and the tombstone write the in-cycle
+collector applies. The wrapper now refuses `--apply` with its own exit code
+3, and the sweep's parser sets `allow_abbrev=False`, so no shorter spelling
+reaches `apply=True` (under argparse's default, `--a`, `--ap`, `--app` and
+`--appl` all did). `scripts/tests/test_flag_marker_check_wrapper.py` pins
+the refusal and `fused-memory/tests/test_sweep_orphan_flag_markers_cli.py`
+pins the parser. This follows the
+standing norm from the RCA's §3
+(`plans/reify-flag-marker-backlog-rca-2026-07-22.md`): in this subsystem 8
+prompt-level fixes failed while every fix that held was deterministic.
+
+**What that closes — and what it does not.** The guard covers the check
+wrapper only, so the hazard is narrowed to one entry point rather than
+removed. `scripts/fused-memory-flag-marker-sweep.sh` still execs the same
+script with `--apply --terminal-drain` unconditionally, every night, under
+the systemd timer, so "the wrapper now refuses `--apply`" closes the ad-hoc
+operator vector, not the nightly one. What bounds the nightly path is task
+**4435** (filed by task 3498), which routed `delete_orphan_markers` through
+the same mirror guard and tombstone write the in-cycle collector applies —
+see item 2 under "Why the relay pool is censused, never deleted".
 
 ## Install / enable
 
@@ -644,9 +752,11 @@ venv are actually live, so enabling the timer and running the first drain is
 one reproducible, committed action — it just has to be run post-merge, on
 the host, by an operator. The tests added by this task
 (`scripts/tests/test_flag_marker_sweep_wrapper.py`,
-`scripts/tests/test_install_flag_marker_sweep_timer.py`) assert the wiring
-behavior via fakes (a fake sweep-command recorder, a fake `systemctl`); they
-do not and cannot assert the live drain outcome.
+`scripts/tests/test_install_flag_marker_sweep_timer.py`) and by tasks 4591
+and 3498 (`scripts/tests/test_flag_marker_check_wrapper.py`, covering the read-only
+check wrapper) assert the wiring behavior via fakes (a fake sweep-command
+recorder, a fake `uv`, a fake `systemctl`); they do not and cannot assert
+the live drain outcome.
 
 ## Verifying the drain worked
 

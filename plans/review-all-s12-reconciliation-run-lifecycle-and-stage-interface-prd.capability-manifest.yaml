@@ -331,7 +331,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/run_streaks.py"]
           expect: present
       - name: "no-snapshot-quartet"
-        binding: "anti-inversion — task_count_snapshot_cadence.py's streak compute goes"
+        binding: "anti-inversion — task_count_snapshot_cadence.py's streak compute goes (amended 2026-11-14, R93: delivered by task 10081, which deletes the whole module; 9851 depends on it and drops its stale-snapshot streak)"
         verdict: PASS
         delivered_check:
           kind: grep

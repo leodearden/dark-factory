@@ -1,0 +1,13 @@
+import json,collections
+E=sorted((json.loads(l) for l in open('/tmp/gate-10069/predict/events.jsonl')),key=lambda e:e['id'])
+for et in ['merge_attempt','merge_queued','merge_dequeued','merge_finalized','rebase_verify_cost','workflow_verify','speculative_merge','speculative_discard','merge_verify_cancelled','merge_blocked']:
+    keys=collections.Counter(); first={}; vals=collections.defaultdict(collections.Counter)
+    for e in E:
+        if e['et']!=et: continue
+        for k,v in e['d'].items():
+            if v is not None:
+                keys[k]+=1; first.setdefault(k,e['ts'][:10])
+                if isinstance(v,(str,bool,int)) and k in('outcome','disposition','lane','tier','pinned','state','cohort','site','runner','passed','reason','cause','depth','in_graph','category','failure_category','gate_clearance','generation'):
+                    vals[k][str(v)[:50]]+=1
+    print('==',et, sum(1 for e in E if e['et']==et))
+    for k in keys: print('   ',k,keys[k],first[k], dict(vals[k].most_common(14)) if k in vals else '')

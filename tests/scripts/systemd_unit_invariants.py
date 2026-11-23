@@ -150,8 +150,7 @@ def require_installed_unit(basename: str) -> pathlib.Path:
 # canonical, REQUIRED filename: the dashboard's escalation-URL discovery
 # (`_discover_escalation_urls`) keys on that exact string, and legacy spellings
 # (`orchestrator.yaml`, `orchestrator-config.yaml`, `orchestrator/config.yaml`)
-# are honoured only as a discovery fallback for not-yet-migrated projects,
-# never as a supported choice for new ones.
+# are not read by discovery at all (retired, task 7138).
 CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
 
 

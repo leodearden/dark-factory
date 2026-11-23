@@ -4,7 +4,8 @@ material other than this session's own dialogue?
 Two answers live here. The text half recognises machine content re-ingested
 into a transcript (a prior trickle-coder judgment, or a harness-injected
 prompt, briefing or memory block) by its literal shape; the record half reads
-Claude Code's structured ``origin`` stamp. Both are pure functions over plain
+Claude Code's structured provenance stamps: ``origin``, and ``promptSource``
+with ``entrypoint``. Both are pure functions over plain
 strings and record dicts, and this module imports nothing from the legibility
 pipeline it serves.
 """
@@ -200,8 +201,24 @@ TRICKLE_CODER_PROMPT_OPENER: str = 'you are the trickle coder for the dark-facto
 restated rather than imported for the same layering reason as
 :data:`CODER_JUDGMENT_KEYS`."""
 
+CENSUS_VERIFIER_PROMPT_OPENER: str = (
+    'you are the periodic-census verifier for the dark-factory agent-confusion codebook'
+)
+"""The lowercase opening of scripts/legibility/census_verify.py::verify_prompt,
+restated rather than imported for the same layering reason as
+:data:`TRICKLE_CODER_PROMPT_OPENER`."""
+
+CENSUS_SYNTHESIS_PROMPT_OPENER: str = (
+    'you are the periodic-census synthesis writer for the dark-factory agent-confusion codebook'
+)
+"""The lowercase opening of scripts/legibility/census.py::synthesis_prompt,
+restated rather than imported for the same layering reason as
+:data:`TRICKLE_CODER_PROMPT_OPENER`."""
+
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     TRICKLE_CODER_PROMPT_OPENER,
+    CENSUS_VERIFIER_PROMPT_OPENER,
+    CENSUS_SYNTHESIS_PROMPT_OPENER,
     'your previous run was interrupted by a usage limit',
     'you were interrupted by an orchestrator restart',
     'your previous run was stopped at an orchestrator time limit',
@@ -213,6 +230,10 @@ HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
 """Harness-authored PROSE literals, matched as plain case-insensitive
 substrings (unlike the line-anchored heading markers above): the trickle
 coder's system prompt (scripts/legibility/coder.py:174 ``build_prompt``),
+the periodic-census verifier and synthesis prompts
+(``scripts/legibility/census_verify.py::verify_prompt``,
+``scripts/legibility/census.py::synthesis_prompt``), which embed cluster
+JSON quoting other sessions' signal,
 the harness's three resume prompts --
 ``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit),
 ``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator restart) and
@@ -244,9 +265,11 @@ heading interpolates the task.
 Held in lockstep with the canonical sources by
 ``TestHarnessInjectedTurnFilter.test_resume_prompt_is_excluded_lockstep``
 (the three constants),
-``TestHarnessInjectedTurnFilter.test_steward_continuation_prompt_is_excluded_lockstep``
-and ``test_prior_round_adjudicator_prompt_is_excluded_lockstep`` (prompts
-built by the real builders), all in
+``TestHarnessInjectedTurnFilter.test_steward_continuation_prompt_is_excluded_lockstep``,
+``test_prior_round_adjudicator_prompt_is_excluded_lockstep``,
+``test_census_verifier_prompt_is_excluded_lockstep`` and
+``test_census_synthesis_prompt_is_excluded_lockstep`` (prompts built by the
+real builders), all in
 scripts/tests/test_legibility_reingestion.py, which assert
 ``is_harness_injected_turn(<prompt>) is True`` rather than restating the
 literal -- a harness rewording turns them red instead of silently
@@ -425,3 +448,38 @@ def has_non_human_origin(record: Mapping[str, Any]) -> bool:
         return False
     kind = origin.get('kind')
     return isinstance(kind, str) and kind != HUMAN_ORIGIN_KIND
+
+
+SDK_PROMPT_SOURCE: str = 'sdk'
+"""The Claude Code ``promptSource`` of a prompt delivered over the SDK rather than typed."""
+
+HEADLESS_SDK_ENTRYPOINT: str = 'sdk-cli'
+"""The ``entrypoint`` headless ``claude --print`` stamps unless an inherited
+``CLAUDE_CODE_ENTRYPOINT`` overrides it (residual: task 10794)."""
+
+
+def is_headless_sdk_prompt(record: Mapping[str, Any]) -> bool:
+    """True when *record* is a prompt delivered to headless ``claude --print``:
+    ``promptSource`` is :data:`SDK_PROMPT_SOURCE` AND ``entrypoint`` is
+    :data:`HEADLESS_SDK_ENTRYPOINT`. Any other or absent value answers False
+    and falls through to the text rules.
+
+    promptSource alone is not enough: SDK GUI clients (T3 Code: 'sdk-ts',
+    't3-code') stamp it on human-typed turns. It sits only on prompt records,
+    so the rule never reaches a tool_result carrier. The measurement and the
+    residual: plans/confusion-reduction-prd.md §7.2.2 (generation 8).
+    """
+    return (
+        record.get('promptSource') == SDK_PROMPT_SOURCE
+        and record.get('entrypoint') == HEADLESS_SDK_ENTRYPOINT
+    )
+
+
+def has_non_dialogue_provenance(record: Mapping[str, Any]) -> bool:
+    """True when *record*'s structured provenance alone marks it as material
+    other than this session's own dialogue: the record half of the
+    non-dialogue question, mirroring :func:`is_reingested_content`'s text
+    half. A newly sighted structured provenance stamp is a one-line addition
+    to this union.
+    """
+    return has_non_human_origin(record) or is_headless_sdk_prompt(record)

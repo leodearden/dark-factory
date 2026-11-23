@@ -54,6 +54,40 @@ def _utc_iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat()
 
 
+class RunExitKind(StrEnum):
+    STARTUP_CRASH = 'startup_crash'
+    CANCELLED = 'cancelled'
+
+
+@dataclass(frozen=True)
+class RunExitReason:
+    """Why a run did not return cleanly: the one home of ``runs.exit_reason``'s vocabulary."""
+
+    kind: RunExitKind
+    site: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.site is not None) != (self.kind is RunExitKind.STARTUP_CRASH):
+            raise ValueError(
+                f'a run exit reason carries a site exactly for {RunExitKind.STARTUP_CRASH.value} '
+                f'(got kind={self.kind.value} site={self.site!r})'
+            )
+
+    @classmethod
+    def startup_crash(cls, site: str) -> RunExitReason:
+        return cls(RunExitKind.STARTUP_CRASH, site)
+
+    @classmethod
+    def cancelled(cls) -> RunExitReason:
+        return cls(RunExitKind.CANCELLED)
+
+    @property
+    def column_value(self) -> str:
+        if self.site is None:
+            return self.kind.value
+        return f'{self.kind.value}:{self.site}'
+
+
 @dataclass(frozen=True)
 class ShadowCell:
     """One ``shadow_cells`` row (plans/live-shadow-eval-prd.md C1); field names are its columns."""
@@ -545,7 +579,12 @@ CREATE TABLE IF NOT EXISTS runs (
     -- Task 6565: the commit the process's verify wire path was imported from
     -- (orchestrator.deployed_sha.DeployedSha.sha); NULL when unreadable or the
     -- row predates 6565.  Migrated by _migrate_runs_code_sha.
-    code_sha       TEXT
+    code_sha       TEXT,
+    -- Task 8269: when startup finished, and why the run did not return
+    -- cleanly (RunExitReason.column_value); a NULL exit_reason is a clean
+    -- return.  Migrated by _migrate_runs_startup_outcome.
+    startup_completed_at TEXT,
+    exit_reason          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_results (
@@ -652,6 +691,7 @@ class RunStore:
             self._migrate_scheduler_state_ewa_value(conn)
             self._migrate_scheduler_state_hold_columns(conn)
             self._migrate_runs_code_sha(conn)
+            self._migrate_runs_startup_outcome(conn)
             self._migrate_shadow_cells_run_ended_at(conn)
             self._migrate_shadow_cells_model_columns(conn)
         finally:
@@ -754,6 +794,21 @@ class RunStore:
         if add_column_if_missing_sync(conn, 'runs', 'code_sha', 'TEXT'):
             conn.commit()
             logger.info('RunStore: migrated runs — added code_sha')
+
+    def _migrate_runs_startup_outcome(self, conn: sqlite3.Connection) -> None:
+        """Add ``startup_completed_at`` then ``exit_reason`` to a pre-8269 ``runs``.
+
+        Same shape as :meth:`_migrate_runs_code_sha`, run right after it so a
+        migrated DB gets a fresh one's column order. An existing row reads NULL
+        in both.
+        """
+        added = [
+            column for column in ('startup_completed_at', 'exit_reason')
+            if add_column_if_missing_sync(conn, 'runs', column, 'TEXT')
+        ]
+        if added:
+            conn.commit()
+            logger.info('RunStore: migrated runs — added %s', ', '.join(added))
 
     def _migrate_shadow_cells_run_ended_at(self, conn: sqlite3.Connection) -> None:
         """Add ``run_ended_at`` to a pre-5387 ``shadow_cells``.
@@ -896,15 +951,22 @@ class RunStore:
         self,
         run_id: str,
         report: HarnessReport,
+        *,
+        startup_completed_at: datetime | None = None,
+        exit_reason: RunExitReason | None = None,
     ) -> None:
-        """Update the runs row with final aggregates at shutdown."""
+        """Update the runs row with final aggregates and how the run ended, at shutdown."""
+        startup_completed_text = (
+            None if startup_completed_at is None else _utc_iso(startup_completed_at)
+        )
         conn = self._connect()
         try:
             conn.execute(
                 'UPDATE runs SET '
                 'completed_at = ?, total_tasks = ?, completed = ?, '
                 'blocked = ?, escalated = ?, total_cost_usd = ?, '
-                'paused_for_cap = ?, cap_pause_secs = ? '
+                'paused_for_cap = ?, cap_pause_secs = ?, '
+                'startup_completed_at = ?, exit_reason = ? '
                 'WHERE run_id = ?',
                 (
                     report.completed_at,
@@ -915,6 +977,8 @@ class RunStore:
                     report.total_cost_usd,
                     int(report.paused_for_cap),
                     report.cap_pause_duration_secs,
+                    startup_completed_text,
+                    None if exit_reason is None else exit_reason.column_value,
                     run_id,
                 ),
             )

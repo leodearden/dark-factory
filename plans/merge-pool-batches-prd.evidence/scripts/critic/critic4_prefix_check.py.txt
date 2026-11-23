@@ -1,0 +1,30 @@
+import sqlite3, json, subprocess, sys
+REPO='/home/leo/src/dark-factory'
+db=sqlite3.connect(f'file:{REPO}/data/orchestrator/runs.db?mode=ro', uri=True)
+rows=db.execute("""select id,timestamp,task_id,data from events where event_type='merge_verify'
+  and json_extract(data,'$.chain_items')>1 and json_extract(data,'$.passed')=0
+  order by id desc limit 60""").fetchall()
+def git(*a):
+    r=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True)
+    return r.returncode, r.stdout.strip()
+stats={'n':0,'tip_missing':0,'chain_ok':0,'parents_bad':0,'base_on_main':0,'base_not_main':0,'walk_short':0}
+for id_,ts,task,data in rows:
+    d=json.loads(data); sha=d.get('merge_sha'); n=d.get('chain_items'); runner=d.get('runner')
+    stats['n']+=1
+    rc,_=git('cat-file','-e',f'{sha}^{{commit}}')
+    if rc!=0:
+        stats['tip_missing']+=1; print('MISSING tip',id_,ts,runner,sha[:10],n); continue
+    cur=sha; ok=True; twop=True
+    for i in range(n):
+        rc,out=git('rev-list','--parents','-n','1',cur)
+        parts=out.split()
+        if rc!=0 or len(parts)<2: ok=False; break
+        if len(parts)!=3: twop=False
+        cur=parts[1]
+    if not ok: stats['walk_short']+=1; continue
+    if not twop: stats['parents_bad']+=1; print('non-2-parent in chain',id_,ts,runner,sha[:10],n)
+    else: stats['chain_ok']+=1
+    rc,_=git('merge-base','--is-ancestor',cur,'main')
+    stats['base_on_main' if rc==0 else 'base_not_main']+=1
+print(stats)
+print('oldest row', rows[-1][1], 'newest', rows[0][1])

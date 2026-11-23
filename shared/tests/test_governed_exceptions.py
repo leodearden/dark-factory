@@ -916,7 +916,7 @@ class TestCheckOrdering:
         A duplicate key makes every count downstream of it meaningless, so
         reporting the undisposed keys first would hand back a wall of noise
         whose one real cause is a line the reader can see.  This is the
-        ordering discipline ``scripts/merge_lane_metrics.py::
+        ordering discipline ``scripts/merge_lane_ratchet.py::
         check_against_baseline`` applies for the same reason.
         """
         with pytest.raises(MalformedDeclaration):

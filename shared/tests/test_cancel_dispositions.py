@@ -625,11 +625,13 @@ def test_a_repointed_childs_dropped_parent_edge_closes_no_cycle():
     )
 
 
-def test_a_path_through_the_cancelled_parent_closes_no_cycle():
-    _check(
+def test_a_path_through_the_cancelled_parent_is_refused():
+    refusal = _refusal_of(
         {7007: RepointDisposition(onto=(SUPERSEDER,)), 7008: KeepDisposition()},
         depends_on={PARENT: [7007], SUPERSEDER: [7008], 7008: [PARENT]},
     )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', SUPERSEDER)
 
 
 @pytest.mark.parametrize(
@@ -639,13 +641,24 @@ def test_a_path_through_the_cancelled_parent_closes_no_cycle():
         pytest.param(FoldDisposition(into=OTHER), id='fold'),
     ],
 )
-def test_a_path_through_a_sibling_the_map_cancels_closes_no_cycle(
+def test_a_path_through_a_sibling_the_map_cancels_is_refused(
     cancelling: ChildDispositionVariant,
 ):
-    _check(
+    refusal = _refusal_of(
         {7007: RepointDisposition(onto=(SUPERSEDER,)), 7008: cancelling},
         depends_on={SUPERSEDER: [7008], 7008: [7007]},
     )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', SUPERSEDER)
+
+
+def test_a_path_through_an_already_terminal_task_is_refused():
+    refusal = _refusal_of(
+        {7007: RepointDisposition(onto=(SUPERSEDER,))},
+        depends_on={SUPERSEDER: [DONE_SUPERSEDER], DONE_SUPERSEDER: [7007]},
+    )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', SUPERSEDER)
 
 
 def test_repoint_onto_a_sibling_the_map_cancels_is_refused():
@@ -688,12 +701,14 @@ def test_a_target_the_same_act_co_cancels_is_refused(
     assert refusal == (Reason.TARGET_CANCELLED, field, 7008)
 
 
-def test_a_path_through_a_co_cancelled_task_closes_no_cycle():
-    _check(
+def test_a_path_through_a_co_cancelled_task_is_refused():
+    refusal = _refusal_of(
         {7007: RepointDisposition(onto=(SUPERSEDER,))},
         depends_on={SUPERSEDER: [7008], 7008: [7007]},
         co_cancelled=(7008,),
     )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', SUPERSEDER)
 
 
 @pytest.mark.parametrize(

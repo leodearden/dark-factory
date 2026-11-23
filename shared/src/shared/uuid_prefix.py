@@ -62,6 +62,7 @@ from typing import Any, NamedTuple
 __all__ = [
     'UUID_PREFIX_OVERRIDE_KEY',
     'PrefixToken',
+    'WalkableArguments',
     'find_prefix_tokens',
     'strip_uuid_prefix_override',
     'substitute',
@@ -104,7 +105,7 @@ def find_prefix_tokens(arguments: Any) -> tuple[PrefixToken, ...]:
     """Return every prefix-shaped token in *arguments*, in document order.
 
     Every string value reachable through dicts AND lists is scanned, not only
-    the top-level ones that ``mcp_markup_middleware.py::_first_markup_argument``
+    the top-level ones that ``mcp_markup_middleware.py::MarkupGuardMiddleware._markup_arguments``
     inspects. D11 is the reason: the DF 4643 instance lives one level down at
     ``metadata.cluster_memory_ids[i]``, and the measured field spread is 20+
     paths, so a top-level-only scan would have missed the incident that
@@ -309,6 +310,53 @@ def _as_metadata_dict(metadata: object) -> dict[str, Any] | None:
         if isinstance(parsed, dict):
             return parsed
     return None
+
+
+class WalkableArguments:
+    """An argument map as the C1 walk sees it, able to put a repair back in the sent shape.
+
+    :attr:`view` is a shallow copy of the sent map whose JSON-object-string
+    ``metadata`` is decoded, so the walk gives that metadata's values
+    structured paths and leaves its keys unscanned, exactly as for a dict
+    ``metadata`` (PRD §4-C1 Walk, erratum 2026-11-22). Any other ``metadata``
+    is kept as sent.
+
+    The view and the caller's own string are held together, so
+    :meth:`as_sent` needs only the repair and no caller can pair a view with
+    the wrong original. INV-8 cost: one JSON decode at construction, and at
+    most one encode in :meth:`as_sent`. Never raises.
+    """
+
+    __slots__ = ('_sent_metadata', '_view')
+
+    def __init__(self, sent: Mapping[str, Any]) -> None:
+        view = dict(sent)
+        metadata = view.get('metadata')
+        decoded = _as_metadata_dict(metadata) if isinstance(metadata, str) else None
+        if decoded is not None:
+            view['metadata'] = decoded
+        self._view = view
+        self._sent_metadata: str | None = metadata if decoded is not None else None
+
+    @property
+    def view(self) -> Mapping[str, Any]:
+        return self._view
+
+    def as_sent(self, repaired: Mapping[str, Any]) -> dict[str, Any]:
+        """*repaired*, a repair of :attr:`view`, with ``metadata`` in the shape it was sent in.
+
+        A decoded metadata the repair left EQUAL to the decoding is the
+        caller's own string again, byte-identical; a changed one is
+        re-encoded. Equality rather than identity, so the result does not rest
+        on how the repair shared structure with the view.
+        """
+        shaped = dict(repaired)
+        if self._sent_metadata is not None:
+            if repaired['metadata'] == self._view['metadata']:
+                shaped['metadata'] = self._sent_metadata
+            else:
+                shaped['metadata'] = json.dumps(repaired['metadata'])
+        return shaped
 
 
 def uuid_prefix_override_requested(metadata: object) -> bool:

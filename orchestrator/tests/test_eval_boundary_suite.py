@@ -57,7 +57,7 @@ session and the eval fixtures + their ``evals/<id>`` branches / pre-task
 commits checked out::
 
     # From the repo root, one contender over one fixture. The eval runner's
-    # __main__ routes to orchestrator.cli:eval_cmd; select the task + config
+    # __main__ routes to orchestrator.evals.cli:eval_cmd; select the task + config
     # and (optionally) point memory writes at a RecordingMemorySink so the
     # intended writes are captured instead of dropped at the null sentinel:
     cd orchestrator
@@ -913,13 +913,10 @@ async def test_b11_eval_cell_writes_no_production_state(
     monkeypatch.setattr(MEMORY_TRANSPORT, memory_recall)
     agents = _TranscriptWritingAgents()
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', agents.invoke_agent)
-    monkeypatch.setattr(
-        'orchestrator.workflow.run_scoped_verification',
-        AsyncMock(return_value=VerifyResult(
-            passed=True, test_output='OK', lint_output='',
-            type_output='', summary='All checks passed',
-        )),
-    )
+    task_gate = AsyncMock(return_value=VerifyResult(
+        passed=True, test_output='OK', lint_output='',
+        type_output='', summary='All checks passed',
+    ))
 
     worktree, _ = await _snapshots.create_eval_worktree(
         proj, task['id'], task['pre_task_commit'],
@@ -927,6 +924,7 @@ async def test_b11_eval_cell_writes_no_production_state(
     plan = {**copy.deepcopy(PLAN), 'task_id': task['id']}
     workflow = _runner._cell_workflow(
         task, orch_config, worktree, plan, replay_framed=False, usage_gate=None,
+        task_gate=task_gate,
     )
     report = await workflow.run()
     assert report.outcome == WorkflowOutcome.DONE

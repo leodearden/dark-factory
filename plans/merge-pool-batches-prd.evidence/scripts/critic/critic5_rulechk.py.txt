@@ -1,0 +1,31 @@
+import math, itertools, sys
+sys.path.insert(0,'/tmp/gate-10069/critic5')
+from rule6 import fb_release, cost, going, plan
+
+def going_trace(q,r,t,u,mf=12,mt=24,scan='auto',start=(1.0,None),iters=400):
+    a_f=start[0]; a_c = start[1] if start[1] is not None else 1/mt
+    hist=[]
+    for i in range(iters):
+        na_c=min(cost(0,c,q,r,t,u,a_f,a_c,fb_release,scan)/c for c in range(1,mt+1))
+        na_f=min(cost(f,0,q,r,t,u,a_f,na_c,fb_release,scan)/f for f in range(1,mf+1))
+        hist.append((na_f,na_c))
+        if abs(na_c-a_c)<1e-9 and abs(na_f-a_f)<1e-9: return na_f,na_c,i,True,hist
+        a_f,a_c=na_f,na_c
+    return a_f,a_c,iters,False,hist
+
+print('== fixed point: convergence & dependence on start')
+bad=0; tot=0; multi=0
+for q in (1e-6,0.001,0.01,0.05,0.08,0.14,0.2,0.3,0.5,0.7,0.9,0.999):
+  for r in (0.0,1e-6,0.005,0.01,0.05,q):
+    if r>q: continue
+    for t in (0.0,0.01,0.05,0.2,0.43,0.57,0.8,1.5,5.0):
+      for u in (0.0,0.07,0.16,0.5,1.0):
+        for scan in ('auto','on','off'):
+          tot+=1
+          res=[]
+          for st in ((1.0,None),(0.01,0.01),(5.0,5.0),(1.0,1.0)):
+            af,ac,i,ok,h=going_trace(q,r,t,u,scan=scan,start=st)
+            res.append((round(af,6),round(ac,6),ok,i))
+          if not all(x[2] for x in res): bad+=1; print('NOCONV',q,r,t,u,scan,res)
+          elif len({(x[0],x[1]) for x in res})>1: multi+=1; print('MULTI',q,r,t,u,scan,res) if multi<=12 else None
+print('cells',tot,'nonconverged',bad,'start-dependent',multi)

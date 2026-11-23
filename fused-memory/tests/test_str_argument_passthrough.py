@@ -21,6 +21,7 @@ from fused_memory.server.main import (
     _install_recon_report_guards,
     _install_tool_dispatch_guards,
 )
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from fused_memory.server.str_argument_passthrough import install_str_argument_passthrough
 from fused_memory.server.tools import create_mcp_server
 
@@ -126,7 +127,12 @@ async def test_submit_task_on_the_primary_server_receives_json_looking_strings_v
     interceptor = AsyncMock()
     interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-    _install_tool_dispatch_guards(server, known_projects={})
+    _install_tool_dispatch_guards(
+        server,
+        known_projects={},
+        prefix_resolver=None,
+        residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
+    )
 
     result = await server._tool_manager.call_tool(
         'submit_task',

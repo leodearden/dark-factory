@@ -14,7 +14,7 @@ from collections import Counter
 from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, TypedDict, TypeVar, cast
+from typing import Any, TypedDict, TypeVar
 from urllib.parse import urlparse
 
 from falkordb.asyncio import FalkorDB
@@ -62,7 +62,6 @@ from fused_memory.backends.graph_access import (
     STORE,
     FalkorGraphAccess,
     GraphAccess,
-    GraphHandle,
     OpBoundReader,
     paged_ro_query,
 )
@@ -386,13 +385,25 @@ def _canonicalize_group_args(func):
 class EdgeDict(TypedDict):
     """Normalised edge dict returned by GraphitiBackend._edge_dict.
 
-    Consumed by get_valid_edges_for_node, get_all_valid_edges,
-    _canonical_facts, and rebuild_entity_from_edges.
+    Consumed by get_all_valid_edges, _canonical_facts, and
+    rebuild_entity_from_edges.  get_valid_edges_for_node returns the dated
+    subtype, DatedEdgeDict.
     """
 
     uuid: str
     fact: str
     name: str
+
+
+class DatedEdgeDict(EdgeDict):
+    """An EdgeDict with the edge's stored ISO-8601 validity window.
+
+    ``valid_at`` / ``invalid_at`` are returned verbatim as FalkorDB holds them,
+    ``None`` when the property is NULL.
+    """
+
+    valid_at: str | None
+    invalid_at: str | None
 
 
 class EdgeWithEndpoints(TypedDict):
@@ -1145,7 +1156,8 @@ class GraphitiBackend:
     TIMEOUT POSTURE.  Every budgeted read and write follows the rule stated in
     ``backends/timeout_budget.py``.  Raw Cypher is budgeted by the
     ``GraphHandle`` that :attr:`graph_access` resolves
-    (``backends/graph_access.py``); graphiti_core calls go through
+    (``backends/graph_access.py``), and graph listings by its
+    ``GraphAccess.list_graphs``; graphiti_core calls go through
     :meth:`_timed_read` / :meth:`_timed_write`.  The one exception is index
     provisioning (``_ensure_indices``, ``provision_registered_graphs``): it
     runs on its own ``_index_provision_timeout`` budget and never raises, per
@@ -1347,10 +1359,6 @@ class GraphitiBackend:
         self._group_clients[group_id] = client
         return client
 
-    def _graph_for(self, group_id: str) -> GraphHandle:
-        """Shim for the operator scripts until task 9183 moves them onto graph_access."""
-        return self.graph_access.graph(group_id)
-
     @_canonicalize_group_args
     def _identity_lock_for(self, group_id: str) -> asyncio.Lock:
         """Return the per-group_id write-time-identity lock, creating it lazily.
@@ -1395,11 +1403,6 @@ class GraphitiBackend:
         if self._driver is None:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
         return self._driver
-
-    def _require_falkor_client(self) -> Any:
-        """Return the FalkorDB client from the underlying driver."""
-        driver = self._require_driver()
-        return cast(Any, driver).client
 
     async def read_server_settings(self) -> FalkorServerSettings:
         """Read the live TIMEOUT and appendonly settings; read-only, and a failed read is reported, not raised."""
@@ -1478,9 +1481,12 @@ class GraphitiBackend:
             )
 
     async def _provision_existing_registered_graphs(self) -> None:
-        existing = await self._require_falkor_client().list_graphs()
-        for graph_name in sorted(set(existing) & self._registered_graph_ids):
+        for graph_name in await self._existing_registered_graphs():
             await self._ensure_indices(graph_name)
+
+    async def _existing_registered_graphs(self) -> list[str]:
+        """The graphs startup maintenance owns: registered ones the server has (D5)."""
+        return sorted(set(await self.graph_access.list_graphs()) & self._registered_graph_ids)
 
     async def initialize(
         self,
@@ -2437,7 +2443,9 @@ class GraphitiBackend:
         return edges
 
     @_canonicalize_group_args
-    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
+    async def get_valid_edges_for_node(
+        self, node_uuid: str, *, group_id: str,
+    ) -> list[DatedEdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
         Matches the node as either source or target (undirected) and excludes
@@ -2455,17 +2463,17 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, fact, name.
+            List of DatedEdgeDicts with keys: uuid, fact, name, valid_at, invalid_at.
         """
         graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
             f'WHERE {ACTIVE_EDGE_PREDICATE} '
-            'RETURN e.uuid, e.fact, e.name'
+            'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid}, op='get_valid_edges_for_node')
-        seen: dict[str, EdgeDict] = {}
-        edges: list[EdgeDict] = []
+        seen: dict[str, DatedEdgeDict] = {}
+        edges: list[DatedEdgeDict] = []
         for row in (result.result_set or []):
             edge_uuid = row[0]
             if edge_uuid in seen:
@@ -2475,7 +2483,7 @@ class GraphitiBackend:
                 # genuinely-distinct edges sharing a uuid would silently
                 # collapse to the first-seen row. Surface it at debug level
                 # rather than failing silently.
-                dup = self._edge_dict(row[0], row[1], row[2])
+                dup = self._dated_edge_dict(*row[:5])
                 prior = seen[edge_uuid]
                 if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
                     logger.debug(
@@ -2486,7 +2494,7 @@ class GraphitiBackend:
                         edge_uuid, prior['fact'], prior['name'], dup['fact'], dup['name'],
                     )
                 continue
-            edge = self._edge_dict(row[0], row[1], row[2])
+            edge = self._dated_edge_dict(*row[:5])
             seen[edge_uuid] = edge
             edges.append(edge)
         return edges
@@ -3410,7 +3418,7 @@ class GraphitiBackend:
             residual = await self.count_foreign_relationships(
                 deprecated_uuid, group_id=group_id,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             # Deliberately NOT prefixed 'merge_entities: ' — that prefix
             # identifies the one structured JSON record per merge emitted
             # below, and a diagnostic sharing it would break any auditor that
@@ -3514,7 +3522,7 @@ class GraphitiBackend:
             try:
                 await self.refresh_entity_summary(nbr, group_id=group_id)
                 refreshed.append(nbr)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'delete_entity: refresh_entity_summary failed for nbr=%s '
                     '(deleted node uuid=%s): %s',
@@ -3587,6 +3595,31 @@ class GraphitiBackend:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         row = result.result_set[0]
         return (row[0], row[1] or '')
+
+    @_canonicalize_group_args
+    async def get_node_names_by_uuids(
+        self, uuids: Sequence[str], *, group_id: str,
+    ) -> dict[str, str]:
+        """Name the Entity nodes among *uuids* in one indexed read (``Entity(uuid)`` range index).
+
+        It names the endpoints of a batch of graph hits. A node that is absent
+        or has no name is omitted: it has no name to give. Like
+        get_edges_by_uuids, it applies no ``n.group_id`` predicate, so an
+        edge's endpoint is named as stored.
+        """
+        wanted = list(dict.fromkeys(uuids))
+        if not wanted:
+            return {}
+        result = await self.graph_access.graph(group_id).ro_query(
+            'MATCH (n:Entity) WHERE n.uuid IN $uuids RETURN n.uuid, n.name',
+            {'uuids': wanted},
+            op='get_node_names_by_uuids',
+        )
+        names: dict[str, str] = {}
+        for node_uuid, name in result.result_set or []:
+            if isinstance(name, str) and name:
+                names.setdefault(node_uuid, name)
+        return names
 
     @_canonicalize_group_args
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
@@ -3922,9 +3955,10 @@ class GraphitiBackend:
     async def _run_startup_identity_scan(self) -> dict:
         """Startup identity-integrity sweep — per-graph orchestrator (W6-ε).
 
-        Enumerates every project graph via list_graphs() and, for each, runs
+        Enumerates every registered graph that exists and, for each, runs
         both the dup-NODE alarm (_scan_duplicate_entity_names) and the
-        dup-uuid-EDGE repair (_repair_duplicate_edge_uuids). Each graph is
+        dup-uuid-EDGE repair (_repair_duplicate_edge_uuids). The scope rule's
+        home is docs/prds/falkordb-index-provisioning.md D5. Each graph is
         processed best-effort: a failure on one graph is caught and logged,
         never aborting the sweep over the rest — mirrors the initialize()
         index-setup loop idiom (graphiti_client.py:378-385, try/except
@@ -3954,7 +3988,7 @@ class GraphitiBackend:
             - elapsed_ms: wall-clock duration of the full sweep (all graphs),
               in milliseconds.
         """
-        graphs = await self.list_graphs()
+        graphs = await self._existing_registered_graphs()
         stats: dict[str, int | float] = {
             'graphs_scanned': 0, 'dup_name_groups': 0, 'edges_repaired': 0,
         }
@@ -4266,6 +4300,18 @@ class GraphitiBackend:
             'fact': fact if fact is not None else '',
             'name': name if name is not None else '',
         }
+
+    @classmethod
+    def _dated_edge_dict(
+        cls,
+        uuid: str,
+        fact: str | None,
+        name: str | None,
+        valid_at: str | None,
+        invalid_at: str | None,
+    ) -> DatedEdgeDict:
+        """An _edge_dict carrying the stored validity window verbatim."""
+        return {**cls._edge_dict(uuid, fact, name), 'valid_at': valid_at, 'invalid_at': invalid_at}
 
     @staticmethod
     def _duplicate_edge_uuids(rows: Sequence[Sequence[Any]]) -> list[str]:
@@ -5130,7 +5176,7 @@ class GraphitiBackend:
           graph that does not exist yet DOES carry zero indices and is provisioned
           from scratch — measured, the CREATE statements auto-create the key, so
           this is self-healing.  Absence is decided STRUCTURALLY
-          (``group_id not in await client.list_graphs()``), never by matching
+          (``group_id not in await self.graph_access.list_graphs()``), never by matching
           FalkorDB's error wording (D2).
         * **Serialized per graph.**  The read-diff-write section runs under a
           per-``group_id`` ``asyncio.Lock`` (``_index_provision_locks``, an
@@ -5255,10 +5301,10 @@ class GraphitiBackend:
             # which would issue every statement against a graph that may already
             # be fully provisioned.
             #
-            # The RAW client's list_graphs() is used, not GraphitiBackend's, which
-            # filters `default_db` / `*_db` and would misclassify those names as
-            # absent.
-            if group_id in await self._require_falkor_client().list_graphs():
+            # The provider's UNFILTERED listing is used, not
+            # GraphitiBackend.list_graphs(), which filters `default_db` / `*_db`
+            # and would misclassify those names as absent.
+            if group_id in await self.graph_access.list_graphs():
                 raise
             records = []
 
@@ -5281,7 +5327,7 @@ class GraphitiBackend:
             statements.append(statement)
             try:
                 await graph.query(statement, op='_ensure_indices_locked')
-            except Exception as exc:  # noqa: BLE001 - absorbed by contract, see docstring
+            except Exception as exc:  # absorbed by contract, see docstring
                 failed.extend((spec, str(exc)) for spec in specs)
                 # Emitted HERE rather than reconstructed from `failed` afterwards
                 # because `failed` is keyed by IndexSpec, and a fulltext spec's
@@ -5525,8 +5571,7 @@ class GraphitiBackend:
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
-        client = self._require_falkor_client()
-        all_graphs = await client.list_graphs()
+        all_graphs = await self.graph_access.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:

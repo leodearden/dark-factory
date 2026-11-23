@@ -29,6 +29,7 @@ from escalation.queue import EscalationQueue
 from pydantic import ValidationError
 from shared import project_layout
 from shared.cli_invoke import AgentResult
+from shared.mcp_markup_middleware import MARKUP_STORM_ERROR_TYPE
 from shared.project_id import project_id_for_root
 from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
@@ -278,7 +279,7 @@ class TestOperatorToolsFollowTheLayout:
         )
 
         filed = await sink({
-            'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+            'error_type': MARKUP_STORM_ERROR_TYPE,
             'count': 7,
             'threshold': 5,
             'window_seconds': 3600,
@@ -318,9 +319,7 @@ class TestHomePathDefaultsDeriveFromTheMainCheckout:
         monkeypatch.delenv(rab.RUNS_DB_ENV_VAR, raising=False)
         assert rab.default_runs_db_path() == runs_db(default_project_root())
 
-    def test_the_prompt_opt_canary_reads_the_layout_runs_db(self, monkeypatch):
-        monkeypatch.delenv('PROMPT_OPT_RUNS_DB', raising=False)
-
+    def test_the_prompt_opt_canary_reads_the_layout_runs_db(self):
         result = CliRunner().invoke(prompt_opt_cli, [
             'canary', '--deploy-at', '2026-06-15T00:00:00+00:00', '--project-id', 'dark_factory',
         ])
@@ -328,9 +327,7 @@ class TestHomePathDefaultsDeriveFromTheMainCheckout:
         assert result.exit_code == 2, result.output
         assert f'runs.db not found at {runs_db(default_project_root())}' in result.output
 
-    def test_the_reviewer_trial_miner_reads_the_layout_runs_db(self, monkeypatch):
-        monkeypatch.delenv('REVIEWER_TRIAL_RUNS_DB', raising=False)
-
+    def test_the_reviewer_trial_miner_reads_the_layout_runs_db(self):
         result = CliRunner().invoke(reviewer_trial_cli, ['mine'])
 
         assert result.exit_code == 1, result.output
@@ -348,38 +345,30 @@ class TestMainCheckoutDefaultsNameTheirOverrides:
         monkeypatch.setenv(rab.RUNS_DB_ENV_VAR, str(tmp_path / 'elsewhere.db'))
         assert rab.default_runs_db_path() == tmp_path / 'elsewhere.db'
 
-    @pytest.mark.parametrize(('cli', 'args', 'flag', 'env_var'), [
+    @pytest.mark.parametrize(('cli', 'args', 'flag'), [
         pytest.param(
             prompt_opt_cli,
             ['canary', '--deploy-at', '2026-06-15T00:00:00+00:00', '--project-id', 'dark_factory'],
-            '--runs-db', 'PROMPT_OPT_RUNS_DB', id='prompt-opt-canary',
+            '--runs-db', id='prompt-opt-canary',
         ),
         pytest.param(
-            prompt_opt_cli, ['build-curator-corpus'], '--db-path', 'CURATOR_TICKETS_DB',
+            prompt_opt_cli, ['build-curator-corpus'], '--db-path',
             id='prompt-opt-build-curator-corpus',
         ),
         pytest.param(
-            reviewer_trial_cli, ['mine'], '--runs-db', 'REVIEWER_TRIAL_RUNS_DB',
-            id='reviewer-trial-mine',
+            reviewer_trial_cli, ['mine'], '--runs-db', id='reviewer-trial-mine',
         ),
         pytest.param(
-            reviewer_trial_cli, ['campaign', '--results-dir', 'results'], '--config', None,
+            reviewer_trial_cli, ['campaign', '--results-dir', 'results'], '--config',
             id='reviewer-trial-campaign',
         ),
         pytest.param(
-            orchestrator_cli, ['eval-sample', '--dry-run'], '--df-root', None, id='eval-sample',
+            orchestrator_cli, ['eval-sample', '--dry-run'], '--df-root', id='eval-sample',
         ),
     ])
-    def test_an_operator_command_answers_with_a_usage_error(
-        self, monkeypatch, cli, args, flag, env_var,
-    ):
-        if env_var is not None:
-            monkeypatch.delenv(env_var, raising=False)
-
+    def test_an_operator_command_answers_with_a_usage_error(self, cli, args, flag):
         result = CliRunner().invoke(cli, args)
 
         assert result.exit_code == 2, result.output
         assert isinstance(result.exception, SystemExit), result.exception
         assert f'pass {flag}' in result.output
-        if env_var is not None:
-            assert f'set ${env_var}' in result.output

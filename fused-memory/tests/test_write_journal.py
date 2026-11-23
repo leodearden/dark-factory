@@ -23,8 +23,10 @@ from fused_memory.services.write_journal import (
     OPERATOR_TELEMETRY_QUERY,
     Mem0IntentStatus,
     Mem0RetryBacklog,
+    Mem0WriteMethod,
     WriteJournal,
     decode_mem0_intent_metadata,
+    decode_mem0_intent_write_method,
 )
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_verification import ReferentFinding
@@ -646,6 +648,7 @@ async def test_log_mem0_intent_roundtrip_pending(journal):
         content=long_content,
         metadata=metadata,
         payload_digest='digest-abc',
+        write_method=Mem0WriteMethod.ADD,
     )
     incomplete = await journal.get_incomplete_mem0_intents()
     assert len(incomplete) == 1
@@ -676,6 +679,7 @@ async def test_resolve_mem0_intent_completed_removes_from_incomplete(journal):
         content='hi',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     await journal.resolve_mem0_intent(intent_id, 'completed')
 
@@ -697,6 +701,7 @@ async def test_resolve_mem0_intent_dead_persists_reason(journal):
         content='hi',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     reason = 'no backend_op: unknown outcome (not auto-re-issued)'
     await journal.resolve_mem0_intent(intent_id, 'dead', reason=reason)
@@ -722,6 +727,7 @@ async def test_get_mem0_intents_status_filter(journal):
             content=f'content-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         if status != 'pending':
             await journal.resolve_mem0_intent(iid, status)
@@ -746,6 +752,7 @@ async def test_get_incomplete_returns_only_pending(journal):
         content='pending-one',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     for status in ['completed', 'failed', 'dead']:
         iid = str(uuid.uuid4())
@@ -755,6 +762,7 @@ async def test_get_incomplete_returns_only_pending(journal):
             content=f'c-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         await journal.resolve_mem0_intent(iid, status)
 
@@ -776,6 +784,7 @@ async def test_prune_mem0_intents_ages_out_terminal_rows(journal):
             content=f'c-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         if status != 'pending':
             await journal.resolve_mem0_intent(iid, status)
@@ -818,6 +827,7 @@ async def test_prune_mem0_intents_can_include_dead_explicitly(journal):
         content='c',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     await journal.resolve_mem0_intent(iid, 'dead', reason='unknown outcome')
     await journal._require_access().connection.execute(
@@ -889,6 +899,19 @@ class TestMem0IntentRetrySchedule:
         assert row['next_attempt_at'] is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('method', list(Mem0WriteMethod))
+    async def test_an_intent_records_the_method_it_writes_through(self, journal, method):
+        row = await mem0_intent_row(
+            journal, await seed_mem0_intent(journal, write_method=method)
+        )
+        assert row['write_method'] == method.value
+        assert decode_mem0_intent_write_method(row) is method
+
+    def test_an_unknown_write_method_does_not_decode(self):
+        with pytest.raises(ValueError, match='bogus'):
+            decode_mem0_intent_write_method({'write_method': 'bogus'})
+
+    @pytest.mark.asyncio
     async def test_migration_adds_columns_to_a_pre_change_database(self, tmp_path):
         data_dir = tmp_path / 'wj'
         data_dir.mkdir()
@@ -905,6 +928,9 @@ class TestMem0IntentRetrySchedule:
             row = await mem0_intent_row(j, 'old-1')
             assert row['attempts'] == 0
             assert row['next_attempt_at'] is None
+            # Every pre-change intent was journaled by add_memory: add_system_record
+            # journaled none before task 7401.
+            assert row['write_method'] == 'add'
             assert await j.schedule_mem0_retry(
                 'old-1', reason='rate_limited', retry_at=datetime.now(UTC)
             )
@@ -1937,7 +1963,8 @@ def test_prune_write_ops_takes_every_bound_from_its_caller():
     assert defaulted == [], (
         'RED: prune_write_ops re-grew a default for '
         f'{defaulted} — that is a second copy of a number whose home is '
-        'config/schema.py::WriteJournalConfig, and server/main.py already '
+        'config/schema.py::WriteJournalConfig, and '
+        'services/write_ops_retention.py::prune_write_ops_pass already '
         'passes all six from there.'
     )
 

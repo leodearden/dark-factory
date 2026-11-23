@@ -21,6 +21,10 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
+# Per-project cgroup slice; memory-only delegation, started in daemon/: docs/cgroup-slice-topology.md
+Slice=df-solar_challenge_platform.slice
+Delegate=memory
+DelegateSubgroup=daemon
 # CWD must be dark-factory so `uv run --project orchestrator` resolves the package.
 WorkingDirectory=/home/leo/src/dark-factory
 # Gate startup on fused-memory's MCP port (8002) being live.
@@ -28,7 +32,8 @@ ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002
 # --config MUST name the canonical `dark-factory-orchestrator.yaml` -- CLAUDE.md
 # calls it "the canonical, required filename" that the dashboard's escalation-URL
 # discovery keys on. The legacy `orchestrator.yaml` / `orchestrator-config.yaml`
-# spellings are a discovery fallback only; do NOT restore them here (task 3512).
+# spellings are not read by discovery at all (retired, task 7138); do NOT restore
+# them here (task 3512).
 ExecStart=/home/leo/.local/bin/uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/solar-challenge-platform/dark-factory-orchestrator.yaml
 
 # Replicate PATH so verify subprocesses find their toolchain (a user service gets a minimal PATH).

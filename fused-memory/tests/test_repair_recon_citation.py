@@ -395,7 +395,7 @@ class TestMainStartupFailures:
             async def initialize(self):
                 raise RuntimeError('qdrant connect refused')
 
-            async def close(self):  # pragma: no cover - must never be reached
+            async def close(self):
                 wiring['closed'].append('memory')
 
         # A later setattr wins over the fixture's.
@@ -415,9 +415,10 @@ class TestMainStartupFailures:
         assert outcome['hint']
 
         # The leak the finding names: the already-initialized journal WAS
-        # closed. ``memory`` is absent because it never finished initializing —
-        # a half-constructed backend is what close() would have to guess about.
-        assert wiring['closed'] == ['journal']
+        # closed. The half-opened memory is closed first, by the shared close
+        # in maintenance_service, before the script's own finally closes the
+        # journal.
+        assert wiring['closed'] == ['memory', 'journal']
 
     def test_journal_initialize_failure_reports_json_and_never_constructs_the_memory_service(
         self, monkeypatch, wiring, capsys

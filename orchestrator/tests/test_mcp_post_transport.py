@@ -7,14 +7,15 @@ why ~3 months of silently-discarded memory writes were invisible: a
 payload-shaped mock cannot tell a delivered POST from one absorbed by a
 redirect.
 
-So these tests drive a REAL ``httpx.AsyncClient`` through an
-``httpx.MockTransport`` whose handler reproduces the live fused-memory server,
-and assert the resulting STATE: which path the server actually received a
-``tools/call`` on.  The handler and the recording client factory live in
-``_mcp_transport_harness`` — a ``_``-prefixed sibling, because
-``test_suggestion_triage.py`` drives the same fake server and test modules must
-not import each other.  See that module's docstring for what the handler
-reproduces and why.
+So these tests drive a REAL ``httpx.AsyncClient`` over a real socket to
+``shared.testing_mcp_stub.StubMcpServer``, which answers ``/mcp/`` with a 307
+and a POST lacking a JSON Accept with a 406, as the live fused-memory server
+does.  They assert the resulting STATE the server recorded: which requests
+arrived off ``/mcp``, and which ``tools/call`` its tool layer answered past
+those refusals.  The stub's 406 is the one definition of the Accept contract,
+so an answered call is the proof the client sent it.  Only the tests that
+assert on client construction patch ``httpx.AsyncClient``, with the
+constructor-kwargs recorder from ``_mcp_client_recorder``.
 """
 
 from __future__ import annotations
@@ -22,27 +23,28 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-from _mcp_transport_harness import (
-    MCP_PATH,
-    MCP_PATH_WITH_SLASH,
-    RecordingClientFactory,
-    RecordingMcpServer,
-)
+from _mcp_client_recorder import RecordingClientFactory
+from shared.testing_mcp_stub import StubMcpServer
 
 from orchestrator.workflow import TaskWorkflow
 
 
 @pytest.fixture
 def server():
-    return RecordingMcpServer()
+    with StubMcpServer(stateful=False) as stub:
+        yield stub
 
 
 @pytest.fixture
-def client_factory(server):
-    return RecordingClientFactory(server)
+def client_factory():
+    return RecordingClientFactory()
 
 
-def make_workflow(*, tmp_path, task_id='4023', plan=None, mcp_url='http://memory.test:8002'):
+def _arrived_paths(server: StubMcpServer) -> list[str]:
+    return [r.path for r in server.requests]
+
+
+def make_workflow(*, tmp_path, mcp_url, task_id='4023', plan=None):
     """Minimal TaskWorkflow carrying only what the memory writers read.
 
     ``object.__new__`` skips __init__ (same lightweight pattern as
@@ -72,41 +74,34 @@ def make_workflow(*, tmp_path, task_id='4023', plan=None, mcp_url='http://memory
 
 
 @pytest.mark.asyncio
-async def test_completion_write_actually_reaches_the_mcp_endpoint(
-    tmp_path, server, client_factory,
-):
+async def test_completion_write_actually_reaches_the_mcp_endpoint(tmp_path, server):
     """THE regression: the add_memory tools/call must land at /mcp.
 
     Under the pre-fix code the client targets /mcp/ with follow_redirects
-    unset, so the server records ZERO delivered tools/call — while the HTTP
+    unset, so the server answers ZERO tools/call — while the HTTP
     exchange itself reports a perfectly successful 307.
     """
-    wf = make_workflow(tmp_path=tmp_path)
+    wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
-    with patch('httpx.AsyncClient', client_factory):
-        await wf._write_completion_to_memory()
+    await wf._write_completion_to_memory()
 
-    add_memory_calls = server.tool_calls('add_memory')
+    add_memory_calls = server.tool_call_arguments('add_memory')
     assert len(add_memory_calls) == 1, (
-        'expected exactly one add_memory tools/call DELIVERED at /mcp; got '
-        f'{len(add_memory_calls)}. redirected={server.redirected!r} '
-        f'not_acceptable={server.not_acceptable!r}'
+        'expected exactly one add_memory tools/call ANSWERED at /mcp; got '
+        f'{len(add_memory_calls)}. arrived at {_arrived_paths(server)!r}'
     )
-    assert all(path == MCP_PATH for path, _ in server.delivered)
+    assert server.off_endpoint_paths == ()
 
 
 @pytest.mark.asyncio
-async def test_completion_write_never_targets_the_redirecting_slash_path(
-    tmp_path, server, client_factory,
-):
+async def test_completion_write_never_targets_the_redirecting_slash_path(tmp_path, server):
     """No request may hit /mcp/ at all — the slash is the load-bearing defect."""
-    wf = make_workflow(tmp_path=tmp_path)
+    wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
-    with patch('httpx.AsyncClient', client_factory):
-        await wf._write_completion_to_memory()
+    await wf._write_completion_to_memory()
 
-    assert server.redirected == [], (
-        f'POSTed to the redirecting {MCP_PATH_WITH_SLASH} path: {server.redirected!r}'
+    assert server.off_endpoint_paths == (), (
+        f'POSTed off /mcp, e.g. to the redirecting /mcp/ path: {server.off_endpoint_paths!r}'
     )
 
 
@@ -115,7 +110,7 @@ async def test_completion_write_client_is_constructed_with_follow_redirects(
     tmp_path, server, client_factory,
 ):
     """Task's explicit ask (a): the client must opt into following redirects."""
-    wf = make_workflow(tmp_path=tmp_path)
+    wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
     with patch('httpx.AsyncClient', client_factory):
         await wf._write_completion_to_memory()
@@ -124,23 +119,20 @@ async def test_completion_write_client_is_constructed_with_follow_redirects(
 
 
 @pytest.mark.asyncio
-async def test_completion_write_sends_the_mcp_accept_header(
-    tmp_path, server, client_factory,
-):
+async def test_completion_write_sends_the_mcp_accept_header(tmp_path, server):
     """The fourth part of the fix (esc-4023-2), measured against the live server.
 
     Without ``Accept: application/json``, a POST that reaches /mcp is refused
     406 — so dropping the slash alone would merely relocate the silent loss.
+    The stub answers that 406 itself, so an answered call proves the header.
     """
-    wf = make_workflow(tmp_path=tmp_path)
+    wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
-    with patch('httpx.AsyncClient', client_factory):
-        await wf._write_completion_to_memory()
+    await wf._write_completion_to_memory()
 
-    server.assert_every_request_accepted_json()
-    assert server.not_acceptable == [], (
-        'the POST was refused 406 for a missing/!json Accept header — the write '
-        'still did not land'
+    assert server.tool_call_arguments('add_memory') != (), (
+        'no add_memory call was answered; a 406 for a missing JSON Accept header '
+        f'is one cause. arrived at {_arrived_paths(server)!r}'
     )
 
 
@@ -156,9 +148,10 @@ DECISIONS = [
 ]
 
 
-def _workflow_with_decisions(tmp_path, decisions=None):
+def _workflow_with_decisions(tmp_path, *, mcp_url, decisions=None):
     return make_workflow(
         tmp_path=tmp_path,
+        mcp_url=mcp_url,
         plan={
             'analysis': 'because reasons',
             'design_decisions': DECISIONS if decisions is None else decisions,
@@ -168,24 +161,20 @@ def _workflow_with_decisions(tmp_path, decisions=None):
 
 
 @pytest.mark.asyncio
-async def test_decisions_write_delivers_every_decision_to_the_mcp_endpoint(
-    tmp_path, server, client_factory,
-):
+async def test_decisions_write_delivers_every_decision_to_the_mcp_endpoint(tmp_path, server):
     """One delivered add_memory per design decision, all landing at /mcp."""
-    wf = _workflow_with_decisions(tmp_path)
+    wf = _workflow_with_decisions(tmp_path, mcp_url=server.url)
 
-    with patch('httpx.AsyncClient', client_factory):
-        await wf._write_decisions_to_memory()
+    await wf._write_decisions_to_memory()
 
-    calls = server.tool_calls('add_memory')
+    calls = server.tool_call_arguments('add_memory')
     assert len(calls) == len(DECISIONS), (
-        f'expected {len(DECISIONS)} delivered add_memory calls, got {len(calls)}. '
-        f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+        f'expected {len(DECISIONS)} answered add_memory calls, got {len(calls)}. '
+        f'arrived at {_arrived_paths(server)!r}'
     )
-    assert all(path == MCP_PATH for path, _ in server.delivered)
-    assert server.redirected == []
+    assert server.off_endpoint_paths == ()
     # The decision text must survive the trip, not merely the envelope.
-    delivered_text = ' '.join(c['params']['arguments']['content'] for c in calls)
+    delivered_text = ' '.join(args['content'] for args in calls)
     for decision in DECISIONS:
         assert decision['decision'] in delivered_text
 
@@ -206,7 +195,7 @@ async def test_decisions_write_uses_the_patched_client_seam(
     AsyncClient`` at module scope — would silently escape every assertion in
     this file while every test kept passing.
     """
-    wf = _workflow_with_decisions(tmp_path)
+    wf = _workflow_with_decisions(tmp_path, mcp_url=server.url)
 
     with patch('httpx.AsyncClient', client_factory):
         await wf._write_decisions_to_memory()
@@ -221,13 +210,13 @@ async def test_decisions_write_uses_the_patched_client_seam(
 async def test_decisions_write_client_follows_redirects_and_accepts_json(
     tmp_path, server, client_factory,
 ):
-    wf = _workflow_with_decisions(tmp_path)
+    wf = _workflow_with_decisions(tmp_path, mcp_url=server.url)
 
     with patch('httpx.AsyncClient', client_factory):
         await wf._write_decisions_to_memory()
 
     client_factory.assert_follows_redirects()
-    server.assert_every_request_accepted_json()
+    assert len(server.tool_call_arguments('add_memory')) == len(DECISIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -246,47 +235,40 @@ def _reviews_with(n):
 
 
 @pytest.mark.asyncio
-async def test_suggestions_write_delivers_to_the_mcp_endpoint(
-    tmp_path, server, client_factory,
-):
-    wf = make_workflow(tmp_path=tmp_path)
+async def test_suggestions_write_delivers_to_the_mcp_endpoint(tmp_path, server):
+    wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
-    with patch('httpx.AsyncClient', client_factory):
-        await wf._write_suggestions_to_memory(_reviews_with(3))
+    await wf._write_suggestions_to_memory(_reviews_with(3))
 
-    calls = server.tool_calls('add_memory')
+    calls = server.tool_call_arguments('add_memory')
     assert len(calls) == 3, (
-        f'expected 3 delivered add_memory calls, got {len(calls)}. '
-        f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+        f'expected 3 answered add_memory calls, got {len(calls)}. '
+        f'arrived at {_arrived_paths(server)!r}'
     )
-    assert all(path == MCP_PATH for path, _ in server.delivered)
-    assert server.redirected == []
+    assert server.off_endpoint_paths == ()
 
 
 @pytest.mark.asyncio
-async def test_suggestions_write_caps_at_five_delivered_calls(
-    tmp_path, server, client_factory,
-):
+async def test_suggestions_write_caps_at_five_delivered_calls(tmp_path, server):
     """The documented cap is 5 — and it must be a cap on DELIVERED writes."""
-    wf = make_workflow(tmp_path=tmp_path)
+    wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
-    with patch('httpx.AsyncClient', client_factory):
-        await wf._write_suggestions_to_memory(_reviews_with(9))
+    await wf._write_suggestions_to_memory(_reviews_with(9))
 
-    assert len(server.tool_calls('add_memory')) == 5
+    assert len(server.tool_call_arguments('add_memory')) == 5
 
 
 @pytest.mark.asyncio
 async def test_suggestions_write_client_follows_redirects_and_accepts_json(
     tmp_path, server, client_factory,
 ):
-    wf = make_workflow(tmp_path=tmp_path)
+    wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
     with patch('httpx.AsyncClient', client_factory):
         await wf._write_suggestions_to_memory(_reviews_with(2))
 
     client_factory.assert_follows_redirects()
-    server.assert_every_request_accepted_json()
+    assert len(server.tool_call_arguments('add_memory')) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +281,7 @@ async def test_suggestions_write_client_follows_redirects_and_accepts_json(
 # mcp_lifecycle.py pattern in the first place.
 
 
-def _make_merge_worker(tmp_path, mcp_url: str | None = 'http://memory.test:8002'):
+def _make_merge_worker(tmp_path, *, mcp_url: str | None):
     """A bare merge worker whose MCP handle points at *mcp_url* (None: no handle)."""
     import asyncio
 
@@ -327,41 +309,40 @@ FIX_TASK_ARGS = {
 
 
 @pytest.mark.asyncio
-async def test_merge_worker_submit_lands_at_the_mcp_endpoint(tmp_path, server, client_factory):
+async def test_merge_worker_submit_lands_at_the_mcp_endpoint(tmp_path, server):
     """The main-health auto-heal fix task must actually reach the curator."""
-    worker = _make_merge_worker(tmp_path)
+    worker = _make_merge_worker(tmp_path, mcp_url=server.url)
 
-    with patch('httpx.AsyncClient', client_factory):
-        await worker._post_submit_tasks([FIX_TASK_ARGS])
+    await worker._post_submit_tasks([FIX_TASK_ARGS])
 
-    calls = server.tool_calls('submit_task')
+    calls = server.tool_call_arguments('submit_task')
     assert len(calls) == 1, (
-        f'expected 1 submit_task delivered at {MCP_PATH}, got {len(calls)}. '
-        f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+        f'expected 1 submit_task answered at /mcp, got {len(calls)}. '
+        f'arrived at {_arrived_paths(server)!r}'
     )
-    assert calls[0]['params']['arguments'] == FIX_TASK_ARGS
-    assert server.redirected == []
+    assert calls[0] == FIX_TASK_ARGS
+    assert server.off_endpoint_paths == ()
 
 
 @pytest.mark.asyncio
 async def test_merge_worker_client_follows_redirects_and_accepts_json(
     tmp_path, server, client_factory,
 ):
-    worker = _make_merge_worker(tmp_path)
+    worker = _make_merge_worker(tmp_path, mcp_url=server.url)
 
     with patch('httpx.AsyncClient', client_factory):
         await worker._post_submit_tasks([FIX_TASK_ARGS])
 
     client_factory.assert_follows_redirects()
-    server.assert_every_request_accepted_json()
+    assert len(server.tool_call_arguments('submit_task')) == 1
 
 
 @pytest.mark.asyncio
-async def test_merge_worker_submit_is_still_none_safe(tmp_path, server, client_factory):
+async def test_merge_worker_submit_is_still_none_safe(tmp_path, client_factory):
     """The documented ``self._mcp is None`` guard must survive the fix."""
     worker = _make_merge_worker(tmp_path, mcp_url=None)
 
     with patch('httpx.AsyncClient', client_factory):
         await worker._post_submit_tasks([FIX_TASK_ARGS])
 
-    assert server.seen == [], 'a None _mcp must produce no HTTP traffic at all'
+    assert client_factory.ctor_kwargs == [], 'a None _mcp must construct no client at all'

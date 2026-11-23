@@ -40,7 +40,8 @@ its confirmed evidence:
    audit conclusion is pinned as executable behaviour below so the prompt's
    description of the framework cannot silently drift back out of sync.
 4. ``memories_written`` — a retired counter (``stats_verifier``) the prompt
-   still asks for. Not load-bearing, no repair path, deliberately untouched.
+   no longer asks for; the verifier still recognises it if a model emits it.
+   Not load-bearing, no repair path, deliberately untouched.
 
 **Fail direction.** Corroboration is fail-CLOSED on the increment (an
 unverifiable record does not count) while remaining fail-SAFE for the stage:
@@ -168,8 +169,6 @@ def _mock_deps(
     write_journal_mock.get_ops_by_causation = AsyncMock(return_value=list(journal_rows or []))
     journal_mock = MagicMock()
     journal_mock.write_journal = write_journal_mock
-    journal_mock.record_run_session = AsyncMock()
-    journal_mock.clear_run_session = AsyncMock()
     return {
         'memory_service': AsyncMock(),
         'taskmaster': AsyncMock() if taskmaster is None else taskmaster,

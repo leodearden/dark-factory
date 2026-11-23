@@ -1,0 +1,15 @@
+import sys
+sys.path.insert(0,'/tmp/gate-10069/critic7')
+from rule8 import fallback_cost, batch_cost, going_costs, plan_batch
+R,U=0.01,0.15
+fb1=lambda n,p,a: 1.0 if n==1 else fallback_cost(n,p,a)
+for q in (0.14,0.20):
+    a,c,_=going_costs(q,R,U,True)
+    C=lambda f,cc: batch_cost(f,cc,q,R,U,True,a,c,fallback=fb1)
+    alts={(0,11):C(0,11)+12*a,(1,11):C(1,11)+11*a,(12,11):C(12,11)}
+    base=min(alts.values())
+    print(f'q={q}: cost of handling 11 cleared + 12 new, lone-new verify priced at 1:',{k:(round(v,3),f'+{100*(v/base-1):.1f}%') for k,v in alts.items()})
+# cleared-only batch size and first-kind check with the new formula
+for q in (0.05,0.14):
+    a,c,_=going_costs(q,R,U,True)
+    print(q,'cleared-only C/c min at', min(range(1,25),key=lambda x:(round(batch_cost(0,x,q,R,U,True,a,c)/x,12),-x)))

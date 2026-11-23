@@ -26,6 +26,7 @@ import subprocess
 
 import pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shell_logical_lines import logical_lines
 from systemd_unit_invariants import ALL_ORCHESTRATOR_SERVICE_FILES
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -41,45 +42,6 @@ SYNC_SCRIPT = pathlib.Path(__file__).parents[2] / "scripts" / "sync-orchestrator
 # mid-sync.  Folding it into the services loop would stop the timer's unit
 # instead of the timer and break that ordering.
 _WATCHDOG_UNIT = "orchestrator-watchdog.service"
-
-
-def _logical_lines(script: str) -> list[str]:
-    """*script*'s lines with backslash continuations joined into one each.
-
-    A line-oriented scan reads ``"$UV" sync \\`` / ``  --all-packages`` as two
-    fragments and finds no invocation at all — the guard below then reports
-    "found 0", which is loud but names the wrong defect.  The shell joins those
-    two physical lines into one command, and so must anything claiming to read
-    the arguments the shell will see.
-
-    A trailing backslash on a COMMENT line does not continue it in shell (the
-    comment ends at the newline), so such a line is never joined onto the next.
-    Joining it would swallow a real command into a comment and drop it from the
-    scan silently — the one direction this helper must refuse.
-
-    Kept local rather than shared with its unit-file counterpart,
-    tests/scripts/systemd_unit_invariants.py::logical_exec_start: this is a
-    SHELL grammar over a whole script, bound by the shell's comment rule
-    above, and that module holds unit-file semantics only.  This is the one
-    shell consumer.
-    """
-    joined: list[str] = []
-    pending = ""
-    for raw in script.splitlines():
-        line = raw.strip()
-        if pending:
-            line = f"{pending} {line}"
-            pending = ""
-        elif line.startswith("#"):
-            joined.append(line)
-            continue
-        if line.endswith("\\"):
-            pending = line[:-1].strip()
-            continue
-        joined.append(line)
-    if pending:
-        joined.append(pending)
-    return joined
 
 
 def _uv_sync_invocations(script: str) -> list[list[str]]:
@@ -107,7 +69,7 @@ def _uv_sync_invocations(script: str) -> list[list[str]]:
     to replace.
     """
     invocations: list[list[str]] = []
-    for line in _logical_lines(script):
+    for line in logical_lines(script):
         if not line:
             continue
         try:

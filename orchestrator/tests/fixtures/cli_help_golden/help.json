@@ -1,0 +1,528 @@
+{
+  "": {
+    "options": [
+      [
+        "--verbose",
+        "Enable debug logging"
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS] COMMAND [ARGS]..."
+  },
+  "cancel-verify": {
+    "options": [
+      [
+        "--request-id TEXT",
+        "Request ID passed to the verify-merge or verify-task invocation to cancel; the worktree that run recorded is reaped too.  [required]"
+      ],
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 determines worktree_base for the pgid-file lookup."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "check-config": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to the project orchestrator config YAML to lint (REQUIRED unless ORCH_CONFIG_PATH is set)."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "eval": {
+    "options": [
+      [
+        "--task PATH",
+        "Path to a single task JSON file"
+      ],
+      [
+        "--config-name TEXT",
+        "Eval config name (e.g. claude-opus-high) or \"all\""
+      ],
+      [
+        "--matrix",
+        "Run full eval matrix (all tasks \u00d7 all configs)"
+      ],
+      [
+        "--judge",
+        "Run Elo-based LLM judge on existing results"
+      ],
+      [
+        "--plan-only",
+        "Generate plans for tasks (no execution)"
+      ],
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--max-parallel INTEGER",
+        "Max concurrent eval runs (default: unlimited)"
+      ],
+      [
+        "--trials INTEGER",
+        "Number of trials per (task, config) pair"
+      ],
+      [
+        "--force",
+        "Re-run even if results exist"
+      ],
+      [
+        "--cleanup",
+        "Remove eval worktrees"
+      ],
+      [
+        "--timeout INTEGER",
+        "Timeout in minutes per eval run (overrides task JSON)"
+      ],
+      [
+        "--max-rounds INTEGER",
+        "Max judge invocations per task (default: 50)"
+      ],
+      [
+        "--reset",
+        "Clear judge state and start fresh"
+      ],
+      [
+        "--report",
+        "Generate report from existing state (no new judge calls)"
+      ],
+      [
+        "--vllm-url TEXT",
+        "vLLM endpoint URL (e.g. http://workstation:8000)"
+      ],
+      [
+        "--worktree PATH",
+        "Reuse an existing eval worktree (skip create + use its .task state)"
+      ],
+      [
+        "--compare TEXT...",
+        "Compare two model groups head-to-head via LLM assessment. Each arg is a config name (use canonical name from --combine-runs if merging)."
+      ],
+      [
+        "--combine-runs TEXT",
+        "Merge config names as one model (comma-separated, first is canonical). Can be supplied multiple times."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "eval-confirm": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set)."
+      ],
+      [
+        "--arch TEXT",
+        "Winning architect config name (e.g. architect-opus-high)  [required]"
+      ],
+      [
+        "--impl TEXT",
+        "Winning implementer config name (e.g. claude-opus-high)  [required]"
+      ],
+      [
+        "--tasks-dir PATH",
+        "Fixture dir (default: orchestrator/evals/tasks)"
+      ],
+      [
+        "--trials INTEGER",
+        "Confirmation trials per fixture (default: 3, decision 10 floor)"
+      ],
+      [
+        "--max-parallel INTEGER",
+        "Max concurrent eval runs (default: unlimited)"
+      ],
+      [
+        "--timeout INTEGER",
+        "Timeout in minutes per eval run (overrides task JSON)"
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "eval-list-fixtures": {
+    "options": [
+      [
+        "--tasks-dir PATH",
+        "Fixture dir to list (default: orchestrator/evals/tasks)"
+      ],
+      [
+        "--cohort TEXT",
+        "Scope the stratification to one cohort (e.g. revival-zeta)"
+      ],
+      [
+        "--audit",
+        "Also run the corpus audit (band + per-fixture completeness) over ONE cohort; exits non-zero on any audit failure. Scopes to --cohort when given, else defaults to the revival-zeta band cohort \u2014 so a bare --audit never flags the retained legacy fixtures (band overflow / unpinned branches) as failures."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "eval-matrix": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set)."
+      ],
+      [
+        "--tasks-dir PATH",
+        "Fixture dir (default: orchestrator/evals/tasks)"
+      ],
+      [
+        "--trials INTEGER",
+        "Trials per (fixture, pair) cell (default: 1)"
+      ],
+      [
+        "--max-parallel INTEGER",
+        "Max concurrent eval runs (default: unlimited)"
+      ],
+      [
+        "--timeout INTEGER",
+        "Timeout in minutes per eval run (overrides task JSON)"
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "eval-ofat": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set)."
+      ],
+      [
+        "--tasks-dir PATH",
+        "Fixture dir (default: orchestrator/evals/tasks)"
+      ],
+      [
+        "--trials INTEGER",
+        "Trials per (fixture, candidate) cell (default: 1)"
+      ],
+      [
+        "--max-parallel INTEGER",
+        "Max concurrent eval runs (default: unlimited)"
+      ],
+      [
+        "--timeout INTEGER",
+        "Timeout in minutes per eval run (overrides task JSON)"
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "eval-sample": {
+    "options": [
+      [
+        "--since TEXT",
+        "git --since discovery window (default: '6 weeks ago')"
+      ],
+      [
+        "--target-low INTEGER",
+        "Band floor (default 10)"
+      ],
+      [
+        "--target-high INTEGER",
+        "Band ceiling (default 14)"
+      ],
+      [
+        "--seed INTEGER",
+        "Deterministic sampling seed"
+      ],
+      [
+        "--cohort TEXT",
+        "Cohort marker stamped on each cut fixture"
+      ],
+      [
+        "--dry-run",
+        "Print the intended stratified selection without pinning branches or writing fixtures"
+      ],
+      [
+        "--tasks-dir PATH",
+        "Where fixture JSONs are written (default: orchestrator/evals/tasks)"
+      ],
+      [
+        "--df-root PATH",
+        "dark_factory checkout to discover merges in (default: the main checkout)"
+      ],
+      [
+        "--reify-root PATH",
+        "reify checkout to discover merges in (default: the reify root registered in $DASHBOARD_KNOWN_PROJECT_ROOTS)"
+      ],
+      [
+        "--sampled-at TEXT",
+        "ISO-8601 provenance timestamp (default: now, UTC)"
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "eval-shadow": {
+    "options": [
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS] COMMAND [ARGS]..."
+  },
+  "eval-shadow report": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set)."
+      ],
+      [
+        "--shape [implementer|architect|architect-consequence|end-to-end]",
+        "Cell shape to report.  [default: implementer]"
+      ],
+      [
+        "--candidate TEXT",
+        "Report only this candidate."
+      ],
+      [
+        "--json",
+        "Emit the report as JSON."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "flake-ledger": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "gate-identity": {
+    "options": [
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "probe-models": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--models TEXT",
+        "Comma-separated model list to probe, overriding the default (config.routing.allowed_models plus the fable candidate model)."
+      ],
+      [
+        "--output PATH",
+        "Where to write the rendered probe artifact YAML (default: routing.DEFAULT_PROBE_ARTIFACT_PATH, i.e. config/model-availability.yaml)."
+      ],
+      [
+        "--budget-usd FLOAT RANGE",
+        "Per-invocation USD ceiling for each probe turn (default: routing.DEFAULT_PROBE_BUDGET_USD). Must exceed one turn of the most expensive probed model \u2014 undershooting it reports budget_too_low, not unavailability.  [x>0.0]"
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "run": {
+    "options": [
+      [
+        "--prd PATH",
+        "Path to PRD markdown file (omit to run existing tasks)"
+      ],
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--dry-run",
+        "Populate tasks only, do not execute"
+      ],
+      [
+        "--delay TEXT",
+        "Delay before executing tasks (e.g. 4h, 30m, 90s). Escalation server starts immediately."
+      ],
+      [
+        "--force-dirty-start",
+        "project_root with uncommitted changes always starts; this silently skips filing the born-at-L2 cleanup escalation"
+      ],
+      [
+        "--retag-modules",
+        "Force re-tag all non-done/cancelled tasks with code modules"
+      ],
+      [
+        "--until-idle",
+        "Exit when the task queue drains (default: run forever, idling for newly-scheduled tasks)"
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "status": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "verify-cache": {
+    "options": [
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS] COMMAND [ARGS]..."
+  },
+  "verify-cache audit-run": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Its project_root is the tree audited."
+      ],
+      [
+        "--log-dir PATH",
+        "Where each module's raw output is written (default: <project_root>/.df-verify-cache-audit)."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "verify-cache enable": {
+    "options": [
+      [
+        "--reason TEXT",
+        "Why the cache is safe to re-enable; recorded on the policy row.  [required]"
+      ],
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "verify-cache status": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "verify-merge": {
+    "options": [
+      [
+        "--sha TEXT",
+        "Merge commit SHA to verify (must be present in the local repo)  [required]"
+      ],
+      [
+        "--spec TEXT",
+        "MergeVerifySpec as a JSON string (from RemoteRunner dispatch)  [required]"
+      ],
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--request-id TEXT",
+        "Optional request ID for cancellation support (task 1732 \u03b1).  When provided: joins a new process group via setsid, writes the pgid to <worktree_base>/.merge_verify_pgids/<request-id> at startup, and removes it on exit (normal or exceptional).  A concurrent ``orchestrator cancel-verify --request-id X`` can then kill the entire descendant tree (including start_new_session build escapes).  Absent \u2192 today's exact behavior, back-compat.  RemoteRunner wiring is deferred to tasks \u03b2/\u03b3."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "verify-task": {
+    "options": [
+      [
+        "--sha TEXT",
+        "Task tip SHA to verify (must be present in the local repo)  [required]"
+      ],
+      [
+        "--spec TEXT",
+        "TaskVerifySpec as a JSON string (from RemoteRunner.run_task_verify)  [required]"
+      ],
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--request-id TEXT",
+        "Optional cancellation key: joins a new process group and records the pgid and worktree under <worktree_base>/.merge_verify_pgids/ for ``orchestrator cancel-verify --request-id X``."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  }
+}

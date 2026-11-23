@@ -287,7 +287,7 @@ hang-until-released) and `FakeClock` live in `orchestrator/tests/_merge_lane_fak
 |---|---|---|---|
 | `merge_lane/worker.py` | composition root; `_merger_loop`, `_verifier_loop` as thin schedulers; `stop` | `_live_loops`, `_shutdown_signaled`, `_pending_get`, `_pending_verifier_get` | ο |
 | `merge_lane/intake.py` | enqueue, coalesce, lane buffers, suffix conflict graph, bounce, `_drain_queue_into_lanes`, `_acquire_next_request` (amend, esc-5305-1: the lane buffers, suffix graph and bounce went to `merge_lane/intake_buffers.py::MergeIntake` to keep both files under the 1500-line ceiling, and `intake.py` keeps the request entry) | `_lane_buffers`, `_suffix_tracker`, `_redispatch` (sole writer; others *request* redispatch via a method) | ι |
-| `merge_lane/verify_dispatch.py` | `_run_post_merge_verify`, `_run_inflight_verify`, `_dispatch_item`, host quarantine (`_reprobe_quarantined_hosts` et al.), main-health probe | `_runner_unavailable`, `_runner_quarantine`, `_remerge_occurred` | κ |
+| `merge_lane/verify_dispatch.py` | `_run_post_merge_verify`, `_run_inflight_verify`, `_dispatch_item`, host quarantine (`_reprobe_quarantined_hosts` et al.), main-health probe | `_runner_unavailable`, `_runner_quarantine`, `_remerge_occurred` (amend 2026-11-19, task 5040: κ landed as `verify_dispatch.py` plus eight sibling concern modules, `host_quarantine.py`, `main_health_probe.py`, `retry_verify_env.py`, `post_merge_verify.py`, `verify_cross_check.py`, `verify_failure_outcome.py`, `inflight_verify.py` and `dispatch_ports.py`, to keep each under the 1,500-line ceiling, as esc-5305-1 did for ι. The names differ from the plan's analysis: `retry_verify_env` not `retry_env`; `verify_cross_check` and `verify_failure_outcome` not `post_merge_cross_check` and `post_merge_failure`; `inflight_interrupts` is folded into `inflight_verify` (858 lines); `gate_reverify_on_head_host` is `gate_history_leg` since task 8525. `HostQuarantine` owns `_runner_unavailable` and `_runner_quarantine`; `VerifyDispatcher` owns the chain-invalidation flag, formerly `_remerge_occurred`. `dispatch` returns `NoHost`, as it does today. The other concerns are reached through ports of one concern each, named for their future owners: `DispatchCustody` and `VerifyFrontier` (μ); `ChainPlanning`, `SpeculationPermits`, `DispatchRemerge` and `MainTip` (λ); `DeadBases` (`dead_base_ledger.py`); `MergerAnchor` (`speculation_controller.py`, absorbed by λ); `DispatchWorktrees` (ν); `LeaseContention` (ξ)) | κ |
 | `merge_lane/speculation.py` | chain build/depth/placement, permits/leases, `_remerge`/`_void_and_remerge`, absorbing `merge_speculation_controller.py` | `_n_failed`, `_last_known_main_sha` (via the tracker), permit ledger | λ |
 | `merge_lane/landing.py` | `_finalize_inflight`, CAS advance handling, `_land_chain_prefix`, outbox/journal, `_drift_base` transitions | `_inflight` (sole writer through `_inflight_append/_popleft/_clear`), `_drift_base` | μ |
 | `merge_lane/worktrees.py` | merge-worktree lifecycle, owned-worktree ledger, reap | `_owned_merge_worktrees`, `_owned_merge_wt_keys` | ν |
@@ -680,3 +680,26 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    task signal. No trustworthy signal exists — task metadata is author-supplied,
    and 5342 itself arrived as an ordinary bug-fix task carrying no such marker.
    Hence the scoping is prose (this entry) and the enforcement is mechanical.
+
+9. **Decision 9's and Out of scope's "follow-up PRD: git engine" is now
+   `plans/git-ops-split-prd.md`** (2026-11-21, task 7140). That PRD owns
+   retiring `scripts/merge_lane_cluster.py::SIZE_CEILING_EXEMPT`. Its ω deletes
+   the list, its declaration in
+   `scripts/tests/test_scripts_governed_lists.py::SIZE_CEILING_EXEMPT_LIST`,
+   and every test that pins the exemption. Two edits of that PRD touch this
+   PRD's instrument, and this entry records both here:
+
+   - Its β adds every git-engine module to `CLUSTER_PATHS` through
+     Correction 8's authorized-raise path.
+   - Its ω changes `scripts/merge_lane_ratchet.py::_check_ceilings` so that a
+     baseline entry grandfathers a path only while its recorded `lines` exceed
+     `FILE_LINE_CEILING`. An entry at or under the ceiling is held to it.
+
+   Decision 1 is unchanged by the second edit: a key over the ceiling stays
+   grandfathered, so the ratchet is still not a day-one gate. The change binds
+   every cluster file under 1,500 lines, merge-lane files included. Lines are
+   reported in the baseline but never ratcheted, so without the change a
+   split file could regrow unseen. That is the growth-outran-the-refactor
+   failure this PRD's Background records. `git_ops.py`'s own split still does
+   not edit `GitOps.advance_main`, which remains μ's (task 5042). The git-ops
+   PRD's main_landing sub-split depends on 5042.

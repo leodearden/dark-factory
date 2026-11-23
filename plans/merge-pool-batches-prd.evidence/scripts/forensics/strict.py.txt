@@ -1,0 +1,90 @@
+from common import *
+import chain_detail as CD
+MARK='2026-11-17T20:49:02'; D8528='2026-11-19T04:25:50'
+def era(ts): return 'A' if ts<MARK else ('B' if ts<D8528 else 'C')
+MAINRED={'LOOP':('2026-11-15T10:09','2026-11-15T22:55'),'RETIRED':('2026-11-17T14:07','2026-11-17T18:50')}
+def mainred_groups(v):
+    s=dt.datetime.fromtimestamp(v['start'],dt.timezone.utc).isoformat()[:16]
+    return {g for g,(a,b) in MAINRED.items() if a<=s and v['ts'][:16]<=b}
+def same_content(layer_a, tip_b, p1_b):
+    if layer_a['tip']==tip_b: return 'tip'
+    pa=CD.parents(layer_a['sha'])
+    a=CD.own_pid(pa[0],layer_a['tip']); b=CD.own_pid(p1_b,tip_b)
+    return 'owndiff' if a and a==b else None
+def member_fate(v,l):
+    """returns (cleared_t, how, convicted_t, how, tainted list)"""
+    t=l['task']; cleared=None; conv=None; notes=[]
+    for w in V:
+        if w['end']<=v['end']: continue
+        i,m=layer_of(w,t)
+        if m is None or i>=w['k']: 
+            # also count as cleared if present as pred in a passed tree
+            if m is not None and w['passed'] and same_content(l,m['tip'],CD.parents(m['sha'])[0]):
+                if cleared is None: cleared=(w['end'],'in passed tree %d (as pred)'%w['vid'])
+            continue
+        sc=same_content(l,m['tip'],CD.parents(m['sha'])[0])
+        if w['passed']:
+            if sc and cleared is None: cleared=(w['end'],'%s k%d PASS %d [%s]'%('solo' if w['k']==1 else 'chain',w['k'],w['vid'],sc))
+            elif not sc: notes.append('later PASS %d has CHANGED content'%w['vid'])
+        elif w['k']==1 and i==0:
+            fs=fset(w) or set(); mr=mainred_groups(w)
+            unl=[x for x in w['layers'][1:] if not x.get('on_main_now')]
+            if not sc: notes.append('later soloF %d CHANGED content'%w['vid']); continue
+            if fs and fs<=mr: notes.append('soloF %d is MAIN_RED(%s)'%(w['vid'],','.join(fs))); continue
+            if unl: notes.append('soloF %d on unlanded base'%w['vid']); continue
+            if conv is None: conv=(w['end'],'solo FAIL %d [%s]'%(w['vid'],','.join(sorted(fs-mr))))
+    for c,h,ltip,lp1 in CD.LAND.get(t,[]):
+        if T(c)>v['start']:
+            sc=same_content(l,ltip,lp1)
+            lt=T(c)
+            if sc and (cleared is None or lt<cleared[0]): cleared=(lt,'landed %s [%s]'%(h[:8],sc))
+            elif not sc: notes.append('landed %s with CHANGED content'%h[:8])
+            break
+    return cleared,conv,notes
+res=[]
+for v in V:
+    if v['k']<=1 or v['passed'] or v['ts']<'2026-11-15T11:19': continue
+    k=v['k']; L=v['layers']; pred=L[k:]
+    unl=[l for l in pred if not l.get('on_main_now') and l.get('task')]
+    odd_unl=[l for l in pred if not l.get('on_main_now') and not l.get('task')]
+    base_ok = (not unl) and (v['base_relation']=='main' or not odd_unl)
+    fs=fset(v) or set(); mr=mainred_groups(v)
+    mem=[l for l in L[:k]]
+    fates=[]
+    for l in mem:
+        if not l.get('task'): fates.append((v['task'],'?',None,None,['owner landed as linear commits; tip not comparable'])); continue
+        c,cv,n=member_fate(v,l); fates.append((l['task'],l['tip'][:8],c,cv,n))
+    res.append((v,base_ok,mr,fs,fates))
+def f(t): return dt.datetime.fromtimestamp(t,dt.timezone.utc).strftime('%m-%dT%H:%M')
+tot=collections.Counter()
+for v,base_ok,mr,fs,fates in res:
+    e=era(v['ts'])
+    tot[(e,'red chains')]+=1
+    if not base_ok: tot[(e,'excluded: base never landed')]+=1; continue
+    if mr: tot[(e,'excluded: main red during verify (%s)'%','.join(sorted(mr)))]+=1; flag='MAINRED'
+    else: flag=''
+    nver=sum(1 for x in fates if x[2] or x[3]); k=len(fates)
+    allv=(nver==k)
+    conv=[x for x in fates if x[3] and (not x[2] or x[3][0]<x[2][0])]
+    clr=[x for x in fates if x[2] and not (x[3] and x[3][0]<x[2][0])]
+    unk=[x for x in fates if not x[2] and not x[3]]
+    status=''
+    if not flag:
+        tot[(e,'strict-eligible (sound base)')]+=1
+        if allv:
+            tot[(e,'  all members have constant-content verdict')]+=1
+            if not conv: tot[(e,'    ...and none convicted')]+=1
+        # elimination: exactly one member not cleared-before-others
+        order=sorted([(x[2][0] if x in clr else (x[3][0] if x[3] else 9e18),x) for x in fates],key=lambda z:z[0])
+        last=order[-1][1]; others=[z[1] for z in order[:-1]]
+        if all(o in clr for o in others):
+            lt=order[-1][0]
+            if all(o[2][0]<lt for o in others):
+                truth='BAD(solo)' if last in conv else ('GOOD(cleared)' if last in clr else 'NO-VERDICT')
+                status='ELIM last=%s truth=%s'%(last[0],truth); tot[(e,'  elim case: last suspect '+truth)]+=1
+    print(v['vid'],v['ts'][5:16],e,'own',v['task'],'k%d'%k,flag,'fails',','.join(sorted(fs)),'| verdicts %d/%d'%(nver,k),'|',status)
+    for x in fates:
+        s='CLEARED %s %s'%(f(x[2][0]),x[2][1]) if x[2] else ''
+        s2='CONVICTED %s %s'%(f(x[3][0]),x[3][1]) if x[3] else ''
+        print('      ',x[0],x[1],s,s2,'; '.join(sorted(set(x[4])))[:150])
+for k_,c in sorted(tot.items()): print(c,k_)

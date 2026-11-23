@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 from orchestrator.shadow_types import ReferenceKind
 
+from .cell_sandbox import CellSandbox
 from .measurement import UnmeasuredRecord
 from .plan_predicates import is_scorable_plan
 
@@ -53,7 +54,6 @@ DECLINE_READERS: Mapping[str, str] = MappingProxyType({
     'unactionable': 'read_unactionable_task',
     'ready_to_merge': 'read_ready_to_merge',
 })
-_DECLINE_READERS = DECLINE_READERS
 
 # The five EXPLICIT plan-tools decline exits (plan_tools._report_* →
 # artifacts.TaskArtifacts.write_*), in the fixed order that breaks a
@@ -289,6 +289,13 @@ class EvalMetrics:
     # The key is written unconditionally; see docs/eval-replay-frame.md.
     replay_frame: str | None = None
 
+    # What this cell's sandboxed agents ran under (evals/cell_sandbox.py::CellSandbox).
+    # None means an architect cell, whose agents are all unsandboxed roles, or a
+    # cell recorded before task 9849. Since that task an architect cell of a
+    # fixture from another project does run with that project's agent env
+    # (evals/fixture_agent_env.py).
+    sandbox_backend: CellSandbox | None = None
+
     # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
     # is the record's home and this is its pointer. None on every non-shadow cell
     # and on every result persisted before these fields existed.
@@ -470,7 +477,7 @@ def read_decline_artifacts(
             continue
         try:
             artifact = reader()
-        except Exception as exc:                       # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'decline artifact %s unreadable (%s): %s', kind,
                 type(exc).__name__, exc,

@@ -390,17 +390,16 @@ def _inject_operational_registry(
     Patches ``fused_memory.middleware.task_curator.load_operational_registry``
     at the MODULE level (never the shipped config/operational_ask_registry.yaml —
     a production-config edit is out of scope for this test-only task).
-    ``TaskCurator._maybe_route_deterministic`` looks this name up in its own
-    module on its first call (lazy-load, then cached on
-    ``self._operational_registry`` for the lifetime of the TaskCurator
-    instance) — so patching that binding before the first call is picked up
+    ``TaskCurator.__init__`` reads this name from its own module when it binds
+    ``self._operational_registry``'s loader, and the ticket worker constructs
+    the curator lazily, after this patch — so the patched binding is picked up
     regardless of whatever (unread — scenario 5 never touches disk) path
     ``config.curator.operational_ask_registry_path`` names. The curator is
     deliberately left ACTIVE here (unlike ``_submit_normal_and_get``'s
     ``TaskCurator.curate_prepared`` neutralization) — scenario 5 must reach
     ``_maybe_route_deterministic`` for real.
     """
-    def _fake_load(path):  # noqa: ARG001 — path unread; see docstring
+    def _fake_load(path):  # path unread; see docstring
         return [entry]
 
     monkeypatch.setattr(

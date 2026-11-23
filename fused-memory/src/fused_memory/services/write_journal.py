@@ -39,6 +39,8 @@ from shared.sqlite_column_migration import add_column_if_missing
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.services.read_rollup import (
     COUNT_READ_SQL,
+    NON_PER_ROW_OPERATION_READ_PREDICATE,
+    PER_ROW_OPERATION_READ_PREDICATE,
     READ_OP_COUNTS_SCHEMA_SQL,
     keeps_read_row,
 )
@@ -237,7 +239,8 @@ CREATE INDEX IF NOT EXISTS idx_bo_created ON backend_ops(created_at);
 -- terminal completed/failed rows are aged out by WriteJournal.prune_mem0_intents
 -- (run at startup after recovery); 'dead' rows are preserved for manual replay.
 -- 'retrying' rows (task 7397: a transient provider failure, re-issued at
--- next_attempt_at) keep resolved_at NULL and so are never pruned.
+-- next_attempt_at) keep resolved_at NULL and so are never pruned. A re-issue
+-- calls the Mem0Backend method write_method names (task 7401).
 CREATE TABLE IF NOT EXISTS mem0_intents (
     id TEXT PRIMARY KEY,
     write_op_id TEXT,
@@ -254,7 +257,8 @@ CREATE TABLE IF NOT EXISTS mem0_intents (
     created_at TEXT NOT NULL,
     resolved_at TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT
+    next_attempt_at TEXT,
+    write_method TEXT NOT NULL DEFAULT 'add'
 );
 CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
 CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
@@ -311,10 +315,42 @@ CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, crea
 """
 
 
-def _prune_batch_sql(horizon_rows: str) -> str:
+KIND_TIME_INDEX = 'idx_wo_kind_time'
+
+#: The read horizon's partial index. ``WriteJournal._migrate`` creates it, not
+#: ``SCHEMA_SQL``, because its WHERE needs the ``kind`` column.
+READ_HORIZON_INDEX = 'idx_wo_read_horizon_time'
+READ_HORIZON_INDEX_SQL = (
+    f'CREATE INDEX {READ_HORIZON_INDEX} ON write_ops(created_at) '
+    f'WHERE {NON_PER_ROW_OPERATION_READ_PREDICATE}'
+)
+
+
+async def _ensure_read_horizon_index(db: aiosqlite.Connection) -> None:
+    """Build ``READ_HORIZON_INDEX`` exactly as ``READ_HORIZON_INDEX_SQL``: its WHERE
+    must equal the read horizon's predicate, or INDEXED BY has no query solution."""
+    rows = list(await db.execute_fetchall(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (READ_HORIZON_INDEX,),
+    ))
+    if rows:
+        built_sql = rows[0][0]
+        if built_sql == READ_HORIZON_INDEX_SQL:
+            return
+        logger.warning(
+            'Migration: rebuilding %s, built as %r instead of %r',
+            READ_HORIZON_INDEX, built_sql, READ_HORIZON_INDEX_SQL,
+        )
+        await db.execute(f'DROP INDEX {READ_HORIZON_INDEX}')
+    started = _monotonic()
+    await db.execute(READ_HORIZON_INDEX_SQL)
+    logger.info('Migration: built %s in %.1f s', READ_HORIZON_INDEX, _monotonic() - started)
+
+
+def _prune_batch_sql(horizon_rows: str, index: str) -> str:
     return (
         'DELETE FROM write_ops WHERE id IN ('
-        'SELECT id FROM write_ops INDEXED BY idx_wo_kind_time '
+        f'SELECT id FROM write_ops INDEXED BY {index} '
         f'WHERE {horizon_rows} AND created_at >= ? AND created_at < ? '
         'ORDER BY created_at LIMIT ?) RETURNING created_at'
     )
@@ -323,12 +359,13 @@ def _prune_batch_sql(horizon_rows: str) -> str:
 #: One batch of ``WriteJournal.prune_write_ops`` per retention horizon, in the
 #: order it drains them: delete the oldest ``LIMIT`` rows of the horizon created
 #: in ``[resume_from, cutoff)`` and return their ``created_at``. Parameters:
-#: ``(resume_from, cutoff, limit)``. Each range-seeks idx_wo_kind_time, and
-#: INDEXED BY pins it, so a missing index errors instead of scanning.
+#: ``(resume_from, cutoff, limit)``. Each range-seeks the index its INDEXED BY
+#: names, so a missing index errors instead of scanning. The read horizon's
+#: partial index holds only that horizon's rows.
 WRITE_OPS_PRUNE_BATCH_SQL: Mapping[str, str] = MappingProxyType({
-    'read': _prune_batch_sql("kind = 'read' AND operation <> 'search'"),
-    'search': _prune_batch_sql("kind = 'read' AND operation = 'search'"),
-    'write': _prune_batch_sql("kind = 'write'"),
+    'read': _prune_batch_sql(NON_PER_ROW_OPERATION_READ_PREDICATE, READ_HORIZON_INDEX),
+    'search': _prune_batch_sql(PER_ROW_OPERATION_READ_PREDICATE, KIND_TIME_INDEX),
+    'write': _prune_batch_sql("kind = 'write'", KIND_TIME_INDEX),
 })
 
 #: One batch of ``WriteJournal.prune_backend_ops``. It takes the same
@@ -447,6 +484,13 @@ class Mem0IntentStatus(StrEnum):
     DEAD = 'dead'
 
 
+class Mem0WriteMethod(StrEnum):
+    """Which ``Mem0Backend`` method an intent's write goes through, so a re-issue calls the same one."""
+
+    ADD = 'add'
+    ADD_SYSTEM_RECORD = 'add_system_record'
+
+
 def _schedule_timestamp(moment: datetime) -> str:
     return moment.isoformat(timespec='microseconds')
 
@@ -454,6 +498,14 @@ def _schedule_timestamp(moment: datetime) -> str:
 def decode_mem0_intent_metadata(intent: Mapping[str, Any]) -> dict[str, Any]:
     """The metadata a ``mem0_intents`` row journaled: the one decoder of that column."""
     return json.loads(intent.get('metadata') or '{}')
+
+
+def decode_mem0_intent_write_method(intent: Mapping[str, Any]) -> Mem0WriteMethod:
+    """The method a ``mem0_intents`` row writes through: the one decoder of that column.
+
+    Raises ``ValueError`` naming an unknown or missing value.
+    """
+    return Mem0WriteMethod(intent.get('write_method'))
 
 
 @dataclass(frozen=True)
@@ -597,13 +649,19 @@ class WriteJournal:
             if await add_column_if_missing(db, 'mem0_intents', 'next_attempt_at', 'TEXT'):
                 logger.info('Migration: added next_attempt_at column to mem0_intents')
 
+            if await add_column_if_missing(
+                db, 'mem0_intents', 'write_method', "TEXT NOT NULL DEFAULT 'add'"
+            ):
+                logger.info('Migration: added write_method column to mem0_intents')
+
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
-                'CREATE INDEX IF NOT EXISTS idx_wo_kind_time ON write_ops(kind, created_at)'
+                f'CREATE INDEX IF NOT EXISTS {KIND_TIME_INDEX} ON write_ops(kind, created_at)'
             )
             await db.execute(
                 'CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at)'
             )
+            await _ensure_read_horizon_index(db)
 
     async def log_write_op(
         self,
@@ -1070,6 +1128,7 @@ class WriteJournal:
         content: str,
         metadata: dict | None = None,
         payload_digest: str | None,
+        write_method: Mem0WriteMethod,
     ) -> None:
         """Write-ahead a Mem0 write intent.
 
@@ -1089,8 +1148,8 @@ class WriteJournal:
                     """INSERT INTO mem0_intents
                        (id, write_op_id, causation_id, project_id, agent_id,
                         session_id, category, payload_digest, content, metadata,
-                        status, reason, created_at, resolved_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)""",
+                        write_method, status, reason, created_at, resolved_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)""",
                     (
                         intent_id,
                         write_op_id,
@@ -1102,6 +1161,7 @@ class WriteJournal:
                         payload_digest,
                         content,
                         json.dumps(metadata) if metadata else '{}',
+                        write_method.value,
                         datetime.now(UTC).isoformat(),
                     ),
                 )
@@ -1435,18 +1495,12 @@ class WriteJournal:
         warmth and on six index b-trees per delete. The deadline is checked
         BETWEEN batches, never mid-batch.
 
-        EACH HORIZON RESUMES WHERE ITS LAST BATCH STOPPED. ``operation`` is not
-        in idx_wo_kind_time, so the read horizon tests ``operation <> 'search'``
-        with a table-row lookup per index entry, and its range holds every kept
-        search row older than the oldest expired read. A batch started from the
-        bottom walks all of them before deleting anything: measured 2026-10-12 on
-        the live journal, 430,040 rows took 9.4 s cold and 0.4-0.6 s warm in one
-        statement the deadline cannot interrupt, against 2 ms from a resume
-        point. ``_pruned_below`` keeps, per horizon, the ``created_at`` below
-        which every matching row is already deleted. It stays true because every
-        ``write_ops`` writer stamps ``created_at`` with the current time, so no
-        row lands behind it. It lives as long as the process, so only the first
-        batch after a start pays the walk, and that runs before READY.
+        EACH HORIZON RESUMES WHERE ITS LAST BATCH STOPPED. The read horizon
+        seeks its own partial index (``READ_HORIZON_INDEX``), so no batch visits a
+        kept search row. ``_pruned_below`` still bounds every batch below: it
+        keeps, per horizon, the ``created_at`` below which every matching row is
+        already deleted. It stays true because every ``write_ops`` writer stamps
+        ``created_at`` with the current time, so no row lands behind it.
 
         WHAT NET PROGRESS REQUIRES, stated so the claim is checkable rather than
         hopeful: rows removed per day (passes per day x rows per pass) must

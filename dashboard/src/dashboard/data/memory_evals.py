@@ -1392,7 +1392,7 @@ def build_memory_evals(
         _build_payload(
             payload, memory_evals_dir, corpus, escalation_queue, issues, resolved_now,
         )
-    except Exception as exc:  # noqa: BLE001 - the never-500 boundary; named, not swallowed
+    except Exception as exc:  # the never-500 boundary; named, not swallowed
         # Logged with the traceback: the payload names the bug for the
         # operator, the log carries what whoever fixes it actually needs.
         # Without this half, honouring the never-500 contract would mean a bug
@@ -1599,7 +1599,7 @@ def _build_payload(
     for eval_dir in eval_dirs:
         try:
             row, claims = _build_eval(eval_dir, sources, claims, resolved_now, issues)
-        except Exception as exc:  # noqa: BLE001 - per-eval half of the never-500 boundary
+        except Exception as exc:  # per-eval half of the never-500 boundary
             logger.exception('memory-evals eval build failed for %s', eval_dir)
             _issue(
                 issues, 'internal_error', eval_id=eval_dir.name, path=eval_dir,

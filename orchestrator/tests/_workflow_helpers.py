@@ -50,6 +50,7 @@ from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.pin_reservation import Blocker, BlockerKind
+from orchestrator.review_lineage import RetiredReview
 from orchestrator.scheduler import (
     BlastRadiusResult,
     TaskAssignment,
@@ -58,6 +59,9 @@ from orchestrator.scheduler import (
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
+
+if TYPE_CHECKING:
+    from orchestrator.branch_stack import StackTarget
 
 
 class FakeMcp:
@@ -498,6 +502,7 @@ class FakeBriefing:
         *, include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
         rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         return f'Plan task: {task.get("title", "")}'
 
@@ -588,6 +593,7 @@ class FakeBriefing:
         self, task: dict, existing_plan: dict, changed_files: list,
         worktree=None, context: str | None = None, *, text_drift=None,
         integrity_refusal=None, rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 
@@ -623,7 +629,7 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -663,7 +669,7 @@ def _make_status_setting_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -771,6 +777,7 @@ def _make(
     git_ops.get_main_sha = get_main_sha
     git_ops.resolve_branch_sha = AsyncMock(return_value=None)
     git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+    git_ops.own_delta_cut = AsyncMock(return_value=None)
     git_ops.find_task_citation_commit = AsyncMock(return_value=landing_citation)
     git_ops.commit_effect_present_in_main = AsyncMock(
         return_value=landing_effect_present,
@@ -1304,6 +1311,7 @@ def _build_workflow_with_escalation(
     spawn_merge_worker: bool = True,
     steward_factory: type | None = None,
     queue: EscalationQueue | None = None,
+    stack_target: StackTarget | None = None,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Wire up a TaskWorkflow with an EscalationQueue attached.
 
@@ -1312,7 +1320,8 @@ def _build_workflow_with_escalation(
     merge work; omitting create_task avoids the 'Task was destroyed but it is
     pending!' warning in pytest teardown.  ``queue`` lets a caller submit
     records, and build a steward that closes over the queue, before the
-    workflow exists; ``steward_factory`` goes to the public constructor argument.
+    workflow exists; ``steward_factory`` and ``stack_target`` go to the public
+    constructor arguments of the same names.
     """
     scheduler = FakeScheduler()
     queue = queue if queue is not None else EscalationQueue(tmp_path / 'escalation_queue')
@@ -1333,6 +1342,7 @@ def _build_workflow_with_escalation(
         merge_queue=merge_queue,
         merge_worker=worker,
         steward_factory=steward_factory,
+        stack_target=stack_target,
     )
     return workflow, scheduler, queue
 

@@ -58,6 +58,8 @@ import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from _transcript_fixtures import assistant_record, confirmed_bash_launch
+
 from shared.cli_invoke import TranscriptWatch, run_cli_subprocess
 
 # ── Fake process builders ───────────────────────────────────────────────────
@@ -72,7 +74,7 @@ def _make_hanging_proc():
     TimeoutError on call 2 (the post-SIGTERM retry) → SIGKILL branch."""
     call_count = [0]
 
-    async def communicate_side_effect(input=None):  # noqa: A002
+    async def communicate_side_effect(input=None):
         call_count[0] += 1
         if call_count[0] == 1:
             # Hang until the watchdog cancels comm_task — CancelledError lands here.
@@ -124,7 +126,7 @@ def _make_delayed_success_proc(
     hanging until the suite timeout.
     """
 
-    async def communicate_side_effect(input=None):  # noqa: A002
+    async def communicate_side_effect(input=None):
         await asyncio.sleep(delay_secs)
         if reads_observed is not None:
             deadline = time.monotonic() + max_extra_wait_secs
@@ -519,31 +521,18 @@ class TestTimeoutPathRereadOffLoop:
 
 
 # ── Normal-exit fixture ─────────────────────────────────────────────────────
-# Two assistant records whose tail is an unreaped background launch.  Borrowed
-# from TestDetectEndedAwaitingBackground::test_single_abandoned_launch_is_true
-# (in test_cli_invoke_background.py) so the expected ended_awaiting_background
-# value is one the detector's own suite already pins, not one invented here.
+# Two assistant records, the second launching a background task, then the
+# result confirming the launch, which nothing reaps.  Built from the
+# _transcript_fixtures confirmed launch that
+# TestDetectEndedAwaitingBackground::test_single_abandoned_launch_is_true
+# (in test_cli_invoke_background.py) pins, so the expected
+# ended_awaiting_background value is one the detector's own suite already
+# pins, not one invented here.
 #   → transcript_turns == 2 (two type='assistant' records)
 #   → ended_awaiting_background is True (launch never followed by a reap)
 _ABANDONED_LAUNCH_RECORDS = [
-    {
-        'type': 'assistant',
-        'message': {
-            'role': 'assistant',
-            'content': [{'type': 'text', 'text': 'kick off the long build'}],
-        },
-    },
-    {
-        'type': 'assistant',
-        'message': {
-            'role': 'assistant',
-            'content': [{
-                'type': 'tool_use',
-                'name': 'Bash',
-                'input': {'command': './occt-test.sh', 'run_in_background': True},
-            }],
-        },
-    },
+    assistant_record([{'type': 'text', 'text': 'kick off the long build'}]),
+    *confirmed_bash_launch(command='./occt-test.sh'),
 ]
 
 
@@ -712,7 +701,7 @@ class TestCompletionRecheckAfterOffLoopRead:
         comm_returned = threading.Event()  # thread-side: set by communicate()
         stdout_bytes = b'{"type":"result","subtype":"success"}'
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             await comm_gate.wait()
             comm_returned.set()
             return (stdout_bytes, b'')

@@ -274,6 +274,19 @@ factory's task slots do not govern that load. Task-leg admission wait was
 1.0 min, landings 1 in 2 h. The 3-slot period (11-11 23:27Z to 11-12 04:27Z)
 had local merge verifies of 20-28 min until reify's warm-lane work began.
 
+### 2026-11-15 — 2 -> 3 (Leo's ruling)
+
+Raised at about 14:40Z by Leo's direct ruling, not by the progressive-slot rule.
+This key sizes BOTH the local task-verify width AND the task legs the workstation
+sends to each remote verify host (`verify_hosts.py::HostPool.policy` builds each
+host's `AdmissionGate` from the workstation's `admission_policy`). It was raised so
+that leo-laptop, whose own `dark-factory-laptop.yaml` went 1 -> 3 the same day,
+actually receives 3 concurrent legs. Same-day context:
+`verify_task_host_policy: remote_all` and `max_concurrent_tasks` 24 -> 36
+(dc2c55f6d3). Before the change, task-leg admission wait was a median 8.4 min and
+p90 25.6 min over 24 h, with a waiter present in 100% of heartbeats; the merge
+queue was at depth 0. Step-down trigger: a local merge verify over 46 min.
+
 ---
 
 ## 2026-09-27 — task 5797: 48h gate on the 1 -> 2 raise

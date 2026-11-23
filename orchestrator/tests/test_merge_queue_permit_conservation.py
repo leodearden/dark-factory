@@ -729,14 +729,14 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             # (2) B is now dispatched (in-flight, verifying) — its
             # InflightEntry must carry the SAME token still registered in
             # ledger.live, proving the merger stamped item.permit at
-            # transfer time (step 4a) and _dispatch_item copied it onto the
+            # transfer time (step 4a) and VerifyDispatcher.dispatch copied it onto the
             # InflightEntry (step 4b).
             # Read as the derived count rather than off the entry:
             # inflight_speculative IS
             # `len(speculation_ledger.live) - held_by_merger`
             # (_inflight_speculative_count, task 2160 eta), so exactly one
             # verifier-owned permit proves the merger stamped item.permit at
-            # transfer time and _dispatch_item copied it onto the
+            # transfer time and VerifyDispatcher.dispatch copied it onto the
             # InflightEntry. A transfer that dropped the token leaves this 0.
             assert req_b.task_id in {
                 e['task_id'] for e in worker.snapshot()['entries']

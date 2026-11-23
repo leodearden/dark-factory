@@ -127,19 +127,23 @@ function signalCell(signal) {
 
 // ── The contention line ──
 
+function holdersText(holders, atHolderLimit) {
+  const [first, ...rest] = holders;
+  if (first === undefined) return 'no holder';
+  const more = rest.length === 0 ? '' : ` and ${rest.length} more`;
+  const room = atHolderLimit ? '' : ' · below its holder limit';
+  return `held by #${first.task_id} (${storeStatusText(first.status)})${more}${room}`;
+}
+
 function contentionEntryText(entry) {
-  const holder = entry.holder;
-  const held = holder === null
-    ? 'no holder'
-    : `held by #${holder.task_id} (${storeStatusText(holder.status)})`;
-  return `${entry.key} · ${entry.wanted_by_ready} ready want it · ${held}`;
+  return `${entry.key} · ${entry.wanted_by_ready} ready want it · ${holdersText(entry.holders, entry.at_holder_limit)}`;
 }
 
 function heldShareText(heldShare) {
   const bands = Object.entries(heldShare).map(
-    ([band, share]) => `${band} ${share.naming_held_key} of ${share.ready}`,
+    ([band, share]) => `${band} ${share.naming_full_key} of ${share.ready}`,
   );
-  return 'ready naming a held key: ' + (bands.length === 0 ? 'no ready tasks' : bands.join(' · '));
+  return 'ready naming a key at its holder limit: ' + (bands.length === 0 ? 'no ready tasks' : bands.join(' · '));
 }
 
 function neverStartedText(neverStarted) {

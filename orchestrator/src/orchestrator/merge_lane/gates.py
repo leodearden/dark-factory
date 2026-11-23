@@ -5,8 +5,9 @@ post-merge-pyright gates, the advance-finalize and advance-failure-mapping
 functions, the ``merge_attempt`` event emitter they share with the worker,
 and their supporting types and reason-prefix constants.
 
-Verify EXECUTION (``_run_post_merge_verify`` and its cluster) stays in the
-worker — this module owns gate POLICY, not verify execution (PRD Open Q1).
+Verify EXECUTION (``merge_lane/post_merge_verify.py::run_post_merge_verify``
+and its cluster) lives outside this module — this module owns gate POLICY,
+not verify execution (PRD Open Q1).
 Where a gate needs a worker function, the worker injects it: the re-verify
 through ``_reverify_rebased_tree``'s *run_post_merge_verify*, the γ2
 auto-chain through :class:`_GenerationChainContext`.  This module never
@@ -47,7 +48,10 @@ from orchestrator.merge_lane.types import (
     OutcomeKind,
     TerminalOutcomeRetention,
 )
+from orchestrator.rebase_drops import DroppedCommit, RebaseDropLedger
 from orchestrator.verify import VerifyResult, run_verification
+from orchestrator.verify_evidence import GREEN_OUTCOMES, Leg, module_leg_name, units_from_wire
+from orchestrator.verify_plan import full_suite_type_check_modules, merge_breadth_is_full
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -86,6 +90,7 @@ async def _run_unscoped_typechecks(
     *,
     block_on_timeout: bool,
     task_id: str | None = None,
+    executed: VerifyResult | None = None,
 ) -> PostMergePyrightResult:
     """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
 
@@ -103,12 +108,19 @@ async def _run_unscoped_typechecks(
             When ``False``, a timed-out module is appended only to
             ``timed_out_subprojects`` (fail-open, for the post-advance check).
         task_id: Optional task identifier for log messages.
+        executed: The scoped verify this gate follows (pre-advance only). At
+            breadth ``'full'`` a module it already type-checked green is not
+            re-run; see :func:`_type_covered_modules`.
 
     Returns:
         :class:`PostMergePyrightResult` with the classification of each
         module's type-check outcome.
     """
-    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    covered = _type_covered_modules(executed, config)
+    active = [
+        mc for mc in module_configs
+        if mc.type_check_command is not None and mc.prefix not in covered
+    ]
     if not active:
         return PostMergePyrightResult()
 
@@ -154,6 +166,24 @@ async def _run_unscoped_typechecks(
         timed_out_subprojects=timed_out_subprojects,
         detail=detail,
     )
+
+
+def _type_covered_modules(executed: VerifyResult | None, config: OrchestratorConfig) -> frozenset[str]:
+    """The modules whose unscoped pyright *executed* already ran green, or replayed.
+
+    Task 5294: the gate consults what the scoped leg ran rather than handing
+    ``LocalRunner`` a second module set (INV-5). Only breadth ``'full'``
+    consults, so ``'scoped'`` is unchanged. A module counts when the executed
+    plan holds a FULL_SUITE pyright run with a command and its type unit is
+    green; a result without units (an older remote) is decided by its plan.
+    """
+    if executed is None or not merge_breadth_is_full(config):
+        return frozenset()
+    planned = full_suite_type_check_modules(executed.plan)
+    if executed.units is None:
+        return planned
+    green = {unit.unit for unit in units_from_wire(executed.units) if unit.outcome in GREEN_OUTCOMES}
+    return frozenset(prefix for prefix in planned if module_leg_name(prefix, Leg.TYPE) in green)
 
 
 def _elapsed_ms(start: float | None) -> int | None:
@@ -364,9 +394,12 @@ class PlanFilesTouchedResult:
 
     Attributes:
         not_touched: Plan-file entries that the branch's history did NOT
-            touch.  Non-empty means the architect declared work that the
-            branch never actually delivered.  Empty list means every plan
-            entry is covered by some commit on the branch.
+            touch, so the gate fails when it is non-empty.  Empty list means
+            every plan entry is covered by some commit on the branch.  Why an
+            entry is untouched is told by the fields below: a stale path
+            (``missing_from_tree``) or a change a rebase dropped
+            (``dropped_by_rebase``) is not under-delivery; an entry in
+            neither is.
         missing_from_tree: Declared entries that do NOT exist in the branch
             tree at ``branch_head`` and for which no rename resolved.
             ALWAYS a subset of ``not_touched`` (a stale entry is reported in
@@ -388,11 +421,36 @@ class PlanFilesTouchedResult:
             architect's spelling, pre-normalization) so the diagnostic names
             exactly what plan.json says.  A resolution alone never passes the
             gate — the resolved path must additionally be in the touched set.
+        dropped_by_rebase: Declared entry → the commits a rebase dropped
+            from the branch that wrote it, keyed by the ORIGINAL declared
+            string like ``resolved_renames``.  ALWAYS a subset of
+            ``not_touched`` and disjoint from ``missing_from_tree``, which
+            construction enforces.  A key means the branch DID write a change
+            to that entry and a later rebase dropped it because the rebase
+            target already carried the change (task 4669) — not
+            under-delivery.
+        touched_set_error: The branch's history scan failed, so
+            ``not_touched`` lists every declared entry UNMEASURED and
+            nothing about the branch can be concluded from it.  ``None``
+            when the touched set was read.
     """
 
     not_touched: list[str] = field(default_factory=list)
     missing_from_tree: list[str] = field(default_factory=list)
     resolved_renames: dict[str, str] = field(default_factory=dict)
+    dropped_by_rebase: dict[str, tuple[DroppedCommit, ...]] = field(default_factory=dict)
+    touched_set_error: str | None = None
+
+    def __post_init__(self) -> None:
+        dropped = set(self.dropped_by_rebase)
+        not_untouched = sorted(dropped - set(self.not_touched))
+        missing = sorted(dropped & set(self.missing_from_tree))
+        if not_untouched or missing:
+            raise ValueError(
+                'dropped_by_rebase must be a subset of not_touched and disjoint '
+                f'from missing_from_tree; not in not_touched: {not_untouched}, '
+                f'in missing_from_tree: {missing}'
+            )
 
 
 DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
@@ -410,6 +468,76 @@ the branch's history (``base..HEAD``) doesn't touch them, the implementation
 hasn't actually delivered against the plan — short-circuit straight to L1
 without involving the steward (mutating plan.json to silence the gate
 would defeat its purpose)."""
+
+
+def plan_files_not_touched_reason(check: PlanFilesTouchedResult) -> str:
+    """The block reason for a failed plan-files gate, scoped class by class.
+
+    The head, :data:`PLAN_FILES_NOT_TOUCHED_REASON_PREFIX` plus every
+    untouched entry, is the contract
+    ``orchestrator/src/orchestrator/unblock_types.py::classify_block_reason``
+    keys on via ``startswith``.  Each clause after it names only its own
+    class, because each class is a different failure: entries no commit
+    touched, entries a rebase dropped (task 4669), entries absent from the
+    tree (task 3110), and the rename audit trail.
+    """
+    stale_set = set(check.missing_from_tree)
+    live = [e for e in check.not_touched if e not in stale_set]
+    return ''.join((
+        f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: {", ".join(check.not_touched)}. ',
+        _unwritten_clause([e for e in live if e not in check.dropped_by_rebase]),
+        _dropped_clause({
+            e: check.dropped_by_rebase[e] for e in live if e in check.dropped_by_rebase
+        }),
+        _stale_clause([e for e in check.not_touched if e in stale_set]),
+        _rename_clause(check.resolved_renames),
+    )).strip()
+
+
+def _unwritten_clause(entries: list[str]) -> str:
+    if not entries:
+        return ''
+    return (
+        f'The architect declared these files but no commit on the branch '
+        f'touched them: {", ".join(entries)}.  '
+        f'Implementation has not delivered against the plan.  '
+    )
+
+
+def _dropped_clause(dropped: dict[str, tuple[DroppedCommit, ...]]) -> str:
+    if not dropped:
+        return ''
+    entries = '; '.join(
+        f'{entry} (by {", ".join(commit.label for commit in commits)})'
+        for entry, commits in dropped.items()
+    )
+    return (
+        f'These changes were written on this branch and then dropped by a '
+        f'rebase whose target already carried them, so this is not an '
+        f'implementation gap: {entries}.  Re-derive each change against '
+        f'current main (a version or cache-buster bump must be recomputed '
+        f"past main's value), commit it, and re-submit.  "
+    )
+
+
+def _stale_clause(entries: list[str]) -> str:
+    if not entries:
+        return ''
+    return (
+        f'Declared path does not exist in the tree at branch HEAD (renamed or '
+        f'never created), so the branch-touched set was not consulted for: '
+        f'{", ".join(entries)} — investigate the declared path, not the '
+        f'branch.  '
+    )
+
+
+def _rename_clause(resolved_renames: dict[str, str]) -> str:
+    if not resolved_renames:
+        return ''
+    pairs = ', '.join(
+        f'{declared} -> {resolved}' for declared, resolved in resolved_renames.items()
+    )
+    return f'Rename resolution: {pairs}.'
 
 
 CROSS_REPO_DELIVERABLE_REASON_PREFIX = 'Cross-repo deliverable'
@@ -1848,7 +1976,7 @@ async def resolve_already_landed_branch(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'already-landed: probe raised for task_id=%s branch=%s — failing '
             'closed (the unchanged plan_files_not_touched path runs)',
@@ -2048,18 +2176,17 @@ async def _resolve_already_landed_branch(
         return None
 
     # --- signal 3: the landing COVERS every declared entry -----------------
-    touched = await git_ops.get_files_touched_in_branch(
+    touched, touched_err = await git_ops.get_files_touched_in_branch(
         f'{landed_sha}^1', landed_sha,
     )
     touched_set = set(touched)
-    if not touched_set:
-        # `get_files_touched_in_branch` fails OPEN with [] on a git error, so
-        # an empty set is indistinguishable from "could not measure".  Either
-        # way there is no coverage evidence, so decline.
+    if touched_err is not None or not touched_set:
+        # An unreadable history and a landing that touched nothing are both
+        # absent coverage evidence, so decline either way.
         logger.warning(
             'already-landed: attributing commit %s (mechanism=%s) touched no '
-            'measurable files task_id=%s — failing closed',
-            landed_sha, mechanism, task_id,
+            'measurable files task_id=%s err=%s — failing closed',
+            landed_sha, mechanism, task_id, touched_err,
         )
         return None
 
@@ -2669,6 +2796,12 @@ async def _resolve_renamed_plan_path(
     return candidates
 
 
+def _with_git_stderr(err: Exception) -> str:
+    """*err* as text, carrying git's own message when *err* has a ``stderr``."""
+    stderr = (getattr(err, 'stderr', None) or '').strip()
+    return f'{err}: {stderr[:200]}' if stderr else str(err)
+
+
 async def _check_plan_files_touched_in_branch(
     plan_files: list[str],
     base_sha: str,
@@ -2676,6 +2809,7 @@ async def _check_plan_files_touched_in_branch(
     git_ops: GitOps,
     *,
     task_id: str | None = None,
+    branch: str | None = None,
 ) -> PlanFilesTouchedResult:
     """Pre-merge Decision-1 check: every plan file must be touched on the branch.
 
@@ -2703,14 +2837,33 @@ async def _check_plan_files_touched_in_branch(
 
     Empty ``plan_files`` returns no entries — vacuously satisfied.
 
-    Fail-open on git error (matches :func:`_check_plan_targets_in_tree`):
-    return an empty ``PlanFilesTouchedResult`` so a transient diff error
-    doesn't block a real merge.  Loud-log so regressions surface in ops.
+    With *branch* (the full branch name), each untouched entry not classified
+    as missing from the tree is matched against the commits a rebase dropped
+    from that branch (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``)
+    and reported in ``dropped_by_rebase``.  That attribution only explains a
+    failure; it never passes the gate.
+
+    When the branch's history cannot be read the gate fails CLOSED but
+    says so: every non-empty declared entry is returned in ``not_touched``
+    with ``touched_set_error`` set, and no per-entry probe runs, so the
+    caller can report the delivery as unmeasured rather than undelivered.
     """
     if not plan_files:
         return PlanFilesTouchedResult()
 
-    touched = await git_ops.get_files_touched_in_branch(base_sha, branch_head)
+    touched, touched_err = await git_ops.get_files_touched_in_branch(
+        base_sha, branch_head,
+    )
+    if touched_err is not None:
+        logger.warning(
+            'plan-files-touched: touched set unreadable task_id=%s base=%s '
+            'head=%s err=%s — every declared entry is unmeasured',
+            task_id or '<unknown>', base_sha, branch_head, touched_err,
+        )
+        return PlanFilesTouchedResult(
+            not_touched=[entry for entry in plan_files if entry],
+            touched_set_error=_with_git_stderr(touched_err),
+        )
     touched_set = set(touched)
 
     # Lazily-computed, once-per-invocation listing of every path in the
@@ -2847,19 +3000,56 @@ async def _check_plan_files_touched_in_branch(
 
         not_touched.append(entry)
 
+    dropped_by_rebase = await _attribute_rebase_drops(
+        [e for e in not_touched if e not in missing_from_tree],
+        branch, git_ops, task_id=task_id,
+    )
     if not_touched:
         logger.warning(
             'plan-files-touched: not_touched task_id=%s '
             'base=%s head=%s entries=%r '
-            'missing_from_tree=%r resolved_renames=%r',
+            'missing_from_tree=%r resolved_renames=%r dropped_by_rebase=%r',
             task_id or '<unknown>', base_sha, branch_head, not_touched,
-            missing_from_tree, resolved_renames,
+            missing_from_tree, resolved_renames, dropped_by_rebase,
         )
     return PlanFilesTouchedResult(
         not_touched=not_touched,
         missing_from_tree=missing_from_tree,
         resolved_renames=resolved_renames,
+        dropped_by_rebase=dropped_by_rebase,
     )
+
+
+async def _attribute_rebase_drops(
+    entries: list[str],
+    branch: str | None,
+    git_ops: GitOps,
+    *,
+    task_id: str | None,
+) -> dict[str, tuple[DroppedCommit, ...]]:
+    """Map each of *entries* to the commits a rebase dropped from *branch*
+    that covered it, through the same exact-or-beneath predicate
+    (:func:`_entry_covered`) the already-landed resolver uses.
+
+    Fail-open: a ledger that cannot be read attributes nothing.
+    """
+    if branch is None or not entries:
+        return {}
+    try:
+        dropped = await RebaseDropLedger(git_ops.project_root, _run).dropped_of(branch)
+    except Exception as exc:
+        logger.warning(
+            'plan-files-touched: could not read rebase drops task_id=%s branch=%s: %s',
+            task_id or '<unknown>', branch, exc,
+        )
+        return {}
+    attributed: dict[str, tuple[DroppedCommit, ...]] = {}
+    for entry in entries:
+        norm = _normalize_plan_path(entry)
+        covering = tuple(c for c in dropped if _entry_covered(norm, set(c.paths)))
+        if covering:
+            attributed[entry] = covering
+    return attributed
 
 
 async def _rename_aware_compare_set(
@@ -3325,13 +3515,13 @@ def _disjoint_skip_blockers(
         The gate's verdict decomposes over disjoint file sets — i.e. every check
         it runs is diff-scoped.  A whole-tree check violates this by
         construction: its entire premise is that an unrelated file can fail you.
-        Signal used: ``merge_verify_breadth == 'full'``, the EXISTING per-project
-        declaration that the merge gate runs every registered module's suite
-        rather than just the touched ones.  It is a declaration, not a gate name,
-        so this stays project-agnostic.  It is also only a PARTIAL detector of a
-        non-compositional gate (a project whose own verify script runs whole-tree
-        checks internally reads as 'scoped' here — reify is exactly that), which
-        is why P2 below, not P1, is the arm that actually closes the incident.
+        Signal used: ``merge_verify_breadth == 'full'`` (the shipped default,
+        task 7008): the merge gate runs every registered module's suite, not
+        just the touched ones.  A config value, not a gate name, so this stays
+        project-agnostic.  It is only a PARTIAL detector of a non-compositional
+        gate (a project that runs whole-tree checks inside its own verify
+        script but opts down to 'scoped' reads as compositional here), which is
+        why P2 below, not P1, is the arm that actually closes the incident.
 
     P2 (the drift is itself green)
         Main at *rebased_onto* passes the gate on its own.  This premise is
@@ -3365,9 +3555,9 @@ def _disjoint_skip_blockers(
     blockers: list[str] = []
     config = getattr(req, 'config', None)
 
-    # P1 — project-declared whole-tree merge gate.  Deliberately NOT covered by
-    # the kill switch: a project that has declared its merge gate whole-tree has
-    # declared this skip unsound outright, not merely expensive.
+    # P1 — whole-tree merge gate.  Deliberately NOT covered by the kill switch:
+    # a project whose merge gate is whole-tree has made this skip unsound
+    # outright, not merely expensive.
     if getattr(config, 'merge_verify_breadth', None) == 'full':
         blockers.append('whole-tree merge gate (merge_verify_breadth=full)')
 
@@ -3555,10 +3745,10 @@ async def _reverify_rebased_tree(
     rebased_onto:
         The current main SHA the branch was rebased onto.
     timeouts / enospc_retries / max_timeouts / max_enospc:
-        Forwarded verbatim to ``_run_post_merge_verify``.
+        Forwarded verbatim to ``merge_lane/post_merge_verify.py::run_post_merge_verify``.
     keep_worktrees:
         Additional worktrees to protect from disk-guard pruning — forwarded
-        verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
+        verbatim to ``merge_lane/post_merge_verify.py::run_post_merge_verify``.  Default ``None`` produces
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     run_post_merge_verify:
         The worker's verify callable, carrying the worker's handles, its

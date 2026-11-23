@@ -68,6 +68,13 @@ ALLOWED_UNCONDITIONALLY = {
         'metadata_files as measured 2026-07-30. Rewriting it would falsify a '
         'past measurement, so it is allowlisted rather than edited'
     ),
+    'fused-memory/calibration/consolidation_adjudicator_eval_set.jsonl': (
+        'FROZEN measurement artifact — the consolidation adjudicator PRD\'s eval '
+        'set (plans/consolidation-adjudicator-prd.md N6), quoting Mem0 memory '
+        'texts verbatim; task β pins its sha256 as a module constant. A quoted '
+        'memory that names the retired wiring is data, not a live reference; '
+        'editing it would break that pin and falsify the eval set'
+    ),
     'fused-memory/calibration/write_triage_pairs_to_rate.jsonl': (
         'FROZEN measurement artifact — task 6151\'s blind rater input, quoting '
         'Mem0 write texts verbatim as frozen 2026-10-05 and pinned by sha256 '

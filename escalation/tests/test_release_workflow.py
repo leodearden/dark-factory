@@ -10,6 +10,7 @@ matching the pattern used by other MCP-tool unit tests in this repo.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -468,7 +469,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     - parked='blocked' (scheduler.get_status='in-progress' → parked to blocked)
     - scheduler.set_task_status called once with (tid, 'blocked')
     """
-    from unittest.mock import MagicMock, patch  # noqa: PLC0415
+    from unittest.mock import MagicMock, patch
 
     from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
     from orchestrator.scheduler import TaskAssignment  # type: ignore[reportMissingImports]
@@ -529,6 +530,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     h._merge_inflight_registry = None  # type: ignore[assignment]
     h.cost_store = None  # type: ignore[assignment]
     h._task_verify_dispatcher = MagicMock()
+    h._verify_cache = MagicMock()
 
     # _collect_slot_report / _apply_retry_cap
     h._run_store = None  # type: ignore[assignment]
@@ -656,6 +658,8 @@ async def test_orphan_park_lands_inside_real_scheduler_grace_window(
     # note_workflow_cancelled writes where workflow_cancel_recent reads.  A
     # rename of either attribute fails this test loudly (AttributeError).
     sched._RECONCILE_CANCEL_GRACE_S = 30.0  # type: ignore[assignment]
+    # Mirrors Scheduler.__init__: both grace accessors read the injected clock.
+    sched._time_source = time.monotonic
     # The two MCP round-trips are the only stubs.
     sched.get_status = AsyncMock(return_value='in-progress')  # type: ignore[method-assign]
     sched.set_task_status = AsyncMock()  # type: ignore[method-assign]

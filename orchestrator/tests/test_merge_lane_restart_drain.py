@@ -20,9 +20,9 @@ from unittest.mock import AsyncMock
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import (
-    FakeClock,
     FakeVerifier,
     hangs_until,
+    healthy_verify_clock,
     lane_scene_config,
     make_lane,
     running_lane,
@@ -85,12 +85,6 @@ async def _request(scene: _Scene, name: str, *, lane: str = 'normal') -> MergeRe
     )
 
 
-def _writing_clock() -> FakeClock:
-    """A fake clock on which a held verify keeps writing, so the lane's
-    no-progress watchdog never mistakes it for a dead one."""
-    return FakeClock(content_mtime=1.0, content_tick=1.0)
-
-
 async def _until(predicate: Callable[[], bool]) -> None:
     while not predicate():
         await asyncio.sleep(0)
@@ -122,7 +116,7 @@ async def test_a_halt_starts_nothing_new_and_lets_the_inflight_verify_land(
     scene: _Scene,
 ) -> None:
     release_first = asyncio.Event()
-    clock = _writing_clock()
+    clock = healthy_verify_clock()
     verifier = FakeVerifier(scripts={'first': hangs_until(release_first)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=clock)
@@ -174,7 +168,7 @@ async def test_a_merged_item_reaching_dispatch_under_a_halt_is_requeued_unverifi
     verifier = FakeVerifier(scripts={'first': hangs_until(release_first)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
-        scene.git_ops, queue, verifier=verifier, clock=_writing_clock(), speculation_depth=2,
+        scene.git_ops, queue, verifier=verifier, speculation_depth=2,
     )
     first = await _request(scene, 'first')
     second = await _request(scene, 'second')
@@ -256,7 +250,7 @@ async def _stacked_train(scene: _Scene) -> GroupMergeRequest:
 async def test_a_train_verifying_in_the_merger_is_in_flight(scene: _Scene) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
-    clock = _writing_clock()
+    clock = healthy_verify_clock()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
@@ -365,7 +359,7 @@ async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: P
     )
     release_first = asyncio.Event()
     release_gate = asyncio.Event()
-    clock = _writing_clock()
+    clock = healthy_verify_clock()
     verifier = FakeVerifier(sequence=[hangs_until(release_first), hangs_until(release_gate)])
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=clock)

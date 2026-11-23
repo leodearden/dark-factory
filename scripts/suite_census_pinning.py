@@ -453,8 +453,21 @@ def measure_python_tree(tree_root: Path) -> PythonPinningCensus:
 _DECLARED_TESTS_ROOT = MemberRoots.declared('<member>').tests_root
 _SINGLE_PACKAGE_TESTS_ROOT = MemberRoots.single_package('<name>').tests_root
 _PSEUDO_MEMBERS_TEXT = ', '.join(f'`{m.name}` (`{m.tests_root}/`)' for m in PSEUDO_MEMBERS)
-_EXTRA_IMPORT_ROOTS_TEXT = ' and '.join(
-    f'`{root}/`' for m in PSEUDO_MEMBERS for root in m.extra_import_roots
+
+
+def _extra_import_roots_sentence(roots: tuple[str, ...]) -> str:
+    if not roots:
+        return ''
+    listed = ' and '.join(f'`{root}/`' for root in roots)
+    are = 'is an import root' if len(roots) == 1 else 'are import roots'
+    return (
+        f' {listed} {are} too, on `sys.path` via `scripts/tests/conftest.py`,'
+        f' so `{roots[0]}/x.py` is also `x`.'
+    )
+
+
+_EXTRA_IMPORT_ROOTS_SENTENCE = _extra_import_roots_sentence(
+    tuple(root for m in PSEUDO_MEMBERS for root in m.extra_import_roots)
 )
 
 _DEFINITIONS = f"""\
@@ -467,9 +480,8 @@ package named by its `[project].name`, whose tests root is
 package is its member. First-party
 names are the import names of the domain's source files whose every dotted
 segment is an identifier, so `scripts/` is an import root and
-`scripts/legibility/x.py` is `legibility.x`. {_EXTRA_IMPORT_ROOTS_TEXT} are
-import roots too, as `scripts/tests/conftest.py` puts them on `sys.path`, so
-that file is also `x`. A name two files share is refused.
+`scripts/legibility/x.py` is `legibility.x`.{_EXTRA_IMPORT_ROOTS_SENTENCE}
+A name two files share is refused.
 Rows are in package-name order and are not ranked.
 
 - **test fns**: module-level `test*` functions and `test*` methods of `Test*`

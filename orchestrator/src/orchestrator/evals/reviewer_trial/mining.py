@@ -23,12 +23,25 @@ from collections import Counter
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from shared.cli_invoke import no_mcp_servers_config
 from shared.merge_subject import MergeSubject, parse_merge_subject
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.evals.measurement import (
+    MeasurementStage,
+    Scored,
+    Unmeasured,
+    json_answer,
+    measured_call,
+)
+from orchestrator.evals.paths import main_checkout
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
+
+if TYPE_CHECKING:
+    from shared.cli_invoke import AgentResult
 
 logger = logging.getLogger(__name__)
 
@@ -466,13 +479,13 @@ async def propose_labels_frontier(
     description: str = '',
     oauth_token: str | None = None,
     max_turns: int = 3,
-) -> tuple[list[GroundTruthIssue], float]:
+) -> Scored[list[GroundTruthIssue]] | Unmeasured:
     """Propose ground-truth issue labels for a mined diff via a frontier model.
 
-    Reuses the ``scorer.match_issues`` ``invoke_agent`` pattern (no tools,
-    structured JSON output, cost always reported) but the frontier model
-    proposes NEW issues found in *diff_text* rather than matching against
-    existing ground truth.
+    Runs through ``measured_call`` like ``scorer.match_issues`` (built-in
+    tools denied, MCP scoped to no servers, structured JSON output, spend
+    always reported) but the frontier model proposes NEW issues found in
+    *diff_text* rather than matching against existing ground truth.
 
     Each proposed issue is mapped into a ``GroundTruthIssue``. Its ``id`` is
     always synthesized as ``"frontier_<n>"`` — never taken from the model's
@@ -482,10 +495,11 @@ async def propose_labels_frontier(
     layer richer provenance (model name, diff description, timestamps) on
     top of this.
 
-    Returns ``(issues, cost_usd)``. Never raises: returns ``([], cost_usd)``
-    when the output is unparseable or carries no usable ``issues`` list —
-    the incurred cost is still reported since the tokens were billed
-    regardless (mirrors ``match_issues``' unparseable-output behaviour).
+    Returns ``Scored`` with the proposed issues; an empty list means the
+    model judged the diff clean. Returns ``Unmeasured`` with the spend when
+    the call was refused or the answer carries no usable ``issues`` list, so
+    a refusal is never read as a clean diff. Any other exception propagates
+    (``measured_call``'s contract).
 
     *oauth_token*, when set, is forwarded to ``invoke_agent`` to select a
     specific Claude account from the multi-account pool (env vars
@@ -497,8 +511,9 @@ async def propose_labels_frontier(
     *max_turns* defaults to 3 (matching ``match_issues``' turn budget), but
     empirically ``effort='high'`` needs materially more turns than a plain
     low-effort matcher call to reach a schema-conformant final answer — the
-    ``mine`` CLI passes a larger value (~15) to avoid a silent
-    ``error_max_turns`` (empty output, cost still billed).
+    ``mine`` CLI passes a larger value (~15) because a call that ends in
+    ``error_max_turns`` has empty output, is still billed, and so comes
+    back ``Unmeasured``.
     """
     diff_context = diff_text[:10_000] if len(diff_text) > 10_000 else diff_text
 
@@ -539,35 +554,39 @@ If there are no issues, return an empty issues list. Output your findings as JSO
         'report issues you are confident are real. Output ONLY valid JSON.'
     )
 
-    result = await invoke_agent(
+    return await measured_call(
+        invoke_agent,
+        _frontier_labels,
+        stage=MeasurementStage.LABEL_PROPOSER,
+        backend='claude',
+        label='frontier label proposer',
         prompt=prompt,
         system_prompt=system_prompt,
-        cwd=Path('/home/leo/src/dark-factory'),
+        cwd=main_checkout(),
         model=model,
         max_turns=max_turns,
         max_budget_usd=2.0,
         output_schema=_FRONTIER_LABEL_SCHEMA,
         effort='high',
-        allowed_tools=[],  # no tools needed — all context is in the prompt
+        # All context is in the prompt: deny the built-ins and scope MCP to an
+        # empty server set so the .mcp.json at cwd is never ambient-merged
+        # (allowed_tools=[] does not restrict under bypassPermissions).
+        disallowed_tools=['*'],
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
         oauth_token=oauth_token,
     )
 
-    cost = result.cost_usd
 
-    data = result.structured_output
-    if not data:
-        try:
-            data = json.loads(result.output)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                'Frontier label proposal produced unparseable output: %s',
-                result.output[:200],
-            )
-            return [], cost
+def _frontier_labels(result: AgentResult) -> list[GroundTruthIssue]:
+    """The proposer's answer as issues, skipping each malformed item.
 
-    raw_issues = data.get('issues') if isinstance(data, dict) else None
+    Raises ``ValueError`` when the answer has no ``issues`` list, or a
+    non-empty one in which no item is well-formed.
+    """
+    raw_issues = json_answer(result).get('issues')
     if not isinstance(raw_issues, list):
-        return [], cost
+        raise ValueError(f'issues is not a list but {type(raw_issues).__name__}')
 
     issues: list[GroundTruthIssue] = []
     for i, raw in enumerate(raw_issues, start=1):
@@ -582,9 +601,10 @@ If there are no issues, return an empty issues list. Output your findings as JSO
             ))
         except (KeyError, TypeError):
             logger.warning('Skipping malformed frontier issue at index %d: %r', i, raw)
-            continue
 
-    return issues, cost
+    if raw_issues and not issues:
+        raise ValueError(f'none of the {len(raw_issues)} proposed issues is well-formed')
+    return issues
 
 
 _LANG_EXTENSIONS = {
@@ -693,6 +713,39 @@ def admit_mined_diff(
         frontier_model=frontier_model,
         notes=f'Frontier-proposed labels for FN candidate {diff.diff_id}.',
     )
+
+
+@dataclass(frozen=True)
+class NoIssuesProposed:
+    """The proposer measured and proposed no issues, so ``admit_proposal`` admitted nothing."""
+
+
+def admit_proposal(
+    manifest: CorpusManifest,
+    log: AdjudicationLog,
+    recovered: RecoveredCandidate,
+    proposal: Scored[list[GroundTruthIssue]] | Unmeasured,
+    *,
+    description: str,
+    escalation_refs: Sequence[EscalationRef],
+    runs_db: Path,
+    frontier_model: str,
+) -> CorpusDiff | Unmeasured | NoIssuesProposed:
+    """Admit *recovered* labelled with *proposal*'s issues and return the admitted diff.
+
+    Admit nothing and return why when the proposer did not measure (its
+    ``Unmeasured``) or proposed no issues (``NoIssuesProposed``).
+    """
+    if isinstance(proposal, Unmeasured):
+        return proposal
+    if not proposal.value:
+        return NoIssuesProposed()
+    diff = mined_corpus_diff(
+        recovered, issues=proposal.value, description=description,
+        escalation_refs=escalation_refs, runs_db=runs_db,
+    )
+    admit_mined_diff(manifest, log, diff, frontier_model=frontier_model)
+    return diff
 
 
 _SPLIT_RATIO_NAMES = ('train', 'selection', 'test')

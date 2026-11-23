@@ -255,8 +255,10 @@ Prints three things: **open flake debt** (each suppressed test with its
 owning task id and how long the debt has been open), **per-test recurrence
 chains** (how many times a test has been re-suppressed, and when and by
 which commit it was last resolved), and **three health counters** — gate
-blind, non-convergence, and systemic. Like `orchestrator status` it reads
-persisted state and needs no running orchestrator.
+blind, non-convergence, and systemic. It also reads each open debt row's
+owner status live from fused-memory when it can; when it cannot, it still
+prints the whole ledger and says `owner liveness: READ FAILED`. Like
+`orchestrator status`, it needs no running orchestrator.
 
 Gate blind and systemic are printed per call site, one block for each
 `FlakeCallSite` member and for any other spelling stored in the ledger; a
@@ -271,6 +273,13 @@ project that has none, and it will not add the flake tables to a
 and exits 0 instead. On a ledger that predates the due list, its first read adds that one empty table, as every ledger entry point does.
 
 **The due list and `filing pending`.** A suppressed test no longer gets its de-flake task during the merge. The merge writes the test's occurrence row and one item on the ledger's due list (`flake_debt_due`, in the same `runs.db`) in one local transaction, and the orchestrator's `flake-debt-drain` background service files the owner afterwards, every 30 seconds, through the same `open_debt` rule as before. Until that filing completes, an open debt row with no owner and an item on the due list reads `filing pending since <time>` (its oldest item's enqueue time): expected, and normally gone within a minute. An ownerless row with no item still reads `*** NO OWNER (invariant breach) ***`. The `due list:` line gives the list's size and the age of its oldest item, and says `PAST THE 30-MINUTE BOUND` once that item has waited longer. A failed filing is retried after 5 minutes, then 10, 20, 40, and hourly after that; nothing is dropped, and nothing caps how many de-flake tasks a burst files. A suppression at a merge sha that does not contain a finished de-flake task's fix closes that task's cycle without a regression escalation.
+
+**Owner markers.** A stored owner is only a pointer, so the report reads every open row's owner live and marks the row when no live task owns the test. Each marker is a §5.9 breach, and the non-convergence line counts them as `owner_done=` and `owner_closed=`.
+
+- `OWNER DONE, DEBT CYCLE NOT CLOSED`: the de-flake task finished, but the ledger never closed its cycle. Closing is lazy today: the test's next suppression closes it, and θ's sweep will once task 3792 lands. If the marker is still there after a later suppression, the orchestrator log's `could not read owner` warning says why `get_task` keeps failing.
+- `OWNER CANCELLED OR GONE`: the next suppression files a replacement.
+- `(deferred: filed, never released)` is a note, not a breach.
+- `owner liveness: READ FAILED`: no row carries a marker because nothing could be read, not because the owners are healthy, and both counts read `n/a`.
 
 **The drain's escalation.** When any item has waited on the due list for more than 30 minutes, the drain opens one level-1 `infra_issue` escalation (task id `__flake_debt_due_stale__`, role `orchestrator-flake-debt-drain`) naming how many items are stale, the oldest, its test and its last error, amends it as that changes, and resolves it itself once no item is stale. The usual cause is fused-memory being unreachable (`last_error` reads `task_client_failed`): restore fused-memory and the drain catches up on its own; nothing needs re-filing. A `no_owner` that persists means the task store refused the filing (the orchestrator log carries its reply), which the drain cannot cure: escalate to the operator, since `orchestrator flake-ledger` is read-only and cannot set an owner. `ancestry_unreadable` means the drain could not tell whether the observation's merge sha contains the finished de-flake task's fix (`git merge-base --is-ancestor` failed, for example because the sha is gone); `owner_deferred` means a filed task has not left `deferred`. If you resolve the escalation while items are still stale, the drain does not re-open it for those items; it opens a new one only for items that become stale later.
 
@@ -367,10 +376,9 @@ cost and scope with a red-conditioned sample.
 
 Three things a census must not assume:
 
-- **Junit exists only under `merge_verify_breadth: full`.** The shipped
-  default (`config.py`) is `scoped`; this repo's
-  `dark-factory-orchestrator.yaml` opts in. A project on the default
-  archives plans and logs but no junit at all.
+- **Junit exists only under `merge_verify_breadth: full`.** That is the
+  shipped default (`orchestrator/src/orchestrator/defaults.yaml`). A project
+  that opts down to `scoped` archives plans and logs but no junit at all.
 - **The stem joins per-ATTEMPT, not per-module.** Merge verifies carry no
   attempt id, so their files stem at `attempt-1`. Logs and junit carry a
   `.<module>` infix; the plan does not — under per-module fan-out one plan
@@ -491,8 +499,11 @@ window before treating a p90 or a max as complete.
 Each scheduler tick, the dispatch-admission gate reads one load sample. It
 holds new HEAVY agent dispatch while any configured arm is at or over its
 threshold and this orchestrator already has at least `min_inflight_floor`
-tasks in flight. Deterministic tasks are exempt. The floor is per
-orchestrator, so the gate never holds with nothing running. Design:
+tasks in flight. Deterministic tasks and main-health fixes (tasks carrying
+`metadata.main_health_signature`) are exempt, so a `dispatch_deferred` event
+never names a fix (DA-D10 of `docs/prds/dispatch-admission-load-cap.md`).
+The floor is per orchestrator, so the gate never holds with nothing running.
+Design:
 `docs/prds/dispatch-admission-load-cap.md`, amended by
 `plans/load-throttle-harmonisation-prd.md`.
 
@@ -575,9 +586,9 @@ one tally. A root whose store is missing or unreadable is reported as a
 named per-project error with **empty** sections (never a bundle of
 zeros), the remaining projects still print, and the exit code is 1.
 
-Prints six sections per project — landings/day, the four-segment
-lead-time split (queue wait → verify → finalize+CAS residual), verify
-duration by runner, host occupancy, heartbeat queue depth, and the
+Prints six sections per project — landings/day, the lead-time split
+(queue wait → re-queued → verify → finalize+CAS residual, plus a
+non-additive verify->land row), verify duration by runner, host occupancy, heartbeat queue depth, and the
 `merge_attempt`/`merge_finalized` outcome mixes — plus two behind flags:
 `--speculation` (depth distributions, the chain-dead void rate, and a
 cross-project void-rate block) and `--chains` (deep merge-ahead chain
@@ -613,7 +624,7 @@ writes nothing, files nothing, escalates nothing and emits no events, so
 it is safe to run against a live store while the orchestrator is
 merging.
 
-**Four caveats, all of which change how you read the output.**
+**Five caveats, all of which change how you read the output.**
 *(a) Match the window to the row you are reading.* The
 `plans/merge-lane-throughput-prd.md` § Background table is not
 single-windowed: most rows are a 14-day window, but four are explicitly
@@ -644,7 +655,22 @@ verifies but appeared in no heartbeat is still listed, with `0 sample(s)`
 and both sample-based estimators `n/a`, rather than dropped; and if the
 lead-time split fails to decompose for some landing, a `WARNING …
 NEGATIVE finalize+CAS residual` line names the count instead of letting
-it average away inside the residual percentile.
+it average away inside the residual percentile. *(e) Reading the
+lead-time split.* For every landing with an in-span dequeue, lead =
+queue wait + re-queued + verify + finalize+CAS. An internal re-queue
+(`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._requeue_request`,
+reached from the dead-verify no-progress abort among its other callers)
+emits no `merge_queued`, so it shows as a further `merge_dequeued` under
+the same joined queue row. The time from the first to the last in-span
+dequeue, the aborted attempts plus their re-queue waits, is reported as
+re-queued, and verify counts only the landing attempt's `merge_verify`
+rows. A dequeue stamped after the landing (a stale duplicate request
+later found `already_merged`) belongs to no segment. Finalize+CAS still
+holds the gap between the final dispatch and the start of its verify, so
+read verify->land (the landing minus the landing attempt's last
+`merge_verify`) for finalize time alone. Reports produced before task
+5195 put the re-queue time inside finalize+CAS, so compare a dated
+report's residual row only with one produced by the same script version.
 
 ### Stopping gracefully
 
@@ -808,9 +834,10 @@ list `/home/leo`) and step 7 (the canary feed).
 
 - Test and criteria evidence exists for pytest projects only: junit
   injection is pytest-only (PRD §2).
-- Per-test results for merge runs exist only when the client project's
-  `dark-factory-orchestrator.yaml` sets `merge_verify_breadth: full`.
-  Otherwise only task legs carry `test_results`.
+- Per-test results for merge runs exist unless the client project's
+  `dark-factory-orchestrator.yaml` opts down to
+  `merge_verify_breadth: scoped`. On such a project only task legs carry
+  `test_results`.
 
 ---
 
@@ -864,19 +891,35 @@ duplicate-spawn incident. `holder_record=<unlinked|absent|unreadable|active|exit
 axis: the state of the holder's session-registry record, found through the
 `record_slug` the lease body carries. `exited`/`absent` corroborate an
 `orphaned` pid, and `unlinked` (a lease claimed before that field existed) is no
-evidence either way.
+evidence either way. `lease-claim` also prints `slug=<resolved>`: the slug the
+CLI derived for **this caller**, never the holder's. It is a diagnostic to
+compare against `lease-show`'s `holder_slug` when a later heartbeat comes back
+`result=refused`, not a value to carry into a later verb, and it is printed on
+the fail-open `decision=proceed` path too, where `holder_liveness=` is not
+(`orchestrator/src/orchestrator/session_registry.py::_run_lease_claim`).
 
 A holder whose lease body says `holder_pid=0` claimed it on the **degraded**
-pid path (`$CLAUDE_PID` unset — the CLI records 0, a never-alive sentinel, and
-logs a WARNING). Such a lease is protected only by its heartbeat and always
-reads `orphaned`; that is deliberate, because recording some other durable pid
-(the shell) instead would make it unreapable forever.
+pid path: from a shared `claude agents` host, whose pid outlives every session
+it hosts and so cannot vouch for one, or with `$CLAUDE_PID` unset, which since
+4248 also needs an explicit `--slug` to claim at all. The CLI records 0, a
+never-alive sentinel, and logs a WARNING
+(`orchestrator/src/orchestrator/session_identity.py::lease_liveness_pid`).
+Such a lease is protected only by its heartbeat and always reads `orphaned`;
+that is deliberate, because recording some other durable pid (the shell)
+instead would make it unreapable forever.
 
-`lease-heartbeat` and `lease-release` require the `--slug` the lease was
-claimed with and **refuse** on a mismatch (`result=refused`, nothing touched),
-so no session can evict another's lease or keep a stranger's alive. `--force`
-is the deliberate operator-recovery override: it acts anyway and logs at
-WARNING naming both the forcing slug and the displaced holder.
+`lease-heartbeat` and `lease-release` act only for the lease's holder and
+**refuse** anyone else (`result=refused`, nothing touched), so no session can
+evict another's lease or keep a stranger's alive. The holder is identified by a
+slug the CLI derives afresh on every lease verb
+(`orchestrator/src/orchestrator/session_leases.py::default_lease_slug`;
+`watcher-df-1430433` is a typical one, and `lease-claim`'s `slug=` line shows
+yours). Pass `--slug` only as an operator override. When the slug cannot be
+derived and no `--slug` is given, all three lease verbs exit 2 naming the
+unusable variable, rather than invent a token that a second degraded session
+would share. `--force` is the deliberate operator-recovery override: it acts
+anyway and logs at WARNING naming both the forcing slug and the displaced
+holder.
 
 `result=absent` differs by verb: on a **release** it is plain idempotence, but
 on a **heartbeat** it means that session's lease is gone (reaped, or
@@ -885,11 +928,27 @@ can claim the name freely. Both watcher skills tell a heartbeating session to
 re-claim on `absent` rather than continue; if you force-release a live
 watcher's lease, expect it to re-claim on its next cycle.
 
-**Rollout note (task 3994).** Any watcher session already running on the
-pre-3994 prescription must be **restarted** so it re-reads its skill: its
-`lease-heartbeat`/`lease-release` calls pass no `--slug` and now exit 2
-(argparse) instead of mutating. Nothing is stranded — such a lease stops being
-heartbeated and ages out normally within `LEASE_HEARTBEAT_TTL`, then is reaped.
+**Rollout note (tasks 3994, 4248).** Between 3994 and 4248, a
+`lease-heartbeat`/`lease-release` with no `--slug` exited 2 (argparse) instead
+of mutating. Since 4248 such a call derives the slug, so it no longer exits 2
+whenever the session's identity resolves, and exit 2 now means the slug is
+underivable. A derived slug that does not match the holder's is still
+`result=refused`. For the two watcher leases (`watcher-<project>`,
+`recon-watcher-<project>`) the derived slug is byte-identical to the one the
+skills used to build in shell, so an in-flight watcher keeps its lease.
+`/unblock`'s slug changed shape, from `unblock-<project>-<TASK_ID>-<pid>` to
+`unblock-<project>#<TASK_ID>-<pid>`, so a pre-4248 `/unblock` that releases
+without a slug gets `result=refused`: loud and non-destructive. Its recovery is
+the one-time rollout note in
+`skills/unblock/SKILL.md`'s release step (pass the original `--slug`, or wait
+for the lease to go stale). Any watcher session still running on the pre-3994
+prescription must be **restarted** so it re-reads its skill. Nothing is
+stranded — a lease that stops being heartbeated, or whose release is refused,
+becomes reapable by the same rule as any other: once its holder pid is dead
+**and** its heartbeat is past `LEASE_HEARTBEAT_TTL`. A pre-4248 `/unblock`
+lease from a non-hosted session records that session's long-lived
+`$CLAUDE_PID`, so a refused one lingers for as long as that claude process
+lives, and up to the TTL after.
 
 Its priority order when triaging is: infra stability first, software
 quality second, task progress third. Clear-cut issues get acted on
@@ -917,7 +976,10 @@ through the **B3 low-risk gate** instead of spawning an interactive
   never cancelled at the sub-agent's 20-minute polling ceiling: the
   sub-agent hands its `request_id` back to the watcher, which resumes
   polling it to terminal in a fresh background sub-agent. Only an entry
-  still queued at the ceiling is cancelled.
+  still queued at the ceiling is cancelled. A submission superseded by a
+  successor (a generation advance or a coalesce train) that has not
+  resolved by the ceiling is handed back and resumed the same way, never
+  cancelled.
 - Anything else (drift, an aborted low-risk attempt, a capped budget) is
   left pending, written to the project's `afk-digest.md`, and recorded as
   a decision for the next human return-triage pass. A handed-off merge
@@ -1068,12 +1130,11 @@ terminal tier's claimants through `set_task_claimant` (`--repair-hygiene`
 adds the hygiene tier). Exit 3 means nothing was read. Run the script
 directly, never via `python -m`.
 
-The census reports the raw terminal tier, ledgered rows included: unlike
-the gauge, it does not separate sanctioned C4-E2 exceptions (task 6777
-owns adding that). Before you
-treat a census terminal row as unledgered, or run `--apply`, check it
-against the gauge's `ledgered` flag or the row's
-`metadata.claimant_exception`.
+The census reports sanctioned C4-E2 exceptions separately: a terminal row
+whose `metadata.claimant_exception` names its claimant is tier `ledgered`.
+So the census `terminal` tier is the same set as the gauge's unledgered rows.
+`--apply` never writes a ledgered row. A row that becomes ledgered between
+the census and the write is skipped as `skipped_changed_under_us`.
 
 **The mint-time tripwire.** A `set_task_claimant` write that stamps a
 claimant onto a terminal row logs an ERROR whose discriminator is
@@ -1104,7 +1165,10 @@ session:
 | Tool | Use for |
 |---|---|
 | `mcp__escalation__get_pending_escalations` | List open escalations (filter by `level`) |
+| `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
+| `mcp__escalation__get_task_escalation_history` | Every escalation ever filed for one task, archive included; its `count: 0` is attributable to the query, and it answers for this server's queue only |
 | `mcp__escalation__get_merge_queue` | Live merge-queue snapshot: in-flight/queued items, conflict graph, frozen verify prefix |
+| `mcp__escalation__merge_status` | One merge request's state, by `request_id` / `task_id` / `branch` |
 | `mcp__escalation__get_merge_halt_status` | Whether the merge queue is currently halted, and by which escalation |
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
@@ -1112,6 +1176,11 @@ session:
 | `mcp__fused-memory__find_tasks_by_metadata` | Which tasks carry metadata key K (with value V), every status incl. deferred/cancelled — paged |
 | `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
 | `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
+
+An orchestrator-spawned agent's escalation tools are the ones its grant
+names: the steward's in
+`orchestrator/src/orchestrator/agents/roles.py::STEWARD`, the L1
+rotation's in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`.
 
 ### Is reconciliation halted, or just behind?
 
@@ -1134,6 +1203,57 @@ knob): a halt auto-resumes once its cooldown expires, and the judge re-halts
 if the pipeline is still sick. So a halt you find with an already-expired
 cooldown is about to clear itself on the next ~5s tick — in that one window a
 manual trigger IS consumed, and the tool says so.
+
+### Has the reconciliation judge hit its turn cap?
+
+Any retune of the judge's `max_turns` waits for the first production
+`error_max_turns` (esc-4344-6, option C; task 6573). Every `claude_cli` judge
+invocation records one row in the `judge_invocations` table of
+`data/reconciliation/reconciliation.db`. That path is this deployment's
+`reconciliation.data_dir` in `fused-memory/config/config.yaml`; a relative
+value is anchored at the checkout by
+`fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout`.
+
+- **Is the tripwire armed?** Check this first:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT COUNT(*), MAX(completed_at) FROM judge_invocations;"
+
+  Zero rows means no judge invocation has ever been recorded: the judge is
+  disabled, its provider is not `claude_cli`, or fused-memory has not
+  restarted onto this code. The tripwire is then NOT armed, which is a
+  different state from "no hit".
+- **Has it fired?** Any row means the trigger has fired:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT ji.completed_at, ji.run_id, r.project_id, ji.schema_salvaged, ji.num_turns, ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1;"
+
+  A schema-salvaged run counts too: the turn cap ended it, even though its
+  verdict was recovered. The `schema_salvaged` column tells the two apart: 1
+  is a run whose verdict was recovered, 0 is a verdict-less one, which also
+  shows up as a `JUDGE_INFRA_FAILURE` no-verdict. A NULL `num_turns` means
+  the CLI reported no turn count (a timed-out or killed run), not zero turns,
+  so leave those rows out of any turn distribution.
+- **Rejected tool calls.** The judge registers no tool but `StructuredOutput`,
+  so the CLI rejects every other call it makes:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT COUNT(*), SUM(rejected_tool_calls), SUM(rejected_tool_calls IS NULL) FROM judge_invocations;"
+
+  NULL means the transcript was unreadable, not zero.
+- **Live signals.** Grep the fused-memory journal with a bounded window:
+
+      journalctl --user -u fused-memory --since -1h --no-pager -o cat --grep 'reconciliation.judge_(turn_cap_hit|invocation_record_failed)'
+
+  The user journal is tens of GB, so widen `--since` with care; the table,
+  not the journal, is the durable record. Each WARNING's message reads
+  `reconciliation.judge_turn_cap_hit run_id='…' num_turns=… max_turns=… rejected_tool_calls=… schema_salvaged=…`,
+  logged on every hit even when the row write fails, or
+  `reconciliation.judge_invocation_record_failed run_id='…' ended_error_max_turns=…`,
+  logged when a row was lost. So the table is a lower bound, and the log is
+  the backstop. String values print quoted, so no value can split into
+  further `key=value` fields.
+- **Next action on a hit.** Re-run
+  `fused-memory/scripts/probe_schema_max_turns.py --shape judge` before
+  changing `_JUDGE_CLI_MAX_TURNS`
+  (`fused-memory/src/fused_memory/reconciliation/judge.py`).
 
 ### Is the curator deduping, or just creating?
 
@@ -1182,6 +1302,69 @@ That latency is faster than any real model call.
 Incident, back-test and residual risks:
 [`plans/curator-dedup-outage-2026-08-15-rca.md`](plans/curator-dedup-outage-2026-08-15-rca.md).
 
+### Is a curator guard registry loaded?
+
+The curator's three pre-LLM guards (the cancelled-premise `blocklist`, the
+`recon-premise` registry and the `operational-ask` registry) each read a YAML
+list named by a `curator.*_path` setting. `get_curator_state`'s `registries`
+list gives each one's `state`, with `path`, `entry_count`, `error` and
+`failures`:
+
+- `failed` means that guard fails open: its curations look exactly like a
+  healthy curator with an empty registry. While an orchestrator is running
+  for the project, the curator's startup self-check also files a
+  `curator_registry_load_failed` escalation from `fused-memory/task-curator`,
+  one pending record per project and registry label that folds across
+  restarts
+  (`fused-memory/src/fused_memory/middleware/curator_escalator.py::CuratorEscalator.report_registry_load_failed`).
+  With no orchestrator running it only logs an ERROR, so a missing
+  escalation does not prove the registries loaded.
+- A fix to the file at the reported `path` is picked up, with no restart, by
+  the first curation at least `curator.registry_load_retry_seconds`
+  (default 300) after the failed attempt. A change to the configured path
+  itself needs a fused-memory restart.
+- `loaded` with `entry_count: 0` is a registry that loaded empty, not a
+  failure. `unconfigured` means its path is unset, which disables that
+  guard on purpose. `not_loaded` means it has not been used yet.
+
+The load contract lives in
+`fused-memory/src/fused_memory/middleware/curator_registry.py::CuratorRegistry`.
+
+### Which resolutions are absorbing refiles?
+
+A resolved or dismissed escalation gains one `refiles_suppressed` each time its
+resolution suppresses an identical refile. What the counter means, and why it
+never escalates, is in
+`escalation/src/escalation/queue.py::EscalationQueue.note_suppressed_refile`.
+Two producers bump it, both on the per-project orchestrator queue
+`<project_root>/data/escalations`, not the reconciliation queue:
+
+- `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::file_unattributed_landing_escalation`:
+  `provenance_unattributed`, keyed on `citation_sha`.
+- `fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._file_finding_task_escalation`:
+  `recon_task_finding`, with no `citation_sha`.
+
+List them from the repo root. The command is read-only; add `--json` for
+machine output:
+
+    uv run --directory escalation python -m escalation.refile_absorption --queue-dir <project_root>/data/escalations
+
+Each project has its own queue, so for the fleet:
+
+    for q in /home/leo/src/*/data/escalations; do echo "== $q"; uv run --directory escalation python -m escalation.refile_absorption --queue-dir "$q"; done
+
+- **Reading it.** Rows come largest count first. The last line,
+  `total_absorbed=… records=… scanned=… skipped_vanished=… skipped_unreadable=… skipped_unparsable=…`,
+  always prints. A non-zero `skipped_*` is records the scan lost, not noise;
+  stderr names each unreadable or unparsable file. Open a row with
+  `mcp__escalation__get_escalation(<id>)` for the full record. Exit 2 means
+  `--queue-dir` is not a directory.
+- **Limits.** The counter is a lifetime total per record, not windowed. It is
+  deliberately unthresholded, so nothing pages on it and this query is how you
+  hear about it. A record whose dated archive subdir has been pruned
+  (`escalation/src/escalation/archive.py::prune_archive`) is gone, so the
+  listing covers only what the archive still holds.
+
 ---
 
 ## 5. Unblocking work
@@ -1210,6 +1393,60 @@ Incident, back-test and residual risks:
 5. Ends with a mandatory `/reflect` — decisions and discoveries from the
    unblock session get written to memory before the session closes.
 
+### A task waiting on a peer's park (`park_refused`, task 6328)
+
+Only the scored scan's top candidate earns skips and fairness parks. A task
+below it that is refused its locks by a same-tier (or lower-tier) park earns
+nothing and waits as long as that park's owner does, which can be days when
+the owner itself waits on a holder. The scheduler reports that wait as
+`park_refused`: a dispatch candidate refused by parks alone, none of which
+outranks it. The first event comes once the refusal has lasted
+`park_refused_emit_interval_secs` (default 1800 s, green tier, hot-reloadable),
+then at most once per interval. A dispatch, a refusal by anything else, or the
+task leaving the dispatch candidates ends the episode.
+
+Read it with
+`mcp__fused-memory__get_scheduler_events(project_root=..., event_types=['park_refused'])`.
+The payload is `{task_id, priority, episode_secs, blockers, park_owners}`:
+
+- `blockers` — `[{module, owner, kind: 'parked'}]`, every park that refused
+  the acquire;
+- `park_owners` — one entry per blocking owner: `owner`, its park priority
+  (`source` plus `tier`, or `pin_order`), `park_age_secs`, and `waiting_on`,
+  the owner's own blockers (`null` when the owner is not in the tick's task
+  list).
+
+The lever is to pin the waiting task B:
+
+1. `set_task_priority_override(project_root, task_id=<B>, pinned=True, ttl_secs=<a few hours>)`.
+2. If other pins exist, `reorder_pin_queue` with B first. Only the first
+   `pin_reservation_max_active` (default 1) eligible lock-blocked pins
+   reserve; `get_pin_queue` shows the order.
+3. On the next tick B's pin reservation shadows the peer's park on the shared
+   keys and B dispatches.
+
+What the lever leaves alone: the peer's park comes back the moment B
+dispatches, its park on keys B does not need is never touched, and a held lock
+is never taken. So pinning does not help while any blocker reads
+`kind: 'held'`: B then waits on that holder, and `park_refused` stops naming
+it. Clear the pin afterwards with
+`clear_task_priority_override(project_root, task_id=<B>, field='pinned')` if
+you set no ttl.
+
+The heavier alternative is to defer the park owner. Since task 6518 a deferred
+owner drops its whole footprint, including keys B never needed.
+
+The automatic backstop is the starvation watchdog's `lock_refused` gate (knobs
+`starvation_watchdog.skip_threshold` and `starvation_watchdog.idle_only_secs`;
+`dark-factory-orchestrator.yaml` overrides them). It auto-pins the starving
+task, but only while an auto-pin slot (`starvation_watchdog.auto_pin_max_concurrent`)
+is free.
+
+While the `fairness.skip_threshold` TRIAL block in
+`dark-factory-orchestrator.yaml` is in force (review: gate task 10128),
+skip-earned fairness parks are effectively off, but `reserve_now` still
+installs tier-ranked parks, and those can produce this event.
+
 ### Merging: the submit → poll protocol
 
 **Never** `git merge --no-ff` directly into a project's main while its
@@ -1232,11 +1469,25 @@ worker for the same ref. Always go through `/merge-queue`:
    ```
    `wait_secs=100` is always passed explicitly — it's the server's maximum
    bounded wait, so a fast or idle-queue merge often resolves terminally in
-   this same call. A **terminal** result (`done`, `already_merged`,
-   `conflict`, `blocked`, `unknown_branch`, `failed`, `superseded`) needs no
-   further polling (except `superseded` — see below). A **non-terminal**
-   result (`queued`, `attached`) means the request was accepted as durable
-   intent; poll for it.
+   this same call. The result is one of two kinds:
+
+   <!-- merge-state-vocab:begin partition=SUBMIT_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py. -->
+   - A **terminal** result (`done`, `already_merged`, `done_wip_recovery`,
+     `conflict`, `blocked`, `unknown_branch`, `unmerged_state`,
+     `stash_failed`, `wip_halted`, `wip_recovery_no_advance`, `error`,
+     `superseded`) needs no further polling (except `superseded` — see below).
+   <!-- merge-state-vocab:end -->
+     The worker-internal outcomes among them are rare; handle all of them
+     but `done_wip_recovery` (which landed — treat it as `done`) as
+     `blocked`, per `/merge-queue` step 3.
+   <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py. -->
+   - A **non-terminal** result (`queued`, `attached`) means the request was
+     accepted as durable intent; poll for it.
+   <!-- merge-state-vocab:end -->
 4. Poll `merge_status(request_id)` on a 15s→60s backoff (or the server's
    `eta_seconds` if given) until terminal. `state: "superseded"` means your
    request was absorbed into an in-flight coalesced train — poll
@@ -1258,46 +1509,51 @@ order. One passing verify can therefore land k items — and it is not a
 statistical bet, because the suite that passed ran on the exact cumulative
 tree being landed.
 
-**The knob.** `merge_deep.chain_cap` bounds how many queued items one chain
-may contain. The shipped default is **`0`**, which is the **kill switch**:
-the gate can never open, so no chain code executes on any dispatch path and
-merging is byte-identical to pre-feature behaviour. Every `merge_deep` leaf
-is green-tier hot-reloadable (see [§6](#6-config-reload-vs-restart)), so
-enabling, retuning and killing the feature are each one `reload_config`
-away — no restart, no drained queue.
+**The knob.** `merge_deep.chain_cap` is the **kill switch** and nothing
+more: `0` is off, and any positive value is on. It no longer bounds how deep
+a chain goes. The stock default is `0`. At `0` the gate can never open, so
+no chain code executes on any dispatch path and merging is byte-identical to
+pre-feature behaviour.
+Every `merge_deep` leaf, `depth_table` included, is green-tier
+hot-reloadable (see [§6](#6-config-reload-vs-restart)), so enabling,
+retuning and killing the feature are each one `reload_config` away — no
+restart, no drained queue.
 
-**Cap staging is a plan, not a live value.** `plans/deep-merge-ahead-prd.md`
-decision 6 stages the cap `6` → `32` (the study-validated depth, then
-"uncapped in practice"), but that rollout is owned by tasks ζ (reify canary
-at 6), η1 (the 7-day predicate) and η2 (promote to 32), and the cap is
-per-project config. The stock default is still `0` everywhere. To learn
-whether chains are live on a unit, read that project's
-`dark-factory-orchestrator.yaml` — do not infer `6` from the PRD.
+**Depth comes from the pass estimate, not a cap.** Cap staging is retired:
+task 3191 (promote the cap to 32) is cancelled, and task 3190 was superseded
+on 2026-11-17. Each round's depth is read off `merge_deep.depth_table`
+(shipped: one row per depth from 12, at an estimate of 0.992, down to 3, at 0.75; below the
+last row, one item; the rows and their derivation are in `plans/merge-lane-policy-prd.md` D7)
+against the rolling per-item pass estimate over the last 30 tip verdicts of
+the rounds the policy sized, and is never more than the queue holds. The
+window lives in memory and is seeded at worker start from the newest
+`merge_verify` rows.
+To learn whether chains are live on a unit, read that project's
+`dark-factory-orchestrator.yaml`.
 
-**Failure policy: halve on fail, reset on pass.** A tip failure says nothing
-about *which* item broke, so the next round targets `max(1, ⌊d/2⌋)` against
-the depth actually built, and consecutive failures log-bisect (6 → 3 → 1)
-toward the bad item. **Any** pass resets the state. Each round recomputes
-`target_depth = min(queue_len, chain_cap, halving_state)` afresh, so a reset
-re-derives the target from the queue as it is *now* rather than replaying a
-stale length. At the `d=1` floor no chain is built at all and the round
-takes today's adjacent verify — the floor is byte-identical **by
-construction**, not by careful mimicry. A failed tip lands nothing *via the
-chain* and mutates the queue not at all: its items stay queued and take
-their normal sequential path. The round is not therefore a zero-landing
-round — the head is never chained, so its own verify proceeds untouched and
-can still land in that same round; the head's verdict is discarded only on a
-tip **pass**, where the tip's tree strictly contains it.
+**Failure policy: each member verifies alone.** A tip failure says nothing
+about *which* item broke, so the failed tip lands nothing, its owner is
+requeued, and the owner and every link are marked. A marked task is neither
+chained nor offered as a link: its next verify covers its own tree alone. A
+passer lands and the bad item is blocked with its findings. The mark lasts
+until the task's request leaves the lane (landed, blocked or dropped), so a
+verify the cascade cancels or voids does not clear it. Requests that are not
+marked keep chaining at the table's depth. A chain verify that RAISES is not
+a verdict: it marks its owner the same way (task 3185). Each `merge_verify`
+row's `chain_depth_reason` records the basis, the estimate, the table row
+and the queue depth; it is null when the policy did not size the round (a
+marked task, a dispatch that may not chain, the kill switch), and such a
+round does not feed the pass estimate.
 
 **What you do with it.** To stop chains on a live unit, set `chain_cap: 0`
 and `reload_config`; that is the whole intervention, and it takes effect on
-the next dispatch round. To judge whether to raise it, read the `--chains`
-report (see
+the next dispatch round. To judge whether to deepen or shallow the table,
+read the `--chains` report (see
 [§"Reading the merge-lane throughput baseline"](#reading-the-merge-lane-throughput-baseline)).
-The authoritative contract — the dispatch and landing invariants,
-truncate-at-conflict semantics, and the stale-CAS abort — is
-`plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
-it, not a second copy.
+The authoritative contracts are `plans/merge-lane-policy-prd.md` D6/D7 for
+depth and the failure policy, and `plans/deep-merge-ahead-prd.md` for the dispatch and
+landing invariants, truncate-at-conflict semantics and the stale-CAS abort;
+this section is the operator's summary of them, not a second copy.
 
 **Deploying a knob flip.** `scripts/merge-deep-set-cap.sh`, like its sibling
 `scripts/merge-pytest-n-ab-switch.sh`, lands its yaml edit through the
@@ -1445,6 +1701,20 @@ Resolve the halt-owner escalation specifically (check `get_merge_halt_status`
 if unsure which one owns it) — `resolve_issue` on it un-halts the whole
 queue. If the log shows the halt cleared but the escalation record still
 shows `pending`, that's a genuine bug, not something to dismiss.
+
+**Across a restart.** A pending halt-owner record survives an orchestrator
+restart, but its halt is re-asserted only while `project_root` still has
+tracked uncommitted WIP or unmerged (`UU`/`AA`/`DD`) entries, or while that
+predicate cannot be measured
+(`orchestrator/src/orchestrator/merge_halt_rehydration.py::rehydrate_merge_halt`,
+task 3876). A record measured clean does **not** halt the queue: the journal
+carries a WARNING beginning `Merge halt NOT rehydrated`, and the record is
+stamped `halt_released_at` / `halt_release_note`, so it never re-owns a halt at
+any later restart. A conflict confined to a task worktree does not by itself
+re-halt the queue; such a record re-owns the halt only if `project_root` is
+itself dirty, unmerged or unmeasurable at the restart. A released record still
+needs its human disposition (for example, a WIP recovery branch to reapply),
+but it no longer appears as `owner_esc_id` in `get_merge_halt_status`.
 
 #### `park_lock_contended` — a blocked merge, **not** a halt
 
@@ -1665,6 +1935,18 @@ then clear the bench. Other skew reasons name the failing step (uv, disk, the
 gate root, the remote config): fix it on the host and let the reprobe re-admit
 it.
 
+**Low-battery guard on leo-laptop** (task 9051):
+`scripts/deploy/install_laptop_battery_guard.sh` installs a root
+`laptop-battery-guard.timer` (add `--check` to only print the current reading),
+then runs the service once and requires `Result=success`, so a broken drop-in
+fails the install rather than the guard. Every 30 s it reads BAT* and ignores AC online, which stays 1 on a weak USB-C
+supply. At Discharging <= 10 % it stops `df-verify-*.scope` and powers off; at
+11–15 % it warns in the journal and on the desktop. Tune with `systemctl edit`
+drop-ins (`BATTERY_GUARD_FLOOR_PERCENT`, `BATTERY_GUARD_WARN_MARGIN_PERCENT`,
+or the timer's `OnUnitActiveSec`), which the installer never overwrites. After
+an unexpected poweroff, `journalctl -b -1 -u laptop-battery-guard.service`
+shows the reading that triggered it.
+
 `scripts/orchestrator-watchdog.py --report` shows a `CODE-SHA` column per
 unit: the commit each unit's verify wire path was imported from, read from
 its fleet heartbeat. Units at different commits build different gate
@@ -1708,6 +1990,325 @@ is one edit, `verify_task_host_policy: local`, then
 `mcp__escalation__reload_config`. The next dispatch runs locally, and a leg
 already running finishes where it is.
 
+### Verify-host disk hygiene (leo-laptop, task 7269)
+
+A remote verify host keeps DF-owned leftovers whenever a verify dies before its
+cleanup. What bounds each class:
+
+| Class | Generated by | Bounded by |
+|---|---|---|
+| `_merge-<8hex>` worktrees and `.merge_verify_pgids` records on a remote host | a `verify-merge`/`verify-task` killed before its `finally` | task 4196 (pending); until it lands, `scripts/verify_host_hygiene.py`. `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.reap_orphaned_merge_worktrees` runs only where a merge worker runs |
+| `df-verify-*.scope` on a remote host | a verify controller that died while its scope ran | nothing automatic: this tool, or a reboot. 2829's `orchestrator/src/orchestrator/verify.py::reap_leftover_verify_scopes` sweeps only the orchestrator's own host (follow-up ticket `tkt_0RX7YZB882KPFAWE04DKAKQ81X`) |
+| gate checkouts under `dark-factory-gate/` | one per gate sha | 6565's `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.reap_idle_gates`, 7 days idle. `.build-*.lock` files are never reaped, by design |
+| reify `_merge-verify/target` | reify merge verifies | the 7042 trim timer (reify-owned) |
+| `_mainsweep-*` / `_mainprobe-*` | main-tip sweeps and probes | 5584 / 6794, on the workstation warm-lanes pool, not the laptop |
+| numeric task worktrees from 2026-03..04 | one-time residue; no orchestrator runs on the laptop | this tool; no live generator. The tool refuses any repo holding a task store, so it cannot reach a live orchestrator's task worktrees; `--class verify-scope` alone still runs on an orchestrator host |
+
+The tool never touches a checkout's untracked paths (SETUP.md §12), which
+include `fused-memory/data`, mounted by the laptop's running `docker-qdrant-1`
+and `docker-falkordb-1`. It never touches `_merge-verify` or any other `_`/`.`
+band except `_merge-<8hex>`, nor sccache. It leaves `.merge_verify_pgids`
+records alone and only counts them (`total=`, `dead=`), because they are task
+4196's to collect and their leftover count is its self-kill signal.
+
+    scripts/verify_host_hygiene.py --host leo-laptop --repo /home/leo/src/dark-factory --repo /home/leo/src/reify [--apply]
+
+It is report-only unless `--apply` is given. `--class merge-worktree`,
+`task-worktree` or `verify-scope` (repeatable) narrows it, and
+`--min-age-hours` moves the age floor (default 24). Each verdict is one
+tab-separated line, `kind action reason bytes target`. `action` is `reclaim` or
+`keep` in a report, and `reclaimed`, `failed` or `keep` under `--apply`.
+`bytes` is counted only for reclaims. Each repo then gets a `pgid-records` line
+and a `free` line (`now=`, or `before=`/`after=`), and each controller-less
+scope gets one `scope-member pid comm` line per process it held. Exit codes: 0 ok, 1 some
+reclaim failed, 2 usage (a `--repo` that is not a checkout top level, or,
+whenever a worktree class is requested, one holding
+`.taskmaster/tasks/tasks.db`, in report mode too), otherwise ssh's own code.
+Under `--apply`, a store that appears mid-run turns the pending removals into
+`failed` (exit 1).
+
+A worktree is kept by the first of these that holds: git `locked`; a live
+`.merge_verify_pgids` record naming it; a process cwd inside it; a touch within
+the age floor; a held `<dir>.lock`; and, for task worktrees only, being
+unregistered or dirty. A signal that cannot be read keeps the dir as
+`unreadable`, with one stderr line naming the path and the error. `--apply`
+takes `<dir>.lock` only for a dir that reads stale, then re-checks and removes
+it under that lock, so a kept dir never gains a `.lock` file, and a dir any
+earlier signal keeps never has its lock touched. Dirty means `git status --porcelain` output, so ignored files such as
+`.task/` do not count, and a non-force `git worktree remove` deletes them. That
+is why both worktree classes refuse a repo holding `.taskmaster/tasks/tasks.db`,
+an orchestrator's project root: there a clean, idle task worktree can still
+belong to a blocked, queued or in-review task, and a `_merge-*` dir belongs to
+that host's merge worker and its
+`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.reap_orphaned_merge_worktrees`. A scope
+is reclaimed only when it is `failed`, or `active` with no member whose
+out-of-scope parent is anything but PID 1 or a systemd instance. An unreadable
+cgroup or parent keeps the scope, and so does any other state
+(`unit-transitioning`, `unit-inactive`, `unit-state-unknown`). A controller-less
+scope still holding an `sccache` process is kept as `shared-daemon`: reify's
+`verify_env` sets `RUSTC_WRAPPER=sccache`, so a verify can leave the server it
+started in its scope, other live verifies use that server, and it exits on its
+own idle timeout. A failed unit is `reset-failed`; an orphaned one is
+SIGKILLed, stopped, and confirmed `inactive` or `failed` by `is-active`. Human
+gate task 11145 runs the first `--apply` on leo-laptop.
+
+---
+
+## 5a. Reify's canonical build path and shared build cache
+
+Reify builds at one canonical path, `/opt/reify-canon/ws` (CANON), so that one
+compiler cache, a WebDAV store on the workstation, serves both hosts. The design
+and its rationale are in `plans/canonical-build-path-shared-cache-prd.md`; C13
+there specifies the tools below. This section is the runbook.
+
+### Provisioning `/opt/reify-canon/ws`
+
+Once per host, as root. It stays root-owned and empty; nothing ever populates it.
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/reify-canon /opt/reify-canon/ws
+```
+
+### The store (workstation)
+
+```bash
+scripts/deploy/install_build_cache_store.sh          # idempotent apply
+scripts/deploy/install_build_cache_store.sh --check  # read-only; exit 0 = healthy
+```
+
+It installs, as user units in `~/.config/systemd/user`:
+
+- `~/.cache/build-cache-store`, with its 4,368 directories down to the 4,096
+  `<k0>/<k1>/<k2>` leaves pre-created;
+- `build-cache-store.service`: `rclone serve webdav` on port **4227**, bound to
+  127.0.0.1 and the tailscale address only, `Restart=always`;
+- `~/.config/build-cache-store/credentials` (mode 0600, `RCLONE_USER=` and
+  `RCLONE_PASS=`), the unit's `EnvironmentFile`, so the password is in neither
+  argv nor the unit;
+- `build-cache-store-prune.service` and its daily `.timer`, running a copy of
+  the pruner in `~/.local/lib/build-cache-store/`.
+
+Preflight writes nothing and refuses when lingering is off, when
+`tailscale ip -4` gives no address or `0.0.0.0`, or when rclone is not on
+`PATH`. A re-run writes only what differs. It restarts the store only when its
+unit changed, when the credentials differ from those it was last started with
+(their digest is kept in `~/.local/state/build-cache-store/`), or when it is
+not running, so a re-run that changes nothing never cuts in-flight builds. To rotate the
+password, edit `RCLONE_PASS=` in the credentials file and re-run the
+installer. Re-copy the credentials file to every other host (the `scp` and
+`chmod 600` of the laptop steps below), then re-run `--host-config` and
+`--check --host-config` on each host. `--check` also reports a
+hand-edited unit as drift. Overrides: `BUILD_CACHE_STORE_PORT`,
+`BUILD_CACHE_STORE_CAP_BYTES`, `BUILD_CACHE_STORE_DIR`,
+`BUILD_CACHE_STORE_CREDENTIALS`.
+
+Boot order rests on `Restart=always`, not on unit ordering. A user manager
+cannot see `tailscaled.service` or `network-online.target`, so the unit has no
+`After=`. Until tailscaled assigns its address, rclone fails to bind it, and
+that failure takes the loopback address down too. The unit retries every 2 s,
+and `StartLimitIntervalSec=0` keeps a slow tailscale start from tripping the
+start limit.
+
+### The host configuration file
+
+`~/.config/reify-canon/host.toml`, mode 0600, is read by reify's primitive
+(`REIFY_CANON_HOST_CONFIG` overrides the path). Its seven keys are C13's:
+`enabled`, `store_url`, `store_user`, `store_password`, `fallback_dir`,
+`fallback_cap` and `policy`. The keys, their defaults and their value rules
+have one home, `scripts/deploy/reify_canon_host_config.py`. The installer's
+`--host-config` mode calls it to write the file, and installs no store:
+
+```bash
+REIFY_CANON_ENABLED=true REIFY_CANON_POLICY=shared \
+  scripts/deploy/install_build_cache_store.sh --host-config
+scripts/deploy/install_build_cache_store.sh --check --host-config
+```
+
+| Variable | Key |
+|---|---|
+| `REIFY_CANON_ENABLED` | `enabled` |
+| `REIFY_CANON_POLICY` | `policy` |
+| `BUILD_CACHE_STORE_URL` | `store_url` |
+| `REIFY_CANON_FALLBACK_DIR` | `fallback_dir` |
+| `REIFY_CANON_FALLBACK_CAP` | `fallback_cap` |
+| `BUILD_CACHE_STORE_CREDENTIALS` | the file `store_user` and `store_password` are always read from |
+
+An unset variable keeps the existing file's value, so a re-run changes only
+what you pass, and each change is logged old -> new. Defaults apply only where
+there is no file yet. Among them, `enabled = false` and a loopback `store_url`,
+which is why the laptop passes `BUILD_CACHE_STORE_URL`. `--check --host-config`
+checks the file's mode, keys and values under the same rules. It then proves
+the store accepts this host's credentials over `store_url`: 404 for a missing
+key with them, 401 without.
+
+On the laptop, copy the workstation's credentials file, then point at the
+workstation's tailscale address:
+
+```bash
+install -d -m 0700 ~/.config/build-cache-store
+scp <workstation>:.config/build-cache-store/credentials ~/.config/build-cache-store/credentials
+chmod 600 ~/.config/build-cache-store/credentials
+REIFY_CANON_ENABLED=true BUILD_CACHE_STORE_URL=http://<workstation tailscale address>:4227 \
+  scripts/deploy/install_build_cache_store.sh --host-config
+```
+
+### Enabling, disabling and rolling back a host
+
+To enable:
+
+1. Provision `/opt/reify-canon/ws`.
+2. Write host.toml with `REIFY_CANON_ENABLED=true` and pass
+   `--check --host-config`.
+3. Set `build_canon.root: /opt/reify-canon/ws` and
+   `build_canon.shim_dir: ~/.local/share/reify-canon/bin` (absolute) in the
+   host's own reify orchestrator yaml, never in `verify_env`. Apply with
+   `mcp__escalation__reload_config`; the section is hot-reloadable.
+4. Reset the host's task-verify lanes so their build directories are
+   recreated at CANON. `orchestrator verify-lanes reset --config <host yaml>`
+   does this (exit 3 means a busy lane was skipped, so re-run it), but it is
+   delivered by the task-verify-lanes PRD (`plans/task-verify-lanes-prd.md`
+   C10, tasks 10736–10739) and does not exist until those land. Until then,
+   halt the merge queue, wait for in-flight verifies to finish, and remove
+   the lanes' build directories by hand. Then drop the merge lane's build directory, as in
+   [Rebuilding the warm base](#rebuilding-the-warm-base).
+5. Once verifies have run, compare the drift probe on both hosts and run the
+   in-service check. Only when it exits 0, set `build_canon.expect_canon: true`.
+
+To disable or roll back, follow PRD decision 22's order:
+
+1. Write host.toml with `enabled = false` (`--host-config` with
+   `REIFY_CANON_ENABLED=false`). New build directories are then real-path.
+2. Rebuild the warm base ([below](#rebuilding-the-warm-base)).
+3. Only then unset `build_canon.root` and `expect_canon`, and reload.
+
+Existing CANON directories keep working throughout. A leg about to run
+unprefixed in a CANON-stamped directory gets a fresh build directory (C8).
+
+### Changing a host's policy
+
+1. Re-run `--host-config` with the new `REIFY_CANON_POLICY`; every other value
+   is kept.
+2. [Rebuild the warm base](#rebuilding-the-warm-base) under the new policy.
+
+Every workspace unit's identity changes with the policy (C12). Old units are
+never reused, which is why the base is dropped.
+
+### Rebuilding the warm base
+
+The persistent merge lane's build directory is what the warm base is refreshed
+from, so dropping it rebuilds the base under the host's current host.toml:
+
+1. Halt the merge queue (`mcp__escalation__halt_merge_queue`) and wait for it
+   to be idle.
+2. In reify's main checkout, `rm -rf .worktrees/_merge-verify/target`.
+3. Release the queue (`mcp__escalation__unhalt_merge_queue`).
+
+The next merge verify builds it cold, through `canon_run.py exec` (C12). On
+landing, reify's `scripts/refresh-warm-base.sh` refreshes
+`$REIFY_WARM_LANE_MOUNT/base/target` from it. To rebuild before the next
+merge, run reify's `scripts/seed-warm-base-initial.sh` between steps 2 and 3.
+
+### Reading observations
+
+- `<project>/data/verify-logs/build-cache-observations.jsonl` holds one row per
+  verify result that carried a `build_cache` fact. Its keys are `time`, `host`,
+  `role`, the task id or merge commit, and `build_cache` (C9: `mode`,
+  `backend`, `policy`, `reason`, the counters, `wall_secs` and `cpu_secs`).
+  The in-service check reads only `time`, `host` and `build_cache`; the names'
+  home is its `ROW_*` constants
+  (`scripts/deploy/check_build_cache_in_service.py::ROW_TIME` and siblings).
+- `<build dir>/.reify-canon-journal.jsonl` holds the same record plus the cargo
+  subcommand for every outermost invocation. That includes agent and
+  interactive builds, which emit no event (C6).
+
+### The in-service check
+
+```bash
+scripts/deploy/check_build_cache_in_service.py \
+  --observations <project>/data/verify-logs/build-cache-observations.jsonl \
+  --host leo-laptop --since 2026-11-20T00:00:00Z --min-runs 5 \
+  --canon-root /opt/reify-canon/ws --status-json <file holding canon_run.py status output>
+```
+
+Exit 0 means in service. PRD C13 specifies the exit table.
+`check_build_cache_in_service.py --help` prints it, with the order it is
+evaluated in and the tool's own codes for a usage error and an unreadable
+observations file. Stdout is one JSON line carrying `verdict`, the counts,
+`latest` and `per_policy` sums of runs, hits, misses and cpu_secs.
+
+### The alarm
+
+Each executing host has the sentinel `__build_cache_degraded__<host>`, category
+`infra_issue`. Its ladder is PRD decision 18's, and "degraded" is defined by
+C10. When it fires: run `--check` on the workstation and
+`--check --host-config` on the host, then read that host's latest rows.
+
+### Pruning
+
+`build-cache-store-prune.timer` runs daily, delayed at random by up to an hour,
+and catches up after downtime. It prunes to `BUILD_CACHE_STORE_CAP_BYTES`
+(default 300 GiB, PRD open question 5):
+
+- least recently used first, by the later of atime and mtime;
+- never a file modified in the last ten minutes, and never a directory.
+
+After removing anything it sends the store's main process SIGHUP, so rclone
+drops its directory cache. Without it, rclone serves a removed object as a
+truncated 200. To change the cap, re-run the installer with
+`BUILD_CACHE_STORE_CAP_BYTES`. A dry run, and the last real one:
+
+```bash
+~/.local/lib/build-cache-store/build_cache_store_prune.py ~/.cache/build-cache-store \
+  --cap-bytes $((300 << 30)) --check
+journalctl --user -u build-cache-store-prune.service -n 20
+```
+
+It exits 0 even when still over cap: the young files age out, and the JSON
+says `over_cap`.
+
+### The drift probe
+
+On each host, against its reify checkout, then diff the two outputs:
+
+```bash
+scripts/deploy/build_cache_drift_probe.sh ~/src/reify > /tmp/drift-$(hostname).tsv
+diff /tmp/drift-<workstation>.tsv /tmp/drift-leo-laptop.tsv
+```
+
+Zero differences outside `#info` lines are required before gates ι and κ.
+Each pkg-config module that reify's dependencies probe has its own
+`pkg-config.<module>` line, carrying its version and `libdir`, or `ABSENT`, so
+the diff names the module. α's cross-host misses were `xscrnsaver` present on
+the laptop only (libxss-dev, esc-10782-1). The module list is derived from the
+checkout's `Cargo.lock` on every run: each locked registry crate's
+`[package.metadata.system-deps]` entries, read from its source under
+`$CARGO_HOME/registry/src`, plus the pkg-config names in x11-dl's `build.rs`.
+`#info.cargo.registry-sources-missing` names locked registry crates whose
+source is not on that host. It is informational and never compared: it lists
+what the host has not fetched, mostly target-specific crates a Linux build
+never downloads. If a missing crate declares system-deps, its
+`pkg-config.<module>` lines are absent on that host only, so the diff shows
+it. Run `cargo fetch` in the reify checkout on that host and probe again. Whole-system
+package and module lists are not compared, because the hosts legitimately
+differ in hundreds of unrelated packages. A probe of a checkout with no
+`Cargo.lock` exits 2.
+
+`REIFY_PROBE_DEEP=1` adds the digests of the C++ wrappers' header closures.
+
+### Shrinking the old host sccache cache
+
+The workstation's host sccache, the `sccache.service` user unit on port 4226
+with `SCCACHE_CACHE_SIZE=500G` over `~/.cache/sccache`, still serves real-path
+builds. Lower its cap once the store holds a week of builds:
+
+```bash
+systemctl --user edit sccache.service   # [Service] Environment=SCCACHE_CACHE_SIZE=<new>
+```
+
+Restart it only with the merge queue halted and idle. The home filesystem was
+91% full when this was planned, and the store replaces that cache rather than
+adding to it.
+
 ---
 
 ## 6. Config reload vs restart
@@ -1724,7 +2325,9 @@ takes no arguments: it always re-reads that process's own
   `backends`
 - `routing.*` (`allowed_models`, `ladder`, `per_model_daily_ceiling_usd`,
   `rules` — see [§7](#7-model-routing))
-- Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`)
+- Steward (`steward_completion_timeout`, `steward_lifetime_budget`,
+  `steward_session_mode`: `fresh_per_l0` | `resume`, applies from the next L0
+  a steward handles)
 - Scheduler and watcher tuning knobs
 - `review.*` checkpoint knobs
 - `unblock_auto.*`
@@ -1749,6 +2352,11 @@ takes no arguments: it always re-reads that process's own
   homes: `orchestrator/src/orchestrator/config.py::DeterministicConfig` and
   `plans/completion-driven-triggers-prd.md` C1.
 - `verify_env`
+- `verify_allow_no_tests_ran` (default false). It applies when a task's diff
+  matches no module config and the fallback's test slot runs nothing (bare
+  `pytest` default, task role, no test touched): the verify then fails as
+  `no_tests_ran` unless this is true. Green-tier because it is read fresh per
+  verify. Rationale: `docs/fallback-test-floor.md`.
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when
   `verify_use_cgroup_scope` is on; read at each scope spawn, so a reload
@@ -1809,9 +2417,10 @@ takes no arguments: it always re-reads that process's own
   `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
   keeps the leg's segments on the packages that own marked tests. Green-tier
   for the same reason as `merge_gate_history_pure`.
-- `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
+- `merge_deep.*`, including `chain_cap` and `depth_table` (deep merge-ahead
+  chains — see
   [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
-  `0` is the shipped default and the feature's kill switch). Green-tier on
+  `chain_cap` is the feature's kill switch, `0` off). Green-tier on
   purpose, for the reason the `config_key_census.*` bullet above and the
   `mem0_update.enabled` bullet below both give: a kill switch you can only
   pull by restarting the unit is not a kill switch. Enable, retune and
@@ -1843,6 +2452,7 @@ takes no arguments: it always re-reads that process's own
 effect until a full restart):**
 
 - `max_concurrent_tasks`
+- `main_health_fix_reserved_slots`
 - Pool sizes / `verify_runners`
 - `escalation` bind host/port
 - `sandbox.backend`
@@ -1865,7 +2475,7 @@ allowlist over `fused-memory/config/config.yaml`, applied by
 process, different file. Do not look for one config's leaves in the
 other's list. Its green tier currently covers several `reconciliation.*`
 leaves (the near-dup/topic-guard knobs and `stale_run_recovery_seconds`),
-`write_triage.*`, and the five in-place-update leaves below — read
+`write_triage.*`, and the in-place-update leaves below — read
 `RELOADABLE_FIELDS` in `fused-memory/src/fused_memory/config/reload.py` as
 the authoritative list rather than treating this enumeration as exhaustive.
 `server.*` (the bind host, the port and `recon_report_port`) is not in it, so
@@ -1895,6 +2505,19 @@ a bind change is restart-only in both processes (the orchestrator's
   to correct; a silent content rewrite is neither. (`agent_id` is
   self-reported, so this is a misuse deterrent for cooperating callers,
   not a security boundary.)
+- `mem0_update.agent_prefix_sanctioned_use` — the prefix-to-role map. A
+  `Mem0UpdateNotAuthorized` refusal renders, for each prefix on the
+  refusing arm's list, the role that prefix declares, together with the
+  norm: adopt a prefix only if you are that role, and a caller refused in
+  the middle of other work escalates rather than renaming itself. A listed
+  prefix with no entry renders as undocumented ("do not adopt it").
+  Documenting a prefix here is part of widening either list. The shipped
+  default (`Mem0UpdateConfig.agent_prefix_sanctioned_use`) documents every
+  prefix on either default allowlist; a YAML value replaces that map
+  wholesale, so restate every entry. Green-tier,
+  reloaded as one atomic leaf. This makes the norm legible, not the gate
+  enforceable: `agent_id` stays self-reported, and the storm alarm below
+  remains the backstop.
 - `mem0_update.storm_threshold` and `mem0_update.storm_window_seconds` —
   the content-amend burst alarm (escalates, never blocks; metadata-only
   calls do not count toward it). Genuinely reload-safe because the shared
@@ -2244,8 +2867,17 @@ Every resolved invocation emits a `routing_decision` event (model, effort,
 budget, turns, which layer set the model, which rule matched, any
 rejections) and mirrors the latest decision onto the task's own
 `metadata.routing` — a bounded history (last 5), a routing-tier counter,
-and a `simple_saturated` flag. Today this is what you read directly
-(`routing_decision` events, `metadata.routing` per task) — there is not
+and a `simple_saturated` flag. The event row's `phase` column carries the
+workflow phase the invocation ran in (the live phase inside a task
+workflow, `escalated` for steward and triage, `blocked` for unblock_auto),
+so a per-role cap or cost cohort splits by phase from `runs.db` alone; it
+is NULL for the project-level deep_reviewer and the batch module_tagger.
+In-workflow roles, the steward and unblock_auto also emit an
+`invocation_end` row with the same phase. Triage emits none, and its
+`routing_decision` row is written before the lifetime-budget check, so the
+row also exists when that check skips the triage. Today this is
+what you read directly (`routing_decision` events, `metadata.routing` per
+task) — there is not
 yet an auto-escalating retry ladder or a rendered rollup panel; see below.
 
 ### Adaptive-routing substrate (not yet active)
@@ -2671,13 +3303,27 @@ active `fused-memory.socket` and `orchestrator-*.socket` units, the compose
 publishes and the recon-report port, on every address `ip -j addr` lists
 outside scope `host` and on `127.0.0.1`. `scripts/setup-host.sh` §11 runs it.
 
+One loopback refusal is not a failure. fused-memory starts without the compose
+services in the script's `OPTIONAL_COMPOSE_SERVICES` (today `embedder`, whose
+`ExecStartPre` in `scripts/fused-memory.service.template` is `-`-prefixed), so
+on a host that has never created such a service's container nothing is meant
+to serve its port. When a port refuses on `127.0.0.1` and every owner of it is
+such a service, the check asks docker, read-only, whether the service has a
+container in any state: `docker container ls --all --quiet`, filtered on the
+labels `com.docker.compose.project=docker` (compose's default project name,
+the compose file's directory) and `com.docker.compose.service=<service>`. With
+no container, the port gets an informational `[no-container]` line instead of
+a failure. Once the container exists, a refusal fails again, even while the
+container is stopped. Off-loopback findings and a loopback timeout are never
+excused, and if docker cannot be read the refusal stays a failure.
+
 To run it by hand (no sudo; the connects are read-only):
 `python3 scripts/check_network_exposure.py [--connect-timeout SECS]`. Exit 0
-means loopback only and 1 means a finding. Every line carries the
-`[network_exposure]` tag, and each failure line names its kind in brackets,
-then the port, its owners and the address. What each kind means and how to
-clear it is in the [§10 Troubleshooting](#10-troubleshooting) row for a
-`Network exposure:` FAIL.
+means loopback only, and may carry informational `[no-container]` lines; 1
+means a finding. Every line carries the `[network_exposure]` tag, and each
+finding line names its kind in brackets, then the port, its owners and the
+address. What each kind means and how to clear it is in the
+[§10 Troubleshooting](#10-troubleshooting) row for a `Network exposure:` FAIL.
 
 ### fused-memory liveness revive
 
@@ -2693,12 +3339,17 @@ and a revive rate cap — described below.
 `scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict`, which
 classifies fm three ways: `port-down` (the port probe fails), `healthy`
 (the zero-I/O `/alive` route answers within 15s), or `wedged` (the port is
-up but `/alive` does not answer — the asyncio loop is hung). Under socket
-activation `port-down` does **not** mean the process is gone: the probe sees
+up but `/alive` does not answer — the asyncio loop is hung). Under
+[socket activation](#socket-activation-mcp-ports-survive-restarts)
+`port-down` does **not** mean the process is gone: the probe sees
 `fused-memory.socket`, which stays bound through a restart or a crash awaiting
-auto-restart and closes only on a deliberate stop or disable. A dead process
-behind a live socket is restarted by the next connection, and one that does
-not answer in time reads as `wedged`. `/health` is deliberately not
+auto-restart. It closes only on a deliberate stop or disable, or when a crash
+loop exhausts the service's `StartLimitBurst`
+(`scripts/fused-memory.service.template`): systemd then fails the socket with
+result `service-start-limit-hit`. That second case is the
+permanently-unstartable unit the revive cap below exists to bound. A dead process behind a live socket is
+restarted by the next connection, and one that does not answer in time reads
+as `wedged`. `/health` is deliberately not
 consulted for the verdict: it awaits two sequential backing-store
 round-trips, which would make a slow FalkorDB/Qdrant read as a wedge and
 get the shared MCP server restarted for nothing. `/health` is still the
@@ -2712,10 +3363,12 @@ persisted to `data/fused-memory/fm_liveness_streak.json` rather than held
 in memory because `orchestrator-watchdog.service` is `Type=oneshot` — the
 process exits between probes, so an in-memory counter could never
 accumulate. The streak is **shared across both non-healthy classes** on
-purpose: an fm instance dying mid-probe can legitimately alternate
-`port-down`/`wedged` from tick to tick, and per-class counters would each
-keep resetting, so a genuinely broken process would reach neither
-threshold.
+purpose: on a host without `fused-memory.socket`, an fm instance dying
+mid-probe can legitimately alternate `port-down`/`wedged` from tick to
+tick, and per-class counters would each keep resetting, so a genuinely
+broken process would reach neither threshold. Socket activation changes
+what each class means (see **The verdict** above), not the case for one
+shared streak.
 
 **Layer 2 — a revive cap**, on its own clock file
 `data/fused-memory/last_liveness_restart_fused_memory.json`. That is
@@ -2748,12 +3401,59 @@ which defeats systemd's own `StartLimitBurst` backstop, so an uncapped
 lane would re-restart a permanently-unstartable unit (bad config, missing
 dependency, corrupt venv) every ~180s forever.
 
-A shorter, port-down-specific lane was designed under task 4131 and
-DELIBERATELY NOT SHIPPED — see esc-4131-9 (Leo's 2026-09-21 ruling) and
-task 5739, which revisits it once task 5550 has removed the wedge cause.
-Measured 2026-08-23..2026-09-21: 57 `wedged` threshold-crossings against
-exactly 1 `port-down` crossing, and that one was a race with an external
-restart already in flight.
+**No port-down fast lane — closed (task 5739).** A shorter, 600s
+port-down-specific lane was designed under task 4131 and dropped by Leo's
+2026-09-21 ruling on esc-4131-9. Task 5739 re-measured after task 5550 and
+closed it: the single shared `FM_LIVENESS_RESTART_MIN_INTERVAL_SECS` window
+is the permanent answer. The pre-5550 baseline, syslog 2026-08-23..09-21,
+had 57 `wedged` threshold-crossings against 1 `port-down` crossing, and
+that one was a race with an external restart already in flight. The
+post-5550 window, the whole syslog rotation set from 2026-10-18 to
+2026-11-15 (28 days, starting 23 days after the 2026-09-25 merge), had 0
+crossings of either class, 0 capped ticks, 0 `restart issued` lines and 0
+`port-down` verdicts at any streak; its 21 sub-threshold `wedged` ticks (20
+at 1/3, 1 at 2/3) never reached threshold. So the cap was never armed in the
+window and hid nothing, and `port-down` did not occur even below threshold.
+The lane's target class is also gone. The lane was built to revive a
+crashed process sooner, and since `fused-memory.socket` (2026-09-29) a crash
+no longer reads `port-down`. Both of the causes **The verdict** above gives
+for a socket-era `port-down` argue against a lane. A deliberate stop needs
+no revive. A crash loop that exhausted `StartLimitBurst` is the
+permanently-unstartable unit the cap exists to bound, and a faster lane
+would only make it worse. Reopen only if either holds:
+
+- fm runs on a host without its socket unit, so `port-down` again means
+  "process gone";
+- a syslog re-measure over >=4 weeks finds more than ~1 `port-down`
+  crossing per week that is not a crash loop. A crossing that coincides with
+  `fused-memory.socket` failing with result `service-start-limit-hit` in
+  `journalctl --user -u fused-memory.socket` is one: it calls for fixing the
+  crash, not for a lane. Count each episode once, at its threshold tick,
+  whether it revived or was capped:
+  `for f in /var/log/syslog*; do echo "$f $(zgrep -cE "verdict 'port-down' \(streak ([0-9]+)/\1\)(; restarting| but a liveness restart is capped)" "$f")"; done`
+  The backreference matches only a streak equal to its threshold, so a
+  capped episode's later revive is not counted twice and a non-default
+  `FM_LIVENESS_STREAK_THRESHOLD` still works. zgrep reads plain and `.gz`
+  files alike. Unlike the literal `(streak 3/3); restarting` form used to
+  compare against the esc-4131-9 baseline, it also counts a capped episode
+  that recovered before its window expired.
+
+A reopened lane must also meet task 5739's constraints:
+
+- Detection stays class-blind: the shared streak above, pinned by
+  `tests/scripts/test_orchestrator_watchdog.py::test_liveness_pass_mixed_non_healthy_verdicts_reach_threshold`.
+- The lane is resolved from the WHOLE streak, via a sticky "saw a wedge"
+  bit in the streak file (the esc-4131-7 shape), so a mixed streak always
+  arms the 3600s window and no class's cap is ever left un-armed.
+- The true aggregate revive bound is stated here and on the constant's
+  comment. Separate clocks ADD: the 4131 design silently moved <=24/day to
+  <=168/day.
+- It is justified on probe semantics, not on the 3180s figure (READ THAT
+  FIGURE CORRECTLY, above).
+- `--report` shows a revive COUNT, not just an age.
+- `NRestarts` is not evidence of quiet: watchdog revives are manual
+  restarts, which it never counts (the crash-loop paragraph in
+  [§8](#8-fleet-redeploy--watchdog)).
 
 **A failed — or raising — restart still arms the cap.** `restart_unit`
 passes `check=False`, so a non-zero `systemctl` exit has always armed it;
@@ -2842,6 +3542,10 @@ python3 /home/leo/src/dark-factory/scripts/falkordb_aof_gate.py \
   --compose-file /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml --check-only
 ```
 
+The recovery dumps under `fused-memory/data/{cgl-eta,cgl-iota,solar-ns-merge}`
+and `data/backups/2026-07-02-ops-purge-prune` are retained under a ruling:
+[docs/falkordb-recovery-dumps.md](docs/falkordb-recovery-dumps.md).
+
 #### Experiments never touch production FalkorDB
 
 Production has segfaulted three times, and two of the crashes were ad-hoc
@@ -2869,8 +3573,9 @@ So:
    covers hand-run access. It does not cover this section's own remedy and
    recovery procedures, or committed tooling, whose access to production is
    settled when it is reviewed. The eval harness and
-   `seed_scratch_reference_graph.py` in "The scratch FalkorDB" below are
-   committed tooling of that kind.
+   `seed_scratch_reference_graph.py` in "The scratch FalkorDB" below, and
+   `fused-memory/scripts/cleanup_litter_graphs.py` in "Deleting test litter
+   from production" below, are committed tooling of that kind.
 3. **Never clone a graph on production.** That means no `RESTORE` onto it and
    no `EVAL`. The one sanctioned `DUMP` is
    `fused-memory/scripts/seed_scratch_reference_graph.py`, and its `RESTORE`
@@ -2936,6 +3641,87 @@ for g in $(docker exec $C redis-cli GRAPH.LIST); do
   printf '%s %s\n' "$g" "$(docker exec $C redis-cli GRAPH.RO_QUERY "$g" 'MATCH (n) RETURN count(n)' | sed -n 2p)"
 done > /tmp/falkordb-graph-counts-$(date +%s).txt
 ```
+
+#### Deleting test litter from production
+
+`fused-memory/scripts/cleanup_litter_graphs.py` deletes test and probe graphs
+from the FalkorDB the config names, which is production. An operator runs it,
+never an agent. Its `LITTER_PATTERNS` allowlist is its whole blast radius: a
+graph is deleted only if its name fully matches a pattern and the reviewed
+listing names it. Registered project graphs, `evalmem_lme_ref_incumbent_a`
+(the graph `seed_scratch_reference_graph.py` copies to scratch), `default_db`
+and every other name stay, and the listing shows them under `keep`.
+
+1. **Halt the merge queue** (`mcp__escalation__halt_merge_queue`) and wait for
+   it to be idle.
+2. **Confirm no offline-lane pass is running**: the newest
+   `data/orchestrator/offline-lane/qdrant-integration/*/record.json` has a
+   non-null `effect` (see "The offline lane's red path"):
+
+   ```bash
+   R=$(ls -td /home/leo/src/dark-factory/data/orchestrator/offline-lane/qdrant-integration/*/ | head -1)
+   python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["effect"] is not None)' "${R}record.json"
+   ```
+
+3. **Set aside a copy.** Once `docker exec docker-falkordb-1 redis-cli INFO
+   persistence` reads `aof_rewrite_in_progress:0`, run step 1 of "Deciding
+   which FalkorDB copy is newest" above with the suffix `.pre-litter-cleanup`
+   in place of `.pre-bootstrap`.
+4. **List**, from `fused-memory/` in the main checkout, with `FALKORDB_URI`
+   unset. This deletes nothing:
+
+   ```bash
+   uv run python scripts/cleanup_litter_graphs.py list --out ~/litter-listing.json
+   ```
+
+   Check that the printed `target` is production (port 6379), then review the
+   listing's `delete` and `keep` sections.
+5. **Delete** what was reviewed:
+
+   ```bash
+   uv run python scripts/cleanup_litter_graphs.py delete \
+     --reviewed ~/litter-listing.json --record ~/litter-record.json
+   ```
+
+   It refuses a listing whose `delete` section names a graph that is not on
+   `LITTER_PATTERNS`. Otherwise it deletes one graph at a time,
+   `--pace-seconds` apart (default 10), and only graphs in that section that
+   are still present. Litter that appeared after the listing is reported in the
+   record's `unreviewed`, not deleted, and reviewed graphs already gone in its
+   `already_absent`. The record also holds every graph's node count before the
+   run and each kept graph's count after it.
+6. **Read the exit code**:
+
+   | Exit | Meaning | Next |
+   |---|---|---|
+   | 0 `ok` | Every reviewed graph still present was deleted, and no kept graph shrank. | Step 7. |
+   | 1 `failed` | No connection, a Redis or file error, or an interrupt (Ctrl-C). A record written before the error has `outcome: failed` and names what was deleted. The `deleted N graphs` count on stderr is right even when the last record write failed. | If the record exists, first compare the server's current `run_id` (`docker exec docker-falkordb-1 redis-cli INFO server \| grep run_id`) with the record's `run_id_before`. If they differ, or the server does not answer, treat the run as row 4 (a crash), not as a cause to fix and list again. Otherwise fix the cause, then list again. If no record was written, nothing was deleted. |
+   | 2 | A usage error. | Fix the arguments. |
+   | 3 `refused` | The listing is unreadable, was taken on another target, or names under `delete` a graph that is not on `LITTER_PATTERNS` (stderr names it). Nothing was deleted. | List again against this target. A graph off the allowlist, such as `default_db`, is deleted only after a reviewed change adds it to `LITTER_PATTERNS`. |
+   | 4 `server_restarted` | The server's `run_id` changed during the run, so the run stopped. The record's `run_id_after` is the new id, and its `after` is empty when the restarted server could not yet be counted. | Treat it as a crash: read `docker logs --tail 50 docker-falkordb-1`, then, once `docker exec docker-falkordb-1 redis-cli INFO persistence` reads `loading:0`, take the counts with `list` and compare them with the record's `before`. Do not run `delete` again until the crash is understood. |
+   | 5 `kept_graph_shrank` | A kept graph's node count fell during the run; the record's `shrank` names it. With no restart, `GRAPH.DELETE` of a litter graph cannot touch another graph, so the likely cause is live fused-memory work: entity merges and deletes remove nodes. | Count the nodes fused-memory removed since `delete` started (below). If they cover the drop, the shrink is that work. Otherwise treat it as damage. Either way, investigate before unhalting. |
+
+   Each entity merge or delete logs one `delete_entity_node: deleted node=`
+   line, which does not name the graph. To count them for row 5:
+
+   ```bash
+   journalctl --user -u fused-memory --since '<when delete started>' --no-pager -o cat -q \
+     --grep 'delete_entity_node: deleted node=' | wc -l
+   ```
+
+   A record whose `outcome` is `null` comes from a run that was killed before
+   it finished, for example by a closed terminal. Its `deleted` names what was
+   removed, but may miss the last delete. Treat it as row 1.
+
+7. **Unhalt the merge queue** (`mcp__escalation__unhalt_merge_queue`).
+8. **Remove the set-aside copy** once a `list` run after two lane passes shows
+   no delete candidates, with `D` and `IMG` from step 1 of "Deciding which
+   FalkorDB copy is newest":
+
+   ```bash
+   docker run --rm --entrypoint sh -v "$D":/d "$IMG" -c \
+     'rm -rf /d/appendonlydir.pre-litter-cleanup /d/dump.rdb.pre-litter-cleanup'
+   ```
 
 #### Bootstrapping FalkorDB's AOF from dump.rdb
 
@@ -3276,9 +4062,12 @@ drop-in.
 
 Installing the compose service, the template lines and the drop-in on the host is
 a separate attended step (α2, task 6801); the tracked files alone change nothing
-on the host. Until α2 starts the embedder, `scripts/check_network_exposure.py`
-(whose `COMPOSE_PUBLISHED_PORTS` mirrors every compose publish, 8420 included)
-reports `[not-listening]` for 8420; that finding is expected until then.
+on the host. Until α2 (task 6801) creates the embedder's container,
+`scripts/check_network_exposure.py` (whose `COMPOSE_PUBLISHED_PORTS` mirrors
+every compose publish, 8420 included) reports 8420 as an informational
+`[no-container]` line and does not fail on it, because `embedder` is in its
+`OPTIONAL_COMPOSE_SERVICES`. Once the container exists, a refusing 8420 is a
+`[not-listening]` failure again, even while the container is stopped.
 
 ### Dashboard unit-parity check
 
@@ -3447,9 +4236,10 @@ directly, not just interactive sessions. Treat it accordingly:
   `git commit --only <path>` (not a bare `git commit`) so you don't sweep
   up unrelated staged or dirty state from a concurrent process.
 - On main, `pre-commit` runs the merge gate's own checks for what the
-  commit stages (task 8531; `scripts/hook_module_checks.py` derives the
-  list, `hooks/project-checks` runs it in parallel), so what a commit costs
-  depends on what it stages:
+  commit stages, plus the hook's own `root:type` unit for repo-root Python
+  that no module owns (task 8531; `scripts/hook_module_checks.py` derives
+  the list, `hooks/project-checks` runs it in parallel), so what a commit
+  costs depends on what it stages:
   - **Staged `.py` under a registered module** — that module's
     `lint_command` and `type_check_command` run verbatim, exactly as the
     merge gate would run them, so a staged `scripts/*.py` now runs
@@ -3457,6 +4247,12 @@ directly, not just interactive sessions. Treat it accordingly:
   - **Staged `.py` under `shared/` or `escalation/`** — every module
     imports them, so the type check of EVERY registered module runs. This
     is the worst case.
+  - **Staged `.py` at the repo root** (`conftest.py`,
+    `df_pytest_isolation.py`) — no module can own a repo-root path, so
+    `root:type` runs pyright over those files
+    (`scripts/hook_module_checks.py::root_units`). A root module other than
+    `conftest.py` also runs the type check of every registered module, as
+    `shared/` and `escalation/` do.
   - **A staged file under `plans/`, `docs/` or `review/`, or a
     `*.yaml`/`*.json`/`*.md` outside a workspace package** — the
     whole-tree screen runs the `scripts/merge_screen.yaml` checks: about
@@ -3595,15 +4391,17 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | A fused-memory offline-lane pass is recorded as an outage on a line starting `falkordb: ` (with the container stopped, measured: `falkordb: connect: ConnectionError`), or a fused-memory test session under the lane exits 4 at start with `the scratch FalkorDB at redis://localhost:6380 is not reachable` | The scratch FalkorDB (compose service `falkordb-scratch`, `127.0.0.1:6380`) is not running. Docker restarts it on its own unless someone stopped it, and nothing else starts it; see [§8 The scratch FalkorDB](#the-scratch-falkordb) | `docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d --no-deps falkordb-scratch`, then `docker exec docker-falkordb-scratch-1 redis-cli ping`. If `GRAPH.LIST` there lacks `evalmem_lme_ref_incumbent_a`, seed it with `scripts/seed_scratch_reference_graph.py`. The next lane pass runs normally |
 | All work across the fleet stalls; every account shows capped | The multi-account usage gate is **all-or-nothing per scope**: capacity in a scope only frees up once at least one account is uncapped for it | Check account-level cap/reset times; this self-heals once any single account resets — it is not a per-request failure to retry individually |
 | A burst of zero-output invocations across many tasks at once | Usually a transient upstream 5xx (529 overloaded), not a real failure. Since task 3316 an execute-phase zero-output result carrying a 5xx requeues through the scheduler's transient lane instead of blocking | Read the task's `zero_output_evidence-iter<N>.json` under its TASK root, `<worktree base>/.task-meta/task-<id>/` (for this repo `.worktrees/.task-meta/task-<id>/`; path owner `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.zero_output_evidence_path`). A `ZERO_OUTPUT_HANG_REASON` block's detail names the exact glob. `api_error_status` in 500-599, with the provider's error in `output_tail`, is a provider outage: wait it out, and do not switch accounts or treat it as a code regression. `api_error_status: null` with `transcript_turns: 0` is a local wedge: read `proc_tree` and `stderr_tail`. Check host health via PSI (`full` pressure), not load average |
-| Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |
+| Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, when a crash loop exhausts the service's `StartLimitBurst` (systemd fails the socket with result `service-start-limit-hit`; the crash is in `journalctl --user -u fused-memory.service`), or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |
 | `Permission denied` reading `/proc/<pid>/environ` while diagnosing a systemd --user unit's `PATH` or environment, or a unit failing `ENOENT` on a binary that `which` finds | That pid is the user manager, whose environ is readable or not depending on its capabilities, and is the wrong layer anyway. Or the unit is `DRIFTED`: it still has the environment of its last start | [§3 Inspecting a unit's live environment](#inspecting-a-units-live-environment) |
 | `escalation-watcher-auto` rotations respawn continuously while the L1 queue shows only `esc-task-path-guard*` records, and each rotation resolves nothing | The path-scope guard files its rejection / advisory audit records at `level=1` under a **synthetic anchor** `task_id` — no such task exists. Until the record reaches a terminal state it stays `pending`, and the supervisor's pre-boot precheck (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts any pending un-promoted L1 as actionable, so it keeps spawning rotations. A `stamp_triage` does **not** clear it: that precheck reads `status`/`level` only, never `triaged_at` | Expected, and clears on the first rotation that actually reaches the record — the watcher's `scope_violation` recipe has an audit-only branch that closes these `close_only`/`benign` (see `skills/escalation-watcher-auto/SKILL.md`). **Do not `stamp_triage` these records**: a stamp reaches no terminal state, so it cannot clear the precheck, but its fresh `triaged_at` makes the next rotation drop the record at the drain filter before the auto-close branch is consulted — the loop then persists for as long as the stamp stays fresh (~6h). The recipe carves these out of that skip; a rotation running an older copy will not. If they persist beyond that, check the drain-filter carve-out is present, then compare the branch's tokens against `_ANCHOR_TASK_ID` / `_AGENT_ROLE` in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` for producer drift. Do **not** "fix" this by re-gating the producer — the guard is the census, and the one deliberate bypass (`routing_override_reason`) already returns before any verdict or escalation fires (`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._path_guard_or_skip`), so there is nothing left to gate |
 | Two branches that each moved `orchestrator/tests/merge_lane_ratchet_baseline.json` conflict on it (a probe bounce or a stopped merge), although they moved different code | The structured merge driver `.gitattributes` names (`merge=ratchet-baseline`) is not installed in this host's `.git/config`, so git falls back to its line merge, which conflicts whenever two branches touch one baseline row; or the driver REFUSED this pair (it says why on stderr: two different changes to one scalar, a row deleted on one side and changed on the other, two insertions at one place in a path list) and wrote git's own text merge with markers. The probe (`git merge-tree` at `project_root`) reads attributes from `project_root`'s working tree, so it composes only once `.gitattributes` is on main and `project_root` has re-synced | `git config --get merge.ratchet-baseline.driver` on the host: empty means run `python3 scripts/merge_lane_ratchet_merge.py install` from the main checkout (it writes the shared `.git/config`, so it covers every linked worktree; `scripts/setup-host.sh` step 9 does the same on a new host). A merge or probe that instead DIES with `fatal: custom merge driver ratchet-baseline lacks command line` (exit 128) means a `merge.ratchet-baseline` section without its `driver` key: `git config --remove-section merge.ratchet-baseline`, then install. A refusal is an ordinary conflict: resolve the code, then regenerate the baseline with `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json`. While a driver merge runs under the probe, git leaves transient `.merge_file_*` files in `project_root`; they are untracked and gone when the probe returns. A raise is never authorized in the baseline file itself: it is one new file under `orchestrator/tests/merge_lane_ratchet_raises/`, which never conflicts |
-| `git commit` finishing a merge (one stopped on another file) is refused by the ratchet commit gate for a baseline raise over its 3-way bound, and `--write-baseline --authorize-raise` then prints `no measure rose; nothing recorded` | The staged baseline holds more than merging both parents can (`scripts/merge_lane_metrics.py::_both_moved_bound`; two raises of one measure compose, so the ratchet-baseline merge driver's own `ours + theirs - base` passes), and the excess is the merge's own raise; but the file on disk already holds that value, so the write gate sees nothing rising | `git checkout HEAD -- orchestrator/tests/merge_lane_ratchet_baseline.json` (ours; `--ours` does nothing once the driver resolved the file), then `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason "<why>"`: it measures from ours, records the merge's own entry file, and the commit passes. The gate's refusal prints the same recipe |
-| `scripts/setup-host.sh` §11 prints a `Network exposure:` FAIL, or `python3 scripts/check_network_exposure.py` exits 1 | Read the kind on each tagged line. `[exposed]`: a listener is bound to a wildcard address. That is `fused-memory.socket`'s `ListenStream` (`scripts/fused-memory.socket.template`), fused-memory's `server.host`, which binds `:8003` itself (`fused-memory/config/config.yaml`), or a compose `ports` entry without a `127.0.0.1:` prefix (`fused-memory/docker/docker-compose.yml`). `[not-listening]`: the named owner is down, or bound somewhere other than `127.0.0.1`. `[timed-out]`: an off-loopback connect was neither accepted nor refused, typically because a DROP rule hides whatever listens there; a timeout counts as a failure. `[unverified]`: an off-loopback connect failed with the errno the line names, so that address was not checked. `[source-error]`: `systemctl` or `ip` could not be read, usually because there is no user bus for `systemctl --user` or no `ip` binary; every port it could still find was probed | Bind the named owner to `127.0.0.1` in its committed home and restart it. A socket's `ListenStream` change needs the stop-then-start in [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts); for fused-memory that is `scripts/restart-fused-memory.sh --rebind-socket`. `plans/mcp-network-exposure-prd.md` tracks the loopback flip of today's known wildcard binds. Start a not-listening owner. For an unverified address, read the errno (a link going down, say) and rerun once the link has settled. For a source error, run the check as the login user with `XDG_RUNTIME_DIR` set. How to run the check: [§8 Network exposure check](#network-exposure-check) |
+| `git commit` finishing a merge (one stopped on another file) is refused by the ratchet commit gate for a baseline raise over its 3-way bound, and `--write-baseline --authorize-raise` then prints `no measure rose; nothing recorded` | The staged baseline holds more than merging both parents can (`scripts/merge_lane_ratchet.py::_both_moved_bound`; two raises of one measure compose, so the ratchet-baseline merge driver's own `ours + theirs - base` passes), and the excess is the merge's own raise; but the file on disk already holds that value, so the write gate sees nothing rising | `git checkout HEAD -- orchestrator/tests/merge_lane_ratchet_baseline.json` (ours; `--ours` does nothing once the driver resolved the file), then `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason "<why>"`: it measures from ours, records the merge's own entry file, and the commit passes. The gate's refusal prints the same recipe |
+| `scripts/setup-host.sh` §11 prints a `Network exposure:` FAIL, or `python3 scripts/check_network_exposure.py` exits 1 | Read the kind on each tagged line. `[exposed]`: a listener is bound to a wildcard address. That is `fused-memory.socket`'s `ListenStream` (`scripts/fused-memory.socket.template`), fused-memory's `server.host`, which binds `:8003` itself (`fused-memory/config/config.yaml`), or a compose `ports` entry without a `127.0.0.1:` prefix (`fused-memory/docker/docker-compose.yml`). `[not-listening]`: the named owner is down, or bound somewhere other than `127.0.0.1`. `[timed-out]`: an off-loopback connect was neither accepted nor refused, typically because a DROP rule hides whatever listens there; a timeout counts as a failure. `[unverified]`: an off-loopback connect failed with the errno the line names, so that address was not checked. `[source-error]`: `systemctl`, `ip` or the `docker container ls` query could not be read, usually because there is no user bus for `systemctl --user`, no `ip` binary, or no reachable docker daemon; every port it could still find was probed, and when the docker query failed, the port it asked about stays a `[not-listening]` failure. `[no-container]` is informational and never the cause of exit 1: an optional compose service has no container on this host, so nothing is expected on its port yet ([§8 Network exposure check](#network-exposure-check)) | Bind the named owner to `127.0.0.1` in its committed home and restart it. A socket's `ListenStream` change needs the stop-then-start in [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts); for fused-memory that is `scripts/restart-fused-memory.sh --rebind-socket`. `plans/mcp-network-exposure-prd.md` tracks the loopback flip of today's known wildcard binds. Start a not-listening owner. For an unverified address, read the errno (a link going down, say) and rerun once the link has settled. For a source error, run the check as the login user with `XDG_RUNTIME_DIR` set; for the docker query, also check that this user can run `docker ps`. How to run the check: [§8 Network exposure check](#network-exposure-check) |
 | A `recon_missing_index` escalation appears on the reconciliation queue (port 8103, `task_id` `graph:<group_id>`) | A registered graph lacks indices in the expected set, typically because a provisioning statement failed or the graph was born after the last restart and its first-write provisioning did not complete. `index_health.missing` names the specs | Read the `Index provisioning statement failed on graph` (or `did not complete`) journal line for that graph in `journalctl --user -u fused-memory`, fix what it names, then restart fused-memory (`scripts/restart-fused-memory.sh`, with operator sign-off): startup provisioning creates only what is missing. That restart is how the escalation's `ensure_indices(group_id=...)` suggestion is carried out, since no tool exposes it. The next reconciliation cycle re-checks it. See [§8 FalkorDB index provisioning](#falkordb-index-provisioning-expected-set-drift-the-bm25-canary-the-composite-trap) |
 | A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_queued` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
 | A reviewer verdict carried `note_dispositions` that were not applied: the info note is still pending after the review, or was later closed by the router or promoted instead of carrying the reviewer's class | One of four mechanisms. (i) The workflow rejected the entry: `orchestrator/src/orchestrator/escalation_router.py::reviewer_note_refusal` admits only a pending, router-owned info L0 of the reviewed task that is agent-filed, not mechanical, and not already held on a curator ticket, so an unknown id, another task's record, a non-info or eval-lane record, a harness or mechanical notice, or a router-disabled config is refused; a refusal logs the WARNING `info-l0-router: rejected the reviewer disposition` with the reason and emits `info_l0_dispositioned` with class `rejected_disposition`. (ii) `work` never closes a note, by design: it stamps the reviewer mark (triaged_by `reviewer-comprehensive/workflow`) and the exit router converts the note. (iii) The verdict was lost or errored, so nothing was applied: `TaskWorkflow._salvageable_verdict_payload` drops a malformed payload whole, and an ERROR verdict carries no dispositions (`orchestrator/src/orchestrator/review_payload.py::normalize_review`). (iv) Applying raised, which logs an exception and emits class `router-error` | Read the task's `info_l0_dispositioned` events (`class`, `reason`) and the journal WARNING to see which case applied. Nothing needs repairing, and a pending note must not be hand-closed: the exit finalizer, or the orphan reaper or startup amnesty, routes it, which is the designed backstop (`plans/info-l0-disposition-router-prd.md` boundary row 17). A `convert_to_task` L1 under `harness-info-l0-router` with reason `router_error` means the router already dismissed the note (`orchestrator/src/orchestrator/escalation_router.py::_promote` dismisses before it files the L1), so act on that L1, not the note. If the journal shows the ERROR `could not file its fallback L1`, the note is dismissed and its text survives only in that log line. A recurring (i) for the reviewer's own notes points at a briefing/eligibility mismatch; file it against `reviewer_notes` / `reviewer_note_refusal` |
+| A `legibility census commit did not land`, `legibility census refused by its landing gate` or `legibility trickle codebook commit failed` escalation, or one that repeats nightly | The target's pre-commit hook or the census landing gate refused a machine-written legibility write, which was quarantined and rolled back | [§12 Unlanded legibility writes and the quarantine](#unlanded-legibility-writes-and-the-quarantine) |
+| An orchestrator unit restarts every ~100 s | A startup step, or a crash site between steps, raises a process-killing fault on every start (a `BaseException` such as `SystemExit`, or a fatal step's refusal), so systemd's `Restart=` loops the unit. A non-fatal step that raises an ordinary `Exception` is reported on `orchestrator-startup-<step>` and skipped instead, and does not loop | `journalctl --user -u orchestrator-<name>.service` for the traceback. Then `sqlite3 <project_root>/data/orchestrator/runs.db "SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs ORDER BY rowid DESC LIMIT 10"`: `startup_crash:<site>` names the step, or `before-first-step` / `after-<step>` for a crash between steps; `cancelled` is a SIGTERM; a NULL `exit_reason` with `startup_completed_at` set is a start that came up. `cat <project_root>/data/orchestrator/startup_failures.json` shows the current streak. After 3 consecutive crashes at one non-fatal step, the next start skips that step and files the born-at-L2 `orchestrator-startup-crash-loop` (`orchestrator/src/orchestrator/startup_steps.py::page_crash_loop`); a fatal step, or a crash outside any step, still runs and pages the same way. The `finish_startup` of a start that comes up clears the journal, so fix the cause before the next restart. A crash the process cannot record itself (SIGKILL, an import error) is the [§8](#8-fleet-redeploy--watchdog) watchdog's `orchestrator-crash-loop-<unit>` page instead |
 
 ---
 
@@ -3618,8 +4416,8 @@ check `applied`/`restart_required` on your reload call, per
 
 | Knob | Default | Scope |
 |---|---|---|
-| `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
-| `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
+| `watcher_daily_cost_ceiling_usd` | `150.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
+| `orch_daily_cost_ceiling_usd` | `10000.0` | All orchestrator invocations (every role) for the day |
 
 **Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
 pool whose roster resolves no token is EMPTY, and every invocation then raises
@@ -3697,7 +4495,9 @@ Recurring maintenance runs as systemd **user** timers, not as orchestrator
 work. Each job is the same four files — a committed wrapper `.sh` (all the
 logic, so it is testable and runnable by hand), a thin `Type=oneshot`
 `.service` whose `ExecStart` is that wrapper, a `.timer` carrying the
-cadence, and an idempotent self-verifying `install-*-timer.sh`.
+cadence, and an idempotent self-verifying `install-*-timer.sh`. On-demand
+sweeps that have no timer, and so none of those four files, are grouped after
+the timer jobs at the end of this section.
 
 The cadence lives in the unit's `OnCalendar` — **not** in
 `dark-factory-orchestrator.yaml`. The orchestrator process is not the thing
@@ -3713,24 +4513,34 @@ cases, the same backing stores. **Check this table before adding a job** —
 
 **A row here is a claim about the host, not about `scripts/`.** An installer
 committed to main installs nothing; only running it does. So a timer job is
-done when its timer is listed, not when its installer lands. The check is one
-command: `systemctl --user list-timers --all` must list an instance for every
-row, which for a templated `@` unit means one `@<project_id>` instance per
-project. An agent cannot run the installer, because `~/.config/systemd/user/`
-is outside the sandbox write-set
+done when its timer is armed, not when its installer lands.
+`scripts/user_timers.py check` reads every timer declared in
+`scripts/expected_user_timers.py` (each row here, plus the load sampler) and
+exits non-zero naming each one that is not loaded, enabled and active, with
+the installer that arms it. `scripts/user_timers.py arm` runs the installer of
+each unarmed one and leaves a masked one alone; `scripts/setup-host.sh` §7b
+runs it, and a deterministic `before_done` deploy can run it too. Adding a row
+here means adding a `scripts/expected_user_timers.py::EXPECTED_TIMERS` entry,
+which `scripts/tests/test_expected_user_timers.py` enforces for every
+committed `.timer`. Both commands bind a templated `@` unit to the main
+checkout's own `@<project_id>` instance; an instance for any other project
+remains that project's own deploy task. `systemctl --user list-timers --all`
+stays the manual cross-check. An agent cannot run an installer, because
+`~/.config/systemd/user/` is outside the sandbox write-set
 (`orchestrator/src/orchestrator/agents/write_set.py`). The deploy is therefore
 a `task_kind='deterministic'` `before_done` task, one per project, paired with
 a liveness predicate so that a timer which stops firing is loud. History:
 tasks 2901, 4557 and 5351 (rows that were never installed); task 5400 (the
-missing `LoadState` detector).
+declared registry and its `LoadState`-aware detector).
 
 | Slot | Job | Units |
 |---|---|---|
+| 01:30 | Timeout-headroom self-check (per-test ceiling anchors and family leg budgets against the verify archive; files `escalate_info`) | `timeout-headroom-selfcheck.timer` |
 | 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
-| 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
+| 02:30 | Transcript secret sweep (leo-laptop runs its own copy) | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
-| 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`) | `fused-memory-memory-eval.timer` |
+| 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`); runs for hours because of e6, see its section | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
 | 03:45 | Quality-metrics snapshot of main, one instance per Python project (no LLM, never commits) | `quality-snapshot@.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
@@ -3745,7 +4555,8 @@ All timers carry `Persistent=true` (a night missed to a sleeping laptop is
 caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
-Per-job docs: [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
+Per-job docs: [Timeout headroom self-check (01:30)](#timeout-headroom-self-check-0130)
+for the 01:30 job; [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
 for the 02:00 job; [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
 for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
 02:15 one; the sections below for the 02:30, 03:00, 03:15, 03:45, 04:00 and 05:00 ones,
@@ -3754,6 +4565,22 @@ for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-02
 for the 06:00 one, and
 [Weekly duplicate-cluster report (Sun 06:30)](#weekly-duplicate-cluster-report-sun-0630)
 for the weekly one.
+
+**The 03:30 job is an adjunct, not the collector.** Both Mem0 marker pools
+are already drained in-cycle, unconditionally and per-project, by
+reconciliation itself — task 2853 for the `source`-tagged pool this timer
+targets, task 2966 for the `flag_for_stage2` relay pool. So a night that
+deletes **zero** records is the healthy steady state, not evidence the
+timer is broken. A zero is not self-certifying either: since task 3897 each
+run emits a `cross_check` block whose `blind_spot: true` means "saw
+nothing" rather than "there was nothing" — see the per-job doc's "Reading
+the output" section before reading a clean count as a clean bill. The
+nightly run passes no `--check`, so it reports a blind spot in `cross_check` and never
+goes `failed` on one; since task 3923 an observed blind spot fails an
+ad-hoc `--check` run by default.
+`scripts/fused-memory-flag-marker-check.sh` is the read-only ad-hoc census
+counterpart for running that same probe by hand (its `before_done` gate
+role was retired by task 3923; it refuses `--apply` outright).
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
 trickle health probe (see below). The nightly reify closure-staleness sweep and
@@ -3775,6 +4602,72 @@ harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
 reconciliation. Those residual units do **not** collide with the new 04:30 job:
 they carry a different unit name, and a re-armed sweep would merely fail
 `203/EXEC` alongside it rather than contend for anything.
+
+### Timeout headroom self-check (01:30)
+
+Each night this job re-measures the figures that the per-test timeout ceilings
+and the family verify-leg budgets were sized from (task 10940). The script is
+`scripts/timeout_headroom_selfcheck.py`. Its four files are
+`scripts/timeout-headroom-selfcheck.{sh,service,timer}` and
+`scripts/install-timeout-headroom-selfcheck-timer.sh`, which kicks no immediate
+run. Arming it is a separate deploy step: the deterministic `before_done` deploy
+or `scripts/user_timers.py arm`, as described above. This section does not
+claim the timer is armed; `scripts/user_timers.py check` answers that.
+
+- **What it reads.** The main checkout's verify archive,
+  `data/verify-logs/<task>/`: the archived junits, the attempt summaries and
+  the dispatch records. Each junit row is judged at its own run's tree, which
+  is the dispatch's `tip_sha`, else its `base_sha`, else `HEAD`. An xdist
+  worker-crash row and a row pytest-timeout killed carry no duration of their
+  own, so each anchor lists them as `censored` and `timed_out` and never judges
+  them: a hung test's junit time says where the timeout fired, not how long the
+  test takes. A judged worst row names its outcome. Nothing is kept between runs. The archive holds about seven
+  days, so the nightly scan sees every run about seven times before it ages
+  out.
+- **Check 1, per-test headroom.** Each anchor in
+  `shared/src/shared/testing_ceiling_anchors.py::registered_anchors` has a
+  population: the tests whose closest `timeout` mark is spelled through the
+  anchor's constant, or the unmarked tests for the ini default. The worst
+  member's per-test total must not exceed the ceiling divided by
+  `shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR`.
+- **Check 2, leg budget.** A registered verify leg whose tracked tree holds a
+  whole-tree guard family member must declare a `verify_command_timeout_secs`
+  of at least
+  `shared/src/shared/whole_tree_guard_family.py::min_leg_budget_for_family(W)`.
+  W is the leg's longest green `test` command in the archived summaries. A leg
+  with no green run is reported `no_run` and is not judged.
+- **Where findings go.** Each breach is one `escalate_info` (`risk_identified`,
+  agent role `timeout-headroom-selfcheck`). Its opaque `task_id` slot is
+  `timeout-headroom:<kind>:<subject>:<bound>`, where `<kind>` is
+  `per_test_headroom` or `leg_budget`. `<subject>` is the anchor id or the
+  leg's archive infix (`tests/scripts` files as `tests_scripts`), because the
+  escalation server mints `esc-<slot>` files from the slot, so it must be one
+  file-name component. A run skips any slot that has escalation
+  history (archive-inclusive), so an unresized breach is filed once however
+  its 7-day window worst drifts, up or down; the required value travels in the
+  record. A re-size changes `<bound>` and re-arms the check. The info-L0 router turns each record
+  into owned work. Ceiling re-sizing belongs to task 9396; the ini default and
+  the headroom factor belong to task 7013.
+- **The stamp.** A real run writes `data/timeout-headroom-selfcheck/state.json`
+  in the main checkout. It holds `ok`, `measured_at`, `failure`, `findings`,
+  `filed`, `skipped` and the full report of every anchor and leg. A run that
+  could not measure or act records `ok` false with the stage that failed
+  (`config`, `tree`, `archive` or `escalation`, or `unexpected` for an
+  exception none of those anticipated) and exits 2. The wrapper still
+  exits 0, for the reason every §12 job shares, and narrates `selfcheck=<rc>`
+  in `journalctl --user -u timeout-headroom-selfcheck.service`. Nothing
+  watches the stamp's age.
+
+To look now, without filing or stamping anything:
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --no-sync --project shared python scripts/timeout_headroom_selfcheck.py --dry-run          # one line per anchor and leg
+uv run --no-sync --project shared python scripts/timeout_headroom_selfcheck.py --dry-run --json   # the structured report
+```
+
+The default `--project-root` is the main checkout even from a task worktree,
+so a dry run always reads the host's archive.
 
 ### Nightly link-heal sweep (02:15)
 
@@ -3809,6 +4702,12 @@ check.
   same texts, no longer supports is recorded `superseded` and never written:
   the newest ruling stands. Only the heals in `link_heal.sweep_actions` (default `detach`,
   `relabel`) are staged; every other heal is recorded as `not_enabled`.
+  A run asks the adjudicator about at most `link_heal.max_adjudications_per_run`
+  (200) pairs it has no verdict for; verdicts it reuses do not count. The pairs
+  are taken from each project in turn, so one project's backlog cannot starve
+  the others. The rest are recorded `unexamined`, the run is partial
+  (`adjudication_capped`, exit 0) and does not move the window, so later runs
+  drain a backlog a batch at a time (task 6188).
 - **When it writes.** It writes only when `link_heal.writes: true` is set, no
   `--dry-run` is given, and the latest calibration of the adjudicator's exact
   model and prompt version passed. The prompt version is the sha256 of the
@@ -3867,8 +4766,8 @@ check.
 - **Run it by hand.** `link_heal.py sweep [--dry-run] [--project P ...]`. The
   one-off backlog run, covering everything since triage went live, is
   `link_heal.py sweep --since 2026-10-11T00:00:00+00:00`. `--since` needs a UTC
-  offset. The cap drains a large backlog over several nights. To drain it at
-  once, review the latest sweep plan document that `status` lists, then run
+  offset. The write cap, `link_heal.max_actions_per_run`, drains a large
+  backlog over several nights. To drain it at once, review the latest sweep plan document that `status` lists, then run
   `link_heal.py apply --sweep --approved-plan-sha <its sha>`. `apply --sweep`
   is refused (exit 2) while `link_heal.writes` is off, and applies the same
   write-time calibration gate.
@@ -3894,15 +4793,55 @@ check.
     each write's before and after snapshots. An undone heal keeps its action
     and after-state and names the undo run that took it back. The records are
     append-only and never pruned.
-- **Exit codes.** 0 when the run is complete, or partial only by the cap or
-  stale skips. 1 on a read, adjudication or write failure, a stopped run, or a
-  report it could not write.
+  - The run's M1 metric series, through `shared.memory_eval_metrics`, in the
+    main checkout's `fused-memory/data/memory-evals/link-heal/metrics-<STAMP>.json`
+    (with `report-<STAMP>.txt`), its `limits-current.json` and the rolling
+    `summary.json` beside it. Every metric is a reported scalar, so the limits
+    artifact never alarms; it is there because the dashboard reads a
+    memory-eval directory with runs and no limits as a failed evaluator. The
+    summary holds six top-level numbers over the runs stamped in the last 7
+    days: `runs_7d`, `writing_runs_7d`, `would_escape_7d`,
+    `adjudication_failure_rate_7d`, `actions_planned_7d` and `skipped_cap_7d`,
+    plus `run_days_7d`, `adjudications_asked_7d`, `adjudication_failed_7d` and
+    `adjudication_capped_7d`. Gate θ (task 6191) reads `runs_7d`,
+    `would_escape_7d` and `adjudication_failure_rate_7d`. Every sweep run counts,
+    `--dry-run` and `--since` runs included, so a burst of hand runs raises
+    `runs_7d`; `run_days_7d`, the distinct UTC days with a run, does not.
+    `skipped_cap_7d` stays 0 while writes are off. The rate is 0.0 when nothing
+    was asked, and `adjudications_asked_7d` shows the denominator. The run-report
+    escalation names `summary.json`, and its summary line also names the failure
+    when the metrics could not be written (`metrics_unwritten`). The summary
+    also carries `expires_at`, 28 h after its window ends
+    (`fused-memory/src/fused_memory/maintenance/link_heal_metrics.py::SUMMARY_TTL`).
+    That is the longest gap between two 02:15 runs (25 h, at the autumn clock
+    change) plus the 5-minute jitter, and leaves a run just under 3 h to write
+    its summary. `scripts/check_write_triage_readiness_gate.py` fails any gate
+    on a report past its `expires_at`, so θ's own predicate run fails closed on
+    a summary no run has replaced, whether the run was refused (exit 2),
+    crashed, or the timer stopped firing; one missed night is enough. θ's
+    delivered-checks re-run fails closed only once main next advances: the
+    scheduler caches a passing delivered check per main SHA
+    (`orchestrator/src/orchestrator/scheduler.py::Scheduler._compute_delivered_check_cache`).
+    A summary without `expires_at`, as written before task 11287, never
+    expires; the first run that writes its metrics replaces it. A run whose metrics could
+    not be written also removes the previous `summary.json`, because it no
+    longer counts tonight. If even that removal fails, the run-report
+    escalation's detail (not its summary line) and the sweep's JSON output
+    name the failure as `stale_summary_unremoved`.
+- **Exit codes.** 0 when the run is complete, or partial only by the write or
+  adjudication cap or stale skips. 1 on a read, adjudication or write failure,
+  a stopped run, or a report or metrics it could not write.
   2 when the run was refused before it started.
 
 ### Transcript secret sweep (02:30)
 
-Agent subprocesses inherit no secret-bearing variable except their own
-`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`). Verify and
+Agent subprocesses inherit no secret-bearing variable except the credentials
+their backend names (`shared/src/shared/secret_env.py::agent_subprocess_env`).
+A Claude child keeps only its own `CLAUDE_CODE_OAUTH_TOKEN`. codex, gemini and
+pi keep only their provider keys
+(`orchestrator/src/orchestrator/agents/invoke.py::CODEX_CREDENTIAL_VARS`,
+`GEMINI_CREDENTIAL_VARS`, `PI_CREDENTIAL_VARS`). The `CLAUDE_OAUTH_TOKEN_*`
+pool never reaches any agent child. Verify and
 offline-lane children, a target project's build and test runs, inherit every
 credential except the `CLAUDE_OAUTH_TOKEN_*` account pool
 (`shared/src/shared/secret_env.py::without_account_pool`, task 6828); that
@@ -3916,12 +4855,42 @@ everything already on disk.
   `~/.config/systemd/user/orchestrator-*.service`) and under
   `~/.claude/projects`, subagent transcripts included. It also scans the
   `*.jsonl.archive-tmp` staging copies a hard kill can strand mid-archive,
-  which are redacted only after they are staged.
+  which are redacted only after they are staged. Under each of those project
+  roots it also scans `data/verify-logs` and `data/orchestrator/offline-lane`.
+  In both it scans `*.log`, `*.json` and `*.xml`, and the gzipped junit
+  `*.xml.gz`. A `*.xml.gz` is redacted by decompressing it, replacing the
+  value and recompressing it, with mode and mtime kept. These logs were added
+  after failing pytest env assertions printed live tokens into them (task
+  10144). `~/.claude/projects` is still scanned for transcripts only. Last,
+  it scans pytest's per-user base temp (`/tmp/pytest-of-<user>`,
+  `--pytest-tmp-dir`), where env-capturing tests leave raw environment
+  dumps, but only files named like one
+  (`scripts/transcript_secret_sweep.py::PYTEST_ENV_DUMP_SUFFIXES`). Reading
+  every file there is not cheap: the 2026-11-15 run read 821,808 files, and
+  every one of its hits had one of those names. A file or directory pytest
+  prunes mid-walk is passed over, not reported unreadable. An orchestrated
+  project's transcript archive and `~/.claude/projects` are required roots;
+  `data/verify-logs`, `data/orchestrator/offline-lane` and the pytest base
+  temp are optional, because most projects have no offline lane, a project
+  has no verify logs before its first verify, and a host that has not run
+  pytest has no base temp. The full tree list, with each root's required
+  flag, is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
-  pattern. Each hit is replaced in place, by the 2026-10-11 method: a
+  pattern. A value is matched in the form the file holds it: JSON-escaped in
+  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, a `*.bin` or an
+  `env-dump`, and entity-escaped in junit text and attribute values. A value a
+  log cut short is matched too: at least
+  `shared/src/shared/secret_redaction.py::MIN_TRUNCATED_PREFIX_LEN` leading
+  characters of it, followed by `...`, `…` or a closing quote or bracket (in
+  the file's escaped form), are replaced by a placeholder of the same length.
+  Each hit is replaced in place, by the
+  2026-10-11 method: a
   `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
-  mtime kept, no backup. A rewrite that would break a JSON line is refused
+  mtime kept, no backup. In XML the placeholder is entity-escaped
+  (`&lt;redacted:VAR&gt;`), so a junit report still parses and reads as
+  `<redacted:VAR>`. `scripts/suite_census_evidence.py` reads these reports as
+  census evidence. A rewrite that would break a JSON line is refused
   for that line only: the line keeps its value, the rest of the file is still
   redacted, and the escalation names the path, the line and the variable.
 - **What it cannot see.** A secret defined only in another factory project's
@@ -3931,16 +4900,62 @@ everything already on disk.
 - **What it files.** One `risk_identified` info escalation per sweep that
   redacted or refused anything, naming each path with its per-variable counts.
   It prints one JSON record line to the journal, and never prints a value.
+  A `*.xml.gz` that does not decompress is listed under `unreadable` in that
+  record line and left as found.
+- **What it files when it cannot cover its roots.** When the sweep cannot run
+  (no secret-bearing values in its environment, e.g. `.env` moved or its
+  variables renamed), cannot find a required root, cannot read an
+  orchestrator unit, or finds no unit naming a project root (a renamed or
+  moved unit), it files one `infra_issue` info escalation (task_id
+  `transcript-secret-sweep-shortfall`) naming each shortfall, and exits 2.
+  The wrapper still exits 0, as every §12 job does, so the escalation is the
+  signal. A failing night re-files: one escalation per night until it is
+  fixed. The archive directory is created when a project archives its first
+  transcript, so a newly onboarded project reports its archive missing until
+  then; that shortfall clears itself. A root a host config names
+  (`--host-configs-dir`, the laptop) has no archive requirement: a verify host
+  archives no agent transcripts, and none of the laptop's four roots had an
+  archive when measured on 2026-11-19. Under `--dry-run` or `--no-escalation`
+  a shortfall is printed and exits 2 but is not filed. The wrapper resolves
+  `uv` via `scripts/lib/resolve_uv.sh`, so a boot catch-up run without the
+  login PATH still finds it.
 - **What it skips.** Files modified in the last 15 minutes, which a live
-  session may still be appending to. The next night picks them up.
+  session or test run may still be appending to. The next night picks them up.
+- **A dry run.** `--dry-run` rewrites nothing and files nothing. Its record
+  line lists under `matched` every file a real run would redact, with
+  per-variable counts. The wrapper forwards its arguments and sources `.env`,
+  so on the workstation run
+  `/home/leo/src/dark-factory/scripts/transcript-secret-sweep.sh --dry-run`.
+  After a real run, a dry run should list nothing.
 
 Installing it is a post-merge deterministic deploy
 (`scripts/install-transcript-secret-sweep-timer.sh`, which kicks no immediate
 run). For a run now: `systemctl --user start transcript-secret-sweep.service`.
+
 At archive time a refused redaction is counted like any other archival
 failure (`transcript_archive: failed to redact` WARNING), and the transcript is
 held rather than archived with its value. At teardown, its other lines are
 still redacted in place.
+
+**On leo-laptop.** The laptop runs the same timer, service and wrapper from
+its own checkout. They are installed from the workstation by
+`scripts/deploy/install_laptop_transcript_secret_sweep.sh`, a post-merge
+deterministic deploy (run it with `--check` first). The laptop sweep sources
+the laptop's own `.env`, which holds a different slice of the pool, so no
+value crosses the wire. A drop-in (`scripts/transcript-secret-sweep.laptop.conf`)
+adds two flags:
+
+- `--host-configs-dir /home/leo/.config/orchestrator`, because the laptop has
+  no orchestrator units. Its verify configs there name its project roots.
+- `--no-escalation`, because the escalation server binds 127.0.0.1 on the
+  workstation. Laptop findings are therefore in the laptop journal only:
+  `ssh leo-laptop journalctl --user -u transcript-secret-sweep.service`.
+
+It is a user timer, so it fires only while leo's user manager runs. Lingering
+was off on the laptop when measured on 2026-11-16, and `Persistent=true`
+catches up a missed night. A laptop dry run:
+`ssh leo-laptop 'PATH=$HOME/.local/bin:$PATH /home/leo/src/dark-factory/scripts/transcript-secret-sweep.sh --host-configs-dir /home/leo/.config/orchestrator --no-escalation --dry-run'`
+(uv is not on a non-login ssh PATH).
 
 ### Legibility trickle accounts (03:00)
 
@@ -4057,7 +5072,8 @@ exhaustions, each prefixed with the label:
   loud `legibility account pool resolved NO usable accounts` warning naming the
   roster, or with `legibility account pool could not load its roster` when the
   file is unreadable or malformed. The night is still recorded as DEFERRED
-  rather than crashing (task 5635).
+  rather than crashing (task 5635), so after a week of it the trickle health
+  probe's deferred-streak verdict fires.
 - `<label>: no account completed this invocation in one pass over the
   7-account pool and the gate still considers max-c usable — so this is not a
   capacity limit ...`. This is neither weather nor a missing token: every
@@ -4107,12 +5123,30 @@ resolves one: the watcher is the sole closer.
 | `scripts/fused-memory-memory-eval.timer` | `OnCalendar=*-*-* 03:15:00` |
 | `scripts/install-memory-eval-timer.sh` | Installer |
 | `fused-memory/scripts/memory_eval_runner.py` | The runner and its producer registry |
-| `fused-memory/config/memory-eval.yaml` | Every threshold, including the storm limit K; `runs_per_quarter` must count the timer's cadence (a test pins it) |
+| `fused-memory/config/memory-eval.yaml` | Every threshold, including the storm limit K; `runs_per_quarter` must count the timer's cadence (a test pins it). Also each producer's wall-clock bound: `producer_timeout_secs`, which `producer_timeout_secs_by_eval` overrides per eval |
 
 **Artifacts** live under `fused-memory/data/memory-evals/`: one directory per
 eval (its M1 series, reports and `limits-current.json`), plus
 `verdicts-<STAMP>.json`, `verdicts-current.json` (what the dashboard reads)
 and `run-report-<STAMP>.txt` at the root.
+
+**A run takes hours, because of e6.** `e6-corpus-health` has its own bound in
+`producer_timeout_secs_by_eval`: its lexical sweep of all three Mem0
+categories runs for hours (task 9961). The runner writes the verdicts and the
+run report only after the last producer finishes, so a run's verdicts land
+hours after 03:15. e6 finishes its Qdrant reads in its first few minutes. The
+rest is single-core CPU, so it overlaps the later ladder slots on CPU only.
+To check e6 against its bound in the scheduled context, look in
+`journalctl --user -u fused-memory-memory-eval.service` under
+`--- producer e6-corpus-health output ---`. Read the timestamps inside its
+log lines, not the journal's own, because the runner relays a producer's
+output only after the producer exits, and relays its stdout (e6's JSON plan,
+which has no timestamps) before its stderr log. The first timestamped line
+starts the sweep, and its `Wrote metrics artifact` line marks the end. A
+`TimeoutExpired` for e6 in the run report means its sweep ran past the bound.
+That run never logs `Wrote metrics artifact`, so it gives only a lower bound,
+the bound itself. Size the new bound from the last run that completed, or
+raise it and re-measure.
 
 **The first run is the grandfather snapshot.** An eval with no
 `limits-current.json` records today's failures as known-bad and alarms on
@@ -4354,6 +5388,29 @@ is how an operator ends up tuning the sampler for a crashed coder:
   at zero the night is simply unfinished and where signal stopped is
   **unknown** (the nightly records its crash sentinel before the digest
   stage, so a `failed` night with nothing selected is ordinary).
+- **owed date past recovery** — the retry backlog holds an owed date that the
+  next night will abandon as older than `RETRY_MAX_AGE_DAYS` (7) days
+  (`scripts/legibility/trickle_state.py::unrecoverable_owed_date`); the verdict
+  names it. Retries run only after a finished pass, one per night, so it takes
+  about a week of passes that did not finish. A pure deferral reaches it on its
+  seventh consecutive night. The check reads the backlog, not a streak count,
+  so one failed night inside the deferral counts the same, as does a finished
+  night whose retry was itself capped, and a manual `nightly.py run --date`
+  pass moves it only through what it does to the backlog. One deferred night
+  is weather; a week has outlasted a
+  weekly cap reset, and each further night that does not finish loses one more
+  date. The verdict reports `consecutive_deferred_runs`,
+  `consecutive_failed_runs` and the last recorded outcome and exit code. Read
+  the DEFERRED reason in `journalctl --user -u legibility-trickle@<project>`
+  (the verdict prints the `--since` window), and for a failed run its error.
+  `no pool accounts resolved` is a config fault that never clears on its own
+  (task 5635), and accounts named with credentials rejected need operator
+  action; see the pool exhaustions under "Legibility trickle accounts
+  (03:00)". Only an all-capped pool is weather, and then there is nothing to
+  do. The abandoned dates' sessions stay minable by the census within
+  `census.ledger_retention_days`. A failed streak takes precedence over this
+  verdict, and this verdict takes precedence over the barren ones; it names no
+  door and reports the carried `consecutive_barren_runs`.
 - **`barren` streak** — the run completed and the sampler's doors dropped
   everything. Compare `budgets.max_daily_digest_bytes` against
   `sampling.top_fraction` / `per_stratum_min`; the verdict names which door
@@ -4370,14 +5427,19 @@ is how an operator ends up tuning the sampler for a crashed coder:
   but the last recorded run was `deferred`: the usage cap deferred its
   coding, so it re-observed neither door. The streak is still unresolved.
   There is no crash to clear and no door to name; the deferral clears at the
-  cap reset, so re-read the probe once a run has completed.
+  cap reset, so re-read the probe once a run has completed. This applies only
+  while no owed date is past recovery; once one is, the owed-date verdict
+  above replaces it.
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.
 - **`deferred`** — a usage-cap night (`coder.is_cap_deferral`): its digests
   were selected and the cap deferred their coding. No action; it self-clears
-  at the reset. It keeps `last_productive_at` and both streaks unchanged and
-  owes its date a retry (see "Retried nights").
+  at the reset. It keeps `last_productive_at`, the barren streak and the
+  failed streak unchanged, adds one to `consecutive_deferred_runs`, and owes
+  its date a retry (see "Retried nights"). A finished night resets
+  `consecutive_deferred_runs` and a failed one carries it. No verdict reads
+  that count; the OK line reports it.
 - **census fired without advancing** — the census trigger FIREd on at least N
   (default 3) consecutive recorded trickle nights while `last_census_at`
   stayed put, and every such night launches a paid census. A census deferred
@@ -4387,7 +5449,9 @@ is how an operator ends up tuning the sampler for a crashed coder:
   the verdict names `<since>` and the outcome lines to look for. Nights where
   the trigger was not evaluated (a failed or capped trickle) neither break nor
   extend the streak. A census that advances clears the verdict at once,
-  because the probe re-reads census-state live.
+  because the probe re-reads census-state live. For the `census: commit did
+  not land` and landing-gate shapes, see
+  [Unlanded legibility writes and the quarantine](#unlanded-legibility-writes-and-the-quarantine).
 
 **Retried nights** (task 5678). A night that did not finish (a non-zero exit,
 or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
@@ -4414,6 +5478,22 @@ mistaken for a gap. When every later night finishes, an outage of up to
 each later night that does not finish costs the oldest owed date. Never-run
 dates already past the window are abandoned in one WARNING,
 `abandoning <n> never-run date(s) <first>..<last>`.
+The 03:00 scheduled pass after a post-midnight catch-up re-targets the date
+the catch-up already ran. Because the schedule cursor has already reached
+that date, that pass draws the night's full sample again and codes only the
+selected sessions the session ledger does not hold, so it never re-codes a
+session the catch-up ledgered (task 7025;
+`scripts/legibility/nightly.py::_ledger_skips`). Its journal says how many
+it left out: `<k> of <n> selected session(s) already-coded, not re-coded`.
+The sample is not guaranteed to be the catch-up's: a session that was still
+running at the catch-up has grown by 03:00, which can change its stratum,
+its dedupe representative or the budget cut, so the pass may code a session
+the catch-up did not select. A manual `--date` pass still re-codes
+everything.
+The progress probe's OK line prints `consecutive_deferred_runs=<n>` and
+`retry_backlog=<n> owed (oldest <date>, window 7 days)` (`retry_backlog=0 owed`
+when nothing is owed), so a growing deferral or backlog is visible before any
+verdict fires.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own
@@ -4433,11 +5513,21 @@ info escalation, on the first night after deploy, and its detail says why.
 Those silence cases apply to the progress and liveness probes only: a
 census-probe failure **always** posts, because nothing else escalates an
 unadvanced-fire streak. A non-zero exit is the authoritative signal whether or
-not the POST landed.
+not the POST landed. The owed-date-past-recovery verdict posts like any other
+failing progress verdict. When its last night was deferred or failed, that
+night recorded `barren_escalated: false`, so nothing suppresses it.
 
-The nightly escalates once per streak, on the night the barren streak reaches
-its threshold: `trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or
-`nightly.py run --max-barren-runs N`. To read whether it did, run
+The nightly escalates when the barren streak reaches its threshold
+(`trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or
+`nightly.py run --max-barren-runs N`), again on a bounded doubling of it (the
+threshold times each entry of
+`scripts/legibility/trickle_state.py::BARREN_ESCALATION_MULTIPLES`), and then
+not again for that streak. The schedule counts streak values, not nights: a
+failed or deferred night carries the streak without advancing it. A productive
+or quiet night resets the schedule. On
+every other night of a streak at or past the threshold this health probe posts,
+because that night's record says `barren_escalated: false`. To read whether the
+nightly escalated, run
 `python3 scripts/legibility/check_trickle_progress.py <project> <N>`: every
 verdict on a readable record, and its OK line, prints `barren_escalated=` as
 `True`, `False`, or `unrecorded`.
@@ -4464,6 +5554,133 @@ lever. **No shipped unit sets it** — production always takes the anchored
 branch — and if you do set it, set it for **both** units at once: pinning one
 half is exactly how the writer/reader divergence comes back.
 
+### Unlanded legibility writes and the quarantine
+
+**What happens.** The trickle's codebook dump
+(`scripts/legibility/nightly.py::_commit_stage`) and the census's outputs
+(`scripts/legibility/census_run.py::persist`: the report `.md`, its `.json`
+record, the codebook, `census-state.json`, and the payloads file under
+`--dry-run-filing`) are committed into the target's main checkout by
+`scripts/legibility/unlanded.py::commit_only`, which never skips the hooks. A
+write does not land when the pre-commit hook refuses it, when a lock is still
+contended after `unlanded.py::COMMIT_ATTEMPTS` attempts, when git fails for
+any other reason, or, for the census only, when its `census.landing_gate`
+command does not pass (`scripts/legibility/landing_gate.py`).
+
+Then `unlanded.py::roll_back` copies every written file into a fresh
+quarantine dir FIRST, and only then restores those paths to HEAD in the index
+and the worktree; a path HEAD does not track is deleted. If the copy cannot be
+made, the checkout is left untouched (dirty) instead. `census-state.json`
+rolls back with the rest, so `last_census_at` and the session watermark do not
+move, and the trigger fires again on its next evaluation. Three effects are
+not undone, or were never made:
+
+- Census remediation tickets are filed before the commit; the escalation
+  lists them.
+- Census sessions are ledgered only after a landed commit, so none are
+  ledgered.
+- A trickle night is recorded `failed`, and neither its ledger nor its census
+  stage runs. Its date is re-coded later (see "Retried nights" under
+  [Legibility trickle health probe (04:30)](#legibility-trickle-health-probe-0430)).
+
+**Reading the escalation.** Each is an `escalate_info` with
+`category=infra_issue` and `severity=info`
+(`scripts/legibility/alarm.py::raise_alarm`), under
+`task_id=legibility-census-<project_id>` or
+`legibility-trickle-<project_id>`. Summaries
+(`census_run.py::_unlanded`, `_commit_refusal`, `_gate_refusal`;
+`nightly.py::_commit_stage`):
+
+- `legibility census commit did not land (<project_id>): outputs rolled back, census-state NOT advanced`
+- `legibility census refused by its landing gate (<project_id>): outputs rolled back, census-state NOT advanced`
+- either census headline followed by `(<project_id>): rollback INCOMPLETE, outputs still dirty in the checkout`
+- `legibility trickle codebook commit failed`
+
+The detail opens with git's diagnostic (the trickle's may be the committer's
+traceback instead), or with the gate command's verdict and its output tail. Next
+comes `refused content quarantined at <dir>; restored to HEAD: <paths>`, or
+`rollback INCOMPLETE: <why>`, either one ending with a pointer to this section.
+A census detail then lists the tickets filed before the commit. The census
+child's own stderr line (`census: commit did not land -- ...` or
+`census: landing gate refused the census -- ...`; census.py exits 1) is in
+`journalctl --user -u legibility-trickle@<project_id>`.
+
+**Where the quarantine is.** `<quarantine root>/<label>-<random>/<repo-relative path>`,
+where `<quarantine root>` is `quarantine/` in the directory holding
+`trickle-state.json`; its resolution and the
+`DARK_FACTORY_LEGIBILITY_STATE_ROOT` lever are in "Where the state file lives"
+above. Print it from its one home, `scripts/legibility/unlanded.py::quarantine_root`,
+in a dark-factory checkout root:
+`python3 -c 'import sys; sys.path.insert(0, "scripts"); from legibility import unlanded; print(unlanded.quarantine_root("<project_id>"))'`.
+`<label>` is `trickle-<target date>` or `census-<census date>`. Use the dir the
+escalation names. To list them newest first, `ls -lt <quarantine root>`; to see
+what one holds, `find <dir> -type f`.
+
+**Recovering.**
+
+1. Fix why the write did not land first: the escalation names git's
+   diagnostic or the gate command, which you can re-run by hand in the
+   checkout.
+2. Diff before you copy, for each file:
+   `git diff --no-index <project_root>/<path> <dir>/<path>`. Lines the copy
+   would REMOVE (`-` lines) are content that landed after the refusal, such as
+   a later trickle night's sightings; then do not overwrite. Never re-apply a
+   census's `census-state.json` once a later census has landed.
+3. Decide whether to re-apply at all. For the trickle it is optional: the
+   retry backlog re-codes the date. For the census it is optional too, since
+   the next fire re-mines the window, but that pays for another census and
+   files its tickets again, relying on the curator's dedup. Re-applying keeps
+   the codebook's back-links to the tickets already filed
+   (`census_run.py::_after_filing`). It does not ledger the census's sessions,
+   which only a run whose own commit landed does
+   (`census_run.py::_ledger_census_codings`), so the next census re-mines any
+   of them its window still covers, the same re-mine cost a failed ledger
+   write has.
+4. Re-apply with a normal hooked commit, per
+   [§9](#9-working-in-the-main-checkout): copy the files to their repo paths,
+   then `git -C <project_root> add -- <paths>` and
+   `git -C <project_root> commit --only -m '<msg>' -- <paths>`. **Never
+   `--no-verify`.** If the hook refuses again, the cause is not fixed: put the
+   paths back with
+   `git -C <project_root> restore --source=HEAD --staged --worktree -- <paths HEAD tracks>`
+   and `git -C <project_root> rm -f -- <paths HEAD does not track>`, and
+   return to step 1.
+
+**Cleaning up.** Once the content is on main, or you have decided to drop it,
+`rm -r <dir>`. Nothing else reads a quarantine dir, and nothing expires one.
+
+**Rollback INCOMPLETE.** The paths are still dirty in the main checkout, which
+blocks the target's redeploys and trips the dirty-tree guard
+([§10](#10-troubleshooting)), so fix this first. If a quarantine dir is named,
+confirm it holds every written file by comparing it with the checkout; if none
+is named, copy the files out yourself. Then restore those paths to HEAD as in
+step 4.
+
+**Breaking a repeated-unlanded-census loop.** The signs: the same census
+escalation recurs on every FIRE night, each adding a `census-<date>-*` dir
+(`ls -d <quarantine root>/census-*` counts them), and after
+`trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES` fires the 04:30 probe's
+"census fired without advancing" verdict appears. Each repeat pays again for
+mining, verify and synthesis. Two levers:
+
+1. **Fix the cause** in the target repo (its hook, or the gate's failing
+   tests) through a normal task. If the gate refuses the census's OWN output,
+   that is a census defect: file it, and do not loosen the gate.
+2. **Pause.** `legibility.yaml` has no census-only switch, so stop the trickle
+   timer, which pauses the trickle and the census it launches:
+   `systemctl --user stop legibility-trickle@<project_id>.timer`, or
+   `disable --now` to survive a reboot. Do not stop a running
+   `legibility-trickle@<project_id>.service`: that kills a census mid-run.
+   While paused, the 04:30 probe reports the recorder stale, as expected.
+   Resume only after lever 1, with `systemctl --user start` (or
+   `enable --now`) on the timer, or by re-running
+   `scripts/legibility/install-trickle-timer.sh <project_id>`.
+   `Persistent=true` then starts a catch-up run at once, and the missed
+   nights enter the retry backlog ("Retried nights").
+
+Do not edit `legibility.yaml` uncommitted in the main checkout to pause it:
+that trips the same dirty-tree guard.
+
 ### Nightly legibility transcript check (04:00)
 
 **What it does.** Runs `check_transcript_persistence.py`, task 2893's
@@ -4473,14 +5690,41 @@ means a lost-transcript finding; the detector also best-effort POSTs an
 `escalate_info`, but the non-zero exit is the authoritative signal, since a
 down escalation server is swallowed. So a night with a finding leaves the
 unit `failed`. That is the alarm, not a broken unit, and the liveness probe
-below tells the two apart.
+below tells the two apart. A record the session reaper marked orphaned
+(exit_code 200, `orchestrator/src/orchestrator/session_reaper.py::ORPHAN_EXIT_CODE`)
+that no session hook ever bound (no `claude_session_id` or
+`claude_launch_session_id`) is not checked, because nothing shows its
+session started. The unit's output line counts such records ("N unbound
+orphan record(s) not checked") without changing the exit code. A sudden rise
+in that count means hooks stopped binding session ids, which would also hide
+lost transcripts from sibling-mode spawns.
 
-**Why no `--check-preventer`.** The comment in
-`legibility-transcript-check@.service` (task 2901 DD2) says the 2893 guard
-regex missed `spawn-claude.sh`'s mid-line export, so the flag would make the
-timer exit 1 every night. Task 2923 fixed that regex on 2026-07-23. Measured
-on 2026-09-24, the guard finds the export, so the comment is stale. Whether to
-enable the flag is an open decision owned by task 5859.
+**Why no `--check-preventer`.** With the flag, the detector also exits 1 when `skills/spawn/spawn-claude.sh` stops
+exporting `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`. Task 5859 decided to
+leave it off. The reason task 2901 gave (DD2: the guard regex missed the
+script's mid-line export, so the timer would exit 1 every night) has been
+false since task 2923 fixed the regex on 2026-07-23, and
+`scripts/tests/test_legibility_transcript_persistence.py::test_main_check_preventer_passes_on_committed_spawn_script`
+now pins that the guard recognises the committed script. The current
+reasons:
+
+- **The export is already a merge gate.**
+  `tests/scripts/test_spawn_claude.py::test_spawn_exports_session_and_parent_ids`
+  and `::test_spawn_id_exports_fail_soft_when_registry_faults` run the real
+  script against a fake `claude` and assert the child sees the variable set
+  to `1`, so a change that drops the export cannot land. The nightly guard
+  would only re-check a tracked file after the fact, by regex.
+- **A preventer-only failure files nothing.** `run_check` POSTs only when
+  there is a lost-transcript finding, and the liveness probe reads exit 1 as
+  ALIVE, so no reader is bound to that exit.
+- **It would give exit 1 a second meaning**, where this section and the
+  probe read it as a lost-transcript finding.
+- **It is not per-project.** The guard reads the dark-factory checkout's
+  spawn script whatever `%i` names, so the `dark_factory` and `reify`
+  instances would both report the same fact.
+
+The r6 chain carrier (task 4681, below) runs the same command without the
+flag and inherits this decision.
 
 | File | Role |
 |---|---|
@@ -4564,6 +5808,23 @@ run, so ~470 KiB once the retention window is full** — the bound the cap
 buys, worth knowing before reading the per-night figure below, because the
 file is rewritten whole every night rather than appended to in place.
 
+**Reading the `kind` vocabulary drift block.** The JSON's top-level
+`kind_registry_drift` (schema 6) and the markdown's `## Kind vocabulary drift`
+score the live `kind` population against the frozen
+`memory_metadata.KIND_REGISTRY`. `unregistered` lists live values that are not
+in the registry; `absent_from_corpus` lists registry values with no live
+record. A growing unregistered count is the **expected** steady state: PRD §10
+open question 1 was ruled option (b), so `kind` membership only warns (a
+non-str `kind` is still a fatal type defect under `memory_metadata.enforce`).
+Do not top up the registry, regenerate the frozen oracle fixture, or file a
+"registry is stale" task. What is worth a look is a step change in `unregistered_records`
+concentrated on a few values. That means a first-party writer started emitting
+an unregistered kind, as `fused-memory/scripts/cleanup_pin_queue_edges.py` does
+with `pin_queue_edge_cleanup_audit`. The trend is
+`git log -p plans/memory-metadata-census-report.md`. The old
+`memory_metadata.enforce_kind_registry` key is retired: a fused-memory config
+still carrying it loads with a `retired key(s)` WARNING, so delete the line.
+
 **What landing all three nightly costs, stated rather than assumed.** The
 two report artifacts are full rewrites every run (measured: JSON 1.04 MiB /
 markdown 223 KiB raw; 90 KiB / 47 KiB zlib-compressed, which is what git
@@ -4591,7 +5852,7 @@ the invocation the wrapper makes, on the generation worktree's own copy of
 the script (below), so the report's recorded paths stay repo-relative:
 
 ```bash
-uv run --frozen --project fused-memory python \
+uv run --no-sync --project fused-memory python \
     fused-memory/scripts/census_memory_metadata.py --top-n 400
 ```
 
@@ -4744,7 +6005,7 @@ probe's docstring points here.
 stamps stays an operator decision, run by hand after reading the rehearsal:
 
 ```bash
-uv run --frozen --project fused-memory python \
+uv run --no-sync --project fused-memory python \
     fused-memory/scripts/retro_stamp_topics.py --apply
 ```
 
@@ -4854,8 +6115,8 @@ is no commit seam, unlike the 05:00 census:
 from the repo root:
 
 ```bash
-uv run --frozen --project shared python scripts/sitting/nightly_prepare.py
-uv run --frozen --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
+uv run --no-sync --project shared python scripts/sitting/nightly_prepare.py
+uv run --no-sync --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
 ```
 
 The first spends a Fable budget. For a **no-cost re-render**, skip it:
@@ -5068,6 +6329,25 @@ The ladder row above is a host claim. An agent cannot run the installer (see
 `systemctl --user list-timers --all` lists
 `fused-memory-duplicate-audit.timer`.
 
+### Plan-decision cross-pairing scan (on demand, no timer)
+
+To look for plans whose `design_decisions` entries pair a decision with the
+wrong rationale, re-run the read-only scanner rather than quote the dated
+figures: `python scripts/scan_plan_decision_pairing.py`. It sees only the
+mis-pairings someone noticed and documented in a later correction entry, so
+every count it reports, zero included, is a strict lower bound and never
+evidence that plans are clean. Unattended, use
+`python scripts/scan_plan_decision_pairing.py --fail-on-hit --require-scanned 1`;
+plain `--fail-on-hit` exits 0 when the sweep read nothing (exit 3 is the
+coverage floor). That gate is red from day one and stays red: on 2026-11-15,
+against the default root, it exited 1 on 27 historical mis-pairings in 24
+plans, and those cannot be repaired. For a gate that starts green, pass
+`--require-scanned 1` without `--fail-on-hit`, or compare the `--json` hit
+count against a recorded baseline. The findings, why repair is impossible, and
+why no write-time containment exists are in
+[docs/plan-decision-cross-pairing.md](docs/plan-decision-cross-pairing.md); see
+the CHANGELOG entry for task 3967.
+
 ---
 
 ## 12a. INV-12 `exceptions-owned-or-ratified`: the exception register and owner sweep
@@ -5164,8 +6444,12 @@ PRD D11 accepts this. If the timer stops firing, only someone who runs
 
 ### What the sweep files
 
-Each finding has a key, and a run skips a finding whose key a live task or a
-pending escalation already carries.
+Each finding has a key. A run skips a finding whose key a live task or a
+pending escalation carries, or that a live task converted from one of the
+key's escalations answers. That is an exact `metadata.escalation_id` match
+against every escalation ever filed in the key's `task_id` slot, read
+archive-inclusive, so the info-L0 router dismissing a note no longer makes the
+next night file it again. The ladder is `scripts/exception_owner_sweep.py::decide`.
 
 - **Dead owner, inline scope:** a task carrying `x_inv12_finding`. Its remedy
   is `scripts/exception_owner_sweep.py::_DEAD_OWNER_REMEDY`: re-own each site
@@ -5177,18 +6461,28 @@ pending escalation already carries.
   baseline). It recurs by design.
 - **More than `scripts/exception_owner_sweep.py::MAX_OUTPUTS_PER_RUN` outputs
   in one run:** one roll-up escalation. The rest wait for the next run.
-- **A closed dead-owner task whose owner is still dead:** an escalation, never
-  a re-file.
+- **A dead-owner task no longer open (closed or deferred) whose owner is still
+  dead:** an escalation, never a re-file, whose summary names that task and its
+  status. A task converted from one of the finding's escalations counts the
+  same.
 - **A live cited owner:** an `x_inv12_owns` note merged into its metadata.
 
-**Known gap.** The sweep treats a named-list finding as already raised only
-while its escalation is pending (`scripts/exception_owner_sweep.py::decide`).
-The info-L0 router dismisses info notes within about ten minutes, so the same
-note is filed again every night until the entry is re-owned. The dead task-6201
-citation in `_WALL_CLOCK_DEADLINE_DEBT` has been escalated nightly since
-2026-10-29; task 7693 owns re-owning it. Separately, the finding bodies say to
-run `--report` to see the findings, but `--report` lists none: use `--dry-run`.
-Task 9468 owns both fixes, and updates this paragraph when either lands.
+The dead-owner and roll-up bodies name
+`uv run --project shared python scripts/exception_owner_sweep.py --dry-run`,
+which lists each cited owner's verdict and planned step now. `--report` lists
+no findings.
+
+**Residual.** A conversion the curator combined onto a task whose
+`metadata.escalation_id` names none of the key's escalations is invisible to
+the sweep. That finding is escalated again each night until a task carrying
+one of its escalation ids appears, or the entry is re-owned. A home task that
+closes or is deferred while the owner is still dead is escalated once per such
+change. That escalation's summary names the home and its status, so the router
+converts it into a new task instead of folding it onto the old one under the
+store's candidate-key index, and the new task then answers the finding. The
+curator's semantic drop is a second fold, and it excludes only cancelled tasks:
+a re-raise the curator drops onto the home it names recurs nightly until the
+entry is re-owned.
 
 ---
 
@@ -5369,6 +6663,15 @@ Every path that deletes a per-task config dir now goes through
 deletes only what it has made durable. The three sites are
 `TaskWorkflow._cleanup_config_dir`, `_recycle_config_dir`, and the
 `GitOps.cleanup_worktree` backstop.
+
+Reconciliation runs are covered too (task 3972):
+`fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::gc_run_config_dir`
+archives each recon stage transcript to
+`data/orchestrator/agent-transcripts/recon-<run_id>/<enc>/<sid>.jsonl` before it
+removes `data/reconciliation/recon-config/claude-config-<run_id>/`, unless
+`transcript_archive_enabled` is off. To list a day's archived runs, use
+`python scripts/legibility/inventory.py --cwd-prefix <root> --date <d> --agent-transcript-root data/orchestrator/agent-transcripts`;
+each line's path names its `recon-<run_id>`.
 
 The call is **synchronous** on purpose. It used to be
 `await asyncio.to_thread(...)`, which meant a SIGTERM arriving mid-teardown
