@@ -13,7 +13,6 @@ import json
 import logging
 
 import pytest
-from shared.jcodemunch_launch import jcodemunch_server_config
 
 from fused_memory.reconciliation.stages.base import (
     _find_fused_memory_server,
@@ -119,13 +118,12 @@ def _mcp_json(tmp_path, entry: dict):
 
 
 class TestReconCoreMcpServers:
-    """recon_core_mcp_servers is the one home of recon's fused-memory and jcodemunch entries."""
+    """recon_core_mcp_servers is the one home of recon's fused-memory entry."""
 
-    def test_an_http_entry_yields_the_url_and_jcodemunch(self, tmp_path):
+    def test_an_http_entry_yields_the_url(self, tmp_path):
         candidates = _mcp_json(tmp_path, {'type': 'http', 'url': 'http://127.0.0.1:8002/mcp'})
         assert recon_core_mcp_servers(candidates=candidates) == {
             'fused-memory': {'type': 'http', 'url': 'http://127.0.0.1:8002/mcp'},
-            'jcodemunch': jcodemunch_server_config(),
         }
 
     def test_a_stdio_entry_takes_openai_api_key_from_the_process_env(
@@ -161,6 +159,6 @@ class TestReconCoreMcpServers:
             'command': 'python', 'args': [], 'env': {'OPENAI_API_KEY': ''},
         }
 
-    def test_it_names_exactly_the_two_core_servers(self, tmp_path):
+    def test_it_names_exactly_the_core_servers(self, tmp_path):
         candidates = _mcp_json(tmp_path, {'type': 'http', 'url': 'http://x'})
-        assert sorted(recon_core_mcp_servers(candidates=candidates)) == ['fused-memory', 'jcodemunch']
+        assert sorted(recon_core_mcp_servers(candidates=candidates)) == ['fused-memory']

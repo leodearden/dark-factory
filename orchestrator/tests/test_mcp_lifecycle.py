@@ -3,9 +3,8 @@
 TestApplyMcpStartupEnv — MCP_STARTUP_TIMEOUT_MS constant and
 apply_mcp_startup_env() helper (step-1/step-2).
 
-TestJcodemunchLaunchPinned — JCODEMUNCH_COMMAND/JCODEMUNCH_ENV constants and
-mcp_config_json() regression guard (step-3/step-4), including the
-JCODEMUNCH_GIT_ROOT_IDENTITY identity lever (task 4562 step-1/step-2).
+TestMcpConfigServerSet — mcp_config_json() assembles exactly fused-memory,
+plus escalation when a URL is given, and no other server.
 
 TestInvokeInjectsMcpStartupTimeout — _invoke_claude_with_sandbox injects
 MCP_TIMEOUT into env_overrides (step-5/step-6).
@@ -89,80 +88,31 @@ class TestApplyMcpStartupEnv:
 
 
 # ---------------------------------------------------------------------------
-# Step-3/Step-4: JCODEMUNCH_COMMAND / JCODEMUNCH_ENV + mcp_config_json
+# mcp_config_json server set
 # ---------------------------------------------------------------------------
 
 
-class TestJcodemunchLaunchPinned:
-    """mcp_config_json() uses the named constants and is pinned to the prebuilt
-    launcher (not uvx), guarding against regressions."""
+class TestMcpConfigServerSet:
+    """mcp_config_json() assembles the 'orchestrator' family's servers and
+    nothing else: fused-memory always, escalation only with a URL."""
 
-    def test_command_is_prebuilt_launcher_not_uvx(self):
-        """JCODEMUNCH_COMMAND is 'jcodemunch-mcp' (prebuilt, not 'uvx')."""
-        from shared.jcodemunch_launch import JCODEMUNCH_COMMAND
-
-        assert JCODEMUNCH_COMMAND == 'jcodemunch-mcp'
-        assert JCODEMUNCH_COMMAND != 'uvx'
-
-    def test_env_contains_no_version_hint(self):
-        """JCODEMUNCH_ENV contains JCODEMUNCH_NO_VERSION_HINT."""
-        from shared.jcodemunch_launch import JCODEMUNCH_ENV
-
-        assert 'JCODEMUNCH_NO_VERSION_HINT' in JCODEMUNCH_ENV
-
-    def test_mcp_config_json_uses_constants(self, mock_orch_config):
-        """mcp_config_json() jcodemunch entry matches constants (regression guard)."""
-        from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
-
+    def test_without_escalation_url_only_fused_memory(self, mock_orch_config):
         from orchestrator.mcp_lifecycle import McpLifecycle
 
         mock_orch_config.fused_memory.url = 'http://localhost:8000'
         lifecycle = McpLifecycle(mock_orch_config)
         out = lifecycle.mcp_config_json()
 
-        jc = out['mcpServers']['jcodemunch']
-        assert jc['command'] == JCODEMUNCH_COMMAND
-        assert jc['env'] == JCODEMUNCH_ENV
-        # Regression guard: 'uvx' must not appear in command or args
-        assert 'uvx' not in jc.get('command', '')
-        args = jc.get('args', [])
-        assert not any('uvx' in str(a) for a in args)
+        assert set(out['mcpServers']) == {'fused-memory'}
 
-    def test_env_sets_git_root_identity_lever(self):
-        """JCODEMUNCH_ENV pins the identity lever to the exact literal '0'.
-
-        jcodemunch's bool env parser treats '0' as False (lever ON, selecting
-        per-worktree local identity) but '1'/'true' as True (lever OFF,
-        silently reverting to the worktree-collapsing git-root default) — so
-        this must assert the literal value, not just key presence.
-        """
-        from shared.jcodemunch_launch import JCODEMUNCH_ENV
-
-        assert 'JCODEMUNCH_GIT_ROOT_IDENTITY' in JCODEMUNCH_ENV
-        assert JCODEMUNCH_ENV['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'
-
-    def test_mcp_config_json_carries_git_root_identity_lever(self, mock_orch_config):
-        """The identity lever reaches the generated per-agent mcp_config_json.
-
-        Asserted against a literal, not against JCODEMUNCH_ENV — but this is
-        defense-in-depth, not a coverage gap this test alone closes. The
-        neighbouring pair already fails if the lever is dropped from either
-        side: test_env_sets_git_root_identity_lever pins the literal on the
-        constant, and test_mcp_config_json_uses_constants asserts
-        jc['env'] == JCODEMUNCH_ENV (full dict equality), which breaks if the
-        constant and the generated config ever diverge. This test instead
-        guards against that equality assert being loosened to a subset check
-        later, by pinning the user-observable value directly on the
-        generated config, independent of how it got there.
-        """
+    def test_with_escalation_url_adds_only_escalation(self, mock_orch_config):
         from orchestrator.mcp_lifecycle import McpLifecycle
 
         mock_orch_config.fused_memory.url = 'http://localhost:8000'
         lifecycle = McpLifecycle(mock_orch_config)
-        out = lifecycle.mcp_config_json()
+        out = lifecycle.mcp_config_json(escalation_url='http://h:9999/mcp')
 
-        jc = out['mcpServers']['jcodemunch']
-        assert jc['env']['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'
+        assert set(out['mcpServers']) == {'fused-memory', 'escalation'}
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +174,7 @@ class TestMcpConfigEscalationHeaders:
         assert 'escalation' not in out_headers_only['mcpServers']
 
     def test_headers_do_not_alter_other_server_blocks(self, mock_orch_config):
-        """escalation_headers only touches the escalation block; fused-memory/jcodemunch blocks unaffected."""
+        """escalation_headers only touches the escalation block; the fused-memory block is unaffected."""
         from orchestrator.mcp_lifecycle import McpLifecycle
 
         mock_orch_config.fused_memory.url = 'http://localhost:8000'
@@ -238,7 +188,6 @@ class TestMcpConfigEscalationHeaders:
         )
 
         assert with_headers['mcpServers']['fused-memory'] == baseline['mcpServers']['fused-memory']
-        assert with_headers['mcpServers']['jcodemunch'] == baseline['mcpServers']['jcodemunch']
 
 
 # ---------------------------------------------------------------------------

@@ -144,9 +144,8 @@ the dashboard and this session's own MCP tooling):
   - `systemd-analyze --user verify` no longer prints the "Service has
     RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." line for
     fused-memory.service (the dark-factory-dashboard.service line was
-    cleared separately by step-4; the remaining jcodemunch-serve.service
-    "No such file or directory" line is Reify-owned, out of scope — see the
-    plan analysis).
+    cleared separately by step-4; the remaining Reify-owned unit's "No such
+    file or directory" line is out of scope — see the plan analysis).
   - fused-memory.service remained `active` throughout; no restart was
     performed or required.
   - Both tests in this module pass under `-m integration`.
@@ -266,8 +265,7 @@ def test_installed_unit_file_restart_backoff_effective() -> None:
     correct here because a <unit>.d/ drop-in merges by appending.
 
     The shared helper's own failure message is written for the COMMITTED
-    fleet and points at scripts/jcodemunch-watcher.service.template as the
-    worked example — accurate, but it never mentions re-installing THIS unit
+    fleet — accurate, but it never mentions re-installing THIS unit
     or running daemon-reload, which is the only thing that fixes a drifted
     HOST copy. Since this is the layer an operator hits first, the assertion
     is re-raised with _REMEDIATION appended rather than delegating the

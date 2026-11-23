@@ -247,9 +247,8 @@ def uv_run_level_flags(exec_start: str) -> list[str] | None:
 
     None means exactly one thing: this command is not a ``uv run`` invocation,
     so the invariant does not apply and callers SKIP.  That is a real answer —
-    scripts/orchestrator-watchdog.service runs a bare Python probe and
-    scripts/jcodemunch-watcher.service.template runs ``uvx``, an EPHEMERAL
-    environment that never touches the shared venv.  The None-vs-raise split
+    scripts/orchestrator-watchdog.service runs a bare Python probe that never
+    touches the shared venv.  The None-vs-raise split
     follows the contract stated once at
     systemd_unit_invariants.py::config_arg_from_exec_start.  A unit whose
     ExecStart is a shell wrapper running ``uv run`` inside it also answers None

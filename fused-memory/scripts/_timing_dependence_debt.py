@@ -390,7 +390,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'shared/tests/test_config_dir_credentials_live.py': 1,
     'shared/tests/test_defect_enumerator.py': 1,
     'shared/tests/test_deploy_clock_redirect.py': 1,
-    'shared/tests/test_jcodemunch_launch.py': 1,
     'shared/tests/test_merge_subject.py': 1,
     'shared/tests/test_proc_group_leader_pidfd.py': 1,
     'shared/tests/test_proc_group_mount_ns.py': 1,
