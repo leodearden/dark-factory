@@ -182,6 +182,15 @@ def test_every_live_gated_test_is_in_the_integration_tier() -> None:
     ),
     pytest.param(
         """
+        pytestmark = [pytest.mark.integration]
+        pytestmark = [falkor_skipif()]
+        def test_live(): ...
+        """,
+        ['test_live'], ['test_live'],
+        id='rebound-module-pytestmark-drops-integration',
+    ),
+    pytest.param(
+        """
         @pytest.mark.skipif(True, reason='qdrant_skipif')
         def test_unit(): ...
         @falkor_skipif()
