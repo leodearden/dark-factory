@@ -958,9 +958,9 @@ function MergeTab({ projectFilter }) {
           </>
         );
         return (
-          <div key={pid} className="col-span-12">
+          <div key={pid} className="col-span-12 stack-host">
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
-              <div className="grid cols-12" style={{ gap: 12 }}>
+              <div className="grid cols-12 stack-narrow" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
                   <DatumPanelHead title={`Merge attempts · ${depthBucketCaption(depthSeries)}`} datum={depth}
                       reading={series => `peak ${Math.max(0, ...series.values)}/bucket`} />
