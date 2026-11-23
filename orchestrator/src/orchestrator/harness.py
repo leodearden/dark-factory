@@ -691,6 +691,8 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
+    # Read-only existence lookup for dependency_discovered and workflow_slot_wedged (task 10426)
+    'mcp__fused-memory__search_tasks',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
     # Convert-to-tracked-work filing (task 3726): submit_task files the

@@ -62,7 +62,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 **Design** — PRD mis-decomposition / wrong architecture → sibling tasks of the same PRD all stalling:
 - Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
-- RCA tool: fused-memory `get_task` to read each task's parent, `get_tasks` (always with `statuses`, `fields` and `page_size`) to list siblings, `search` for related design decisions
+- RCA tool: fused-memory `get_task` on each escalated task to compare their parents, `search_tasks` on the parent or PRD title for siblings that have not escalated, `search` for related design decisions
 
 **Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
 - Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
@@ -79,7 +79,7 @@ Deepen RCA when you observe **any** of the following signals:
 
 - **Repeated failures on the same module or merge** — two or more `task_failure` escalations referencing the same file path or recent commit
 - **Burst of infra symptoms** — three or more `infra_issue` or MCP-error escalations in one drain cycle, especially from unrelated tasks
-- **Sibling tasks of one PRD all stalling** — multiple escalations whose task IDs share the same parent task (check via `mcp__fused-memory__get_task` on each task, then `mcp__fused-memory__get_tasks` with `statuses`, `fields` and `page_size` for the siblings)
+- **Sibling tasks of one PRD all stalling** — multiple escalations whose task IDs share the same parent task (check via `mcp__fused-memory__get_task` on each escalated task to compare their parents, then `mcp__fused-memory__search_tasks` on the parent or PRD title for siblings that have not escalated)
 - **Same category + overlapping summaries** from distinct tasks with no obvious individual root cause
 
 Without these signals, log the escalation category and summary, apply the routing table (step 5), and move on.
@@ -97,7 +97,8 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `Bash(git status ...)` | Working-tree state at the project root |
 | `python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py` | List and count one task's `runs.db` events before a `root_cause`/`evidence` narrative joins them (read-only). Advisory entry: not in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`; it runs because the rotation's `bypassPermissions` mode admits Bash, as `scripts/watcher-rearm.sh` does |
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
-| `mcp__fused-memory__get_tasks` | Filtered task list — pass `statuses`, `fields` and `page_size` to find sibling tasks of the same parent; never call it bare (it returns every task in the store) |
+| `mcp__fused-memory__get_tasks` | Filtered task list — pass `statuses`, `fields` and `page_size`, and page with `offset` until `pagination.has_more` is false before treating a miss as absence; never call it bare (it returns every task in the store) |
+| `mcp__fused-memory__search_tasks` | Semantic search over filed tasks, each hit carrying its current `status`: the existence check for "is there already a task for X". Its corpus excludes deferred and uncommitted tasks |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
 | `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
 | `mcp__escalation__get_task_escalation_history` | Every escalation ever filed for one task, archive included, as a `{task_id, count, level_filter, escalations}` envelope. It has no `compact`, so the drain's cross-check keeps `get_task_escalations(compact=True)` ([Draining pending escalations](#draining-pending-escalations)) |
@@ -108,7 +109,7 @@ The filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_t
 
 **MCP tool names are per-server.** The `mcp__<server>__` prefix names the server that owns a tool.
 
-- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` — the escalation server has no `get_task`. This rotation's escalation reads return escalation records, not task records: `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`), `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), `mcp__escalation__get_task_escalation_history` (the same set as a self-describing envelope) and `mcp__escalation__get_escalation` (one record by id, archive included).
+- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` / `mcp__fused-memory__search_tasks` — the escalation server has no `get_task`. This rotation's escalation reads return escalation records, not task records: `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`), `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), `mcp__escalation__get_task_escalation_history` (the same set as a self-describing envelope) and `mcp__escalation__get_escalation` (one record by id, archive included).
 - **Reading one full escalation record.** Call `mcp__escalation__get_escalation(escalation_id=<id>)`. It is archive-inclusive and returns the full `Escalation.to_dict()` (`escalation/src/escalation/models.py`), which carries every field, including `detail` and `pin_declared_reason`. If `get_escalation` is missing from your toolset or the call is refused (an orchestrator not yet restarted onto the task-3176 grant can still list the tool but deny it), fall back to a non-compact `mcp__escalation__get_pending_escalations(task_id=<its task_id>)` — or `mcp__escalation__get_task_escalations(task_id=<its task_id>)` to include the archive — and pick the row by `id`; those full rows are the same shape. Trying `get_escalation` first is safe: [Graceful Degradation](#graceful-degradation)'s never-a-trial-call rule guards the tools whose call mutates state, and this one is a read.
 - **Tools the server lists but this rotation is not granted.** The escalation server's MCP instructions (`escalation/src/escalation/server_instructions.py`) describe what the SERVER offers. Of the reads it lists, this rotation is not granted `get_task_runtime_state`; it is also not granted `declare_pin` (see [Declared pins](#declared-pins-a-close-can-be-refused-declared_pin_refused)) or any merge-queue mutator ([Hard Constraints](#hard-constraints--never-violate)). The rotation's contract is to call only what `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` lists (see [Headless-mode permission gotchas](#headless-mode-permission-gotchas-credit-external-pr-4)).
 
@@ -836,11 +837,11 @@ task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
 
 Agent found it depends on work that isn't done yet.
 
-1. Check if the prerequisite is an **existing incomplete task** in fused-memory (never call `get_tasks` without filters — it returns every task in the store):
+1. Check if the prerequisite is an **existing incomplete task** in fused-memory:
    ```
-   mcp__fused-memory__get_tasks(project_root=<project_root>, statuses=["pending", "in-progress", "blocked"], fields=["title", "status"], page_size=100)
+   mcp__fused-memory__search_tasks(project_root=<project_root>, query="<the prerequisite, in the agent's words>")
    ```
-   Then `mcp__fused-memory__get_task` on each candidate to read its full record.
+   Then `mcp__fused-memory__get_task` on each candidate whose `status` is `pending`, `in-progress` or `blocked`, to confirm it is the prerequisite. If `search_tasks` is missing from your toolset or the call is refused (an orchestrator not yet restarted onto the task-10426 grant can still list the tool but deny it), a refusal is not "no match": page `mcp__fused-memory__get_tasks(project_root=<project_root>, statuses=["pending", "in-progress", "blocked"], fields=["title", "status"], page_size=500, offset=...)` until `pagination.has_more` is false before reaching step 3.
 2. **If a matching incomplete task exists:**
    ```
    mcp__fused-memory__add_dependency(id=<task_id>, depends_on=<dep_id>, project_root=<project_root>)
