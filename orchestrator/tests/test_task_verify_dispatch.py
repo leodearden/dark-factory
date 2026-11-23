@@ -37,6 +37,7 @@ from _verify_artifact_fixtures import (
     UNBLOCK_SKILL,
     registry_config,
 )
+from _verify_cache_fixtures import TEST_CODE
 
 from orchestrator import task_verify_dispatch
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, apply_reload
@@ -56,6 +57,8 @@ from orchestrator.task_verify_spec import (
 )
 from orchestrator.verify import VerifyInfraError, VerifyResult, run_scoped_verification
 from orchestrator.verify_admission_gate import AdmissionPlan
+from orchestrator.verify_cache.registry import Registry
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_plan import (
@@ -375,7 +378,8 @@ class _Hooks:
 
 class _LocalRun:
     """A recording stand-in for run_scoped_verification; *body*, when set, is
-    awaited with the call's admission plan before the verdict."""
+    awaited with the call's admission plan before the verdict. Each call's
+    ``verify_cache`` is kept apart in *caches*, so *calls* compares as before."""
 
     def __init__(self, observe: Callable[[], object]) -> None:
         self.result = _result(True, summary='local verdict')
@@ -383,9 +387,11 @@ class _LocalRun:
         self.observe = observe
         self.body: Callable[[AdmissionPlan], Awaitable[None]] | None = None
         self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.caches: list[CacheAccess | None] = []
         self.observed: list[object] = []
 
     async def __call__(self, *args: Any, **kwargs: Any) -> VerifyResult:
+        self.caches.append(kwargs.pop('verify_cache', None))
         self.calls.append((args, kwargs))
         self.observed.append(self.observe())
         if self.body is not None:
@@ -465,6 +471,7 @@ def _harness(
     modules: list[ModuleConfig] | None = None,
     runner_kwargs: dict[str, Any] | None = None,
     config: OrchestratorConfig | None = None,
+    verify_cache: CacheAccess | None = None,
 ) -> _Harness:
     repo = seed_repo(tmp_path / 'repo', _SEED)
     base = _git(repo, 'rev-parse', 'HEAD')
@@ -504,6 +511,7 @@ def _harness(
     harness.dispatcher = task_verify_dispatch.TaskVerifyDispatcher(
         pool, GitOps(GitConfig(main_branch='main'), repo),
         policy_of=lambda _config: harness.policy, run_local=harness.local,
+        verify_cache=verify_cache,
     )
     return harness
 
@@ -514,6 +522,77 @@ _ORCH_ONLY = TaskVerifyPolicy(host_policy='remote_modules', remote_modules=('orc
 def _assert_turn_left(h: _Harness) -> None:
     assert h.laptop_turns() == (0, 0)
     assert h.pool.holders() == {}
+
+
+# ---------------------------------------------------------------------------
+# Task 5653 (A3): a local verdict joins the task-role verify cache, a parity re-run does not
+# ---------------------------------------------------------------------------
+
+
+def _access(tmp_path: Path) -> CacheAccess:
+    return CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
+
+
+@pytest.mark.asyncio
+class TestLocalArmsJoinTheTaskCache:
+    async def test_the_local_policy_verifies_through_the_access_it_was_given(self, tmp_path: Path) -> None:
+        access = _access(tmp_path)
+        h = _harness(tmp_path, TaskVerifyPolicy(), verify_cache=access)
+
+        await h.call()
+
+        [cache] = h.local.caches
+        assert cache is access
+
+    @pytest.mark.parametrize(('policy', 'remotes', 'quarantined', 'reason'), [
+        pytest.param(TaskVerifyPolicy(host_policy='remote_all'), (), False, 'no_host', id='no-host'),
+        pytest.param(
+            TaskVerifyPolicy(host_policy='remote_modules', remote_modules=('fused_memory',)),
+            ('laptop',), False, 'not_eligible', id='not-eligible',
+        ),
+        pytest.param(_ORCH_ONLY, ('laptop',), True, 'local_granted_first', id='race-won-locally'),
+    ])
+    async def test_a_remote_dispatch_that_falls_back_to_local_joins_too(
+        self, tmp_path: Path, policy: TaskVerifyPolicy, remotes: tuple[str, ...], quarantined: bool,
+        reason: str,
+    ) -> None:
+        access = _access(tmp_path)
+        h = _harness(tmp_path, policy, remotes=remotes, verify_cache=access)
+        if quarantined:
+            h.quarantine.add('laptop')
+
+        await h.call()
+
+        assert h.only_sidecar()['reason'] == reason
+        [cache] = h.local.caches
+        assert cache is access
+
+    @pytest.mark.parametrize(('parity', 'remote', 'reason'), [
+        pytest.param({'cross_check_every_n': 1}, _result(True), 'cross_check', id='cross-check'),
+        pytest.param(
+            {'red_confirms_locally': True}, _result(False, category='test_failure'), 'red_confirm',
+            id='red-confirm',
+        ),
+    ])
+    async def test_a_parity_rerun_of_a_remote_verdict_stays_outside_the_cache(
+        self, tmp_path: Path, parity: dict[str, Any], remote: VerifyResult, reason: str,
+    ) -> None:
+        policy = dataclasses.replace(_ORCH_ONLY, **parity)
+        h = _harness(
+            tmp_path, policy, transport=_Transport(verify=_answers(remote)), verify_cache=_access(tmp_path),
+        )
+
+        await h.call()
+
+        assert h.only_sidecar()['reason'] == reason
+        assert h.local.caches == [None]
+
+    async def test_a_dispatcher_given_no_access_verifies_outside_the_cache(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, TaskVerifyPolicy())
+
+        await h.call()
+
+        assert h.local.caches == [None]
 
 
 # ---------------------------------------------------------------------------

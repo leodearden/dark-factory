@@ -1,0 +1,12 @@
+{
+  "task_id": "5653",
+  "reason": "Task 5653 step-17 adds TestWorkflowRecordsTaskGreens to orchestrator/tests/test_verify_cache_recorder.py, which brings that file into the cluster. Its 5 private reads drive TaskWorkflow._execute_verify_review_loop (implement site) and _rebase_before_enqueue (pre-merge site): the same seams test_verify_events_units.py's workflow_verify scenes drive, since TaskWorkflow exposes no public entry to one verify pass. This is new test coverage, not a refactor.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6118,
+      "current": 6123
+    }
+  ]
+}

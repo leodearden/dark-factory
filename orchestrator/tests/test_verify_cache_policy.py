@@ -116,6 +116,7 @@ class TestConsult:
 
         assert isinstance(consulted, policy.Unavailable)
         assert 'no registry' in consulted.reason
+        assert 'no_registry_on_runner' in consulted.reason
 
     @pytest.mark.asyncio
     async def test_a_damaged_registry_is_unavailable_naming_it(self, tmp_path: Path):

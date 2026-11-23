@@ -1,0 +1,36 @@
+{
+  "task_id": "5653",
+  "reason": "Harness.__init__ now builds one CacheAccess (self._verify_cache) that _run_slot injects into build_workflow; the four hand-built Harness.__new__ fixtures that drive _run_slot must mirror that new composition-root attribute with one MagicMock stub each. Net-additive wiring, not a failed refactor.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_claimant_clear.py",
+      "baseline": 17,
+      "current": 18
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_merge_registry_wiring.py",
+      "baseline": 23,
+      "current": 24
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_reblock_guard.py",
+      "baseline": 22,
+      "current": 23
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_cancellation.py",
+      "baseline": 43,
+      "current": 44
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6122,
+      "current": 6126
+    }
+  ]
+}
