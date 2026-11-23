@@ -21,6 +21,7 @@ from _dashboard_helpers import (
 )
 from shared.mcp_post import MCP_POST_HEADERS, mcp_endpoint_url
 from shared.testing_virtual_clock import virtual_clock_test
+from shared.write_queue_statuses import CLAIMABLE, WriteQueueStatus
 
 from dashboard.data.datum import Datum, DatumState, unknown_datum, validate_datum
 from dashboard.data.memory import get_curator_state
@@ -961,7 +962,7 @@ class TestWriteQueueDatum:
         'oldest_pending_age_seconds': 12.5,
     }
 
-    def test_reachable_answer_is_a_fresh_datum_of_the_four_counts(self):
+    def test_reachable_answer_is_a_fresh_datum_of_the_shown_counts(self):
         from dashboard.data.memory import (
             WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
             write_queue_datum,
@@ -970,12 +971,37 @@ class TestWriteQueueDatum:
         datum = write_queue_datum(self.REACHABLE, measured_at=self.MEASURED_AT)
 
         assert datum == Datum(
-            {'pending': 4, 'retry': 1, 'dead': 0, 'oldest_pending_age_seconds': 12.5},
+            {
+                'pending': 4, 'retry': 1, 'parked': 0, 'dead': 0,
+                'oldest_pending_age_seconds': 12.5,
+            },
             self.MEASURED_AT,
             DatumState.FRESH,
             None,
             WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
         )
+
+    def test_a_parked_backlog_is_shown(self):
+        from dashboard.data.memory import write_queue_datum
+
+        datum = write_queue_datum(
+            {'counts': {'parked': 111, 'completed': 40}, 'oldest_pending_age_seconds': 86400.0},
+            measured_at=self.MEASURED_AT,
+        )
+
+        assert datum.state is DatumState.FRESH
+        assert datum.value is not None
+        assert (datum.value['parked'], datum.value['pending']) == (111, 0)
+        assert datum.value['oldest_pending_age_seconds'] == 86400.0
+
+    def test_the_shown_counts_follow_the_shared_vocabulary(self):
+        from dashboard.data.memory import write_queue_datum
+
+        datum = write_queue_datum(self.REACHABLE, measured_at=self.MEASURED_AT)
+
+        assert datum.value is not None
+        shown = [key for key in datum.value if key != 'oldest_pending_age_seconds']
+        assert shown == [s.value for s in (*CLAIMABLE, WriteQueueStatus.DEAD)]
 
     def test_offline_answer_is_unknown_with_the_verbatim_error(self):
         from dashboard.data.memory import (
