@@ -1,10 +1,10 @@
-"""Role-prompt guidance: a task branch's history is append-only for every agent.
+"""Role-prompt sections that keep a task branch's history append-only.
 
-`orchestrator/src/orchestrator/agents/roles.py` splices `BRANCH_HISTORY_GUIDANCE`
-into the roles whose commits the harness attributes to plan steps, and appends
-`REVIEWER_BRANCH_HISTORY_RULE` to the reviewer contract. It is a leaf module,
-imported downward by roles.py, only so that already oversized file does not grow
-further.
+`BRANCH_HISTORY_GUIDANCE` is the writer section, for the roles whose commits the
+harness attributes to plan steps. `REVIEWER_BRANCH_HISTORY_RULE` is the reviewer
+section. `orchestrator/src/orchestrator/agents/roles.py` splices both;
+`orchestrator/src/orchestrator/agents/briefing.py`'s amender prompt points at the
+writer section by `BRANCH_HISTORY_HEADING`.
 
 `orchestrator/tests/test_roles_branch_history_guidance.py` checks the splices,
 never the wording.
@@ -29,8 +29,9 @@ records in step only for the rewrites it makes.
 
 When a commit needs rationale its message lacks, write the rationale in the
 message of a NEW commit that names the commit it explains by its subject or
-plan step id. If nothing else needs committing, make that commit with
-`git commit --allow-empty`, and never pass its sha to `mark_step_done`: it
+plan step id. When you are committing a change anyway, put the rationale in
+that commit's message. Only if nothing else needs committing, make the commit
+with `git commit --allow-empty`, and never pass its sha to `mark_step_done`: it
 carries none of any step's change.
 
 Never cite one of this branch's commits by sha in a commit message. The harness

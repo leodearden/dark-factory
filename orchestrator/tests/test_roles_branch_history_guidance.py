@@ -5,7 +5,8 @@ exactly the roles whose commits the harness attributes to plan steps (derived
 from the ``mark_step_done`` grant), once each, and its heading constant
 ``BRANCH_HISTORY_HEADING`` is the one the section opens with. The reviewer
 section ``REVIEWER_BRANCH_HISTORY_RULE`` sits in the reviewer CONTRACT of both
-generations, names the WIP subject the harness mints, and reaches no other role.
+generations, names each ``git_ops.WIP_SAFETY_COMMIT_PREFIXES`` subject, and
+reaches no other role.
 The amender turn-prompt points at the writer section by the heading, and that
 pointer has a section to land on.
 
@@ -172,9 +173,7 @@ class TestReviewerRule:
         )
 
     @pytest.mark.parametrize('prefix', WIP_SAFETY_COMMIT_PREFIXES)
-    def test_rule_names_each_subject_the_harness_mints(self, prefix: str) -> None:
-        # Referential integrity, not a wording pin: the subject the reviewer is
-        # told to recognise is the one git_ops mints its WIP commits with.
+    def test_rule_names_each_wip_safety_commit_prefix(self, prefix: str) -> None:
         assert prefix.strip() in REVIEWER_BRANCH_HISTORY_RULE, (
             f'REVIEWER_BRANCH_HISTORY_RULE does not name the WIP subject prefix '
             f'{prefix.strip()!r}. Render the subject list from '
@@ -218,19 +217,19 @@ class TestAmenderPointer:
         )
 
     @pytest.mark.asyncio
-    async def test_a_rewrite_suggestion_meets_the_pointer(
+    async def test_the_amender_prompt_names_the_section(
         self, briefing: BriefingAssembler,
     ) -> None:
         prompt = await briefing.build_amender_prompt(
             plan={'title': 't', 'analysis': 'a'},
             suggestions=[{
                 'reviewer': 'comprehensive',
-                'category': 'documentation',
-                'location': 'tests/_surface_forms.py:12',
-                'description': 'The WIP commit carries real change but no rationale.',
-                'suggested_fix': 'squash it into the step commit or reword its message',
+                'category': 'naming',
+                'location': 'src/m.py:1',
+                'description': 'd',
+                'suggested_fix': 'f',
             }],
-            locked_modules=['tests/'],
+            locked_modules=['src/'],
             context='',
             task_id='7470',
         )
