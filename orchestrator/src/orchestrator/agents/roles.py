@@ -647,12 +647,15 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 _TASK_DIR_NEVER_COMMITTED = """\
 `.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
 `.task/iterations.jsonl` links into durable task storage that survives
-worktree resets, plus the Claude config dir. It must NEVER be committed. It is
-gitignored at the repo root, so an ordinary staging command already excludes
-it — no exclusion pathspec is needed. Never force-add `.task/`
-(`git add -f .task/...`). As a backstop, a pre-commit hook silently strips any
-`.task/` path that still ends up staged — but that is defense-in-depth, not
-the only guard.
+worktree resets, plus the Claude config dir. Those links are the only task
+state exposed here: `metadata.json` and the `reviews/` and `verdicts/`
+directories stay in orchestrator storage outside this worktree, so a read of
+them under `.task/` fails by design — the task details you need are in your
+briefing. `.task/` must NEVER be committed. It is gitignored at the repo root,
+so an ordinary staging command already excludes it — no exclusion pathspec is
+needed. Never force-add `.task/` (`git add -f .task/...`). As a backstop, a
+pre-commit hook silently strips any `.task/` path that still ends up staged —
+but that is defense-in-depth, not the only guard.
 
 Stage your changes with:
 """
