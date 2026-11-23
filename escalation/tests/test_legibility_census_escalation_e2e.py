@@ -51,6 +51,7 @@ from legibility import (
     config,
     nightly,
 )
+from shared.config_dir import CONFIG_DIR_PREFIX, reset_sweep_once_state
 
 # WHY `with alarm.own_endpoint():` AROUND EVERY REAL POST BELOW.
 #
@@ -64,6 +65,7 @@ from legibility import (
 
 _RAISED_MESSAGE = 'codebook merge produced an invalid codebook'
 _PROJECT_ID = 'e2e_census_project'
+_SESSION_SWEEP_PREFIX = CONFIG_DIR_PREFIX + 'legibility-session-'
 
 
 def _write_legibility_yaml(project_root, *, escalation_port):
@@ -173,7 +175,7 @@ def test_an_alarm_to_a_down_server_reports_not_landed_without_raising(tmp_path, 
 
 
 def test_census_hard_failure_lands_a_retrievable_escalation(
-    tmp_path, serve_escalation_mcp, monkeypatch,
+    tmp_path, serve_escalation_mcp, monkeypatch, private_tempdir, plant_dead_pid_dir,
 ):
     """A forced census failure exits 1 and leaves its fail-loud boundary's
     alarm in a real queue, retrievable by id."""
@@ -185,6 +187,8 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
         raise RuntimeError(_RAISED_MESSAGE)
 
     monkeypatch.setattr(census_run, 'run_census', _raising_run_census)
+    ghost = plant_dead_pid_dir(private_tempdir, _SESSION_SWEEP_PREFIX)
+    reset_sweep_once_state(_SESSION_SWEEP_PREFIX)
 
     with alarm.own_endpoint():
         exit_code = census.main(['--project-root', str(project_root), '--force'])
@@ -196,6 +200,11 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
         f'legibility census run failed ({_PROJECT_ID}): RuntimeError: {_RAISED_MESSAGE}'
     )
     assert _RAISED_MESSAGE in fetched.detail
+    assert not ghost.exists(), (
+        f'{ghost.name} survived in the private tempdir; the dead-PID sweep of the '
+        f'census session runner must run over the private tempdir of this test, '
+        f'never the host /tmp, and still reclaim there'
+    )
 
 
 def test_nightly_crash_lands_a_retrievable_escalation(tmp_path, serve_escalation_mcp):
