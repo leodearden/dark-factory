@@ -271,8 +271,9 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
-  // MERGE_QUEUE: {project_label: {depth: Datum ({labels, values,
-  //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
+  // MERGE_QUEUE: {project_label: {depth: Datum ({labels, values}),
+  //   landing_rate: Datum ({labels, values, trailing_minutes}),
+  //   attempts: Datum ({outcomes, latency: {p50, p95, p99,
   //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
   //   runs_db_present, active_spark, halt, train_events:

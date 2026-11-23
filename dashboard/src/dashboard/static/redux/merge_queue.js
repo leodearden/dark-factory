@@ -1,6 +1,7 @@
 // merge_queue.js — the CLIENT twin of dashboard/src/dashboard/data/merge_queue.py,
 // and the ONE reader of the /merge-queue Datums — in_queue, speculative,
-// recent_total, depth, landing_rate and attempts — and of each queued row's enqueue instant. MergeTab's tiles,
+// recent_total, depth (the attempts tile's spark), landing_rate and attempts —
+// and of each queued row's enqueue instant. MergeTab's tiles,
 // pips and captions, the Overview live feed and the rail badge all read them
 // here, so no two of them can disagree. Named for its server twin (the
 // datum.js precedent).
@@ -203,7 +204,7 @@ function sumSpeculativeCounts(parts) {
 }
 
 // *project*'s merge_attempt counts per bucket over the window, leading empty
-// buckets trimmed by the server.
+// buckets trimmed by the server. It feeds only the attempts tile's spark.
 function projectDepth(data, project) {
   return projectServed(data, project, 'depth');
 }
@@ -288,13 +289,6 @@ function spanText(minutes) {
   return `${minutes}-min`;
 }
 
-// The width the server counted the depth series at
-// (data/merge_queue.py::BUCKET_LADDER), never assumed here; a series naming none states none.
-function depthBucketCaption(depth) {
-  const span = spanText((depth || {}).bucket_minutes);
-  return span === null ? QUEUE_EM_DASH : `${span} buckets`;
-}
-
 // The trailing window the server counted each landing-rate point over
 // (data/merge_queue.py::TRAILING_WINDOW_LADDER); a rate naming none states none.
 function landingRateCaption(series) {
@@ -327,7 +321,6 @@ const MERGE_QUEUE_API = {
   hitRateText,
   recentTotal,
   latencyCaption,
-  depthBucketCaption,
   projectDepth,
   projectLandingRate,
   landingRateCaption,

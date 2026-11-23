@@ -38,7 +38,7 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.label_spans import label_spans
-from dashboard.data.merge_queue import DepthSeries, LandingRateSeries, MergeAttempts
+from dashboard.data.merge_queue import LandingRateSeries, MergeAttempts
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
@@ -522,18 +522,10 @@ def _shape_attempts(attempts: MergeAttempts) -> dict[str, Any]:
     return {'outcomes': _shape_outcomes(attempts.outcome_chart()), 'latency': attempts.latency()}
 
 
-def _shape_depth(series: DepthSeries) -> dict[str, Any]:
-    """Serve a depth series as ``{labels, values, bucket_minutes}``, leading zero buckets trimmed.
-
-    ``bucket_minutes`` is the width in minutes each bucket spans, None when
-    the series names no width.
-    """
+def _shape_depth(series: ChartData) -> dict[str, Any]:
+    """Serve a depth series as ``{labels, values}``, leading zero buckets trimmed."""
     trimmed = trim_leading_zero_buckets(series)
-    return {
-        'labels': list(trimmed['labels']),
-        'values': list(trimmed['values']),
-        'bucket_minutes': series.get('bucket_minutes'),
-    }
+    return {'labels': list(trimmed['labels']), 'values': list(trimmed['values'])}
 
 
 def _shape_landing_rate(series: LandingRateSeries) -> dict[str, Any]:

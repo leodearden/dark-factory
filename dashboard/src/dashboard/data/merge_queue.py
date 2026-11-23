@@ -155,12 +155,6 @@ def _ladder_minutes(ladder: tuple[tuple[int | None, int], ...], hours: int) -> i
     raise ValueError(f'a window ladder ends in a catch-all tier (ladder={ladder!r}, hours={hours!r})')
 
 
-class DepthSeries(ChartData):
-    """merge_attempt counts per bucket, and the width in minutes each bucket spans."""
-
-    bucket_minutes: int
-
-
 def _align_bucket(t: datetime, bucket_min: int) -> datetime:
     """Floor *t* to the nearest bucket boundary using epoch-based arithmetic.
 
@@ -197,11 +191,11 @@ async def queue_depth_timeseries(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> Datum[DepthSeries]:
+) -> Datum[ChartData]:
     """Approximate merge queue throughput as adaptive-width bucket counts.
 
-    The series carries ISO bucket-start labels, integer counts and the
-    ``bucket_minutes`` they were counted at.
+    The series carries ISO bucket-start labels and integer counts; its labels
+    are spaced at the window's ``BUCKET_LADDER`` width.
     Bucket width is chosen adaptively via ``_bucket_minutes_for_window`` so
     the point count stays manageable for all window sizes:
 
@@ -221,16 +215,16 @@ async def queue_depth_timeseries(
             get deterministic bucket counts and eliminate boundary flakiness.
 
     Returns:
-        One ``Datum[DepthSeries]``, FRESH at *now* when the window was read —
+        One ``Datum[ChartData]``, FRESH at *now* when the window was read —
         a readable empty window is a series of measured zeros. With no
         runs.db, or when the read fails, the Datum is UNKNOWN with a reason
-        saying which: an unread series counted nothing, at no width.
+        saying which: an unread series counted nothing.
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
     if db is None:
         return _no_runs_db()
 
-    async def _query(conn: aiosqlite.Connection) -> Datum[DepthSeries]:
+    async def _query(conn: aiosqlite.Connection) -> Datum[ChartData]:
         effective_now = resolve_now(now)
         cutoff = effective_now - timedelta(hours=hours)
 
@@ -275,7 +269,7 @@ async def queue_depth_timeseries(
 
         labels = [b.isoformat() for b in buckets]
         values: list[int | float] = [counts[lbl] for lbl in labels]
-        series: DepthSeries = {'labels': labels, 'values': values, 'bucket_minutes': bucket_min}
+        series: ChartData = {'labels': labels, 'values': values}
         return Datum(series, effective_now, DatumState.FRESH, None, bound)
 
     return await with_db(
@@ -948,8 +942,8 @@ async def build_per_project_merge_queue(
 
     Returns:
         Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput, landing_rate, runs_db_present}}``,
-        where ``depth_timeseries`` is a ``Datum[DepthSeries]`` whose series
-        carries its ``bucket_minutes``, ``attempts`` a ``Datum[MergeAttempts]``
+        where ``depth_timeseries`` is a ``Datum[ChartData]``, ``attempts`` a
+        ``Datum[MergeAttempts]``
         (the shaper projects its outcome chart and latency), ``recent_total``
         a ``Datum[int]``, ``speculative`` a ``Datum[dict]``,
         ``train_throughput`` a ``Datum[TrainThroughput]`` and ``landing_rate``
