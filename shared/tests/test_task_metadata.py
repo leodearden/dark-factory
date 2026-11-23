@@ -1633,8 +1633,7 @@ class TestMigrations:
         assert upgraded['memory_hints'] == {'entities': ['E'], 'queries': ['Q']}
 
     def test_missing_schema_version_treated_as_v0_and_stamped_to_2(self):
-        # Chains v0->v1->v2 (no legacy retry-ledger counters present, so the
-        # v1->v2 step is a no-op beyond the version stamp).
+        # Chains v0->v1->v2.
         upgraded = apply_migrations({})
         assert upgraded['schema_version'] == 2
 
@@ -1652,17 +1651,16 @@ class TestMigrations:
         assert blob == original
 
 
-class TestRetryLedgerCounterMigration:
-    """v1->v2 migration: lift legacy top-level infra-resume counters into retry_ledger.
+class TestV1ToV2IsStampOnly:
+    """v1->v2 only stamps ``schema_version=2``.
 
-    ``consecutive_infra_resume_failures`` / ``last_infra_resume_iteration_count``
-    are :class:`RetryLedger` fields, but some legacy blobs (pre-2172
-    placement) still carry them as TOP-LEVEL metadata keys. RED: no v1->v2
-    migration exists yet, so the counters stay top-level (surfacing as
-    unknown_key warnings) and a v1 blob never reaches schema_version 2.
+    The lift of the legacy top-level infra-resume counters into
+    ``retry_ledger`` that this step once carried was retired by task 7135
+    after the stored blobs were migrated, so a top-level counter is now an
+    ordinary unknown key.
     """
 
-    def test_v1_blob_with_top_level_counters_lifted_into_retry_ledger(self):
+    def test_top_level_counters_stay_top_level(self):
         blob = {
             'schema_version': 1,
             'consecutive_infra_resume_failures': 4,
@@ -1670,88 +1668,23 @@ class TestRetryLedgerCounterMigration:
         }
         upgraded = apply_migrations(blob)
         assert upgraded['schema_version'] == 2
-        assert 'consecutive_infra_resume_failures' not in upgraded
-        assert 'last_infra_resume_iteration_count' not in upgraded
-        assert upgraded['retry_ledger'] == {
-            'consecutive_infra_resume_failures': 4,
-            'last_infra_resume_iteration_count': 9,
-        }
-
-    def test_v0_blob_chains_through_v1_to_v2_and_lifts_counters(self):
-        # No schema_version key at all -- chains v0->v1 (stamps 1) -> v1->v2
-        # (lifts the counters, stamps 2) in one apply_migrations call.
-        blob = {
-            'consecutive_infra_resume_failures': 2,
-            'last_infra_resume_iteration_count': 3,
-        }
-        upgraded = apply_migrations(blob)
-        assert upgraded['schema_version'] == 2
-        assert 'consecutive_infra_resume_failures' not in upgraded
-        assert 'last_infra_resume_iteration_count' not in upgraded
-        assert upgraded['retry_ledger'] == {
-            'consecutive_infra_resume_failures': 2,
-            'last_infra_resume_iteration_count': 3,
-        }
-
-    def test_nested_retry_ledger_value_wins_on_conflict(self):
-        blob = {
-            'schema_version': 1,
-            'consecutive_infra_resume_failures': 4,
-            'last_infra_resume_iteration_count': 9,
-            'retry_ledger': {'consecutive_infra_resume_failures': 99},
-        }
-        upgraded = apply_migrations(blob)
-        assert upgraded['schema_version'] == 2
-        assert 'consecutive_infra_resume_failures' not in upgraded
-        assert 'last_infra_resume_iteration_count' not in upgraded
-        assert upgraded['retry_ledger'] == {
-            'consecutive_infra_resume_failures': 99,
-            'last_infra_resume_iteration_count': 9,
-        }
-
-    def test_non_dict_retry_ledger_left_untouched_no_lift(self):
-        blob = {
-            'schema_version': 1,
-            'consecutive_infra_resume_failures': 4,
-            'last_infra_resume_iteration_count': 9,
-            'retry_ledger': 'oops',
-        }
-        upgraded = apply_migrations(blob)
-        assert upgraded['schema_version'] == 2
-        assert upgraded['retry_ledger'] == 'oops'
         assert upgraded['consecutive_infra_resume_failures'] == 4
         assert upgraded['last_infra_resume_iteration_count'] == 9
+        assert 'retry_ledger' not in upgraded
 
-    def test_non_dict_retry_ledger_with_counters_warning_set_is_locked(self):
-        # apply_migrations alone (above) has no warnings to inspect -- this
-        # goes through parse_metadata to pin the resulting CENSUS signal for
-        # this corner. Because the malformed retry_ledger blocks the lift,
-        # the legacy counters stay top-level and unblessed, so they surface
-        # their own unknown_key warnings *in addition to* the invalid_field
-        # warning for the malformed retry_ledger value itself. This double
-        # signal is intentional (malformed data should be loud, not silently
-        # swallowed) -- this test locks it down as such.
+    def test_dict_retry_ledger_left_as_is_beside_top_level_counters(self):
+        ledger = {'consecutive_infra_resume_failures': 99, 'consecutive_no_plan_failures': 1}
         blob = {
             'schema_version': 1,
             'consecutive_infra_resume_failures': 4,
             'last_infra_resume_iteration_count': 9,
-            'retry_ledger': 'oops',
+            'retry_ledger': dict(ledger),
         }
-        model, warnings = parse_metadata(blob, direction='read')
-
-        by_code: dict[str, set[str]] = {}
-        for w in warnings:
-            by_code.setdefault(w.code, set()).add(w.field)
-
-        assert by_code.get('invalid_field') == {'retry_ledger'}
-        assert by_code.get('unknown_key') == {
-            'consecutive_infra_resume_failures',
-            'last_infra_resume_iteration_count',
-        }
-        dumped = model.model_dump()
-        assert dumped['retry_ledger'] == 'oops'
-        assert dumped['consecutive_infra_resume_failures'] == 4
-        assert dumped['last_infra_resume_iteration_count'] == 9
+        upgraded = apply_migrations(blob)
+        assert upgraded['schema_version'] == 2
+        assert upgraded['retry_ledger'] == ledger
+        assert upgraded['consecutive_infra_resume_failures'] == 4
+        assert upgraded['last_infra_resume_iteration_count'] == 9
 
     def test_v1_blob_with_no_counters_still_upgraded_to_v2(self):
         blob = {'schema_version': 1, 'files': ['a.py']}
@@ -1759,36 +1692,7 @@ class TestRetryLedgerCounterMigration:
         assert upgraded['schema_version'] == 2
         assert upgraded['files'] == ['a.py']
 
-    def test_does_not_mutate_caller_input(self):
-        blob = {
-            'schema_version': 1,
-            'consecutive_infra_resume_failures': 4,
-            'retry_ledger': {'consecutive_no_plan_failures': 1},
-        }
-        original = copy.deepcopy(blob)
-        upgraded = apply_migrations(blob)
-        assert blob == original
-        # Mutating the *returned* nested dict must not reach back into the
-        # caller's blob -- the ledger sub-dict is copied, not shared.
-        upgraded['retry_ledger']['consecutive_no_plan_failures'] = 999
-        assert blob['retry_ledger']['consecutive_no_plan_failures'] == 1
-
-    def test_does_not_mutate_caller_input_when_no_counters_to_lift(self):
-        # No top-level legacy counters at all -- there is nothing to lift,
-        # but an existing dict retry_ledger must still be copied (never the
-        # same object as blob['retry_ledger']), not just when a lift occurs.
-        blob = {
-            'schema_version': 1,
-            'retry_ledger': {'consecutive_no_plan_failures': 1},
-        }
-        original = copy.deepcopy(blob)
-        upgraded = apply_migrations(blob)
-        assert blob == original
-        assert upgraded['retry_ledger'] is not blob['retry_ledger']
-        upgraded['retry_ledger']['consecutive_no_plan_failures'] = 999
-        assert blob['retry_ledger']['consecutive_no_plan_failures'] == 1
-
-    def test_parse_metadata_suppresses_legacy_counter_unknown_key_warnings(self):
+    def test_parse_metadata_reports_top_level_counters_as_unknown_keys(self):
         model, warnings = parse_metadata(
             {
                 'consecutive_infra_resume_failures': 5,
@@ -1797,11 +1701,9 @@ class TestRetryLedgerCounterMigration:
             direction='read',
         )
         unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
-        assert 'consecutive_infra_resume_failures' not in unknown_key_fields
-        assert 'last_infra_resume_iteration_count' not in unknown_key_fields
-        assert model.retry_ledger is not None
-        assert model.retry_ledger.consecutive_infra_resume_failures == 5
-        assert model.retry_ledger.last_infra_resume_iteration_count == 2
+        assert 'consecutive_infra_resume_failures' in unknown_key_fields
+        assert 'last_infra_resume_iteration_count' in unknown_key_fields
+        assert model.retry_ledger is None
 
 
 class TestParseMetadataCore:
