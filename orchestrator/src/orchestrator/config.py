@@ -4573,6 +4573,11 @@ class OrchestratorConfig(BaseSettings):
     steward_completion_timeout: float = Field(default=900.0)
     steward_max_timeouts_per_escalation: int = Field(default=3, ge=2, le=5)
     steward_max_empty_outputs_per_escalation: int = Field(default=2, ge=2, le=4)
+    # 'fresh_per_l0' handles every L0 in a new session with a full briefing plus a
+    # digest of the L0s this steward already concluded; 'resume' keeps one resumed
+    # session across L0s (the shadow-eval comparison arm, task 5820). Behaviour:
+    # orchestrator/src/orchestrator/steward.py::TaskSteward.
+    steward_session_mode: Literal['fresh_per_l0', 'resume'] = Field(default='fresh_per_l0')
 
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
@@ -6968,6 +6973,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Steward grace
         'steward_completion_timeout',
         'steward_lifetime_budget',
+        'steward_session_mode',
         # Scheduler tuning
         'fairness.skip_threshold',
         # Transient-requeue jittered backoff (task 3317 / PRD contract C3,

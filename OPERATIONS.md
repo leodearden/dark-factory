@@ -2325,7 +2325,9 @@ takes no arguments: it always re-reads that process's own
   `backends`
 - `routing.*` (`allowed_models`, `ladder`, `per_model_daily_ceiling_usd`,
   `rules` — see [§7](#7-model-routing))
-- Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`)
+- Steward (`steward_completion_timeout`, `steward_lifetime_budget`,
+  `steward_session_mode`: `fresh_per_l0` | `resume`, applies from the next L0
+  a steward handles)
 - Scheduler and watcher tuning knobs
 - `review.*` checkpoint knobs
 - `unblock_auto.*`
