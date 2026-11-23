@@ -4593,12 +4593,16 @@ tasks named.
 
 | Lane command | Task | What it does |
 |---|---|---|
-| `verify-cache-audit` | 5655 (ε) | Runs the merge-role command set uncached (`DF_VERIFY_CACHE=off`) against every landed head. A red attributable to a `cache_hit` unit evicts that unit's entries, attaches the leak record to the fix task and bumps the streak |
-| the separate recording lane command | 5656 (ζ1) | Records per-test input sets from green runs for the per-test tier. It consumes green runs' coverage only, so it needs neither the audit nor the lane's confirmed-red repair (task 4226) |
+| `verify-cache-audit` | 5655 (ε) | Runs the merge-role command set uncached (`DF_VERIFY_CACHE=off`) against every landed head. A red attributable to a `cache_hit` unit evicts that unit's entries, bumps the streak and returns the leak record as an evidence note; the lane renders it into the fix task it files once the red persists. A repeated pass of the same leak is counted once |
+| the separate recording lane command | 5656 (ζ1) | Records per-test input sets from green runs for the per-test tier. It consumes green runs' coverage only, so it does not wait for the audit |
 
-The audit's red path is the lane's existing one: confirm re-run, fix task,
-blocker after three confirmed-red advances. A red that is not attributable to a
-replay (main was red anyway) takes that path untouched.
+The audit plugs into the offline lane's red path through the `on_pass_outcome`
+hook ([`plans/offline-lane-red-path-prd.md`](plans/offline-lane-red-path-prd.md)
+§5.7). When the lane files a fix task and when it escalates are decided in that
+PRD (D5, D11); the runbook is "The offline lane's red path" above. A red not
+attributable to a replay (main was red anyway) returns no notes and takes that
+path untouched. The blocker the audit files itself when it trips the kill switch
+is under "Kill switch and re-enabling".
 
 ### Kill switch and re-enabling
 
