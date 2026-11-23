@@ -17,6 +17,7 @@ from shared.async_sqlite_base import (
     connect_daemon,
 )
 from shared.sqlite_column_migration import add_column_if_missing
+from shared.write_queue_statuses import AWAITING_OPERATOR, CLAIMABLE, WriteQueueStatus
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -32,6 +33,13 @@ from fused_memory.reconciliation.throughput import utc_hour_bucket
 from fused_memory.utils.sqlite_connector import Connector
 
 logger = logging.getLogger(__name__)
+
+# Rows the queue's workers will still finish on their own hold reconciliation
+# off; rows awaiting an operator do not, or a parked backlog would stall it
+# until a human acts.
+_QUEUE_BUSY_STATUSES: frozenset[WriteQueueStatus] = (
+    frozenset({*CLAIMABLE, WriteQueueStatus.IN_FLIGHT}) - AWAITING_OPERATOR
+)
 
 # Defensive schema — EventBuffer creates its own tables even if journal hasn't run yet.
 _BUFFER_SCHEMA_SQL = """
@@ -572,7 +580,7 @@ class EventBuffer:
         return rowcount
 
     async def _is_quiescent(self) -> bool:
-        """System is quiescent when no agent is bursting and durable queue is idle."""
+        """System is quiescent when no agent is bursting and no busy durable-queue row remains."""
         await self.expire_stale_bursts()
 
         # Any agents still bursting?
@@ -587,10 +595,7 @@ class EventBuffer:
             try:
                 stats = await self._queue_stats_fn()
                 counts = stats.get('counts', {})
-                pending = counts.get('pending', 0)
-                retry = counts.get('retry', 0)
-                in_flight = counts.get('in_flight', 0)
-                if (pending + retry + in_flight) > 0:
+                if any(counts.get(status, 0) for status in _QUEUE_BUSY_STATUSES):
                     return False
             except Exception:
                 # If we can't check the queue, assume not quiescent
