@@ -1791,6 +1791,10 @@ def _proj_raw(*roots: str) -> dict:
             ),
             'attempts': Datum(MergeAttempts(), read_at, DatumState.FRESH, None, 30),
             'train_throughput': Datum({}, read_at, DatumState.FRESH, None, 30),
+            'landing_rate': Datum(
+                {'labels': [], 'values': [], 'trailing_minutes': 1440},
+                read_at, DatumState.FRESH, None, 30,
+            ),
             'recent': [],
             'recent_total': Datum(0, read_at, DatumState.FRESH, None, 30),
             'speculative': Datum(

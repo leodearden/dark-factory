@@ -696,6 +696,7 @@ _MQ_MEASURED_QUEUE = {
     'depth_timeseries': _mq_read({'labels': [], 'values': [], 'bucket_minutes': 15}),
     'attempts': _mq_read(MergeAttempts()),
     'train_throughput': _mq_read(_MQ_ZERO_THROUGHPUT),
+    'landing_rate': _mq_read({'labels': [], 'values': [], 'trailing_minutes': 1440}),
 }
 """The queue fields the route resolves for every project: here, a measured empty queue."""
 
@@ -749,6 +750,31 @@ def test_shape_merge_queue_serves_an_unread_depth_as_unknown():
     unread = unknown_datum('the merge_attempt depth series could not be read from runs.db', 30)
 
     assert _shaped(depth_timeseries=unread)['depth'] == unread.to_wire()
+
+
+def test_shape_merge_queue_serves_the_landing_rate_with_leading_zero_points_trimmed():
+    """Leading zero points are dropped; an interior zero is a measured lull and stays."""
+    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 2.0, 0, 1.5], 'trailing_minutes': 1440}
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert rate['state'] == 'fresh'
+    assert rate['value'] == {'labels': ['b', 'c', 'd'], 'values': [2.0, 0, 1.5], 'trailing_minutes': 1440}
+
+
+def test_shape_merge_queue_serves_a_never_landed_window_as_a_measured_empty_rate():
+    series = {'labels': ['a', 'b'], 'values': [0, 0], 'trailing_minutes': 1440}
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert rate['state'] == 'fresh'
+    assert rate['value'] == {'labels': [], 'values': [], 'trailing_minutes': 1440}
+
+
+def test_shape_merge_queue_serves_an_unread_landing_rate_as_unknown():
+    unread = unknown_datum('the landings could not be read from runs.db: OperationalError: boom', 30)
+
+    assert _shaped(landing_rate=unread)['landing_rate'] == unread.to_wire()
 
 
 def test_shape_merge_queue_carries_the_recent_window_total():
@@ -2239,6 +2265,7 @@ class TestShapeMergeQueueServedDatums:
         ('depth_timeseries', 'depth', {'labels': [], 'values': [], 'bucket_minutes': 15}),
         ('attempts', 'attempts', MergeAttempts()),
         ('train_throughput', 'train_throughput', {}),
+        ('landing_rate', 'landing_rate', {'labels': [], 'values': [], 'trailing_minutes': 1440}),
     ])
     def test_a_bare_value_is_a_wiring_bug(self, raw_key, wire_name, bare):
         with pytest.raises(DatumContractError) as excinfo:
