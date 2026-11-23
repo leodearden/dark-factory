@@ -2698,6 +2698,11 @@ class Harness:
             ))
         return tuple(outcomes)
 
+    # How long shutdown waits for cancelled workflow slots to unwind (run()'s step 4a).
+    _SHUTDOWN_WORKFLOW_DRAIN_SECS: float = 15.0
+    # How long shutdown waits for cancelled straggler tasks to unwind (run()'s step 4b).
+    _SHUTDOWN_STRAGGLER_DRAIN_SECS: float = 5.0
+
     async def run(
         self,
         prd_path: Path | None = None,
@@ -3168,10 +3173,13 @@ class Harness:
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*live, return_exceptions=True),
-                        timeout=15.0,
+                        timeout=self._SHUTDOWN_WORKFLOW_DRAIN_SECS,
                     )
                 except TimeoutError:
-                    logger.error('Workflow tasks did not drain within 15s')
+                    logger.error(
+                        'Workflow tasks did not drain within %.0fs',
+                        self._SHUTDOWN_WORKFLOW_DRAIN_SECS,
+                    )
             self._compute_tallies(task_reports)
 
             self.report.completed_at = datetime.now(UTC).isoformat()
@@ -3245,11 +3253,14 @@ class Harness:
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*stragglers, return_exceptions=True),
-                        timeout=5.0,
+                        timeout=self._SHUTDOWN_STRAGGLER_DRAIN_SECS,
                     )
                 except TimeoutError:
                     still = [t.get_name() for t in stragglers if not t.done()]
-                    logger.error(f'Stragglers did not die within 5s: {still}')
+                    logger.error(
+                        'Stragglers did not die within %.0fs: %s',
+                        self._SHUTDOWN_STRAGGLER_DRAIN_SECS, still,
+                    )
 
             # Release singleton lock
             if self._lock_file is not None:
