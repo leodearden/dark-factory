@@ -26,8 +26,11 @@ import pytest
 
 from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 from shared.defects import SideOutcome
+from shared.testing_own_time import run_on_own_time
 
 pytestmark = pytest.mark.timeout(300)
+
+_PYTEST_RUN_BUDGET_S = 240.0
 
 _DEFECT_REF = 'human:20261119T000000Z:abcdef12'
 _SECOND_REF = 'human:20261119T000000Z:12345678'
@@ -117,13 +120,11 @@ def _unimportable_shared_beside(project: Path) -> Path:
 def _run_pytest(project: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k not in ('PYTEST_ADDOPTS', 'PYTHONPATH')}
     env['PYTHONPATH'] = os.pathsep.join([str(_unimportable_shared_beside(project)), str(DEFECT_PLUGIN_DIR)])
-    return subprocess.run(
+    return run_on_own_time(
         [sys.executable, '-m', 'pytest', '-p', '_df_defect_plugin', '-p', 'no:cacheprovider', *args],
+        budget=_PYTEST_RUN_BUDGET_S,
         cwd=project,
         env=env,
-        capture_output=True,
-        text=True,
-        timeout=240,
     )
 
 
