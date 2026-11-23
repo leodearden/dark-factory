@@ -35,7 +35,7 @@ function loadMergeQueue() {
 
 const { api: mergeQueue, window: loadedWindow } = loadMergeQueue();
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
   projectDepth, projectAttempts, attemptCount, attemptsOver, attemptsHistory, worstP95Over,
   totalHint, projectLandingRate, landingRateCaption, landingRateReading,
@@ -113,10 +113,10 @@ function entryReading(spec, recent, served = inQueue('fresh', 0)) {
   return { ...entryWith(served), speculative: spec, recent_total: recent };
 }
 
-// A served depth series value: data/merge_queue.py::DepthSeries, its leading
+// A served depth series value: merge_attempt counts per bucket, its leading
 // zero buckets trimmed by the shaper.
-function depthSeries(labels, values, bucketMinutes = 15) {
-  return { labels, values, bucket_minutes: bucketMinutes };
+function depthSeries(labels, values) {
+  return { labels, values };
 }
 
 // A served landing-rate value: landings per day at each point over the trailing
@@ -171,7 +171,7 @@ test('the module exposes its readers and assigns window.DF_MERGE_QUEUE', () => {
     Object.keys(mergeQueue).sort(),
     [
       'attemptCount', 'attemptsHistory', 'attemptsOver',
-      'depthBucketCaption', 'hitRateText', 'inQueueHistory', 'inQueueOver',
+      'hitRateText', 'inQueueHistory', 'inQueueOver',
       'landingRateCaption', 'landingRateReading', 'latencyCaption',
       'projectAttempts', 'projectDepth',
       'projectInQueue', 'projectLandingRate', 'projectSpeculative', 'queuedSince', 'recentTotal',
@@ -363,31 +363,6 @@ test('latencyCaption: the centiles say how many attempts they were computed over
 test('latencyCaption: a latency block without the split states nothing rather than a zero', () => {
   assert.equal(latencyCaption({}), '');
   assert.equal(latencyCaption(undefined), '');
-});
-
-// ── depthBucketCaption: the width the server counted the depth series at ────
-
-test('depthBucketCaption: each width the server ladder serves today', () => {
-  assert.equal(depthBucketCaption({ bucket_minutes: 15 }), '15-min buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 60 }), '1-h buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 360 }), '6-h buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 1440 }), '1-day buckets');
-});
-
-test('depthBucketCaption: a width outside the ladder is computed, not looked up', () => {
-  assert.equal(depthBucketCaption({ bucket_minutes: 90 }), '90-min buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 120 }), '2-h buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 2880 }), '2-day buckets');
-});
-
-test('depthBucketCaption: a depth naming no usable width states none', () => {
-  const holes = [
-    undefined, null, {}, { bucket_minutes: null }, { bucket_minutes: 0 },
-    { bucket_minutes: -15 }, { bucket_minutes: 7.5 }, { bucket_minutes: '15' },
-  ];
-  for (const depth of holes) {
-    assert.equal(depthBucketCaption(depth), EM_DASH, JSON.stringify(depth));
-  }
 });
 
 // ── landingRateCaption / landingRateReading: the throughput panel's words ──

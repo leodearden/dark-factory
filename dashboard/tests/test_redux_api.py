@@ -693,7 +693,7 @@ _MQ_MEASURED_QUEUE = {
     'runs_db_present': True,
     'speculative': _mq_read({'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}),
     'recent_total': _mq_read(0),
-    'depth_timeseries': _mq_read({'labels': [], 'values': [], 'bucket_minutes': 15}),
+    'depth_timeseries': _mq_read({'labels': [], 'values': []}),
     'attempts': _mq_read(MergeAttempts()),
     'train_throughput': _mq_read(_MQ_ZERO_THROUGHPUT),
     'landing_rate': _mq_read({'labels': [], 'values': [], 'trailing_minutes': 1440}),
@@ -717,14 +717,14 @@ def test_shape_merge_queue_relabels_and_renames_depth():
             'recent': [_mq_titled('17')],
             'active': [],
             **_MQ_MEASURED_QUEUE,
-            'depth_timeseries': _mq_read({'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}),
+            'depth_timeseries': _mq_read({'labels': [0, 1], 'values': [3, 4]}),
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     assert 'dark-factory' in body['MERGE_QUEUE']
     section = body['MERGE_QUEUE']['dark-factory']
     assert section['depth']['state'] == 'fresh'
-    assert section['depth']['value'] == {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}
+    assert section['depth']['value'] == {'labels': [0, 1], 'values': [3, 4]}
     assert _task_ids(section['recent']) == ['17']
     # Default: no halt_status passed → offline fallback per project.
     assert section['halt'] == {'offline': True}
@@ -732,18 +732,11 @@ def test_shape_merge_queue_relabels_and_renames_depth():
 
 def test_shape_merge_queue_trims_the_depths_leading_zero_buckets():
     """Leading empty buckets are dropped; an interior zero is an activity gap and stays."""
-    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 3, 0, 4], 'bucket_minutes': 15}
+    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 3, 0, 4]}
 
     depth = _shaped(depth_timeseries=_mq_read(series))['depth']
 
-    assert depth['value'] == {'labels': ['b', 'c', 'd'], 'values': [3, 0, 4], 'bucket_minutes': 15}
-
-
-def test_shape_merge_queue_serves_no_width_for_a_depth_that_names_none():
-    """A depth series without bucket_minutes serves None for it, never a guessed width."""
-    depth = _shaped(depth_timeseries=_mq_read({'labels': [], 'values': []}))['depth']
-
-    assert depth['value'] == {'labels': [], 'values': [], 'bucket_minutes': None}
+    assert depth['value'] == {'labels': ['b', 'c', 'd'], 'values': [3, 0, 4]}
 
 
 def test_shape_merge_queue_serves_an_unread_depth_as_unknown():
@@ -2262,7 +2255,7 @@ class TestShapeMergeQueueServedDatums:
         ('speculative', 'speculative',
          {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}),
         ('recent_total', 'recent_total', 0),
-        ('depth_timeseries', 'depth', {'labels': [], 'values': [], 'bucket_minutes': 15}),
+        ('depth_timeseries', 'depth', {'labels': [], 'values': []}),
         ('attempts', 'attempts', MergeAttempts()),
         ('train_throughput', 'train_throughput', {}),
         ('landing_rate', 'landing_rate', {'labels': [], 'values': [], 'trailing_minutes': 1440}),

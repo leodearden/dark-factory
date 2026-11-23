@@ -401,18 +401,17 @@ class TestQueueDepthTimeseries:
     @pytest.mark.parametrize(
         'hours, minutes', [(24, 15), (168, 60), (720, 360), (87600, 1440)],
     )
-    async def test_reports_the_width_its_labels_are_spaced_at(
+    async def test_labels_are_spaced_at_the_windows_bucket_width(
         self, empty_merge_events_conn, hours, minutes,
     ):
-        """The series names its bucket width, and its labels are spaced exactly that far."""
+        """The labels are spaced exactly the ladder's width apart; the series serves no width key."""
         now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
         series = fresh_read(await queue_depth_timeseries(empty_merge_events_conn, hours=hours, now=now), now)
 
-        assert series['bucket_minutes'] == minutes
-        width = timedelta(minutes=series['bucket_minutes'])
+        assert 'bucket_minutes' not in series
         starts = [datetime.fromisoformat(label) for label in series['labels']]
-        gaps = {later - earlier for earlier, later in zip(starts, starts[1:], strict=False)}
-        assert gaps == {width}
+        gaps = {later - earlier for earlier, later in pairwise(starts)}
+        assert gaps == {timedelta(minutes=minutes)}
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
@@ -1699,7 +1698,7 @@ class TestBuildPerProjectMergeQueue:
             for field in ('speculative', 'recent_total'):
                 validate_datum(data[field], now)
 
-    async def test_a_read_depth_names_its_width_an_unread_one_is_unknown(self, tmp_path):
+    async def test_a_read_depth_is_spaced_at_the_windows_width_an_unread_one_is_unknown(self, tmp_path):
         """A real empty project counted at the window's width; a (pid, None) one counted nothing."""
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
@@ -1712,7 +1711,10 @@ class TestBuildPerProjectMergeQueue:
                 [('/tmp/real', conn), ('/tmp/none', None)], hours=168, now=now,
             )
 
-        assert fresh_read(result['/tmp/real']['depth_timeseries'], now)['bucket_minutes'] == 60
+        series = fresh_read(result['/tmp/real']['depth_timeseries'], now)
+        assert 'bucket_minutes' not in series
+        starts = [datetime.fromisoformat(label) for label in series['labels']]
+        assert {later - earlier for earlier, later in pairwise(starts)} == {timedelta(minutes=60)}
         assert_unread(result['/tmp/none']['depth_timeseries'], now)
 
     async def test_a_real_root_serves_the_landings_its_runs_db_records(self, tmp_path):

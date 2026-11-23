@@ -226,9 +226,8 @@ function unreadWireDatum(reason) {
 
 // One MERGE_QUEUE[project] block, as data/redux_api.py::shape_merge_queue
 // serves it: a measured, empty queue whose depth series holds `buckets` labels
-// ending at WIRE_AS_OF, `bucketMinutes` apart, every count zero but the newest.
-// A null `bucketMinutes` is a series that names no width; its labels are then
-// hourly. Its landing rate counts each point over `trailingMinutes` (null names
+// ending at WIRE_AS_OF, `bucketMinutes` apart (hourly when null), every count
+// zero but the newest. Its landing rate counts each point over `trailingMinutes` (null names
 // no trailing window): `rates` per point at labels spaced like the depth's, or,
 // when null, 1/day at each depth label. `outcomes` counts the window's untimed
 // attempts by outcome. With `unread`, the project's runs.db could not be read,
@@ -252,7 +251,7 @@ export function mergeQueueBlock({
   return {
     depth: unread
       ? unreadWireDatum(unreadReason)
-      : wireDatum({ labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)), bucket_minutes: bucketMinutes }),
+      : wireDatum({ labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)) }),
     landing_rate: unread
       ? unreadWireDatum(unreadReason)
       : wireDatum({ labels: rateLabels, values: rates ?? labels.map(() => 1), trailing_minutes: trailingMinutes }),

@@ -1786,7 +1786,7 @@ def _proj_raw(*roots: str) -> dict:
     return {
         root: {
             'depth_timeseries': Datum(
-                {'labels': [], 'values': [], 'bucket_minutes': 15},
+                {'labels': [], 'values': []},
                 read_at, DatumState.FRESH, None, 30,
             ),
             'attempts': Datum(MergeAttempts(), read_at, DatumState.FRESH, None, 30),
