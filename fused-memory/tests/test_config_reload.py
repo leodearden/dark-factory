@@ -1137,11 +1137,19 @@ class TestConsolidationAutoLeavesAreGreenTier:
             'preferences_and_norms': 1.0,
             'observations_and_summaries': 0.4,
         },
+        'max_adjudications_per_cycle': 2,
+        'adjudicator_model': 'gpt-6-luna',
+        'adjudicator_reasoning_effort': 'medium',
+        'adjudicator_timeout_seconds': 30.0,
+        'adjudicator_field_chars': 2000,
+        'adjudicator_member_max': 6,
+        'outcome_retention_days': 30,
+        'memo_days': 7,
     }
 
     def test_the_schema_actually_declares_the_leaves(self):
         """Guards the derivation itself: an empty set would pass vacuously."""
-        assert len(self.LEAVES) == 14, self.LEAVES
+        assert len(self.LEAVES) == 22, self.LEAVES
 
     def test_every_leaf_is_allowlisted(self):
         expected = {f'consolidation_auto.{name}' for name in self.LEAVES}

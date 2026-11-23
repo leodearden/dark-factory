@@ -285,6 +285,18 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # write_triage.t_high_by_category. Each therefore reloads all-or-nothing,
     # which is why a partially-applied ranking map can never gate a cycle.
     'consolidation_auto.category_weights',
+    # Adjudicator leaves (plans/consolidation-adjudicator-prd.md K7), read by
+    # reconciliation/consolidation_adjudicator.py,
+    # reconciliation/consolidation_adjudicator_calibration.py and the executor
+    # (task gamma of that PRD).
+    'consolidation_auto.max_adjudications_per_cycle',
+    'consolidation_auto.adjudicator_model',
+    'consolidation_auto.adjudicator_reasoning_effort',
+    'consolidation_auto.adjudicator_timeout_seconds',
+    'consolidation_auto.adjudicator_field_chars',
+    'consolidation_auto.adjudicator_member_max',
+    'consolidation_auto.outcome_retention_days',
+    'consolidation_auto.memo_days',
     # ---- Link-heal executor caps and adjudicator knobs (tasks 6181, 6184;
     # plans/write-triage-link-healing-prd.md H1, H2) ----
     # The consumers are fused-memory/scripts/link_heal.py and
