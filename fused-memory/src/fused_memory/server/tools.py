@@ -4595,6 +4595,13 @@ def create_mcp_server(
             a top-level hit.  A record that is neither a child nor has children
             carries no 'grouped' key at all.
 
+            ATTRIBUTION (task 3137).  Every top-level result carries 'agent_id' (the writer),
+            'task_id' (the writer's metadata task_id, as a string) and 'project_id' (the
+            project scope the record is STORED under) beside 'created_at', each null when the
+            store recorded none.  Graphiti results never carry agent_id or task_id.  project_id
+            is the storage scope, not the origin: a rehomed record's origin is still read from
+            metadata.src_project.  Nested 'grouped' entries do not carry these keys.
+
             TOPIC-PINNED RESULTS (task 3111).  Every result carries a
             'topic_anchored' bool.  When True, that result was PROMOTED into
             the window BY RULE rather than earned its place by rank: when a
@@ -9263,10 +9270,12 @@ def create_mcp_server(
             release_holder: Must be the literal ``true`` for a follow-up holder to go
                 ``done``, ``cancelled`` or ``deferred``; without it that write is refused
                 ``followup_holder_protected`` with the holder's ``held_count``. Releasing the
-                holder releases every held follow-up at once, so it is a human act. Until
-                promotion lands (task 8418), a cancel-release also files one L1 escalation
-                per held follow-up while the orchestrator is live, or blocks each one when
-                it is stopped. Ignored on any other task. See docs/task-authoring.md §3.4.
+                holder releases every held follow-up at once, so it is a human act: each one
+                is promoted by human, with one ``followup_promoted`` event apiece, before
+                targeted reconciliation runs. A promotion failure after the status write is
+                reported in ``post_write_warnings``; passing it again on a holder already at
+                that status releases whatever is still held. Ignored on any other task. See
+                docs/task-authoring.md §3.4.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -10885,8 +10894,14 @@ def create_mcp_server(
 
         ``depends_on`` accepts two forms:
 
-        - **Bare integer** (e.g. ``"5"``): issues an unconditional ``DELETE``
-          from the integer ``dependencies`` table — the original behavior.
+        - **Bare integer** (e.g. ``"5"``): deletes the edge from the integer
+          ``dependencies`` table. One exception: removing a held follow-up's
+          holder edge is a human promotion (``by='human'``,
+          ``ref='remove_dependency'``) that also promotes the task's held
+          dependencies; the result then carries ``promoted`` (the promoted ids),
+          and a registered promotion guard can refuse it with error
+          ``followup_promotion_deferred``, nothing written. See
+          docs/task-authoring.md §3.4.
         - **Qualified** (e.g. ``"dark_factory:13"``): removes the canonical
           entry from the dependent task's ``metadata.external_deps`` list.
           ``'-'`` in the project_id is normalised to ``'_'``.  Idempotent —

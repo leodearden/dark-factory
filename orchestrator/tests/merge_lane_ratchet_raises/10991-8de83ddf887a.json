@@ -1,0 +1,30 @@
+{
+  "task_id": "10991",
+  "reason": "net-additive review amendment: BranchResetError names the resume-attach undo and its entry-tip restore distinctly from the rebase refusal, and rebind_branch_to_head accepts the caller's HEAD classification so the resume attach probes HEAD once",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1551,
+      "current": 1554
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__",
+      "baseline": 4,
+      "current": 6
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::rebind_branch_to_head",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5239,
+      "current": 5242
+    }
+  ]
+}

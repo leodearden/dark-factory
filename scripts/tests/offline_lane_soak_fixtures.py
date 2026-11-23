@@ -19,6 +19,7 @@ from typing import Any
 import _checkout as _checkout
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from offline_lane_soak_inputs import MetadataMatches
 from orchestrator.config import LaneCommand
 from orchestrator.flake_debt_drain import REGRESSED_AFTER_RESOLUTION, call_site_evidence
 from orchestrator.flake_ledger import (
@@ -136,6 +137,13 @@ def effect(**fields: Any) -> PassEffect:
     return PassEffect(**{**empty, **fields})
 
 
+def _effect_block(pass_effect: PassEffect, *, debt_fields: bool) -> dict[str, Any]:
+    block = pass_effect.to_json()
+    if not debt_fields:
+        del block['debts_offered'], block['debts_undecided']
+    return block
+
+
 class Clock:
     def __init__(self, start: datetime = T0) -> None:
         self.current = start
@@ -148,13 +156,17 @@ class FakeTaskStore:
     """The ledger's task seam (``flake_ledger.FlakeLedgerTaskClient``) and the soak report's task reader.
 
     An id told :meth:`answer_absent` reads as a corroborated absence, and one told
-    :meth:`fail` as a failed read, by the ``(task, error)`` convention.
+    :meth:`fail` as a failed read, by the ``(task, error)`` convention.  A metadata lookup
+    answers the ids of :attr:`tasks` carrying the value, and as unreadable those whose metadata
+    is not a dict, but neither kind told :meth:`answer_absent`; after :meth:`fail_lookups`
+    every lookup is a failed read.
     """
 
     def __init__(self) -> None:
         self.tasks: dict[str, dict[str, Any]] = {}
         self.absent: set[str] = set()
         self.failing: set[str] = set()
+        self.lookups_fail = False
         self._next_id = 9000
 
     def answer_absent(self, task_id: str) -> None:
@@ -162,6 +174,9 @@ class FakeTaskStore:
 
     def fail(self, task_id: str) -> None:
         self.failing.add(task_id)
+
+    def fail_lookups(self) -> None:
+        self.lookups_fail = True
 
     async def submit_task(self, arguments: dict) -> SubmittedTask:
         self._next_id += 1
@@ -186,6 +201,14 @@ class FakeTaskStore:
         if task_id in self.absent or task_id not in self.tasks:
             return None, None
         return copy.deepcopy(self.tasks[task_id]), None
+
+    async def metadata_matches(self, key: str, value: str) -> tuple[MetadataMatches | None, Exception | None]:
+        if self.lookups_fail:
+            return None, ConnectionError(f'task store unreachable looking up {key}={value}')
+        stored = {task_id: task.get('metadata', {}) for task_id, task in self.tasks.items() if task_id not in self.absent}
+        found = [task_id for task_id, metadata in stored.items() if isinstance(metadata, dict) and metadata.get(key) == value]
+        unreadable = [task_id for task_id, metadata in stored.items() if not isinstance(metadata, dict)]
+        return MetadataMatches(tuple(sorted(found, key=int)), tuple(sorted(unreadable, key=int))), None
 
     async def commit_planning(self, task_ids: list[str]) -> None:
         for task_id in task_ids:
@@ -248,11 +271,13 @@ class SoakProject:
         effect: PassEffect | None = None,
         blocks: bool = True,
         probe: ProbeResult | None = None,
+        debt_fields: bool = True,
     ) -> LanePass:
         """One pass: *detect* None writes no sub-run (a header only), ``()`` a green one.
 
         *blocks* False leaves the outcome and effect blocks as the header wrote them,
         which is how an interrupted pass, and a pass written before δ2, look.
+        *debt_fields* is :meth:`set_blocks`'.
         """
         self.clock.current = at
         lane_pass = self.records.allocate_pass(command, Leg.GENERIC, head)
@@ -261,15 +286,21 @@ class SoakProject:
         if confirm is not None:
             self._run(lane_pass, Phase.CONFIRM, confirm, None)
         if blocks:
-            self.set_blocks(lane_pass, outcome=outcome, effect=effect)
+            self.set_blocks(lane_pass, outcome=outcome, effect=effect, debt_fields=debt_fields)
         return lane_pass
 
-    def set_blocks(self, lane_pass: LanePass, *, outcome: PassOutcome | None, effect: PassEffect | None) -> None:
-        """The outcome and effect blocks, as ``offline_lane_pass.run_pass`` writes them at the end of a pass."""
+    def set_blocks(
+        self, lane_pass: LanePass, *, outcome: PassOutcome | None, effect: PassEffect | None, debt_fields: bool = True,
+    ) -> None:
+        """The outcome and effect blocks, as ``offline_lane_pass.run_pass`` writes them at the end of a pass.
+
+        *debt_fields* False writes the effect block without ``debts_offered`` and
+        ``debts_undecided``, as the lane wrote it before task 6865 (ε2).
+        """
         self.records.set_pass_blocks(
             lane_pass,
             outcome=None if outcome is None else outcome_to_json(outcome),
-            effect=None if effect is None else effect.to_json(),
+            effect=None if effect is None else _effect_block(effect, debt_fields=debt_fields),
         )
 
     def pass_record(self, lane_pass: LanePass) -> PassRecord:

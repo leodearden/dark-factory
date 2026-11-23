@@ -93,6 +93,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'GitOps over the tmp_path git_repo fixture and its worktrees'
     ),
     'orchestrator/tests/test_git_ops_no_op_landing.py': '_Repo wraps the tmp_path git_repo fixture',
+    'orchestrator/tests/test_git_ops_stacked_worktree.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_git_ops_unstack.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_group_merge_candidate_ordering.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_harness_plan_step_rederive.py': _SEEDS_ITS_OWN_REPO,
@@ -125,8 +126,10 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_rebase_branch_reset_guard.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebase_drops.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebase_drops_wiring.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_rebase_recovery.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebased_solo_landing_ladder.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_reconcile_done_step_commits.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_reconcile_landed_uncited_tip.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_recut_ruling_gitops.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_review_inputs.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_roles_already_done_commit_search.py': _SEEDS_ITS_OWN_REPO,
@@ -140,6 +143,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_warm_lane_abort_teardown.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_integration_gate.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_pool.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_warm_lane_resume_foreign_head.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_workflow_e2e.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_workflow_helpers.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_flip_reify_gate_exclude_heavy.py': (

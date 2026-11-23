@@ -14,13 +14,17 @@ goes to a new third rater.
 
 A :class:`RatingScratch` directory holds the rounds:
 
-- ``key.json``: each shard's role, rater, round, item ids and the sha256 of
-  the brief its rater was given, and each item id's pair and basis. It is the
-  only map from an item back to its pair. Its ``rerates`` list records each
-  re-rate (see :func:`rerate_round`).
+- ``key.json``: each shard's role, rater, round, kind (:class:`ShardKind`),
+  basis, item ids and the sha256 of the brief its rater was given, and each
+  item id's pair and basis. It is the only map from an item back to its pair.
+  Its ``rerates`` list records each re-rate (see :func:`rerate_round`).
 - ``texts.json``: each pair and basis as its raters saw it.
 - ``shards/<name>.txt``: what a rater reads, re-renderable from the key and the texts.
 - ``ratings/<name>.jsonl``: the rater's answers, one line per item.
+
+A round plans all its shards, checks them together, and only then writes any
+(:meth:`RatingScratch.write_shards`), so a refused round leaves no shard text
+and no key change behind; a name that already has a ratings file is never keyed.
 
 Callers choose which pairs to rate and what the effective lines mean, save
 that a re-rate covers the pairs whose derivation reads LOSS
@@ -34,12 +38,10 @@ import json
 import math
 import random
 import re
-import sqlite3
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -70,6 +72,15 @@ RATER_MODELS: Mapping[str, str] = MappingProxyType({
 DOUBLE_RATED = (Role.PRIMARY, Role.SECOND)
 
 
+class ShardKind(StrEnum):
+    """How a shard came to be keyed: the round function that wrote it."""
+
+    INITIAL = 'initial'
+    REASK = 'reask'
+    THIRD = 'third'
+    RERATE = 'rerate'
+
+
 def _double_rater(role: str) -> str:
     """The one rater of a double-rating *role*, in every round."""
     return f'{RATER_MODELS[role]}-{role}'
@@ -98,6 +109,27 @@ class Shard:
 
     text: str
     key: Mapping[str, Mapping[str, str]]
+
+
+@dataclass(frozen=True)
+class PlannedShard:
+    """A shard a round plans to key: its name, its entries of exactly one basis, and whose it is."""
+
+    name: str
+    entries: tuple[ShardEntry, ...]
+    kind: ShardKind
+    role: str
+    rater: str
+    round: int
+
+    def __post_init__(self) -> None:
+        bases = sorted({entry.basis for entry in self.entries})
+        if len(bases) != 1:
+            raise ValueError(f'shard {self.name}: its entries must share exactly one basis, not {bases}')
+
+    @property
+    def basis(self) -> str:
+        return self.entries[0].basis
 
 
 def _entry_order(entry: ShardEntry) -> Triple:
@@ -299,63 +331,6 @@ def rating_volume(key: Mapping[str, Any]) -> dict[str, dict[str, int]]:
             for basis, by_role in sorted(pairs.items())}
 
 
-def read_only(database: Path) -> closing[sqlite3.Connection]:
-    """A read-only connection to *database*, with temp storage kept in memory."""
-    connection = sqlite3.connect(f'{Path(database).resolve().as_uri()}?mode=ro', uri=True)
-    connection.execute('PRAGMA temp_store=MEMORY')
-    return closing(connection)
-
-
-class MemoryHistory:
-    """The UPDATE events of mem0's history table, read once from the read-only database."""
-
-    def __init__(
-        self, updates: Mapping[str, Sequence[tuple[datetime, str | None]]],
-        covers: frozenset[str] | None,
-    ) -> None:
-        self._updates = updates
-        self._covers = covers
-
-    @classmethod
-    def read(cls, history_db: Path, memory_ids: Iterable[str] | None = None) -> MemoryHistory:
-        """Every memory's UPDATE events, or only those of *memory_ids*, which it then alone answers for."""
-        covers = None if memory_ids is None else frozenset(memory_ids)
-        updates: defaultdict[str, list[tuple[datetime, str | None]]] = defaultdict(list)
-        with read_only(history_db) as connection:
-            rows = connection.execute(
-                "SELECT memory_id, old_memory, updated_at FROM history WHERE event = 'UPDATE'"
-            ).fetchall()
-        for memory_id, old, at in rows:
-            if at and (covers is None or memory_id in covers):
-                updates[memory_id].append((datetime.fromisoformat(at), old))
-        return cls(updates, covers)
-
-    def text_at(self, memory_id: str, instant: datetime, current_text: str) -> str | None:
-        """A memory's text at *instant*.
-
-        The old text of the earliest UPDATE after *instant*; *current_text* when
-        the memory was not edited after it; None when that UPDATE kept no old text.
-        """
-        later = self._edits_after(memory_id, instant)
-        if not later:
-            return current_text
-        return min(later, key=lambda edit: edit[0])[1]
-
-    def edited_after(self, memory_id: str, instant: datetime) -> bool:
-        """Whether an UPDATE of the memory follows *instant*."""
-        return bool(self._edits_after(memory_id, instant))
-
-    def _edits_after(self, memory_id: str, instant: datetime) -> list[tuple[datetime, str | None]]:
-        if self._covers is not None and memory_id not in self._covers:
-            raise ValueError(f'this history was read for {len(self._covers)} memories, not {memory_id!r}')
-        return [(at, old) for at, old in self._updates.get(memory_id, ()) if at > instant]
-
-
-def text_at(history_db: Path, memory_id: str, instant: datetime, current_text: str) -> str | None:
-    """:meth:`MemoryHistory.text_at` for one memory, read from *history_db*."""
-    return MemoryHistory.read(history_db, [memory_id]).text_at(memory_id, instant, current_text)
-
-
 _SHARD_PREFIX: Mapping[str, str] = MappingProxyType({Basis.CURRENT: '', Basis.ATTACH_TIME: 'attach_'})
 
 
@@ -384,6 +359,9 @@ class RatingScratch:
     """The scratch directory of one set of rating rounds; see the module docstring for its layout.
 
     Every shard it writes is rendered for, and records the sha256 of, *brief*.
+    A round's shards are checked together before any is written
+    (:meth:`write_shards`), and a name that already has a ratings file is
+    never keyed.
     """
 
     def __init__(self, root: Path, brief: Path = BRIEF_PATH) -> None:
@@ -402,50 +380,85 @@ class RatingScratch:
     def add_shards(self, key: dict[str, Any], entries: Sequence[ShardEntry], *, seed: int) -> list[str]:
         """Shard each entry not yet keyed under each double-rating role; the new shards' names.
 
-        Attach-time entries get shards of their own, prefixed ``attach_``.
+        Attach-time entries get shards of their own, prefixed ``attach_``. Each
+        role and basis numbers its new shards past its initial shards. Refused
+        when a keyed shard records no kind or basis.
         """
+        self._refuse_unbackfilled(key)
         keyed = {
             (spec['role'], _keyed_order(key['items'][item]))
             for spec in key['shards'].values() for item in spec['items']
         }
-        added = []
+        planned = []
         for basis, prefix in _SHARD_PREFIX.items():
             for role in DOUBLE_RATED:
                 pending = [entry for entry in entries
                            if entry.basis == basis and (role, _entry_order(entry)) not in keyed]
-                first = sum(name.startswith(f'{prefix}{role}_') for name in key['shards'])
-                for name, members in plan_shards(pending, role=role, prefix=prefix, seed=seed,
-                                                 first_index=first):
-                    self.write_shard(key, name, members, role=role, rater=_double_rater(role),
-                                     round=0)
-                    added.append(name)
-        return added
+                first = sum(spec['kind'] == ShardKind.INITIAL and spec['role'] == role
+                            and spec['basis'] == basis for spec in key['shards'].values())
+                planned += [
+                    PlannedShard(name=name, entries=tuple(members), kind=ShardKind.INITIAL,
+                                 role=role, rater=_double_rater(role), round=0)
+                    for name, members in plan_shards(pending, role=role, prefix=prefix, seed=seed,
+                                                     first_index=first)
+                ]
+        return self.write_shards(key, planned)
 
-    def write_shard(self, key: dict[str, Any], name: str, entries: Sequence[ShardEntry], *,
-                    role: str, rater: str, round: int, introduces_brief: bool = False) -> None:
-        """Render *entries* as shard *name* and record it in *key*; the caller saves the key.
+    def _refuse_unbackfilled(self, key: Mapping[str, Any]) -> None:
+        lacking = sorted(name for name, spec in key['shards'].items()
+                         if 'kind' not in spec or 'basis' not in spec)
+        if lacking:
+            raise ValueError(f'shards record no kind or basis: {lacking}; run'
+                             f' scripts/backfill_rating_shard_kinds.py on {self.key_path}')
 
-        Refused, before anything is written, when the scratch's brief is not
-        admissible (:func:`admissible_briefs`) for every pair of *entries*. The
-        first round-0 double shards set the round-0 brief; only a re-rate passes
-        *introduces_brief* to key a new one.
+    def write_shards(self, key: dict[str, Any], planned: Sequence[PlannedShard]) -> list[str]:
+        """Render each *planned* shard and record it in *key*, in plan order; their names.
+        The caller saves the key.
+
+        Every shard is checked against *key* as given before any is written,
+        and the whole plan is refused, naming each problem: a name already
+        keyed or planned twice; a ratings file already under its name, which
+        would be read as the new shard's answers; or the scratch's brief not
+        admissible (:func:`admissible_briefs`) for its pairs. The first initial
+        shards set the round-0 brief; only a re-rate keys a new one.
         """
+        problems = self._plan_problems(key, planned)
+        if problems:
+            raise ValueError(f'the round keys none of its {len(planned)} shards:\n' + '\n'.join(problems))
         sha = brief_sha256(self.brief)
-        sets_round_0 = round == 0 and role in DOUBLE_RATED and round_0_brief(key) is None
-        if not (introduces_brief or sets_round_0):
-            barred = sorted({(entry.entry_id, entry.target_id) for entry in entries
+        for plan in planned:
+            rendered = shard(plan.entries, name=plan.name)
+            self._shard_path(plan.name).parent.mkdir(parents=True, exist_ok=True)
+            self._shard_path(plan.name).write_text(rendered.text)
+            key['shards'][plan.name] = {
+                'role': plan.role, 'rater': plan.rater, 'round': plan.round, 'kind': str(plan.kind),
+                'basis': plan.basis, 'items': sorted(rendered.key), 'brief_sha256': sha,
+            }
+            key['items'].update({item_id: dict(pair) for item_id, pair in rendered.key.items()})
+        return [plan.name for plan in planned]
+
+    def _plan_problems(self, key: Mapping[str, Any], planned: Sequence[PlannedShard]) -> list[str]:
+        sha = brief_sha256(self.brief)
+        sets_round_0 = round_0_brief(key) is None
+        counts = Counter(plan.name for plan in planned)
+        problems = [f'shard {name}: planned twice or more in one round ({count} times)'
+                    for name, count in counts.items() if count > 1]
+        for plan in planned:
+            if plan.name in key['shards']:
+                problems.append(f'shard {plan.name}: already keyed')
+            if self._ratings_path(plan.name).exists():
+                problems.append(f'shard {plan.name}: {self._ratings_path(plan.name)} already exists;'
+                                ' a stale rating would be read as this shard\'s answers')
+            if plan.kind is ShardKind.RERATE or (plan.kind is ShardKind.INITIAL and sets_round_0):
+                continue
+            barred = sorted({(entry.entry_id, entry.target_id) for entry in plan.entries
                              if sha not in admissible_briefs(key, (entry.entry_id, entry.target_id))})
             if barred:
-                raise ValueError(
-                    f'shard {name}: brief {self.brief} (sha256 {sha}) is not admissible for'
+                problems.append(
+                    f'shard {plan.name}: brief {self.brief} (sha256 {sha}) is not admissible for'
                     f' {len(barred)} of its pairs, which admit only the round-0 brief'
                     f' {round_0_brief(key)} or a covering re-rate\'s: {barred}')
-        rendered = shard(entries, name=name)
-        self._shard_path(name).parent.mkdir(parents=True, exist_ok=True)
-        self._shard_path(name).write_text(rendered.text)
-        key['shards'][name] = {'role': role, 'rater': rater, 'round': round,
-                               'items': sorted(rendered.key), 'brief_sha256': sha}
-        key['items'].update({item_id: dict(pair) for item_id, pair in rendered.key.items()})
+        return problems
 
     def render_missing(self, key: Mapping[str, Any], entries: Mapping[Triple, ShardEntry]) -> list[str]:
         """Render again, byte for byte, each keyed shard whose text file is missing; their names."""
@@ -528,10 +541,13 @@ class RatingScratch:
     def _shard_path(self, name: str) -> Path:
         return self.root / 'shards' / f'{name}.txt'
 
+    def _ratings_path(self, name: str) -> Path:
+        return self.root / 'ratings' / f'{name}.jsonl'
+
     def _shard_ratings(
         self, name: str, spec: Mapping[str, Any], items: Mapping[str, Mapping[str, str]],
     ) -> list[dict[str, Any]]:
-        path = self.root / 'ratings' / f'{name}.jsonl'
+        path = self._ratings_path(name)
         if not path.exists():
             raise ValueError(f'{path}: shard {name} has no ratings yet')
         rows, seen = [], Counter[str]()
@@ -558,7 +574,8 @@ class RatingScratch:
 def reask_round(
     scratch: RatingScratch, key: dict[str, Any], entries: Mapping[Triple, ShardEntry],
 ) -> dict[str, Any]:
-    """Shard every line to ask again, each rater's in a new round of its own; saves the key.
+    """Shard every line to ask again, each rater's in a new round of its own and each basis
+    in shards of its own (attach-time ones prefixed ``attach_``); saves the key.
 
     Returns the lines written and each new shard's size.
     """
@@ -566,16 +583,23 @@ def reask_round(
     for reask in scratch.ratings(key, entries).reask:
         reask_by_rater[reask.row['rater']].append(reask)
     last_round = max(spec['round'] for spec in key['shards'].values())
-    written = {}
+    planned = []
     for round_, (rater, lines) in enumerate(sorted(reask_by_rater.items()), start=last_round + 1):
         role = lines[0].row['role']
-        members = [entries[_keyed_order(line.row)] for line in lines]
-        for name, dealt in _dealt(members, f'reask_{round_:02d}_{role}'):
-            scratch.write_shard(key, name, dealt, role=role, rater=rater, round=round_)
-            written[name] = len(dealt)
-    if written:
+        by_basis: defaultdict[str, list[ShardEntry]] = defaultdict(list)
+        for line in lines:
+            by_basis[line.row['basis']].append(entries[_keyed_order(line.row)])
+        planned += [
+            PlannedShard(name=name, entries=tuple(dealt), kind=ShardKind.REASK, role=role,
+                         rater=rater, round=round_)
+            for basis, members in sorted(by_basis.items())
+            for name, dealt in _dealt(members, f'{_SHARD_PREFIX[basis]}reask_{round_:02d}_{role}')
+        ]
+    scratch.write_shards(key, planned)
+    if planned:
         scratch.save_key(key)
-    return {'lines': sum(written.values()), 'shards': written}
+    return {'lines': sum(len(plan.entries) for plan in planned),
+            'shards': {plan.name: len(plan.entries) for plan in planned}}
 
 
 def third_round(
@@ -591,10 +615,11 @@ def third_round(
     rater = f'{RATER_MODELS[Role.THIRD]}-third-{index:02d}'
     members = [entry for (entry_id, target_id, basis), entry in sorted(entries.items())
                if basis == Basis.CURRENT and (entry_id, target_id) in pairs]
-    names = []
-    for name, dealt in _dealt(members, f'third_{index:02d}'):
-        scratch.write_shard(key, name, dealt, role=Role.THIRD, rater=rater, round=0)
-        names.append(name)
+    names = scratch.write_shards(key, [
+        PlannedShard(name=name, entries=tuple(dealt), kind=ShardKind.THIRD, role=Role.THIRD,
+                     rater=rater, round=0)
+        for name, dealt in _dealt(members, f'third_{index:02d}')
+    ])
     if names:
         scratch.save_key(key)
     return {'pairs': len(members), 'shards': names}
@@ -666,6 +691,39 @@ def brief_version(label: str) -> str:
     return label
 
 
+_SHA256 = re.compile(r'[0-9a-f]{64}')
+
+
+@dataclass(frozen=True)
+class RaterBrief:
+    """A rater brief: its version label (:func:`brief_version`) and the sha256 of its text."""
+
+    version: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        brief_version(self.version)
+        if _SHA256.fullmatch(self.sha256) is None:
+            raise ValueError(f'brief sha256 {self.sha256!r} is not 64 lowercase hex digits')
+
+
+BRIEF_V2_1 = RaterBrief('v2.1', BRIEF_V2_1_SHA256)
+
+
+def latest_rerate_brief(record: Mapping[str, Any]) -> RaterBrief:
+    """The brief of *record*'s latest re-rate: a scratch key's, or a corpus summary's or derivation's.
+
+    That brief is the corpus's own: assemble refuses any pair reading LOSS
+    outside the latest re-rate (:func:`refuse_loss_outside_the_latest_rerate`).
+    A corpus with no re-rate names its brief explicitly, e.g. :data:`BRIEF_V2_1`.
+    """
+    rerates = record.get('rerates') or ()
+    if not rerates:
+        raise ValueError('the record holds no re-rate, so it names no brief; a corpus without'
+                         ' one names its brief explicitly (e.g. BRIEF_V2_1)')
+    return RaterBrief(rerates[-1]['version'], rerates[-1]['brief_sha256'])
+
+
 def keyed_rerate(key: Mapping[str, Any], version: str, brief: Path = BRIEF_PATH) -> Mapping[str, Any] | None:
     """The re-rate *key* records under brief *version*; None if none.
 
@@ -700,13 +758,13 @@ def rerate_round(
         raise ValueError(f'no pair to re-rate under brief {version}')
     round_ = max(spec['round'] for spec in key['shards'].values()) + 1
     members = [entries[(entry_id, target_id, Basis.CURRENT)] for entry_id, target_id in selected]
-    names = []
-    for role in DOUBLE_RATED:
+    names = scratch.write_shards(key, [
+        PlannedShard(name=name, entries=tuple(dealt), kind=ShardKind.RERATE, role=role,
+                     rater=_double_rater(role), round=round_)
+        for role in DOUBLE_RATED
         for name, dealt in plan_shards(members, role=role, prefix=f'rerate_{round_:02d}_',
-                                       seed=version, first_index=0):
-            scratch.write_shard(key, name, dealt, role=role, rater=_double_rater(role), round=round_,
-                                introduces_brief=True)
-            names.append(name)
+                                       seed=version, first_index=0)
+    ])
     rerate = {
         'version': version, 'round': round_, 'brief_sha256': brief_sha256(scratch.brief),
         'pairs': [list(pair) for pair in selected], 'shards': sorted(names),

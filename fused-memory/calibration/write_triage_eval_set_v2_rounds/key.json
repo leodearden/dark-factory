@@ -48032,6 +48032,7 @@
   ],
   "shards": {
     "primary_00": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_00-000",
@@ -48075,11 +48076,13 @@
         "primary_00-038",
         "primary_00-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_01": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_01-000",
@@ -48123,11 +48126,13 @@
         "primary_01-038",
         "primary_01-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_02": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_02-000",
@@ -48171,11 +48176,13 @@
         "primary_02-038",
         "primary_02-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_03": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_03-000",
@@ -48219,11 +48226,13 @@
         "primary_03-038",
         "primary_03-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_04": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_04-000",
@@ -48267,11 +48276,13 @@
         "primary_04-038",
         "primary_04-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_05": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_05-000",
@@ -48315,11 +48326,13 @@
         "primary_05-038",
         "primary_05-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_06": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_06-000",
@@ -48363,11 +48376,13 @@
         "primary_06-038",
         "primary_06-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_07": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_07-000",
@@ -48411,11 +48426,13 @@
         "primary_07-038",
         "primary_07-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_08": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_08-000",
@@ -48459,11 +48476,13 @@
         "primary_08-038",
         "primary_08-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_09": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_09-000",
@@ -48507,11 +48526,13 @@
         "primary_09-038",
         "primary_09-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_10": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_10-000",
@@ -48555,11 +48576,13 @@
         "primary_10-038",
         "primary_10-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_100": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_100-000",
@@ -48602,11 +48625,13 @@
         "primary_100-037",
         "primary_100-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_101": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_101-000",
@@ -48649,11 +48674,13 @@
         "primary_101-037",
         "primary_101-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_102": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_102-000",
@@ -48696,11 +48723,13 @@
         "primary_102-037",
         "primary_102-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_103": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_103-000",
@@ -48743,11 +48772,13 @@
         "primary_103-037",
         "primary_103-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_104": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_104-000",
@@ -48790,11 +48821,13 @@
         "primary_104-037",
         "primary_104-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_105": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_105-000",
@@ -48837,11 +48870,13 @@
         "primary_105-037",
         "primary_105-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_106": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_106-000",
@@ -48884,11 +48919,13 @@
         "primary_106-037",
         "primary_106-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_11": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_11-000",
@@ -48932,11 +48969,13 @@
         "primary_11-038",
         "primary_11-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_12": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_12-000",
@@ -48980,11 +49019,13 @@
         "primary_12-038",
         "primary_12-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_13": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_13-000",
@@ -49028,11 +49069,13 @@
         "primary_13-038",
         "primary_13-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_14": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_14-000",
@@ -49076,11 +49119,13 @@
         "primary_14-038",
         "primary_14-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_15": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_15-000",
@@ -49124,11 +49169,13 @@
         "primary_15-038",
         "primary_15-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_16": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_16-000",
@@ -49172,11 +49219,13 @@
         "primary_16-038",
         "primary_16-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_17": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_17-000",
@@ -49220,11 +49269,13 @@
         "primary_17-038",
         "primary_17-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_18": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_18-000",
@@ -49268,11 +49319,13 @@
         "primary_18-038",
         "primary_18-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_19": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_19-000",
@@ -49316,11 +49369,13 @@
         "primary_19-038",
         "primary_19-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_20": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_20-000",
@@ -49364,11 +49419,13 @@
         "primary_20-038",
         "primary_20-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_21": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_21-000",
@@ -49412,11 +49469,13 @@
         "primary_21-038",
         "primary_21-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_22": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_22-000",
@@ -49460,11 +49519,13 @@
         "primary_22-038",
         "primary_22-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_23": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_23-000",
@@ -49508,11 +49569,13 @@
         "primary_23-038",
         "primary_23-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_24": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_24-000",
@@ -49556,11 +49619,13 @@
         "primary_24-038",
         "primary_24-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_25": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_25-000",
@@ -49604,11 +49669,13 @@
         "primary_25-038",
         "primary_25-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_26": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_26-000",
@@ -49652,11 +49719,13 @@
         "primary_26-038",
         "primary_26-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_27": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_27-000",
@@ -49700,11 +49769,13 @@
         "primary_27-038",
         "primary_27-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_28": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_28-000",
@@ -49748,11 +49819,13 @@
         "primary_28-038",
         "primary_28-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_29": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_29-000",
@@ -49796,11 +49869,13 @@
         "primary_29-038",
         "primary_29-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_30": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_30-000",
@@ -49844,11 +49919,13 @@
         "primary_30-038",
         "primary_30-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_31": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_31-000",
@@ -49892,11 +49969,13 @@
         "primary_31-038",
         "primary_31-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_32": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_32-000",
@@ -49940,11 +50019,13 @@
         "primary_32-038",
         "primary_32-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_33": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_33-000",
@@ -49988,11 +50069,13 @@
         "primary_33-038",
         "primary_33-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_34": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_34-000",
@@ -50036,11 +50119,13 @@
         "primary_34-038",
         "primary_34-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_35": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_35-000",
@@ -50084,11 +50169,13 @@
         "primary_35-038",
         "primary_35-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_36": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_36-000",
@@ -50132,11 +50219,13 @@
         "primary_36-038",
         "primary_36-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_37": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_37-000",
@@ -50180,11 +50269,13 @@
         "primary_37-038",
         "primary_37-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_38": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_38-000",
@@ -50228,11 +50319,13 @@
         "primary_38-038",
         "primary_38-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_39": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_39-000",
@@ -50276,11 +50369,13 @@
         "primary_39-038",
         "primary_39-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_40": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_40-000",
@@ -50324,11 +50419,13 @@
         "primary_40-038",
         "primary_40-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_41": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_41-000",
@@ -50372,11 +50469,13 @@
         "primary_41-038",
         "primary_41-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_42": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_42-000",
@@ -50420,11 +50519,13 @@
         "primary_42-038",
         "primary_42-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_43": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_43-000",
@@ -50468,11 +50569,13 @@
         "primary_43-038",
         "primary_43-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_44": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_44-000",
@@ -50516,11 +50619,13 @@
         "primary_44-038",
         "primary_44-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_45": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_45-000",
@@ -50564,11 +50669,13 @@
         "primary_45-038",
         "primary_45-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_46": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_46-000",
@@ -50612,11 +50719,13 @@
         "primary_46-038",
         "primary_46-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_47": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_47-000",
@@ -50660,11 +50769,13 @@
         "primary_47-038",
         "primary_47-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_48": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_48-000",
@@ -50708,11 +50819,13 @@
         "primary_48-038",
         "primary_48-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_49": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_49-000",
@@ -50756,11 +50869,13 @@
         "primary_49-038",
         "primary_49-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_50": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_50-000",
@@ -50804,11 +50919,13 @@
         "primary_50-038",
         "primary_50-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_51": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_51-000",
@@ -50852,11 +50969,13 @@
         "primary_51-038",
         "primary_51-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_52": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_52-000",
@@ -50900,11 +51019,13 @@
         "primary_52-038",
         "primary_52-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_53": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_53-000",
@@ -50948,11 +51069,13 @@
         "primary_53-038",
         "primary_53-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_54": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_54-000",
@@ -50996,11 +51119,13 @@
         "primary_54-038",
         "primary_54-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_55": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_55-000",
@@ -51044,11 +51169,13 @@
         "primary_55-038",
         "primary_55-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_56": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_56-000",
@@ -51092,11 +51219,13 @@
         "primary_56-038",
         "primary_56-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_57": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_57-000",
@@ -51140,11 +51269,13 @@
         "primary_57-038",
         "primary_57-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_58": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_58-000",
@@ -51188,11 +51319,13 @@
         "primary_58-038",
         "primary_58-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_59": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_59-000",
@@ -51236,11 +51369,13 @@
         "primary_59-038",
         "primary_59-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_60": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_60-000",
@@ -51284,11 +51419,13 @@
         "primary_60-038",
         "primary_60-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_61": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_61-000",
@@ -51332,11 +51469,13 @@
         "primary_61-038",
         "primary_61-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_62": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_62-000",
@@ -51380,11 +51519,13 @@
         "primary_62-038",
         "primary_62-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_63": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_63-000",
@@ -51428,11 +51569,13 @@
         "primary_63-038",
         "primary_63-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_64": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_64-000",
@@ -51476,11 +51619,13 @@
         "primary_64-038",
         "primary_64-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_65": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_65-000",
@@ -51524,11 +51669,13 @@
         "primary_65-038",
         "primary_65-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_66": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_66-000",
@@ -51572,11 +51719,13 @@
         "primary_66-038",
         "primary_66-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_67": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_67-000",
@@ -51620,11 +51769,13 @@
         "primary_67-038",
         "primary_67-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_68": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_68-000",
@@ -51668,11 +51819,13 @@
         "primary_68-038",
         "primary_68-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_69": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_69-000",
@@ -51716,11 +51869,13 @@
         "primary_69-038",
         "primary_69-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_70": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_70-000",
@@ -51764,11 +51919,13 @@
         "primary_70-038",
         "primary_70-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_71": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_71-000",
@@ -51812,11 +51969,13 @@
         "primary_71-038",
         "primary_71-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_72": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_72-000",
@@ -51860,11 +52019,13 @@
         "primary_72-038",
         "primary_72-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_73": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_73-000",
@@ -51908,11 +52069,13 @@
         "primary_73-038",
         "primary_73-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_74": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_74-000",
@@ -51956,11 +52119,13 @@
         "primary_74-038",
         "primary_74-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_75": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_75-000",
@@ -52004,11 +52169,13 @@
         "primary_75-038",
         "primary_75-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_76": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_76-000",
@@ -52052,11 +52219,13 @@
         "primary_76-038",
         "primary_76-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_77": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_77-000",
@@ -52100,11 +52269,13 @@
         "primary_77-038",
         "primary_77-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_78": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_78-000",
@@ -52148,11 +52319,13 @@
         "primary_78-038",
         "primary_78-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_79": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_79-000",
@@ -52196,11 +52369,13 @@
         "primary_79-038",
         "primary_79-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_80": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_80-000",
@@ -52244,11 +52419,13 @@
         "primary_80-038",
         "primary_80-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_81": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_81-000",
@@ -52292,11 +52469,13 @@
         "primary_81-038",
         "primary_81-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_82": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_82-000",
@@ -52340,11 +52519,13 @@
         "primary_82-038",
         "primary_82-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_83": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_83-000",
@@ -52387,11 +52568,13 @@
         "primary_83-037",
         "primary_83-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_84": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_84-000",
@@ -52434,11 +52617,13 @@
         "primary_84-037",
         "primary_84-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_85": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_85-000",
@@ -52481,11 +52666,13 @@
         "primary_85-037",
         "primary_85-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_86": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_86-000",
@@ -52528,11 +52715,13 @@
         "primary_86-037",
         "primary_86-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_87": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_87-000",
@@ -52575,11 +52764,13 @@
         "primary_87-037",
         "primary_87-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_88": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_88-000",
@@ -52622,11 +52813,13 @@
         "primary_88-037",
         "primary_88-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_89": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_89-000",
@@ -52669,11 +52862,13 @@
         "primary_89-037",
         "primary_89-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_90": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_90-000",
@@ -52716,11 +52911,13 @@
         "primary_90-037",
         "primary_90-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_91": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_91-000",
@@ -52763,11 +52960,13 @@
         "primary_91-037",
         "primary_91-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_92": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_92-000",
@@ -52810,11 +53009,13 @@
         "primary_92-037",
         "primary_92-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_93": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_93-000",
@@ -52857,11 +53058,13 @@
         "primary_93-037",
         "primary_93-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_94": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_94-000",
@@ -52904,11 +53107,13 @@
         "primary_94-037",
         "primary_94-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_95": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_95-000",
@@ -52951,11 +53156,13 @@
         "primary_95-037",
         "primary_95-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_96": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_96-000",
@@ -52998,11 +53205,13 @@
         "primary_96-037",
         "primary_96-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_97": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_97-000",
@@ -53045,11 +53254,13 @@
         "primary_97-037",
         "primary_97-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_98": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_98-000",
@@ -53092,11 +53303,13 @@
         "primary_98-037",
         "primary_98-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_99": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_99-000",
@@ -53139,11 +53352,13 @@
         "primary_99-037",
         "primary_99-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "rerate_01_primary_00": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_00-000",
@@ -53184,11 +53399,13 @@
         "rerate_01_primary_00-035",
         "rerate_01_primary_00-036"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_01": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_01-000",
@@ -53229,11 +53446,13 @@
         "rerate_01_primary_01-035",
         "rerate_01_primary_01-036"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_02": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_02-000",
@@ -53273,11 +53492,13 @@
         "rerate_01_primary_02-034",
         "rerate_01_primary_02-035"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_03": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_03-000",
@@ -53317,11 +53538,13 @@
         "rerate_01_primary_03-034",
         "rerate_01_primary_03-035"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_04": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_04-000",
@@ -53361,11 +53584,13 @@
         "rerate_01_primary_04-034",
         "rerate_01_primary_04-035"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_05": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_05-000",
@@ -53405,11 +53630,13 @@
         "rerate_01_primary_05-034",
         "rerate_01_primary_05-035"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_06": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_06-000",
@@ -53449,11 +53676,13 @@
         "rerate_01_primary_06-034",
         "rerate_01_primary_06-035"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_07": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_07-000",
@@ -53493,11 +53722,13 @@
         "rerate_01_primary_07-034",
         "rerate_01_primary_07-035"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_second_00": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_00-000",
@@ -53538,11 +53769,13 @@
         "rerate_01_second_00-035",
         "rerate_01_second_00-036"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_01": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_01-000",
@@ -53583,11 +53816,13 @@
         "rerate_01_second_01-035",
         "rerate_01_second_01-036"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_02": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_02-000",
@@ -53627,11 +53862,13 @@
         "rerate_01_second_02-034",
         "rerate_01_second_02-035"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_03": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_03-000",
@@ -53671,11 +53908,13 @@
         "rerate_01_second_03-034",
         "rerate_01_second_03-035"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_04": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_04-000",
@@ -53715,11 +53954,13 @@
         "rerate_01_second_04-034",
         "rerate_01_second_04-035"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_05": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_05-000",
@@ -53759,11 +54000,13 @@
         "rerate_01_second_05-034",
         "rerate_01_second_05-035"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_06": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_06-000",
@@ -53803,11 +54046,13 @@
         "rerate_01_second_06-034",
         "rerate_01_second_06-035"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_07": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_07-000",
@@ -53847,11 +54092,13 @@
         "rerate_01_second_07-034",
         "rerate_01_second_07-035"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "second_00": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_00-000",
@@ -53895,11 +54142,13 @@
         "second_00-038",
         "second_00-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_01": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_01-000",
@@ -53943,11 +54192,13 @@
         "second_01-038",
         "second_01-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_02": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_02-000",
@@ -53991,11 +54242,13 @@
         "second_02-038",
         "second_02-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_03": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_03-000",
@@ -54039,11 +54292,13 @@
         "second_03-038",
         "second_03-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_04": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_04-000",
@@ -54087,11 +54342,13 @@
         "second_04-038",
         "second_04-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_05": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_05-000",
@@ -54135,11 +54392,13 @@
         "second_05-038",
         "second_05-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_06": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_06-000",
@@ -54183,11 +54442,13 @@
         "second_06-038",
         "second_06-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_07": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_07-000",
@@ -54231,11 +54492,13 @@
         "second_07-038",
         "second_07-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_08": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_08-000",
@@ -54279,11 +54542,13 @@
         "second_08-038",
         "second_08-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_09": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_09-000",
@@ -54327,11 +54592,13 @@
         "second_09-038",
         "second_09-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_10": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_10-000",
@@ -54375,11 +54642,13 @@
         "second_10-038",
         "second_10-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_100": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_100-000",
@@ -54422,11 +54691,13 @@
         "second_100-037",
         "second_100-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_101": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_101-000",
@@ -54469,11 +54740,13 @@
         "second_101-037",
         "second_101-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_102": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_102-000",
@@ -54516,11 +54789,13 @@
         "second_102-037",
         "second_102-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_103": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_103-000",
@@ -54563,11 +54838,13 @@
         "second_103-037",
         "second_103-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_104": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_104-000",
@@ -54610,11 +54887,13 @@
         "second_104-037",
         "second_104-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_105": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_105-000",
@@ -54657,11 +54936,13 @@
         "second_105-037",
         "second_105-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_106": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_106-000",
@@ -54704,11 +54985,13 @@
         "second_106-037",
         "second_106-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_11": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_11-000",
@@ -54752,11 +55035,13 @@
         "second_11-038",
         "second_11-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_12": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_12-000",
@@ -54800,11 +55085,13 @@
         "second_12-038",
         "second_12-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_13": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_13-000",
@@ -54848,11 +55135,13 @@
         "second_13-038",
         "second_13-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_14": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_14-000",
@@ -54896,11 +55185,13 @@
         "second_14-038",
         "second_14-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_15": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_15-000",
@@ -54944,11 +55235,13 @@
         "second_15-038",
         "second_15-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_16": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_16-000",
@@ -54992,11 +55285,13 @@
         "second_16-038",
         "second_16-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_17": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_17-000",
@@ -55040,11 +55335,13 @@
         "second_17-038",
         "second_17-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_18": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_18-000",
@@ -55088,11 +55385,13 @@
         "second_18-038",
         "second_18-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_19": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_19-000",
@@ -55136,11 +55435,13 @@
         "second_19-038",
         "second_19-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_20": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_20-000",
@@ -55184,11 +55485,13 @@
         "second_20-038",
         "second_20-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_21": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_21-000",
@@ -55232,11 +55535,13 @@
         "second_21-038",
         "second_21-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_22": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_22-000",
@@ -55280,11 +55585,13 @@
         "second_22-038",
         "second_22-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_23": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_23-000",
@@ -55328,11 +55635,13 @@
         "second_23-038",
         "second_23-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_24": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_24-000",
@@ -55376,11 +55685,13 @@
         "second_24-038",
         "second_24-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_25": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_25-000",
@@ -55424,11 +55735,13 @@
         "second_25-038",
         "second_25-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_26": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_26-000",
@@ -55472,11 +55785,13 @@
         "second_26-038",
         "second_26-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_27": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_27-000",
@@ -55520,11 +55835,13 @@
         "second_27-038",
         "second_27-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_28": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_28-000",
@@ -55568,11 +55885,13 @@
         "second_28-038",
         "second_28-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_29": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_29-000",
@@ -55616,11 +55935,13 @@
         "second_29-038",
         "second_29-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_30": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_30-000",
@@ -55664,11 +55985,13 @@
         "second_30-038",
         "second_30-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_31": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_31-000",
@@ -55712,11 +56035,13 @@
         "second_31-038",
         "second_31-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_32": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_32-000",
@@ -55760,11 +56085,13 @@
         "second_32-038",
         "second_32-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_33": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_33-000",
@@ -55808,11 +56135,13 @@
         "second_33-038",
         "second_33-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_34": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_34-000",
@@ -55856,11 +56185,13 @@
         "second_34-038",
         "second_34-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_35": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_35-000",
@@ -55904,11 +56235,13 @@
         "second_35-038",
         "second_35-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_36": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_36-000",
@@ -55952,11 +56285,13 @@
         "second_36-038",
         "second_36-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_37": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_37-000",
@@ -56000,11 +56335,13 @@
         "second_37-038",
         "second_37-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_38": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_38-000",
@@ -56048,11 +56385,13 @@
         "second_38-038",
         "second_38-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_39": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_39-000",
@@ -56096,11 +56435,13 @@
         "second_39-038",
         "second_39-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_40": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_40-000",
@@ -56144,11 +56485,13 @@
         "second_40-038",
         "second_40-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_41": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_41-000",
@@ -56192,11 +56535,13 @@
         "second_41-038",
         "second_41-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_42": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_42-000",
@@ -56240,11 +56585,13 @@
         "second_42-038",
         "second_42-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_43": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_43-000",
@@ -56288,11 +56635,13 @@
         "second_43-038",
         "second_43-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_44": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_44-000",
@@ -56336,11 +56685,13 @@
         "second_44-038",
         "second_44-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_45": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_45-000",
@@ -56384,11 +56735,13 @@
         "second_45-038",
         "second_45-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_46": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_46-000",
@@ -56432,11 +56785,13 @@
         "second_46-038",
         "second_46-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_47": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_47-000",
@@ -56480,11 +56835,13 @@
         "second_47-038",
         "second_47-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_48": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_48-000",
@@ -56528,11 +56885,13 @@
         "second_48-038",
         "second_48-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_49": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_49-000",
@@ -56576,11 +56935,13 @@
         "second_49-038",
         "second_49-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_50": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_50-000",
@@ -56624,11 +56985,13 @@
         "second_50-038",
         "second_50-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_51": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_51-000",
@@ -56672,11 +57035,13 @@
         "second_51-038",
         "second_51-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_52": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_52-000",
@@ -56720,11 +57085,13 @@
         "second_52-038",
         "second_52-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_53": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_53-000",
@@ -56768,11 +57135,13 @@
         "second_53-038",
         "second_53-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_54": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_54-000",
@@ -56816,11 +57185,13 @@
         "second_54-038",
         "second_54-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_55": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_55-000",
@@ -56864,11 +57235,13 @@
         "second_55-038",
         "second_55-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_56": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_56-000",
@@ -56912,11 +57285,13 @@
         "second_56-038",
         "second_56-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_57": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_57-000",
@@ -56960,11 +57335,13 @@
         "second_57-038",
         "second_57-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_58": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_58-000",
@@ -57008,11 +57385,13 @@
         "second_58-038",
         "second_58-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_59": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_59-000",
@@ -57056,11 +57435,13 @@
         "second_59-038",
         "second_59-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_60": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_60-000",
@@ -57104,11 +57485,13 @@
         "second_60-038",
         "second_60-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_61": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_61-000",
@@ -57152,11 +57535,13 @@
         "second_61-038",
         "second_61-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_62": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_62-000",
@@ -57200,11 +57585,13 @@
         "second_62-038",
         "second_62-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_63": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_63-000",
@@ -57248,11 +57635,13 @@
         "second_63-038",
         "second_63-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_64": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_64-000",
@@ -57296,11 +57685,13 @@
         "second_64-038",
         "second_64-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_65": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_65-000",
@@ -57344,11 +57735,13 @@
         "second_65-038",
         "second_65-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_66": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_66-000",
@@ -57392,11 +57785,13 @@
         "second_66-038",
         "second_66-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_67": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_67-000",
@@ -57440,11 +57835,13 @@
         "second_67-038",
         "second_67-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_68": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_68-000",
@@ -57488,11 +57885,13 @@
         "second_68-038",
         "second_68-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_69": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_69-000",
@@ -57536,11 +57935,13 @@
         "second_69-038",
         "second_69-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_70": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_70-000",
@@ -57584,11 +57985,13 @@
         "second_70-038",
         "second_70-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_71": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_71-000",
@@ -57632,11 +58035,13 @@
         "second_71-038",
         "second_71-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_72": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_72-000",
@@ -57680,11 +58085,13 @@
         "second_72-038",
         "second_72-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_73": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_73-000",
@@ -57728,11 +58135,13 @@
         "second_73-038",
         "second_73-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_74": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_74-000",
@@ -57776,11 +58185,13 @@
         "second_74-038",
         "second_74-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_75": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_75-000",
@@ -57824,11 +58235,13 @@
         "second_75-038",
         "second_75-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_76": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_76-000",
@@ -57872,11 +58285,13 @@
         "second_76-038",
         "second_76-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_77": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_77-000",
@@ -57920,11 +58335,13 @@
         "second_77-038",
         "second_77-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_78": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_78-000",
@@ -57968,11 +58385,13 @@
         "second_78-038",
         "second_78-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_79": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_79-000",
@@ -58016,11 +58435,13 @@
         "second_79-038",
         "second_79-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_80": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_80-000",
@@ -58064,11 +58485,13 @@
         "second_80-038",
         "second_80-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_81": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_81-000",
@@ -58112,11 +58535,13 @@
         "second_81-038",
         "second_81-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_82": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_82-000",
@@ -58160,11 +58585,13 @@
         "second_82-038",
         "second_82-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_83": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_83-000",
@@ -58207,11 +58634,13 @@
         "second_83-037",
         "second_83-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_84": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_84-000",
@@ -58254,11 +58683,13 @@
         "second_84-037",
         "second_84-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_85": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_85-000",
@@ -58301,11 +58732,13 @@
         "second_85-037",
         "second_85-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_86": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_86-000",
@@ -58348,11 +58781,13 @@
         "second_86-037",
         "second_86-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_87": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_87-000",
@@ -58395,11 +58830,13 @@
         "second_87-037",
         "second_87-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_88": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_88-000",
@@ -58442,11 +58879,13 @@
         "second_88-037",
         "second_88-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_89": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_89-000",
@@ -58489,11 +58928,13 @@
         "second_89-037",
         "second_89-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_90": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_90-000",
@@ -58536,11 +58977,13 @@
         "second_90-037",
         "second_90-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_91": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_91-000",
@@ -58583,11 +59026,13 @@
         "second_91-037",
         "second_91-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_92": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_92-000",
@@ -58630,11 +59075,13 @@
         "second_92-037",
         "second_92-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_93": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_93-000",
@@ -58677,11 +59124,13 @@
         "second_93-037",
         "second_93-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_94": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_94-000",
@@ -58724,11 +59173,13 @@
         "second_94-037",
         "second_94-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_95": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_95-000",
@@ -58771,11 +59222,13 @@
         "second_95-037",
         "second_95-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_96": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_96-000",
@@ -58818,11 +59271,13 @@
         "second_96-037",
         "second_96-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_97": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_97-000",
@@ -58865,11 +59320,13 @@
         "second_97-037",
         "second_97-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_98": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_98-000",
@@ -58912,11 +59369,13 @@
         "second_98-037",
         "second_98-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_99": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_99-000",
@@ -58959,11 +59418,13 @@
         "second_99-037",
         "second_99-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "third_00_00": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_00_00-000",
@@ -59007,11 +59468,13 @@
         "third_00_00-038",
         "third_00_00-039"
       ],
+      "kind": "third",
       "rater": "opus-third-00",
       "role": "third",
       "round": 0
     },
     "third_00_01": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_00_01-000",
@@ -59055,11 +59518,13 @@
         "third_00_01-038",
         "third_00_01-039"
       ],
+      "kind": "third",
       "rater": "opus-third-00",
       "role": "third",
       "round": 0
     },
     "third_00_02": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_00_02-000",
@@ -59102,11 +59567,13 @@
         "third_00_02-037",
         "third_00_02-038"
       ],
+      "kind": "third",
       "rater": "opus-third-00",
       "role": "third",
       "round": 0
     },
     "third_00_03": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_00_03-000",
@@ -59149,11 +59616,13 @@
         "third_00_03-037",
         "third_00_03-038"
       ],
+      "kind": "third",
       "rater": "opus-third-00",
       "role": "third",
       "round": 0
     },
     "third_00_04": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_00_04-000",
@@ -59196,11 +59665,13 @@
         "third_00_04-037",
         "third_00_04-038"
       ],
+      "kind": "third",
       "rater": "opus-third-00",
       "role": "third",
       "round": 0
     },
     "third_00_05": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_00_05-000",
@@ -59243,11 +59714,13 @@
         "third_00_05-037",
         "third_00_05-038"
       ],
+      "kind": "third",
       "rater": "opus-third-00",
       "role": "third",
       "round": 0
     },
     "third_01": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "third_01-000",
@@ -59289,15 +59762,18 @@
         "third_01-036",
         "third_01-037"
       ],
+      "kind": "third",
       "rater": "opus-third-01",
       "role": "third",
       "round": 0
     },
     "third_02": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "third_02-000"
       ],
+      "kind": "third",
       "rater": "opus-third-02",
       "role": "third",
       "round": 0

@@ -144,6 +144,11 @@
           "budget_bytes": 1200000,
           "task": "6991",
           "reason": "Re-measured 2026-11-17 05:48Z against the live dashboard (127.0.0.1:8080) after BURNDOWN_BY_PROJECT.{}.labels became label_spans, half-open [start, stop) index ranges into BURNDOWN.labels: the live body was 1,725,145 bytes with window=90d, and the same body with the span encoding applied is 950,875 (-44.9%). 12 projects; the union BURNDOWN.labels holds 2,661 labels; each project holds 1,177 to 2,164 measured rows (mean 1,958), sent as 30 to 470 spans (48,196 bytes in all). Dominant fields: BURNDOWN.labels 9.8%, then the per-project value series at about 5-9% each (BURNDOWN_BY_PROJECT.{}.done 9.1%, .pending 7.4%, label_spans 5.1%). 1,200,000 is the headroom convention over that measurement (1.25m = 1,188,594, rounded up). The 90d window is not yet full, since the store reaches back only to 2026-09-20, so the body keeps growing; full-window growth is task 10258."
+        },
+        {
+          "budget_bytes": 1200000,
+          "task": "10258",
+          "reason": "Re-measured 2026-11-20 22:47Z against the live dashboard (127.0.0.1:8080), still main's shape: 980,789 bytes with window=90d, and the same body with in_progress_live, in_progress_stranded and in_progress_rows stripped from every block and from latest.value.counts is 798,490 (-18.6%). No client reads those three series; the server still reads them for the parity verdict, as it does concurrency_cap. 12 projects, 24,179 measured rows over a union of 2,750 labels; BURNDOWN.labels spans 61.6 of the 90 days, since the store begins 2026-09-20. Stripped growth is about 9.6 KB a day (7d to 30d), so the window fills around 2026-12-19 at a projected plateau of about 1,070,650 bytes (1,311,210 had the split stayed). The payload fleet now seeds that full-window steady state, 2,740 rows per root, and serves 1,068,143. 1,200,000 is HELD, not lowered: the headroom convention over today's partial-window measurement (1,000,000) would be crossed around 2026-12-11 as the window fills, and the convention over the plateau (1,400,000) would be a raise. Headroom at the plateau is about 129,000 bytes (11%). An extra always-on project adds about 95 KB; epoch-second BURNDOWN.labels (about 80 KB at the plateau) is the next lever."
         }
       ]
     },
@@ -299,6 +304,11 @@
           "budget_bytes": 21000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 4,081 bytes with no query. Three evals. Small; the 16 KiB headroom floor sets this budget."
+        },
+        {
+          "budget_bytes": 100000,
+          "task": "10137",
+          "reason": "Measured 2026-11-23: 65,320 bytes, by building this route with task 10137's code (build_memory_evals plus shape_memory_evals, serialized as Starlette's JSONResponse does) over the live artifact tree fused-memory/data/memory-evals and the live reconciliation queue, since the live dashboard still served main's code. In the old per-item-row shape the live dashboard served 79,622 bytes on 2026-11-14 and 116,964 on 2026-11-17. Census: 7 eval dirs, 5 with runs: e1-retrieval-health 6 metric rows over 12 runs (a tripwire's 34 items nested under it), 11,146 B; e4-staleness-sweep 5 rows over 11 runs (78 items nested), 13,436 B; e6-corpus-health 44 rows over 8 runs, 34,114 B; link-heal 7 rows over 2 runs, 3,364 B; e7-write-after-miss 1 row over 11 runs, 2,147 B; 2 run-less dirs. Item rows no longer copy the metric fields or the trend, so the payload is O(items) plus one trend per metric. That trend term still grows by about 1.9 KB per daily run, two thirds of it trend.labels, which repeats the eval's run_stamps in every metric row (follow-up ticket tkt_0RXAFRYTP5CSB76AZ8G8PKCKNM removes it). The headroom convention would give 82,000, about 9 days of that growth. This budget is sized for the growth instead, about 18 days, so the daily live check holds until the follow-up lands and lowers it. It stays within the sweep's slack rule over the fleet's 52,354 bytes."
         }
       ]
     },

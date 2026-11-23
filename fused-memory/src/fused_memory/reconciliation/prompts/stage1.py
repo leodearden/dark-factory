@@ -22,12 +22,12 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     preservation_mem0_filters,
 )
 from fused_memory.reconciliation.prompts import (
-    _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
-    _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     FLAG_FOR_STAGE2_MARKER_KIND,
+    GRAPHITI_QUEUED_GUIDANCE,
+    PROJECT_ID_GUIDELINE,
     REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -226,15 +226,15 @@ triggering Graphiti's edge resolution pipeline which can falsely invalidate acti
 Use `add_memory(category='entities_and_relations')` only for genuinely new relationships \
 that don't correspond to any existing edge.
 - When you do use `add_memory(category='entities_and_relations')` for a genuinely new \
-fact, the fused-memory server now AUTOMATICALLY repairs the most common false invalidation \
+fact, the fused-memory server automatically repairs the most common false invalidation \
 it triggers: a post-write guardrail in `MemoryService._execute_graphiti_write` restores any \
 pre-existing edge that the write invalidated but whose `(source, target)` node-pair is NOT \
 restated by any surviving edge in that same write — a provably-false sibling invalidation. \
-So a manual `get_entity` before/after diff is no longer required to catch THIS failure mode. \
+So no manual `get_entity` before/after diff is needed to catch THIS failure mode. \
 Known limitation: an invalidated edge whose node-pair IS restated by a new surviving edge is \
 left untouched (it may be a legitimate contradiction) and still warrants care. This does not \
 weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary` for restated facts.
-- {_STAGE1_PROJECT_ID_GUIDELINE}
+- {PROJECT_ID_GUIDELINE}
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
@@ -254,11 +254,10 @@ mandatory two-step verification:
 
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
-IDs. `delete_memory` now REJECTS any id that is not a full 36-character UUID, returning a \
+IDs. `delete_memory` REJECTS any id that is not a full 36-character UUID, returning a \
 structured `ValidationError` that names the malformed id and tells you how to resolve the \
 real one — so a truncated prefix fails loudly instead of reporting success. The steps above \
-are still the procedure; the tool error is the backstop, not a substitute for them. \
-(Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
+are still the procedure; the tool error is the backstop, not a substitute for them.
 
 **The citation gate binds EVERY caller.** A `store='mem0'` `delete_memory` is REFUSED \
 (`error_type='CitationRepointRequired'`) while a live (non-terminal) task still cites the \
@@ -288,8 +287,7 @@ write into any task's metadata — a value like `'re-derive the current canonica
 search(query=...)'`. It is rejected mechanically (`CitationReplacementInvalid`), because \
 re-deriving at read time resolves back to the superseded cluster members the consolidation \
 was collapsing, routing dispatch into exactly the contradictory advice you just removed. \
-Only a concrete UUID forwards. \
-(Regression-pinned in fused-memory/tests/test_delete_memory_citation_guard.py.)
+Only a concrete UUID forwards.
 
 **Where there is no survivor at all, there is exactly one sanctioned bypass.** Some \
 deletes are not consolidations — a plain drop rather than a consolidation, where the entry \
@@ -369,14 +367,11 @@ needs no escalation read at all: the stamp lives on the task record, which you d
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
 was created — count it as a no-op, not a successful addition. Your stats \
-(`memories_added` / `memories_written`) must reflect actual IDs returned, not calls \
+(`memories_added`) must reflect actual IDs returned, not calls \
 attempted. If a write returns zero IDs and you expected a new memory, either retry with \
 different content or note the deduplication in your report.
 
-Invariant: `len(memory_ids_returned) == memories_written == memories_added`. Both keys \
-must carry the same count and both count only writes where `memory_ids` was non-empty.
-
-{_STAGE1_GRAPHITI_QUEUED_GUIDANCE}
+{GRAPHITI_QUEUED_GUIDANCE}
 
 Note that the stats verifier may report a LOWER final count than you did, because a write \
 you correctly counted can later be dead-lettered by the durable queue after this stage has \
@@ -506,9 +501,8 @@ write, so a persisted edge goes stale within the hour while still reading as cur
 Extraction also produces facts that name no task at all (e.g. "Pin order is set to \
 10."), which no sweep can attribute to a task or drain.
 
-**Do not be the writer**: since task 3853 (the esc-3834-1 ruling) this edge class no \
-longer originates from the MCP override tools, which emit no memory write at all. Do \
-not re-mint it from a pin-queue observation.
+**Do not be the writer**: the MCP override tools emit no memory write, so this edge \
+class does not originate there. Do not re-mint it from a pin-queue observation.
 
 ### Stale task-count snapshot edges — do NOT emit correction findings
 
@@ -628,24 +622,15 @@ The one case already automated is BLOCKED-status snapshot edges, which the deter
 duplicate the sweep's work there; the one exception is an edge you can show it missed, \
 which you fix AND flag per that section.
 
-**Encoding effective dates in fact text**: when writing a temporal-fact snapshot via \
+**Encoding effective dates in fact text**: when writing a temporal fact via \
 `add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \
 fact text itself so the temporal anchor is human-readable even if `valid_at` metadata \
 is not surfaced by the search caller. Example fact text: \
-`"As of 2026-05-09: project dark_factory has 3 blocked, 18 done, 42 total."` \
-This is especially important for task-count, task-status, run summary, and system-stat \
-snapshots where the date of the reading is part of the fact's meaning.
+`"As of 2026-05-09: the scheduler overlays the governed rate onto BillingConfig."`
 
-**Cycle summary acknowledgment**: note in your cycle summary that `update_edge` lacks a \
-`valid_at` parameter and that you used the two-step workaround (invalidate + add_memory) \
-for any temporal/snapshot edge updates. This keeps the `valid_at` gap visible to \
-downstream stages and the judge. Example: "Used invalidate+add_memory workaround for \
-N snapshot edges (update_edge valid_at limitation)."
-
-When this applies: any time the fact text describes "current state as of today" (task \
-counts, task status, system status, run summaries). For static entity relationships where \
-the temporal anchor is irrelevant, plain `update_edge` with new fact text remains \
-acceptable.
+When this applies: any time the fact text describes state as of a particular date. For \
+static entity relationships where the temporal anchor is irrelevant, plain `update_edge` \
+with new fact text remains acceptable.
 
 ## Cycle Fence
 When a cycle fence timestamp is provided in the payload, do NOT delete, merge, or modify \

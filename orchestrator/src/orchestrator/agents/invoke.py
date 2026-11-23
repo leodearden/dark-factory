@@ -45,6 +45,7 @@ from orchestrator.agents.mimo_backend import (
     read_mimo_sessions,
 )
 from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
+from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
 from orchestrator.agents.zcode_backend import (
     ZCodeEndpoint,
     parse_zcode_output,
@@ -57,28 +58,6 @@ from orchestrator.agents.zcode_backend import (
 from orchestrator.mcp_lifecycle import apply_mcp_startup_env
 
 logger = logging.getLogger(__name__)
-
-# Fallback USD/1M-token rate used ONLY when a model has no configured price
-# (neither in a threaded-in prices map nor the packaged default_price_table()).
-# Unifies the two former silent per-backend fallbacks (codex 2.0/8.0, gemini
-# 1.0/4.0) into one DEFINED, logged rate — see _estimate_cost.
-_FALLBACK_PRICE: dict[str, float] = {'input_per_1m': 2.0, 'output_per_1m': 8.0}
-
-
-def _rate(entry: Any, key: str) -> float:
-    """Read *key* off a price *entry*, which may be a PriceEntry (attribute)
-    or a plain dict (item) — so both ``config.prices`` values and plain
-    dicts (e.g. _FALLBACK_PRICE, test fixtures) work through the same
-    accessor. Uses hasattr (not a getattr default) so a legitimate 0.0 rate
-    is read correctly rather than masked by a fallback default.
-    """
-    return getattr(entry, key) if hasattr(entry, key) else entry[key]
-
-
-def _optional_rate(entry: Any, key: str) -> float | None:
-    """Read an optional *key* off a price *entry* as _rate does, answering
-    None when it is absent or unset rather than raising."""
-    return getattr(entry, key) if hasattr(entry, key) else entry.get(key)
 
 
 def _estimate_cost(
@@ -96,7 +75,7 @@ def _estimate_cost(
     or a plain dict of dicts) consulted first. When None, resolves to the
     packaged ``default_price_table()`` (lazy import — this low-level module
     does not depend on orchestrator.config at module-load time). A model
-    absent from the resolved table falls back to _FALLBACK_PRICE.
+    absent from the resolved table falls back to FALLBACK_PRICE, with a WARNING.
 
     *input_tokens* INCLUDES *cached_input_tokens*; that cached share is priced
     at cached_input_per_1m, or at input_per_1m when the entry has none.
@@ -109,18 +88,15 @@ def _estimate_cost(
         logger.warning(
             'No configured price for model %r; falling back to $%.2f/1M input, '
             '$%.2f/1M output (add it to config.prices to silence)',
-            model, _FALLBACK_PRICE['input_per_1m'], _FALLBACK_PRICE['output_per_1m'],
+            model, FALLBACK_PRICE['input_per_1m'], FALLBACK_PRICE['output_per_1m'],
         )
-        entry = _FALLBACK_PRICE
-    input_rate = _rate(entry, 'input_per_1m')
-    cached_rate = _optional_rate(entry, 'cached_input_per_1m')
-    if cached_rate is None:
-        cached_rate = input_rate
-    return (
-        (input_tokens - cached_input_tokens) * input_rate
-        + cached_input_tokens * cached_rate
-        + output_tokens * _rate(entry, 'output_per_1m')
-    ) / 1_000_000
+        entry = FALLBACK_PRICE
+    usage = TokenUsage(
+        input_tokens=input_tokens - cached_input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cached_input_tokens,
+    )
+    return price_tokens(entry, usage).cost_usd
 
 
 async def invoke_agent(

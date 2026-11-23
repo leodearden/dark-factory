@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _git_fault_shim import fail_git
 from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
@@ -878,6 +879,56 @@ class TestRequeueReuseUnstacks:
         assert await _rev_parse(lane, 'HEAD') == tip_before
         await _assert_clean_and_not_rebasing(lane)
         assert await warm_repo.ledger.base_of('task/M') == p_tip
+
+    async def test_registered_cold_worktree_requeue_resumes_on_own_delta(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        await repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await repo.git_ops.create_worktree('M')
+
+        assert info.path == repo.wt('M')
+        await _assert_resumed_on_own_delta(repo)
+
+    async def test_registered_cold_worktree_with_an_unreadable_record_stays_on_its_old_base(
+        self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        tip_before = await repo.sha('task/M')
+        p_tip = await repo.sha('task/P')
+        main_sha = await repo.advance_main({'unrelated.txt': 'main moved\n'})
+        fail_git(
+            monkeypatch, tmp_path / 'shim' / 'bin',
+            'for-each-ref*refs/dark-factory/stack-base/*',
+        )
+
+        info = await repo.git_ops.create_worktree('M')
+
+        monkeypatch.undo()
+        assert info.path == repo.wt('M')
+        assert await repo.sha('task/M') == tip_before
+        assert not await repo.git_ops.is_ancestor(main_sha, 'task/M')
+        await _assert_clean_and_not_rebasing(repo.wt('M'))
+        assert await repo.ledger.base_of('task/M') == p_tip
+
+    async def test_registered_cold_train_successor_is_rebased_onto_its_predecessor_and_recorded(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        await repo.git_ops.forget_stack_bases(['M'])
+        p_tip = await _commit_files(repo.wt('P'), {'p_more.txt': 'p\n'}, 'P moves on')
+
+        info = await repo.git_ops.create_worktree(
+            'M', train={'id': 'T', 'order': 1, 'members': ['P', 'M']},
+        )
+
+        assert info.path == repo.wt('M')
+        assert await repo.git_ops.is_ancestor(p_tip, 'task/M')
+        assert await _diff_vs_main(repo.root, 'task/M') == {
+            'shared.txt', 'p_only.txt', 'p_more.txt', 'm.txt',
+        }
+        assert await repo.ledger.base_of('task/M') == p_tip
 
     async def test_cold_reattach_of_a_train_successor_keeps_its_stack(
         self, repo: Repo,

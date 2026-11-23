@@ -52,7 +52,7 @@ from fused_memory.config.schema import WriteTriageConfig
 # CONTESTED_METADATA_KEY below.
 from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX, SUPERSEDED_BY_METADATA_KEY
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.memory import MemoryResult
+from fused_memory.models.memory import MemoryResult, mem0_hit_attribution
 from fused_memory.utils.async_utils import gather_collect
 from fused_memory.utils.clip_disclosure import elide_text
 from fused_memory.utils.mem0_content_keys import mem0_payload_text
@@ -457,7 +457,8 @@ def _promoted_parent(parent_id: str, record: Mapping[str, Any]) -> MemoryResult:
     So the payload is partitioned with ``mem0_client.split_managed_metadata``
     — the DECIDED HOME for that split (INV-5) rather than a re-derivation —
     and only the CUSTOM half becomes ``metadata``.  ``created_at`` is read back
-    off the managed half, which is exactly where that key lands.
+    off the managed half, which is exactly where that key lands.  Writer and
+    scope are read from the managed half too, the same as a direct hit.
     """
     payload = record.get('metadata') or {}
     managed, custom = split_managed_metadata(dict(payload))
@@ -474,6 +475,7 @@ def _promoted_parent(parent_id: str, record: Mapping[str, Any]) -> MemoryResult:
         source_store=SourceStore.mem0,
         metadata=custom,
         created_at=created_at if isinstance(created_at, str) else None,
+        **mem0_hit_attribution(managed, custom),
     )
 
 

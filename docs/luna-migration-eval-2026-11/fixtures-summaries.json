@@ -1,0 +1,1033 @@
+[
+  {
+    "edge_uuids": [
+      "b072378b-91a7-402a-abc0-76e4af2b52c4"
+    ],
+    "episode_content_sha256": "58378b78d3a6984751bc0d8be0fd9c4da903e6ba729fd4a3d1ebf2535e6ffb1b",
+    "episode_uuid": "8519a1d7-d3e0-4d79-a0c6-9b6544557f75",
+    "episode_valid_at": "2026-10-10T18:58:22.064080+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "Heuristic 10",
+    "node_uuid": "198aed85-3e64-45aa-ab9d-5c00dce67d60",
+    "summary_sha256": "6d068385a4f5bfd633bbd00b5acda28e7651d0bb0513c7e09b1bb8414060f542",
+    "summary_with_edges_chars": 15984
+  },
+  {
+    "edge_uuids": [
+      "dff14e7e-42b4-4a5f-ba6c-9a245e7614ee"
+    ],
+    "episode_content_sha256": "58378b78d3a6984751bc0d8be0fd9c4da903e6ba729fd4a3d1ebf2535e6ffb1b",
+    "episode_uuid": "8519a1d7-d3e0-4d79-a0c6-9b6544557f75",
+    "episode_valid_at": "2026-10-10T18:58:22.064080+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "ConsentGate",
+    "node_uuid": "9665acf3-e81d-4643-a3b2-4259db689f60",
+    "summary_sha256": "b89ca72316d00309ff34cb9169d055d90ebc177871d5e139a4478d0d522266b5",
+    "summary_with_edges_chars": 2024
+  },
+  {
+    "edge_uuids": [
+      "c908f4a2-2b09-43e4-ad17-e22f8aeee332",
+      "fc250ed0-0bf9-4616-9194-e2d8e30cedb9"
+    ],
+    "episode_content_sha256": "77fedb1ac6ac9970f7538a6dc8aa05f1c8eb8e09e7c9bcfb563e1496cee237a5",
+    "episode_uuid": "29c4f1a3-12ff-4dc5-84aa-e3b13d7327dd",
+    "episode_valid_at": "2026-10-30T09:16:05.419062+00:00",
+    "graph": "reify",
+    "node_name": "ArgTypeMismatch",
+    "node_uuid": "a7695839-c545-429c-afe4-76604956bca7",
+    "summary_sha256": "d2f5bc80acfeb084d968db1bc290a49a3b5292d1a6b2e5996ee301dc6dc984b7",
+    "summary_with_edges_chars": 2493
+  },
+  {
+    "edge_uuids": [
+      "3c312d94-3fdf-4773-873c-f840e2bc1bb9"
+    ],
+    "episode_content_sha256": "77fedb1ac6ac9970f7538a6dc8aa05f1c8eb8e09e7c9bcfb563e1496cee237a5",
+    "episode_uuid": "29c4f1a3-12ff-4dc5-84aa-e3b13d7327dd",
+    "episode_valid_at": "2026-10-30T09:16:05.419062+00:00",
+    "graph": "reify",
+    "node_name": "heuristic 11",
+    "node_uuid": "6817a451-dba0-414e-bafb-72d908648745",
+    "summary_sha256": "1828b5e8014642e44e98b196ecae4c00c2a61578ff1d4360fb5686fc243e71dd",
+    "summary_with_edges_chars": 20360
+  },
+  {
+    "edge_uuids": [
+      "df55cbec-d637-4836-8a34-6f6448642444"
+    ],
+    "episode_content_sha256": "2bdc107496fe8cfb2caa18285d7bae510b5624046a7d2b8143a07725c8cdaf5a",
+    "episode_uuid": "6b3dcbaf-ae6f-447c-b1c0-fe90f1325ef9",
+    "episode_valid_at": "2026-10-26T09:51:22.378733+00:00",
+    "graph": "stream_touch",
+    "node_name": "Leo",
+    "node_uuid": "38e740f1-a735-4214-a10b-917990a18965",
+    "summary_sha256": "b519d47127689240dcdf2db153157014680289cdacd12c5aa7612eb88e6a80c9",
+    "summary_with_edges_chars": 3575
+  },
+  {
+    "edge_uuids": [
+      "df55cbec-d637-4836-8a34-6f6448642444"
+    ],
+    "episode_content_sha256": "2bdc107496fe8cfb2caa18285d7bae510b5624046a7d2b8143a07725c8cdaf5a",
+    "episode_uuid": "6b3dcbaf-ae6f-447c-b1c0-fe90f1325ef9",
+    "episode_valid_at": "2026-10-26T09:51:22.378733+00:00",
+    "graph": "stream_touch",
+    "node_name": "PRD",
+    "node_uuid": "33db6a81-99e5-4df3-8455-b1f1b9720142",
+    "summary_sha256": "5c43e48cc9a0f623718e2728c22947d0e84a5a3076038032fbb9a1903c350b5e",
+    "summary_with_edges_chars": 12197
+  },
+  {
+    "edge_uuids": [
+      "24537f2a-937c-4456-a6d9-86e4aaf0e0d2"
+    ],
+    "episode_content_sha256": "bd06f79c8f9ae44210a3186322d36f99d4320ef8d7ec31297b60596b75f0b9b7",
+    "episode_uuid": "75a860ad-c03c-4be9-8b75-8cbe3ff16284",
+    "episode_valid_at": "2026-10-29T17:04:10.583754+00:00",
+    "graph": "scoping_intake",
+    "node_name": "pyright",
+    "node_uuid": "25f9dd3c-ec97-4914-893e-ecc279aa421f",
+    "summary_sha256": "aeef1c6dc1e2a8c32aee3e70dc5c60b0b6eed423133eaeaa1e528052e7b1020c",
+    "summary_with_edges_chars": 14530
+  },
+  {
+    "edge_uuids": [
+      "3d5cf387-91c6-4088-b8fc-faf8a7059db5",
+      "699b8c41-fe9b-4438-8ccc-fa2a578a9007"
+    ],
+    "episode_content_sha256": "bd06f79c8f9ae44210a3186322d36f99d4320ef8d7ec31297b60596b75f0b9b7",
+    "episode_uuid": "75a860ad-c03c-4be9-8b75-8cbe3ff16284",
+    "episode_valid_at": "2026-10-29T17:04:10.583754+00:00",
+    "graph": "scoping_intake",
+    "node_name": "test_clients.py",
+    "node_uuid": "f8624c49-4286-4d82-8d46-80c8041b287f",
+    "summary_sha256": "47b65bfb6fccc76bcc8abd32c1bdbaf033b9c39b5edfa121b593f20d1368a4a1",
+    "summary_with_edges_chars": 6834
+  },
+  {
+    "edge_uuids": [
+      "137b005f-25fa-4860-bdfd-cb5c0b0088af",
+      "ce5fca6c-80c2-4bf9-967a-6ecae9b3c5ba"
+    ],
+    "episode_content_sha256": "201da65dc7f247e494d9e0ab06d9bfa54591a4cbc5e4a6ab6817839ba56f54c2",
+    "episode_uuid": "bca9e311-a171-43f5-ad1e-34f2bdbe482e",
+    "episode_valid_at": "2026-11-17T04:38:50.405303+00:00",
+    "graph": "dark_factory",
+    "node_name": "OPENAI_API_KEY",
+    "node_uuid": "d36d3248-c42d-4cd4-9676-c68ab387f948",
+    "summary_sha256": "3271f671e48ea70a7490fd2a95242fbdd16c1c1185c1fabf51a4d9e5af3806ba",
+    "summary_with_edges_chars": 3128
+  },
+  {
+    "edge_uuids": [
+      "366b0cb8-f2e3-40d5-ba01-2c6f794b9ad9"
+    ],
+    "episode_content_sha256": "2dc18b0fd552f9e6b1fb255bfb82ff8949bbb4a455fcf3efaa00114e2749cce3",
+    "episode_uuid": "19adad1f-13ba-4b5b-8b8f-e2c0a3e3929b",
+    "episode_valid_at": "2026-10-28T23:31:12.412500+00:00",
+    "graph": "dark_factory",
+    "node_name": "Heuristic 1",
+    "node_uuid": "23fe6ad8-5c47-4200-b5b7-084a0855487a",
+    "summary_sha256": "deb8757ccdfbcb0c11b1a2360050832644306e373961de17e719d7c10c9487c3",
+    "summary_with_edges_chars": 9772
+  },
+  {
+    "edge_uuids": [
+      "799eba90-4b27-49af-a5a2-716babcdc5e8"
+    ],
+    "episode_content_sha256": "497c1080d228acfb3c1071295bc59188417e760a564db321fd2365b668b9ea56",
+    "episode_uuid": "135d44f1-f93b-4ad4-8a38-f981e631fe26",
+    "episode_valid_at": "2026-11-06T04:20:31.831799+00:00",
+    "graph": "dark_factory",
+    "node_name": "sweep",
+    "node_uuid": "4f5e772f-fa55-4688-a8c7-ff9d2e182ec9",
+    "summary_sha256": "0d05fa69ebadd91f8a70e173ed1f4aef39c3a2b58507013620e2417aa04e6e1f",
+    "summary_with_edges_chars": 6672
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "497c1080d228acfb3c1071295bc59188417e760a564db321fd2365b668b9ea56",
+    "episode_uuid": "135d44f1-f93b-4ad4-8a38-f981e631fe26",
+    "episode_valid_at": "2026-11-06T04:20:31.831799+00:00",
+    "graph": "dark_factory",
+    "node_name": "ledger",
+    "node_uuid": "4fd51257-a18c-49b3-9d3b-c9d0839b3d2e",
+    "summary_sha256": "6b9dd6514f44bb61496ce1acc72cd5ac3330d1541906d9e894a9df38871e5780",
+    "summary_with_edges_chars": 5870
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "1373fa9e50cfbc25a3b6aeeea14f19403fec26507baf78a1ebfe1dde535e7f08",
+    "episode_uuid": "ef305c16-c852-4cdc-b2ea-52be1bcf4d7a",
+    "episode_valid_at": "2026-10-01T14:30:53.362037+00:00",
+    "graph": "solar_challenge",
+    "node_name": "jobs module",
+    "node_uuid": "22cb3ade-3a9d-4f91-b914-74ef81bd5319",
+    "summary_sha256": "f55f441c07422914112f01fcff0e060191bffc375c4e5f44a9e0a0a1dc99d47a",
+    "summary_with_edges_chars": 2471
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "1373fa9e50cfbc25a3b6aeeea14f19403fec26507baf78a1ebfe1dde535e7f08",
+    "episode_uuid": "ef305c16-c852-4cdc-b2ea-52be1bcf4d7a",
+    "episode_valid_at": "2026-10-01T14:30:53.362037+00:00",
+    "graph": "solar_challenge",
+    "node_name": "atexit",
+    "node_uuid": "ec6c91bf-9f9c-4593-9238-2c976a847a72",
+    "summary_sha256": "c973cc07e9dc7446ffcf87e9c2fcf62d596f76acc207b10571ebf1ab66da9473",
+    "summary_with_edges_chars": 2906
+  },
+  {
+    "edge_uuids": [
+      "86824e10-8669-455e-bb4e-c981db891c71"
+    ],
+    "episode_content_sha256": "6e1dc4e40d066a61a4bedf6ae123d928e008034d7ac627819a65c81e3c996697",
+    "episode_uuid": "17b586fb-0241-43db-a5d5-39d79b355416",
+    "episode_valid_at": "2026-11-10T10:11:05.944084+00:00",
+    "graph": "scoping_intake",
+    "node_name": "architect",
+    "node_uuid": "98e2a0f0-ab48-495f-99c7-d61026ab8b16",
+    "summary_sha256": "e9e984b0bd032d23880d872aa993e974210a9afa10eaa204608b0b9b75de70b3",
+    "summary_with_edges_chars": 4778
+  },
+  {
+    "edge_uuids": [
+      "21f2b460-4d6d-45e9-bd6a-326e586600fd",
+      "c1a8b847-3af3-4fdb-8b4e-da4e29919362",
+      "d79d7d03-f2c7-4d44-8978-7efe711e4a88"
+    ],
+    "episode_content_sha256": "609d1df9f6331c3739908f45773a54e5600a2edf5b210f5c71d5e6023fda9df6",
+    "episode_uuid": "2e47930d-2fc4-4abd-85ce-9ba87aad4624",
+    "episode_valid_at": "2026-11-10T15:35:20.887338+00:00",
+    "graph": "scoping_intake",
+    "node_name": "FakeClaude",
+    "node_uuid": "d041fb1e-e4af-409b-b174-f9d1c4061594",
+    "summary_sha256": "f431fe7055e5762ae71506f10514db7e65a2aafed6044d878d56b29cbeba9a3e",
+    "summary_with_edges_chars": 4267
+  },
+  {
+    "edge_uuids": [
+      "89f22fe0-6ed3-4aa7-af1a-7d280dcaf107",
+      "cac32547-f616-4c71-83c2-83380b13dab6"
+    ],
+    "episode_content_sha256": "fbc1a457b8fe97f239adad614a5ffcd4643bfae99079dbe6fe8b3d2f523fea03",
+    "episode_uuid": "e7f4f814-7891-43d6-8600-74072fd4253b",
+    "episode_valid_at": "2026-11-09T08:12:39.749240+00:00",
+    "graph": "scoping_intake",
+    "node_name": "model",
+    "node_uuid": "65499792-18a1-4ee3-96fb-c7193bf5eb67",
+    "summary_sha256": "bf15ea54365f10a0038421b718a074b513383dc02cffb67424f5843c000a4c31",
+    "summary_with_edges_chars": 2124
+  },
+  {
+    "edge_uuids": [
+      "c1cac5d7-7d60-4382-bb54-57986b4d3999"
+    ],
+    "episode_content_sha256": "fbc1a457b8fe97f239adad614a5ffcd4643bfae99079dbe6fe8b3d2f523fea03",
+    "episode_uuid": "e7f4f814-7891-43d6-8600-74072fd4253b",
+    "episode_valid_at": "2026-11-09T08:12:39.749240+00:00",
+    "graph": "scoping_intake",
+    "node_name": "heuristic 10",
+    "node_uuid": "ae83cf05-a651-40a5-9270-693f43f887ee",
+    "summary_sha256": "2ef1060f8bd2ac2fc71be704bde4b14a8f80f116a2370b211983725bcc3aab6a",
+    "summary_with_edges_chars": 14641
+  },
+  {
+    "edge_uuids": [
+      "0a651c0a-8c4c-4c16-8644-39d66a61cf90"
+    ],
+    "episode_content_sha256": "21230a931477fa15ff4ca32fbc3a9c6e72eec20a20e623f4c4853894be381886",
+    "episode_uuid": "87a2f26c-79e3-42e8-987e-d6126358247b",
+    "episode_valid_at": "2026-10-21T10:00:27.715323+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "tests/_timescale_container.py",
+    "node_uuid": "43dc911d-40ee-4e3f-93b4-2e3db8d6e71f",
+    "summary_sha256": "cf2c6f02402fe72584d8943248eda36edfd54b03b2d5ee9b8db4cefe39b01bca",
+    "summary_with_edges_chars": 2033
+  },
+  {
+    "edge_uuids": [
+      "0a651c0a-8c4c-4c16-8644-39d66a61cf90",
+      "16253e40-8327-45af-8d75-3b0c40c0a5d5",
+      "1c58c36a-99ea-4095-a663-a8e4239a6426",
+      "20faf1e0-6157-466a-941a-4851868467f7",
+      "30b97b52-0a14-46fb-b663-9c06d80c3d60",
+      "5c384c5a-a37f-4a00-90b0-089e4c431aa9",
+      "95a77d5c-dd60-475b-9e57-834d693daa02",
+      "e9c9b428-d263-4704-9e75-38a06e1afb1f",
+      "fbc506d5-d213-4c36-a825-ba12bbec1c19"
+    ],
+    "episode_content_sha256": "21230a931477fa15ff4ca32fbc3a9c6e72eec20a20e623f4c4853894be381886",
+    "episode_uuid": "87a2f26c-79e3-42e8-987e-d6126358247b",
+    "episode_valid_at": "2026-10-21T10:00:27.715323+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "DOCKER_API_TIMEOUT_S",
+    "node_uuid": "1ff539c2-2f81-4242-a2ed-cceabce2686c",
+    "summary_sha256": "4660e65fdc26e50404102f6653b5b8162f14b60ecb3bac212ccb7d8f5776ea52",
+    "summary_with_edges_chars": 2468
+  },
+  {
+    "edge_uuids": [
+      "7f7f3b3c-c642-4849-84f3-a8ec70b4c357"
+    ],
+    "episode_content_sha256": "562545eeadf38a0dceecfa2dcfd590bace79a015a8bce0a8a3005cf8a762f961",
+    "episode_uuid": "522879ba-f80c-4bc3-ab5d-78a8fb36b59e",
+    "episode_valid_at": "2026-10-10T21:13:02.513154+00:00",
+    "graph": "dark_factory",
+    "node_name": "D3",
+    "node_uuid": "e3dda896-112a-4d41-8f3d-195007465c94",
+    "summary_sha256": "2c67f85291a05766f871742051c6ce2d30e893cc5e0eb7344e4b4826b30eaebb",
+    "summary_with_edges_chars": 2215
+  },
+  {
+    "edge_uuids": [
+      "bd5dd8d5-4b18-4674-98d5-114192297c1d"
+    ],
+    "episode_content_sha256": "562545eeadf38a0dceecfa2dcfd590bace79a015a8bce0a8a3005cf8a762f961",
+    "episode_uuid": "522879ba-f80c-4bc3-ab5d-78a8fb36b59e",
+    "episode_valid_at": "2026-10-10T21:13:02.513154+00:00",
+    "graph": "dark_factory",
+    "node_name": "\u03bc",
+    "node_uuid": "8029f00e-865d-48cd-8849-b8346a5dcb47",
+    "summary_sha256": "b9735742bcbb714c592eb4c6327a46bba9741462aa66b63bd3b77f0239341891",
+    "summary_with_edges_chars": 2260
+  },
+  {
+    "edge_uuids": [
+      "b07ccb16-917e-4bbf-b00f-18a296933f35"
+    ],
+    "episode_content_sha256": "477811f8535a732da4f96accf9bfc07304231620585331ee1abd3f6211b79eec",
+    "episode_uuid": "73d19d05-a901-41f3-a9ae-b93645e0ee5a",
+    "episode_valid_at": "2026-10-01T22:54:30.350209+00:00",
+    "graph": "dark_factory",
+    "node_name": "pytest-timeout",
+    "node_uuid": "580102e3-d621-46c9-a9bc-a8b627bd392f",
+    "summary_sha256": "8e04bcd9075093fa558ae5be71966a97a1fd95fc7011dd74715c86e8ae7b198f",
+    "summary_with_edges_chars": 2895
+  },
+  {
+    "edge_uuids": [
+      "e33de698-48ce-485b-8a95-47f05ca56fc4"
+    ],
+    "episode_content_sha256": "4a42cbd5e41b60cc370daecb0862573cc24bab78259de61a6a238213070e355b",
+    "episode_uuid": "1abf3795-e500-4920-a938-6c1ebdc1aee1",
+    "episode_valid_at": "2026-11-04T11:34:00.416147+00:00",
+    "graph": "dark_factory",
+    "node_name": "worker.py",
+    "node_uuid": "d9639d74-440b-4785-86bf-0395ad2ec7ca",
+    "summary_sha256": "0e9ad9b149a7f44bc38737c12a47bfd7875b4cc99b1b6d17c7a2ead8b175d727",
+    "summary_with_edges_chars": 9620
+  },
+  {
+    "edge_uuids": [
+      "133a568c-e1b5-40c5-b876-bb88c4bbf4a6",
+      "21b53f4d-60bf-4f69-9231-963f53ac328d",
+      "31f8a00f-81d5-4905-9201-af515a864a36",
+      "35fc84fe-ed35-4973-922f-1ae701bbc901",
+      "50dd77ee-ba48-4e0a-bb02-eee13671a605",
+      "56d053ad-9f3e-4103-b7e7-d1ba5f920fb4",
+      "5f22dbcd-8228-43d8-875e-de905837338b",
+      "7d27a30c-ace1-4ad4-9e53-45266177a000",
+      "86b94a89-e447-4cc7-a6a7-5e92c5b26f7d",
+      "a576f026-8156-439e-9845-f400e0ce4cb3",
+      "d49e0238-b1f9-43c9-bae3-8917dcca68da",
+      "d761db8c-7b06-4efa-b518-53f9d7666117",
+      "e33de698-48ce-485b-8a95-47f05ca56fc4",
+      "f52bf4d5-39ba-489c-9cc6-2a1afb73ddd2"
+    ],
+    "episode_content_sha256": "4a42cbd5e41b60cc370daecb0862573cc24bab78259de61a6a238213070e355b",
+    "episode_uuid": "1abf3795-e500-4920-a938-6c1ebdc1aee1",
+    "episode_valid_at": "2026-11-04T11:34:00.416147+00:00",
+    "graph": "dark_factory",
+    "node_name": "verify_dispatch.py",
+    "node_uuid": "a3b994f8-d7f0-48c5-9b5b-b1dc36aa889b",
+    "summary_sha256": "0ac5478477a21e53e2ae87bb08d50b8733f200498a63c1a4183f473110f01798",
+    "summary_with_edges_chars": 2214
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "4c64fa8cf1f4245ae953ecddd48db999b56d914afa687f8b46f44369e7301957",
+    "episode_uuid": "12e2b213-c085-459e-b810-71a64a6e691d",
+    "episode_valid_at": "2026-10-01T16:55:52.831453+00:00",
+    "graph": "solar_challenge",
+    "node_name": "JobManager",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+    "summary_sha256": "eb8eae4e8d3db77b5fd49ebc891a7152f4fe0349b283ef01a4f652c8f336743b",
+    "summary_with_edges_chars": 27173
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "4c64fa8cf1f4245ae953ecddd48db999b56d914afa687f8b46f44369e7301957",
+    "episode_uuid": "12e2b213-c085-459e-b810-71a64a6e691d",
+    "episode_valid_at": "2026-10-01T16:55:52.831453+00:00",
+    "graph": "solar_challenge",
+    "node_name": "jobs module",
+    "node_uuid": "22cb3ade-3a9d-4f91-b914-74ef81bd5319",
+    "summary_sha256": "f55f441c07422914112f01fcff0e060191bffc375c4e5f44a9e0a0a1dc99d47a",
+    "summary_with_edges_chars": 2471
+  },
+  {
+    "edge_uuids": [
+      "4cee7175-1693-42f2-9053-c30c04718416"
+    ],
+    "episode_content_sha256": "4f0d8ccd9e7bf40468889b3a66ebe837ffbbdfcbc489a39f1f5e853027890321",
+    "episode_uuid": "c5fa0c76-a3f0-4fdc-82b5-8380820dc2c3",
+    "episode_valid_at": "2026-11-02T14:27:52.200677+00:00",
+    "graph": "solar_challenge",
+    "node_name": "test_named_classes.py",
+    "node_uuid": "9fdae2a4-b5eb-4017-861e-f926877c7ca1",
+    "summary_sha256": "9908740c8d87c62711bdcf270ee8f9705730cd583513f10ddf69fa0b9b2ba96a",
+    "summary_with_edges_chars": 5634
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "4f0d8ccd9e7bf40468889b3a66ebe837ffbbdfcbc489a39f1f5e853027890321",
+    "episode_uuid": "c5fa0c76-a3f0-4fdc-82b5-8380820dc2c3",
+    "episode_valid_at": "2026-11-02T14:27:52.200677+00:00",
+    "graph": "solar_challenge",
+    "node_name": "test_surface_form.py",
+    "node_uuid": "9ae19f97-b061-43ef-a512-c8d1e1d5c205",
+    "summary_sha256": "67ec2147faeb685c414d0acde447266f8cb00119bf43646598117ba8718e8d5e",
+    "summary_with_edges_chars": 3730
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "78603a1fada955b38d72b5a3e2f676978786613a852deb66dbdaf17c477d76b7",
+    "episode_uuid": "f96613dc-463e-4d6b-9b76-29223f5498c9",
+    "episode_valid_at": "2026-10-01T19:38:08.285265+00:00",
+    "graph": "solar_challenge",
+    "node_name": "JobManager",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+    "summary_sha256": "eb8eae4e8d3db77b5fd49ebc891a7152f4fe0349b283ef01a4f652c8f336743b",
+    "summary_with_edges_chars": 27173
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "78603a1fada955b38d72b5a3e2f676978786613a852deb66dbdaf17c477d76b7",
+    "episode_uuid": "f96613dc-463e-4d6b-9b76-29223f5498c9",
+    "episode_valid_at": "2026-10-01T19:38:08.285265+00:00",
+    "graph": "solar_challenge",
+    "node_name": "a08eacc",
+    "node_uuid": "25c9872d-539e-4319-83a9-86f4bc7be42d",
+    "summary_sha256": "e3b7f208a425ac1c39f41bf981d1432137f4cd7376776cdb0790f60a2cf81203",
+    "summary_with_edges_chars": 2245
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "25966595126309676a9da05f1b460052c424ab74cbbbaa46fb176ed386e5adfe",
+    "episode_uuid": "ea2a4400-9469-4784-84e8-8fc16892e9b8",
+    "episode_valid_at": "2026-10-07T22:29:04.642198+00:00",
+    "graph": "reify",
+    "node_name": "defect",
+    "node_uuid": "661ececa-32ab-440f-a29f-0f832826b807",
+    "summary_sha256": "a3ec3c82672f35b79ffb21af17d219100a8cab665428d717ff2656447dce3c22",
+    "summary_with_edges_chars": 2248
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "0da788f65c9bbc336d035062c4c59a6090efa9dadde064ab53444ff6aaeb0c23",
+    "episode_uuid": "e5d2ac5a-7ce4-455a-950e-b25d609b6209",
+    "episode_valid_at": "2026-10-02T01:32:50.605082+00:00",
+    "graph": "solar_challenge",
+    "node_name": "esc-121-3",
+    "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+    "summary_sha256": "c0010665a35957127bcf1ffb65ea34a9db8fa9494b73a93c9569bc3e737f60da",
+    "summary_with_edges_chars": 11928
+  },
+  {
+    "edge_uuids": [
+      "449d289b-6572-4082-8c24-3d72145f2c42"
+    ],
+    "episode_content_sha256": "0da788f65c9bbc336d035062c4c59a6090efa9dadde064ab53444ff6aaeb0c23",
+    "episode_uuid": "e5d2ac5a-7ce4-455a-950e-b25d609b6209",
+    "episode_valid_at": "2026-10-02T01:32:50.605082+00:00",
+    "graph": "solar_challenge",
+    "node_name": "Main bb2bfb1",
+    "node_uuid": "814e6734-83e5-4a46-9ed3-03136acbc2e4",
+    "summary_sha256": "8ae34f0876a18a231e8def4cedd9570e9c37f76cfbbce24859a89eedebdb85f1",
+    "summary_with_edges_chars": 6970
+  },
+  {
+    "edge_uuids": [
+      "22f4a7b3-fba2-40dd-9931-27d9a87cb64f"
+    ],
+    "episode_content_sha256": "d3800f2aadadec8a02cd66c32686b81c8b0b3635d35c16af7e94ed90851b4356",
+    "episode_uuid": "0fea6914-f42e-492c-ba8e-93959f2c0561",
+    "episode_valid_at": "2026-11-17T07:47:33.000921+00:00",
+    "graph": "dark_factory",
+    "node_name": "docs/task-authoring.md",
+    "node_uuid": "2f62cd08-47d2-43df-bfe2-8974fdaca1de",
+    "summary_sha256": "5b570a2d391da29066b25bb1b9ec5136cc580fd119c21306f45d392ef7fa6cb3",
+    "summary_with_edges_chars": 4328
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "90528c6c5ef758c5ea817a38c5cdc53d617758497105dcaedf939f9ecdb35789",
+    "episode_uuid": "9175793b-0e7e-4a10-a748-cfe36c9845b2",
+    "episode_valid_at": "2026-10-04T11:16:34.534437+00:00",
+    "graph": "solar_challenge",
+    "node_name": "esc-121-3",
+    "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+    "summary_sha256": "c0010665a35957127bcf1ffb65ea34a9db8fa9494b73a93c9569bc3e737f60da",
+    "summary_with_edges_chars": 11928
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "90528c6c5ef758c5ea817a38c5cdc53d617758497105dcaedf939f9ecdb35789",
+    "episode_uuid": "9175793b-0e7e-4a10-a748-cfe36c9845b2",
+    "episode_valid_at": "2026-10-04T11:16:34.534437+00:00",
+    "graph": "solar_challenge",
+    "node_name": "Main 18a3394",
+    "node_uuid": "02496b13-01c6-466a-8222-d9b1b790b565",
+    "summary_sha256": "d76d3c1c291ac17c13fc628d9616153d3eb47f77b34236d3cd58f2d855194fc3",
+    "summary_with_edges_chars": 12207
+  },
+  {
+    "edge_uuids": [
+      "65823f6c-6e4b-4311-a1a3-2d4ee5194dba"
+    ],
+    "episode_content_sha256": "efe42ba17686ea07dec40c540da5c7563a0a48e47bcf93a43d09382cd998bf86",
+    "episode_uuid": "066b7e64-769f-4682-a264-3ae57594040c",
+    "episode_valid_at": "2026-10-07T00:57:05.040053+00:00",
+    "graph": "dark_factory",
+    "node_name": "detector",
+    "node_uuid": "9940c909-a830-4ff0-97a9-78406af23864",
+    "summary_sha256": "4cfc0405377d9fc20dc224bebc9287280c7be5fb84973edb4181ae12409b0738",
+    "summary_with_edges_chars": 4296
+  },
+  {
+    "edge_uuids": [
+      "a883d302-c1de-4a68-ae8f-735c2df130de"
+    ],
+    "episode_content_sha256": "efe42ba17686ea07dec40c540da5c7563a0a48e47bcf93a43d09382cd998bf86",
+    "episode_uuid": "066b7e64-769f-4682-a264-3ae57594040c",
+    "episode_valid_at": "2026-10-07T00:57:05.040053+00:00",
+    "graph": "dark_factory",
+    "node_name": "census",
+    "node_uuid": "10af8a54-3975-497a-97f4-adf1d6f8fd13",
+    "summary_sha256": "8ae7c6f73567ceb05b65503f1fd570c447c4fa84874717bd9a06b4cdcfb93568",
+    "summary_with_edges_chars": 18581
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "5aab0ab87eb12b726bc1c63104a3611aa66e8750747cf568d165b7555b0e686f",
+    "episode_uuid": "b8f82dfd-e3fd-4b27-a538-0bc4b8169398",
+    "episode_valid_at": "2026-10-26T18:36:14.137817+00:00",
+    "graph": "stream_touch",
+    "node_name": "heuristic 11",
+    "node_uuid": "dfe64d65-1619-44d9-939b-ee841f2c5aa8",
+    "summary_sha256": "8ecdb926c683bccfdee50c91dfa3aab531e8da316048c734a45787eb55f09308",
+    "summary_with_edges_chars": 11578
+  },
+  {
+    "edge_uuids": [
+      "6c17d419-b619-4840-892b-9728853eea9a"
+    ],
+    "episode_content_sha256": "5aab0ab87eb12b726bc1c63104a3611aa66e8750747cf568d165b7555b0e686f",
+    "episode_uuid": "b8f82dfd-e3fd-4b27-a538-0bc4b8169398",
+    "episode_valid_at": "2026-10-26T18:36:14.137817+00:00",
+    "graph": "stream_touch",
+    "node_name": "PRD",
+    "node_uuid": "33db6a81-99e5-4df3-8455-b1f1b9720142",
+    "summary_sha256": "5c43e48cc9a0f623718e2728c22947d0e84a5a3076038032fbb9a1903c350b5e",
+    "summary_with_edges_chars": 12222
+  },
+  {
+    "edge_uuids": [
+      "2fa38e12-2e4b-41c2-bf72-d075c8f3a6fb"
+    ],
+    "episode_content_sha256": "3385b67a2dd37265bd8759e88e0c1ea23bfb9c0e90531ff2faf6f5e779e026c6",
+    "episode_uuid": "4bb349b6-2220-459d-ac0e-e2d7e27735f8",
+    "episode_valid_at": "2026-10-22T01:51:51.096589+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "mypy",
+    "node_uuid": "5209b2d5-7461-4f0e-9df9-948fc19abcab",
+    "summary_sha256": "e88acb5b73704255438dfa0ed6fd1746c1cb4ea0ef763be692363260f983abfd",
+    "summary_with_edges_chars": 13906
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "3385b67a2dd37265bd8759e88e0c1ea23bfb9c0e90531ff2faf6f5e779e026c6",
+    "episode_uuid": "4bb349b6-2220-459d-ac0e-e2d7e27735f8",
+    "episode_valid_at": "2026-10-22T01:51:51.096589+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "RegisterSpan",
+    "node_uuid": "450a55db-cdf6-4034-8019-5a428536eced",
+    "summary_sha256": "53448d84752df35eafba509f74adbab5cdfe6de9ea81c71d14d77449142711e5",
+    "summary_with_edges_chars": 4169
+  },
+  {
+    "edge_uuids": [
+      "835c97f0-e06d-44c5-b988-807333bb3f5c"
+    ],
+    "episode_content_sha256": "ff9435729e422db144dd4f18b0472d7cf97183792a7fb034626a4ff744003dfd",
+    "episode_uuid": "a4e66cb0-2f8d-428b-90b0-32da2581e8b5",
+    "episode_valid_at": "2026-11-15T09:46:46.886591+00:00",
+    "graph": "dark_factory",
+    "node_name": "config",
+    "node_uuid": "4466eb10-bb10-4c9f-9e81-06bff4fbc56a",
+    "summary_sha256": "20107f581ab574f70e71f89e9ea3a2c6b71d1141b8037e0845cea6bb74974bcb",
+    "summary_with_edges_chars": 2708
+  },
+  {
+    "edge_uuids": [
+      "07d97cbe-23f3-4ee9-8de3-5005c1f71d72"
+    ],
+    "episode_content_sha256": "ff9435729e422db144dd4f18b0472d7cf97183792a7fb034626a4ff744003dfd",
+    "episode_uuid": "a4e66cb0-2f8d-428b-90b0-32da2581e8b5",
+    "episode_valid_at": "2026-11-15T09:46:46.886591+00:00",
+    "graph": "dark_factory",
+    "node_name": "FusedMemoryConfig()",
+    "node_uuid": "b996c117-b9ed-400a-a2d6-7010483de46e",
+    "summary_sha256": "5c0fbbfaa2827de5ccbe5caf9a0789a8b3534d82df217f114e6b2953512a9e66",
+    "summary_with_edges_chars": 3576
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "ffefa43e1d560e3b0d1b8d37525986a6b642de914e7d67f5ab3863bffffca22c",
+    "episode_uuid": "951ebb36-dd9e-4263-a5aa-5f65cee6243d",
+    "episode_valid_at": "2026-10-22T13:01:11.411150+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "SQLAlchemy",
+    "node_uuid": "830353d1-a37c-4acd-b927-434f307f27c6",
+    "summary_sha256": "f90fa47dd8f88f9bf04915ef1f61f0321f95ebde8d3cb205fbbb6b206adae72f",
+    "summary_with_edges_chars": 4753
+  },
+  {
+    "edge_uuids": [
+      "74859709-18f3-429c-88e5-0469df518f08",
+      "a90b98e5-7c8d-4e2d-905b-6e0a7225b9e0",
+      "f28ebf83-8541-4a0c-a746-4c13568be40d",
+      "f48db511-f2ac-4f66-a226-0e13fb60e5ee"
+    ],
+    "episode_content_sha256": "ffefa43e1d560e3b0d1b8d37525986a6b642de914e7d67f5ab3863bffffca22c",
+    "episode_uuid": "951ebb36-dd9e-4263-a5aa-5f65cee6243d",
+    "episode_valid_at": "2026-10-22T13:01:11.411150+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "test_timescale_store.py",
+    "node_uuid": "6b3cb188-5234-4932-bac0-7f7bcb0d71be",
+    "summary_sha256": "e76cfdf08bf8117719bc10da4794011edc1a374ed244c51e34919dfa08746627",
+    "summary_with_edges_chars": 2418
+  },
+  {
+    "edge_uuids": [
+      "30a1ccde-8e66-408b-a515-1a5a6d0bd074",
+      "420ce9fe-00d8-4bfa-8fd2-1e75a28174df",
+      "4f230268-0c8b-4818-8bfe-d86542f90b05"
+    ],
+    "episode_content_sha256": "d91c8587a1eda5220573bf0184ef10ee351ca9ad93d29fdb7f479ba3ea3739ef",
+    "episode_uuid": "ad0907b9-772a-46e5-a591-41bb1981c74e",
+    "episode_valid_at": "2026-10-26T04:08:55.027373+00:00",
+    "graph": "stream_touch",
+    "node_name": "FsStore",
+    "node_uuid": "d26eb564-c9b7-48bc-92d7-4dd9d5c5b90f",
+    "summary_sha256": "ac2ed54efad5511d4b2fa19c25e27de7eeafb588887ef9a6fc752b9839b83559",
+    "summary_with_edges_chars": 2272
+  },
+  {
+    "edge_uuids": [
+      "d90002ba-4234-4658-99b4-a255f38a065b"
+    ],
+    "episode_content_sha256": "d91c8587a1eda5220573bf0184ef10ee351ca9ad93d29fdb7f479ba3ea3739ef",
+    "episode_uuid": "ad0907b9-772a-46e5-a591-41bb1981c74e",
+    "episode_valid_at": "2026-10-26T04:08:55.027373+00:00",
+    "graph": "stream_touch",
+    "node_name": "session.toml",
+    "node_uuid": "71f7b858-c98a-4eeb-b9c0-b782b48e08c5",
+    "summary_sha256": "f72ad0a470342bbfb410db9810e98331845596c99c4ea7857ecce314733c439f",
+    "summary_with_edges_chars": 6081
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "1e06d53f6ccc4e818c514e204132e88780e3d38db4919c9d6236036417e3d804",
+    "episode_uuid": "3ca2029c-f4f3-4c66-ae48-80ef9121436a",
+    "episode_valid_at": "2026-10-01T12:46:12.466434+00:00",
+    "graph": "solar_challenge",
+    "node_name": "dd081a2",
+    "node_uuid": "8d6fed17-fabf-4921-ba31-efe661ddcf0c",
+    "summary_sha256": "8baf083a9dadf49e89832ef34e33b8579c603ce6918b0dd48a9e954d8546ba93",
+    "summary_with_edges_chars": 2170
+  },
+  {
+    "edge_uuids": [
+      "ed261641-f4fe-4760-b672-a3378fc2d6e9"
+    ],
+    "episode_content_sha256": "1e06d53f6ccc4e818c514e204132e88780e3d38db4919c9d6236036417e3d804",
+    "episode_uuid": "3ca2029c-f4f3-4c66-ae48-80ef9121436a",
+    "episode_valid_at": "2026-10-01T12:46:12.466434+00:00",
+    "graph": "solar_challenge",
+    "node_name": "jobs.py",
+    "node_uuid": "e92507e1-d7da-4bc8-9db9-ec7c7d90b865",
+    "summary_sha256": "ee21fb4de0cb24310475eabb891002993712935e9dc537af95c55341d05be081",
+    "summary_with_edges_chars": 21427
+  },
+  {
+    "edge_uuids": [
+      "5342baf0-4a51-44bf-838c-73e916a9937a"
+    ],
+    "episode_content_sha256": "40689edad650dde4c036aa90c195ba2b931f4a7a9da5ded297dee81e1cf28127",
+    "episode_uuid": "c2265dc1-7776-4d40-94ca-5edb73e74ba1",
+    "episode_valid_at": "2026-11-01T19:48:19.580562+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "settings.py",
+    "node_uuid": "bca61fd1-8256-4a21-a921-47036629e153",
+    "summary_sha256": "bbf4f50d9cac4006c4cfd7d1fded39b944783b6f1254ab9e16c025f9da4235c3",
+    "summary_with_edges_chars": 4781
+  },
+  {
+    "edge_uuids": [
+      "fe3e5eeb-8519-4079-afc6-5aab0e72a43b"
+    ],
+    "episode_content_sha256": "40689edad650dde4c036aa90c195ba2b931f4a7a9da5ded297dee81e1cf28127",
+    "episode_uuid": "c2265dc1-7776-4d40-94ca-5edb73e74ba1",
+    "episode_valid_at": "2026-11-01T19:48:19.580562+00:00",
+    "graph": "solar_challenge_platform",
+    "node_name": "Settings",
+    "node_uuid": "388148dd-1cfa-41a1-826f-33b15b9cdb92",
+    "summary_sha256": "5504e8bcee883040500153a0ef1f68c73cc4773d8c011e44fff3823925862932",
+    "summary_with_edges_chars": 16303
+  },
+  {
+    "edge_uuids": [
+      "7f9ab99c-ebfd-4f0d-8eaf-266ac44ec577"
+    ],
+    "episode_content_sha256": "0da788f65c9bbc336d035062c4c59a6090efa9dadde064ab53444ff6aaeb0c23",
+    "episode_uuid": "39f0a92c-9dbd-42b0-98d9-0b81eaf84d4c",
+    "episode_valid_at": "2026-10-02T07:59:32.920295+00:00",
+    "graph": "solar_challenge",
+    "node_name": "esc-121-3",
+    "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+    "summary_sha256": "c0010665a35957127bcf1ffb65ea34a9db8fa9494b73a93c9569bc3e737f60da",
+    "summary_with_edges_chars": 12020
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "0da788f65c9bbc336d035062c4c59a6090efa9dadde064ab53444ff6aaeb0c23",
+    "episode_uuid": "39f0a92c-9dbd-42b0-98d9-0b81eaf84d4c",
+    "episode_valid_at": "2026-10-02T07:59:32.920295+00:00",
+    "graph": "solar_challenge",
+    "node_name": "Main bb2bfb1",
+    "node_uuid": "814e6734-83e5-4a46-9ed3-03136acbc2e4",
+    "summary_sha256": "8ae34f0876a18a231e8def4cedd9570e9c37f76cfbbce24859a89eedebdb85f1",
+    "summary_with_edges_chars": 6894
+  },
+  {
+    "edge_uuids": [
+      "456744c1-4763-4fb6-97f4-cf0e1ed8017b",
+      "806e56cb-1c87-454c-91f9-7a15ec7016c3"
+    ],
+    "episode_content_sha256": "d72f15ef93bbe4ea936c137cc39428549fbcfefcf49395fdddc3bf67df91e761",
+    "episode_uuid": "8010efd0-baa5-404c-91cf-4abb7c6968bf",
+    "episode_valid_at": "2026-10-08T06:51:43.731516+00:00",
+    "graph": "dark_factory",
+    "node_name": "create_server",
+    "node_uuid": "1d3f9423-0e32-4a51-af2f-7dfa6d565c5b",
+    "summary_sha256": "67af79b8bc9da894051901f504a0e0c4de98845da01de74afe3fa623ba25c689",
+    "summary_with_edges_chars": 5096
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "1f02cfcac23e7a80c89d477e88b4927babef56cc8ca2ea6ec0b9e3ba7fcfaca5",
+    "episode_uuid": "94bb011d-ff7b-4828-bc1b-ee9c3c621651",
+    "episode_valid_at": "2026-10-09T10:08:28.321820+00:00",
+    "graph": "solar_challenge",
+    "node_name": "FROZEN_SURFACE",
+    "node_uuid": "5032c626-089c-48d4-ba5c-bea889c73a5e",
+    "summary_sha256": "07bb53dd8ddcc37bd1e9e9a5ad81fa287c636126b48fa88a2d8c6c7c86fd1ce7",
+    "summary_with_edges_chars": 8092
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "1f02cfcac23e7a80c89d477e88b4927babef56cc8ca2ea6ec0b9e3ba7fcfaca5",
+    "episode_uuid": "94bb011d-ff7b-4828-bc1b-ee9c3c621651",
+    "episode_valid_at": "2026-10-09T10:08:28.321820+00:00",
+    "graph": "solar_challenge",
+    "node_name": "Task 195",
+    "node_uuid": "bfb4489f-8e05-46d0-8178-2781c51d29c6",
+    "summary_sha256": "c83af07955784b523f14c3074e9bcc394c59e44a25e1ecdc2e27f548933f3b27",
+    "summary_with_edges_chars": 6297
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "490623f3a07b98a430ffa4db169db04230b6da4084a55ef77aad705fa64ee3bf",
+    "episode_uuid": "624a196a-f366-46da-b05a-2bc6e12eb8e9",
+    "episode_valid_at": "2026-10-02T12:41:01.736123+00:00",
+    "graph": "solar_challenge",
+    "node_name": "_build_app",
+    "node_uuid": "0170553c-2932-4d4c-a83e-372363f47ce7",
+    "summary_sha256": "fae65464f8e7bae4d78e562706c52b54c30039e594ffdc8489b4181d0c723130",
+    "summary_with_edges_chars": 3489
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "490623f3a07b98a430ffa4db169db04230b6da4084a55ef77aad705fa64ee3bf",
+    "episode_uuid": "624a196a-f366-46da-b05a-2bc6e12eb8e9",
+    "episode_valid_at": "2026-10-02T12:41:01.736123+00:00",
+    "graph": "solar_challenge",
+    "node_name": "create_app",
+    "node_uuid": "03032bd9-ca84-4e57-b5d5-a4016d12911a",
+    "summary_sha256": "5ed1816381924beb7cabb68fe3a3422405a61806ca4e0c00478b709662a094ba",
+    "summary_with_edges_chars": 5308
+  },
+  {
+    "edge_uuids": [
+      "ee2cbd2f-31d9-4110-b5f8-e792f8debf43"
+    ],
+    "episode_content_sha256": "3b5c3e7557645696b2f94655c237c8f443e38ce453b4585bf631f5180c7e9fa4",
+    "episode_uuid": "34774da0-bce7-4c08-aa93-63c3c906c683",
+    "episode_valid_at": "2026-10-24T04:18:19.248327+00:00",
+    "graph": "solar_challenge",
+    "node_name": "SPOT",
+    "node_uuid": "32c11f24-9b9b-41f0-a231-f0b2c3f512b2",
+    "summary_sha256": "457bafac0e2aaf6e7c76c49c6721f08c61a7909e3aeaa2d5cf3f060c18db4f44",
+    "summary_with_edges_chars": 3200
+  },
+  {
+    "edge_uuids": [
+      "29367b97-c47b-42ed-8fe1-8e0d597c6e9b",
+      "ee2cbd2f-31d9-4110-b5f8-e792f8debf43"
+    ],
+    "episode_content_sha256": "3b5c3e7557645696b2f94655c237c8f443e38ce453b4585bf631f5180c7e9fa4",
+    "episode_uuid": "34774da0-bce7-4c08-aa93-63c3c906c683",
+    "episode_valid_at": "2026-10-24T04:18:19.248327+00:00",
+    "graph": "solar_challenge",
+    "node_name": "load.py",
+    "node_uuid": "7b994a94-ad0e-4cf6-9ea9-4834aba8cce9",
+    "summary_sha256": "a7811f001840d1881d6c60c91ab307e7b333492040944f5fde905dff103f2ccd",
+    "summary_with_edges_chars": 3735
+  },
+  {
+    "edge_uuids": [
+      "4e8485fe-0fe4-4359-b3fb-11c63bfa6d35"
+    ],
+    "episode_content_sha256": "9c6cacde09ad5d172afb3827528070252e2eaf5e4463a63d0aceba70b27d2388",
+    "episode_uuid": "e6422203-8fdb-4665-a247-550bdda19c74",
+    "episode_valid_at": "2026-10-28T13:58:36.272031+00:00",
+    "graph": "stream_touch",
+    "node_name": "tests/durable.rs",
+    "node_uuid": "7a6f56be-56b8-4658-81e3-7fc3644a98f1",
+    "summary_sha256": "679de3da2f7b50d8af56efc6457570b585f27dea83b13745480409080018d178",
+    "summary_with_edges_chars": 3464
+  },
+  {
+    "edge_uuids": [
+      "2cde09c3-61e2-4b30-a765-e32c374ec042"
+    ],
+    "episode_content_sha256": "9c6cacde09ad5d172afb3827528070252e2eaf5e4463a63d0aceba70b27d2388",
+    "episode_uuid": "e6422203-8fdb-4665-a247-550bdda19c74",
+    "episode_valid_at": "2026-10-28T13:58:36.272031+00:00",
+    "graph": "stream_touch",
+    "node_name": "Display",
+    "node_uuid": "9c95b74a-c004-4e44-85a5-df1794f1f2fe",
+    "summary_sha256": "bc530c4b1098fcc480c04260f603ea1f346c7f0a5e1dd6944303a7c67bb1ef11",
+    "summary_with_edges_chars": 3009
+  },
+  {
+    "edge_uuids": [
+      "48b5ea50-4fd3-4bf0-911f-43e88316738c"
+    ],
+    "episode_content_sha256": "7f3c48dae9f41097f41e1c5ef64ee1dd9a484ab351f14a9bc4330bc209214b91",
+    "episode_uuid": "4e70da61-47d4-48c0-b47f-542c537e5fee",
+    "episode_valid_at": "2026-10-07T17:52:32.511865+00:00",
+    "graph": "reify",
+    "node_name": "tests/prd-gate/fixtures/",
+    "node_uuid": "35ddc3cb-2805-4b74-b812-6a239f030bf1",
+    "summary_sha256": "3e76db1d7379d594ad6e7a415d6dfb911c5941ea9232b45c4b331575cd948e32",
+    "summary_with_edges_chars": 4288
+  },
+  {
+    "edge_uuids": [
+      "56410d08-62d2-4308-b6a2-6fcc02125e4e"
+    ],
+    "episode_content_sha256": "2b6d7e604cc3ef993fdafd8ae1660f738adb5b9835872184a937ea1ee9f05f76",
+    "episode_uuid": "b3d064fe-d3e5-4674-bd8b-69823acc11b8",
+    "episode_valid_at": "2026-10-01T13:46:50.379113+00:00",
+    "graph": "solar_challenge",
+    "node_name": "JobManager",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+    "summary_sha256": "eb8eae4e8d3db77b5fd49ebc891a7152f4fe0349b283ef01a4f652c8f336743b",
+    "summary_with_edges_chars": 27280
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "2b6d7e604cc3ef993fdafd8ae1660f738adb5b9835872184a937ea1ee9f05f76",
+    "episode_uuid": "b3d064fe-d3e5-4674-bd8b-69823acc11b8",
+    "episode_valid_at": "2026-10-01T13:46:50.379113+00:00",
+    "graph": "solar_challenge",
+    "node_name": "test_shutdown_all_managers_shuts_down_every_live_manager",
+    "node_uuid": "4395502d-4d1c-483d-bdab-291a1a74ac45",
+    "summary_sha256": "9a0f7204f2b09dfc2b3bdf000cbcbf3fdccf50658ab695245e5b13500a3e8ba3",
+    "summary_with_edges_chars": 2212
+  },
+  {
+    "edge_uuids": [
+      "4963f10e-a8a5-499d-9fb9-3b1f8f161fe2",
+      "4a149a15-98a3-4293-a88c-93907879e279"
+    ],
+    "episode_content_sha256": "759f9f9c72e262512e665f85440317f3270bcacf15539395db938c42ddd037d2",
+    "episode_uuid": "9f35c5ed-19b8-47e1-acc4-cd05f4655077",
+    "episode_valid_at": "2026-10-09T19:05:17.667244+00:00",
+    "graph": "dark_factory",
+    "node_name": "policy",
+    "node_uuid": "f8795f93-dff5-4b63-8b27-6050571f42c8",
+    "summary_sha256": "aed434fe0f0eb84defd4a0b17f1f60dd821a19347c5f48848e878e6105973e3f",
+    "summary_with_edges_chars": 3519
+  },
+  {
+    "edge_uuids": [
+      "32bfe82b-1266-4157-9c7c-d12b3b0b43ac",
+      "362d7f8c-2a22-4cf1-99e5-ad94530e28f6",
+      "4963f10e-a8a5-499d-9fb9-3b1f8f161fe2",
+      "4c00c347-2a41-44a4-bac2-6f5b40d9fc4e",
+      "67673e82-d792-4dc3-9d7f-405e793930d3",
+      "dbd547cc-4ab5-4bdb-bf19-3fdba3010557"
+    ],
+    "episode_content_sha256": "759f9f9c72e262512e665f85440317f3270bcacf15539395db938c42ddd037d2",
+    "episode_uuid": "9f35c5ed-19b8-47e1-acc4-cd05f4655077",
+    "episode_valid_at": "2026-10-09T19:05:17.667244+00:00",
+    "graph": "dark_factory",
+    "node_name": "\u03b2",
+    "node_uuid": "1ad5dd1a-2798-4a04-b891-056ad5d7577e",
+    "summary_sha256": "28be95809025c22c68fc8ceb13afaaa9bdcd98291e3c97ad35305b8b3b03874e",
+    "summary_with_edges_chars": 6082
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "d00fd385891c3dc580d340190474f190291af7c92c3a88e53cc3b2df3a324ecb",
+    "episode_uuid": "fc1b42be-137d-4ff7-a1ad-96d0ef6e21c5",
+    "episode_valid_at": "2026-10-20T19:17:06.202291+00:00",
+    "graph": "solar_challenge",
+    "node_name": "PVConfig",
+    "node_uuid": "a0034a3b-b3ac-4ecd-9cfc-52d849f5e247",
+    "summary_sha256": "cb7d86ebc0614ce9ce199d36d4754386a669507e7fd444c33ed212c4f8f0c534",
+    "summary_with_edges_chars": 15023
+  },
+  {
+    "edge_uuids": [
+      "ccb1d5c1-61f0-459d-8039-c6dc40e3434a"
+    ],
+    "episode_content_sha256": "d00fd385891c3dc580d340190474f190291af7c92c3a88e53cc3b2df3a324ecb",
+    "episode_uuid": "fc1b42be-137d-4ff7-a1ad-96d0ef6e21c5",
+    "episode_valid_at": "2026-10-20T19:17:06.202291+00:00",
+    "graph": "solar_challenge",
+    "node_name": "\u03b5",
+    "node_uuid": "8da2bd38-f4bc-41fa-837b-0dc372c0cf4a",
+    "summary_sha256": "0b3cbcf22ac02530fd43b7e57cedacd635125295f3931ad930a8fe679a30c0d8",
+    "summary_with_edges_chars": 2540
+  },
+  {
+    "edge_uuids": [
+      "1b7474eb-0a67-41b9-916a-336d11ed2e29"
+    ],
+    "episode_content_sha256": "a933c249881477fb8d59b36c4041116a564f1b04681b0a22987c547158739183",
+    "episode_uuid": "c549c393-5587-4bb6-b07f-cbcd9fe3e103",
+    "episode_valid_at": "2026-10-23T02:12:24.470816+00:00",
+    "graph": "scoping_intake",
+    "node_name": "Leo",
+    "node_uuid": "6ea3f846-39ca-4aeb-981b-a9403b1b06bb",
+    "summary_sha256": "85744627ef30b89751a98302219709f079df2ba27bef92a89385d08725d8a727",
+    "summary_with_edges_chars": 59744
+  },
+  {
+    "edge_uuids": [
+      "2827f1fc-75b9-4984-9323-87447fe765a1",
+      "be6533f9-90a7-4791-a2bf-560549bd18e9"
+    ],
+    "episode_content_sha256": "a933c249881477fb8d59b36c4041116a564f1b04681b0a22987c547158739183",
+    "episode_uuid": "c549c393-5587-4bb6-b07f-cbcd9fe3e103",
+    "episode_valid_at": "2026-10-23T02:12:24.470816+00:00",
+    "graph": "scoping_intake",
+    "node_name": "Intake.place",
+    "node_uuid": "5e903e68-6437-4b19-bb76-e4a61371210e",
+    "summary_sha256": "c02b775f00fae6e6610c10c74d5b46d3e1da6b521cf20367bd95036e2cab3e27",
+    "summary_with_edges_chars": 3289
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "78603a1fada955b38d72b5a3e2f676978786613a852deb66dbdaf17c477d76b7",
+    "episode_uuid": "ad5a977a-77f8-4b5f-b7da-6e565ab7a909",
+    "episode_valid_at": "2026-10-04T11:20:40.673239+00:00",
+    "graph": "solar_challenge",
+    "node_name": "JobManager",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+    "summary_sha256": "eb8eae4e8d3db77b5fd49ebc891a7152f4fe0349b283ef01a4f652c8f336743b",
+    "summary_with_edges_chars": 27173
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "78603a1fada955b38d72b5a3e2f676978786613a852deb66dbdaf17c477d76b7",
+    "episode_uuid": "ad5a977a-77f8-4b5f-b7da-6e565ab7a909",
+    "episode_valid_at": "2026-10-04T11:20:40.673239+00:00",
+    "graph": "solar_challenge",
+    "node_name": "a08eacc",
+    "node_uuid": "25c9872d-539e-4319-83a9-86f4bc7be42d",
+    "summary_sha256": "e3b7f208a425ac1c39f41bf981d1432137f4cd7376776cdb0790f60a2cf81203",
+    "summary_with_edges_chars": 2245
+  },
+  {
+    "edge_uuids": [
+      "34b88f4d-6341-491f-9e5e-0e1a5a4e8263",
+      "90d9dff9-ec45-41ab-bb40-d9648fa8d298"
+    ],
+    "episode_content_sha256": "90528c6c5ef758c5ea817a38c5cdc53d617758497105dcaedf939f9ecdb35789",
+    "episode_uuid": "24068d28-8531-4bc1-aa62-895085dfc03f",
+    "episode_valid_at": "2026-10-02T04:38:59.166376+00:00",
+    "graph": "solar_challenge",
+    "node_name": "esc-121-3",
+    "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+    "summary_sha256": "c0010665a35957127bcf1ffb65ea34a9db8fa9494b73a93c9569bc3e737f60da",
+    "summary_with_edges_chars": 12102
+  },
+  {
+    "edge_uuids": [
+      "34b88f4d-6341-491f-9e5e-0e1a5a4e8263",
+      "a3fb277a-de74-49fd-bc6a-e395a2767ad6"
+    ],
+    "episode_content_sha256": "90528c6c5ef758c5ea817a38c5cdc53d617758497105dcaedf939f9ecdb35789",
+    "episode_uuid": "24068d28-8531-4bc1-aa62-895085dfc03f",
+    "episode_valid_at": "2026-10-02T04:38:59.166376+00:00",
+    "graph": "solar_challenge",
+    "node_name": "Main 18a3394",
+    "node_uuid": "02496b13-01c6-466a-8222-d9b1b790b565",
+    "summary_sha256": "d76d3c1c291ac17c13fc628d9616153d3eb47f77b34236d3cd58f2d855194fc3",
+    "summary_with_edges_chars": 12420
+  },
+  {
+    "edge_uuids": [
+      "1fbcd815-1544-49d8-bd36-741a7ba9a673"
+    ],
+    "episode_content_sha256": "2b6d7e604cc3ef993fdafd8ae1660f738adb5b9835872184a937ea1ee9f05f76",
+    "episode_uuid": "d44cd744-319e-41e1-992f-f12a6a8ef27e",
+    "episode_valid_at": "2026-10-02T09:23:46.825050+00:00",
+    "graph": "solar_challenge",
+    "node_name": "JobManager",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+    "summary_sha256": "eb8eae4e8d3db77b5fd49ebc891a7152f4fe0349b283ef01a4f652c8f336743b",
+    "summary_with_edges_chars": 27207
+  },
+  {
+    "edge_uuids": [],
+    "episode_content_sha256": "2b6d7e604cc3ef993fdafd8ae1660f738adb5b9835872184a937ea1ee9f05f76",
+    "episode_uuid": "d44cd744-319e-41e1-992f-f12a6a8ef27e",
+    "episode_valid_at": "2026-10-02T09:23:46.825050+00:00",
+    "graph": "solar_challenge",
+    "node_name": "app.py",
+    "node_uuid": "ce0815f2-178f-4fc7-b38f-f0a71914a46e",
+    "summary_sha256": "1731a456841af241e0f028d33e9420c2808c2b47b45c5bd1765f699009ce1ce4",
+    "summary_with_edges_chars": 4462
+  },
+  {
+    "edge_uuids": [
+      "dca58a15-804c-48c3-8f83-30e4507c4566"
+    ],
+    "episode_content_sha256": "32317183a6458a5ff2ad385624f5726184747670dd30f1c95fa9fb10e88f1eae",
+    "episode_uuid": "42f8a90a-bc7a-45b8-b036-29b9992c6520",
+    "episode_valid_at": "2026-10-14T13:14:43.447875+00:00",
+    "graph": "reify",
+    "node_name": "reify-expr",
+    "node_uuid": "57e7c5f1-ad41-4c5f-950a-ce7dd12d64d8",
+    "summary_sha256": "ab1a18cc19f293375929dc4fd29852bef40a0be63f6217730ebafe6aabfbcb87",
+    "summary_with_edges_chars": 3369
+  }
+]

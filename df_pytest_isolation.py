@@ -285,10 +285,10 @@ SEVENTH DEFENCE — a ``UsageGate`` a test builds in-process never sweeps the re
 tempdir.
 
 Its dead-PID probe-dir sweep (task 3086) is confined to a private per-test root
-in the four rootdirs that build gates — ``shared``, ``orchestrator``,
-``fused-memory`` and ``scripts/tests`` — each armed by
+in the five rootdirs that build gates — ``shared``, ``orchestrator``,
+``fused-memory``, ``scripts/tests`` and ``escalation`` — each armed by
 :func:`arm_usage_gate_sweep_confinement`.  That list is the known coverage
-boundary, and nothing checks it: a fifth rootdir that starts building gates
+boundary, and nothing checks it: a sixth rootdir that starts building gates
 sweeps the real tempdir, with no test failing, until its conftest arms the
 plugin too.  The plugin patches this process, so it cannot reach a spawned
 child: a gate built in a child sweeps whatever tempdir the child inherits, and

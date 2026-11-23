@@ -545,7 +545,7 @@ def _run_lease_reap() -> list[session_leases.ReapedLease]:
 
 
 def _resolve_filing_record_slug(local_id: str, project: str) -> str:
-    """Return the record_slug a write-decision filing of *local_id* stamps.
+    """Return the record_slug a write-decision filing of *local_id* stamps, file-and-close-decision's included.
 
     That is resolve_own_record_slug's slug, else '' after a WARNING, because a
     blank one leaves that cockpit row unable to focus its filer's session for
@@ -559,8 +559,8 @@ def _resolve_filing_record_slug(local_id: str, project: str) -> str:
         '(unset, unusable or a shared `claude agents` host pid; or no sessions-by-pid/<pid> '
         'pointer whose record still names that pid as its owner), so this decision gets a '
         'BLANK record_slug and its cockpit row cannot focus the filing session (Enter-to-focus) '
-        'for the life of the record. This alone does not refuse the filing; an id on stdout is '
-        'what says it landed.',
+        'for the life of the record. This alone does not refuse the filing, whether write-decision\'s '
+        'own or the filing half of file-and-close-decision; an id on stdout is what says it landed.',
         local_id,
         project,
         session_identity.SESSION_PID_ENV,
@@ -689,8 +689,8 @@ def main(argv: list[str] | None = None) -> int:
     from argparse's parse_args() below, before the try/except.
 
     A decision verb goes to decision_cli.run_verb, which owns the decision
-    half of this policy, including why close-decision and reopen-decision
-    exit non-zero on a refusal. The filer's record slug it needs is session
+    half of this policy, including why the refusing verbs exit non-zero on
+    a refusal. The filer's record slug it needs is session
     identity, so this module hands it _resolve_filing_record_slug.
     """
     parser = _build_parser()

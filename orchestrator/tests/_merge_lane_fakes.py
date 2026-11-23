@@ -76,6 +76,7 @@ from orchestrator.merge_lane.types import (
 from orchestrator.merge_lane.verify_failure_outcome import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_runner import RunnerUnavailable
 
 
@@ -303,6 +304,9 @@ class FakeVerifier:
       disk.
     """
 
+    #: The class default lets a subclass whose ``__init__`` skips super still satisfy ``VerifyPort``.
+    verify_cache: CacheAccess | None = None
+
     def __init__(
         self,
         default: VerifyScript | None = None,
@@ -310,7 +314,9 @@ class FakeVerifier:
         *,
         sequence: Iterable[VerifyScript] = (),
         disk_reason: str | None = None,
+        verify_cache: CacheAccess | None = None,
     ) -> None:
+        self.verify_cache = verify_cache
         self.default = passes() if default is None else default
         self.scripts: dict[str | None, VerifyScript] = dict(scripts or {})
         self._ordered = collections.deque(sequence)

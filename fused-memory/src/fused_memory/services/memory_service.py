@@ -80,6 +80,8 @@ from fused_memory.models.memory import (
     EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
+    graphiti_hit_attribution,
+    mem0_hit_attribution,
     render_add_memory_message,
 )
 from fused_memory.models.reconciliation import (
@@ -1567,6 +1569,7 @@ def _graph_search_result(
         )),
         metadata=metadata,
         created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
+        **graphiti_hit_attribution(getattr(edge, 'group_id', None)),
     )
 
 
@@ -7855,6 +7858,7 @@ class MemoryService:
                         relevance_score=0.0,
                         metadata=custom,
                         created_at=created_at if isinstance(created_at, str) else None,
+                        **mem0_hit_attribution(managed, custom),
                         topic_anchored=True,
                     ))
                     pin_at += 1
@@ -8076,6 +8080,7 @@ class MemoryService:
                 relevance_score=_rrf_score(rank),
                 metadata=metadata,
                 created_at=item.get('created_at'),
+                **mem0_hit_attribution(item, meta),
             ))
         return results
 

@@ -261,3 +261,36 @@ def test_refresh_entity_summary_live_class_gated() -> None:
         f'expected {live_class} to be collected under -m integration (it must '
         f'remain selectable as an explicit opt-in). Output:\n{override_output}'
     )
+
+
+def test_graph_access_live_socket_timeout_test_gated() -> None:
+    """The live socket-timeout test is deselected by default; its mock sibling stays collected.
+
+    The marker sits on the one method, so the class's unit tests stay on the merge gate (task 11484).
+    """
+    module = TESTS_DIR / 'test_graph_access.py'
+    live_test = (
+        'TestTheConnectionHasASocketTimeout::test_a_live_connection_carries_the_socket_timeout'
+    )
+    mock_anchor = (
+        'TestTheConnectionHasASocketTimeout::'
+        'test_the_driver_connects_with_the_socket_timeout_and_its_clones_share_it'
+    )
+
+    default_output = _collect(module)
+    assert live_test not in default_output, (
+        f'{live_test} was collected by default -- it must be marked '
+        f"@pytest.mark.integration (task 11484) so the -m 'not integration' "
+        f'addopts deselects the live-FalkorDB round-trip. Output:\n{default_output}'
+    )
+    assert mock_anchor in default_output, (
+        f'expected the mock sibling {mock_anchor} to remain collected by default: the '
+        f'integration marker belongs on the live method, not on its class. '
+        f'Output:\n{default_output}'
+    )
+
+    override_output = _collect(module, '-m', 'integration')
+    assert live_test in override_output, (
+        f'expected {live_test} to be collected under -m integration (it must '
+        f'remain selectable for the offline lane). Output:\n{override_output}'
+    )

@@ -25,7 +25,7 @@ SIZE_CEILING_EXEMPT_LIST = governed_exceptions(
     'FILE_LINE_CEILING, because its split into smaller modules is owed by a '
     'follow-up PRD.',
     sorted(merge_lane_cluster.SIZE_CEILING_EXEMPT),
-    default=Debt(TaskRef(7140)),
+    default=Debt(TaskRef(11423)),
     default_covers=1,
 )
 

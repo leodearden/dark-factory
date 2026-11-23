@@ -1,3 +1,5 @@
+import pytest
+
 from orchestrator.config import PriceEntry
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.metrics import RoleUnderTest
@@ -54,6 +56,23 @@ class TestBuildPriceTable:
         table = build_price_table([_cfg('cfg-a', 'model-x')], prices)
         assert table['cfg-a']['implementer'] == {
             'input_per_1m': 2.0, 'output_per_1m': 8.0,
+        }
+
+    @pytest.mark.parametrize('entry', [
+        {
+            'input_per_1m': 1.40, 'output_per_1m': 4.40,
+            'cached_input_per_1m': 0.26, 'cache_write_per_1m': 1.40,
+        },
+        PriceEntry(
+            input_per_1m=1.40, output_per_1m=4.40,
+            cached_input_per_1m=0.26, cache_write_per_1m=1.40,
+        ),
+    ], ids=['dict', 'price_entry'])
+    def test_cache_rates_join_the_role_entry(self, entry):
+        table = build_price_table([_cfg('cfg-a', 'glm-5.3')], {'glm-5.3': entry})
+        assert table['cfg-a']['implementer'] == {
+            'input_per_1m': 1.40, 'output_per_1m': 4.40,
+            'cached_input_per_1m': 0.26, 'cache_write_per_1m': 1.40,
         }
 
     def test_deterministic_sorted_config_keys(self):
@@ -124,19 +143,38 @@ class TestFormatPriceTableSection:
             build_price_table([_cfg('cfg-a', 'model-x')], self._PRICES),
         )
         assert lines[0] == 'price table:'
-        assert lines[1].split() == ['config', 'role', 'input_per_1m', 'output_per_1m']
+        assert lines[1].split() == [
+            'config', 'role', 'input_per_1m', 'output_per_1m',
+            'cached_input_per_1m', 'cache_write_per_1m',
+        ]
 
     def test_listed_entry_renders_its_rates_at_four_dp(self):
         lines = format_price_table_section(
             build_price_table([_cfg('cfg-a', 'model-x')], self._PRICES),
         )
-        assert self._rows(lines) == [['cfg-a', 'implementer', '2.0000', '8.0000']]
+        assert self._rows(lines) == [
+            ['cfg-a', 'implementer', '2.0000', '8.0000', 'none', 'none'],
+        ]
 
-    def test_unpriced_entry_renders_the_marker_in_both_rate_cells(self):
+    def test_unpriced_entry_renders_the_marker_in_every_rate_cell(self):
         lines = format_price_table_section(
             build_price_table([_cfg('cfg-z', 'unlisted-model')], self._PRICES),
         )
-        assert self._rows(lines) == [['cfg-z', 'implementer', 'unpriced', 'unpriced']]
+        assert self._rows(lines) == [
+            ['cfg-z', 'implementer', 'unpriced', 'unpriced', 'unpriced', 'unpriced'],
+        ]
+
+    def test_cache_rates_render_at_four_dp(self):
+        prices = {'glm-5.3': {
+            'input_per_1m': 1.40, 'output_per_1m': 4.40,
+            'cached_input_per_1m': 0.26, 'cache_write_per_1m': 1.40,
+        }}
+        lines = format_price_table_section(
+            build_price_table([_cfg('cfg-g', 'glm-5.3')], prices),
+        )
+        assert self._rows(lines) == [
+            ['cfg-g', 'implementer', '1.4000', '4.4000', '0.2600', '1.4000'],
+        ]
 
     def test_rows_sort_by_config(self):
         configs = [_cfg('z', 'model-x'), _cfg('a', 'unlisted-model')]

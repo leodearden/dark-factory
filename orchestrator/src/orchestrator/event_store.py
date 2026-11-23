@@ -745,6 +745,11 @@ class EventType(StrEnum):
     # when the pin becomes blocked, then at most once per
     # pin_blocked_emit_interval_secs while it stays blocked.
     pin_blocked = 'pin_blocked'
+    # A dispatch candidate was refused its locks by parks alone, none of which
+    # outranks it (task 6328).  Producer, and the one statement of the payload:
+    # scheduler.py::Scheduler._note_park_refusal.  Emitted once the refusal has
+    # lasted park_refused_emit_interval_secs, then at most once per that interval.
+    park_refused = 'park_refused'
     # The starvation watchdog fired on a task (task 3821).  Producer, and the
     # one statement of the payload: scheduler.py::Scheduler._deliver_starvation_finding,
     # whose pin fields come from starvation_watchdog.py::PinOutcome.as_payload;
@@ -1400,12 +1405,15 @@ class EventStore:
         data: dict | None = None,
         cost_usd: float | None = None,
         duration_ms: int | None = None,
-    ) -> None:
-        """Write a single event row.  Never raises."""
+    ) -> int | None:
+        """Write a single event row.  Never raises.
+
+        Returns the inserted row's id, or None when the write failed.
+        """
         try:
             conn = self._connect()
             try:
-                conn.execute(
+                cursor = conn.execute(
                     'INSERT INTO events '
                     '(timestamp, run_id, task_id, event_type, phase, role, '
                     ' data, cost_usd, duration_ms) '
@@ -1423,10 +1431,12 @@ class EventStore:
                     ),
                 )
                 conn.commit()
+                return cursor.lastrowid
             finally:
                 conn.close()
         except Exception:
             logger.warning('event_store.emit failed', exc_info=True)
+            return None
 
     def latest_merge_finalized(
         self,

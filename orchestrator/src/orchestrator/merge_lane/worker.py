@@ -596,7 +596,7 @@ async def _ensure_verify_disk_space(
     )
 
 
-PRODUCTION_VERIFIER: VerifyPort = ProductionVerifier(
+PRODUCTION_VERIFIER: ProductionVerifier = ProductionVerifier(
     scoped=lambda: run_scoped_verification,
     unscoped=lambda: _run_unscoped_typechecks,
     post_merge_pyright=lambda: _check_post_merge_pyright,

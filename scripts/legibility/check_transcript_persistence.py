@@ -264,33 +264,19 @@ def _normalize_ws(text: str) -> str:
     return ' '.join(text.split())
 
 
-_SLASH_COMMAND_TURN_RE = re.compile(
-    r"""
-    \s*(?:<command-message>[^<]*</command-message>\s*)?
-    <command-name>(?P<name>[^<]*)</command-name>\s*
-    (?:<command-message>[^<]*</command-message>\s*)?
-    <command-args>(?P<args>.*?)</command-args>
-    """,
-    re.DOTALL | re.VERBOSE,
-)
-"""Claude Code's expanded slash-command turn, matched from the turn's START:
-the ``<command-name>``/``<command-args>`` pair, adjacent and in that order,
-with ``<command-message>`` written either before or between them (both orders
-occur on disk). The anchor rejects a turn that merely QUOTES an expansion."""
-
-
 def _typed_slash_command(text: str) -> str | None:
     """Rebuild the typed ``/name args`` from Claude Code's expanded slash-command turn.
 
     ``record.prompt`` holds the literal argv (``/unblock 4743 ...``) while the
-    transcript stores the tagged expansion (:data:`_SLASH_COMMAND_TURN_RE`);
-    this is the inverse that lets the unchanged prompt-prefix needle match.
-    Returns None when *text* is not itself such an expansion.
+    transcript stores the tagged expansion
+    (:func:`detectors.parse_slash_command_expansion`); this is the inverse
+    that lets the unchanged prompt-prefix needle match. Returns None when
+    *text* is not itself such an expansion with an args tag.
     """
-    expansion = _SLASH_COMMAND_TURN_RE.match(text)
-    if expansion is None:
+    expansion = detectors.parse_slash_command_expansion(text)
+    if expansion is None or expansion.args is None:
         return None
-    return '/' + expansion['name'].strip().lstrip('/') + ' ' + expansion['args']
+    return '/' + expansion.name.strip().lstrip('/') + ' ' + expansion.args
 
 
 def find_matching_transcript(

@@ -41,7 +41,6 @@ from shared.cli_invoke import (
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.declared_checks import declared_checks
-from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
@@ -101,6 +100,7 @@ from orchestrator.already_landed_tick_view import (
     read_already_landed_tick_view,
 )
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.auto_eval_redo import redo_submit_text
 from orchestrator.background_service import (
     DEFAULT_BACKOFF_SECS,
     BackgroundService,
@@ -158,6 +158,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     LandingReason,
     branch_is_degenerate,
+    branch_tip_landed,
     branch_work_landed,
     file_unattributed_landing_escalation,
     found_on_main_note,
@@ -291,6 +292,7 @@ from orchestrator.task_status import (
 )
 from orchestrator.task_verify_dispatch import TaskVerifyDispatcher, policy_from_config
 from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_hosts import HostPool, remote_runner_factory, task_verify_hosts
 from orchestrator.verify_runner import RunnerUnavailable
@@ -515,8 +517,6 @@ _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES: frozenset[str] = frozenset({'pending'})
 _AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES: frozenset[str] = frozenset(
     {'wip_conflict', 'infra_issue', 'branch_reset'},
 )
-
-_REDO_TITLE_MAX = 200
 
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
@@ -2197,8 +2197,10 @@ class Harness:
             quarantine=self._runner_quarantine,
             on_unavailable=self._bench_verify_host,
         )
+        self._verify_cache = CacheAccess.on_dispatcher(config.project_root, deployed=deployed_sha)
         self._task_verify_dispatcher = TaskVerifyDispatcher(
             self._host_pool, self.git_ops, policy_of=policy_from_config,
+            verify_cache=self._verify_cache,
         )
         self._abandoned_member_sweep = AbandonedMemberSweep()
         # This unit's side of the restart drain (task 5371): steers the merge
@@ -6787,35 +6789,6 @@ class Harness:
             return 'converted_to_blocked'
 
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
-            # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
-            # design decision): θ1's _RECOVERY table has no degenerate-branch
-            # guard — a zero-commit branch (tip == branch_base_sha) that is
-            # an ancestor of main classifies ON_MAIN -> MARK_DONE the same as
-            # a genuinely merged branch. Extending θ1's resolver would mean
-            # threading task metadata into _resolve_branch_state, undoing its
-            # reviewed branch-state/task-row concurrency split — so this
-            # thin, sweep-side check downgrades the decision instead. Safe
-            # for journal hits: a genuinely merged branch is never
-            # degenerate, so this never fires for a real MergeProvenance
-            # journal row.
-            if (
-                await self._branch_is_degenerate(branch, metadata)
-                or await self.git_ops.warm_lane_ref_is_degenerate(tid)
-            ):
-                # A degenerate branch carries ZERO task work, so MARK_DONE
-                # would phantom-complete a task that never actually landed
-                # anything. An in-progress incarnation with no live claimant
-                # (already established by recovery_for reaching this action)
-                # is recovered by reverting to pending so the scheduler
-                # re-dispatches it. 'blocked' keeps the leave-alone
-                # discipline: only flip to done on positive evidence, which a
-                # degenerate branch is not — matching pre-migration behavior.
-                if status == 'in-progress':
-                    return await self._revert_in_progress_if_no_live_claimant(
-                        tid, mid_run=mid_run, metadata=metadata, status=status,
-                    )
-                return None
-
             # BranchState docstring invariant (task_ground_truth.py): sha is
             # always populated for ON_MAIN / GONE_WITH_MERGE_MARKER — the
             # only variants that reach MARK_DONE_WITH_PROVENANCE. Guard it
@@ -6834,6 +6807,50 @@ class Harness:
                 f'BranchState invariant violated for task {tid}: kind='
                 f'{report.branch_state.kind!r} carries no sha'
             )
+
+            # The live branch tip feeds both the degenerate veto below and
+            # validate_landing_evidence (where it is diagnostic only —
+            # CANDIDATE mode never reads it for the decision), so it is
+            # resolved once, before a revert reaps the worktree.
+            branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
+
+            # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
+            # design decision): θ1's _RECOVERY table has no degenerate-branch
+            # guard — a zero-commit branch (tip == branch_base_sha) that is
+            # an ancestor of main classifies ON_MAIN -> MARK_DONE the same as
+            # a genuinely merged branch. Extending θ1's resolver would mean
+            # threading task metadata into _resolve_branch_state, undoing its
+            # reviewed branch-state/task-row concurrency split — so this
+            # thin, sweep-side check downgrades the decision instead. The
+            # warm-lane script judges a landed tip by its subject alone, so it
+            # can call a genuinely merged branch degenerate (reify 6828,
+            # uncited `amend:` tips). branch_tip_landed is the veto that still
+            # marks such a branch done; see its docstring. The landing it
+            # consults is BranchState.landing_sha, never a branch tip
+            # (orchestrator/src/orchestrator/task_ground_truth.py::BranchState.landing_sha).
+            if (
+                await self._branch_is_degenerate(branch, metadata)
+                or (
+                    await self.git_ops.warm_lane_ref_is_degenerate(tid)
+                    and not await branch_tip_landed(
+                        self.git_ops, branch, branch_tip_sha,
+                        landing_sha=report.branch_state.landing_sha,
+                    )
+                )
+            ):
+                # A degenerate branch carries ZERO task work, so MARK_DONE
+                # would phantom-complete a task that never actually landed
+                # anything. An in-progress incarnation with no live claimant
+                # (already established by recovery_for reaching this action)
+                # is recovered by reverting to pending so the scheduler
+                # re-dispatches it. 'blocked' keeps the leave-alone
+                # discipline: only flip to done on positive evidence, which a
+                # degenerate branch is not — matching pre-migration behavior.
+                if status == 'in-progress':
+                    return await self._revert_in_progress_if_no_live_claimant(
+                        tid, mid_run=mid_run, metadata=metadata, status=status,
+                    )
+                return None
 
             on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
 
@@ -6855,11 +6872,6 @@ class Harness:
             # a re-derivation clobber rather than a revert. No escalation on
             # reject here by design; the reject is recorded as a
             # landing_evidence_rejected event before any revert (task 4496).
-            #
-            # The live branch tip is diagnostic only — CANDIDATE mode never
-            # reads it for the decision — but it must be captured before a
-            # revert reaps the worktree.
-            branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
             verdict = await validate_landing_evidence(
                 self.git_ops, tid, branch,
                 branch_tip_sha=branch_tip_sha,
@@ -10608,6 +10620,7 @@ class Harness:
                 cancel_event=cancel_event,
                 task_verify=self._task_verify_dispatcher,
                 task_priority=self._task_priority,
+                verify_cache=self._verify_cache,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
                 # ε (task 3733): the harness IS the sink — it owns the streak,
@@ -11223,20 +11236,17 @@ class Harness:
             'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
-        original_title = str(assignment.task.get('title') or '')
-        title = elide_at_word(f'[auto-eval redo] {original_title}', _REDO_TITLE_MAX)
-        description = (
-            f'Automated full-architect redo of task {original_id} '
-            f'(blocked at phase={report.block_phase} via optimistic path '
-            f'{optimistic_path!r}). Original branch+worktree are renamed to '
-            f'{new_branch} for forensic comparison once this redo is released.'
-            f'\n\nOriginal title: {original_title}'
+        submit_text = redo_submit_text(
+            assignment.task,
+            original_id=original_id,
+            block_phase=report.block_phase,
+            optimistic_path=optimistic_path,
+            new_branch=new_branch,
         )
 
         outcome = await self.scheduler.submit_task({
             'project_root': str(self.config.project_root),
-            'title': title,
-            'description': description,
+            **submit_text,
             'priority': str(assignment.task.get('priority') or 'medium'),
             'metadata': redo_metadata,
             'planning_mode': True,
@@ -12237,7 +12247,7 @@ class Harness:
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
-        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER, SpeculativeMergeWorker
 
         # K = verify hosts + 1 counts the frontier and sizes the worker's
         # speculation cap (speculation_depth).  Leased verifies are bounded by
@@ -12318,6 +12328,7 @@ class Harness:
             usage_gate=getattr(self, 'usage_gate', None),
             cost_store=getattr(self, 'cost_store', None),
             provenance_conflict_sink=self._provenance_conflict_sink,
+            verifier=PRODUCTION_VERIFIER.joined_to(self._verify_cache),
             deployed_sha=self._deployed_sha,
             verify_hosts=[r.name for r in self.config.verify_runners],
             runner_quarantine=self._runner_quarantine,

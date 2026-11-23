@@ -18,6 +18,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Held follow-ups are promoted (task 8418)
+
+A held follow-up now leaves the hold by promotion: one write drops its holder
+edge and stamps `followup_hold.promoted {by, at, ref}`, and every held task it
+depends on is promoted with it. `pending_since` is left as it is. See
+`docs/task-authoring.md` §3.4.
+
+- Triggers: an edge from a pending, unheld task (`add_dependency`, a
+  born-with dependency, an `update_task` replacement); a landing on `pending`
+  from `deferred` (`commit_planning`, `set_task_status`, the deferral sweep);
+  a citation (`x_finding_key` or `prd_path` written by `update_task`); a
+  combine of a candidate outside the hold rule; a human
+  `remove_dependency(task, holder)` or replacement dropping the holder id; and
+  `release_holder=True`, which promotes every active held follow-up before
+  targeted reconciliation runs, so a cancel-release no longer files one L1
+  per held follow-up.
+- Two new event types: `followup_promoted {task_id, by, ref}` and
+  `followup_promotion_deferred {task_id, by, ref, guard, reason}`.
+- Two new refusals: `followup_holder_edge_strip_refused`, for a machine-role
+  `update_task` replacement that drops the holder edge, and
+  `followup_promotion_deferred`, for a human removal a guard defers.
+- A promotion guard hook, `followup_hold.py::register_promotion_guard`; none
+  is registered by default. A guard that raises counts as a deferral.
+- A promotion that another write set off never fails that write: its error
+  is reported in `post_write_warnings` (`post_create_warnings` on a filing),
+  and the write's event and reconciliation still run. `release_holder=True`
+  on a holder already at the release status releases whatever is still
+  held, so a release that stopped partway can be finished.
+- `update_task` keeps a held task's `followup_hold` record: a write that
+  would drop or rewrite it, a `replace` included, carries the stored record.
+- `TaskInterceptor.hold_emit(project_root)` gives a caller outside the
+  interceptor the journaling `emit` every promotion function takes.
+
+#### New `park_refused` event and `park_refused_emit_interval_secs` (task 6328)
+
+**Old behaviour.** Only the scored scan's top candidate earns skips and fairness
+parks. A candidate below it that was refused its locks by a same-tier (or
+lower-tier) park earned nothing and left no trace: no skip, no park, no event. It
+waited as long as the park's owner did. 6040 waited about 70 h behind 5221's
+critical park, while 5221 waited on 3096's hold of `harness.py`.
+
+**New behaviour.**
+
+- **New `park_refused` event** for a dispatch candidate refused by parks alone, none
+  of which outranks it. Higher-tier fairness parks (fairness working as designed),
+  pin reservations (they report through `pin_blocked`) and any held blocker are out
+  of the class. Payload `{task_id, priority, episode_secs, blockers: [{module, owner,
+  kind}], park_owners: [{owner, source, tier|pin_order, park_age_secs,
+  waiting_on}]}`; `waiting_on` is the owner's own blockers, or `null` when the owner
+  is not in the tick's task list. Dispatch decisions are unchanged.
+- **New config key `park_refused_emit_interval_secs`**, default `1800`, `gt=0`,
+  green tier. The first event comes once the refusal has lasted one interval, then at
+  most once per interval. A dispatch, a refusal by anything else, or the task leaving
+  the dispatch candidates ends the episode; a scoped tick (task 8480) does not.
+- **New read `ModuleLockTable.top_park_rank(owner)`**: the strongest rank among the
+  stack tops the owner holds.
+
+The operator lever is to pin the waiting task: OPERATIONS.md §5, "A task waiting on a
+peer's park". Why visibility rather than an automatic reservation:
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, "Annotation (task 6328)".
+
 #### Low follow-ups are held behind a per-project follow-up holder (task 8417)
 
 `submit_task` now files a low or polish agent follow-up or reviewer suggestion

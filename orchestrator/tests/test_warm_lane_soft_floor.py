@@ -9,13 +9,13 @@ boundary test B10.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _seed_script_stubs import seed_default_warm_base
 from pydantic import ValidationError
 
@@ -27,21 +27,10 @@ from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Temporary git repository with an initial commit + a resolvable warm base."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     seed_default_warm_base(repo)
     return repo
 

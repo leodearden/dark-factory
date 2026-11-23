@@ -61,7 +61,6 @@ from fused_memory.reconciliation.known_projects_section import render_known_proj
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
-from fused_memory.reconciliation.task_count_snapshot_cadence import SNAPSHOT_WRITTEN_STAT_KEY
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_TREE_HEADER,
     TaskTreeUnavailableReason,
@@ -19457,300 +19456,6 @@ class TestFullCycleWiringIndexHealth:
         )
 
 
-# ---------------------------------------------------------------------------
-# _maybe_escalate_stale_task_count_snapshot — task 2278 step-9/10
-# ---------------------------------------------------------------------------
-
-
-def _snapshot_stage_reports(stat: int | None, key: str = SNAPSHOT_WRITTEN_STAT_KEY) -> dict:
-    """Build a stage_reports dict carrying (or omitting) the freshness stat.
-
-    Raw-dict shape (not a StageReport model) — extract_snapshot_written
-    handles both, and the raw shape keeps these test doubles lightweight.
-
-    *key* selects the stat spelling. It survives the task-3488 retirement of
-    the pre-rename alias for exactly one caller — _make_prior_run, used by
-    TestPreRenameJournalRowIsNoLongerHonored to build a fixture carrying the
-    old spelling, in order to assert it is now read as UNKNOWN rather than as
-    a miss. Every other caller takes the default.
-    """
-    if stat is None:
-        return {}
-    return {'task_knowledge_sync': {'stats': {key: stat}}}
-
-
-def _make_current_run(run_id: str, stat: int | None) -> ReconciliationRun:
-    """Build a real ReconciliationRun (not a SimpleNamespace stand-in) so it
-    type-checks against _maybe_escalate_stale_task_count_snapshot's ``run:
-    ReconciliationRun`` parameter — mirrors the ``_make_fake_rfc`` convention
-    used elsewhere in this file.
-    """
-    return ReconciliationRun(
-        id=run_id,
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='test',
-        started_at=datetime.now(UTC),
-        stage_reports=_snapshot_stage_reports(stat),
-    )
-
-
-def _make_prior_run(
-    run_id: str, run_type: str, status: str, stat: int | None, *, offset_seconds: int,
-    key: str = SNAPSHOT_WRITTEN_STAT_KEY,
-) -> ReconciliationRun:
-    """Build a real ReconciliationRun for prior-run journal fixtures (see
-    _make_current_run for why this isn't a SimpleNamespace)."""
-    return ReconciliationRun(
-        id=run_id,
-        project_id='test-project',
-        run_type=RunType(run_type),
-        trigger_reason='test',
-        started_at=datetime.now(UTC) - timedelta(seconds=offset_seconds),
-        status=RunStatus(status),
-        stage_reports=_snapshot_stage_reports(stat, key),
-    )
-
-
-class TestMaybeEscalateStaleTaskCountSnapshot:
-    """_maybe_escalate_stale_task_count_snapshot(project_id, run_id, run).
-
-    Escalates category 'recon_stale_task_count_snapshot' after 2+ consecutive
-    full-cycle CONFIRMED misses, filtering prior runs to run_type=='full' AND
-    status=='completed' so remediation/targeted/failed runs neither count
-    toward nor reset the streak.
-    """
-
-    @staticmethod
-    def _escalate_call_category_and_finding(mock_escalate):
-        call = mock_escalate.call_args
-        category = call.args[0] if len(call.args) >= 1 else call.kwargs.get('category')
-        run_id = call.args[1] if len(call.args) >= 2 else call.kwargs.get('run_id')
-        finding = call.kwargs.get('finding')
-        return category, run_id, finding
-
-    @pytest.mark.asyncio
-    async def test_two_consecutive_full_cycle_misses_escalates(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """(a) current miss + 1 prior full/completed miss -> streak 2 -> escalate."""
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        project_id = 'test-project'
-        run_id = 'run-current'
-        run = _make_current_run(run_id, 0)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
-        ])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
-
-        harness._escalate.assert_called_once()
-        category, esc_run_id, finding = self._escalate_call_category_and_finding(harness._escalate)
-        assert category == 'recon_stale_task_count_snapshot'
-        assert esc_run_id == run_id
-        assert finding['affected_ids'] == [f'task_count_snapshot:{project_id}']
-
-    @pytest.mark.asyncio
-    async def test_single_miss_below_threshold_not_called(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """(b) current miss + no prior full-cycle misses -> streak 1 -> NOT called."""
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
-
-        harness._escalate.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_current_written_not_called(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """(c) current cycle wrote the snapshot -> NOT called, regardless of priors."""
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 1)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
-        ])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
-
-        harness._escalate.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_current_stat_absent_not_called(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """(d) current cycle's stat is absent (unknown) -> NOT called.
-
-        Deliberately NOT parametrized over both stat spellings: ``stat=None``
-        makes _snapshot_stage_reports return an EMPTY dict, so no stat key of
-        either spelling is ever read on the current run, and the early return
-        happens before the priors matter.
-        """
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', None)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
-        ])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
-
-        harness._escalate.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_blocked_project_not_called_despite_long_streak(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """(e) is_snapshot_write_blocked project (know_live) -> NOT called.
-
-        Also asserts the efficiency fix (amendment round, reviewer finding):
-        the blocked check short-circuits BEFORE the journal read, so a
-        blocked project's cycle never issues a get_recent_runs query or
-        rebuilds/sorts a prior-flags list that evaluate_snapshot_cadence
-        would discard anyway.
-
-        Deliberately NOT parametrized over both stat spellings: that same
-        short-circuit returns before any stat is read, so the key never
-        participates in the outcome.
-        """
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
-            _make_prior_run('run-prior-2', 'full', 'completed', 0, offset_seconds=200),
-        ])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot('know_live', 'run-current', run)
-
-        assert harness._escalate.call_count == 0
-        harness.journal.get_recent_runs.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_remediation_run_interleaved_ignored_still_escalates(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """(f1) A remediation-run miss interleaved with a full-run miss is ignored
-        (not counted), but the full-run miss still contributes -> streak 2 -> escalate."""
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-remediation', 'remediation', 'completed', 0, offset_seconds=50),
-            _make_prior_run('run-prior-full', 'full', 'completed', 0, offset_seconds=100),
-        ])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
-
-        harness._escalate.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_remediation_run_only_does_not_reach_threshold(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """(f2) Only a remediation-run miss in history (no full-cycle prior) ->
-        filtered out entirely -> streak 1 -> NOT called."""
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-remediation', 'remediation', 'completed', 0, offset_seconds=50),
-        ])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
-
-        harness._escalate.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_failed_full_run_skipped_streak_bridges_to_next_completed(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """(g) A failed full run is skipped (not counted, not a reset); the
-        streak bridges across it to the next completed full run's miss."""
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-failed', 'full', 'failed', 0, offset_seconds=50),
-            _make_prior_run('run-prior-completed', 'full', 'completed', 0, offset_seconds=100),
-        ])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
-
-        harness._escalate.assert_called_once()
-
-
-class TestPreRenameJournalRowIsNoLongerHonored:
-    """A pre-rename journal row must resolve as UNKNOWN, not as a miss — task 3488.
-
-    This class pins the DELIBERATE post-retirement contract END TO END: a
-    pre-rename prior row plus a confirmed current miss must flow all the way
-    through _maybe_escalate_stale_task_count_snapshot without escalating.
-    That wiring — streak stops -> _escalate not called — is what this test
-    uniquely covers.
-
-    It is NOT the primary guard on extract_snapshot_written itself. That is
-    test_pre_rename_key_0_is_unknown_on_stage_report (and its raw-dict twin)
-    in tests/reconciliation/test_task_count_snapshot_cadence.py, which catch
-    a re-introduced legacy-key fallback — or a `.get(...) or ...` chain that
-    recreates it — at the unit level, without standing up a harness, a
-    journal double and two ReconciliationRun models.
-
-    Direction matters, and it is fail-SAFE. A pre-rename blob now reads
-    None, and compute_snapshot_miss_streak STOPS on unknown rather than
-    counting it — so retirement can under-escalate by at most one cycle and
-    can never over-escalate. That is the safe side of a guard whose job is
-    to notice an absence.
-
-    Retirement was gated on a measurement, not an assumption: at the time
-    the alias was deleted, all 24 in-window full+completed pre-rename rows
-    (my_solar_challenge 11, pump_web_ui 13) carried value 1, and a value of
-    1 is indistinguishable from unknown to the streak — both break the loop.
-    Value 0 is the only value where the fallback could change a streak, and
-    no in-window row carried it. See task 3488 / esc-3488-2.
-
-    The fixture uses the RAW LITERAL pre-rename spelling rather than a
-    constant: the constant is gone, and the literal is what real journal
-    blobs actually contain, which makes this a true regression guard rather
-    than a tautology over a symbol.
-    """
-
-    @pytest.mark.asyncio
-    async def test_legacy_keyed_prior_miss_no_longer_tips_the_streak(
-        self, journal, event_buffer, mock_memory_service,
-    ):
-        """Current run is a CONFIRMED miss under the new key; the single
-        prior full+completed run carries ONLY the pre-rename spelling, also
-        with value 0.
-
-        Before retirement the legacy 0 resolved False, the streak reached
-        1 (prior) + 1 (current) == TASK_COUNT_SNAPSHOT_MISS_THRESHOLD and
-        the escalation FIRED. After retirement the prior row is unknown, the
-        streak stops at 1 < 2, and nothing fires.
-        """
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0)
-        harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run(
-                'run-prior-pre-rename', 'full', 'completed', 0,
-                offset_seconds=100, key='task_count_snapshot_written',
-            ),
-        ])
-        harness._escalate = MagicMock()
-
-        await harness._maybe_escalate_stale_task_count_snapshot(
-            'test-project', 'run-current', run,
-        )
-
-        harness._escalate.assert_not_called()
-
-
 # ── Tests for Task 2417: reconciliation freshness pre-check wiring ───────
 
 
@@ -21488,21 +21193,19 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
 
     `EscalationQueue.has_open_l1` is LEVEL-1-ONLY
     (`escalation/queue.py::EscalationQueue.has_open_l1`, which delegates to
-    `get_by_task(task_id, status='pending', level=1)`), and the orchestrator
-    reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at
-    guards that divert real work: TWO sites in `orchestrator/workflow.py`.
+    `get_by_task(task_id, status='pending', level=1)`), and the orchestrator's
+    guards that divert real work — "is a human already on this task?" — read
+    pending LEVEL-1 records only.
     That population is enumerated authoritatively,
     in `path::symbol` form, in the `FINDING_TASK_ESCALATION_LEVEL` comment block
     of `fused_memory/reconciliation/finding_task_escalation.py` — read it there
     rather than restating it here, and do not reintroduce bare line pins
     (CLAUDE.md: cite as `path/to/module.py::symbol`, never `module.py:1234`).
-    Deliberately a POINTER and not a summary-with-names: an earlier revision
-    named one of the two workflow.py sites and read as if that were the whole
-    set, which is how the block's own list came to be missing one (see the
-    correction note in it).
+    Deliberately a POINTER and not a summary-with-names: a summary here would
+    read as the whole set and drift from the block's list.
 
-    A recon-authored L1 would answer YES to every one of them, turning a
-    PASSIVE observation into a gate on dispatch. The two assertions below are
+    A recon-authored L1 sitting on the task could answer YES to them, turning
+    a PASSIVE observation into a gate on dispatch. The two assertions below are
     together the executable proof that the collision class is closed WITHOUT
     sacrificing the acceptance criterion — the record is still on the task's
     own ladder, it simply is not an L1.
@@ -21520,10 +21223,10 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
 
     queue = EscalationQueue(queue_dir)
 
-    # (1) Invisible to every uncategorized L1 guard above.
+    # (1) Invisible to every level-1 guard above.
     assert queue.has_open_l1('4458') is False, (
         'a routed recon finding must NOT register as an open L1 — that is the '
-        'signal every uncategorized orchestrator guard reads as "a human is '
+        'signal every orchestrator level-1 guard reads as "a human is '
         'handling this task"'
     )
 

@@ -168,8 +168,10 @@ left out.
   raters, and earlier third votes on those pairs are retired
   (`fused-memory/scripts/write_triage_rating_rounds.py::rerate_round`).
   `write_triage_eval_set_v2.md` §6 records why v2.2 was written and what it
-  moved. Verdict rows do not record the brief, so the scorer takes the label
-  from its caller (`score_write_triage_reader.py --rubric`).
+  moved. Verdict rows do not record the brief, so the scorer records the
+  brief named by the corpus record's latest re-rate
+  (`score_write_triage_reader.py --corpus-record`), or, for a corpus without a
+  re-rate, an explicit `--rubric` label with its `--brief-sha256`.
 
 ## 5. Reconstructing write-time state
 
@@ -253,7 +255,9 @@ record marked). The window opens when the last of them is live, runs at least
 4. Rate per §4: two blind Opus raters on every item. Validate every line, and
    re-ask each rater whose line breaks the row contract or whose evidence is
    not found until none is left. Then check kappa over consumed answers.
-5. Score with `score_write_triage_reader.py --strata --rubric <brief label>`. For the gaps a refusal
+5. Score with `score_write_triage_reader.py --strata`, naming the brief the corpus was rated
+   under: `--corpus-record <its derivation>` once it records a re-rate, else `--rubric` with
+   `--brief-sha256`. For the gaps a refusal
    names, run a third round with a new rater, and repeat until the scorer
    accepts the corpus.
 6. Read the release condition off the report and the window's logs.
@@ -277,7 +281,10 @@ memo 2c (amendment bodies rendered past 240 chars) as task 7518, not a
 precondition of the window.
 
 **Which brief: v2.2 (Leo, 2026-10-30).** The post-fix measurement rates under
-rater brief v2.2, the file's default, and is scored with `--rubric v2.2`. This
+rater brief v2.2, the file's default, at round 0. Its corpus then records no
+re-rate, so it is scored with `--rubric v2.2 --brief-sha256 7cd0bad3…`, the
+brief the soak's `--corpus-record write_triage_v2_soak_derivation_v2_2.json`
+also names. This
 release condition was first ratified under v2.1: M1 <= 0.15, and M3 population
 <= 0.35 (esc-7301-1, recorded on task 3131), were set against the v2.1 soak
 baseline (§8). v2.2 narrows LOSS, which can only lower the figures that rest on
@@ -304,7 +311,8 @@ The labelled pair set for it is `write_triage_eval_set_v2.md`.
 
 The 2026-10-19 soak's 553 adjudicated attaches and the R8 extension, rated
 under rubric v2.1. The report is `write_triage_v2_soak_baseline.json`
-(rendered as `write_triage_v2_soak_baseline.md`), the scorer's output over
+(rendered as `write_triage_v2_soak_baseline.md`), the scorer's output with
+`--rubric v2.1 --brief-sha256 b12cdc…` over
 `write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json}`. The sample,
 the rating volume and the derivation check are in
 `write_triage_v2_soak_derivation.json`. Every figure below is quoted from one
@@ -455,7 +463,8 @@ stratified bootstrap 95% interval.
   sample rate is dominated by the contested census, 332 of 371. The
   population rate is dominated by the 14 amended conflicts: each amended item
   stands for 12.24 amended writes (1,224 / 100), each restated item for 1.25
-  (125 / 100).
+  (125 / 100). `plans/write-triage-m3-levers.md` classifies these 39 hits and
+  replays the soak corpus under each M3 lever (task 7519).
 - **M4** counts every decided attach, contested ones included, and leaves 2
   UNCLEAR out. Its population rate sits above the sample rate because the
   amended stratum is weighted 12.24 per item.
@@ -510,7 +519,8 @@ The same soak, with every pair whose derivation reads LOSS re-rated under brief
 v2.2, the committed `write_triage_rater_brief_v2.md`. The report is
 `write_triage_v2_soak_baseline_v2_2.json` (rendered as
 `write_triage_v2_soak_baseline_v2_2.md`), the scorer's output with
-`--rubric v2.2` over `write_triage_v2_soak_{items.jsonl,strata.json}` and
+`--corpus-record write_triage_v2_soak_derivation_v2_2.json` over
+`write_triage_v2_soak_{items.jsonl,strata.json}` and
 `write_triage_v2_soak_verdicts_v2_2.jsonl`. The derivation is
 `write_triage_v2_soak_derivation_v2_2.json`. The re-rate left the v2.1 files
 above unchanged. Task 7518 later re-derived DIGEST in both verdict files (see

@@ -1,5 +1,6 @@
 # Write-triage reader report (rubric v2.2)
 
+Rater brief: v2.2, sha256 7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1.
 Items: 673 (decided 671, unclear 2). By outcome: amended 100, contested 473, restated 100, stored 0.
 Sampled per stratum: amended-sample 100, contested-census 473, restated-sample 100.
 Stratum populations: amended-sample 1224, contested-census 473, restated-sample 125.

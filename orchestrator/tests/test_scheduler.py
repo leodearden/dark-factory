@@ -5495,7 +5495,7 @@ class TestBlastRadiusRequeueEmitsRelease:
         assert event_store is not None
         real_emit = event_store.emit
 
-        def _spy_emit(event_type, **kwargs) -> None:
+        def _spy_emit(event_type, **kwargs) -> int | None:
             if str(event_type) == str(EventType.lock_released):
                 order.append('release')
             return real_emit(event_type, **kwargs)

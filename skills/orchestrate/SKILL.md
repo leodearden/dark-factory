@@ -348,7 +348,7 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 |---|---|
 | Per-role `models` / `budgets` / `max_turns` / `effort` / `timeouts` / `backends` | Reload |
 | `routing.*` (`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules`) | Reload |
-| Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`) | Reload |
+| Steward (`steward_completion_timeout`, `steward_lifetime_budget`, `steward_session_mode`) | Reload |
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, persist passes, recheck seconds, red-unlanded hours) | Reload |

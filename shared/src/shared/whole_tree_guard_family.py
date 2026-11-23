@@ -95,7 +95,7 @@ __all__ = [
 #   task-role run of its leg, and a hang in it is caught only at this ceiling,
 #   not at the ini default (docs/task-role-pytest-floor.md).
 # The current anchor is
-# orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE,
+# shared/src/shared/testing_ceiling_anchors.py::WHOLE_TREE_FAMILY_MEASURED_WORST_SECS,
 # which floors the family at
 # orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
 # Derivation: plans/pytest-per-test-timeout-measurement-2026-09-17.md.

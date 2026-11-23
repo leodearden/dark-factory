@@ -48,6 +48,7 @@ if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
 from df_pytest_isolation import (
     arm_leaked_drain_process_guard,
     arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 
@@ -139,6 +140,10 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
+from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
+    fake_clock as fake_clock,
+)
+
 # NOTE (task 3644, review finding #6): the `scripts/` path injection the
 # census<->escalation E2E contract test needs is NOT done here.  It lives in
 # that one test module (`test_legibility_census_escalation_e2e.py`), scoped to
@@ -151,10 +156,13 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences and UsageGate sweep confinement."""
     reject_unsafe_basetemp(config)
     arm_test_root_isolation(config)
     arm_leaked_drain_process_guard(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
 
 
 # ---------------------------------------------------------------------------
