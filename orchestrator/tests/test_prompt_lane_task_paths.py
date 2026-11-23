@@ -14,10 +14,11 @@ from _briefing_helpers import briefing as briefing
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import ROLES
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import LANE_SYMLINKED_ARTIFACTS, TaskArtifacts
 
 _LANE_PATH = re.compile(r'\.task/[A-Za-z0-9_.-]*[A-Za-z0-9_]')
 _HISTORY_PATHS = ('.task/plan.json', '.task/iterations.jsonl')
+_LANE_LAYOUT_ROLES = ('implementer', 'debugger', 'merger', 'steward', 'simple_task')
 
 
 def build_dual_root_lane(tmp_path: Path) -> tuple[Path, TaskArtifacts]:
@@ -56,6 +57,16 @@ def test_history_reading_roles_name_both_lane_paths(name):
     prompt = ROLES[name].system_prompt
     for path in _HISTORY_PATHS:
         assert path in prompt, f'{name} does not name {path}'
+
+
+@pytest.mark.parametrize('name', _LANE_LAYOUT_ROLES)
+def test_lane_layout_roles_say_only_the_linked_artifacts_are_exposed(name):
+    prompt = ROLES[name].system_prompt
+    for linked in LANE_SYMLINKED_ARTIFACTS:
+        assert f'.task/{linked}' in prompt, f'{name} does not name .task/{linked}'
+    assert 'metadata.json' in prompt, (
+        f'{name} describes the .task/ layout without saying metadata.json is not exposed there'
+    )
 
 
 @pytest.mark.parametrize('name', sorted(ROLES))
