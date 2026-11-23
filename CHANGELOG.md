@@ -17,6 +17,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### The filing curator can combine two candidates of one batch (task 8416)
+
+The curator may now combine two candidates the worker drains in one batch,
+lifting batch rule 2: `action='combine'` with `batch_target_index=<B>`,
+`target_id` null, `target_fingerprint` set to B's title and a
+`rewritten_task`. B must itself be created. It is then rewritten through the
+ordinary combine path, under every combine guard.
+
+- A combine whose target sibling was not created (dropped, combined, parked
+  elsewhere, failed or refused) is created on its own with a reason starting
+  `batch-target-not-create`. It also writes a combine-audit refusal row with
+  `refused_reason: batch-target-not-create`. A combine onto a parked sibling
+  parks with it, as a drop does.
+- A within-batch drop onto a sibling now writes a combine-audit row. That row
+  records the target unchanged: `new` equals `old`, and `items_after` equals
+  `items_before`.
+- Every combine-audit row carries `action` (`combine` or `drop`). A row
+  without the key predates it and was a combine.
+- The parser keeps `batch_target_index` only on a batch edge. A drop or
+  combine that sets both `target_id` and `batch_target_index` degrades to
+  `ambiguous-<action>`.
+- The curator prompt harness is now `curator-v2`. Heuristics artifacts pinned
+  under `curator-v1` stop resolving, and the in-code baseline is used until
+  they are re-pinned.
+
 #### Held follow-ups are promoted (task 8418)
 
 A held follow-up now leaves the hold by promotion: one write drops its holder
