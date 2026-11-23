@@ -428,7 +428,7 @@ async def test_an_original_without_details_files_no_details(tmp_path: Path):
 
     submit_args = await _redo_submit_args(f)
 
-    assert not submit_args.get('details')
+    assert 'details' not in submit_args
 
 
 @pytest.mark.asyncio
