@@ -51,7 +51,9 @@ class MemoryResult(BaseModel):
     # BIRTH, not its last edit. None when the store supplies no stamp.
     created_at: str | None = None
     # Writer identity and the project scope the record is STORED under; None when the store
-    # recorded none. project_id is never the query's scope nor the metadata origin tag.
+    # recorded none. project_id is read off the record, never copied from the query, and is
+    # not metadata['project_id']: that key is a writer-supplied ORIGIN tag, one of
+    # server/grouped_read.py::ORIGIN_PROJECT_TAG_KEYS. The two are never merged.
     agent_id: str | None = None
     task_id: str | None = None
     project_id: str | None = None
@@ -82,7 +84,10 @@ def _stored_task_id(value: object) -> str | None:
 
 
 def mem0_hit_attribution(managed: Mapping[str, Any], custom: Mapping[str, Any]) -> HitAttribution:
-    """Attribution of a mem0 record: ``managed`` is mem0's processed search item or the managed half from backends/mem0_client.py::split_managed_metadata."""
+    """Attribution of a mem0 record: ``managed`` is mem0's processed search item or the managed half from backends/mem0_client.py::split_managed_metadata.
+
+    project_id inverts models/scope.py::Scope.mem0_user_id, which stores the project id verbatim as user_id.
+    """
     return HitAttribution(
         agent_id=_non_empty_str(managed.get('agent_id')),
         task_id=_stored_task_id(custom.get('task_id')),
@@ -91,7 +96,10 @@ def mem0_hit_attribution(managed: Mapping[str, Any], custom: Mapping[str, Any]) 
 
 
 def graphiti_hit_attribution(group_id: object) -> HitAttribution:
-    """Attribution of a Graphiti edge from its ``group_id`` partition; the graph stores no writer."""
+    """Attribution of a Graphiti edge from its ``group_id`` partition; the graph stores no writer.
+
+    project_id inverts models/scope.py::Scope.graphiti_group_id, which partitions by the project id verbatim.
+    """
     return HitAttribution(agent_id=None, task_id=None, project_id=_non_empty_str(group_id))
 
 
