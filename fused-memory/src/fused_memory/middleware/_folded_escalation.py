@@ -2,16 +2,23 @@
 
 :func:`file_folded_escalation` owns the defensive optional-``escalation``
 import, the guarded ``EscalationQueue`` construction, the
-``get_by_task(anchor, status='pending')`` dedupe fold, and the never-raise
-``Escalation(...)`` + ``queue.submit(...)``.  Each caller keeps its own
+``get_by_task(anchor, status='pending', agent_role=role)`` dedupe fold, and
+the never-raise ``Escalation(...)`` + ``queue.submit(...)``.  The fold is
+role-scoped, the same scope :func:`pending_folded_escalations` reads and
+:func:`resolve_folded_escalations` closes, so another role's pending record
+under the anchor cannot silence the filer.  Each caller keeps its own
 ``_ANCHOR_TASK_ID`` / ``_AGENT_ROLE`` / ``_CATEGORY`` constants and builds its
 own summary and detail.  :func:`pending_folded_escalations` and
 :func:`resolve_folded_escalations` read and close what a caller filed, for an
 alarm that clears itself, under the same guard.
 
-EVERY FILER'S ANCHOR MUST BE UNIQUE.  A filer that dedupes against an anchor
-somebody else keeps open never files again, and that silence is
-indistinguishable from health.  Measured: the L1 escalation watcher squatted
+EVERY FILER'S ANCHOR MUST BE UNIQUE.  Role scoping stops another ROLE's
+record under the anchor from silencing a filer, but a second filer under the
+same anchor and role would fold into the first one's open record and never
+file again, and that silence is indistinguishable from health.  Queue
+consumers outside this module also match on ``task_id`` without the role, e.g.
+``escalation/src/escalation/queue.py::EscalationQueue.dismiss_if_covered``.
+Measured before the fold was role-scoped: the L1 escalation watcher squatted
 the ``markup-tripwire`` anchor, and the tripwire filed nothing from 2026-08-16
 to 2026-08-19 while 41 rejections occurred.  So ``anchor_task_id`` is required
 and keyword-only with no default, which makes a shared anchor impossible to
@@ -142,9 +149,14 @@ def file_folded_escalation(
             and ``escalation/src/escalation/disposition.py::route_info_l0``
             decides it, converting a note with content into a curator task.
             Any other L0 is promoted to L1 after a delay.
-        dedupe: Fold into an already-open escalation under *anchor_task_id*
-            instead of filing a duplicate.  Pass false when each record holds
-            a distinct payload that a fold would discard.
+        dedupe: Fold into an already-open escalation *agent_role* filed under
+            *anchor_task_id* instead of filing a duplicate.  Another role's
+            pending record under the anchor is not folded into.  That
+            includes the L1 the orphan reaper re-files under its own role when
+            it promotes an L0, so after a promotion each recurrence files a
+            fresh L0, which the reaper then dismisses as covered by that L1.
+            That churn is bounded and accepted.  Pass false when each record
+            holds a distinct payload that a fold would discard.
         context: The caller's description of the subject, appended to every
             emitted message, including the no-op arms.
         on_fold: Called with the existing escalation in place of the default
@@ -152,8 +164,8 @@ def file_folded_escalation(
             its own level.  An exception from it is logged, never raised.
 
     Returns the escalation id — freshly filed, or the id of the already-open
-    escalation under this anchor when one exists — or ``None`` when filing was
-    not possible. NEVER raises.
+    escalation *agent_role* filed under this anchor when one exists — or
+    ``None`` when filing was not possible. NEVER raises.
 
     Without the ``escalation`` package the alarm is LOST, so that arm logs at
     WARNING for every caller; the rationale lives in
@@ -167,21 +179,15 @@ def file_folded_escalation(
         return None
 
     # While a condition persists every event breaches again, so filing per
-    # breach would bury the queue; any pending record under the anchor IS this
-    # caller's open alarm. A read failure falls THROUGH to filing: a possible
-    # duplicate is far cheaper than a silenced alarm.
-    existing = []
-    if dedupe:
-        try:
-            existing = queue.get_by_task(anchor_task_id, status='pending')
-        except Exception:
-            logger.exception(
-                '%s: failed to check for an already-open alarm under anchor %r '
-                'in project_root=%r; proceeding to file a new one rather than '
-                'silencing the alarm%s',
-                log_label, anchor_task_id, project_root, _suffix(context),
-            )
-            existing = []
+    # breach would bury the queue; a pending record THIS ROLE filed under the
+    # anchor is the caller's open alarm. A read failure falls THROUGH to
+    # filing: a possible duplicate is far cheaper than a silenced alarm.
+    existing = _pending_in(
+        queue, project_root, anchor_task_id=anchor_task_id, agent_role=agent_role,
+        logger=logger, log_label=log_label,
+        outcome='filing a new one rather than silencing the alarm',
+        context=context,
+    ) if dedupe else []
     if existing:
         if on_fold is not None:
             try:
@@ -246,7 +252,7 @@ def pending_folded_escalations(
         return []
     return _pending_in(
         queue, project_root, anchor_task_id=anchor_task_id, agent_role=agent_role,
-        logger=logger, log_label=log_label,
+        logger=logger, log_label=log_label, outcome='treating it as nothing pending',
     )
 
 
@@ -258,13 +264,20 @@ def _pending_in(
     agent_role: str,
     logger: logging.Logger,
     log_label: str,
+    outcome: str,
+    context: str = '',
 ) -> list[Escalation]:
+    """The pending records *agent_role* filed under *anchor_task_id*.
+
+    ``[]`` on a read failure, logged with *outcome* as :func:`_open_queue`
+    logs its no-op lines.
+    """
     try:
         return queue.get_by_task(anchor_task_id, status='pending', agent_role=agent_role)
     except Exception:
         logger.exception(
-            '%s: failed to read pending records under anchor %r in project_root=%r',
-            log_label, anchor_task_id, project_root,
+            '%s: failed to read pending records under anchor %r in project_root=%r; %s%s',
+            log_label, anchor_task_id, project_root, outcome, _suffix(context),
         )
         return []
 
@@ -291,7 +304,7 @@ def resolve_folded_escalations(
         return []
     pending = _pending_in(
         queue, project_root, anchor_task_id=anchor_task_id, agent_role=agent_role,
-        logger=logger, log_label=log_label,
+        logger=logger, log_label=log_label, outcome='nothing resolved',
     )
     resolved: list[str] = []
     for esc in pending:

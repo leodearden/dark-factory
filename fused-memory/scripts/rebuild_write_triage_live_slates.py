@@ -71,10 +71,12 @@ _SCRIPTS = Path(__file__).resolve().parent
 
 if TYPE_CHECKING:
     import freeze_write_triage_population as _freeze
+    import mem0_history_at as _history
     import write_triage_rating_rounds as _rounds
 else:
     _freeze = load_script(_SCRIPTS / 'freeze_write_triage_population.py',
                           'freeze_write_triage_population')
+    _history = load_script(_SCRIPTS / 'mem0_history_at.py', 'mem0_history_at')
     _rounds = load_script(_SCRIPTS / 'write_triage_rating_rounds.py', 'write_triage_rating_rounds')
 
 SOAK_EMBEDDING_DIMS = 1536
@@ -262,7 +264,7 @@ class Unrecoverable(ValueError):
 
 
 def write_time_slate(
-    write: SoakWrite, table: VectorTable, history: _rounds.MemoryHistory, k: int = CANDIDATE_K,
+    write: SoakWrite, table: VectorTable, history: _history.MemoryHistory, k: int = CANDIDATE_K,
 ) -> dict[str, Any]:
     """*write* with its slate as it was at its instant, in the frozen snapshot's write shape."""
     neighbours = _neighbours(write, table, k)
@@ -310,7 +312,7 @@ def _memory_result(memory_id: str, metadata: Mapping[str, Any]) -> MemoryResult:
 
 def _candidate(
     table: VectorTable, memory_id: str, cosine: float, instant: datetime,
-    history: _rounds.MemoryHistory,
+    history: _history.MemoryHistory,
 ) -> dict[str, Any]:
     payload = table.payload(memory_id) or {}
     metadata = _metadata(table, memory_id, cosine)
@@ -327,7 +329,7 @@ def _candidate(
 
 
 def _target(
-    table: VectorTable, memory_id: str, instant: datetime, history: _rounds.MemoryHistory,
+    table: VectorTable, memory_id: str, instant: datetime, history: _history.MemoryHistory,
 ) -> dict[str, Any]:
     """A hoisted canonical off the slate; one absent from the table is noted, its text not restored."""
     payload = table.payload(memory_id)
@@ -340,7 +342,7 @@ def _target(
 
 
 def _text_at(
-    history: _rounds.MemoryHistory, memory_id: str, instant: datetime, current: str,
+    history: _history.MemoryHistory, memory_id: str, instant: datetime, current: str,
 ) -> str | None:
     text = history.text_at(memory_id, instant, current)
     return None if text is None else _rounds.capped(text)
@@ -399,7 +401,7 @@ class Rebuild:
 
 
 def rebuild(
-    writes: Iterable[SoakWrite], tables: Mapping[str, VectorTable], history: _rounds.MemoryHistory,
+    writes: Iterable[SoakWrite], tables: Mapping[str, VectorTable], history: _history.MemoryHistory,
     *, total: int, seed: int | str, k: int = CANDIDATE_K,
 ) -> Rebuild:
     """Re-decide every write's band, draw from the judge band, and rebuild the drawn slates.
@@ -480,7 +482,7 @@ def _deleted_alive_at(
 ) -> dict[str, int]:
     """Per write, the records history deleted after its instant that existed before it and no table holds."""
     present = {point_id for table in tables.values() for point_id in table.ids}
-    with _rounds.read_only(history_db) as connection:
+    with _history.read_only(history_db) as connection:
         events = connection.execute(
             "SELECT memory_id, created_at, updated_at FROM history WHERE event = 'DELETE'"
         ).fetchall()
@@ -554,7 +556,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     writes = [write for write in soak_writes(journal, json.loads(args.attaches.read_text()), SOAK_WINDOW)
               if write.project_id in args.projects]
     tables, source = args.vectors.load(args.projects)
-    rebuilt = rebuild(writes, tables, _rounds.MemoryHistory.read(history_db),
+    rebuilt = rebuild(writes, tables, _history.MemoryHistory.read(history_db),
                       total=args.total, seed=args.seed)
     instants = {write.memory_id: write.instant for write in writes}
     header = {

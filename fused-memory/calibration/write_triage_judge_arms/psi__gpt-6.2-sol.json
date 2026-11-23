@@ -1,0 +1,744 @@
+{
+  "per_class": {
+    "duplicate": {
+      "n": 75,
+      "correct": 46,
+      "accuracy": 0.6133
+    },
+    "distinct": {
+      "n": 3,
+      "correct": 0,
+      "accuracy": 0.0
+    },
+    "pseudo_contradiction": {
+      "n": 6,
+      "correct": 1,
+      "accuracy": 0.1667
+    },
+    "distractor": {
+      "n": 0,
+      "correct": 0,
+      "accuracy": null
+    }
+  },
+  "confusion": {
+    "duplicate": {
+      "amended": 37,
+      "contested": 27,
+      "restated": 9,
+      "stored": 2
+    },
+    "distinct": {
+      "amended": 1,
+      "contested": 0,
+      "restated": 2,
+      "stored": 0
+    },
+    "pseudo_contradiction": {
+      "amended": 0,
+      "contested": 5,
+      "restated": 1,
+      "stored": 0
+    },
+    "distractor": {
+      "amended": 0,
+      "contested": 0,
+      "restated": 0,
+      "stored": 0
+    }
+  },
+  "duplicate_outcome_split": {
+    "restated": 9,
+    "amended": 37
+  },
+  "false_contested": 32,
+  "production_shape": {
+    "attach_outcomes": [
+      "amended",
+      "contested",
+      "restated"
+    ],
+    "duplicate_attach": {
+      "n": 75,
+      "strict": 18,
+      "strict_rate": 0.24,
+      "any": 73,
+      "any_rate": 0.9733
+    },
+    "wrong_record_attach": {
+      "n": 59,
+      "attached": 82,
+      "rate_of_attaches": 0.7195,
+      "rate_of_cases": 0.7024,
+      "cases": [
+        {
+          "memory_id": "034879e4-bf0e-4a62-a1e4-b00203db0031",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "288805b3-c2e2-4af5-ade1-ef3968fb1b60",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "62a73a82-8502-4500-8526-ea2908a8ba3c",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "74b9430a-0d0d-4991-b864-8811fef451e7",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "preferences_and_norms",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "ae4a7f5a-eb0b-4b46-bc48-f29164cd56c0",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "309ba479-0ad0-486d-95e4-6b0c7e857987",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "dd617629-0a16-4214-a30a-3d237fe901d5",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "74b9430a-0d0d-4991-b864-8811fef451e7",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "preferences_and_norms",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "03dbcd3a-9afe-4c6a-8c77-ebf75203bf89",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "486c508d-ffd0-402e-948e-e265b0d3b406",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "18cccfbc-0484-4247-a00c-eb80cf026101",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "cbaa7a0e-16e4-400b-8b33-8166058384a8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "5115a184-07d7-4adf-a9e8-bf1eb8a51aca",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "c06b4f7d-6a6c-465c-8209-f47f7080555d",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "d1a94705-c98e-482e-9069-871bfa13a6dc",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "e591f8d0-b5f7-43ac-ae2a-d8392f0cae27",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "e0b6466d-3c84-466d-bf5f-57721e2df35b",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "4719df39-7261-4c76-be2a-8810faa9ecea",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "e0d31950-27f1-4867-a2df-b6e7701ed682",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "92d754b6-0a78-4b5d-bff5-e5fce092baea",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "e6c54af5-e9f9-4bcf-9b4e-8bdda242d83b",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "1051d09b-67d4-406e-b61a-9f1226d5a449",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "0e46ec63-01c9-4505-a0c9-dcd3a003ad28",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "cf61d6c9-c5ae-4136-993d-865dea33142c",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "1d54d1d7-da71-44fe-894b-3011a41161af",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "a3fd16e5-6ccf-4401-82e4-2a439a26f312",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "31632470-5c39-4929-a768-23e98cd9217c",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "dde9cd6f-5f5b-4c64-9b8b-5be51df824b0",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "335028f7-0e0e-4aac-a4c3-9c47885c36f3",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "f69a1c8f-8426-4231-92e2-a6bcc5d50bde",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "6fa72085-4198-4a2e-8bfa-8e7a82a55a3a",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "97a0199d-5a4a-4012-be33-39f489293809",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "74fc3315-f5e3-4544-972e-32e8a2c3eaaa",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "141f3fa2-68c1-4530-ab3a-510e18ac05ea",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "preferences_and_norms",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "77bf2f5c-523b-41af-8ce4-9eb0cd3cb08e",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "daf1a44a-e76b-448f-8e47-c0088f7c7858",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "8a3fad31-386b-4102-aa8d-1abf2984450d",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "f02e3277-bddd-413d-9104-a7632a0de035",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "preferences_and_norms",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "8b47b378-d154-4460-9cf6-0fa681a02ce1",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "815353e6-61ec-42d5-b607-52ff0e9e3555",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "a390babf-8bad-4d98-b047-35c75e25755b",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "07b1216e-ba44-4b90-87c9-7ecf31b7f173",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "ce42b17f-2c80-47c8-ae92-61f1f7bbef0e",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "bb1285ec-7557-493c-be63-d80f3ac95b7d",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "f6a4bd31-0414-4a8a-a900-5520655b9af2",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "3bad2820-97fe-4344-9b6d-d80921c91352",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "18cbefc3-5845-443b-95cb-1d14b265befd",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "331d55ff-92f8-456b-9a0f-e09e969c0c14",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "1a265e20-6e4d-4c7c-a1dd-cdf880c865e4",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "0342741b-a4f5-4fb0-af2f-a212130d82e6",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "80936e18-6a91-4b74-9bb8-cae79e6490b8",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "44abf8dc-d271-4c9f-8845-cae0cded9600",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "8110c809-04cf-4de8-9aad-1c2c00e25053",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "c8a04039-a340-40e3-a21d-abbfad8b8031",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "ad415479-f6b6-441b-b95f-6bf1d4168804",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "ee283f79-f3f0-4e65-a2ea-e71a24784cac",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "3bd4fc1e-65af-41ea-9e3a-e5e09aefbdeb",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "dfe48d19-8f08-4638-b08d-6c0b5d1f7f58",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "4743c358-c9dc-4197-a475-651e16edc809",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "876f3f44-f741-4c29-8ac3-745d46e9e6b9",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "c77d25d9-70b0-44f4-a6fd-b00c7a63118b",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "14e71e7c-b1c5-4eac-80e6-24d502cbf376",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "59390607-ece1-44a6-aea8-3b677d94ce40",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "85996a13-1d05-46f7-aca3-33984306f37f",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "preferences_and_norms",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "5d7c4909-6ca9-451d-9881-932b924f88d8",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "8c188190-169e-4f2c-9d50-3496ef63f5cd",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "b54c5f0d-8f9b-4ded-8eeb-359a73c8cf28",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "8c188190-169e-4f2c-9d50-3496ef63f5cd",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "bbd7cac3-11ba-402f-93f8-06a74871741b",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "8c188190-169e-4f2c-9d50-3496ef63f5cd",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "057d0baa-52aa-4627-9d3a-55f28347d51a",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "8fbf387d-756f-4889-bf60-3c1951438adb",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "1e3614d7-76bd-40bd-9fe5-dd7930ebcab3",
+          "expected_class": "duplicate",
+          "outcome": "restated",
+          "attach_target_id": "8fbf387d-756f-4889-bf60-3c1951438adb",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "3ac85fc6-ddc4-4f49-852c-d66d26262731",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "b683b21e-a28a-4ee4-9753-cb282d5e1ff6",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "2200d20e-697f-47d4-9983-47d4b3aa4b43",
+          "expected_class": "pseudo_contradiction",
+          "outcome": "contested",
+          "attach_target_id": "1ad67bc2-2af9-42b7-b3d5-f9816d1130d4",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "preferences_and_norms",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "2eda458f-da8b-4d38-969c-c2238c60ffae",
+          "expected_class": "pseudo_contradiction",
+          "outcome": "contested",
+          "attach_target_id": "3bbf3332-16f6-41d3-a188-24cb92e7864e",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "524933e4-969c-4fa5-b166-29f00e33e934",
+          "expected_class": "pseudo_contradiction",
+          "outcome": "contested",
+          "attach_target_id": "3bbf3332-16f6-41d3-a188-24cb92e7864e",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "676a4c57-a8f5-4e11-83eb-30a3c330cbd6",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "353911ad-b452-464b-80de-bff2dafd9591",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "d6cd4626-f249-4668-8e3c-156842ef1137",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "8a14e8c8-4670-405d-ad9f-d4b936f98bb8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": null,
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "669fadfa-48e0-46f9-b1e7-0e8d1cdaa628",
+          "expected_class": "distinct",
+          "outcome": "amended",
+          "attach_target_id": "d770a14f-00f8-42c6-88cf-f98392483a61",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "2b911b54-cd27-4a94-81f3-890926202be1",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "7170adae-cfd2-478d-854d-16a27bb25e68",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "5697ff2f-4f9b-49bb-be89-5643b94802ec",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "e29b46c7-a14f-4e2f-9029-c0ca383b6025",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "5f1c0d8f-b980-4a75-8a16-747e2519eb05",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "e27a1942-223d-465c-b4c6-67a16d0d5ce5",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "b6b82b57-63c2-44a7-b594-07ac22873093",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "964042e9-cf2d-40cd-af89-e7b9271892bc",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "d5226000-0a3b-46e9-b07c-61dcf3c151ac",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "f8286a29-df66-4c33-9fd8-d601cbd44fc3",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "90a10d71-8ff0-495f-a53f-e31e32b91858",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "37bd1911-e2b0-4667-ac9f-33cf51bf59ef",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "243b6dec-f0ce-4123-bb09-16d834b7e9c8",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "79b07847-572c-4aa5-8e49-ab48b54a87e8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "41f3e4f8-43de-4e65-bc84-4d210e7dccbf",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "79b07847-572c-4aa5-8e49-ab48b54a87e8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "420be09b-7444-4894-92e0-77aea392d47a",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "79b07847-572c-4aa5-8e49-ab48b54a87e8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "58ba125e-d46a-4927-9890-a186826bfbb4",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "3bf2119c-91e5-45e2-b6e5-9e2a983cc327",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "69b7dfd9-f7d7-4cd5-824d-0740323662f3",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "79b07847-572c-4aa5-8e49-ab48b54a87e8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "935ecd70-5948-45c0-94a2-aaec7cda743a",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "79b07847-572c-4aa5-8e49-ab48b54a87e8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "9f32e820-0d0b-49c5-b471-90cbb696b29c",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "79b07847-572c-4aa5-8e49-ab48b54a87e8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "c315352b-6d4e-467d-9a3f-360bc2d53229",
+          "expected_class": "duplicate",
+          "outcome": "contested",
+          "attach_target_id": "79b07847-572c-4aa5-8e49-ab48b54a87e8",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "d3a57bb8-8948-4344-88cd-4485419bcc2f",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "b245e24a-61d1-44ad-a78a-be75738261d1",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        }
+      ]
+    },
+    "false_attach": {
+      "n": 9,
+      "denominator": 9,
+      "rate": 1.0,
+      "classes": [
+        "distinct",
+        "pseudo_contradiction",
+        "distractor"
+      ]
+    },
+    "band_split": {
+      "duplicate": {
+        "restated": 9,
+        "judge": 66,
+        "stored": 0
+      },
+      "distinct": {
+        "restated": 1,
+        "judge": 2,
+        "stored": 0
+      },
+      "pseudo_contradiction": {
+        "restated": 1,
+        "judge": 5,
+        "stored": 0
+      },
+      "distractor": {
+        "restated": 0,
+        "judge": 0,
+        "stored": 0
+      }
+    },
+    "band_split_all": {
+      "restated": 11,
+      "judge": 73,
+      "stored": 0
+    },
+    "middle_band": {
+      "n": 73,
+      "correct": 40,
+      "accuracy": 0.5479
+    },
+    "canonical_in_slate": {
+      "n": 84,
+      "hits": 28,
+      "rate": 0.3333
+    },
+    "canonical_absent": 21,
+    "judge_calls": 84,
+    "judge_spend": {
+      "calls_with_usage": 84,
+      "prompt_tokens": 248265,
+      "completion_tokens": 3653,
+      "total_tokens": 251918
+    }
+  },
+  "routing": {
+    "route_split": {
+      "duplicate": {
+        "restated": 0,
+        "judge": 75,
+        "stored": 0
+      },
+      "distinct": {
+        "restated": 0,
+        "judge": 3,
+        "stored": 0
+      },
+      "pseudo_contradiction": {
+        "restated": 0,
+        "judge": 6,
+        "stored": 0
+      },
+      "distractor": {
+        "restated": 0,
+        "judge": 0,
+        "stored": 0
+      }
+    },
+    "route_split_all": {
+      "restated": 0,
+      "judge": 84,
+      "stored": 0
+    },
+    "restate_band": {
+      "n": 11,
+      "judged": 11,
+      "verbatim": 0,
+      "correct": 7,
+      "accuracy": 0.6364
+    },
+    "judged": {
+      "n": 84,
+      "correct": 47,
+      "accuracy": 0.5595
+    }
+  },
+  "contested_ground_truth": {
+    "available": false,
+    "reason": "no_positive_contested_labels: the fixture carries 6 pseudo_contradiction records, every one curator-adjudicated NOT a contradiction, and 0 records labelled as a genuine contradiction. Contested recall and precision are therefore unmeasurable against this corpus; only the false-positive count below is a measurement."
+  },
+  "caveats": [
+    "No accuracy floor is asserted anywhere in this script or its tests (PRD D10). This artifact is evidence for a human decision, not a gate.",
+    "false_contested counts EVERY contested verdict, and every one of them is a false positive \u2014 see contested_ground_truth. A judge structurally incapable of ever answering `contested` would score identically to a perfect one here, so a low number is not evidence that the contradiction detector works.",
+    "The duplicate class accepts BOTH `restated` and `amended`, because the curator's labels do not separate a verbatim restatement from a rediscovery carrying a novel fragment. The split between them is reported as a distribution and is not scored as error. NOT SCORED IS NOT THE SAME AS NOT CONSEQUENTIAL: `_TRIAGE_ATTACH_KINDS` in `server/tools.py` files a `restated` verdict as a SIGHTING, which `grouped_read` only counts, and an `amended` one as an AMENDMENT, whose text is digested into the canonical's grouped read. A swing between the two therefore changes what an operator reads while leaving every accuracy above unmoved, so read this split as a behaviour selector rather than as noise.",
+    "There is NO distractor control class in this mode. A retrieved slate carrying no correct attach target is the ORDINARY case here rather than one this script constructs, so the control would measure nothing the population does not already show. `production_shape.canonical_in_slate` is the measured equivalent \u2014 the share of cases whose own canonical reached the prompt at all \u2014 and `canonical_absent` counts the cases whose canonical is no longer in the corpus. Those are KEPT in the population, because production meets them.",
+    "Every figure here is measured over the population production would actually route: the slate, the band winner, the cosine band and the route all come from a live retrieval through `retrieve_candidates` / `decide_band` / `route_band` / `select_judge_candidates` at this config's `candidate_k`, `t_high` and `t_low`, and the judge was asked for every case `route_band` sends it: the [t_low, t_high) middle band, plus each restate-band write that does not repeat its band winner, or the winner's canonical, near-verbatim. So `per_class` MIXES routes \u2014 a near-verbatim `restated` and a below-floor `stored` are counted there without an LLM having seen the case. `routing.judged` is the judge's own accuracy; `production_shape.middle_band` is its accuracy on the cosine middle band, and `routing.restate_band` its accuracy on judged high-cosine writes. A verdict that is correct for its curator label can still attach to ANOTHER RECORD, which `per_class` cannot show. `production_shape.duplicate_attach.strict` and `production_shape.wrong_record_attach` score `attach_target_id`, the record production files the write against. For a judged attach that is the candidate the judge NAMED, hoisted to its canonical (`judged_candidate_id`); otherwise it is the band winner (`band_winner_id`). So for a judged write `strict` is recall at `judge_candidate_count`, not at 1. An artifact from a judge that named no candidate (before task 5794) attached every judged write to the band winner, and its rows carry no `judged_candidate_id`.",
+    "Under the shipped `contests` definition \u2014 the entry says a candidate is wrong, outdated or different (Leo's ruling 2026-09-30, plans/write-triage-flip-readiness-prd.md \u00a711.3 C1'') \u2014 the judge answered `contested` on 5 of 6 pseudo_contradiction cases (of the 6 the judge saw); all outcomes: `amended` 0, `contested` 5, `restated` 1, `stored` 0. These records were adjudicated NOT contradictions under the EARLIER definition (\"cannot be true at the same time\"), and this report still scores `contested` on them as wrong and counts it in false_contested. The fixture is deliberately not relabelled, so this reports how the new definition reads them without asserting which reading is right.",
+    "The judge, `gpt-6.2-sol`, answered `contested` on 27 of 75 duplicate cases (of the 75 the judge saw). The curator labelled each duplicate the same claim as its canonical, so this report scores `contested` on one as wrong; with triage enabled, each is a write this judge would flag `contested` for a human to read. The `contests` definition was settled on a frontier reasoning judge: its live boundary test, fused-memory/tests/server/test_write_triage_judge.py::TestTheShippedWordingLive, pins one, because gpt-4o-mini answers that test's outdated cases `contested` under the earlier wording too. Where this judge is not the model that test pins, the figure measures the wording on a judge it was not settled on: read it beside a run on that model before deciding which judge the flip ships."
+  ],
+  "provenance": {
+    "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
+    "judge_provider": "openai",
+    "judge_model": "gpt-6.2-sol",
+    "judge_system_prompt_sha256": "312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a",
+    "limit": null,
+    "canonical_aliases_path": "tests/fixtures/write_triage_calibration.canonical_aliases.json",
+    "canonical_aliases_count": 3,
+    "cases_path": "calibration/write_triage_judge_arms/psi__gpt-6.2-sol.cases.jsonl",
+    "slate_mode": "retrieved",
+    "field_chars": 4000,
+    "record_count": 104,
+    "case_count": 84,
+    "candidate_count": 5,
+    "candidate_count_min": 5,
+    "distractor_count": null,
+    "distractor_count_requested": null,
+    "judge_candidate_count": 5,
+    "judge_enabled": true,
+    "project_id": "reify",
+    "t_high": 0.8868282526657318,
+    "t_low": 0.5229672433064231,
+    "candidate_k": 20,
+    "canonical_absent": 21,
+    "degraded_retrievals": 0,
+    "self_retrieved": 0
+  }
+}

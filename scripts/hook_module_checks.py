@@ -3,8 +3,8 @@
 
 Reads newline-separated staged paths on stdin and prints one ``<unit>\\t<command>``
 line per check: ``module:<prefix>:lint`` and ``module:<prefix>:type`` carry the
-registered module's own commands, verbatim, for every module the gate would
-execute for those paths; ``screen:<id>`` runs one scripts/merge_screen.yaml check
+registered module's own commands, verbatim, for every module whose lint or type
+leg the gate would execute for those paths; ``screen:<id>`` runs one scripts/merge_screen.yaml check
 when a staged path is one the whole-tree screen reads. ``root:type`` is the
 hook's own unit, pyright over every staged repo-root ``.py`` file: no registered
 module can own a repo-root path, so the gate's registry never lists it. Lint is
@@ -32,13 +32,13 @@ from orchestrator.verify_cmd import (
     render,
     scope_to,
 )
-from orchestrator.verify_evidence import module_leg_name
+from orchestrator.verify_evidence import Leg, module_leg_name
 from orchestrator.verify_plan import (
     FileKind,
     classify_file,
     derive_verify_plan,
     effective_merge_module_configs,
-    executed_module_prefixes,
+    planned_run_leg,
 )
 
 TOP_CONFIG = 'dark-factory-orchestrator.yaml'
@@ -84,7 +84,10 @@ def touched_modules(
     staged: list[str], registry: list[ModuleConfig], config: OrchestratorConfig,
 ) -> frozenset[str]:
     plan = derive_verify_plan(staged, registry, config, _read_checkout_file, role='task')
-    return executed_module_prefixes(plan)
+    return frozenset(
+        run.module_prefix for run in plan.runs
+        if run.cmd is not None and planned_run_leg(run) in (Leg.LINT, Leg.TYPE)
+    )
 
 
 def _require_dependency_modules(registry: list[ModuleConfig]) -> None:

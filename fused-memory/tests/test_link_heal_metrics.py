@@ -52,6 +52,7 @@ from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_metrics import (
     CONTRACT_METRICS,
     EVAL_ID,
+    SUMMARY_TTL,
     SUMMED_METRICS,
     THETA_SUMMARY_KEYS,
     SweepMetrics,
@@ -263,6 +264,21 @@ class TestTheSummary:
         assert summary['runs_7d'] == 4
         assert summary['run_days_7d'] == 3
 
+    def test_the_summary_expires_one_ttl_after_its_window_ends(self, tmp_path):
+        summary = summarize_series(tmp_path, now=NOW)
+
+        assert isinstance(summary['expires_at'], str)
+        expires_at = datetime.fromisoformat(summary['expires_at'])
+        assert expires_at.tzinfo is not None
+        assert expires_at == NOW + SUMMARY_TTL
+        assert summary['window']['until'] == format_stamp(NOW)
+
+    def test_the_ttl_outlives_one_nightly_interval_but_not_a_missed_night(self):
+        jitter = timedelta(minutes=5)
+        longest_night = timedelta(hours=25) + jitter
+        shortest_two_nights = timedelta(hours=23 + 24) - jitter
+        assert longest_night + timedelta(hours=2) < SUMMARY_TTL < shortest_two_nights
+
 
 #: The per-run metrics behind θ's keys: each _7d sum in THETA_KEYS, and the rate's two terms.
 CONTRACT_METRIC_IDS = (
@@ -377,10 +393,12 @@ class TestTheTarget:
         assert emitted.summary_path == root / EVAL_ID / 'summary.json'
         assert load_metric_series(emitted.metrics_path).eval_id == EVAL_ID
         assert emitted.unwritten is None
+        assert emitted.stale_summary_unremoved is None
         assert emitted.as_detail() == {
             'metrics_json': str(emitted.metrics_path),
             'summary_json': str(emitted.summary_path),
             'metrics_unwritten': None,
+            'stale_summary_unremoved': None,
         }
 
     def test_a_root_under_a_regular_file_is_reported_not_raised(self, tmp_path):
@@ -418,6 +436,7 @@ class TestTheTarget:
 
         assert emitted.unwritten is not None
         assert emitted.unwritten.startswith('JSONDecodeError')
+        assert emitted.stale_summary_unremoved is None
         assert not summary_path(root).exists()
 
     def test_a_series_that_cannot_be_written_removes_the_earlier_summary(self, tmp_path):
@@ -430,6 +449,22 @@ class TestTheTarget:
 
         assert emitted.unwritten is not None
         assert not summary_path(root).exists()
+
+    def test_a_stale_summary_that_cannot_be_removed_is_named_apart_from_the_write_failure(
+        self, tmp_path,
+    ):
+        root = tmp_path / 'memory-evals'
+        summary_path(root).mkdir(parents=True)
+
+        emitted = SweepMetricsTarget(root, DF).write(_view(_run(1)), NOW)
+
+        assert emitted.unwritten is not None
+        assert emitted.unwritten.startswith('IsADirectoryError')
+        assert 'stale summary' not in emitted.unwritten
+        assert isinstance(emitted.stale_summary_unremoved, str)
+        assert emitted.stale_summary_unremoved.startswith('IsADirectoryError')
+        assert emitted.as_detail()['stale_summary_unremoved'] == emitted.stale_summary_unremoved
+        assert summary_path(root).exists()
 
 
 @pytest_asyncio.fixture

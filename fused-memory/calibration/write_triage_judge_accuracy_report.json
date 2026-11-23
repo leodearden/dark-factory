@@ -2,8 +2,8 @@
   "per_class": {
     "duplicate": {
       "n": 75,
-      "correct": 43,
-      "accuracy": 0.5733
+      "correct": 39,
+      "accuracy": 0.52
     },
     "distinct": {
       "n": 3,
@@ -23,15 +23,15 @@
   },
   "confusion": {
     "duplicate": {
-      "amended": 26,
-      "contested": 29,
-      "restated": 17,
+      "amended": 30,
+      "contested": 33,
+      "restated": 9,
       "stored": 3
     },
     "distinct": {
-      "amended": 0,
+      "amended": 1,
       "contested": 0,
-      "restated": 3,
+      "restated": 2,
       "stored": 0
     },
     "pseudo_contradiction": {
@@ -48,10 +48,10 @@
     }
   },
   "duplicate_outcome_split": {
-    "restated": 17,
-    "amended": 26
+    "restated": 9,
+    "amended": 30
   },
-  "false_contested": 34,
+  "false_contested": 38,
   "production_shape": {
     "attach_outcomes": [
       "amended",
@@ -60,8 +60,8 @@
     ],
     "duplicate_attach": {
       "n": 75,
-      "strict": 19,
-      "strict_rate": 0.2533,
+      "strict": 18,
+      "strict_rate": 0.24,
       "any": 72,
       "any_rate": 0.96
     },
@@ -83,10 +83,10 @@
         {
           "memory_id": "62a73a82-8502-4500-8526-ea2908a8ba3c",
           "expected_class": "duplicate",
-          "outcome": "amended",
-          "attach_target_id": "74b9430a-0d0d-4991-b864-8811fef451e7",
+          "outcome": "contested",
+          "attach_target_id": "288805b3-c2e2-4af5-ade1-ef3968fb1b60",
           "attach_target_cluster_id": null,
-          "attach_target_category": "preferences_and_norms",
+          "attach_target_category": "observations_and_summaries",
           "attach_target_label": null
         },
         {
@@ -173,8 +173,8 @@
         {
           "memory_id": "0e46ec63-01c9-4505-a0c9-dcd3a003ad28",
           "expected_class": "duplicate",
-          "outcome": "restated",
-          "attach_target_id": "afac739c-844b-4359-af72-f1d6eb94c84b",
+          "outcome": "amended",
+          "attach_target_id": "f69a1c8f-8426-4231-92e2-a6bcc5d50bde",
           "attach_target_cluster_id": null,
           "attach_target_category": "observations_and_summaries",
           "attach_target_label": null
@@ -282,7 +282,7 @@
           "memory_id": "1a265e20-6e4d-4c7c-a1dd-cdf880c865e4",
           "expected_class": "duplicate",
           "outcome": "contested",
-          "attach_target_id": "44abf8dc-d271-4c9f-8845-cae0cded9600",
+          "attach_target_id": "0342741b-a4f5-4fb0-af2f-a212130d82e6",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
@@ -290,7 +290,7 @@
         {
           "memory_id": "80936e18-6a91-4b74-9bb8-cae79e6490b8",
           "expected_class": "duplicate",
-          "outcome": "restated",
+          "outcome": "contested",
           "attach_target_id": "44abf8dc-d271-4c9f-8845-cae0cded9600",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
@@ -299,7 +299,7 @@
         {
           "memory_id": "8110c809-04cf-4de8-9aad-1c2c00e25053",
           "expected_class": "duplicate",
-          "outcome": "restated",
+          "outcome": "amended",
           "attach_target_id": "c8a04039-a340-40e3-a21d-abbfad8b8031",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
@@ -326,8 +326,8 @@
         {
           "memory_id": "c77d25d9-70b0-44f4-a6fd-b00c7a63118b",
           "expected_class": "duplicate",
-          "outcome": "restated",
-          "attach_target_id": "876f3f44-f741-4c29-8ac3-745d46e9e6b9",
+          "outcome": "contested",
+          "attach_target_id": "14e71e7c-b1c5-4eac-80e6-24d502cbf376",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
@@ -335,7 +335,7 @@
         {
           "memory_id": "59390607-ece1-44a6-aea8-3b677d94ce40",
           "expected_class": "duplicate",
-          "outcome": "restated",
+          "outcome": "amended",
           "attach_target_id": "85996a13-1d05-46f7-aca3-33984306f37f",
           "attach_target_cluster_id": null,
           "attach_target_category": "preferences_and_norms",
@@ -435,16 +435,16 @@
           "memory_id": "d6cd4626-f249-4668-8e3c-156842ef1137",
           "expected_class": "duplicate",
           "outcome": "amended",
-          "attach_target_id": "8a14e8c8-4670-405d-ad9f-d4b936f98bb8",
+          "attach_target_id": "28b3f282-98f5-4e81-8af7-cd36306e8cfe",
           "attach_target_cluster_id": null,
-          "attach_target_category": null,
+          "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
         },
         {
           "memory_id": "669fadfa-48e0-46f9-b1e7-0e8d1cdaa628",
           "expected_class": "distinct",
-          "outcome": "restated",
-          "attach_target_id": "708d3470-6eaf-4198-9541-2c253f7554c6",
+          "outcome": "amended",
+          "attach_target_id": "d770a14f-00f8-42c6-88cf-f98392483a61",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
@@ -453,7 +453,7 @@
           "memory_id": "2b911b54-cd27-4a94-81f3-890926202be1",
           "expected_class": "duplicate",
           "outcome": "contested",
-          "attach_target_id": "f8286a29-df66-4c33-9fd8-d601cbd44fc3",
+          "attach_target_id": "7170adae-cfd2-478d-854d-16a27bb25e68",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
@@ -472,6 +472,15 @@
           "expected_class": "duplicate",
           "outcome": "amended",
           "attach_target_id": "7170adae-cfd2-478d-854d-16a27bb25e68",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "64564dd5-2c0d-4d0f-89e1-88d881da3d41",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "a5e8b6b4-10f5-4d43-8b7e-f0cadd54e7bb",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
@@ -499,15 +508,6 @@
           "expected_class": "duplicate",
           "outcome": "restated",
           "attach_target_id": "37bd1911-e2b0-4667-ac9f-33cf51bf59ef",
-          "attach_target_cluster_id": null,
-          "attach_target_category": "procedural_knowledge",
-          "attach_target_label": null
-        },
-        {
-          "memory_id": "c759c53b-9506-41d8-858f-fb882c7e297f",
-          "expected_class": "pseudo_contradiction",
-          "outcome": "restated",
-          "attach_target_id": "b0deef10-590a-493b-a4d4-10663748e29c",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
@@ -634,8 +634,8 @@
     },
     "middle_band": {
       "n": 73,
-      "correct": 34,
-      "accuracy": 0.4658
+      "correct": 33,
+      "accuracy": 0.4521
     },
     "canonical_in_slate": {
       "n": 84,
@@ -643,12 +643,53 @@
       "rate": 0.3333
     },
     "canonical_absent": 21,
-    "judge_calls": 73,
+    "judge_calls": 84,
     "judge_spend": {
-      "calls_with_usage": 73,
-      "prompt_tokens": 195134,
-      "completion_tokens": 5028,
-      "total_tokens": 200162
+      "calls_with_usage": 84,
+      "prompt_tokens": 252465,
+      "completion_tokens": 5166,
+      "total_tokens": 257631
+    }
+  },
+  "routing": {
+    "route_split": {
+      "duplicate": {
+        "restated": 0,
+        "judge": 75,
+        "stored": 0
+      },
+      "distinct": {
+        "restated": 0,
+        "judge": 3,
+        "stored": 0
+      },
+      "pseudo_contradiction": {
+        "restated": 0,
+        "judge": 6,
+        "stored": 0
+      },
+      "distractor": {
+        "restated": 0,
+        "judge": 0,
+        "stored": 0
+      }
+    },
+    "route_split_all": {
+      "restated": 0,
+      "judge": 84,
+      "stored": 0
+    },
+    "restate_band": {
+      "n": 11,
+      "judged": 11,
+      "verbatim": 0,
+      "correct": 7,
+      "accuracy": 0.6364
+    },
+    "judged": {
+      "n": 84,
+      "correct": 40,
+      "accuracy": 0.4762
     }
   },
   "contested_ground_truth": {
@@ -660,9 +701,9 @@
     "false_contested counts EVERY contested verdict, and every one of them is a false positive \u2014 see contested_ground_truth. A judge structurally incapable of ever answering `contested` would score identically to a perfect one here, so a low number is not evidence that the contradiction detector works.",
     "The duplicate class accepts BOTH `restated` and `amended`, because the curator's labels do not separate a verbatim restatement from a rediscovery carrying a novel fragment. The split between them is reported as a distribution and is not scored as error. NOT SCORED IS NOT THE SAME AS NOT CONSEQUENTIAL: `_TRIAGE_ATTACH_KINDS` in `server/tools.py` files a `restated` verdict as a SIGHTING, which `grouped_read` only counts, and an `amended` one as an AMENDMENT, whose text is digested into the canonical's grouped read. A swing between the two therefore changes what an operator reads while leaving every accuracy above unmoved, so read this split as a behaviour selector rather than as noise.",
     "There is NO distractor control class in this mode. A retrieved slate carrying no correct attach target is the ORDINARY case here rather than one this script constructs, so the control would measure nothing the population does not already show. `production_shape.canonical_in_slate` is the measured equivalent \u2014 the share of cases whose own canonical reached the prompt at all \u2014 and `canonical_absent` counts the cases whose canonical is no longer in the corpus. Those are KEPT in the population, because production meets them.",
-    "Every figure here is measured over the population production would actually route: the slate, the band winner and the band all come from a live retrieval through `retrieve_candidates` / `decide_band` / `select_judge_candidates` at this config's `candidate_k`, `t_high` and `t_low`, and the judge was asked ONLY for the middle band. So `per_class` MIXES bands \u2014 a deterministic `restated` and a below-floor `stored` are counted there without an LLM having seen the case \u2014 and `production_shape.middle_band` is the judge's own accuracy. A verdict that is correct for its curator label can still attach to ANOTHER RECORD, which `per_class` cannot show. `production_shape.duplicate_attach.strict` and `production_shape.wrong_record_attach` score `attach_target_id`, the record production files the write against. For a middle-band attach that is the candidate the judge NAMED, hoisted to its canonical (`judged_candidate_id`); otherwise it is the band winner (`band_winner_id`). So for the middle band `strict` is recall at `judge_candidate_count`, not at 1. An artifact from a judge that named no candidate (before task 5794) attached every judged write to the band winner, and its rows carry no `judged_candidate_id`.",
-    "Under the shipped `contests` definition \u2014 the entry says a candidate is wrong, outdated or different (Leo's ruling 2026-09-30, plans/write-triage-flip-readiness-prd.md \u00a711.3 C1'') \u2014 the judge answered `contested` on 5 of 6 pseudo_contradiction cases (of the 5 the judge saw); all outcomes: `amended` 0, `contested` 5, `restated` 1, `stored` 0. These records were adjudicated NOT contradictions under the EARLIER definition (\"cannot be true at the same time\"), and this report still scores `contested` on them as wrong and counts it in false_contested. The fixture is deliberately not relabelled, so this reports how the new definition reads them without asserting which reading is right.",
-    "The judge, `gpt-6.1-sol`, answered `contested` on 29 of 75 duplicate cases (of the 66 the judge saw). The curator labelled each duplicate the same claim as its canonical, so this report scores `contested` on one as wrong; with triage enabled, each is a write this judge would flag `contested` for a human to read. The `contests` definition was settled on a frontier reasoning judge: its live boundary test, fused-memory/tests/server/test_write_triage_judge.py::TestTheShippedWordingLive, pins one, because gpt-4o-mini answers that test's outdated cases `contested` under the earlier wording too. Where this judge is not the model that test pins, the figure measures the wording on a judge it was not settled on: read it beside a run on that model before deciding which judge the flip ships."
+    "Every figure here is measured over the population production would actually route: the slate, the band winner, the cosine band and the route all come from a live retrieval through `retrieve_candidates` / `decide_band` / `route_band` / `select_judge_candidates` at this config's `candidate_k`, `t_high` and `t_low`, and the judge was asked for every case `route_band` sends it: the [t_low, t_high) middle band, plus each restate-band write that does not repeat its band winner, or the winner's canonical, near-verbatim. So `per_class` MIXES routes \u2014 a near-verbatim `restated` and a below-floor `stored` are counted there without an LLM having seen the case. `routing.judged` is the judge's own accuracy; `production_shape.middle_band` is its accuracy on the cosine middle band, and `routing.restate_band` its accuracy on judged high-cosine writes. A verdict that is correct for its curator label can still attach to ANOTHER RECORD, which `per_class` cannot show. `production_shape.duplicate_attach.strict` and `production_shape.wrong_record_attach` score `attach_target_id`, the record production files the write against. For a judged attach that is the candidate the judge NAMED, hoisted to its canonical (`judged_candidate_id`); otherwise it is the band winner (`band_winner_id`). So for a judged write `strict` is recall at `judge_candidate_count`, not at 1. An artifact from a judge that named no candidate (before task 5794) attached every judged write to the band winner, and its rows carry no `judged_candidate_id`.",
+    "Under the shipped `contests` definition \u2014 the entry says a candidate is wrong, outdated or different (Leo's ruling 2026-09-30, plans/write-triage-flip-readiness-prd.md \u00a711.3 C1'') \u2014 the judge answered `contested` on 5 of 6 pseudo_contradiction cases (of the 6 the judge saw); all outcomes: `amended` 0, `contested` 5, `restated` 1, `stored` 0. These records were adjudicated NOT contradictions under the EARLIER definition (\"cannot be true at the same time\"), and this report still scores `contested` on them as wrong and counts it in false_contested. The fixture is deliberately not relabelled, so this reports how the new definition reads them without asserting which reading is right.",
+    "The judge, `gpt-6.1-sol`, answered `contested` on 33 of 75 duplicate cases (of the 75 the judge saw). The curator labelled each duplicate the same claim as its canonical, so this report scores `contested` on one as wrong; with triage enabled, each is a write this judge would flag `contested` for a human to read. The `contests` definition was settled on a frontier reasoning judge: its live boundary test, fused-memory/tests/server/test_write_triage_judge.py::TestTheShippedWordingLive, pins one, because gpt-4o-mini answers that test's outdated cases `contested` under the earlier wording too. Where this judge is not the model that test pins, the figure measures the wording on a judge it was not settled on: read it beside a run on that model before deciding which judge the flip ships."
   ],
   "provenance": {
     "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",

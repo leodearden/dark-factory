@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Stand-in for the PRD's cargo trampoline + primitive under `shared` policy (C4, C7), for gate α's
+# agent session only. CANON is already bound by the session's bwrap prefix; this starts a private
+# foreground sccache server on a unix socket in the build directory, runs the real cargo with the
+# cache environment, journals the server's counters, and stops the server.
+set -uo pipefail
+REAL="$HOME/.cargo/bin/cargo"
+[ -n "${ALPHA_NESTED:-}" ] && exec "$REAL" "$@"
+case "$(pwd -P)/" in "$ALPHA_CANON"/*) ;; *) exec "$REAL" "$@" ;; esac
+# shellcheck disable=SC1090
+. "$ALPHA_STORE_ENV"
+sock="$ALPHA_CANON/target/.reify-sccache.$$.sock"
+mkdir -p "$ALPHA_CANON/target" "$ALPHA_FALLBACK"
+( exec env -u SCCACHE_DIR SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1 SCCACHE_IDLE_TIMEOUT=0 SCCACHE_SERVER_UDS="$sock" \
+    SCCACHE_WEBDAV_ENDPOINT="$ALPHA_STORE_URL" SCCACHE_WEBDAV_KEY_PREFIX=alpha \
+    SCCACHE_WEBDAV_USERNAME="$ALPHA_STORE_USER" SCCACHE_WEBDAV_PASSWORD="$ALPHA_STORE_PASS" sccache ) \
+    </dev/null >/dev/null 2>"$ALPHA_FALLBACK/server.$$.err" &
+spid=$!
+for _ in $(seq 1 600); do [ -S "$sock" ] && break; kill -0 "$spid" 2>/dev/null || break; sleep 0.1; done
+[ -S "$sock" ] || { echo "alpha trampoline: sccache server did not start: $(tail -2 "$ALPHA_FALLBACK/server.$$.err")" >&2; exit 126; }
+t0=$(date +%s.%N)
+ALPHA_NESTED=1 PWD="$(pwd -P)" SCCACHE_SERVER_UDS="$sock" SCCACHE_DIR="$ALPHA_FALLBACK" SCCACHE_IDLE_TIMEOUT=1800 \
+    RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 "$REAL" "$@"
+rc=$?
+stats="$(SCCACHE_SERVER_UDS="$sock" sccache --show-stats --stats-format json 2>/dev/null)"
+SCCACHE_SERVER_UDS="$sock" sccache --stop-server >/dev/null 2>&1
+wait "$spid" 2>/dev/null; rm -f "$sock"
+python3 -I - "$rc" "$t0" "$*" "$stats" "$(grep -c 'storage write check failed' "$ALPHA_FALLBACK/server.$$.err")" >>"$ALPHA_JOURNAL" <<'PY'
+import json, sys, time
+rc, t0, args, raw, ro = sys.argv[1:6]
+try:
+    st = json.loads(raw)['stats']
+    c = lambda v: v['counts']
+    row = {'hits': c(st['cache_hits']), 'misses': c(st['cache_misses']), 'writes': st['cache_writes'],
+           'write_errors': st['cache_write_errors'], 'not_cached': st['not_cached']}
+except Exception as e:
+    row = {'stats_error': str(e)}
+print(json.dumps({'args': args, 'rc': int(rc), 'wall_secs': round(time.time() - float(t0), 1),
+                  'readonly_server': ro != '0', **row}))
+PY
+exit "$rc"
