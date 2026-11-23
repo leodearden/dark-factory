@@ -13,11 +13,11 @@
 # Invariant: a dir carrying .ready has answered `gate-identity` for $SHA through
 # its own binary. Builds happen in place (a moved uv venv is dead: its shebangs and
 # editable .pth entries are absolute) under a per-sha build lock; after .ready
-# nothing writes into the dir. A failed run unlinks the build lock it holds; as a
-# holder may unlink it, a lock is held only once fd 9 is still the file at the
-# lock path. stdout carries only the final JSON line; every diagnostic goes to
-# stderr. Exit status 255 is the ssh client's own failure
-# (remote_gate.py::classify_remote_exit), so this script never exits 255.
+# nothing writes into the dir. A failed run unlinks the build lock it holds, by
+# the build lock protocol in reap-gates.sh's header. stdout carries only the
+# final JSON line; every diagnostic goes to stderr. Exit status 255 is the ssh
+# client's own failure (remote_gate.py::classify_remote_exit), so this script
+# never exits 255.
 set -euo pipefail
 
 lock_held=false

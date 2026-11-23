@@ -9,10 +9,15 @@
 # are exactly 40 hex digits or start with .trash-. A sha dir is reaped under its
 # build lock (never while ensure-gate.sh builds or touches it), is renamed to
 # trash first so an interrupted reap never leaves a half-dir at a sha path, and
-# is aged by its mtime, which every ensure refreshes. A sha's build lock is
-# unlinked together with its dir, under that lock, and only after checking that
-# fd 9 is still the file at the lock path. No lock is aged, so a held lock is
-# never unlinked.
+# is aged by its mtime, which every ensure refreshes.
+#
+# Build lock protocol, binding on every locker of $GATE_ROOT/.build-<sha>.lock
+# (this script, ensure-gate.sh and any future one): this script unlinks a reaped
+# sha's lock and ensure-gate.sh unlinks its lock when it fails, each under that
+# lock. So a locker holds the lock only once a re-check after flock finds fd 9
+# still the file at the lock path; one that finds it replaced retakes it
+# (ensure-gate.sh) or skips the sha (here). Only that verified holder unlinks a
+# lock, and no lock is aged, so a lock another process holds is never unlinked.
 set -euo pipefail
 
 [[ ${GATE_ROOT:-} == /* ]] || {
