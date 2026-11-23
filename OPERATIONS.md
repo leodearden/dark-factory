@@ -2415,7 +2415,12 @@ takes no arguments: it always re-reads that process's own
   `tests/scripts/test_merge_gate_history_leg.py::test_every_test_file_importing_a_history_helper_is_accounted_for`
   on an unmarked test file importing a history-reading helper, and
   `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
-  keeps the leg's segments on the packages that own marked tests. Green-tier
+  keeps the leg's segments on the packages that own marked tests. Every
+  module's `lint_command` also runs `tests/scripts/git_history_census.py` over
+  that module's gate test roots, so an unaccounted history reader fails at
+  task verify and in the pre-commit hook rather than first at the merge gate;
+  the throwaway-repo registry now lives at
+  `tests/scripts/git_history_census.py::READS_ONLY_THROWAWAY_REPOS`. Green-tier
   for the same reason as `merge_gate_history_pure`.
 - `merge_deep.*`, including `chain_cap` and `depth_table` (deep merge-ahead
   chains — see
