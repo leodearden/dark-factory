@@ -5570,8 +5570,7 @@ async def test_run_full_cycle_cancellation_records_traceback_and_sqlite_classifi
     journal, event_buffer, mock_memory_service,
 ):
     """A cancelled full cycle records the same failure evidence as the
-    remediation pass, so a consumer can index the sqlite keys on any failed
-    row."""
+    remediation pass, traceback and sqlite classification included."""
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     await event_buffer.push(_make_event())
     stage_entered = asyncio.Event()
