@@ -6,7 +6,12 @@ import dataclasses
 
 import pytest
 
-from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
+from orchestrator.agents.token_pricing import (
+    FALLBACK_PRICE,
+    TokenUsage,
+    price_fields,
+    price_tokens,
+)
 from orchestrator.config import PriceEntry
 
 # Measured counts of eval cell endpoint__46074e01 (a glm-5.3 workflow run).
@@ -81,6 +86,25 @@ class TestPriceTokens:
         assert priced.cost_usd == pytest.approx(
             ((100 + 1_000 + 500) * input_rate + 10 * FALLBACK_PRICE['output_per_1m']) / 1e6,
         )
+
+
+class TestPriceFields:
+    def test_set_cache_rates_join_input_and_output(self, entry_shape):
+        assert price_fields(entry_shape(GLM_RATES)) == GLM_RATES
+
+    def test_unset_cache_rates_are_omitted(self, entry_shape):
+        rates = {'input_per_1m': 1.0, 'output_per_1m': 4.0, 'cached_input_per_1m': 0.1}
+
+        assert price_fields(entry_shape(rates)) == rates
+
+
+class TestTokenUsageCountsAreNonNegative:
+    @pytest.mark.parametrize('field', [
+        'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_create_tokens',
+    ])
+    def test_a_negative_count_is_rejected_naming_the_field_and_value(self, field):
+        with pytest.raises(ValueError, match=rf'TokenUsage\.{field} must be non-negative, got -1'):
+            TokenUsage(**{field: -1})
 
 
 class TestValuesAreFrozen:

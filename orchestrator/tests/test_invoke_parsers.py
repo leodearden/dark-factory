@@ -23,6 +23,7 @@ from orchestrator.agents.invoke import (
     _warn_if_argv_near_arg_max,
     _write_pi_mcp_config,
 )
+from orchestrator.agents.token_pricing import TokenUsage, price_tokens
 from orchestrator.config import PriceEntry
 
 
@@ -282,6 +283,25 @@ class TestEstimateCostCachedInput:
 
         # FALLBACK_PRICE has no cached rate: (300 * 2.0 + 100 * 8.0) / 1e6
         assert cost == pytest.approx((300 * 2.0 + 100 * 8.0) / 1_000_000)
+
+
+class TestEstimateCostPricesThroughTheSharedFormula:
+    """The runtime estimator prices through agents.token_pricing.price_tokens,
+    the formula eval pricing uses too, so the two cannot drift apart again."""
+
+    @pytest.mark.parametrize('entry', [
+        {'input_per_1m': 1.40, 'output_per_1m': 4.40, 'cached_input_per_1m': 0.26},
+        {'input_per_1m': 1.40, 'output_per_1m': 4.40},
+    ], ids=['with_cached_rate', 'without_cached_rate'])
+    def test_estimate_cost_agrees_with_price_tokens(self, entry):
+        uncached, cached, out = 1_193, 1_370_402, 12_537
+
+        estimated = _estimate_cost(
+            'm', uncached + cached, out, {'m': entry}, cached_input_tokens=cached,
+        )
+
+        usage = TokenUsage(input_tokens=uncached, output_tokens=out, cache_read_tokens=cached)
+        assert estimated == price_tokens(entry, usage).cost_usd
 
 
 # Measured verbatim from codex-cli 0.154.0 on 2026-09-11, carried by both an

@@ -137,6 +137,16 @@ class ArchitectUsage:
     turns: int = 0
     duration_ms: int = 0
 
+    @property
+    def tokens(self) -> TokenUsage:
+        """The four token counts, as the pricing formula takes them."""
+        return TokenUsage(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cache_create_tokens=self.cache_create_tokens,
+        )
+
     @classmethod
     def of(cls, result: AgentResult) -> ArchitectUsage:
         """The last attempt's usage; a provider that did not report one counts 0."""
@@ -430,12 +440,7 @@ def _architect_cost(
     is_local_model: bool,
 ) -> tuple[float, str]:
     """The architect component's ``(cost_usd, cost_source)`` per Invariant P5."""
-    tokens = TokenUsage(
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        cache_read_tokens=usage.cache_read_tokens,
-        cache_create_tokens=usage.cache_create_tokens,
-    )
+    tokens = usage.tokens
     if tokens == TokenUsage() and not spent_usd:
         return 0.0, 'cli'
     return resolve_cost_usd(

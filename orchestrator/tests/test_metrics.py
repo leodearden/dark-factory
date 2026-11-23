@@ -357,25 +357,6 @@ class TestResolveCostUsd:
         assert source == 'unpriced_proxy'
         assert cost == pytest.approx(price_tokens(FALLBACK_PRICE, self._MEASURED_USAGE).cost_usd)
 
-    def test_agrees_with_the_runtime_estimator(self):
-        from orchestrator.agents.invoke import _estimate_cost
-        from orchestrator.evals.metrics import resolve_cost_usd
-
-        entry = {'input_per_1m': 1.40, 'output_per_1m': 4.40, 'cached_input_per_1m': 0.26}
-        uncached, cached, out = 1_193, 1_370_402, 12_537
-
-        cost, _ = resolve_cost_usd(
-            TokenUsage(input_tokens=uncached, output_tokens=out, cache_read_tokens=cached),
-            model='m',
-            prices={'m': entry},
-            cli_cost_usd=0.0,
-            is_local_model=True,
-        )
-
-        assert cost == _estimate_cost(
-            'm', uncached + cached, out, {'m': entry}, cached_input_tokens=cached,
-        )
-
 
 class TestComposeCostSource:
     """Task 3656: collapse a TWO-COMPONENT cost sum's provenance to ONE label.
@@ -462,8 +443,7 @@ class TestIsProxiedEndpoint:
 
     def test_runner_uses_the_metrics_singleton(self):
         """Identity, not mere equality — a re-declared local copy in runner.py
-        (the price-table seeding site) would fail this. It is the same single-home
-        rule ``TestCostFormulaSingleHome`` holds for the cost formula."""
+        (the price-table seeding site) would fail this."""
         from orchestrator.evals import metrics, runner
 
         assert runner.is_proxied_endpoint is metrics.is_proxied_endpoint
@@ -647,25 +627,3 @@ class TestBlendComposite:
         assert blend_composite(
             0.9, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=False,
         ) == pytest.approx(0.94, abs=1e-4)
-
-
-class TestCostFormulaSingleHome:
-    """The runtime estimator and the eval resolver price through ONE formula,
-    agents.token_pricing.price_tokens, so the two cannot drift apart again."""
-
-    @pytest.mark.parametrize('entry', [
-        {'input_per_1m': 1.40, 'output_per_1m': 4.40, 'cached_input_per_1m': 0.26},
-        {'input_per_1m': 1.40, 'output_per_1m': 4.40},
-    ], ids=['with_cached_rate', 'without_cached_rate'])
-    def test_estimate_cost_agrees_with_price_tokens(self, entry):
-        from orchestrator.agents.invoke import _estimate_cost
-        from orchestrator.agents.token_pricing import TokenUsage, price_tokens
-
-        uncached, cached, out = 1_193, 1_370_402, 12_537
-
-        estimated = _estimate_cost(
-            'm', uncached + cached, out, {'m': entry}, cached_input_tokens=cached,
-        )
-
-        usage = TokenUsage(input_tokens=uncached, output_tokens=out, cache_read_tokens=cached)
-        assert estimated == price_tokens(entry, usage).cost_usd

@@ -16,6 +16,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
+from orchestrator.agents.token_pricing import price_fields
 from orchestrator.config import default_price_table
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.shadow_types import CostBasis
@@ -834,15 +835,7 @@ class CandidateEndpointPrice:
 
     def rates(self) -> dict[str, float]:
         """The PriceEntry-shaped rates, omitting every unset cache rate."""
-        optional = {
-            'cached_input_per_1m': self.cached_input_per_1m,
-            'cache_write_per_1m': self.cache_write_per_1m,
-        }
-        return {
-            'input_per_1m': self.input_per_1m,
-            'output_per_1m': self.output_per_1m,
-            **{key: value for key, value in optional.items() if value is not None},
-        }
+        return price_fields(self)
 
 
 # List rates from the 2026-09-10 live market check (task 5384). Keyed EXACTLY

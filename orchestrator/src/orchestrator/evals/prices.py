@@ -7,11 +7,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from orchestrator.agents.token_pricing import optional_rate, rate
+from orchestrator.agents.token_pricing import CACHE_RATE_KEYS, price_fields
 
 from .table_render import render_fixed_table
-
-_CACHE_RATE_KEYS = ('cached_input_per_1m', 'cache_write_per_1m')
 
 
 def _price_role_entry(model: str, prices: dict[str, Any] | None) -> dict[str, Any]:
@@ -25,12 +23,7 @@ def _price_role_entry(model: str, prices: dict[str, Any] | None) -> dict[str, An
     entry = prices.get(model) if prices else None
     if entry is None:
         return {'source': 'unpriced'}
-    cache_rates = {key: optional_rate(entry, key) for key in _CACHE_RATE_KEYS}
-    return {
-        'input_per_1m': rate(entry, 'input_per_1m'),
-        'output_per_1m': rate(entry, 'output_per_1m'),
-        **{key: value for key, value in cache_rates.items() if value is not None},
-    }
+    return price_fields(entry)
 
 
 def build_price_table(
@@ -40,7 +33,7 @@ def build_price_table(
 
     Each config's ``model`` is looked up in *prices* (a ``config.prices``-shaped
     map; ``PriceEntry`` objects and plain ``{'input_per_1m','output_per_1m'}``
-    dicts are both accepted via ``agents.token_pricing.rate``). A listed model
+    dicts are both accepted via ``agents.token_pricing.price_fields``). A listed model
     yields ``{role: {'input_per_1m', 'output_per_1m'}}`` plus whichever of
     ``cached_input_per_1m`` / ``cache_write_per_1m`` it sets; an UNLISTED model
     yields the explicit ``{role: {'source': 'unpriced'}}`` marker — never a
@@ -77,7 +70,7 @@ def build_pairwise_price_table(
     return table
 
 
-_RATE_COLUMNS = ('input_per_1m', 'output_per_1m', *_CACHE_RATE_KEYS)
+_RATE_COLUMNS = ('input_per_1m', 'output_per_1m', *CACHE_RATE_KEYS)
 _PRICE_TABLE_COLUMNS = ('config', 'role', *_RATE_COLUMNS)
 
 

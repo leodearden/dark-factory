@@ -97,7 +97,8 @@ class EvalMetrics:
     # first four are what :func:`resolve_cost_usd` resolves for a SINGLE
     # invocation's spend. 'price_table_no_cache_rate' is a listed model whose
     # entry lacks a cache rate its tokens needed: the figure prices those cache
-    # tokens at input_per_1m, an upper bound.
+    # tokens at input_per_1m in place of the missing rate, which over-states
+    # cache reads and under-states a provider's surcharged cache writes.
     # 'mixed' is producible only by the ARCHITECT path, whose cost_usd is a
     # TWO-COMPONENT sum (architect spend + plan-judge spend): when those two
     # components' sources disagree, :func:`compose_cost_source` says so rather
@@ -693,7 +694,8 @@ def resolve_cost_usd(
       (proxy-untrustworthy) CLI number.
     - **price_table_no_cache_rate** — listed, but the entry lacks a cache rate
       that nonzero cache tokens needed. Those tokens are priced at
-      input_per_1m, an upper bound, and a WARNING names the missing keys.
+      input_per_1m in place of the missing rate, and a WARNING names the
+      missing keys.
     - **cli** — a NATIVE cloud endpoint (``is_local_model=False``) whose model
       is unlisted: the CLI's own ``cli_cost_usd`` is trustworthy for the real
       Anthropic API, so it is used verbatim.
@@ -714,7 +716,8 @@ def resolve_cost_usd(
             return priced.cost_usd, 'price_table'
         logger.warning(
             'Price entry for model %r has no %s; its cache tokens were priced '
-            'at input_per_1m, an upper bound (add the rate to config.prices to silence)',
+            'at input_per_1m in place of the missing rate (add the rate to '
+            'config.prices to silence)',
             model, ', '.join(sorted(priced.defaulted_rates)),
         )
         return priced.cost_usd, 'price_table_no_cache_rate'
