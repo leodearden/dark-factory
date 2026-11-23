@@ -7,13 +7,15 @@ scheduler dispatches it ahead of the tier-scored queue (task 11330).
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import Any, TypeVar
 
 from shared.pure_gate_provenance import is_pure_gate_shape
 
 from orchestrator.id_tie_break import id_tie_break
 
 __all__ = ['is_timed_gate', 'timed_gates']
+
+_TaskT = TypeVar('_TaskT', bound=Mapping[str, Any])
 
 
 def is_timed_gate(task: Mapping[str, Any]) -> bool:
@@ -26,7 +28,7 @@ def is_timed_gate(task: Mapping[str, Any]) -> bool:
     return is_pure_gate_shape(metadata) or _is_predicate(metadata.get('before_done'))
 
 
-def timed_gates(tasks: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+def timed_gates(tasks: Iterable[_TaskT]) -> list[_TaskT]:
     """The timed gates among *tasks*, oldest id first."""
     return sorted(
         (task for task in tasks if is_timed_gate(task)),
