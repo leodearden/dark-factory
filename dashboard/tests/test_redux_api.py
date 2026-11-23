@@ -17,7 +17,7 @@ from dashboard.data.datum import (
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.label_spans import labels_from_spans
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
-from dashboard.data.merge_queue import MergeAttempts, TrainThroughput
+from dashboard.data.merge_queue import MergeAttempts, TrainThroughput, trailing_landing_rates
 from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.project_labels import ProjectLabels
@@ -696,7 +696,9 @@ _MQ_MEASURED_QUEUE = {
     'depth_timeseries': _mq_read({'labels': [], 'values': []}),
     'attempts': _mq_read(MergeAttempts()),
     'train_throughput': _mq_read(_MQ_ZERO_THROUGHPUT),
-    'landing_rate': _mq_read({'labels': [], 'values': [], 'trailing_minutes': 1440}),
+    'landing_rate': _mq_read({
+        'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }),
 }
 """The queue fields the route resolves for every project: here, a measured empty queue."""
 
@@ -747,21 +749,44 @@ def test_shape_merge_queue_serves_an_unread_depth_as_unknown():
 
 def test_shape_merge_queue_serves_the_landing_rate_with_leading_zero_points_trimmed():
     """Leading zero points are dropped; an interior zero is a measured lull and stays."""
-    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 2.0, 0, 1.5], 'trailing_minutes': 1440}
+    series = {
+        'labels': ['a', 'b', 'c', 'd'], 'values': [0, 2.0, 0, 1.5],
+        'trailing_minutes': 1440, 'window_mean_per_day': 0.5,
+    }
 
     rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
 
     assert rate['state'] == 'fresh'
-    assert rate['value'] == {'labels': ['b', 'c', 'd'], 'values': [2.0, 0, 1.5], 'trailing_minutes': 1440}
+    assert rate['value'] == {
+        'labels': ['b', 'c', 'd'], 'values': [2.0, 0, 1.5],
+        'trailing_minutes': 1440, 'window_mean_per_day': 0.5,
+    }
+
+
+def test_shape_merge_queue_serves_a_trimmed_landing_rates_window_mean_as_landings_per_window_day():
+    """The served mean counts the whole window, not the points left after the leading-zero trim."""
+    now = MQ_SERVED_AT
+    series = trailing_landing_rates(
+        [now - timedelta(hours=49), now - timedelta(hours=1)], now=now, hours=168,
+    )
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert len(rate['value']['labels']) < len(series['labels'])
+    assert rate['value']['window_mean_per_day'] == pytest.approx(2 / 7)
 
 
 def test_shape_merge_queue_serves_a_never_landed_window_as_a_measured_empty_rate():
-    series = {'labels': ['a', 'b'], 'values': [0, 0], 'trailing_minutes': 1440}
+    series = {
+        'labels': ['a', 'b'], 'values': [0, 0], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }
 
     rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
 
     assert rate['state'] == 'fresh'
-    assert rate['value'] == {'labels': [], 'values': [], 'trailing_minutes': 1440}
+    assert rate['value'] == {
+        'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }
 
 
 def test_shape_merge_queue_serves_an_unread_landing_rate_as_unknown():
@@ -2258,7 +2283,9 @@ class TestShapeMergeQueueServedDatums:
         ('depth_timeseries', 'depth', {'labels': [], 'values': []}),
         ('attempts', 'attempts', MergeAttempts()),
         ('train_throughput', 'train_throughput', {}),
-        ('landing_rate', 'landing_rate', {'labels': [], 'values': [], 'trailing_minutes': 1440}),
+        ('landing_rate', 'landing_rate', {
+            'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+        }),
     ])
     def test_a_bare_value_is_a_wiring_bug(self, raw_key, wire_name, bare):
         with pytest.raises(DatumContractError) as excinfo:

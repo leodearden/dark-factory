@@ -371,7 +371,8 @@ def _measured_merge_queue(depth: int) -> dict:
         'attempts': Datum(MergeAttempts(), _NOW, DatumState.FRESH, None, 30),
         'train_throughput': Datum({}, _NOW, DatumState.FRESH, None, 30),
         'landing_rate': Datum(
-            {'labels': [], 'values': [], 'trailing_minutes': 1440}, _NOW, DatumState.FRESH, None, 30,
+            {'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0},
+            _NOW, DatumState.FRESH, None, 30,
         ),
         'recent': [],
         'active': [],

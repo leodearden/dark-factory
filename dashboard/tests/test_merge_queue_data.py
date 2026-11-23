@@ -723,6 +723,39 @@ class TestTrailingLandingRates:
         assert series['values'][-1] == 1.0
         assert _rate_at(series, RATE_NOW - trailing) == 1.0
 
+    def test_the_window_mean_is_per_day_of_the_window_not_an_average_of_points(self):
+        landed = [RATE_NOW - timedelta(hours=49), RATE_NOW - timedelta(hours=1)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=168)
+
+        assert series['window_mean_per_day'] == pytest.approx(2 / 7)
+        assert series['values'][0] == 0
+
+    def test_a_landing_in_the_trailing_lead_in_is_outside_the_window_mean(self):
+        landed = [RATE_NOW - timedelta(hours=24 + 12)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['values'][0] == 1.0
+        assert series['window_mean_per_day'] == 0
+
+    def test_the_window_mean_counts_the_half_open_window_ending_now(self):
+        landed = [RATE_NOW - timedelta(hours=24), RATE_NOW]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['window_mean_per_day'] == 1.0
+
+    def test_the_window_mean_is_served_unrounded(self):
+        landed = [RATE_NOW - timedelta(hours=63 - 7 * k) for k in range(10)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=720)
+
+        assert series['window_mean_per_day'] == pytest.approx(10 / 30)
+
+    def test_a_window_with_no_landings_has_a_zero_mean(self):
+        assert trailing_landing_rates((), now=RATE_NOW, hours=24)['window_mean_per_day'] == 0
+
 
 # ---------------------------------------------------------------------------
 # TestLandingRate — the runs.db leg behind the throughput panel
@@ -750,6 +783,7 @@ class TestLandingRate:
         series = fresh_read(await landing_rate(root, hours=24, now=RATE_NOW), RATE_NOW)
 
         assert series['values'][-1] == 4.0
+        assert series['window_mean_per_day'] == 4.0
         assert series['trailing_minutes'] == 1440
 
     async def test_no_open_runs_db_is_unknown(self):

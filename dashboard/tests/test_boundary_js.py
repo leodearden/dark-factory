@@ -341,6 +341,7 @@ def test_the_served_landing_rate_is_a_trailing_rate_ending_at_the_request_instan
         timedelta(minutes=bucket_minutes),
     }
     assert series['values'][-1] == 2.0, 'the done merges at 2h and 20h land within the day before T0'
+    assert series['window_mean_per_day'] == pytest.approx({'24h': 2.0, '7d': 4 / 7}[window])
 
 
 @pytest.mark.parametrize('generation', sorted(CORPUS_TTL_GENERATIONS))
