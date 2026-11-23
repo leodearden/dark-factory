@@ -4636,7 +4636,7 @@ start, not a data loss.
 |---|---|
 | R-cache-1 (2026-09-19), R-cache-2 (2026-11-14) | Rulings; text in the PRD § "Pre-conditions for activating" |
 | Task 5294 (duplicate pyright leg) | Closed as superseded by γ (task 5653) by the operator at γ's landing; γ's unscoped-typecheck consult is its dedupe |
-| Task 5410 (task-leg disjoint-rebase skip) | Stays until the per-test tier lands. The per-test tier (ζ2) subsumes its predicate, so 5410 retires once ζ2 lands. Its own 14-day log window is unchanged. The `details` append on the task record is an operator action |
+| Task 5410 (task-leg disjoint-rebase skip) | Cancelled 2026-10-09 (Leo) as superseded: task 6580 removed the merge-phase verify it targeted, and its predicate never fired (0/40 DF, 0/20 reify). The per-test tier (task 5657, ζ2) remains the long-run owner of green reuse. No retirement action remains; the reasoning is in task 5410's `details` |
 
 ---
 
