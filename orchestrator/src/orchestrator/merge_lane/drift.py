@@ -210,7 +210,7 @@ async def _try_acquire_drift_hosts(
 
     The local lease claims the slot with no runner yet: the local leg's runner
     needs its worktree, which is built only once both slots are held (see
-    :meth:`_HeldHostLeases.seat`), so a deferral costs no git work.
+    :meth:`_HeldHostLeases.seat`), so a busy-slot deferral costs no git work.
     """
     remote = allocator.acquire_remote()
     if remote is None:
@@ -242,16 +242,29 @@ async def _acquire_drift_hosts(
 
 
 class DriftDeferralCause(Enum):
-    """Why a due drift check never ran its legs."""
+    """Why a due drift check never ran its legs; ``text`` is how its log line says so."""
 
-    HOST_SLOTS_BUSY = 'host_slots_busy'
-    NO_WARM_LANE = 'no_warm_lane'
+    HOST_SLOTS_BUSY = ('host_slots_busy', 'host slots stayed busy')
+    NO_WARM_LANE = ('no_warm_lane', 'no warm lane could be seeded')
+
+    text: str
+
+    def __new__(cls, value: str, text: str) -> DriftDeferralCause:
+        member = object.__new__(cls)
+        member._value_ = value
+        member.text = text
+        return member
 
 
-_DEFERRAL_LOG_TEXT = {
-    DriftDeferralCause.HOST_SLOTS_BUSY: 'host slots stayed busy',
-    DriftDeferralCause.NO_WARM_LANE: 'no warm lane could be seeded',
-}
+@dataclass(frozen=True)
+class _DriftDeferral:
+    """A due drift check that never ran its legs: its cause, and what the cause reported."""
+
+    cause: DriftDeferralCause
+    detail: str | None = None
+
+    def describe(self) -> str:
+        return self.cause.text if self.detail is None else f'{self.cause.text} ({self.detail})'
 
 
 def _report_drift_deferral(
@@ -259,7 +272,7 @@ def _report_drift_deferral(
     req: MergeRequest,
     merge_commit: str,
     allocator: HostAllocator,
-    cause: DriftDeferralCause,
+    deferral: _DriftDeferral,
     consecutive: int,
 ) -> None:
     """Log the deferral (INFO for the first of a run, DEBUG after) and emit its event."""
@@ -268,7 +281,7 @@ def _report_drift_deferral(
         logging.INFO if consecutive == 1 else logging.DEBUG,
         'Drift check deferred for task %s / commit %s: %s '
         '(%d consecutive deferral(s)); re-armed for the next landing. Hosts: %s',
-        req.task_id, merge_commit, _DEFERRAL_LOG_TEXT[cause], consecutive, hosts,
+        req.task_id, merge_commit, deferral.describe(), consecutive, hosts,
     )
     if event_store is not None:
         event_store.emit(
@@ -278,7 +291,8 @@ def _report_drift_deferral(
                 'merge_sha': merge_commit,
                 'consecutive_deferrals': consecutive,
                 'hosts': hosts,
-                'cause': cause.value,
+                'cause': deferral.cause.value,
+                'detail': deferral.detail,
             },
         )
 
@@ -370,11 +384,11 @@ async def _run_drift_check_once(
     state_path: Path | None,
     host_settle_secs: float,
     host_poll_secs: float,
-) -> DriftDeferralCause | None:
+) -> _DriftDeferral | None:
     """Acquire both host slots and the local leg's lane, then run both legs.
 
-    Returns why the check deferred, or None once its legs ran.  Every slot it
-    took is released before it returns.
+    Returns the deferral when the check never ran its legs, or None once they
+    ran.  Every slot it took is released before it returns.
     """
     held = _HeldHostLeases(allocator)
     try:
@@ -382,7 +396,7 @@ async def _run_drift_check_once(
             allocator, settle_secs=host_settle_secs, poll_secs=host_poll_secs,
         )
         if leases is None:
-            return DriftDeferralCause.HOST_SLOTS_BUSY
+            return _DriftDeferral(DriftDeferralCause.HOST_SLOTS_BUSY)
         held.hold(*leases)
         async with drift_check_lane(git_ops, merge_commit) as wt:
             _report_drift_start(req, merge_commit, _record_drift_start(state_path))
@@ -392,8 +406,7 @@ async def _run_drift_check_once(
                 verifier=verifier, on_unavailable=on_unavailable,
             )
     except WarmSeedUnavailable as unseeded:
-        logger.debug('Drift check for task %s: %s', req.task_id, unseeded)
-        return DriftDeferralCause.NO_WARM_LANE
+        return _DriftDeferral(DriftDeferralCause.NO_WARM_LANE, str(unseeded))
     finally:
         await held.release_remaining()
     return None
@@ -432,9 +445,9 @@ async def _run_drift_check(
     check DEFERS, running no leg, when the slots never come free or, where a
     pool is configured, no warm lane can be seeded (a deferral there builds no
     cold tree): it records the deferral in *state_path* and emits
-    ``drift_check_deferred`` naming its :class:`DriftDeferralCause`, after its
-    slots are released.  Exceptions are caught and logged so this detective
-    control never crashes the worker.
+    ``drift_check_deferred`` naming its :class:`DriftDeferralCause` and that
+    cause's detail, after its slots are released.  Exceptions are caught and
+    logged so this detective control never crashes the worker.
 
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
@@ -456,15 +469,15 @@ async def _run_drift_check(
         host_poll_secs: How often to retry the slots while waiting.
     """
     try:
-        cause = await _run_drift_check_once(
+        deferral = await _run_drift_check_once(
             git_ops, req, merge_commit, escalation_queue, event_store, quarantine,
             verifier=verifier, allocator=allocator, on_unavailable=on_unavailable,
             state_path=state_path,
             host_settle_secs=host_settle_secs, host_poll_secs=host_poll_secs,
         )
-        if cause is not None:
+        if deferral is not None:
             _report_drift_deferral(
-                event_store, req, merge_commit, allocator, cause,
+                event_store, req, merge_commit, allocator, deferral,
                 _record_drift_deferral(state_path),
             )
     except Exception:

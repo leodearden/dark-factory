@@ -26,13 +26,14 @@ from typing import Generic, TypeVar
 from unittest.mock import patch
 
 import pytest
+from _drift_lanes import registered_drift_lanes
+from _lane_test_helpers import get_head
 from _seed_script_stubs import (
     CURRENT_LOCKING_SEED_SCRIPT,
     commit_seed_script,
     make_seed_test_repo,
     warm_pool_git_config,
 )
-from _worktree_registrations import registered_worktree_paths
 from shared.proc_group import cpu_ticks_under_path
 
 from orchestrator.config import GitConfig
@@ -41,7 +42,6 @@ from orchestrator.git_ops import (
     GitOps,
     WarmSeedUnavailable,
     WorktreeKind,
-    _run,
 )
 from orchestrator.merge_lane.liveness import (
     VerifyProgressWatch,
@@ -447,12 +447,6 @@ _NO_POOL_GIT_CONFIG = GitConfig(
 )
 
 
-async def _head(repo: Path) -> str:
-    rc, out, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
-    assert rc == 0, err
-    return out.strip()
-
-
 async def _drift_scene(
     tmp_path: Path, *, pool: bool, warm_base: bool = True,
 ) -> tuple[GitOps, Path, str]:
@@ -462,11 +456,7 @@ async def _drift_scene(
         GitOps(warm_pool_git_config(), repo, merge_spec_warm_lane_pool_size=1)
         if pool else GitOps(_NO_POOL_GIT_CONFIG, repo)
     )
-    return git_ops, repo, await _head(repo)
-
-
-def _registered_names(repo: Path) -> list[str]:
-    return [Path(p).name for p in registered_worktree_paths(repo)]
+    return git_ops, repo, await get_head(repo)
 
 
 @pytest.mark.asyncio
@@ -518,7 +508,4 @@ class TestDriftCheckLane:
                 entered = True
 
         assert not entered
-        assert [
-            name for name in _registered_names(repo)
-            if name.startswith(('_merge-', WorktreeKind.DRIFT_CHECK.value))
-        ] == []
+        assert registered_drift_lanes(repo) == []

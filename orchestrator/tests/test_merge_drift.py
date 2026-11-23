@@ -31,6 +31,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _drift_lanes import registered_drift_lanes
+from _lane_test_helpers import get_head
 from _merge_lane_fakes import FakeVerifier, delegates_to, hangs_until
 from _orch_helpers import wait_responsive
 from _seed_script_stubs import (
@@ -40,7 +42,6 @@ from _seed_script_stubs import (
     seed_default_warm_base,
     warm_pool_git_config,
 )
-from _worktree_registrations import registered_worktree_paths
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore, EventType
@@ -1035,12 +1036,6 @@ async def _setup_drift_repo(repo: Path) -> None:
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
-async def _drift_head_sha(repo: Path) -> str:
-    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
-    assert rc == 0
-    return out.strip()
-
-
 @pytest.fixture
 def drift_git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
@@ -1105,7 +1100,7 @@ class TestDriftCheckHoldsLaneLease:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        head = await _drift_head_sha(drift_git_ops.project_root)
+        head = await get_head(drift_git_ops.project_root)
         recorded: list[tuple[str, bool, Path]] = []
 
         pass_result = VerifyResult(
@@ -1341,6 +1336,7 @@ class TestDriftCheckDefersWhenAHostSlotIsBusy:
         (deferral,) = _deferrals(scene)
         assert deferral['merge_sha'] == 'drift-sha'
         assert deferral['cause'] == 'host_slots_busy'
+        assert deferral['detail'] is None
         assert deferral['consecutive_deferrals'] == 1
         assert deferral['hosts'] == scene.allocator.host_states()
         assert {h['name']: h['slot_state'] for h in deferral['hosts']}['laptop'] == 'busy'
@@ -1512,7 +1508,7 @@ class _WarmDriftScene:
         remote.run_merge_verify = AsyncMock(return_value=_PASS)
         return cls(
             GitOps(warm_pool_git_config(), repo, merge_spec_warm_lane_pool_size=1),
-            repo, await _drift_head_sha(repo), req, remote,
+            repo, await get_head(repo), req, remote,
             HostAllocator([remote], quarantine=set()), _RecordingEventStore(),
             tmp_path / 'drift_check_state.json',
         )
@@ -1535,12 +1531,6 @@ class _WarmDriftScene:
 
     def slots(self) -> set[str]:
         return {h['slot_state'] for h in self.allocator.host_states()}
-
-    def lanes_built(self) -> list[str]:
-        return [
-            name for name in (Path(p).name for p in registered_worktree_paths(self.repo))
-            if name.startswith(('_merge-', WorktreeKind.DRIFT_CHECK.value))
-        ]
 
 
 @pytest.mark.asyncio
@@ -1565,21 +1555,41 @@ class TestDriftCheckLocalLegRunsWarm:
         assert not wt.exists()
 
     async def test_unseedable_lane_defers_without_running_or_building_anything(
-        self, tmp_path: Path,
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         scene = await _WarmDriftScene.build(tmp_path, warm_base=False)
 
-        verifier, _legs = await scene.run()
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
+            verifier, _legs = await scene.run()
 
-        assert verifier.entered_count == 0
+        assert verifier.entered_count == 0, 'no local leg may run, warm or cold'
         scene.remote.run_merge_verify.assert_not_awaited()
         (deferral,) = scene.event_store.data_for(EventType.drift_check_deferred)
         assert deferral['cause'] == 'no_warm_lane'
+        assert 'warm base not resolvable' in deferral['detail']
         assert deferral['consecutive_deferrals'] == 1
         assert deferral['merge_sha'] == scene.head
+        assert {h['slot_state'] for h in deferral['hosts']} == {'free'}, (
+            'the deferral must be reported after the check released its own slots'
+        )
+        (logged,) = _deferral_logs(caplog, logging.INFO)
+        assert deferral['detail'] in logged, 'the INFO line must say why no lane was seeded'
         assert _load_drift_check_state(scene.state_path).consecutive_deferrals == 1
         assert scene.slots() == {'free'}
-        assert scene.lanes_built() == [], 'nothing may be built cold'
+        assert registered_drift_lanes(scene.repo) == [], 'no residue left'
+
+    async def test_back_to_back_no_warm_lane_deferrals_count_up(
+        self, tmp_path: Path,
+    ) -> None:
+        """A check that never got its lane never started, so it must not clear the count."""
+        scene = await _WarmDriftScene.build(tmp_path, warm_base=False)
+
+        await scene.run()
+        await scene.run()
+
+        deferrals = scene.event_store.data_for(EventType.drift_check_deferred)
+        assert [d['consecutive_deferrals'] for d in deferrals] == [1, 2]
+        assert _load_drift_check_state(scene.state_path).consecutive_deferrals == 2
 
     async def test_a_no_warm_lane_deferral_re_arms_once_a_seed_is_available(
         self, tmp_path: Path,

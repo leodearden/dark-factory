@@ -44,6 +44,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
+from _drift_lanes import registered_drift_lanes
 from _git_fixtures import seed_repo
 from _seed_script_stubs import (
     CURRENT_LOCKING_SEED_SCRIPT,
@@ -1730,13 +1731,9 @@ _REFUSING_SEED_SCRIPT = '#!/usr/bin/env bash\nexit 75\n'
 
 
 def _drift_check_residue(git_ops: GitOps, repo: Path) -> list[str]:
-    """Every ``_driftcheck-*`` entry on disk or in git's worktree list."""
+    """Every ``_driftcheck-*`` entry on disk, and every drift lane in git's worktree list."""
     on_disk = [p.name for p in git_ops.worktree_base.glob(f'{WorktreeKind.DRIFT_CHECK.value}*')]
-    registered = [
-        p for p in registered_worktree_paths(repo)
-        if Path(p).name.startswith(WorktreeKind.DRIFT_CHECK.value)
-    ]
-    return on_disk + registered
+    return on_disk + registered_drift_lanes(repo)
 
 
 async def _warm_scene(tmp_path: Path, script: str, *, warm_base: bool = True) -> tuple[GitOps, Path, str]:
@@ -1748,7 +1745,8 @@ async def _warm_scene(tmp_path: Path, script: str, *, warm_base: bool = True) ->
 class TestWarmEphemeralWorktree:
     """task 11479: a warm-required throwaway is CoW-seeded under its held lock,
     or it raises WarmSeedUnavailable before its body runs and leaves nothing
-    behind. Real git and the reify seed-script stubs; nothing is patched."""
+    behind. Real git and the reify seed-script stubs; the one patch forces the
+    never-raising seed call to raise."""
 
     def test_seeds_target_under_the_held_lock_and_tears_down(self, tmp_path: Path) -> None:
         observed: list[tuple[Path, bool]] = []
@@ -1793,6 +1791,46 @@ class TestWarmEphemeralWorktree:
         git_ops, repo = asyncio.run(scenario())
 
         assert not entered, 'the body must never run when the seed did not happen'
+        assert _drift_check_residue(git_ops, repo) == []
+
+    def test_an_unresolvable_warm_base_is_refused_before_anything_is_minted(
+        self, tmp_path: Path,
+    ) -> None:
+        async def scenario() -> GitOps:
+            git_ops, _repo, head = await _warm_scene(
+                tmp_path, CURRENT_LOCKING_SEED_SCRIPT, warm_base=False,
+            )
+            assert not git_ops.worktree_base.exists()
+            with pytest.raises(WarmSeedUnavailable):
+                async with git_ops.warm_ephemeral_worktree(WorktreeKind.DRIFT_CHECK, head):
+                    pass
+            return git_ops
+
+        git_ops = asyncio.run(scenario())
+
+        assert not git_ops.worktree_base.exists(), (
+            'a refused warm base must not reach ephemeral_worktree, which creates the base dir'
+        )
+
+    def test_a_raising_seed_gate_raises_unavailable_not_the_fault(self, tmp_path: Path) -> None:
+        """``_seed_warm_lane`` never raises by contract, so only a patch reaches this branch."""
+        entered = False
+
+        async def scenario() -> tuple[GitOps, Path]:
+            nonlocal entered
+            git_ops, repo, head = await _warm_scene(tmp_path, CURRENT_LOCKING_SEED_SCRIPT)
+            fault = AsyncMock(side_effect=RuntimeError('boom'))
+            with (
+                patch.object(git_ops, '_seed_warm_lane', new=fault),
+                pytest.raises(WarmSeedUnavailable, match='warm-seed gate raised RuntimeError: boom'),
+            ):
+                async with git_ops.warm_ephemeral_worktree(WorktreeKind.DRIFT_CHECK, head):
+                    entered = True
+            return git_ops, repo
+
+        git_ops, repo = asyncio.run(scenario())
+
+        assert not entered
         assert _drift_check_residue(git_ops, repo) == []
 
     def test_drift_check_band_is_registered_and_rendered(self, tmp_path: Path) -> None:

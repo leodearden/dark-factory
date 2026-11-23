@@ -1,0 +1,30 @@
+{
+  "task_id": "11479",
+  "reason": "Amendment pass (review suggestions 2-4, 6): warm_ephemeral_worktree refuses an unresolvable warm base before minting a checkout (+1 branch); the warm-seed helper became disposition-neutral, so the fail-soft COLD log moved to its own caller-side helper; a drift deferral now carries its cause's detail, rendered by one conditional. Net-additive behaviour, not a failed refactor.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1576,
+      "current": 1579
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::warm_ephemeral_worktree",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/drift.py",
+      "baseline": 33,
+      "current": 34
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5276,
+      "current": 5280
+    }
+  ]
+}

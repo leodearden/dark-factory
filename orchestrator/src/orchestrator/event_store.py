@@ -302,8 +302,9 @@ class EventType(StrEnum):
     # window, or a warm lane where a pool is configured, so it ran nothing and
     # re-arms for the next landing.  Producer:
     # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
-    # consecutive_deferrals, hosts, cause}, hosts being
-    # HostAllocator.host_states() and cause a DriftDeferralCause value.
+    # consecutive_deferrals, hosts, cause, detail}, hosts being
+    # HostAllocator.host_states(), cause a DriftDeferralCause value and detail
+    # the cause's own report (why no warm lane could be seeded), else null.
     drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
