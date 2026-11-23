@@ -13,6 +13,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _clip_assertions import assert_elided
+from _count_call_spelling import non_keyword_count_calls
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_git_repos import init_ab_commit_repo, init_merge_history_repo
 from _fm_helpers import (
@@ -3010,6 +3011,27 @@ class TestProactiveSampling:
         assert proactive_step_count >= 1, (
             "The 'Your Task' instruction section should reference the Proactive Task Sample"
         )
+
+    @pytest.mark.asyncio
+    async def test_payload_your_task_spells_count_gate_with_keyword_filters(
+        self, mock_deps, watermark
+    ):
+        stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='test_project', project_root='/tmp/test_project')
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'blocked'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = payload[payload.index('## Your Task'):]
+        offending = non_keyword_count_calls(section)
+        assert offending == [], (
+            f"'## Your Task' spells count_memories_by_metadata positionally: {offending}"
+        )
+        assert 'count_memories_by_metadata(' in section
 
     # --- Step: lazy iterable acceptance (task-709) ---
 
