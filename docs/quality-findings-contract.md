@@ -18,8 +18,9 @@ disposition lives; and how one run schedules the next.
 A finding is a claim that a specific part of the code raises the cost or
 risk of the next change, in the sense of `docs/code-quality.md`, located
 precisely enough that another agent can re-verify it at a later commit.
-Everything else a run learns (counts, trends, caveats, method notes) is
-report prose, not a finding.
+A live correctness defect (§6) is recorded as a finding too. Everything
+else a run learns (counts, trends, caveats, method notes) is report
+prose, not a finding.
 
 Every finding carries these fields, in the instrument's committed artefact:
 
@@ -141,6 +142,16 @@ Two routes, chosen by the finding's class, recorded on the finding:
   deliberation with the human, then a program doc, then `/prd`, which files
   tasks under `planning_mode` and stamps the finding keys (§8) on them.
 
+A live correctness defect (wrong behaviour in landed code today) never
+waits for deliberation, whatever the class of the finding that exposed
+it: the instrument records the defect as its own mechanical finding (its
+anchor, the behaviour, the fix that stops it) and files it by the
+mechanical route. Any structural finding behind it still goes to
+deliberation, citing the defect's key in its `statement`. `/prd` stamps
+only the structural finding's key on the tasks it files, never the
+defect's, so a §8 key lookup on the defect finds only the defect's own
+task.
+
 A finding whose proposal is "split this file" or "reduce this number" is
 structural by definition; heuristic 14's measurement protocol in
 `docs/code-quality.md` applies before any split is proposed.
@@ -184,7 +195,11 @@ decided each finding:
    value=<key>)` (fused-memory MCP), which matches a list-valued
    `x_finding_key` by membership.
    a. A task in `pending`, `in-progress`, `blocked`, `deferred` or
-      `merge-deferred` → disposition `filed:<id>`; do not file.
+      `merge-deferred` → disposition `filed:<id>`; do not file. If that
+      task is held (it depends on its project's follow-up holder,
+      `docs/task-authoring.md` §3.4), append the finding key to its
+      `x_finding_key` with `update_task(metadata_mode='additive')`. That
+      promotes it with `by=citation` (`ref` = the key), so it dispatches.
    b. A `cancelled` task carrying `x_acceptance_reason` → `accepted:<id>`;
       do not file. A `cancelled` task without it was abandoned, not
       accepted: treat as absent and continue to step 2.
@@ -193,7 +208,8 @@ decided each finding:
 2. **Semantic lookup.** `search_tasks` with a paraphrase of the statement at
    `score_threshold ≥ 0.6`; its corpus excludes `deferred` tasks, which is
    why step 1 runs first. A plausible match is read with `get_task` before
-   deciding.
+   deciding. A plausible match on a held task gets the same append as in
+   step 1a and is recorded as `filed:<id>`.
 3. **Curator.** The ticket path's own `candidate_key` dedup is the last net,
    never the first.
 

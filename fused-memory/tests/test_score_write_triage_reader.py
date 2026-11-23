@@ -45,6 +45,13 @@ def _rubric() -> types.ModuleType:
     )
 
 
+@functools.cache
+def _rounds() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'write_triage_rating_rounds.py', mod_name='write_triage_rating_rounds',
+    )
+
+
 _FLAT = {'home': 'YES', 'loss': 'NO', 'conflict': 'NO'}
 _MORE = {'home': 'YES', 'loss': 'YES', 'conflict': 'NO'}
 
@@ -134,12 +141,18 @@ def _corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 
 _STRATA = {'r': 40, 'a': 20, 'c': 5, 's': 30}
-SOAK_RUBRIC = 'v2.1'
-"""The rater brief the synthetic corpus and the committed soak baseline were rated under."""
+def _soak_brief() -> Any:
+    """The rater brief the synthetic corpus and the committed soak baseline were rated under."""
+    return _rounds().BRIEF_V2_1
+
+
+def _soak_brief_flags() -> list[str]:
+    """The CLI's explicit form of :func:`_soak_brief`, for a corpus that records no re-rate."""
+    return ['--rubric', _soak_brief().version, '--brief-sha256', _soak_brief().sha256]
 
 
 def _score_reader(*args: Any, **kwargs: Any) -> dict[str, Any]:
-    return _mod().score_reader(*args, rubric=SOAK_RUBRIC, **kwargs)
+    return _mod().score_reader(*args, brief=_soak_brief(), **kwargs)
 
 
 @functools.cache
@@ -162,29 +175,94 @@ def _block(hits: int, n: int, *, unclear: int = 0) -> dict[str, Any]:
     }
 
 
-class TestTheRubricLabel:
-    """The caller names the brief its verdicts were rated under; the scorer cannot tell."""
+class TestTheBrief:
+    """The report records the brief its verdicts were rated under, which verdict rows do not say.
 
-    def test_the_report_records_the_label_it_is_given(self) -> None:
-        items, verdicts = _corpus()
-        report = _mod().score_reader(items, verdicts, rubric='v2.2')
-        assert report['rubric'] == 'v2.2'
-        assert _mod().render_markdown(report).startswith('# Write-triage reader report (rubric v2.2)')
+    The CLI takes it from the corpus record's latest re-rate, or explicitly as
+    a label and sha256 for a corpus that records no re-rate.
+    """
 
-    def test_no_label_is_assumed(self) -> None:
+    def test_the_report_records_the_briefs_version_and_sha256(self) -> None:
         items, verdicts = _corpus()
-        with pytest.raises(TypeError, match='rubric'):
+        report = _mod().score_reader(items, verdicts, brief=_rounds().RaterBrief('v2.2', 'a' * 64))
+        assert (report['rubric'], report['brief_sha256']) == ('v2.2', 'a' * 64)
+        markdown = _mod().render_markdown(report)
+        assert markdown.startswith('# Write-triage reader report (rubric v2.2)')
+        assert 'a' * 64 in markdown
+
+    def test_no_brief_is_assumed(self) -> None:
+        items, verdicts = _corpus()
+        with pytest.raises(TypeError, match='brief'):
             _mod().score_reader(items, verdicts)
 
-    def test_the_cli_requires_the_label(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
-    ) -> None:
+    @staticmethod
+    def _inputs(tmp_path: Path) -> list[str]:
         items = _write_jsonl(tmp_path / 'items.jsonl', [_item('X', 'contested', 'P')])
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
+        return ['--items', str(items), '--verdicts', str(verdicts)]
+
+    def test_the_cli_requires_a_corpus_record_or_a_label(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
         with pytest.raises(SystemExit) as exited:
-            _mod().main(['--items', str(items), '--verdicts', str(verdicts)])
+            _mod().main(self._inputs(tmp_path))
         assert exited.value.code == 2
-        assert '--rubric' in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert '--corpus-record' in err and '--rubric' in err
+
+    def test_a_label_needs_its_sha256(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--rubric', 'v2.1'])
+        assert exited.value.code == 2
+        assert '--brief-sha256' in capsys.readouterr().err
+
+    def test_a_corpus_record_with_a_sha256_is_refused_naming_the_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': [
+            {'version': 'v2.2', 'round': 1, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}))
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record),
+                         '--brief-sha256', 'c' * 64])
+        assert exited.value.code == 2
+        assert '--brief-sha256' in capsys.readouterr().err
+
+    @pytest.mark.parametrize(('label', 'sha', 'named'), [
+        ('v2.1', 'xyz', "'xyz'"), ('2.1', 'a' * 64, "'2.1'"),
+    ])
+    def test_a_malformed_label_or_sha256_is_refused_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], label: str, sha: str, named: str,
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--rubric', label, '--brief-sha256', sha])
+        assert exited.value.code == 2
+        assert named in capsys.readouterr().err
+
+    def test_a_corpus_record_names_the_brief_of_its_latest_rerate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': [
+            {'version': 'v2.1', 'round': 1, 'pairs': 2, 'brief_sha256': 'b' * 64},
+            {'version': 'v2.2', 'round': 2, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}))
+        assert _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record)]) == 0
+        printed = json.loads(capsys.readouterr().out)
+        assert (printed['rubric'], printed['brief_sha256']) == ('v2.2', 'c' * 64)
+
+    def test_a_corpus_record_without_a_rerate_is_refused_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': []}))
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record)])
+        assert exited.value.code == 2
+        assert str(record) in capsys.readouterr().err
 
 
 class TestTheItemRowContract:
@@ -212,7 +290,8 @@ class TestTheItemRowContract:
 class TestTheReport:
     def test_states_its_rubric_rules_and_weights(self) -> None:
         report = _report()
-        assert report['rubric'] == SOAK_RUBRIC
+        assert (report['rubric'], report['brief_sha256']) == (
+            _soak_brief().version, _soak_brief().sha256)
         assert set(report['cell_rules']) == {
             'hidden_detail', 'hidden_conflict', 'digest_conflict', 'wrong_home',
             'false_conflict', 'duplicate_clutter', 'orphaned_conflict', 'attached_supersession',
@@ -708,7 +787,7 @@ class TestTheCli:
             '--items', str(_write_jsonl(tmp_path / 'items.jsonl', items)),
             '--verdicts', str(_write_jsonl(tmp_path / 'v1.jsonl', verdicts[:5])),
             str(_write_jsonl(tmp_path / 'v2.jsonl', verdicts[5:])),
-            '--strata', str(strata), '--rubric', SOAK_RUBRIC,
+            '--strata', str(strata), *_soak_brief_flags(),
         ]
 
     def test_prints_the_report_and_writes_both_files(
@@ -742,7 +821,7 @@ class TestTheCli:
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X0', 'P0', home='YES')])
         out, markdown = tmp_path / 'report.json', tmp_path / 'report.md'
         code = _mod().main([
-            '--items', str(items), '--verdicts', str(verdicts), '--rubric', SOAK_RUBRIC,
+            '--items', str(items), '--verdicts', str(verdicts), *_soak_brief_flags(),
             '--out', str(out), '--markdown', str(markdown),
         ])
         assert code == 1
@@ -759,7 +838,7 @@ class TestTheCli:
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
         with pytest.raises(ValueError, match=f'{items}:2'):
             _mod().main(['--items', str(items), '--verdicts', str(verdicts),
-                         '--rubric', SOAK_RUBRIC])
+                         *_soak_brief_flags()])
 
 
 def _table_rows(markdown: str) -> dict[str, list[str]]:
@@ -873,13 +952,23 @@ class TestTheV2ScriptsImportOnlyDownward:
         ('write_triage_reader_rubric', {'write_triage_reader_rubric'}),
         ('score_write_triage_reader', {
             'score_write_triage_reader', 'write_triage_reader_rubric', 'write_triage_stats',
+            'write_triage_rating_rounds',
         }),
         ('write_triage_rating_rounds', {
             'write_triage_rating_rounds', 'write_triage_reader_rubric',
         }),
+        ('mem0_history_at', {'mem0_history_at'}),
+        ('backfill_rating_shard_kinds', {
+            'backfill_rating_shard_kinds', 'write_triage_rating_rounds', 'write_triage_reader_rubric',
+        }),
         ('build_write_triage_v2_soak_baseline', {
             'build_write_triage_v2_soak_baseline', 'write_triage_rating_rounds',
-            'write_triage_reader_rubric',
+            'write_triage_reader_rubric', 'mem0_history_at',
+        }),
+        ('rebuild_write_triage_live_slates', {
+            'rebuild_write_triage_live_slates', 'mem0_history_at', 'write_triage_rating_rounds',
+            'write_triage_reader_rubric', 'freeze_write_triage_population',
+            'eval_write_triage_retrieval', 'calibrate_write_triage', 'eval_write_triage_scoring',
         }),
         ('build_write_triage_eval_set', {
             'build_write_triage_eval_set', 'write_triage_rating_rounds',
@@ -972,6 +1061,7 @@ class TestTheCommittedSoakBaseline:
         extension = {stratum: counts['extension'] for stratum, counts in sample.items()}
         report = _rescored_baseline()
         assert report['rubric'] == 'v2.1'
+        assert report['brief_sha256'] == _rounds().BRIEF_V2_1_SHA256
         assert report['population']['n_items'] == 553 + sum(extension.values())
         assert report['population']['by_outcome'] == {
             'amended': 40 + extension['amended-sample'], 'contested': 473,

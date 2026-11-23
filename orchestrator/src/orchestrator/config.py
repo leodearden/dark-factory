@@ -1067,6 +1067,20 @@ class DeliveredChecksConfig(BaseModel):
             'budget remain uncached and are retried next tick (fail-safe wait).'
         ),
     )
+    max_record_fetches_per_tick: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Maximum number of terminal dep records '
+            'Scheduler._phase_backfill_terminal_dep_records fetches per '
+            'scheduler tick; the delivered-check gate and the scheduled '
+            'self-deploy hold both read those records. Must be >= 1. A '
+            'never-cached dep it defers makes its dependents wait for a later '
+            'tick, so after a restart it sets how fast the cold record cache '
+            'warms; one slot per tick is kept for never-cached deps while any '
+            'wait.'
+        ),
+    )
     grace_cycles: int = Field(
         default=3,
         ge=1,
@@ -1343,6 +1357,53 @@ class SessionResumeConfig(BaseModel):
                 'or lower freshness_window_secs.'
             )
         return self
+
+
+class EarlyStartConfig(BaseModel):
+    """Starting a dependent early on its predecessor's branch while the predecessor waits for its merge.
+
+    ``plans/early-start-on-predecessor-branch-prd.md`` section 7, Config.  The
+    defaults live here only, not in ``defaults.yaml``.  Every leaf is green
+    tier.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Gates new early starts only; a live pair and a branch with a ledger '
+            'record are handled whatever it says. Off in the code until T7.'
+        ),
+    )
+    pass_interval_secs: float = Field(
+        default=60,
+        gt=0,
+        description='Seconds between timer-driven early-start selection passes (a pass also runs after a merge request).',
+    )
+    picture_max_age_secs: float = Field(
+        default=600,
+        gt=0,
+        description='Seconds the early-start selection keeps its task picture before building a new one.',
+    )
+    merge_entry_alert_secs: float = Field(
+        default=43200,
+        gt=0,
+        description="Seconds a dependent may wait at its merge phase for its predecessor's slot to end before one escalation; the wait stays.",
+    )
+    stop_streak_pause: int = Field(
+        default=5,
+        ge=1,
+        description='Early starts in a row ending in a stop after which the feature pauses itself and escalates once.',
+    )
+    stop_hard_cancel_secs: float = Field(
+        default=300,
+        gt=0,
+        description='Seconds a stopped dependent has to exit after its soft cancel before it is hard-cancelled.',
+    )
+    unknown_streak_alert: int = Field(
+        default=3,
+        ge=1,
+        description='Unknown answers in a row to the landed question after which one escalation is raised.',
+    )
 
 
 class SpeculationProbeConfig(BaseModel):
@@ -3573,6 +3634,11 @@ class PriceEntry(BaseModel):
         ge=0,
         description='USD per 1M cached input tokens; None prices them at input_per_1m.',
     )
+    cache_write_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        description='USD per 1M cache-creation input tokens; None prices them at input_per_1m.',
+    )
 
 
 def default_price_table() -> dict[str, dict[str, float]]:
@@ -4559,6 +4625,11 @@ class OrchestratorConfig(BaseSettings):
     steward_completion_timeout: float = Field(default=900.0)
     steward_max_timeouts_per_escalation: int = Field(default=3, ge=2, le=5)
     steward_max_empty_outputs_per_escalation: int = Field(default=2, ge=2, le=4)
+    # 'fresh_per_l0' handles every L0 in a new session with a full briefing plus a
+    # digest of the L0s this steward already concluded; 'resume' keeps one resumed
+    # session across L0s (the shadow-eval comparison arm, task 5820). Behaviour:
+    # orchestrator/src/orchestrator/steward.py::TaskSteward.
+    steward_session_mode: Literal['fresh_per_l0', 'resume'] = Field(default='fresh_per_l0')
 
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
@@ -5363,6 +5434,17 @@ class OrchestratorConfig(BaseSettings):
             'or the task leaving the pin queue, resets it.'
         ),
     )
+    park_refused_emit_interval_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'park_refused is emitted once a dispatch candidate has been refused '
+            'its locks by parks alone, none of which outranks it, for this many '
+            'seconds, then at most once per this many seconds while that lasts. '
+            'A dispatch, a refusal by anything else, or the task leaving the '
+            'dispatch candidates ends the episode.'
+        ),
+    )
 
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
@@ -5430,7 +5512,7 @@ class OrchestratorConfig(BaseSettings):
     # Disable either ceiling by setting to a very high value (no enable-flag
     # needed — mirrors auto_eval_redo_budget_usd pattern).
     watcher_daily_cost_ceiling_usd: float = Field(
-        default=50.0,
+        default=150.0,
         description=(
             'Daily USD ceiling for escalation-watcher invocations (trailing 24h '
             'sum of cost_usd WHERE role LIKE \'%watcher%\'). On breach, '
@@ -5439,7 +5521,7 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     orch_daily_cost_ceiling_usd: float = Field(
-        default=200.0,
+        default=10000.0,
         description=(
             'Daily USD ceiling for ALL orchestrator invocations (trailing 24h '
             'sum of all cost_usd rows). On breach, pause_scheduler is called '
@@ -5650,6 +5732,10 @@ class OrchestratorConfig(BaseSettings):
     # The merge pool's order, promotion period and bounce cap (task 9933,
     # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
     merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
+
+    # Early start on a predecessor's branch (plans/early-start-on-predecessor-branch-prd.md).
+    # The defaults live in EarlyStartConfig only, not in defaults.yaml.
+    early_start: EarlyStartConfig = Field(default_factory=EarlyStartConfig)
 
     # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
     # An absent stanza is OFF for both roles.
@@ -6919,6 +7005,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # count that drifts reads as a checked claim and is not one — the check is
     # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Green tier: T4-T6 read every leaf at use.
+    _submodel_leaf_paths('early_start', EarlyStartConfig),
     # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
     # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
     # which is why the old age_alpha / cpm_beta constants were never tuned.
@@ -6943,6 +7031,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Steward grace
         'steward_completion_timeout',
         'steward_lifetime_budget',
+        'steward_session_mode',
         # Scheduler tuning
         'fairness.skip_threshold',
         # Transient-requeue jittered backoff (task 3317 / PRD contract C3,
@@ -6983,6 +7072,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'pin_reservations_enabled',
         'pin_reservation_max_active',
         'pin_blocked_emit_interval_secs',
+        # park_refused cadence (task 6328): the same flat, tick-time read.
+        'park_refused_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.
@@ -7142,9 +7233,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # lowers the merge fan-out without a restart.
         'merge_verify_max_concurrent_modules',
         # Delivered-check dep-gate sweep budget (task 2580, capability-
-        # delivered-checks PRD delta) — scheduler tuning, same tier as
+        # delivered-checks PRD delta) and the terminal-dep record-fetch budget
+        # (task 9029, S16 D13) — scheduler tuning, same tier as
         # fairness.skip_threshold / starvation_watchdog.*.
         'delivered_checks.max_checks_per_tick',
+        'delivered_checks.max_record_fetches_per_tick',
         # Delivered-check grace-streak escalation knobs (task 2583, epsilon
         # of the same PRD) — same green tier: an operator may flip the kill
         # switch, retune the grace window, or adjust the per-check timeout

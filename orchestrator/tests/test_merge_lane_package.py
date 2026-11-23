@@ -35,6 +35,7 @@ from _merge_lane_fakes import (
     main_health_probe_spawned,
 )
 from _orch_helpers import make_placeholder_future, wait_responsive
+from _verify_cache_fixtures import TEST_CODE
 
 import orchestrator.merge_lane as merge_lane
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -59,6 +60,8 @@ from orchestrator.merge_lane.worker import (
     SpeculativeMergeWorker,
 )
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cache.registry import Registry
+from orchestrator.verify_cache.replay import CacheAccess
 
 # ---------------------------------------------------------------------------
 # The façade
@@ -369,7 +372,11 @@ class _RecordingStub:
 
 
 def _recording_production_verifier() -> tuple[ProductionVerifier, dict[str, _RecordingStub]]:
-    stubs = {field.name: _RecordingStub() for field in dataclasses.fields(ProductionVerifier)}
+    """A port whose every resolver hands back a recording stub; ``verify_cache`` is no resolver."""
+    stubs = {
+        field.name: _RecordingStub()
+        for field in dataclasses.fields(ProductionVerifier) if field.name != 'verify_cache'
+    }
     resolvers: dict[str, Any] = {name: (lambda stub=stub: stub) for name, stub in stubs.items()}
     return ProductionVerifier(**resolvers), stubs
 
@@ -388,6 +395,20 @@ async def test_the_cold_shadow_port_binds_the_verifier_that_owns_it() -> None:
         assert call.options.get('verifier') is port
         assert call.options.get('verifier') is not PRODUCTION_VERIFIER
         assert all(not stub.calls for name, stub in stubs.items() if name != 'cold_shadow_verify')
+
+
+@pytest.mark.asyncio
+async def test_joined_to_holds_the_access_for_opt_in_callers_and_never_injects_it(tmp_path: Path) -> None:
+    original, stubs = _recording_production_verifier()
+    access = CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
+
+    joined = original.joined_to(access)
+
+    assert joined.verify_cache is access
+    assert original.verify_cache is None
+    await joined.run_scoped('wt')
+    (call,) = stubs['scoped'].calls
+    assert call == _Call(('wt',), {})
 
 
 class _ParityBellEventStore(EventStore):

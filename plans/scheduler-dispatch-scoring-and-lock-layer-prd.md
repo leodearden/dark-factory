@@ -651,6 +651,28 @@ state alone and stay stable from tick to tick. Branch progress is the asynchrono
 refreshed `work_product` view, and the score already credits it as continuity, which
 decides who is TRIED first. Precedence decides only whose park may block whom.
 
+**Annotation (task 6328).** The class: a candidate that is not the scored scan's top is
+refused its locks by a same-tier (or lower-tier) park whose pending owner itself waits
+on holders. It earns no skip, no park and no event, so it waits as long as the owner
+does. 6040 waited about 70 h behind 5221's park, while 5221 waited on 3096's hold of
+`harness.py`. Chosen: option (c), visibility plus a documented lever. The
+`park_refused` event names the parks, each park's priority and age, and what each owner
+waits on. The lever is to pin the waiting candidate: 6040's head pin reservation
+shadows the peer's park on the shared keys, the peer's park is restored at the
+candidate's dispatch, and no held lock is touched (OPERATIONS.md §5). The automatic
+backstop is C4's `lock_refused` gate, bounded by its auto-pin cap: at the cap the task
+joins the waiting cohort that C4's cap L1 speaks for (task 9636). Rejected for now:
+option (b), bounding how long a park may block. It is the "Park leases / expiry" row by
+another name, and it lifts C7's `backfill_max_park_age_secs` cutoff, whose named
+casualty is an owner that never dispatches. Deferred: option (a), a bounded automatic
+pin. It adds an automatic below-rank-1 reservation trigger ("refused by parks alone")
+that has never been simulated, and the "Below-rank-1 park INSTALLATION" row admits only
+a gated follow-up. Whether automatic reservations act on dispatch at all is under Leo's
+ruling at gate task 10128, which reviews the 2026-11-15..29 trial with
+`fairness.skip_threshold` at 1000000; its "change" arm names "reserve only for a task
+that has been overtaken". `park_refused` counts are the frequency evidence a later (a)
+would need. See `orchestrator/src/orchestrator/park_refusal.py`.
+
 ## 8. Pre-conditions and substrate verification (G3)
 
 Verified against `main` on 2026-08-06. No assumed capability is unresolved.

@@ -14,6 +14,7 @@ import dataclasses
 import pytest
 
 from orchestrator import shadow_eval
+from orchestrator.agents.token_pricing import TokenUsage
 from orchestrator.config import load_config
 from orchestrator.evals import configs
 from orchestrator.evals.configs import (
@@ -100,7 +101,7 @@ def test_the_cell_runs_mimo_and_prices_the_model_as_imputed(arm, control, model,
     is_local_model = is_proxied_endpoint(orch_config.env_overrides)
     assert is_local_model is True
     _, cost_source = resolve_cost_usd(
-        1000, 50, model=model, prices=orch_config.prices,
+        TokenUsage(input_tokens=1000, output_tokens=50), model=model, prices=orch_config.prices,
         cli_cost_usd=0.0, is_local_model=is_local_model,
     )
     assert cost_source == 'price_table'

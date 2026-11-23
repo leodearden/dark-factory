@@ -135,7 +135,7 @@ mcp__fused-memory__add_dependency(
 )
 ```
 
-Wire intra-batch (Greek-letter prereqs → the IDs from `submit_task`) and out-of-batch (PRD-declared prereqs → existing task IDs elsewhere). If the decomposition specified `metadata.unblocks` reverse-deps, set those via `update_task`.
+Wire intra-batch (Greek-letter prereqs → the IDs from `submit_task`) and out-of-batch (PRD-declared prereqs → existing task IDs elsewhere). If the decomposition specified `metadata.unblocks` reverse-deps, set those via `update_task`. An out-of-batch edge onto a held follow-up (one that depends on its project's follow-up holder, `docs/task-authoring.md` §3.4) promotes it with `by=dependent` when the dependent reaches `pending`, which for a batch task is its `commit_planning` flip; there is no separate release step.
 
 **Cross-project dependencies** — when a task depends on a task in a *different* project, pass a qualified `"project_id:task_id"` string as `depends_on`:
 

@@ -1,0 +1,24 @@
+{
+  "task_id": "5653",
+  "reason": "Task 5653 (absorbs 5294) adds a new decision to the pre-advance unscoped type-check gate: at breadth 'full' it skips a module the scoped leg already type-checked green (FULL_SUITE pyright in the executed plan, type unit in GREEN_OUTCOMES). That rule is new behaviour (_type_covered_modules plus one filter clause in _run_unscoped_typechecks), not a refactor; breadth 'scoped' and timeout handling are unchanged.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 384,
+      "current": 392
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_run_unscoped_typechecks",
+      "baseline": 20,
+      "current": 21
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5229,
+      "current": 5237
+    }
+  ]
+}

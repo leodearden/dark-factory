@@ -573,11 +573,15 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #     lint coverage above. Filed as [tkt_0RS401FD4JNB5SW8F8JB1DQ38K].
 #   * skills/**/*.sh and SKILL.md bodies are BEHAVIOURAL artifacts —
 #     spawn-claude.sh, spawn/hooks/*.sh, and the SKILL.md text
-#     load_skill_system_prompt injects into agent system prompts — whose
-#     consumer tests exist (enumerated in CORRECTION 1) but never run on the
-#     diff that CHANGES them, for the _has_source_files reason in CORRECTION 2.
-#     Fixing that is a verify/verify_plan production change, a different class
-#     from a yaml edit. Filed as [tkt_0RS401ZAKSC9EJFQDX8KCXCSD3].
+#     load_skill_system_prompt injects into agent system prompts. Filed as
+#     [tkt_0RS401ZAKSC9EJFQDX8KCXCSD3]; task 5296 closed it for the artifacts
+#     named in
+#     orchestrator/src/orchestrator/verify_artifact_consumers.py::BEHAVIOURAL_ARTIFACTS:
+#     at role='task' a diff touching one of them runs its consumer tests
+#     (orchestrator/src/orchestrator/verify_plan.py::with_artifact_consumer_modules
+#     and ::derive_verify_plan). A skills/ artifact absent from that table is
+#     still TRIVIAL at the task leg (verify_plan.py::is_trivial_diff) and is
+#     caught at the merge gate.
 # Both are curator TICKET ids, not task ids: the curator runs asynchronously
 # and decides create/combine/drop, so the resulting task number is not knowable
 # at this commit. 3485's own follow-up for this question was
@@ -1589,6 +1593,12 @@ merge_train_max_members: 3
 # Trade-off: a merge's full-breadth verify is slower wall-clock (modules
 # serialized), accepted against the oversubscription-flake churn it removes.
 merge_verify_max_concurrent_modules: 1
+
+# Verify-result cache in log mode for both roles: plans/verify-result-cache-prd.md § Modes and rollout, A3.
+# The code default stays off; merge 'on' waits for epsilon (task 5655).
+verify_cache:
+  task_mode: log
+  merge_mode: log
 
 # ── Lever C (multi-host post-merge verify): laptop runner, prefer_remote ──────
 # ENABLED 2026-09-30 (task 5053 = D1; plans/merge-lane-throughput-prd.md). leo-laptop

@@ -227,6 +227,13 @@ table { border-collapse: collapse; width: 100%; }
 .kpi .delta.flat { color: var(--fg-3); }
 .kpi .spark { height: 28px; }
 
+/* number cards: tabs.jsx::NumberCard weights each card; the row wraps rather than scroll the page */
+.number-cards { display: flex; flex-wrap: wrap; gap: 12px; }
+.number-cards > * { min-width: 0; }
+/* A 12-column grid marked stack-narrow gives every child a whole row once its nearest stack-host is phone-narrow. */
+.stack-host { container-type: inline-size; }
+@container (max-width: 640px) { .grid.stack-narrow > * { grid-column: 1 / -1; } }
+
 /* table */
 .tbl { font-size: 12px; }
 .tbl th, .tbl td { padding: 6px 10px; text-align: left; vertical-align: middle; white-space: nowrap; }

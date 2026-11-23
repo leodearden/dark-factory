@@ -39,7 +39,9 @@ import {
   memoryEvalEscalation,
   memoryEvalRow,
   memoryEvalsPayload,
+  mergeActiveRow,
   mergeQueueBlock,
+  mergeRecentRow,
   openEscalationItem,
   orchestratorRow,
   projectRow,
@@ -47,6 +49,7 @@ import {
   schedulerLockRow,
   schedulerModule,
   schedulerSnapshot,
+  servingEndpoint,
   taskCensus,
   taskRow,
   tasksSnapshotEntry,
@@ -580,6 +583,100 @@ test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth se
   assert.doesNotMatch(depth, /\battempts\b/);
   assert.doesNotMatch(depth, /\bmerges\b/);
 });
+
+// ── A project's Merge-tab layout: one row of number cards, then each table on its own row ──
+// jsdom lays nothing out, so the layout is read from what the browser lays it
+// out by: the cards' shared row, each card's inline flex weight, and the
+// tables' column spans in the project's 12-column grid.
+
+const panelTitleOf = panel => panel.querySelector('.panel-head > .title')?.textContent;
+
+function numberCell(card, label) {
+  const cells = [...card.querySelector('.panel-body').children].filter(cell => [...cell.children].some(line => line.textContent === label));
+  assert.equal(cells.length, 1, `expected exactly one number labelled "${label}"`);
+  return cells[0];
+}
+
+test('tabs.jsx::MergeTab sets Latency centiles, Speculative merge and Live merge metrics in one row, each card weighted by its count of numbers', t => {
+  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60 }));
+  const titles = ['Latency centiles', 'Speculative merge', 'Live merge metrics'];
+  const cards = titles.map(title => panelTitled(container, title));
+
+  const row = cards[0].parentElement;
+  assert.ok(cards.every(card => card.parentElement === row), 'the number cards must share one row');
+  assert.ok(row.classList.contains('number-cards'), 'the shared row must be a .number-cards flex row');
+  assert.ok(row.classList.contains('col-span-12'), 'the number-card row must span the whole project row');
+  assert.ok(row.parentElement.classList.contains('cols-12'), "the number-card row must sit in the project's 12-column grid");
+  assert.deepEqual([...row.children].map(panelTitleOf), titles, 'the row must hold exactly the three number cards, in order');
+  const counts = cards.map(card => card.querySelector('.panel-body').children.length);
+  assert.deepEqual(counts, [4, 3, 2]);
+  assert.deepEqual(cards.map(card => Number(card.style.flexGrow)), counts, 'each card must be weighted by its count of numbers');
+  const basisPerNumber = cards.map((card, i) => parseFloat(card.style.flexBasis) / counts[i]);
+  assert.ok(basisPerNumber[0] > 0, `each card must carry a positive flex basis: ${cards.map(card => card.style.flexBasis)}`);
+  assert.ok(basisPerNumber.every(basis => basis === basisPerNumber[0]), `each card's flex basis must be proportional to its count of numbers: ${cards.map(card => card.style.flexBasis)}`);
+});
+
+const LIVE_METRIC_ARMS = [
+  {
+    arm: 'measured',
+    metrics: { retries_per_landing: 1.5, landings_total: 4, drift_at_detection: { count: 2, last: 3 } },
+    retries: 1.5, drift: 3, hints: ['4 landings', '2 detections'], texts: ['1.50', '3'],
+  },
+  {
+    arm: 'empty',
+    metrics: {},
+    retries: undefined, drift: null, hints: ['offline', 'no conflicts'], holeTitles: ['no value in the payload', 'no drift detections'],
+  },
+];
+
+for (const { arm, metrics, retries, drift, hints, texts, holeTitles } of LIVE_METRIC_ARMS) {
+  test(`tabs.jsx::MergeTab renders Live merge metrics as compact readings with their hints, ${arm}`, t => {
+    const { harness, container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, metrics }));
+    const { plainDatum, derivedDatum, datumView, EM_DASH } = harness.window.DF_DATUM;
+    const { stateKey } = servingEndpoint(harness.window.DF_DATA_LOADER, 'MERGE_QUEUE');
+    const panel = panelTitled(container, 'Live merge metrics');
+    assert.ok(panel.querySelector('.kpi') === null, 'Live merge metrics must render compact readings, not StatTiles');
+    assert.ok(panel.querySelector('.spark') === null, 'Live merge metrics must draw no empty spark slot');
+
+    const views = [
+      datumView(plainDatum(retries, stateKey), { format: n => Number(n).toFixed(2) }),
+      datumView(derivedDatum(drift, stateKey, 'no drift detections')),
+    ];
+    if (texts) assert.deepEqual(views.map(view => view.text), texts);
+    else assert.deepEqual(views.map(view => [view.text, view.title]), holeTitles.map(title => [EM_DASH, title]));
+
+    ['Retries / landing', 'Drift @ detect'].forEach((label, i) => {
+      const cell = numberCell(panel, label);
+      assert.ok(cell.textContent.includes(hints[i]), `"${label}" must show its hint "${hints[i]}": ${cell.textContent}`);
+      const reading = cell.querySelector('.mono > span');
+      assert.equal(reading.firstChild.textContent, views[i].text, `"${label}" reading`);
+      assert.equal(reading.title, views[i].title ?? '', `"${label}" reading's title`);
+    });
+  });
+}
+
+for (const queued of [true, false]) {
+  test(`tabs.jsx::MergeTab gives Currently queued and Recent merges each a full row${queued ? ', queued first' : ', with nothing queued'}`, t => {
+    const block = mergeQueueBlock({ bucketMinutes: 60, active: queued ? [mergeActiveRow()] : [], recent: [mergeRecentRow({ taskId: '2' })] });
+    const { harness, container } = mountMergeTab(t, block);
+    const recent = panelTitled(container, 'Recent merges');
+    const grid = recent.parentElement;
+    assert.ok(grid.classList.contains('cols-12'), "Recent merges must sit in the project's 12-column grid");
+    assert.ok(recent.classList.contains('col-span-12'), 'Recent merges must span the whole row');
+    assert.equal(recent.querySelectorAll('tbody tr').length, 1, 'Recent merges must render its one fixture row');
+
+    if (queued) {
+      const queuedPanel = panelTitled(container, 'Currently queued');
+      assert.ok(queuedPanel.parentElement === grid, "Currently queued must sit in the project's 12-column grid");
+      assert.ok(queuedPanel.classList.contains('col-span-12'), 'Currently queued must span the whole row');
+      assert.ok(queuedPanel.compareDocumentPosition(recent) & harness.window.Node.DOCUMENT_POSITION_FOLLOWING, 'Currently queued must come before Recent merges');
+      assert.equal(queuedPanel.querySelectorAll('tbody tr').length, 1, 'Currently queued must render its one fixture row');
+    } else {
+      const titles = [...container.querySelectorAll('.panel-head > .title')].map(title => title.textContent);
+      assert.ok(!titles.some(text => text.startsWith('Currently queued')), `nothing is queued, yet: ${JSON.stringify(titles)}`);
+    }
+  });
+}
 
 // ── The Completion-paths legend (charts.jsx::PALETTE.paths) ──
 // Every slice performance.py::get_completion_paths serves draws in a colour of

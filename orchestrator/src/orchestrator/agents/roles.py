@@ -12,6 +12,10 @@ from shared.followup_items import (
 )
 from shared.prompt_artifact import PromptSpec
 
+from orchestrator.agents.branch_history_guidance import (
+    BRANCH_HISTORY_GUIDANCE,
+    REVIEWER_BRANCH_HISTORY_RULE,
+)
 from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.detector_guidance import (
@@ -644,12 +648,15 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 _TASK_DIR_NEVER_COMMITTED = """\
 `.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
 `.task/iterations.jsonl` links into durable task storage that survives
-worktree resets, plus the Claude config dir. It must NEVER be committed. It is
-gitignored at the repo root, so an ordinary staging command already excludes
-it — no exclusion pathspec is needed. Never force-add `.task/`
-(`git add -f .task/...`). As a backstop, a pre-commit hook silently strips any
-`.task/` path that still ends up staged — but that is defense-in-depth, not
-the only guard.
+worktree resets, plus the Claude config dir. Those links are the only task
+state exposed here: `metadata.json` and the `reviews/` and `verdicts/`
+directories stay in orchestrator storage outside this worktree, so a read of
+them under `.task/` fails by design — the task details you need are in your
+briefing. `.task/` must NEVER be committed. It is gitignored at the repo root,
+so an ordinary staging command already excludes it — no exclusion pathspec is
+needed. Never force-add `.task/` (`git add -f .task/...`). As a backstop, a
+pre-commit hook silently strips any `.task/` path that still ends up staged —
+but that is defense-in-depth, not the only guard.
 
 Stage your changes with:
 """
@@ -1057,7 +1064,7 @@ The workflow for each step is:
 2. Run tests to verify
 3. Stage and commit ONLY the code: `git add -- .`
 4. Call `mark_step_done(step_id, commit_sha)` to record the step as complete
-""" + SCOPE_BOUNDARY_GUIDANCE + """
+""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Run tests frequently to verify your work.
@@ -1100,7 +1107,7 @@ You will be given:
 git add src/module/file.py tests/test_file.py
 git add -- .
 ```
-""" + SCOPE_BOUNDARY_GUIDANCE + """
+""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Read the failing test/code carefully before making changes.
@@ -1291,6 +1298,7 @@ def build_reviewer_prompt_spec(
                 name=name, specialization=specialization, notes_heading=OPEN_INFO_NOTES_HEADING,
             )
             + REVIEWER_INV12_BLOCKERS
+            + REVIEWER_BRANCH_HISTORY_RULE
         ),
         baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATES[briefing].format(
             specialization=specialization,
@@ -1321,7 +1329,13 @@ _COMPREHENSIVE_SPECIALIZATION = (
     'Comprehensive code review covering ALL of the following areas:\n\n'
     '1. **Test coverage and quality**: Are the right behaviors tested? '
     'Meaningful assertions? Untested failure modes? Edge cases? '
-    'Do tests test what they claim?\n\n'
+    'Do tests test what they claim? '
+    'Timing dependence: flag a real sleep, an elapsed-time-versus-number assertion '
+    'or a written wait deadline in a test unless a deadline is itself the behaviour '
+    'under test and the test carries an explicit timing marker naming it '
+    '(`@pytest.mark.timing(reason=...)` where the project defines one); prefer '
+    'waiting on the event, an injected fake clock, a virtual clock, or a child '
+    "process's own time.\n\n"
     '2. **Code reuse and duplication**: Is there code duplication? '
     'Missed existing utilities? Unnecessary new abstractions? Over-engineering?\n\n'
     '3. **Architecture and design coherence**: Consistent with system design? '
@@ -2238,7 +2252,7 @@ single explore-then-plan-then-implement session.
 git add path/to/file.py
 git add -- .
 ```
-""" + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
         *_ESCALATION_TOOLS,

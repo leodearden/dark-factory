@@ -69,9 +69,8 @@ from fused_memory.reconciliation.mem0_tombstone import (
     record_mem0_deletion_tombstones,
 )
 from fused_memory.reconciliation.prompts import (
-    _STAGE2_PROJECT_ID_GUIDELINE,
-    _STAGE3_PROJECT_ID_GUIDELINE,
     FLAG_FOR_STAGE2_MARKER_KIND,
+    PROJECT_ID_GUIDELINE,
 )
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.recon_pool_map import (
@@ -3898,7 +3897,7 @@ Reconcile task state against memory:
 1. For completed tasks: verify knowledge was captured. If sparse, search for related memories \
 to check context, then write appropriate memories.
 2. For tasks whose assumptions were invalidated by Stage 1 findings: modify, re-scope, or \
-delete tasks. Update dependent tasks.
+cancel tasks (set_task_status('cancelled')). Update dependent tasks.
 3. For AI-generated tasks: cross-reference against knowledge graph for factual consistency.
 4. Attach memory_hints to tasks that would benefit from knowledge context at execution time. \
 Use entity references + semantic queries, NOT inline content. Request the ADDITIVE merge by \
@@ -3915,13 +3914,12 @@ list-format row to the canonical `{{entities, queries}}` dict shape. Do NOT use 
 6. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
 in-progress tasks for completion knowledge to capture, blocked tasks for unblock conditions \
 that may now be met, and done tasks for missing knowledge capture. **For each done task, \
-call count_memories_by_metadata(project_id, {{'task_id': str(task_id), 'stage2_suppress': True}}) \
+call `count_memories_by_metadata(project_id=..., filters={{'task_id': str(task_id), 'stage2_suppress': True}})` \
 FIRST** — if count > 0, skip the task entirely (no search, no write, no finding).
 7. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
 8. Hints on completed tasks are static — don't update them.
-9. When you have completed your work, produce your final structured report as your response.
 
-{_STAGE2_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 Use project_root="{self.project_root}" for tasks scoped to this project.
 For cross-project routing see "Known Projects" above.
 """
@@ -4218,11 +4216,10 @@ Verify consistency across all three systems:
 1. Spot-check: do recently modified tasks align with current memory state?
 2. Spot-check: do recently written memories align with task state?
 3. For flagged items: investigate and classify as consistent/inconsistent.
-4. Report all findings. Inconsistencies found here will be addressed in the next cycle's \
-Stage 1 and Stage 2.
-5. When you have completed your work, produce your final structured report as your response.
+4. Record each inconsistency with `mcp__recon-report__add_finding`. Inconsistencies found here \
+will be addressed in the next cycle's Stage 1 and Stage 2.
 
-{_STAGE3_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 Use project_root="{self.project_root}" for tasks scoped to this project.
 """
 

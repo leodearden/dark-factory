@@ -1,0 +1,88 @@
+{
+ "run": "L1",
+ "counters_from": "sccache-end.json",
+ "host": "laptop",
+ "cache_location": "webdav, name: , prefix: /alpha/",
+ "hits": 1132,
+ "misses": 18,
+ "hits_by_lang": {
+  "Rust": 1074,
+  "Assembler": 2,
+  "C/C++": 56
+ },
+ "misses_by_lang": {
+  "Rust": 18
+ },
+ "miss_share": 0.0157,
+ "writes": 18,
+ "write_errors": 0,
+ "read_errors": 0,
+ "timeouts": 0,
+ "not_cached": {
+  "-o": 3,
+  "crate-type": 767,
+  "missing output_dir": 2,
+  "missing input": 6,
+  "multiple input files": 643,
+  "-": 16
+ },
+ "compile_fails": 8,
+ "build_cpu_min": 51.8,
+ "steps": [
+  {
+   "step": "debug_nextest_build",
+   "rc": 0,
+   "wall_s": 512.5,
+   "cpu_min": 35.9,
+   "hits": 494,
+   "misses": 0
+  },
+  {
+   "step": "gui_nextest_build",
+   "rc": 0,
+   "wall_s": 114.3,
+   "cpu_min": 6.1,
+   "hits": 222,
+   "misses": 9
+  },
+  {
+   "step": "clippy",
+   "rc": 0,
+   "wall_s": 140.5,
+   "cpu_min": 8.2,
+   "hits": 237,
+   "misses": 0
+  },
+  {
+   "step": "gui_check",
+   "rc": 0,
+   "wall_s": 47.3,
+   "cpu_min": 1.7,
+   "hits": 179,
+   "misses": 9
+  },
+  {
+   "step": "tests_in_namespace",
+   "rc": 0,
+   "wall_s": 76.0,
+   "cpu_min": 3.9,
+   "hits": 0,
+   "misses": 0
+  }
+ ],
+ "missed_units": [
+  "anyhow",
+  "proc_macro2",
+  "reify_gui",
+  "tao",
+  "tauri",
+  "tauri_plugin_dialog",
+  "tauri_plugin_fs",
+  "tauri_plugin_shell",
+  "tauri_runtime_wry",
+  "thiserror",
+  "wry",
+  "x11_dl"
+ ],
+ "missed_unit_lines": 26
+}

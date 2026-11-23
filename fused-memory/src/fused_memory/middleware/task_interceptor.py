@@ -21,6 +21,7 @@ from shared.declared_scope import (
     stamp_violation,
 )
 from shared.defects import DeclareEvent, OutcomeEvent
+from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY, PromotionCause
 from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
     FollowupBundleInvalid,
@@ -114,14 +115,25 @@ from fused_memory.middleware.followup_hold import (
     HOLDER_GATE_KEYS,
     HOLDER_MINT_SOURCE,
     FollowupHolders,
+    HoldEmit,
+    HolderEdgeStripRefusedError,
     HolderProtection,
+    PromotionDeferredError,
     backfill,
+    carry_hold_record,
     hold_at_create,
     hold_scope,
     is_holder,
+    judge_update,
+    promote,
+    promote_after_update,
+    promote_dependencies_of,
     protected_status,
     protected_update,
     protection_refusal,
+    release_held,
+    releases_holder,
+    remove_holder_edge,
 )
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
@@ -1726,9 +1738,10 @@ class TaskInterceptor:
                     task_id=task_id,
                     agent_id=agent_id,
                 )
+                unchanged: dict[str, Any] | None = None
                 match same_status:
                     case deferral_gate.Restamp():
-                        return await self._apply_restamp(
+                        unchanged = await self._apply_restamp(
                             tm,
                             task_id=task_id,
                             project_root=project_root,
@@ -1743,7 +1756,7 @@ class TaskInterceptor:
                         return await self._journal_deferral_refusal(
                             refusal, project_root, _journal_params, agent_id,
                         )
-                if status == 'done' and done_provenance:
+                if unchanged is None and status == 'done' and done_provenance:
                     repair = await _repair_done_provenance_same_status(
                         tm,
                         task_id,
@@ -1772,8 +1785,12 @@ class TaskInterceptor:
                         success=interceptor_write_succeeded(repair),
                         error=_journal_error_text(repair),
                     )
-                    return repair
-                return {'success': True, 'no_op': True, 'task_id': task_id}
+                    unchanged = dict(repair)
+                return await self._repeat_release(
+                    tm, project_root, task_id, before,
+                    status=status, release_holder=release_holder,
+                    result=unchanged if unchanged is not None else {'success': True, 'no_op': True, 'task_id': task_id},
+                )
 
             if (protection := protected_status(before, status, release_holder=release_holder)) is not None:
                 return await self._refuse_holder_write(
@@ -2105,6 +2122,14 @@ class TaskInterceptor:
                 )
             else:
                 result = dict(await _do_set_task_status_write())
+            if interceptor_write_succeeded(result):
+                await self._promote_after_write(
+                    result, 'promote_on_transition',
+                    lambda: self._promote_on_transition(
+                        tm, project_root, task_id, before,
+                        old_status=old_status, status=status, release_holder=release_holder,
+                    ),
+                )
 
         # 4b. False-success propagation guard (task 2649 step-11). The
         # backend read-back verify (steps 3/4) reports a lost/suppressed
@@ -2269,18 +2294,85 @@ class TaskInterceptor:
 
     async def backfill_followup_holds(self, project_root: str, *, known_roots: Sequence[str]) -> int:
         """Hold the project's pending follow-up stock behind its holder; see ``followup_hold.backfill``."""
-
-        async def emit(event_type: EventType, payload: Mapping[str, object]) -> None:
-            await self._journal(self._make_event(event_type, project_root, dict(payload)))
-
         return await backfill(
             await self._ensure_taskmaster(),
             project_root,
             holders=self._followup_holders,
             write_lock=self._write_lock(resolve_project_id(project_root)),
-            emit=emit,
+            emit=self.hold_emit(project_root),
             known_roots=known_roots,
         )
+
+    @staticmethod
+    async def _promote_after_write(
+        result: dict[str, Any],
+        stage: str,
+        promotion: Callable[[], Awaitable[object]],
+        *,
+        warnings_key: str = 'post_write_warnings',
+    ) -> None:
+        """Run a promotion its trigger's landed write set off; its failure is a warning on *result*.
+
+        The trigger's write has committed, so raising would skip its event and reconciliation for
+        a write that happened. Every trigger repeats safely: a task already promoted is skipped.
+        """
+        try:
+            await promotion()
+        except Exception as exc:
+            logger.warning('followup promotion (%s) failed after its write landed', stage, exc_info=True)
+            result.setdefault(warnings_key, []).append({'stage': stage, 'error': str(exc)})
+
+    def hold_emit(self, project_root: str) -> HoldEmit:
+        """Journal a hold or promotion event for *project_root*; the emitter every ``followup_hold`` call takes."""
+
+        async def emit(event_type: EventType, payload: Mapping[str, object]) -> None:
+            await self._journal(self._make_event(event_type, project_root, dict(payload)))
+
+        return emit
+
+    async def _promote_on_transition(
+        self,
+        tm: TaskBackendProtocol,
+        project_root: str,
+        task_id: str,
+        before: Mapping[str, object],
+        *,
+        old_status: str | None,
+        status: str,
+        release_holder: bool,
+    ) -> None:
+        """Decision 14 at the status chokepoint; the caller holds the write lock and the write landed.
+
+        An explicit release promotes every held follow-up; a task landing on pending from deferred
+        promotes the held tasks it depends on.
+        """
+        emit = self.hold_emit(project_root)
+        if releases_holder(before, status, release_holder=release_holder):
+            await release_held(tm, project_root, int(task_id), emit=emit)
+        elif old_status == TaskStatus.DEFERRED and status == TaskStatus.PENDING:
+            await promote_dependencies_of(tm, project_root, int(task_id), emit=emit)
+
+    async def _repeat_release(
+        self,
+        tm: TaskBackendProtocol,
+        project_root: str,
+        task_id: str,
+        before: Mapping[str, object],
+        *,
+        status: str,
+        release_holder: bool,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """A holder already at a release status: ``release_holder=True`` releases again.
+
+        It promotes whatever is still held, so a release that stopped partway can be finished.
+        """
+        if interceptor_write_succeeded(result) and releases_holder(before, status, release_holder=release_holder):
+            await self._promote_after_write(
+                result, 'release_holder',
+                lambda: release_held(tm, project_root, int(task_id), emit=self.hold_emit(project_root)),
+            )
+        return result
 
     async def remint_broken_recurrence_chains(self, project_root: str) -> tuple[MintOutcome, ...]:
         """Mint the missing successor of every chain ``recurrence_mint.broken_chains`` finds."""
@@ -3892,6 +3984,15 @@ class TaskInterceptor:
                 exc,
             )
             return None
+        if not hold_scope(candidate_metadata, candidate.priority):
+            target_id = decision.target_id
+            await self._promote_after_write(
+                combined, 'promote_combined',
+                lambda: promote(
+                    tm, project_root, int(target_id),
+                    by=PromotionCause.COMBINE, ref=ticket_id, emit=self.hold_emit(project_root),
+                ),
+            )
         await self._advise_text_amendment(
             decision.target_id,
             project_root,
@@ -4996,11 +5097,11 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
 
         async with self._write_lock(project_id):
-            held_by: int | None = None
+            birth_holder: int | None = None
             if hold_scope(metadata, kwargs.get('priority')):
-                held_by = await self._followup_holders.ensure_holder(tm, project_root)
+                birth_holder = await self._followup_holders.ensure_holder(tm, project_root)
                 kwargs, metadata = hold_at_create(
-                    kwargs, metadata, held_by, held_at=datetime.now(UTC).isoformat(),
+                    kwargs, metadata, birth_holder, held_at=datetime.now(UTC).isoformat(),
                 )
             metadata_json: str | None = None
             if metadata:
@@ -5058,8 +5159,8 @@ class TaskInterceptor:
             status = TicketStatus.CREATED
             reason = _create_reason(decision, curator_unavailable=curator_unavailable)
             result_dict = dict(result)
-            if held_by is not None:
-                result_dict[_HELD_BY_RESULT_KEY] = str(held_by)
+            if birth_holder is not None:
+                result_dict[_HELD_BY_RESULT_KEY] = str(birth_holder)
 
             if metadata_json and task_id_str and not atomic_metadata_written:
                 try:
@@ -5074,6 +5175,14 @@ class TaskInterceptor:
                         task_id_str,
                         e,
                     )
+            if birth_holder is None and kwargs.get('dependencies'):
+                await self._promote_after_write(
+                    result_dict, 'promote_dependencies',
+                    lambda: promote_dependencies_of(
+                        tm, project_root, int(task_id_str), emit=self.hold_emit(project_root),
+                    ),
+                    warnings_key='post_create_warnings',
+                )
 
             # note_created + record_task under curator_lock + write_lock
             # (R3 invariant): by holding curator_lock across curate_prepared()
@@ -5886,6 +5995,16 @@ class TaskInterceptor:
                     return err
                 if err := await self._holder_update_refusal(tm, task_id, project_root, guarded):
                     return err
+                if (carried := carry_hold_record(guarded.stored, guarded.payload, replace=guarded.replace)):
+                    kwargs = {**kwargs, 'metadata': json.dumps(carried)}
+            try:
+                promotion = await judge_update(
+                    tm, project_root, task_id, before,
+                    metadata=kwargs.get('metadata'), dependencies=kwargs.get('dependencies'),
+                    agent_id=agent_id, emit=self.hold_emit(project_root),
+                )
+            except (HolderEdgeStripRefusedError, PromotionDeferredError) as e:
+                return e.to_error_dict()
 
             async def _do_update_task_write() -> Any:
                 return await self._journal_around(
@@ -5939,6 +6058,11 @@ class TaskInterceptor:
                 # raise — holds for both tools.py (which delegates here) and
                 # direct interceptor callers (task C2).
                 return e.to_error_dict()
+            if interceptor_write_succeeded(result):
+                await self._promote_after_write(
+                    result, 'promote_after_update',
+                    lambda: promote_after_update(tm, project_root, promotion, emit=self.hold_emit(project_root)),
+                )
             # Under the lock, before audit-trail rotation: confirms THIS write, not a rewrite.
             if is_recon_stage_write and interceptor_write_succeeded(result):
                 result = await task_text_write_guard.verify_text_write_landed(
@@ -6175,9 +6299,11 @@ class TaskInterceptor:
           unchanged from the original behavior. An edge that would close a cycle
           comes back as the :class:`DependencyCycle` refusal dict, nothing written.
 
-        The interceptor does not inspect or transform ``depends_on``; routing is
-        handled entirely by the backend.  The journal and ``task_modified`` event
-        are emitted regardless of which branch the backend takes.
+        Once the edge lands, a pending, non-held dependent promotes every held
+        follow-up it depends on (``by='dependent'``,
+        :func:`followup_hold.promote_dependencies_of`; docs/task-authoring.md
+        §3.4).  The journal and ``task_modified`` event are emitted regardless of
+        which branch the backend takes.
 
         ``client_op_id`` is an optional client idempotency key (task 2712): a
         retry with a recorded key replays the prior outcome and skips the write
@@ -6205,6 +6331,13 @@ class TaskInterceptor:
                         ),
                     )
                 )
+                if interceptor_write_succeeded(result):
+                    await self._promote_after_write(
+                        result, 'promote_dependencies',
+                        lambda: promote_dependencies_of(
+                            tm, project_root, int(task_id), emit=self.hold_emit(project_root),
+                        ),
+                    )
         except DependencyCycle as e:
             return e.to_error_dict()
         event = self._make_event(
@@ -6227,18 +6360,20 @@ class TaskInterceptor:
     ) -> dict:
         """Remove a dependency from a task.
 
-        ``depends_on`` is forwarded verbatim to the backend.
-
         - **Qualified form** (``"project_id:task_id"``, contains ``':'``): the
           backend removes the canonical entry from the dependent task's
           ``metadata.external_deps`` list.  Idempotent — no error if the entry
           is absent.
-        - **Bare integer form**: issues an unconditional ``DELETE`` from the
-          integer ``dependencies`` table, unchanged from the original behavior.
+        - **Bare integer form**: the backend deletes the edge from the integer
+          ``dependencies`` table — except a held follow-up's holder edge, which
+          the interceptor removes as a human promotion
+          (:func:`followup_hold.remove_holder_edge`, ``ref='remove_dependency'``):
+          the result carries ``promoted``, and a registered promotion guard can
+          refuse it with ``followup_promotion_deferred``, nothing written
+          (docs/task-authoring.md §3.4).
 
-        The interceptor does not inspect or transform ``depends_on``; routing is
-        handled entirely by the backend.  The journal and ``task_modified`` event
-        are emitted regardless of which branch the backend takes.
+        The journal and ``task_modified`` event are emitted for every removal
+        that lands.
 
         ``client_op_id`` is an optional client idempotency key (task 2712): a
         retry with a recorded key replays the prior outcome and skips the write
@@ -6251,20 +6386,18 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
-        async with self._write_lock(project_id):
-            result = dict(
-                await self._journal_around(
-                    'remove_dependency',
-                    project_root,
-                    {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
-                    tm.remove_dependency(
-                        task_id,
-                        depends_on,
+        try:
+            async with self._write_lock(project_id):
+                result = dict(
+                    await self._journal_around(
+                        'remove_dependency',
                         project_root,
-                        tag,
-                    ),
+                        {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
+                        self._remove_dependency_write(tm, task_id, depends_on, project_root, tag),
+                    )
                 )
-            )
+        except PromotionDeferredError as e:
+            return e.to_error_dict()
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -6273,6 +6406,20 @@ class TaskInterceptor:
         await self._journal(event)
         await self._idempotency_record(client_op_id, 'remove_dependency', result)
         return result
+
+    async def _remove_dependency_write(
+        self, tm: TaskBackendProtocol, task_id: str, depends_on: str, project_root: str, tag: str | None,
+    ) -> Mapping[str, Any]:
+        """A held task's holder edge leaves only by promotion (open question 2); any other edge is removed plainly."""
+        promoted = await remove_holder_edge(tm, project_root, task_id, depends_on, emit=self.hold_emit(project_root))
+        if promoted is None:
+            return await tm.remove_dependency(task_id, depends_on, project_root, tag)
+        return {
+            'id': task_id,
+            'dependency_id': depends_on,
+            'message': f'Removed the follow-up holder edge: task {task_id} is promoted by human',
+            'promoted': [str(promoted_id) for promoted_id in promoted],
+        }
 
     # ── Pure reads (direct pass-through) ───────────────────────────────
 
@@ -6732,7 +6879,7 @@ async def _repair_done_provenance_same_status(
     }
 
 
-_GUARDED_METADATA_KEYS = frozenset({DECLARED_SCOPE_METADATA_KEY, *HOLDER_GATE_KEYS})
+_GUARDED_METADATA_KEYS = frozenset({DECLARED_SCOPE_METADATA_KEY, FOLLOWUP_HOLD_METADATA_KEY, *HOLDER_GATE_KEYS})
 
 
 @dataclasses.dataclass(frozen=True)

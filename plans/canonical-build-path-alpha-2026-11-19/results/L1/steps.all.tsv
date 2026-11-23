@@ -1,0 +1,5 @@
+laptop	L1	debug_nextest_build	0	512.5
+laptop	L1	gui_nextest_build	0	114.3
+laptop	L1	clippy	0	140.5
+laptop	L1	gui_check	0	47.3
+laptop	L1	tests_in_namespace	0	76.0

@@ -9,14 +9,17 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
-from _task_verify_fixtures import seed_verify_repo, task_verify_spec
+from _task_verify_fixtures import seed_task_branch_repo, seed_verify_repo, task_verify_spec
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, VerifyCacheConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.task_verify_run import (
     prepare_task_verify_worktree,
     run_task_verify_on_worktree,
 )
+from orchestrator.verify_cache.modes import CacheMode
+from orchestrator.verify_cache.registry import registry_db_path
+from orchestrator.verify_evidence import UnitOutcome
 
 
 class TestPrepareTaskVerifyWorktree:
@@ -57,5 +60,35 @@ async def test_run_task_verify_on_a_fresh_worktree_persists_logs_and_strips_path
         persisted = sorted(p.name for p in (wt / '.task' / 'verify').iterdir())
         assert persisted, 'the cold .task/ invariant must enable attempt-log persistence'
         assert all(name.startswith('attempt-1.') for name in persisted), persisted
+    finally:
+        await git_ops.cleanup_merge_worktree(wt)
+
+
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+@pytest.mark.asyncio
+async def test_a_runners_task_verify_consults_no_registry(tmp_path: Path) -> None:
+    """Task 5653: the runner joins the cache with no registry, so every unit is
+    UNAVAILABLE naming why, and no registry file appears on either side.
+
+    The repo ignores ``.task/``, as a real project does, so the cold verify's
+    own writes there leave the working copy clean enough to key.
+    """
+    repo, _base, head_sha = seed_task_branch_repo(tmp_path)
+    config = OrchestratorConfig(
+        project_root=repo, verify_cold_preprovision_command='',
+        verify_cache=VerifyCacheConfig(task_mode=CacheMode.LOG),
+    )
+    git_ops = GitOps(config.git, repo)
+    wt = await git_ops.create_ephemeral_verify_worktree(head_sha)
+    try:
+        result = await run_task_verify_on_worktree(wt, config, task_verify_spec(head_sha, 'true'))
+
+        assert result.passed, result.summary
+        assert result.units
+        for unit in result.units:
+            assert unit.outcome is UnitOutcome.UNAVAILABLE, unit
+            assert 'no_registry_on_runner' in (unit.reason or ''), unit
+        assert not registry_db_path(repo).exists()
+        assert not registry_db_path(wt).exists()
     finally:
         await git_ops.cleanup_merge_worktree(wt)

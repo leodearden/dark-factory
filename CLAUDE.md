@@ -353,6 +353,25 @@ type and the Python type its values arrive as, and refuses loudly rather than
 reporting an empty schema. It states no column names of its own, deliberately:
 the store is the only copy of them that cannot be stale.
 
+The reconciliation TICKET store, which holds the `tkt_…` ids `submit_task`
+returns, is a second store with the same two traps. WHERE it is: one
+fused-memory server serves every project on this host, so ONE ticket store
+serves them all, in that server's reconciliation data dir:
+`/home/leo/src/dark-factory/data/reconciliation/tickets.db`. `data/` is
+untracked, so no worktree has one, and `fused-memory/data/tickets.db` is a
+0-byte decoy. The location's one home is
+`fused-memory/src/fused_memory/server/main.py::resolve_data_dir`
+(`reconciliation.data_dir` in `fused-memory/config/config.yaml`, overridable by
+`RECONCILIATION_DATA_DIR`). WHAT SHAPE it is: its key is not a task store's
+`id`, and the same tool answers with `--db`.
+
+<!-- tickets-db-schema-lookup:begin
+     EXECUTED by tests/scripts/test_tasks_db_schema_convention.py, with the
+     store swapped for a fixture. Degrade it into a hand-written sqlite query
+     and that guard goes red. -->
+- **Ticket store shape**: `python scripts/tasks_db_schema.py --db /home/leo/src/dark-factory/data/reconciliation/tickets.db`
+<!-- tickets-db-schema-lookup:end -->
+
 ## Model Routing
 
 The orchestrator resolves `(model, effort, budget_usd, max_turns)` for

@@ -123,7 +123,9 @@ dependents (§4.3) are keyed `"<project_id>:<id>"` and admit `repoint` only (`on
 parent's project, written into the child's `external_deps` as `"<parent_project>:<id>"`). Re-scope
 is `keep` plus the canceller's own `update_task` edit; done-on-main is the canceller marking the
 child `done` (`done_provenance.kind=found_on_main`) BEFORE the cancel, after which it is terminal and
-not listed. No `defer` action (D4).
+not listed. No `defer` action (D4). Seam with the follow-up hold: a `repoint` or `fold` of a held
+child moves only its parent edge and leaves its follow-up holder edge, and `keep` leaves it held
+(plans/follow-up-filing-shape-prd.md §5).
 
 `superseded_by`: list of ≥1 distinct ints; each exists in the project, is not the parent, is not
 `cancelled` (any other status is legal: a `done` superseder is the found-on-main case).

@@ -46,10 +46,11 @@ function requireLive(client) {
   }
 }
 
-// A fetch answering every request with `body`, at the instant `receivedAt`.
-function servingDeps(body, receivedAt) {
+// A fetch answering every request with `body` and the served `headers`, at the
+// instant `receivedAt`.
+function servingDeps(body, receivedAt, headers) {
   return {
-    fetchImpl: () => Promise.resolve({ ok: true, json: async () => body }),
+    fetchImpl: () => Promise.resolve({ ok: true, headers: new Headers(headers), json: async () => body }),
     now: () => receivedAt,
     setTimeoutImpl: () => 0,
     clearTimeoutImpl: () => {},
@@ -59,12 +60,13 @@ function servingDeps(body, receivedAt) {
 // Lands `body` as the response to `path` through data.js's real refreshOne, at
 // the instant `receivedAt`, and resolves to its REFRESH_OUTCOMES value. `path`
 // is the endpointsFor(win) key, so a windowed endpoint carries its
-// `?window=` and names the same `win`.
-export function applyServed(client, path, body, { receivedAt = Date.now(), win = '24h', url = path } = {}) {
+// `?window=` and names the same `win`. `headers` are the response headers the
+// route served, when a test needs them on the wire too.
+export function applyServed(client, path, body, { receivedAt = Date.now(), win = '24h', url = path, headers } = {}) {
   requireLive(client);
   const keySpecs = client.loader.endpointsFor(win)[path];
   if (keySpecs === undefined) throw new Error(`data.js registers no endpoint ${path} at window ${win}`);
-  return client.loader.refreshOne(url, keySpecs, client.loader.createPollState(), servingDeps(body, receivedAt));
+  return client.loader.refreshOne(url, keySpecs, client.loader.createPollState(), servingDeps(body, receivedAt, headers));
 }
 
 // Lands `body` as the answer to the on-demand row `name` for `param` through

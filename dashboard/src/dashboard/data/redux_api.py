@@ -990,32 +990,10 @@ def shape_performance(
 # ---------------------------------------------------------------------------
 
 
-# The nine census members plus the rows' in-progress split. ``concurrency_cap``
-# is deliberately NOT here: it is a per-project scalar series, not an additive
-# count.  Summing caps across projects invents a denominator no single
-# orchestrator ever enforced — the parity alarm is aggregated by OR-ing
-# per-project verdicts instead (see below).
-_BURNDOWN_KEYS = (
-    *census.SERIES_KEYS.values(), 'in_progress_live', 'in_progress_stranded', 'in_progress_rows',
-)
-
-
-def _with_split(series: Mapping[str, Any]) -> dict[str, Any]:
-    """Return *series* with the live/stranded split guaranteed present.
-
-    A series predating the split (an un-migrated burndown.db) carries neither
-    key.  ``get_burndown_series`` already degrades that case to all-live, and
-    this seam degrades it identically: contributing 0 to both bands while the
-    ``in_progress`` band they split stays fully populated would break the
-    conservation invariant (``live + stranded == in_progress``) that makes the
-    stacked chart and the parity alarm auditable.
-    """
-    live = list(series.get('in_progress_live') or [])
-    stranded = list(series.get('in_progress_stranded') or [])
-    if not live and not stranded:
-        in_progress = list(series.get('in_progress') or [])
-        live, stranded = in_progress, [0] * len(in_progress)
-    return {**series, 'in_progress_live': live, 'in_progress_stranded': stranded}
+# The wire carries the nine census members only.  The rows' in-progress split
+# and ``concurrency_cap`` are read server-side, from the raw series, for the
+# parity verdict alone (``data/burndown.py::compute_parity_alarm``).
+_BURNDOWN_KEYS = tuple(census.SERIES_KEYS.values())
 
 
 _COMPLETION_FIELDS = ('completed', 'velocity', 'window_days')
@@ -1051,8 +1029,7 @@ def shape_burndown(
     (``dashboard/project_labels.py::ProjectLabels``); a series for a root
     outside *labels* is labelled alongside them (``ProjectLabels.including``),
     so no series overwrites another.  Both blocks carry
-    one series per :data:`_BURNDOWN_KEYS` key (the nine census members and
-    the rows' in-progress split), two served Datums — ``latest`` and
+    one series per census member, two served Datums — ``latest`` and
     ``forecast`` — and a parity block.  Per-project blocks also carry
     ``completed_per_day``.
 
@@ -1113,7 +1090,7 @@ def shape_burndown(
     :func:`_aggregate_parity`), never readings of the carried aggregate: a
     carried copy is not evaluated a second time, and a gap row never reaches
     this function at all (``burndown.py::_measured_rows``).  Parity reads each
-    project's RAW series, never ``_with_split``'s census fill.
+    project's raw series.
 
     The aggregate parity block is an **OR over per-project alarms**, never a
     comparison of summed in-progress against summed caps.  Summing hides a
@@ -1129,7 +1106,6 @@ def shape_burndown(
     served_at = resolve_now(served_at)
     named = labels.including(series_by_project)
     raw = {named.of(pid): series for pid, series in series_by_project.items()}
-    filled = {pid: _with_split(series) for pid, series in raw.items()}
     completions = {pid: compute_window_completion(series) for pid, series in raw.items()}
     provenance, aggregate_provenance = _burndown_provenance(
         {pid: _newest_label(series) for pid, series in raw.items()}, served_at,
@@ -1138,14 +1114,14 @@ def shape_burndown(
     union_labels = sorted({label for series in raw.values() for label in series.get('labels') or []})
     by_project = {
         pid: _project_block(
-            raw[pid], filled[pid], completions[pid], provenance[pid], served_at, union_labels,
+            raw[pid], completions[pid], provenance[pid], served_at, union_labels,
         )
         for pid in raw
     }
 
     aggregate: dict[str, Any] = {
         'labels': union_labels,
-        **_carry_last_sum(filled.values(), union_labels),
+        **_carry_last_sum(raw.values(), union_labels),
     }
     latest = {
         'counts': _counts_at_newest(union_labels, {key: aggregate[key] for key in _BURNDOWN_KEYS}),
@@ -1153,7 +1129,7 @@ def shape_burndown(
     }
     aggregate['latest'] = _served_datum(latest, aggregate_provenance, served_at)
     aggregate['forecast'] = _forecast_datum(
-        aggregate_forecast_confidence(filled.values()), aggregate_provenance, served_at,
+        aggregate_forecast_confidence(raw.values()), aggregate_provenance, served_at,
     )
     aggregate.update(_aggregate_parity(by_project))
 
@@ -1162,7 +1138,6 @@ def shape_burndown(
 
 def _project_block(
     series: Mapping[str, Any],
-    filled: Mapping[str, Any],
     completion: Mapping[str, Any],
     provenance: _Provenance,
     served_at: datetime,
@@ -1171,12 +1146,10 @@ def _project_block(
     """One project's own measured rows, its two served Datums and its parity verdict.
 
     The rows' labels go out as spans over *union_labels*; everything else is
-    read from the project's own row.  Parity reads the RAW *series*:
-    *filled*'s census fill of a missing split is display-only and never
-    compared against the cap.
+    read from the project's own row.
     """
     labels = list(series.get('labels') or [])
-    columns = {key: list(filled.get(key) or []) for key in _BURNDOWN_KEYS}
+    columns = {key: list(series.get(key) or []) for key in _BURNDOWN_KEYS}
     latest = {
         'counts': _counts_at_newest(labels, columns),
         **{field: completion[field] for field in _COMPLETION_FIELDS},

@@ -1393,6 +1393,60 @@ Each project has its own queue, so for the fleet:
 5. Ends with a mandatory `/reflect` — decisions and discoveries from the
    unblock session get written to memory before the session closes.
 
+### A task waiting on a peer's park (`park_refused`, task 6328)
+
+Only the scored scan's top candidate earns skips and fairness parks. A task
+below it that is refused its locks by a same-tier (or lower-tier) park earns
+nothing and waits as long as that park's owner does, which can be days when
+the owner itself waits on a holder. The scheduler reports that wait as
+`park_refused`: a dispatch candidate refused by parks alone, none of which
+outranks it. The first event comes once the refusal has lasted
+`park_refused_emit_interval_secs` (default 1800 s, green tier, hot-reloadable),
+then at most once per interval. A dispatch, a refusal by anything else, or the
+task leaving the dispatch candidates ends the episode.
+
+Read it with
+`mcp__fused-memory__get_scheduler_events(project_root=..., event_types=['park_refused'])`.
+The payload is `{task_id, priority, episode_secs, blockers, park_owners}`:
+
+- `blockers` — `[{module, owner, kind: 'parked'}]`, every park that refused
+  the acquire;
+- `park_owners` — one entry per blocking owner: `owner`, its park priority
+  (`source` plus `tier`, or `pin_order`), `park_age_secs`, and `waiting_on`,
+  the owner's own blockers (`null` when the owner is not in the tick's task
+  list).
+
+The lever is to pin the waiting task B:
+
+1. `set_task_priority_override(project_root, task_id=<B>, pinned=True, ttl_secs=<a few hours>)`.
+2. If other pins exist, `reorder_pin_queue` with B first. Only the first
+   `pin_reservation_max_active` (default 1) eligible lock-blocked pins
+   reserve; `get_pin_queue` shows the order.
+3. On the next tick B's pin reservation shadows the peer's park on the shared
+   keys and B dispatches.
+
+What the lever leaves alone: the peer's park comes back the moment B
+dispatches, its park on keys B does not need is never touched, and a held lock
+is never taken. So pinning does not help while any blocker reads
+`kind: 'held'`: B then waits on that holder, and `park_refused` stops naming
+it. Clear the pin afterwards with
+`clear_task_priority_override(project_root, task_id=<B>, field='pinned')` if
+you set no ttl.
+
+The heavier alternative is to defer the park owner. Since task 6518 a deferred
+owner drops its whole footprint, including keys B never needed.
+
+The automatic backstop is the starvation watchdog's `lock_refused` gate (knobs
+`starvation_watchdog.skip_threshold` and `starvation_watchdog.idle_only_secs`;
+`dark-factory-orchestrator.yaml` overrides them). It auto-pins the starving
+task, but only while an auto-pin slot (`starvation_watchdog.auto_pin_max_concurrent`)
+is free.
+
+While the `fairness.skip_threshold` TRIAL block in
+`dark-factory-orchestrator.yaml` is in force (review: gate task 10128),
+skip-earned fairness parks are effectively off, but `reserve_now` still
+installs tier-ranked parks, and those can produce this event.
+
 ### Merging: the submit → poll protocol
 
 **Never** `git merge --no-ff` directly into a project's main while its
@@ -2271,7 +2325,9 @@ takes no arguments: it always re-reads that process's own
   `backends`
 - `routing.*` (`allowed_models`, `ladder`, `per_model_daily_ceiling_usd`,
   `rules` — see [§7](#7-model-routing))
-- Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`)
+- Steward (`steward_completion_timeout`, `steward_lifetime_budget`,
+  `steward_session_mode`: `fresh_per_l0` | `resume`, applies from the next L0
+  a steward handles)
 - Scheduler and watcher tuning knobs
 - `review.*` checkpoint knobs
 - `unblock_auto.*`
@@ -4360,8 +4416,8 @@ check `applied`/`restart_required` on your reload call, per
 
 | Knob | Default | Scope |
 |---|---|---|
-| `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
-| `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
+| `watcher_daily_cost_ceiling_usd` | `150.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
+| `orch_daily_cost_ceiling_usd` | `10000.0` | All orchestrator invocations (every role) for the day |
 
 **Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
 pool whose roster resolves no token is EMPTY, and every invocation then raises
@@ -4479,6 +4535,7 @@ declared registry and its `LoadState`-aware detector).
 
 | Slot | Job | Units |
 |---|---|---|
+| 01:30 | Timeout-headroom self-check (per-test ceiling anchors and family leg budgets against the verify archive; files `escalate_info`) | `timeout-headroom-selfcheck.timer` |
 | 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
 | 02:30 | Transcript secret sweep (leo-laptop runs its own copy) | `transcript-secret-sweep.timer` |
@@ -4498,7 +4555,8 @@ All timers carry `Persistent=true` (a night missed to a sleeping laptop is
 caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
-Per-job docs: [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
+Per-job docs: [Timeout headroom self-check (01:30)](#timeout-headroom-self-check-0130)
+for the 01:30 job; [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
 for the 02:00 job; [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
 for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
 02:15 one; the sections below for the 02:30, 03:00, 03:15, 03:45, 04:00 and 05:00 ones,
@@ -4544,6 +4602,72 @@ harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
 reconciliation. Those residual units do **not** collide with the new 04:30 job:
 they carry a different unit name, and a re-armed sweep would merely fail
 `203/EXEC` alongside it rather than contend for anything.
+
+### Timeout headroom self-check (01:30)
+
+Each night this job re-measures the figures that the per-test timeout ceilings
+and the family verify-leg budgets were sized from (task 10940). The script is
+`scripts/timeout_headroom_selfcheck.py`. Its four files are
+`scripts/timeout-headroom-selfcheck.{sh,service,timer}` and
+`scripts/install-timeout-headroom-selfcheck-timer.sh`, which kicks no immediate
+run. Arming it is a separate deploy step: the deterministic `before_done` deploy
+or `scripts/user_timers.py arm`, as described above. This section does not
+claim the timer is armed; `scripts/user_timers.py check` answers that.
+
+- **What it reads.** The main checkout's verify archive,
+  `data/verify-logs/<task>/`: the archived junits, the attempt summaries and
+  the dispatch records. Each junit row is judged at its own run's tree, which
+  is the dispatch's `tip_sha`, else its `base_sha`, else `HEAD`. An xdist
+  worker-crash row and a row pytest-timeout killed carry no duration of their
+  own, so each anchor lists them as `censored` and `timed_out` and never judges
+  them: a hung test's junit time says where the timeout fired, not how long the
+  test takes. A judged worst row names its outcome. Nothing is kept between runs. The archive holds about seven
+  days, so the nightly scan sees every run about seven times before it ages
+  out.
+- **Check 1, per-test headroom.** Each anchor in
+  `shared/src/shared/testing_ceiling_anchors.py::registered_anchors` has a
+  population: the tests whose closest `timeout` mark is spelled through the
+  anchor's constant, or the unmarked tests for the ini default. The worst
+  member's per-test total must not exceed the ceiling divided by
+  `shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR`.
+- **Check 2, leg budget.** A registered verify leg whose tracked tree holds a
+  whole-tree guard family member must declare a `verify_command_timeout_secs`
+  of at least
+  `shared/src/shared/whole_tree_guard_family.py::min_leg_budget_for_family(W)`.
+  W is the leg's longest green `test` command in the archived summaries. A leg
+  with no green run is reported `no_run` and is not judged.
+- **Where findings go.** Each breach is one `escalate_info` (`risk_identified`,
+  agent role `timeout-headroom-selfcheck`). Its opaque `task_id` slot is
+  `timeout-headroom:<kind>:<subject>:<bound>`, where `<kind>` is
+  `per_test_headroom` or `leg_budget`. `<subject>` is the anchor id or the
+  leg's archive infix (`tests/scripts` files as `tests_scripts`), because the
+  escalation server mints `esc-<slot>` files from the slot, so it must be one
+  file-name component. A run skips any slot that has escalation
+  history (archive-inclusive), so an unresized breach is filed once however
+  its 7-day window worst drifts, up or down; the required value travels in the
+  record. A re-size changes `<bound>` and re-arms the check. The info-L0 router turns each record
+  into owned work. Ceiling re-sizing belongs to task 9396; the ini default and
+  the headroom factor belong to task 7013.
+- **The stamp.** A real run writes `data/timeout-headroom-selfcheck/state.json`
+  in the main checkout. It holds `ok`, `measured_at`, `failure`, `findings`,
+  `filed`, `skipped` and the full report of every anchor and leg. A run that
+  could not measure or act records `ok` false with the stage that failed
+  (`config`, `tree`, `archive` or `escalation`, or `unexpected` for an
+  exception none of those anticipated) and exits 2. The wrapper still
+  exits 0, for the reason every §12 job shares, and narrates `selfcheck=<rc>`
+  in `journalctl --user -u timeout-headroom-selfcheck.service`. Nothing
+  watches the stamp's age.
+
+To look now, without filing or stamping anything:
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --no-sync --project shared python scripts/timeout_headroom_selfcheck.py --dry-run          # one line per anchor and leg
+uv run --no-sync --project shared python scripts/timeout_headroom_selfcheck.py --dry-run --json   # the structured report
+```
+
+The default `--project-root` is the main checkout even from a task worktree,
+so a dry run always reads the host's archive.
 
 ### Nightly link-heal sweep (02:15)
 
@@ -4686,9 +4810,24 @@ check.
     `skipped_cap_7d` stays 0 while writes are off. The rate is 0.0 when nothing
     was asked, and `adjudications_asked_7d` shows the denominator. The run-report
     escalation names `summary.json`, and its summary line also names the failure
-    when the metrics could not be written (`metrics_unwritten`). Such a run
-    removes the previous `summary.json`, so gate θ fails closed on its absence
-    rather than reading a stale week.
+    when the metrics could not be written (`metrics_unwritten`). The summary
+    also carries `expires_at`, 28 h after its window ends
+    (`fused-memory/src/fused_memory/maintenance/link_heal_metrics.py::SUMMARY_TTL`).
+    That is the longest gap between two 02:15 runs (25 h, at the autumn clock
+    change) plus the 5-minute jitter, and leaves a run just under 3 h to write
+    its summary. `scripts/check_write_triage_readiness_gate.py` fails any gate
+    on a report past its `expires_at`, so θ's own predicate run fails closed on
+    a summary no run has replaced, whether the run was refused (exit 2),
+    crashed, or the timer stopped firing; one missed night is enough. θ's
+    delivered-checks re-run fails closed only once main next advances: the
+    scheduler caches a passing delivered check per main SHA
+    (`orchestrator/src/orchestrator/scheduler.py::Scheduler._compute_delivered_check_cache`).
+    A summary without `expires_at`, as written before task 11287, never
+    expires; the first run that writes its metrics replaces it. A run whose metrics could
+    not be written also removes the previous `summary.json`, because it no
+    longer counts tonight. If even that removal fails, the run-report
+    escalation's detail (not its summary line) and the sweep's JSON output
+    name the failure as `stale_summary_unremoved`.
 - **Exit codes.** 0 when the run is complete, or partial only by the write or
   adjudication cap or stale skips. 1 on a read, adjudication or write failure,
   a stopped run, or a report or metrics it could not write.

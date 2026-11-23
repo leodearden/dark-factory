@@ -59,6 +59,7 @@ from orchestrator.offline_lane_episode_state import (
     PassEffect,
     PassObservation,
     apply_outage,
+    effect_records_debts,
     is_live_owner,
     recheck_due,
     unconfirmable_node,
@@ -348,6 +349,19 @@ def test_an_effect_written_before_the_debt_fields_reads_with_none_offered_or_und
 
     assert (effect.debts_offered, effect.debts_undecided) == ((), ())
     assert effect.tasks_filed == ('9001',)
+
+
+def test_only_an_effect_block_written_with_its_debt_fields_records_its_debts():
+    written = _full_effect().to_json()
+    before_the_debt_fields = _full_effect().to_json()
+    del before_the_debt_fields['debts_offered'], before_the_debt_fields['debts_undecided']
+
+    assert effect_records_debts(written)
+    assert effect_records_debts(json.loads(json.dumps(written)))
+    assert effect_records_debts(_effect().to_json())
+    assert not effect_records_debts(before_the_debt_fields)
+    assert not effect_records_debts(None)
+    assert not effect_records_debts([written])
 
 
 def _without_tasks_filed(payload: dict) -> object:

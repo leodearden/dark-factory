@@ -10,11 +10,15 @@ ONE record lands in the server's primary project root however many writes fail.
 The latch is process-local and flips before the first await, so concurrent
 failures page once. An episode whose page could not be filed stays unpaged,
 and the next exhaustion tries again. The first successful OpenAI-backed write
-resolves the record, and :meth:`BillingExhaustionAlarm.restore` re-latches
-onto a record a previous process left open, so a restart neither re-pages nor
-strands it. A balance that runs dry again within ``REPAGE_COOLDOWN`` of a
-recovery is still settling, so its page waits out the rest of that window
-rather than pushing Leo a second time at once.
+resolves the record. The latch re-checks its page on the first exhaustion at
+least ``REPAGE_COOLDOWN`` after the page was last filed or confirmed pending,
+and on the first after :meth:`BillingExhaustionAlarm.restore` re-latches onto
+a record a previous process left open: a page still pending is folded into,
+so a restart neither re-pages nor strands it, and a page a human closed while
+credits are still out is filed afresh for the same episode. A balance that
+runs dry again within ``REPAGE_COOLDOWN`` of a recovery is still settling, so
+its page waits out the rest of that window rather than pushing Leo a second
+time at once.
 
 :class:`BillingParkPolicy` is the durable queue's side of it: the queue parks
 what the policy names and reports parking and clearing back to the alarm.
@@ -51,19 +55,23 @@ _LOG_LABEL = 'provider_billing_exhausted'
 _SOURCE = BillingSource.API_KEY_CREDITS
 _UNKNOWN = 'unknown'
 
-#: Right after a top-up, writes that land can interleave with probes that
-#: still meet the old balance while it propagates.
+#: Sets two cadences. An exhaustion this soon after a recovery waits it out,
+#: because right after a top-up, writes that land can interleave with probes
+#: that still meet the old balance while it propagates. A filed page is also
+#: re-checked against the queue no more often than this.
 REPAGE_COOLDOWN = timedelta(minutes=10)
 
 
 @dataclass(frozen=True)
 class BillingAlarmState:
-    """The open episode: what ran out, since when, and the page filed for it."""
+    """The open episode: what ran out, since when, the page filed for it, and
+    when that page was last filed or found still pending (None: re-check)."""
 
     exhaustion: BillingExhaustion
     first_seen: datetime
     first_site: str
     escalation_id: str | None
+    page_confirmed_at: datetime | None = None
 
 
 def _utc_now() -> datetime:
@@ -96,14 +104,14 @@ class BillingExhaustionAlarm:
         return self._state
 
     async def record_exhausted(self, exhaustion: BillingExhaustion, *, site: str) -> None:
+        now = self._clock()
         latched = self._state
-        if latched is not None and (latched.escalation_id is not None or self._paging):
+        if latched is not None and (self._paging or self._page_is_current(latched, now)):
             logger.debug(
                 '%s: already latched since %s; %s folds into it',
                 _LOG_LABEL, latched.first_seen.isoformat(), site,
             )
             return
-        now = self._clock()
         fresh = latched is None
         if latched is None:
             latched = BillingAlarmState(
@@ -124,9 +132,13 @@ class BillingExhaustionAlarm:
                 (self._recovered_at + self._repage_cooldown).isoformat(),
             )
             return
-        await self._page_unpaged(latched)
+        await self._confirm_or_file_page(latched, now)
 
-    async def _page_unpaged(self, latched: BillingAlarmState) -> None:
+    def _page_is_current(self, latched: BillingAlarmState, now: datetime) -> bool:
+        confirmed_at = latched.page_confirmed_at
+        return confirmed_at is not None and now - confirmed_at < self._repage_cooldown
+
+    async def _confirm_or_file_page(self, latched: BillingAlarmState, now: datetime) -> None:
         self._paging = True
         try:
             escalation_id = await self._page(latched)
@@ -140,12 +152,18 @@ class BillingExhaustionAlarm:
             self._paging = False
         if escalation_id is None:
             logger.warning(
-                '%s: credits exhausted since %s are not paged yet; the next '
-                'exhaustion retries', _LOG_LABEL, latched.first_seen.isoformat(),
+                '%s: could not file or confirm the page for credits exhausted since '
+                '%s; the next exhaustion retries', _LOG_LABEL, latched.first_seen.isoformat(),
             )
             return
+        if latched.escalation_id is not None and latched.escalation_id != escalation_id:
+            logger.warning(
+                '%s: %s did not come back as the pending page for credits '
+                'exhausted since %s; latched onto %s', _LOG_LABEL,
+                latched.escalation_id, latched.first_seen.isoformat(), escalation_id,
+            )
         if self._state is latched:
-            self._state = replace(latched, escalation_id=escalation_id)
+            self._state = replace(latched, escalation_id=escalation_id, page_confirmed_at=now)
 
     async def record_recovered(self, *, site: str) -> None:
         latched = self._state
