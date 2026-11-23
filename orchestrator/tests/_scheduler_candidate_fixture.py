@@ -6,13 +6,13 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-import orchestrator
-
-FIXTURE_DIR = Path(orchestrator.__file__).resolve().parents[3] / 'orchestrator' / 'tests' / 'fixtures' / 'scheduler_candidates'
+FIXTURE_DIR = Path(__file__).resolve().parent / 'fixtures' / 'scheduler_candidates'
 
 
-def load_candidate_fixture() -> dict:
-    """The newest committed dump of scripts/dump_scheduler_candidate_fixture.py."""
+def load_candidate_fixture(name: str | None = None) -> dict:
+    """The committed dump of scripts/dump_scheduler_candidate_fixture.py named *name*, else the newest."""
+    if name is not None:
+        return json.loads((FIXTURE_DIR / name).read_text())
     dumps = sorted(FIXTURE_DIR.glob('*.json'))
     assert dumps, f'no committed candidate fixture under {FIXTURE_DIR}'
     return json.loads(dumps[-1].read_text())

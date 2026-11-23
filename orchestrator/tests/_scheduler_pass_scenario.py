@@ -1,8 +1,9 @@
 """A recorded ordinary-pass scenario: the live candidate dump plus tasks that make every split step act.
 
 ``build_scenario`` lays out a rig in a directory: a git repo with a ``main``
-branch as the project root, the committed dump of 1,480 recorded pending tasks
-with the wall clock fixed at its capture time, and the synthetic tasks named
+branch as the project root, the committed dump ``RECORDED_DUMP`` of 1,480
+recorded pending tasks with the wall clock fixed at its capture time, and the
+synthetic tasks named
 below, each of which makes one read/write step of the ordinary pass act (task
 10476, plans/early-start-on-predecessor-branch-prd.md §5.4).
 ``record_passes`` runs ordinary passes over it and returns what they decided.
@@ -39,6 +40,15 @@ _UNRECORDED_WRITE_ARGS = frozenset({'client_op_id', 'project_root', 'agent_id'})
 _TIMING_EVENT_TYPES = frozenset({EventType.scheduler_tick.value})
 _TIMING_DATA_SUFFIXES = ('_at', '_ms')
 _SEED_COMMIT_DATE = '2026-10-12T00:00:00+00:00'
+# The golden was recorded on this dump; a newer one would change the population.
+RECORDED_DUMP = '2026-10-12.json'
+# The seed commit's sha is in the golden, so no user or system git config or hook may touch it.
+_GIT_ENV = {
+    'GIT_AUTHOR_DATE': _SEED_COMMIT_DATE,
+    'GIT_COMMITTER_DATE': _SEED_COMMIT_DATE,
+    'GIT_CONFIG_GLOBAL': os.devnull,
+    'GIT_CONFIG_NOSYSTEM': '1',
+}
 
 # Synthetic tasks: ids above the dump's, one role each.
 GREP_PASS_DEP = '9001'
@@ -153,7 +163,7 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(
         ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', '-C', str(repo), *args],
         check=True, capture_output=True,
-        env={**os.environ, 'GIT_AUTHOR_DATE': _SEED_COMMIT_DATE, 'GIT_COMMITTER_DATE': _SEED_COMMIT_DATE},
+        env={**os.environ, **_GIT_ENV},
     )
 
 
@@ -162,7 +172,7 @@ def _init_repo(repo: Path) -> None:
     _git(repo, 'init', '-q', '-b', 'main')
     (repo / 'capability.py').write_text(f'{_PRESENT_PATTERN} = True\n')
     _git(repo, 'add', 'capability.py')
-    _git(repo, 'commit', '-q', '-m', 'seed')
+    _git(repo, 'commit', '-q', '--no-verify', '-m', 'seed')
 
 
 def _grep_check(name: str, pattern: str) -> dict:
@@ -209,7 +219,7 @@ def _seed_overrides(store: OverrideStore, project_root: str, now: datetime) -> N
 
 def build_scenario(root: Path, *, delivered_checks_enabled: bool = True) -> Scenario:
     """A fresh rig under *root*. Needs the ``code_default_config`` fixture active."""
-    fixture = load_candidate_fixture()
+    fixture = load_candidate_fixture(RECORDED_DUMP)
     now = fixture_captured_at(fixture)
     repo = root / 'repo'
     _init_repo(repo)
