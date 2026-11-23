@@ -38,10 +38,17 @@ Run from ``fused-memory/``. This scores the committed soak baseline::
         --items calibration/write_triage_v2_soak_items.jsonl \
         --verdicts calibration/write_triage_v2_soak_verdicts.jsonl \
         --strata calibration/write_triage_v2_soak_strata.json \
+        --rubric v2.1 \
+        --brief-sha256 b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f \
         --out calibration/write_triage_v2_soak_baseline.json \
         --markdown calibration/write_triage_v2_soak_baseline.md
 
-``--items`` and ``--verdicts`` each take one or more JSONL files.
+``--items`` and ``--verdicts`` each take one or more JSONL files. The brief
+the verdicts were rated under is recorded in the report: ``--corpus-record``
+takes it from a corpus summary's or derivation's latest re-rate (e.g.
+``--corpus-record calibration/write_triage_v2_soak_derivation_v2_2.json``),
+and a corpus with no re-rate, as the v2.1 soak above, names it with
+``--rubric`` and ``--brief-sha256``.
 ``--harm-weights`` takes a JSON ``{cell: weight}`` map in place of the
 provisional weights. The report is printed to stdout, and also written to
 ``--out`` and, rendered, to ``--markdown`` when given. A refusal exits 1,
@@ -75,11 +82,13 @@ _SCRIPTS = Path(__file__).resolve().parent
 
 
 if TYPE_CHECKING:
+    import write_triage_rating_rounds as _rounds
     import write_triage_reader_rubric as _rubric
     import write_triage_stats as _stats
 else:
     _rubric = load_script(_SCRIPTS / 'write_triage_reader_rubric.py', 'write_triage_reader_rubric')
     _stats = load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
+    _rounds = load_script(_SCRIPTS / 'write_triage_rating_rounds.py', 'write_triage_rating_rounds')
 
 Cell = _rubric.Cell
 
@@ -260,16 +269,18 @@ def score_reader(
     items: Iterable[Mapping[str, Any]],
     verdicts: Iterable[Mapping[str, Any]],
     *,
-    rubric: str,
+    brief: _rounds.RaterBrief,
     strata: Mapping[str, int] | None = None,
     harm_weights: Mapping[str, float] = PROVISIONAL_HARM_WEIGHTS,
 ) -> dict[str, Any]:
     """Score every item against the verdict corpus; refuse an incomplete one.
 
-    *rubric* labels the rater brief the verdicts were rated under (``v2.1``,
-    ``v2.2``); verdict rows do not say, so the caller must, and the report
-    records it. The report carries no timestamps, so scoring the same inputs
-    twice gives the same report.
+    *brief* is the rater brief the verdicts were rated under; verdict rows do
+    not say, so the caller must, and the report records its version as
+    ``rubric`` and its ``brief_sha256``. A corpus record names its brief
+    (``write_triage_rating_rounds.py::latest_rerate_brief``). The report
+    carries no timestamps, so scoring the same inputs twice gives the same
+    report.
     """
     weights = _validated_weights(harm_weights)
     reader_items = _reader_items(items)
@@ -278,7 +289,8 @@ def score_reader(
     scored = [_score(item, judgements) for item in reader_items]
     _refuse_incomplete(scored)
     return {
-        'rubric': rubric,
+        'rubric': brief.version,
+        'brief_sha256': brief.sha256,
         'cell_rules': {str(cell): rule for cell, rule in _rubric.CELL_RULES.items()},
         'harm_weights': {str(cell): weight for cell, weight in weights.items()},
         'harm_weights_status': (
@@ -773,6 +785,7 @@ def _summary_markdown(report: Mapping[str, Any]) -> str:
     return '\n'.join([
         f'# Write-triage reader report (rubric {report["rubric"]})',
         '',
+        f'Rater brief: {report["rubric"]}, sha256 {report["brief_sha256"]}.',
         f'Items: {population["n_items"]} (decided {population["decided"]},'
         f' unclear {population["unclear"]}). By outcome: {_listed(population["by_outcome"])}.',
         f'Sampled per stratum: {_listed(population["by_stratum"])}.',
@@ -907,9 +920,19 @@ def _build_parser() -> argparse.ArgumentParser:
         '--verdicts', type=Path, nargs='+', required=True, metavar='PATH',
         help='JSONL verdict files, read together as one corpus',
     )
+    brief = parser.add_mutually_exclusive_group(required=True)
+    brief.add_argument(
+        '--corpus-record', type=Path, metavar='PATH',
+        help="the corpus's summary or derivation JSON; its latest re-rate names the brief"
+             ' the verdicts were rated under',
+    )
+    brief.add_argument(
+        '--rubric', metavar='LABEL',
+        help='for a corpus with no re-rate: the version of the brief the verdicts were rated'
+             ' under, e.g. v2.1; needs --brief-sha256',
+    )
     parser.add_argument(
-        '--rubric', required=True, metavar='LABEL',
-        help='the rater brief version the verdicts were rated under, e.g. v2.1; recorded in the report',
+        '--brief-sha256', metavar='SHA', help="with --rubric: the sha256 of that brief's text",
     )
     parser.add_argument(
         '--strata', type=Path, metavar='PATH',
@@ -926,13 +949,32 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _brief(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _rounds.RaterBrief:
+    """The brief *args* name: the corpus record's latest re-rate's, or --rubric with --brief-sha256."""
+    if args.corpus_record is not None:
+        if args.brief_sha256 is not None:
+            parser.error('--brief-sha256 goes with --rubric; a --corpus-record names its own brief')
+        try:
+            return _rounds.latest_rerate_brief(_read_json_object(args.corpus_record))
+        except ValueError as refusal:
+            parser.error(f'{args.corpus_record}: {refusal}')
+    if args.brief_sha256 is None:
+        parser.error('--rubric needs --brief-sha256, the sha256 of the brief it names')
+    try:
+        return _rounds.RaterBrief(args.rubric, args.brief_sha256)
+    except ValueError as refusal:
+        parser.error(str(refusal))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    brief = _brief(parser, args)
     try:
         report = score_reader(
             _read_jsonl(args.items),
             _read_jsonl(args.verdicts),
-            rubric=args.rubric,
+            brief=brief,
             strata=None if args.strata is None else _read_json_object(args.strata),
             harm_weights=(
                 PROVISIONAL_HARM_WEIGHTS if args.harm_weights is None
