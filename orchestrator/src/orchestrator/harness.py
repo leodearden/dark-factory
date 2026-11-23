@@ -32,7 +32,7 @@ from escalation.grant_delivery import (
 from escalation.models import DeliveredCheckOwner, Escalation, cascade_parent_id
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
-from shared.asyncio_tasks import abandon_task, cancel_all_within
+from shared.asyncio_tasks import abandon_task, cancel_all_within, track_task
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -337,6 +337,8 @@ logger = logging.getLogger(__name__)
 
 # Force-release claimant clears that outlived their bound, kept referenced until they unwind.
 _UNDRAINED_CLAIMANT_CLEARS: set[asyncio.Task] = set()
+# Workflow tasks that outlived the shutdown drain, kept referenced until they unwind.
+_UNDRAINED_SHUTDOWN_WORKFLOWS: set[asyncio.Task] = set()
 
 # Maximum number of same-signature blocked→pending re-pends allowed before the
 # 4th flip is withheld and a born-at-L2 human escalation is filed.  A module
@@ -2698,9 +2700,6 @@ class Harness:
             ))
         return tuple(outcomes)
 
-    # How long shutdown waits for cancelled workflow slots to unwind (run()'s step 4a).
-    _SHUTDOWN_WORKFLOW_DRAIN_SECS: float = 15.0
-
     async def run(
         self,
         prd_path: Path | None = None,
@@ -3163,21 +3162,7 @@ class Harness:
             # usage_gate.shutdown() has drained the existing ones, leaving
             # the event loop alive forever.  Each slot's done-callback
             # collects its synthetic CANCELLED report.
-            if self._live_tasks:
-                live = set(self._live_tasks)
-                logger.info(f'Cancelling {len(live)} active workflow task(s)')
-                for t in live:
-                    t.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*live, return_exceptions=True),
-                        timeout=self._SHUTDOWN_WORKFLOW_DRAIN_SECS,
-                    )
-                except TimeoutError:
-                    logger.error(
-                        'Workflow tasks did not drain within %.0fs',
-                        self._SHUTDOWN_WORKFLOW_DRAIN_SECS,
-                    )
+            await self._drain_live_workflows()
             self._compute_tallies(task_reports)
 
             self.report.completed_at = datetime.now(UTC).isoformat()
@@ -3245,6 +3230,31 @@ class Harness:
 
         logger.info(self.report.summary())
         return self.report
+
+    # How long shutdown waits for cancelled workflow slots to unwind (run()'s step 4a).
+    _SHUTDOWN_WORKFLOW_DRAIN_SECS: float = 15.0
+
+    async def _drain_live_workflows(self) -> None:
+        """Cancel every live workflow slot; detach those still running after ``_SHUTDOWN_WORKFLOW_DRAIN_SECS``.
+
+        A detached slot leaves ``_live_tasks`` and is tracked in
+        ``_UNDRAINED_SHUTDOWN_WORKFLOWS`` until it ends.
+        """
+        live = set(self._live_tasks)
+        if not live:
+            return
+        logger.info('Cancelling %d active workflow task(s)', len(live))
+        undrained = await cancel_all_within(live, timeout_secs=self._SHUTDOWN_WORKFLOW_DRAIN_SECS)
+        if not undrained:
+            return
+        self._live_tasks.difference_update(undrained)
+        for task in undrained:
+            track_task(task, _UNDRAINED_SHUTDOWN_WORKFLOWS)
+        logger.error(
+            '%d workflow task(s) did not end within %.0fs of their shutdown cancel; detached: %s',
+            len(undrained), self._SHUTDOWN_WORKFLOW_DRAIN_SECS,
+            sorted(t.get_name() for t in undrained),
+        )
 
     # How long shutdown waits for cancelled straggler tasks to unwind (run()'s step 4b).
     _SHUTDOWN_STRAGGLER_DRAIN_SECS: float = 5.0
