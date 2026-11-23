@@ -136,6 +136,22 @@ def _row_to_override(row: Any) -> OverrideRow:
     )
 
 
+# Stored TTLs are UTC-normalised (set_override guarantees it), so comparing
+# the ISO strings of a UTC ``now`` orders instants correctly.
+_EXPIRED_WHERE = 'project_root=? AND ttl_until IS NOT NULL AND ttl_until < ?'
+
+
+def _expired_params(project_root: str, now: datetime | None) -> tuple[str, str]:
+    """Bind ``_EXPIRED_WHERE`` for *now* (default: the current UTC time)."""
+    if now is not None and now.tzinfo is None:
+        raise ValueError(
+            'now must be timezone-aware; got a naive datetime'
+        )
+    if now is None:
+        now = datetime.now(UTC)
+    return project_root, now.astimezone(UTC).isoformat()
+
+
 class OverrideStore:
     """Synchronous SQLite reader/writer for scheduler priority overrides.
 
@@ -609,27 +625,31 @@ class OverrideStore:
         ``now`` defaults to the current UTC time.  Returns the sorted list of
         deleted task IDs.
         """
-        if now is not None and now.tzinfo is None:
-            raise ValueError(
-                'now must be timezone-aware; got a naive datetime'
-            )
-
-        if now is None:
-            now = datetime.now(UTC)
-
+        params = _expired_params(project_root, now)
         conn = self._connect()
         try:
             rows = conn.execute(
-                'DELETE FROM overrides '
-                'WHERE project_root=? AND ttl_until IS NOT NULL AND ttl_until < ? '
-                'RETURNING task_id',
-                # Normalise to UTC so the ISO-string comparison is invariant
-                # under caller-supplied tzinfo.  Stored TTLs are also UTC-
-                # normalised (set_override guarantees this since step-6), so
-                # the lexicographic comparison produces correct results.
-                (project_root, now.astimezone(UTC).isoformat()),
+                f'DELETE FROM overrides WHERE {_EXPIRED_WHERE} RETURNING task_id',
+                params,
             ).fetchall()
             conn.commit()
+            return sorted(r[0] for r in rows)
+        finally:
+            conn.close()
+
+    def expired_ids(
+        self,
+        project_root: str,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """The sorted ids :meth:`clear_expired` would delete at *now*, deleting nothing."""
+        params = _expired_params(project_root, now)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f'SELECT task_id FROM overrides WHERE {_EXPIRED_WHERE}',
+                params,
+            ).fetchall()
             return sorted(r[0] for r in rows)
         finally:
             conn.close()
