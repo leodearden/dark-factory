@@ -14,8 +14,14 @@ import pytest
 from legibility import coder, detectors, digest, inventory, sampling
 from legibility.detectors import AgentClass, CarrierKind, SignalClass
 from legibility_carrier_fixtures import (
+    CLIENT_RENDERED_IDS,
+    CLIENT_RENDERED_TURNS,
+    LOCAL_COMMAND_STDOUT_TURN,
     PROSE_QUOTING_THE_SCHEMA,
     SDK_GUI_CLIENT_HUMAN_TURNS,
+    SLASH_COMMAND_ARGLESS_TURN,
+    SLASH_COMMAND_EMPTY_ARGS_TURN,
+    SLASH_COMMAND_WITH_ARGS_TURN,
     TRICKLE_CODER_PREAMBLE,
     UNMARKED_HEADLESS_SDK_PROMPT_TEXTS,
     UNMARKED_HEADLESS_SDK_PROMPTS,
@@ -527,6 +533,95 @@ class TestUserTurnText:
         assert detectors.user_turn_text(tool_result_record('tu-1', 'output')) is None
 
 
+class TestParseSlashCommandExpansion:
+    def test_message_first_expansion_with_typed_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_WITH_ARGS_TURN) == (
+            detectors.SlashCommandExpansion(
+                name='/team',
+                args='Should dark-factory split its very large test files?',
+                trailing='',
+            )
+        )
+
+    def test_name_first_expansion_with_empty_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_EMPTY_ARGS_TURN) == (
+            detectors.SlashCommandExpansion(name='/login', args='', trailing='')
+        )
+
+    def test_expansion_without_an_args_tag_has_no_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_ARGLESS_TURN) == (
+            detectors.SlashCommandExpansion(name='/reflect', args=None, trailing='')
+        )
+
+    def test_text_after_the_expansion_is_trailing(self):
+        expansion = detectors.parse_slash_command_expansion(
+            SLASH_COMMAND_WITH_ARGS_TURN + '\nand then redo it'
+        )
+
+        assert expansion is not None
+        assert expansion.trailing.strip() == 'and then redo it'
+
+    def test_args_not_adjacent_to_the_name_are_not_its_args(self):
+        expansion = detectors.parse_slash_command_expansion(
+            '<command-name>/unblock</command-name>\nAn unrelated aside.\n'
+            '<command-args>4743</command-args>'
+        )
+
+        assert expansion is not None
+        assert expansion.args is None
+        assert 'An unrelated aside.' in expansion.trailing
+
+    def test_a_turn_quoting_an_expansion_after_prose_is_not_one(self):
+        text = 'Read the digest below.\n\n' + SLASH_COMMAND_WITH_ARGS_TURN
+
+        assert detectors.parse_slash_command_expansion(text) is None
+
+    def test_plain_prose_is_not_an_expansion(self):
+        assert detectors.parse_slash_command_expansion('status?') is None
+
+
+class TestClientRenderedTurn:
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_a_whole_turn_the_client_composed_is_client_rendered(self, text):
+        assert detectors.is_client_rendered_turn(text)
+
+    @pytest.mark.parametrize('text', [
+        pytest.param(
+            '<command-name>/login</command-name>\n<command-args>  \n </command-args>',
+            id='whitespace_only_args',
+        ),
+        pytest.param(
+            '<local-command-stderr>Error: not logged in</local-command-stderr>',
+            id='local_command_stderr',
+        ),
+        pytest.param('\n\n[Request interrupted by user]\n\n', id='interrupt_in_blank_lines'),
+    ])
+    def test_other_client_rendered_shapes(self, text):
+        assert detectors.is_client_rendered_turn(text)
+
+    @pytest.mark.parametrize('text', [
+        pytest.param(SLASH_COMMAND_WITH_ARGS_TURN, id='typed_args'),
+        pytest.param(SLASH_COMMAND_ARGLESS_TURN + '\nwhy did that fail?', id='expansion_then_prose'),
+        pytest.param('[Request interrupted by user]\nno, use the other branch', id='interrupt_then_prose'),
+        pytest.param('I hit [Request interrupted by user] by mistake, carry on', id='interrupt_quoted'),
+        pytest.param('what does <command-name>/reflect</command-name> do?', id='expansion_quoted'),
+        pytest.param(LOCAL_COMMAND_STDOUT_TURN + '\nok now commit', id='stdout_then_prose'),
+        pytest.param(
+            '<local-command-stdout>a</local-command-stdout> fix it '
+            '<local-command-stdout>b</local-command-stdout>',
+            id='prose_between_two_stdout_blocks',
+        ),
+        pytest.param('status?', id='plain_prose'),
+    ])
+    def test_a_turn_holding_human_prose_is_not_client_rendered(self, text):
+        assert not detectors.is_client_rendered_turn(text)
+
+    def test_the_bare_interrupt_marker_stays_an_interrupt_signal(self):
+        hits = detectors.record_hits(user_record('[Request interrupted by user]'))
+
+        assert hits.count(SignalClass.INTERRUPT) == 1
+
+
 # ---------------------------------------------------------------------------
 # (g) dialogue_turn_text -- the one rule for "a human addressed this
 # session", behind the digest's gold turns and n_user_turns and the
@@ -558,14 +653,15 @@ class TestDialogueTurnText:
     def test_a_gui_client_human_turn_is_its_text(self, text, entrypoint):
         assert detectors.dialogue_turn_text(sdk_prompt(text, entrypoint=entrypoint)) == text
 
-    def test_the_digests_user_turns_are_exactly_the_dialogue_turns(self):
+    def test_the_digests_user_turns_are_the_dialogue_turns_less_client_rendered_ones(self):
         records = [
             user_record('a'), sdk_prompt('b'), user_record('c', isMeta=True),
-            user_record(briefing_text()), user_record('d'),
+            user_record(briefing_text()), user_record(SLASH_COMMAND_ARGLESS_TURN), user_record('d'),
         ]
         dialogue = [text for record in records if (text := detectors.dialogue_turn_text(record)) is not None]
 
-        assert [turn['text'] for turn in digest.iter_user_turns(records)] == dialogue == ['a', 'd']
+        assert dialogue == ['a', SLASH_COMMAND_ARGLESS_TURN, 'd']
+        assert [turn['text'] for turn in digest.iter_user_turns(records)] == ['a', 'd']
 
 
 # ---------------------------------------------------------------------------

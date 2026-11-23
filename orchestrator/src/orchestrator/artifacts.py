@@ -1,4 +1,7 @@
-"""Manages the .task/ directory structure in each worktree."""
+"""A task's artifacts, routed to their lane or task ``.task-meta`` root by
+``ARTIFACT_ROOTS``, and the worktree ``.task/`` links
+(``LANE_SYMLINKED_ARTIFACTS``) that expose some of them to agents.
+"""
 
 from __future__ import annotations
 

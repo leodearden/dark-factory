@@ -2,7 +2,8 @@
 """Count stranded and wrongly dismissed blocking L0 escalations in one escalation queue directory.
 
 ``--queue-dir DIR --window-days N --baseline-stranded-per-100 F --ratio R --min-stranded K
---max-reaper-wrong M --max-pending-hours H`` reads DIR's live records and its dated archive, writes
+--baseline-non-startup-wrong-per-100 G --min-non-startup-wrong J --max-reaper-wrong M
+--max-pending-hours H`` reads DIR's live records and its dated archive, writes
 nothing, and prints human lines followed by a compact JSON object as the last line. It exits 1 when a
 threshold is breached, 0 otherwise, and 2 when it cannot judge: the queue directory could not be read,
 or no blocking L0 was filed in the post window. The rules and thresholds are
@@ -20,7 +21,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, Literal
 
 # orchestrator/src/orchestrator/harness.py::Harness._reap_orphan_l0_escalations
 REAPER_RESOLVER: Final = 'harness-orphan-reaper'
@@ -34,7 +35,6 @@ STALE_STRAND_CLASS: Final = 'stale-strand'
 ARCHIVE_SUBDIR: Final = 'archive'
 ARCHIVE_DAY_FORMAT: Final = '%Y-%m-%d'
 LIVE_RECORD_GLOB: Final = 'esc-*.json'
-PENDING_STATUS: Final = 'pending'
 
 COUNTED_LEVEL: Final = 0
 COUNTED_SEVERITY: Final = 'blocking'
@@ -67,21 +67,35 @@ class NothingFiled(CannotJudge):
     headline = 'nothing to judge'
 
 
+class Status(enum.StrEnum):
+    """escalation/src/escalation/models.py::Escalation.status"""
+
+    PENDING = 'pending'
+    RESOLVED = 'resolved'
+    DISMISSED = 'dismissed'
+
+
 class Closure(enum.StrEnum):
     OPEN = 'open'
-    STEWARD_OR_OTHER = 'steward_or_other'
+    RESOLVED = 'resolved'
     REAPER_PROMOTION = 'reaper_promotion'
     OTHER_PROMOTION = 'other_promotion'
     REAPER_DISMISSAL = 'reaper_dismissal'
     STARTUP_STRAND = 'startup_strand'
     STARTUP_DISMISSAL = 'startup_dismissal'
     WORKFLOW_AUTO_DISMISSAL = 'workflow_auto_dismissal'
+    OTHER_DISMISSAL = 'other_dismissal'
+
+
+NON_STARTUP_DISMISSALS: Final = frozenset(
+    {Closure.REAPER_DISMISSAL, Closure.WORKFLOW_AUTO_DISMISSAL, Closure.OTHER_DISMISSAL}
+)
 
 
 def classify_closure(
-    status: str, resolved_by: str | None, resolution: str | None, resolution_class: str | None,
+    status: Status, resolved_by: str | None, resolution: str | None, resolution_class: str | None,
 ) -> Closure:
-    if status == PENDING_STATUS:
+    if status is Status.PENDING:
         return Closure.OPEN
     if resolution_class == STALE_STRAND_CLASS:
         return Closure.STARTUP_STRAND
@@ -92,7 +106,7 @@ def classify_closure(
         return Closure.STARTUP_DISMISSAL if text.startswith(RESTART_PREFIX) else Closure.WORKFLOW_AUTO_DISMISSAL
     if text.startswith(PROMOTION_PREFIX):
         return Closure.OTHER_PROMOTION
-    return Closure.STEWARD_OR_OTHER
+    return Closure.OTHER_DISMISSAL if status is Status.DISMISSED else Closure.RESOLVED
 
 
 @dataclass(frozen=True)
@@ -152,6 +166,14 @@ def _moment(raw: Mapping[str, Any], key: str, path: Path) -> datetime:
         raise UnreadableQueue(path, f'{key} {value!r} is not a usable ISO timestamp') from exc
 
 
+def _status(raw: Mapping[str, Any], path: Path) -> Status:
+    value = _text(raw, 'status', path)
+    try:
+        return Status(value)
+    except ValueError:
+        raise UnreadableQueue(path, f'status {value!r} is not one of {", ".join(Status)}') from None
+
+
 def _late_resolved(raw: Mapping[str, Any], path: Path) -> bool:
     entries = raw.get('late_resolutions', [])
     if not isinstance(entries, list):
@@ -161,8 +183,8 @@ def _late_resolved(raw: Mapping[str, Any], path: Path) -> bool:
 
 def parse_record(raw: Mapping[str, Any], path: Path) -> Record:
     """The one boundary where an escalation file's persisted fields become a typed Record."""
-    status = _text(raw, 'status', path)
-    is_open = status == PENDING_STATUS
+    status = _status(raw, path)
+    is_open = status is Status.PENDING
     return Record(
         id=_text(raw, 'id', path),
         task_id=_text_or_null(_required(raw, 'task_id', path), 'task_id', path),
@@ -273,6 +295,14 @@ def wrongly_dismissed(record: Record, followers_by_task_category: FollowerIndex)
     )
 
 
+def _per_100(count: int, filed: int) -> float | None:
+    return 100 * count / filed if filed else None
+
+
+def _rounded(rate: float | None) -> float | None:
+    return None if rate is None else round(rate, RATE_DIGITS)
+
+
 @dataclass(frozen=True)
 class WindowCounts:
     filed: int
@@ -285,6 +315,8 @@ class WindowCounts:
     startup_wrong: int
     workflow_auto_dismissals: int
     workflow_auto_wrong: int
+    non_startup_dismissals: int
+    non_startup_wrong: int
 
     @property
     def stranded(self) -> int:
@@ -292,14 +324,18 @@ class WindowCounts:
 
     @property
     def stranded_per_100(self) -> float | None:
-        return 100 * self.stranded / self.filed if self.filed else None
+        return _per_100(self.stranded, self.filed)
+
+    @property
+    def non_startup_wrong_per_100(self) -> float | None:
+        return _per_100(self.non_startup_wrong, self.filed)
 
     def as_json(self) -> dict[str, int | float | None]:
-        rate = self.stranded_per_100
         return {
             **asdict(self),
             'stranded': self.stranded,
-            'stranded_per_100': None if rate is None else round(rate, RATE_DIGITS),
+            'stranded_per_100': _rounded(self.stranded_per_100),
+            'non_startup_wrong_per_100': _rounded(self.non_startup_wrong_per_100),
         }
 
 
@@ -316,6 +352,7 @@ def count_window(records: Sequence[Record], followers: FollowerIndex, *, start: 
     reaper_dismissals = closed_as(Closure.REAPER_DISMISSAL)
     startup_dismissals = closed_as(Closure.STARTUP_STRAND, Closure.STARTUP_DISMISSAL)
     workflow_auto_dismissals = closed_as(Closure.WORKFLOW_AUTO_DISMISSAL)
+    non_startup = closed_as(*NON_STARTUP_DISMISSALS)
     return WindowCounts(
         filed=len(counted),
         reaper_promotions=len(closed_as(Closure.REAPER_PROMOTION)),
@@ -327,6 +364,8 @@ def count_window(records: Sequence[Record], followers: FollowerIndex, *, start: 
         startup_wrong=wrong(startup_dismissals),
         workflow_auto_dismissals=len(workflow_auto_dismissals),
         workflow_auto_wrong=wrong(workflow_auto_dismissals),
+        non_startup_dismissals=len(non_startup),
+        non_startup_wrong=wrong(non_startup),
     )
 
 
@@ -369,32 +408,72 @@ def measure(records: Sequence[Record], *, now: datetime, window_days: int, max_p
 
 class Breach(enum.StrEnum):
     STRANDED_RATE = 'stranded_rate'
+    NON_STARTUP_WRONG_RATE = 'non_startup_wrong_rate'
     REAPER_WRONG = 'reaper_wrong'
     PENDING_OVER_H = 'pending_over_h'
 
 
 @dataclass(frozen=True)
+class RateRule:
+    baseline_per_100: float
+    minimum: int
+
+
+@dataclass(frozen=True)
 class Thresholds:
-    baseline_stranded_per_100: float
     ratio: float
-    min_stranded: int
+    stranded: RateRule
+    non_startup_wrong: RateRule
     max_reaper_wrong: int
 
 
-def stranded_bar_per_100(report: Report, thresholds: Thresholds) -> float:
-    """R * max(pre rate, F): an empty pre window counts as 0, so the baseline floor F applies."""
-    return thresholds.ratio * max(report.pre.stranded_per_100 or 0.0, thresholds.baseline_stranded_per_100)
+@dataclass(frozen=True)
+class RateCheck:
+    """Breached when post rate >= R * max(pre rate, F) and post count >= K; an empty pre window counts as 0."""
+
+    count_name: str
+    post_rate: float | None
+    pre_rate: float | None
+    post_count: int
+    ratio: float
+    rule: RateRule
+
+    @property
+    def bar_per_100(self) -> float:
+        return self.ratio * max(self.pre_rate or 0.0, self.rule.baseline_per_100)
+
+    @property
+    def breached(self) -> bool:
+        return self.post_rate is not None and self.post_rate >= self.bar_per_100 and self.post_count >= self.rule.minimum
+
+    def measured(self) -> str:
+        return (
+            f'post {_shown_rate(self.post_rate)} >= bar {_shown_rate(self.bar_per_100)} '
+            f'(ratio {self.ratio:g} x max(pre {_shown_rate(self.pre_rate)}, '
+            f'baseline {self.rule.baseline_per_100:g}/100)) '
+            f'and post {self.count_name} {self.post_count} >= {self.rule.minimum}'
+        )
+
+
+RateBreach = Literal[Breach.STRANDED_RATE, Breach.NON_STARTUP_WRONG_RATE]
+
+
+def rate_checks(report: Report, thresholds: Thresholds) -> dict[RateBreach, RateCheck]:
+    pre, post = report.pre, report.post
+    return {
+        Breach.STRANDED_RATE: RateCheck(
+            'stranded', post.stranded_per_100, pre.stranded_per_100, post.stranded,
+            thresholds.ratio, thresholds.stranded,
+        ),
+        Breach.NON_STARTUP_WRONG_RATE: RateCheck(
+            'non-startup wrong', post.non_startup_wrong_per_100, pre.non_startup_wrong_per_100,
+            post.non_startup_wrong, thresholds.ratio, thresholds.non_startup_wrong,
+        ),
+    }
 
 
 def judge(report: Report, thresholds: Thresholds) -> list[Breach]:
-    post_rate = report.post.stranded_per_100
-    breaches: list[Breach] = []
-    if (
-        post_rate is not None
-        and post_rate >= stranded_bar_per_100(report, thresholds)
-        and report.post.stranded >= thresholds.min_stranded
-    ):
-        breaches.append(Breach.STRANDED_RATE)
+    breaches: list[Breach] = [breach for breach, check in rate_checks(report, thresholds).items() if check.breached]
     if report.post.reaper_wrong >= thresholds.max_reaper_wrong:
         breaches.append(Breach.REAPER_WRONG)
     if report.pending_over_h > 0:
@@ -423,11 +502,12 @@ def _window_lines(label: str, counts: WindowCounts) -> list[str]:
         f'{label}: filed {counts.filed}, stranded {counts.stranded} '
         f'({counts.reaper_promotions} reaper promotions + {counts.stale_strands} stale-strand) '
         f'= {_shown_rate(counts.stranded_per_100)}',
+        f'  non-startup dismissals {counts.non_startup_dismissals}, wrong {counts.non_startup_wrong} '
+        f'= {_shown_rate(counts.non_startup_wrong_per_100)}',
         f'  reaper dismissals {counts.reaper_dismissals}, wrong {counts.reaper_wrong}',
         f'  promotions by other resolvers {counts.other_promotions} (reported, not judged)',
         f'  startup dismissals {counts.startup_dismissals}, wrong {counts.startup_wrong} (reported, not judged)',
-        f'  workflow auto-dismissals {counts.workflow_auto_dismissals}, '
-        f'wrong {counts.workflow_auto_wrong} (reported, not judged)',
+        f'  workflow auto-dismissals {counts.workflow_auto_dismissals}, wrong {counts.workflow_auto_wrong}',
     ]
 
 
@@ -442,27 +522,22 @@ def render(report: Report) -> list[str]:
 
 
 def breach_line(breach: Breach, report: Report, thresholds: Thresholds) -> str:
-    post = report.post
     match breach:
-        case Breach.STRANDED_RATE:
-            measured = (
-                f'post {_shown_rate(post.stranded_per_100)} >= bar '
-                f'{_shown_rate(stranded_bar_per_100(report, thresholds))} '
-                f'(ratio {thresholds.ratio:g} x max(pre {_shown_rate(report.pre.stranded_per_100)}, '
-                f'baseline {thresholds.baseline_stranded_per_100:g}/100)) '
-                f'and post stranded {post.stranded} >= {thresholds.min_stranded}'
-            )
+        case Breach.STRANDED_RATE | Breach.NON_STARTUP_WRONG_RATE:
+            measured = rate_checks(report, thresholds)[breach].measured()
         case Breach.REAPER_WRONG:
-            measured = f'post reaper_wrong {post.reaper_wrong} >= {thresholds.max_reaper_wrong}'
+            measured = f'post reaper_wrong {report.post.reaper_wrong} >= {thresholds.max_reaper_wrong}'
         case Breach.PENDING_OVER_H:
             measured = f'{report.pending_over_h} blocking L0s pending longer than {report.max_pending_hours:g}h'
     return f'breach: {breach}: {measured}'
 
 
 def verdict_json(report: Report, thresholds: Thresholds, breaches: Sequence[Breach]) -> dict[str, Any]:
+    checks = rate_checks(report, thresholds)
     return {
         **report.as_json(),
-        'stranded_bar_per_100': round(stranded_bar_per_100(report, thresholds), RATE_DIGITS),
+        'stranded_bar_per_100': round(checks[Breach.STRANDED_RATE].bar_per_100, RATE_DIGITS),
+        'non_startup_wrong_bar_per_100': round(checks[Breach.NON_STARTUP_WRONG_RATE].bar_per_100, RATE_DIGITS),
         'breaches': [breach.value for breach in breaches],
         'follow_up': REDESIGN_FOLLOW_UP if breaches else None,
     }
@@ -479,6 +554,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument('--baseline-stranded-per-100', type=float, required=True)
     parser.add_argument('--ratio', type=float, required=True)
     parser.add_argument('--min-stranded', type=int, required=True)
+    parser.add_argument('--baseline-non-startup-wrong-per-100', type=float, required=True)
+    parser.add_argument('--min-non-startup-wrong', type=int, required=True)
     parser.add_argument('--max-reaper-wrong', type=int, required=True)
     parser.add_argument('--max-pending-hours', type=float, required=True)
     return parser.parse_args(argv)
@@ -487,9 +564,11 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     thresholds = Thresholds(
-        baseline_stranded_per_100=args.baseline_stranded_per_100,
         ratio=args.ratio,
-        min_stranded=args.min_stranded,
+        stranded=RateRule(baseline_per_100=args.baseline_stranded_per_100, minimum=args.min_stranded),
+        non_startup_wrong=RateRule(
+            baseline_per_100=args.baseline_non_startup_wrong_per_100, minimum=args.min_non_startup_wrong,
+        ),
         max_reaper_wrong=args.max_reaper_wrong,
     )
     try:

@@ -1,0 +1,24 @@
+{
+  "task_id": "10991",
+  "reason": "net-additive guard: rebind_branch_to_head refuses to adopt a HEAD that is neither on the task branch nor at or past its tip (reify task/10089 loss)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1542,
+      "current": 1543
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::rebind_branch_to_head",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5230,
+      "current": 5231
+    }
+  ]
+}

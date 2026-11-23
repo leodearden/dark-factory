@@ -1,0 +1,36 @@
+{
+  "task_id": "10473",
+  "reason": "net-additive (PRD early-start-on-predecessor-branch, T2a): create_worktree gains the stack_on input, which starts a fresh branch at a predecessor's commit, re-stacks a reused branch's own delta in the registered cold route, and confirms the stack-base record on every stacked route; _reuse_warm_lane gains the re-stack branch in place of the rebase onto main. The re-stack itself lives in branch_stack.py::restack_own_delta and GitOps::_restack_in, not in these two functions",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1541,
+      "current": 1570
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_reuse_warm_lane",
+      "baseline": 3,
+      "current": 6
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::create_worktree",
+      "baseline": 84,
+      "current": 100
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5229,
+      "current": 5258
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6117,
+      "current": 6123
+    }
+  ]
+}

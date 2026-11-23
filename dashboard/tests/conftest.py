@@ -55,6 +55,7 @@ from df_pytest_isolation import (
     arm_test_root_isolation,
     reject_unsafe_basetemp,
 )
+from shared.pytest_fake_clock import fake_clock as fake_clock
 from starlette.testclient import TestClient
 
 

@@ -4,7 +4,7 @@ import http.client
 import json
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -129,6 +129,23 @@ def _notice(line: str) -> None:
     print(line, flush=True)
 
 
+# A blocked wait misses a signal handled on another thread or tripped just before it blocks.
+_PENDING_SIGNAL_CHECK_S = 0.1
+
+
+def _wait_for_interruptibly(
+    state: threading.Condition, predicate: Callable[[], bool], timeout_s: float
+) -> bool:
+    """``state.wait_for``, waking every ``_PENDING_SIGNAL_CHECK_S`` so a pending handler runs."""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        state.wait(min(remaining, _PENDING_SIGNAL_CHECK_S))
+    return True
+
+
 class _SessionCallLog:
     """One tap session's calls; closing it drains the calls still in flight."""
 
@@ -163,7 +180,7 @@ class _SessionCallLog:
             f'usage tap: waiting up to {drain_timeout_s:g} s for {self._in_flight} '
             'in-flight call(s) to land before the session closes'
         )
-        if not self._state.wait_for(lambda: self._in_flight == 0, timeout=drain_timeout_s):
+        if not _wait_for_interruptibly(self._state, lambda: self._in_flight == 0, drain_timeout_s):
             _notice(
                 f'usage tap: drain bound of {drain_timeout_s:g} s expired with '
                 f'{self._in_flight} call(s) still in flight; they land marked outlived_session'

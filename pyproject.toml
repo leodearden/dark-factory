@@ -61,6 +61,7 @@ markers = [
     "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
     "integration: live tests requiring real external services/credentials (live Claude CLI + OAuth accounts, real Qdrant/OpenAI); deselect: -m 'not integration'",
     "warm_lane_bash: the ported warm-lane bash bucket in orchestrator/tests/test_warm_lane_bash_suite.py, which shells out to tests/warm-lane/ (task 3073). Deselected from the default suite by orchestrator/pyproject.toml and re-selected post-merge by the `warm-lane-bash` LaneCommand, whose explicit CLI `-m warm_lane_bash` overrides addopts (last wins) and is therefore unaffected by this mirror; deselect: -m 'not warm_lane_bash'",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
 ]
 # pytest reads exactly ONE [tool.pytest.ini_options] — the rootdir's inifile —
 # and never merges addopts/markers across pyproject.toml files. So any marker a

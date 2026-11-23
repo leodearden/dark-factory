@@ -5690,47 +5690,36 @@ class Scheduler:
         restart resets the cache.
 
         Those still-uncached fetches are further bounded by
-        ``config.delivered_checks.max_checks_per_tick`` — reusing the same
-        knob ``_compute_delivered_check_cache`` applies to check RUNS (a
-        *dedicated* cap would need a new ``config.py`` field, outside this
-        task's scheduler.py-only scope). A tick with more newly-missing
-        dep_ids than the budget fetches a deterministic (sorted) prefix and
-        logs one bounded WARNING naming how many were deferred — the
-        deferred ids are simply "needed" again next tick (they're never
-        negatively cached, and any id fetched this tick is cached and so
-        never recompetes for a future tick's budget), so this is fail-safe
-        deferral, not silent dropping. A deferred dep with no cached record
-        is named in ``ctx.deferred_terminal_deps``, and its dependents wait
-        (UNKNOWN on the scheduled-deploy arm) rather than fail open: after a
-        restart the cold cache needs ceil(terminal deps / budget) ticks to
-        warm, and a held self-deploy sorting late would otherwise release
-        its dependents on every one of them.
+        ``config.delivered_checks.max_record_fetches_per_tick``. A tick with
+        more candidates than the budget fetches a deterministic prefix (see
+        "Budget priority") and logs one bounded WARNING counting the
+        deferred ids by group. A deferred id is ``needed`` again next tick
+        (never negatively cached). Deferring a held record or a never-cached
+        dep is fail-safe: the held record is still served, and the
+        never-cached dep is named in ``ctx.deferred_terminal_deps`` so its
+        dependents wait (UNKNOWN on the scheduled-deploy arm). A deferred
+        checks-carrying re-validation is not served and fails open that
+        tick, like a failed fetch. Bound:
+        never-cached ids get max(1, budget - H) slots per tick, H being
+        that tick's held re-validations, so after a restart N of them are
+        all fetched within ceil(N / max(1, budget - H)) ticks (H the largest
+        over those ticks) while their fetches succeed. A fetched id is
+        cached and leaves the queue; one whose fetch fails competes again
+        every tick and, sorting early, keeps its slot.
 
-        Budget priority: a held scheduled-deploy re-validation goes first
-        of all, since only a fresh read can release its hold (a deferred
-        one is served from cache, see below). Then (task 2977,
-        reviewer_comprehensive performance amendment): genuinely-NEW
-        dep_ids (absent from
-        ``_terminal_dep_record_cache`` entirely — typically a dependent's
-        first-ever evaluation of that dep) are always ordered ahead of
-        already-warmed checks-carrying dep_ids up for re-validation, so a
-        busy tick's steady-state re-validation churn can never chronically
-        starve a brand-new dep out of the shared per-tick budget; each
-        group is independently sorted for determinism, and the deferral
-        WARNING breaks the count down by group. Re-validation demand is
-        also self-limiting: it is driven entirely by the ``needed`` set
-        above, which only includes deps of still-PENDING dependents, so
-        once every dependent gating on a given checks-carrying dep has
-        dispatched, that dep drops out of ``needed`` and re-validation of
-        it stops. A cheaper gate keyed on the observed ``main_sha``
-        (mirroring task 2975's cache key) was considered and rejected:
-        this task's target scenario is an operator correcting a DONE dep's
-        check descriptor IN PLACE AT A FIXED main SHA (task 2977
-        analysis), so a SHA-advancement gate would never observe that edit
-        — reintroducing the exact staleness bug (esc-2911) this task
-        closes — and ``main_sha`` is not even part of this phase's
-        ``TickContext`` today (it is resolved separately, and only, inside
-        ``_compute_delivered_check_cache``).
+        Budget priority: held scheduled-deploy re-validations first, since
+        only a fresh read releases a hold, but while any never-cached id
+        waits they take at most budget - 1 slots; the rest stay served from
+        cache, holds in place. Held ids recur every tick until the settler
+        releases them, so without that cap they would starve never-cached
+        ids forever once H >= budget. At budget 1 held re-validations wait
+        while any never-cached id waits, even one that never fetches (their
+        holds stay). Then never-cached ids, then checks-carrying
+        re-validations (task 2977), so re-validation churn never starves a
+        brand-new dep; each group is sorted independently. Re-validation is
+        self-limiting: only deps of still-PENDING dependents are ``needed``.
+        A ``main_sha``-keyed gate would never see an operator correcting a
+        DONE dep's check descriptor in place at a fixed SHA (esc-2911).
 
         Fetches are issued concurrently via ``asyncio.gather`` over
         ``self.get_task`` (the lean per-id fetch primitive), which already
@@ -5802,23 +5791,25 @@ class Scheduler:
 
             # See this method's "Budget priority" docstring paragraph. Each
             # group is sorted independently for determinism.
+            _budget = self.config.delivered_checks.max_record_fetches_per_tick
+            _held_cap = _budget - 1 if _new_to_fetch else _budget
             _ordered = (
-                sorted(_held_to_fetch) + sorted(_new_to_fetch) + sorted(_revalidate_to_fetch)
-            )
-            _budget = self.config.delivered_checks.max_checks_per_tick
-            if len(_ordered) > _budget:
-                _total = len(_ordered)
-                _deferred = set(_ordered[_budget:])
-                _ordered = _ordered[:_budget]
+                sorted(_held_to_fetch)[:_held_cap]
+                + sorted(_new_to_fetch)
+                + sorted(_revalidate_to_fetch)
+            )[:_budget]
+            _candidates = _held_to_fetch.union(_new_to_fetch, _revalidate_to_fetch)
+            _deferred = _candidates.difference(_ordered)
+            if _deferred:
                 ctx.deferred_terminal_deps = frozenset(_deferred.intersection(_new_to_fetch))
                 logger.warning(
                     'acquire_next: terminal dep record backfill has %d '
                     'dep(s) to fetch this tick (%d held, %d new, %d '
                     're-validation), exceeding '
-                    'delivered_checks.max_checks_per_tick (%d) — fetching '
+                    'delivered_checks.max_record_fetches_per_tick (%d) — fetching '
                     '%d, deferring %d (%d held, %d new, %d re-validation) '
                     'to a later tick.',
-                    _total, len(_held_to_fetch), len(_new_to_fetch),
+                    len(_candidates), len(_held_to_fetch), len(_new_to_fetch),
                     len(_revalidate_to_fetch), _budget, len(_ordered),
                     len(_deferred),
                     len(_deferred.intersection(_held_to_fetch)),
@@ -7783,6 +7774,7 @@ class Scheduler:
             current_holders=one_holder_per_key(held_by_task),
             held_by_task=held_by_task,
             holder_limits=self.lock_table.snapshot_holder_limits(),
+            successor_of=self.lock_table.snapshot_successor_of(),
             lock_depth=self.config.lock_depth,
             is_paused=self.is_paused,
             pause_reason=self.pause_reason,
@@ -8066,6 +8058,32 @@ class Scheduler:
                 task_id, sorted(self.lock_table.held_modules(task_id))
             )
         return result
+
+    def acquire_as_successor(
+        self, task_id: str, modules: list[str], *, predecessor: str, priority: str,
+    ) -> bool:
+        """Take *modules* for *task_id* as the successor of *predecessor*; False when refused.
+
+        The lock half of the early-start claim
+        (``plans/early-start-on-predecessor-branch-prd.md`` section 5.4, step
+        c): :meth:`ModuleLockTable.try_acquire_as_successor` declares the
+        relation and takes the keys in one step, and the acquire emits
+        ``lock_acquired`` (with ``successor_of``) through the single
+        lock-event writer.  Synchronous, so it fits the claim's uninterrupted
+        step.  It neither marks the task dispatched nor writes the snapshot;
+        the claim does both around it.
+        """
+        if not self.lock_table.try_acquire_as_successor(
+            task_id, modules, predecessor=predecessor,
+        ):
+            return False
+        self._emit_lock_event(
+            EventType.lock_acquired,
+            task_id=task_id,
+            modules=sorted(self.lock_table.held_modules(task_id)),
+            priority=priority,
+        )
+        return True
 
     async def handle_blast_radius_expansion(
         self,
@@ -8999,7 +9017,10 @@ class Scheduler:
 
         *extra* is merged into the event payload verbatim (``priority`` for an
         acquire, ``reason`` for a partial release), so each site's payload is
-        preserved byte-for-byte.
+        preserved byte-for-byte.  The one addition is derived here, from the
+        lock table: a ``lock_acquired`` of a task that is currently a
+        successor carries ``successor_of``, its predecessor, whichever path
+        acquired the locks.
 
         Each branch names its ``EventType`` constant LITERALLY rather than
         forwarding the ``event_type`` parameter into ``emit``.  That is not
@@ -9012,6 +9033,9 @@ class Scheduler:
         at = self._wall_now().timestamp()
         data = {'modules': modules, **extra}
         if event_type == EventType.lock_acquired:
+            relation = self.lock_table.successor_relation(task_id)
+            if relation is not None and relation.successor == task_id:
+                data['successor_of'] = relation.predecessor
             self._hold_history.observe_acquired(task_id, modules, at=at)
             if self.event_store:
                 self.event_store.emit(

@@ -747,8 +747,10 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
 
 ## 10. Pre-conditions
 
-- Task 7736 (a failed resume rebase continues on a conflicting base; in progress) lands before T2a, because both
-  edit the worktree-reuse path. Task 7660 is delivered by T2a and is closed as superseded at decompose.
+- Task 7736 (a failed resume rebase continues on a conflicting base; landed) landed before T2a, because both
+  edit `workflow.py`: 7736 added the dispatch-time settle (`workflow.py::TaskWorkflow._settle_conflicting_base`,
+  through `dispatch_base.py`) and did not touch `git_ops.py`, and T2a makes that settle skip a branch whose ledger
+  record says, or may say, it is stacked. Task 7660 is delivered by T2a and is closed as superseded at decompose.
 - This plan writes no yaml key: the feature is on by the code's default once T7 lands (choice 7). A project that
   opts out writes `early_start.enabled: false` only after its orchestrator has restarted on T1 (an unknown key on
   old code raises an escalation on reload).
@@ -762,7 +764,7 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
 | Same plan | A restored dependent would be released at its first pass | That plan already ends in the right state; refinement asked for in the note (choice 6) | No edit here |
 | Tasks 7277, 10093, 10216 (recovered merge requests after a restart; all pending) | A recovered request has no waiting workflow, so its task is not a predecessor in this plan's sense | This plan (the predecessor test in 5.1) | No change needed there |
 | Task 7660 (stack record missing on create; pending, low) | Same code | This plan, T2a | Superseded at decompose |
-| Task 7736 (a failed resume rebase continues on a conflicting base; in progress, high) | Same worktree-reuse path as T2a | Task 7736 first | Pre-condition |
+| Task 7736 (a failed resume rebase continues on a conflicting base; landed) | Same file as T2a: `workflow.py` (the dispatch-time settle T2a makes skip stacked branches) | Task 7736 first | Pre-condition |
 | Task 9267 of `plans/review-all-s5-gitops-ports-query-contract-and-the-git-runner-prd.md` (one owner for every write to a task branch; pending, high, behind a long chain; task 7660 waited on it) | It routes every rebase of a task branch, the un-stack and `rebase_own_delta` through one owner with a closed set of targets (main, stacked on a commit, a frozen prefix); T2a adds the re-stack and its trial to the same functions | Whichever lands second: if T2a lands first, task 9267 routes the re-stack through its owner (its "stacked on" target fits); if task 9267 lands first, T2a builds on the owner | Note on task 9267 at decompose; no dependency, because task 9267 waits behind a long chain |
 | Task 9269 (worktree primitives move out of `git_ops.py`; pending) | Moves the functions T2a changes | Whichever lands second builds on the other | Note on task 9269 at decompose; no dependency |
 | Task 9216 (`slot_lease.py` folds into a slot registry; pending, behind task 5153 and others) | T3's borrowing lease and "slot ended" signal live in the file it removes | Whichever lands second: task 9216 carries lender, borrower and the signal into the registry and re-points T3's manifest check | Note on task 9216 at decompose; no dependency |

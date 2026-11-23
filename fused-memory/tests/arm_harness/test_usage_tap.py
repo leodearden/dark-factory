@@ -7,8 +7,10 @@ import signal
 import socket
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack, closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -330,20 +332,31 @@ def _raise_interrupted(signum, frame) -> None:
     raise _InterruptedWhileDraining
 
 
-def _interrupt_main_thread_once_draining(draining: threading.Event) -> threading.Thread:
-    """Signal the main thread once the closing session announces it is draining."""
+def _signal_the_main_thread() -> None:
+    signal.pthread_kill(threading.main_thread().ident or 0, signal.SIGUSR1)
+
+
+def _signal_this_thread() -> None:
+    """The handler then waits on the main thread, whose blocked wait gets no EINTR."""
+    signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)
+
+
+def _interrupt_once_draining(
+    draining: threading.Event, deliver: Callable[[], None]
+) -> threading.Thread:
+    """Deliver an interrupt once the closing session announces it is draining."""
 
     def interrupt() -> None:
         if draining.wait(timeout=10):
-            signal.pthread_kill(threading.main_thread().ident or 0, signal.SIGUSR1)
+            deliver()
 
     interrupter = threading.Thread(target=interrupt, daemon=True)
     interrupter.start()
     return interrupter
 
 
-def test_an_interrupted_drain_still_marks_the_abandoned_call_as_outliving_the_session(tmp_path):
-    log = tmp_path / 'calls.jsonl'
+def _drain_interrupted_by(log: Path, deliver: Callable[[], None]) -> list[int]:
+    """Interrupt a session draining one held call, then release it; the client's statuses."""
     received, release, draining = threading.Event(), threading.Event(), threading.Event()
     statuses: list[int] = []
     previous = signal.signal(signal.SIGUSR1, _raise_interrupted)
@@ -354,12 +367,27 @@ def test_an_interrupted_drain_still_marks_the_abandoned_call_as_outliving_the_se
             ), usage_tap(upstream, log_path=log) as tap_url:
                 client = _post_in_background(tap_url, statuses)
                 assert received.wait(timeout=10)
-                interrupter = _interrupt_main_thread_once_draining(draining)
+                interrupter = _interrupt_once_draining(draining, deliver)
             interrupter.join(timeout=10)
             release.set()
             client.join(timeout=10)
     finally:
         signal.signal(signal.SIGUSR1, previous)
+    return statuses
+
+
+def test_an_interrupted_drain_still_marks_the_abandoned_call_as_outliving_the_session(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    statuses = _drain_interrupted_by(log, _signal_the_main_thread)
+
+    assert statuses == [200]
+    (record,) = load_call_records(log)
+    assert record.outlived_session is True
+
+
+def test_an_interrupt_delivered_to_another_thread_still_ends_the_drain(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    statuses = _drain_interrupted_by(log, _signal_this_thread)
 
     assert statuses == [200]
     (record,) = load_call_records(log)

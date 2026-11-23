@@ -397,11 +397,6 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         assert len(rows) == provenance['case_count']
         assert _scoring().score_attachments(rows) == report['production_shape']
 
-    @pytest.mark.xfail(strict=True, reason=(
-        'the committed arbiter predates route_band routing (task 9045): it carries '
-        'no routing block and its cases no route. Task 11213 regenerates it and '
-        'deletes this marker.'
-    ))
     def test_the_committed_routing_is_the_score_of_the_committed_cases(self) -> None:
         _block, report, _resolved = self._committed()
         assert report is not None

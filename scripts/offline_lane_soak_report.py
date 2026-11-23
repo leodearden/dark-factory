@@ -14,6 +14,11 @@ Usage:
     python scripts/offline_lane_soak_report.py [--project-root ROOT] [--since ISO]
         [--command NAME ...] [--json] [--server-url URL] [--recheck-secs N]
 
+--since defaults to the ledger cut-over: the start of the earliest stored pass whose
+effect block records its debts.  That is ε2's go-live (task 6865, when the lane began
+writing ledger rows) while a pre-ε2 record survives retention, otherwise the oldest
+surviving ε2-era pass.  The report names it as ``ledger_cut_over``.
+
 Verdict lines go to stderr; stdout carries the figures, or with --json the full report.
 Run it directly, never via `python -m`: it imports flat siblings in scripts/.
 """
@@ -34,6 +39,10 @@ from typing import Any
 import _checkout as _checkout
 from migrate_metadata_modules_to_files import DEFAULT_SERVER
 from offline_lane_soak_inputs import (
+    DEBT_CALL_SITE_KEY,
+    DEBT_CYCLE_KEY,
+    DEBT_TEST_KEY,
+    DEBT_TRIGGER_KEY,
     SoakInputs,
     TaskReader,
     Unjudgeable,
@@ -64,11 +73,6 @@ from orchestrator.offline_lane_escalations import PENDING_ESCALATION
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY, covering_lane_task
 from orchestrator.offline_lane_records import FailureRecord, PassRecord
 from shared.project_layout import default_project_root
-
-# The de-flake owner's metadata keys, by their PRD section 5.6 names: flake_ledger spells them
-# inline (orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata) with no public constant.
-DEBT_CALL_SITE_KEY = 'flake_debt_call_site'
-DEBT_TRIGGER_KEY = 'flake_debt_trigger'
 
 
 class Verdict(StrEnum):
@@ -120,7 +124,9 @@ def _rules(settings: Settings) -> dict[Check, str]:
         'number no more than the (pass, test) entries they list in threshold_reached',
         Check.LEDGER_ROWS_PER_PASS: 'every test a windowed confirmed outcome lists as reproduced has a '
         'fails_in_isolation row, and every cleared test a passes_in_isolation row, at call site offline_lane '
-        "observed at the pass's start (PRD 5.8); the unconfirmable pseudo-test and the unknown id are exempt",
+        "observed at the pass's start (PRD 5.8); the unconfirmable pseudo-test and the unknown id are exempt; "
+        'a pass started before the ledger cut-over, the earliest stored pass whose effect block records its debts '
+        "(ε2's go-live while a pre-ε2 record survives retention), is not judged and is noted",
         Check.DEFLAKE_TASKS_CARRY_EVIDENCE: 'every owner task of a debt a windowed effect block offered, whose '
         'metadata says flake_debt_call_site offline_lane, carries a flake_debt_trigger and, in its description '
         "or details, the kind and first line of one of that test's failures in the command's pass records; "
@@ -227,20 +233,30 @@ def _owed_rows(record: PassRecord, outcome: Confirmed) -> list[tuple[str, FlakeV
     return [(node, verdict) for node, verdict in owed if node not in exempt]
 
 
+def _before_ledger(inputs: SoakInputs, window_pass: WindowPass) -> bool:
+    """Whether *window_pass* started before the ledger cut-over, or no stored pass records one."""
+    return inputs.ledger_cut_over is None or window_pass.started_at < inputs.ledger_cut_over
+
+
 def _ledger_rows_per_pass(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
     rows = _lane_rows(inputs)
+    cut_over = 'none recorded' if inputs.ledger_cut_over is None else inputs.ledger_cut_over.isoformat()
     examined = 0
     failures: list[str] = []
+    notes: list[str] = []
     for window_pass in inputs.passes:
         record = window_pass.stored.record
         if record is None or not isinstance(window_pass.outcome, Confirmed):
             continue
         owed = _owed_rows(record, window_pass.outcome)
+        if owed and _before_ledger(inputs, window_pass):
+            notes.append(f'not judged, before the ledger cut-over {cut_over}: {_label(window_pass)}')
+            continue
         examined += len(owed)
         missing = [f'{node} ({verdict})' for node, verdict in owed if (node, record.started_at, verdict) not in rows]
         if missing:
             failures.append(f'{_label(window_pass)}: no offline_lane row for ' + ', '.join(missing))
-    return _judged(Check.LEDGER_ROWS_PER_PASS, rule, examined, failures)
+    return _judged(Check.LEDGER_ROWS_PER_PASS, rule, examined, failures, notes)
 
 
 def _live_episodes(inputs: SoakInputs) -> Iterator[Episode]:
@@ -520,6 +536,41 @@ def _lane_debts(inputs: SoakInputs) -> Figure:
     )
 
 
+def _cycle_owner(inputs: SoakInputs, task_id: str) -> dict[str, Any]:
+    task = inputs.tasks.get(task_id)
+    metadata = {} if task is None else _metadata(task)
+    return {
+        'task_id': task_id,
+        'cycle': metadata.get(DEBT_CYCLE_KEY),
+        'call_site': metadata.get(DEBT_CALL_SITE_KEY),
+        'trigger': metadata.get(DEBT_TRIGGER_KEY),
+        'status': None if task is None else task.get('status'),
+    }
+
+
+def _cycle_order(owner: Mapping[str, Any]) -> tuple[bool, int]:
+    """By cycle, an owner with no integer cycle last; the sort is stable, so ties keep the lookup's id order."""
+    cycle = owner['cycle']
+    return (False, cycle) if isinstance(cycle, int) else (True, 0)
+
+
+def _debt_cycle_owners(inputs: SoakInputs) -> Figure:
+    return Figure(
+        'debt_cycle_owners',
+        f'owners: per test a windowed effect block offered, every de-flake task whose metadata.{DEBT_TEST_KEY} '
+        f'names it, any status, by cycle (metadata.{DEBT_CYCLE_KEY}), with its call site, trigger and status now; '
+        'unreadable_metadata: the tasks whose metadata is not an object, so the lookup cannot say whether one owns '
+        'a cycle missing from owners',
+        {
+            'owners': {
+                test: sorted((_cycle_owner(inputs, task_id) for task_id in task_ids), key=_cycle_order)
+                for test, task_ids in inputs.cycle_owners.by_test.items()
+            },
+            'unreadable_metadata': list(inputs.cycle_owners.unreadable),
+        },
+    )
+
+
 def _due_list(inputs: SoakInputs) -> Figure:
     items = [
         {
@@ -657,6 +708,7 @@ _FIGURES: tuple[Callable[[SoakInputs], Figure], ...] = (
     _episodes_by_length,
     _filing_delay,
     _lane_debts,
+    _debt_cycle_owners,
     _due_list,
     _undecided_tests,
     _due_offers_per_pass,
@@ -697,6 +749,7 @@ def _report_json(
         'exit_code': exit_code(inputs, results),
         'unjudgeable': None if judged else inputs.reason,
         'since': inputs.since.isoformat() if judged else None,
+        'ledger_cut_over': inputs.ledger_cut_over.isoformat() if judged and inputs.ledger_cut_over else None,
         'now': now.isoformat(),
         'commands': list(inputs.commands) if judged else [],
         'checks': [
@@ -729,7 +782,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--project-root', type=Path, default=None,
                         help='project whose lane to judge (default: the main checkout)')
     parser.add_argument('--since', type=_instant, default=None,
-                        help='window start, ISO-8601 with an offset (default: the first effect-carrying pass)')
+                        help='window start, ISO-8601 with an offset (default: the ledger cut-over, the earliest '
+                        'stored pass whose effect block records its debts)')
     parser.add_argument('--command', action='append', default=[], dest='commands',
                         help='a lane command name to judge; repeatable (default: every command with records)')
     parser.add_argument('--json', action='store_true', help='print the full report as JSON on stdout')
