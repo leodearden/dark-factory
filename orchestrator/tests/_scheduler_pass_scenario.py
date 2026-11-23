@@ -81,12 +81,14 @@ class TaskStoreMcpSession(HermeticMcpSession):
     absent from the active fetch as in production; ``get_statuses`` omits ids
     the table lacks; ``get_task`` returns the full record. Write tools are
     answered benignly by the parent and logged like every other call.
+    A tool named in ``failing`` answers with an MCP error reply.
     """
 
     def __init__(self, tasks: list[dict], external_statuses: dict[str, str]) -> None:
         super().__init__(tasks=[], external_statuses=external_statuses)
         self._table: dict[str, dict] = {str(t['id']): t for t in tasks}
         self.calls: list[tuple[str, dict]] = []
+        self.failing: set[str] = set()
 
     def set_status(self, task_id: str, status: str) -> None:
         self._table[task_id] = {**self._table[task_id], 'status': status}
@@ -94,8 +96,15 @@ class TaskStoreMcpSession(HermeticMcpSession):
     def count(self, tool: str) -> int:
         return sum(1 for name, _ in self.calls if name == tool)
 
+    @property
+    def writes(self) -> list[tuple[str, dict]]:
+        return [(name, arguments) for name, arguments in self.calls if name in WRITE_TOOLS]
+
     async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
         self.calls.append((name, json.loads(json.dumps(arguments))))
+        if name in self.failing:
+            return {'jsonrpc': '2.0', 'id': self._next_id(),
+                    'result': {'isError': True, 'content': [{'type': 'text', 'text': f'{name} failed'}]}}
         if name == 'get_tasks':
             wanted = arguments.get('statuses')
             rows = [t for t in self._table.values() if wanted is None or t['status'] in wanted]
@@ -246,7 +255,7 @@ def build_scenario(root: Path, *, delivered_checks_enabled: bool = True) -> Scen
     return Scenario(scheduler, session, event_store, override_store, callback_calls, script_counter)
 
 
-def _all_events(store: EventStore) -> list[dict]:
+def all_events(store: EventStore) -> list[dict]:
     rows = [row for event_type in EventType for row in store.fetch_events_by_type(event_type)]
     return sorted(rows, key=lambda row: row['id'])
 
@@ -279,25 +288,25 @@ def _priority_decision(scheduler: Scheduler, task_id: str) -> dict:
             'pin_order': priority.pin_order}
 
 
-def _script_runs(counter: Path) -> int:
+def count_script_runs(counter: Path) -> int:
     return len(counter.read_text().splitlines()) if counter.exists() else 0
 
 
 async def record_passes(scenario: Scenario, passes: int = PASSES) -> PassRecord:
     """Run *passes* ordinary passes, marking each assigned task in-progress, and record them."""
     scheduler, session = scenario.scheduler, scenario.session
-    seen_events = {row['id'] for row in _all_events(scenario.event_store)}
+    seen_events = {row['id'] for row in all_events(scenario.event_store)}
     calls_before, callbacks_before = len(session.calls), len(scenario.callback_calls)
     get_task_calls: list[int] = []
     script_runs: list[int] = []
     records: list[dict] = []
     for _ in range(passes):
         get_tasks_before = session.count('get_task')
-        runs_before = _script_runs(scenario.script_counter)
+        runs_before = count_script_runs(scenario.script_counter)
         assignment = await scheduler.acquire_next()
         if assignment is not None:
             session.set_status(assignment.task_id, 'in-progress')
-        new_events = [row for row in _all_events(scenario.event_store) if row['id'] not in seen_events]
+        new_events = [row for row in all_events(scenario.event_store) if row['id'] not in seen_events]
         seen_events.update(row['id'] for row in new_events)
         records.append({
             'assignment': _assignment_decision(assignment),
@@ -307,7 +316,7 @@ async def record_passes(scenario: Scenario, passes: int = PASSES) -> PassRecord:
         })
         calls_before, callbacks_before = len(session.calls), len(scenario.callback_calls)
         get_task_calls.append(session.count('get_task') - get_tasks_before)
-        script_runs.append(_script_runs(scenario.script_counter) - runs_before)
+        script_runs.append(count_script_runs(scenario.script_counter) - runs_before)
     decisions = {
         'passes': records,
         'overrides': {

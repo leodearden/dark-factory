@@ -1,0 +1,138 @@
+"""The task picture: what the ordinary pass's read parts see, built without writing anything.
+
+plans/early-start-on-predecessor-branch-prd.md §5.4 "From what: the task
+picture", invariant 12, test row 35 (task 10476).
+"""
+
+from __future__ import annotations
+
+import pytest
+from _scheduler_pass_scenario import (
+    BOOSTED,
+    DONE_EXT_DEP,
+    EXPIRED_ROW,
+    GREP_FAIL_DEP,
+    GREP_PASS_DEP,
+    HIGH_DEPENDENT,
+    INHERITING_LOW,
+    PINNED,
+    PLAIN_DONE_DEPENDENT,
+    SCRIPT_DEP,
+    SENTINEL_EXT_DEP,
+    SYNTHETIC_IDS,
+    WATCHDOG_PINNED,
+    all_events,
+    build_scenario,
+    count_script_runs,
+    record_passes,
+)
+from orchestrator.task_picture import TaskPicture
+
+pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.asyncio]
+
+
+async def _picture(scenario) -> TaskPicture:
+    picture = await scenario.scheduler.build_task_picture()
+    assert isinstance(picture, TaskPicture)
+    return picture
+
+
+class TestContents:
+    async def test_dep_statuses_and_records_the_active_fetch_leaves_out(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        assert picture.status_map[GREP_PASS_DEP] == 'done'
+        record = picture.terminal_dep_records[GREP_PASS_DEP]
+        assert record['id'] == GREP_PASS_DEP
+        assert record['metadata']['delivered_checks'][0]['name'] == 'lands'
+        assert GREP_PASS_DEP not in picture.tasks_by_id
+
+    async def test_external_statuses_are_the_resolvers_answer(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        assert picture.external_statuses == {SENTINEL_EXT_DEP: 'unknown_task', DONE_EXT_DEP: 'done'}
+        assert picture.external_resolver_failed is False
+
+    async def test_delivered_checks_are_evaluated_at_main(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        assert picture.delivered_check_cache == {GREP_PASS_DEP: True, GREP_FAIL_DEP: False, SCRIPT_DEP: True}
+
+    async def test_switched_off_delivered_checks_read_as_none(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path, delivered_checks_enabled=False))
+
+        assert picture.delivered_check_cache is None
+
+    async def test_overrides_are_the_ones_in_force(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        assert set(picture.overrides) == {BOOSTED, PINNED}
+        assert {GREP_PASS_DEP, EXPIRED_ROW, WATCHDOG_PINNED}.isdisjoint(picture.overrides)
+
+    async def test_tiers_inherit_and_take_live_boosts_only(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        assert picture.effective_priorities[INHERITING_LOW] == 'high'
+        assert picture.effective_priorities[BOOSTED] == 'high'
+        assert picture.effective_priorities[EXPIRED_ROW] == 'low'
+        assert picture.transitive_counts[INHERITING_LOW] == 1
+        assert picture.transitive_counts[HIGH_DEPENDENT] == 0
+
+    async def test_max_id_and_built_at(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        assert picture.max_id == int(PLAIN_DONE_DEPENDENT)
+        assert picture.built_at == 1000.0
+
+    async def test_its_tiers_are_the_ordinary_passes_tiers(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path / 'a'))
+        twin = build_scenario(tmp_path / 'b')
+        await twin.scheduler.acquire_next()
+
+        for task_id in SYNTHETIC_IDS:
+            assert twin.scheduler.task_priority(task_id).base_tier == picture.effective_priorities.get(task_id)
+
+    async def test_a_failed_task_fetch_gives_no_picture(self, tmp_path):
+        scenario = build_scenario(tmp_path)
+        scenario.session.failing.add('get_tasks')
+
+        assert await scenario.scheduler.build_task_picture() is None
+
+
+class TestWritesNothing:
+    """Row 35: building a picture leaves every store, streak and cache as it was."""
+
+    async def test_no_write_event_override_callback_or_tier_changes(self, tmp_path):
+        scenario = build_scenario(tmp_path)
+        overrides_before = scenario.override_store.get_overrides(scenario.project_root)
+        priorities_before = {tid: scenario.scheduler.task_priority(tid) for tid in SYNTHETIC_IDS}
+
+        await _picture(scenario)
+        await _picture(scenario)
+
+        assert scenario.session.writes == []
+        assert all_events(scenario.event_store) == []
+        assert scenario.override_store.get_overrides(scenario.project_root) == overrides_before
+        assert scenario.callback_calls == []
+        assert {tid: scenario.scheduler.task_priority(tid) for tid in SYNTHETIC_IDS} == priorities_before
+
+    async def test_nothing_it_read_is_cached(self, tmp_path):
+        scenario = build_scenario(tmp_path)
+
+        await _picture(scenario)
+        await _picture(scenario)
+
+        assert scenario.session.count('get_task') == 2 * 4
+        assert count_script_runs(scenario.script_counter) == 2
+
+    async def test_the_next_ordinary_passes_behave_as_if_no_picture_was_built(self, tmp_path):
+        with_picture = build_scenario(tmp_path / 'a')
+        without = build_scenario(tmp_path / 'b')
+
+        await _picture(with_picture)
+        a = await record_passes(with_picture)
+        b = await record_passes(without)
+
+        assert a.decisions == b.decisions
+        assert a.get_task_calls == b.get_task_calls
+        assert a.script_runs == b.script_runs
