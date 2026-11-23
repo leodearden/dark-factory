@@ -616,6 +616,14 @@ class TestWorkflowRecordsTaskGreens:
         return verify
 
     @staticmethod
+    async def _verify_at_site(workflow: TaskWorkflow, *, forked: bool = False) -> None:
+        """Drive the site the scene was built for: the post-rebase re-verify when *forked*, else the implement loop."""
+        if forked:
+            assert await workflow._rebase_before_enqueue() is True
+        else:
+            assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+
+    @staticmethod
     async def _recorded_in(access: CacheAccess, key: UnitKey) -> Entry:
         assert access.registry is not None
         return (await _recorded(access.registry, key))[_TASK_UNIT]
@@ -627,7 +635,7 @@ class TestWorkflowRecordsTaskGreens:
         result, key = _task_green()
         self._verifies(monkeypatch, result)
 
-        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+        await self._verify_at_site(workflow)
 
         [row] = store.fetch_events_by_type(EventType.workflow_verify)
         entry = await self._recorded_in(access, key)
@@ -643,7 +651,7 @@ class TestWorkflowRecordsTaskGreens:
         result, key = _task_green()
         verify = self._verifies(monkeypatch, result)
 
-        assert await workflow._rebase_before_enqueue() is True
+        await self._verify_at_site(workflow, forked=True)
 
         [row] = store.fetch_events_by_type(EventType.workflow_verify)
         entry = await self._recorded_in(access, key)
@@ -658,10 +666,7 @@ class TestWorkflowRecordsTaskGreens:
         config, store, workflow = await self._scene(tmp_path, monkeypatch, forked=forked, verify_cache=None)
         self._verifies(monkeypatch, _task_green()[0])
 
-        if forked:
-            assert await workflow._rebase_before_enqueue() is True
-        else:
-            assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+        await self._verify_at_site(workflow, forked=forked)
 
         assert len(store.fetch_events_by_type(EventType.workflow_verify)) == 1
         assert not registry_db_path(config.project_root).exists()
@@ -672,7 +677,7 @@ class TestWorkflowRecordsTaskGreens:
         _config, store, workflow = await self._scene(tmp_path, monkeypatch, verify_cache=self._access(tmp_path))
         self._verifies(monkeypatch, _result(duration_secs=1.0))
 
-        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+        await self._verify_at_site(workflow)
 
         assert len(store.fetch_events_by_type(EventType.workflow_verify)) == 1
         assert not (tmp_path / 'verify_cache.db').exists()
@@ -683,7 +688,7 @@ class TestWorkflowRecordsTaskGreens:
         self._verifies(monkeypatch, _task_green()[0])
         monkeypatch.setattr(workflow, '_verified_tip', AsyncMock(return_value=TipUnresolved.HEAD_UNREADABLE))
 
-        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+        await self._verify_at_site(workflow)
 
         [row] = store.fetch_events_by_type(EventType.workflow_verify)
         assert row['data']['tip_sha_unresolved'] is True
@@ -699,7 +704,7 @@ class TestWorkflowRecordsTaskGreens:
         )
         verify = self._verifies(monkeypatch, _task_green()[0])
 
-        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+        await self._verify_at_site(workflow)
 
         verify.assert_not_awaited()
         assert store.fetch_events_by_type(EventType.workflow_verify) == []
