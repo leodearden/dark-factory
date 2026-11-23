@@ -56,7 +56,7 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     maybe_escalate_preservation_suppression_storm,
     maybe_escalate_unresolved_corroboration,
 )
-from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE1_CYCLE_SUMMARY_RECON_POOL as _STAGE1_CYCLE_SUMMARY_RECON_POOL,
@@ -1103,13 +1103,12 @@ class MemoryConsolidator(BaseStage):
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
-1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
+1. Within Mem0: identify duplicates, contradictions and stale entries. PROPOSE a duplicate cluster for consolidation (do not merge it by hand); delete or amend stale and contradicted entries.
 2. Within Graphiti: review entity consistency, superseded temporal facts.
 3. Cross-store: check for contradictions between stores. Promote solidified patterns.
 4. Flag any items that are relevant to task planning for Stage 2.
-5. When you have completed your work, produce your final structured report as your response.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     async def _fetch_status(self) -> dict:
         """Fetch store status, logging a WARNING and tracking degradation on failure.
@@ -1211,13 +1210,12 @@ Review the above data and perform memory consolidation:
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
-1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
+1. Within Mem0: identify duplicates, contradictions and stale entries. PROPOSE a duplicate cluster for consolidation (do not merge it by hand); delete or amend stale and contradicted entries.
 2. Within Graphiti: review entity consistency, superseded temporal facts.
 3. Cross-store: check for contradictions between stores. Promote solidified patterns.
 4. Flag any items that are relevant to task planning for Stage 2.
-5. When you have completed your work, produce your final structured report as your response.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     async def _render_required_sections(self) -> str:
         """Render every inference-bearing payload section, in registry order.
@@ -1354,9 +1352,9 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 1. For each finding: investigate the affected IDs, apply the suggested action, verify the fix.
 2. If a finding cannot be resolved, flag it for Stage 2 with an explanation.
 3. Do NOT perform general consolidation — only fix the listed findings.
-4. Report each finding's resolution status in your structured report.
+4. State each finding's resolution status, in the vocabulary of the Remediation Mode rules, in your `complete` summary.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """
 
 

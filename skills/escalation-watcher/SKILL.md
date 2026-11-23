@@ -1956,10 +1956,10 @@ enter through `resolve-answers`, with `--source docket` or `--source terminal`.
    (`scripts/sitting/payloads.py::resolve_issue_payload`): this is Leo's ruling, and the
    resolution text cites it. See "Classify and attribute every close" under "Resolving Escalations".
 4. The `update_task` `x_ruling` payload. Say so when it discloses a value it supersedes.
-5. The pre-built `close-decision` payload, quoting the deciding evidence. `close-decision` requires
-   `--project` and `--escalations-dir` naming the record you READ, and refuses any other record, so
-   run the payload rather than hand-typing the verb. A non-zero exit stops that item's apply; report
-   it to Leo.
+5. The pre-built close payload (`close-decision`, or `file-and-close-decision` for an L2 with no
+   DecisionRecord), quoting the deciding evidence. `close-decision` requires `--project` and
+   `--escalations-dir` naming the record you READ, and refuses any other record, so run the payload
+   rather than hand-typing the verb. A non-zero exit stops that item's apply; report it to Leo.
 6. One `add_memory` as `decisions_and_rationale`, plus a second write carrying the rationale to a
    Mem0 category, because the Graphiti route keeps the conclusion and distills the reasoning away.
 
@@ -1969,12 +1969,14 @@ stops the apply before the registry records an answer. On `park_on_info` the rec
 info-severity: do not retry the park; hold the task with a deferral (AFK shift 1) and report it to
 Leo.
 
-An L2 with no DecisionRecord is filed, then closed, under
-`scripts/sitting/payloads.py::sitting_decision_id`: `<project>-<esc id>`, or `<project>-recon-<esc
-id>` for the recon queue, which is the id `write-decision` stores for the project-local id the
-payload files. Decision ids are fleet-global while escalation numbering restarts per project; see
-"Across *projects*, the same local id is two rows" in "Filing Parked Decisions to the Cockpit
-Registry (C8)".
+An L2 with no DecisionRecord gets a payload of one `file-and-close-decision` run of its
+project-local id (`scripts/sitting/payloads.py::close_decision_argv`): `<esc id>`, or `recon-<esc
+id>` for the recon queue. That run closes the id its own `write-decision` filing landed on:
+`<project>-<local id>`, or a same-project legacy record filed under the bare id before task 4835,
+continued in place. So never hand-split it into `write-decision` plus `close-decision`: the close
+would name an id the filing may not have used. Decision ids are fleet-global while escalation
+numbering restarts per project; see "Across *projects*, the same local id is two rows" in "Filing
+Parked Decisions to the Cockpit Registry (C8)".
 
 #### Findings for another task's owner
 

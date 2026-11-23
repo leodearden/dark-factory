@@ -33,7 +33,7 @@ from typing import Any
 from uuid import uuid4
 
 sys.path.insert(0, "/home/leo/src/runpod-toolkit")
-sys.path.insert(0, "/home/leo/src/dark-factory/orchestrator/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator" / "src"))
 from orchestrator.evals.configs import (
     FINAL_RUN_CONFIGS,
     VLLM_EVAL_CONFIGS,

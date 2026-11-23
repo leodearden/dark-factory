@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _eval_diff_repo import repo_with_commit
 
+from orchestrator.config import PriceEntry
 from orchestrator.evals.cell_sandbox import CellSandbox
 from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.runner import collect_metrics
@@ -133,6 +134,44 @@ class TestDiffStats:
 
         assert (m.lines_changed, m.files_changed) == (-1, -1)
         assert _runner_warnings(caplog)
+
+
+def _glm_cell_workflow(price: PriceEntry) -> MagicMock:
+    """A proxied glm-5.3 cell carrying the measured endpoint__46074e01 counts."""
+    wf = _workflow()
+    wf.config.models.implementer = 'glm-5.3'
+    wf.config.env_overrides = {'ANTHROPIC_BASE_URL': 'https://x'}
+    wf.config.prices = {'glm-5.3': price}
+    wf.metrics.total_input_tokens = 1_193
+    wf.metrics.total_output_tokens = 12_537
+    wf.metrics.total_cache_read_tokens = 1_370_402
+    wf.metrics.total_cache_create_tokens = 13_702
+    wf.metrics.total_cost_usd = 99.0
+    return wf
+
+
+@pytest.mark.asyncio
+class TestCollectMetricsPricesCacheTokens:
+    async def test_cache_tokens_are_priced_at_their_own_rates(self, tmp_path: Path):
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+        price = PriceEntry(
+            input_per_1m=1.40, output_per_1m=4.40,
+            cached_input_per_1m=0.26, cache_write_per_1m=1.40,
+        )
+
+        m = await _collect(repo, base, workflow=_glm_cell_workflow(price))
+
+        assert m.cost_usd == pytest.approx(0.43232032)
+        assert m.cost_source == 'price_table'
+        assert m.cache_read_tokens == 1_370_402
+
+    async def test_missing_cache_rates_label_the_cell(self, tmp_path: Path):
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+        price = PriceEntry(input_per_1m=1.40, output_per_1m=4.40)
+
+        m = await _collect(repo, base, workflow=_glm_cell_workflow(price))
+
+        assert m.cost_source == 'price_table_no_cache_rate'
 
 
 def _zero_work_workflow(variant: ImplementerBriefVariant, iterations: int) -> MagicMock:

@@ -40,7 +40,8 @@ its confirmed evidence:
    audit conclusion is pinned as executable behaviour below so the prompt's
    description of the framework cannot silently drift back out of sync.
 4. ``memories_written`` — a retired counter (``stats_verifier``) the prompt
-   still asks for. Not load-bearing, no repair path, deliberately untouched.
+   no longer asks for; the verifier still recognises it if a model emits it.
+   Not load-bearing, no repair path, deliberately untouched.
 
 **Fail direction.** Corroboration is fail-CLOSED on the increment (an
 unverifiable record does not count) while remaining fail-SAFE for the stage:

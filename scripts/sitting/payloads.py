@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from escalation.models import RESOLUTION_CLASSES
-from orchestrator.decision_registry import UNKNOWN_QUEUE, DecisionState, qualify_decision_id
+from orchestrator.decision_registry import (
+    UNKNOWN_QUEUE,
+    DecisionCloseRefused,
+    refuse_unclosable_arguments,
+)
 from shared.project_id import fold_project_token
 from sitting.inventory import OpenItem, queue_tag
 
@@ -38,7 +42,6 @@ RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'clo
 
 SESSION_REGISTRY_TOOL = 'cli:session_registry'
 FOLLOWUP_SOURCE = 'sitting-preparer'
-CLOSING_STATES = frozenset({DecisionState.ANSWERED, DecisionState.DROPPED})
 MEMORY_DECISION_CATEGORY = 'decisions_and_rationale'
 MEMORY_RATIONALE_CATEGORY = 'observations_and_summaries'
 
@@ -251,37 +254,38 @@ def route_finding_to_owner(owner_task_id: str, owner_status: str, finding: Findi
     )
 
 
-def sitting_decision_id(item: OpenItem) -> str:
-    """The id write-decision stores an unrecorded L2 under: ``<project>[-<queue tag>]-<escalation id>``."""
-    return qualify_decision_id(item.project, _sitting_local_decision_id(item))
-
-
 def close_decision_argv(item: OpenItem, state: str, evidence: str) -> ApplyPayload:
-    """``close-decision`` for *item*'s record, preceded by a ``write-decision`` when *item* has none.
+    """One registry run closing *item*'s decision: ``close-decision`` of its record, else ``file-and-close-decision``.
 
-    The filing passes the project-LOCAL id and ``write-decision`` qualifies it
-    by project, so the close names ``sitting_decision_id``, the id actually
-    stored, and a derived id cannot collide across projects. The close's
-    compare-and-swap, ``--project`` and ``--escalations-dir`` naming the record
-    as read, still guards a linked or legacy record, and the residual case
-    where ``write-decision`` refuses a qualified id held by another project's
-    legacy record fail-soft with exit 0, so the close that follows still runs:
-    there it is a loud non-zero exit rather than a silent close of another
-    project's gate.
+    A linked item names its record and the project read off it. An item with
+    no record is filed under its project-LOCAL id, ``[<queue tag>-]<escalation
+    id>``, and closed in the same run on whatever id that filing landed on:
+    the project-qualified id for a fresh filing, or a same-project legacy
+    record continued in place. So the payload never re-derives write-decision's
+    filing rule.
+
+    Two mechanisms keep the close off another gate. A linked close is
+    guarded by the compare-and-swap, ``--project`` and ``--escalations-dir``
+    naming the record as read. An unlinked one is guarded by write-decision's
+    cross-project rule, which refuses to file over another project's OPEN
+    record, so the run exits non-zero having filed nothing; the compare-and-swap
+    refuses its close only when a MODE-2 enrichment keeps another queue's stamp.
+    Another project's CLOSED record at the qualified id meets neither:
+    write-decision's existing full-overwrite policy files this ask over it,
+    and the run closes that filing.
     """
-    if state not in CLOSING_STATES:
-        raise ValueError(f'close-decision closes to one of {sorted(CLOSING_STATES)}, not {state!r}')
-    if not evidence.strip():
-        raise ValueError('close-decision needs the deciding evidence verbatim')
+    try:
+        refuse_unclosable_arguments(str(item.key), state, evidence)
+    except DecisionCloseRefused as exc:
+        raise ValueError(str(exc)) from exc
     registry = ['python3', str(Path(session_registry.__file__).resolve())]
     if item.decision_id is not None:
-        decision_id, expected_project, filing = item.decision_id, item.decision_project, []
+        argv = [*registry, 'close-decision', '--id', item.decision_id, '--state', str(state), '--evidence', evidence,
+                '--project', item.decision_project, '--escalations-dir', item.queue_dir]
     else:
-        decision_id, expected_project = sitting_decision_id(item), item.project
-        filing = [[*registry, *_write_decision_args(_sitting_local_decision_id(item), item)]]
-    close = [*registry, 'close-decision', '--id', decision_id, '--state', str(state), '--evidence', evidence,
-             '--project', expected_project, '--escalations-dir', item.queue_dir]
-    return ApplyPayload(SESSION_REGISTRY_TOOL, [*filing, close])
+        argv = [*registry, 'file-and-close-decision', *_filing_args(_sitting_local_decision_id(item), item),
+                '--state', str(state), '--evidence', evidence]
+    return ApplyPayload(SESSION_REGISTRY_TOOL, [argv])
 
 
 def render_prepared_marker(marker: PreparedMarker) -> str:
@@ -337,11 +341,10 @@ def _sitting_local_decision_id(item: OpenItem) -> str:
     return '-'.join(part for part in (queue_tag(item.queue_dir), item.escalation_id) if part)
 
 
-def _write_decision_args(local_id: str, item: OpenItem) -> list[str]:
+def _filing_args(local_id: str, item: OpenItem) -> list[str]:
     if item.queue_dir in ('', UNKNOWN_QUEUE):
         raise ValueError(f'write-decision needs the item\'s real queue, not {item.queue_dir!r}')
-    args = ['write-decision', '--id', local_id, '--project', item.project, '--text', item.text,
-            '--escalations-dir', item.queue_dir]
+    args = ['--id', local_id, '--project', item.project, '--text', item.text, '--escalations-dir', item.queue_dir]
     if item.task_id:
         args += ['--task-id', item.task_id]
     if item.escalation_id:

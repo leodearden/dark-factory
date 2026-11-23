@@ -3317,7 +3317,7 @@ class SqliteTaskBackend:
         # carry the STORED done_provenance through verbatim, which can only
         # be judged against the row, so _assert_passthrough_only_keys
         # checks it inside the transaction below. The same floor, from the
-        # same table (_PASSTHROUGH_ONLY_METADATA_KEYS), covers the two defect
+        # same table (_PASSTHROUGH_ONLY_REFUSALS), covers the two defect
         # keys, whose only writers are declare_defect / record_defect_outcome. The gate reads the RAW
         # metadata_mode because _resolve_metadata_mode can itself raise, and
         # resolving first would change which error a bad call surfaces.
@@ -4491,7 +4491,7 @@ def _metadata_object_or_raise(metadata: str | dict, task_id: str | None) -> dict
     return loaded
 
 
-_PASSTHROUGH_ONLY_METADATA_KEYS: Mapping[str, Callable[[str], TaskmasterError]] = (
+_PASSTHROUGH_ONLY_REFUSALS: Mapping[str, Callable[[str], TaskmasterError]] = (
     MappingProxyType(
         {
             'done_provenance': DoneProvenanceWriteAuthorityError,
@@ -4509,10 +4509,13 @@ set_task_status (and the privileged stamp_audit_metadata seam) writes
 defect keys (``fused_memory/backends/defect_records.py``).
 """
 
+PASSTHROUGH_ONLY_METADATA_KEYS: frozenset[str] = frozenset(_PASSTHROUGH_ONLY_REFUSALS)
+"""The key names of :data:`_PASSTHROUGH_ONLY_REFUSALS`, for callers outside this backend."""
+
 
 def _refuse_passthrough_only_keys(incoming: dict, task_id: str) -> None:
     """update_task's pre-connect floor outside replace: any carried key is refused, echo included."""
-    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+    for key, refusal in _PASSTHROUGH_ONLY_REFUSALS.items():
         if key in incoming:
             raise refusal(task_id)
 
@@ -4556,7 +4559,7 @@ def _keys_changed_by_write(
 def _assert_passthrough_only_keys(
     stored_raw: str | None, incoming: dict, task_id: str,
 ) -> None:
-    """Refuse a whole-blob replace that would move any :data:`_PASSTHROUGH_ONLY_METADATA_KEYS` key.
+    """Refuse a whole-blob replace that would move any key of :data:`_PASSTHROUGH_ONLY_REFUSALS`.
 
     The contract: update_task may never ADD, CHANGE or REMOVE one of those
     keys. Under metadata_mode='replace' the payload must carry the stored
@@ -4595,7 +4598,7 @@ def _assert_passthrough_only_keys(
     if not isinstance(stored, dict):
         _refuse_passthrough_only_keys(incoming, task_id)
         return
-    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+    for key, refusal in _PASSTHROUGH_ONLY_REFUSALS.items():
         if not _json_identical(stored.get(key, _ABSENT), incoming.get(key, _ABSENT)):
             raise refusal(task_id)
 

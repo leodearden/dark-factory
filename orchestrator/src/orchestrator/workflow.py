@@ -262,6 +262,8 @@ from orchestrator.verify import (
     run_scoped_verification,
     verify_failure_is_preexisting_on_main,
 )
+from orchestrator.verify_cache.recorder import VerifyEvidenceRef, record_greens
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import (
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,
@@ -1423,6 +1425,7 @@ class TaskWorkflow:
         resume_outcome_sink: ResumeOutcomeSink | None = None,
         task_verify: TaskVerifyPort | None = None,
         task_priority: TaskPriorityLookup | None = None,
+        verify_cache: CacheAccess | None = None,
         stack_target: StackTarget | None = None,
     ):
         self.assignment = assignment
@@ -1453,6 +1456,8 @@ class TaskWorkflow:
         # TaskVerifyDispatcher); None keeps the module-level
         # run_scoped_verification, resolved at call time.
         self._task_verify = task_verify
+        # The dispatcher's verify-result cache, which the pre-merge re-verify joins; None keeps it outside.
+        self._verify_cache = verify_cache
         # Task 9908: the scheduler's tier/pin lookup, recorded on merge_queued;
         # None leaves those keys null.
         self._task_priority = task_priority
@@ -1557,6 +1562,8 @@ class TaskWorkflow:
         self._verify_green_result: VerifyResult | None = None
         # The host whose verdict that green is (task 6670), with the same lifetime.
         self._verify_green_runner: str = LOCAL_RUNNER
+        # The workflow_verify row that green emitted (task 5653), with the same lifetime.
+        self._verify_green_event_id: int | None = None
         # Set by _verify_debugfix_loop when a failure is classified as inherited
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
@@ -2726,7 +2733,7 @@ class TaskWorkflow:
                 and new_state is WorkflowState.REVIEW
                 and not self._verify_checkpoint_hit
             ):
-                self._emit_workflow_verify(
+                self._verify_green_event_id = self._emit_workflow_verify(
                     site=VerifySite.IMPLEMENT,
                     result=self._verify_green_result,
                     passed=True,
@@ -2760,14 +2767,15 @@ class TaskWorkflow:
         tip_sha: str | TipUnresolved,
         base_sha: str | None,
         runner: str,
-    ) -> None:
+    ) -> int | None:
         """Record one task-role verify verdict; both workflow sites emit through here.
 
-        *runner* names the host whose verdict this is (task 6670).
+        *runner* names the host whose verdict this is (task 6670). Returns the
+        emitted row's id, or None when there is no store or the emit failed.
         """
         if self.event_store is None:
-            return
-        self.event_store.emit(
+            return None
+        return self.event_store.emit(
             EventType.workflow_verify,
             task_id=self.task_id,
             data=workflow_verify_event_data(
@@ -2779,6 +2787,24 @@ class TaskWorkflow:
                 site=site,
                 runner=runner,
             ),
+        )
+
+    async def _record_task_verify_cache(
+        self, result: VerifyResult | None, event_id: int | None, tip: str | TipUnresolved,
+    ) -> None:
+        """Record *result*'s admitted greens into the joined cache, citing the workflow_verify row *event_id* at *tip*.
+
+        Records nothing outside the cache, without a cache record, a row id, or
+        a resolved tip. The task role writes no consumed rows: I6 is merge-role only.
+        """
+        registry = self._verify_cache.registry if self._verify_cache is not None else None
+        if registry is None or result is None or result.cache_record is None or event_id is None or not isinstance(tip, str):
+            return
+        assert self.event_store is not None  # event_id is one of its rows
+        await record_greens(
+            registry, result.cache_record,
+            flake_suppressed=result.flake_suppression is not None,
+            evidence=VerifyEvidenceRef(event_id, self.event_store.run_id, tip, result.passed),
         )
 
     async def _restamp_branch_base_if_no_own_commits(self) -> bool:
@@ -4218,10 +4244,12 @@ class TaskWorkflow:
                 role='task',
                 task_id=self.task_id,
                 event_store=self.event_store,
+                # It does not go through TaskVerifyDispatcher, so it joins the harness's cache directly.
+                verify_cache=self._verify_cache,
             )
         if self.event_store is not None:
             tip = await self._verified_tip('the post-rebase re-verify')
-            self._emit_workflow_verify(
+            event_id = self._emit_workflow_verify(
                 site=VerifySite.PRE_MERGE,
                 result=verify,
                 passed=verify.passed,
@@ -4229,6 +4257,7 @@ class TaskWorkflow:
                 base_sha=None if isinstance(tip, TipUnresolved) else await self.git_ops.merge_base_with_main(tip),
                 runner=LOCAL_RUNNER,
             )
+            await self._record_task_verify_cache(verify, event_id, tip)
         if not verify.passed:
             if verify.timed_out:
                 logger.warning(
@@ -9008,6 +9037,7 @@ class TaskWorkflow:
             self._verify_green_tip_sha = TipUnresolved.NOT_CAPTURED
             self._verify_green_result = None
             self._verify_green_runner = LOCAL_RUNNER
+            self._verify_green_event_id = None
             self._enter_phase(WorkflowState.VERIFY)
             if self.event_store is not None:
                 tip = await self._head_commit_or_none('the VERIFY checkpoint lookup')
@@ -9059,6 +9089,9 @@ class TaskWorkflow:
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
+            await self._record_task_verify_cache(
+                self._verify_green_result, self._verify_green_event_id, self._verify_green_tip_sha,
+            )
             # Tree-hash verdict cache (task 2749): if a non-blocking verdict
             # is already recorded for HEAD's committed tree hash — from a
             # prior dispatch that reviewed byte-identical content — skip the
@@ -19821,6 +19854,7 @@ def build_workflow(
     resume_outcome_sink: ResumeOutcomeSink | None = None,
     task_verify: TaskVerifyPort | None = None,
     task_priority: TaskPriorityLookup | None = None,
+    verify_cache: CacheAccess | None = None,
     stack_target: StackTarget | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
@@ -19859,5 +19893,6 @@ def build_workflow(
         resume_outcome_sink=resume_outcome_sink,
         task_verify=task_verify,
         task_priority=task_priority,
+        verify_cache=verify_cache,
         stack_target=stack_target,
     )

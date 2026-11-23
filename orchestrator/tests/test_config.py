@@ -3597,6 +3597,17 @@ class TestPriceEntry:
         with pytest.raises(ValidationError):
             PriceEntry(input_per_1m=1, output_per_1m=1, cached_input_per_1m=-0.5)
 
+    def test_cache_write_rate_validates(self):
+        entry = PriceEntry(input_per_1m=1.4, output_per_1m=4.4, cache_write_per_1m=1.4)
+        assert entry.cache_write_per_1m == 1.4
+
+    def test_cache_write_rate_is_optional(self):
+        assert PriceEntry(input_per_1m=1.10, output_per_1m=4.40).cache_write_per_1m is None
+
+    def test_negative_cache_write_rate_rejected(self):
+        with pytest.raises(ValidationError):
+            PriceEntry(input_per_1m=1, output_per_1m=1, cache_write_per_1m=-0.5)
+
 
 class TestOrchestratorConfigPrices:
     """OrchestratorConfig.prices is seeded from the packaged defaults.yaml

@@ -291,6 +291,7 @@ from orchestrator.task_status import (
 )
 from orchestrator.task_verify_dispatch import TaskVerifyDispatcher, policy_from_config
 from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_hosts import HostPool, remote_runner_factory, task_verify_hosts
 from orchestrator.verify_runner import RunnerUnavailable
@@ -2197,8 +2198,10 @@ class Harness:
             quarantine=self._runner_quarantine,
             on_unavailable=self._bench_verify_host,
         )
+        self._verify_cache = CacheAccess.on_dispatcher(config.project_root, deployed=deployed_sha)
         self._task_verify_dispatcher = TaskVerifyDispatcher(
             self._host_pool, self.git_ops, policy_of=policy_from_config,
+            verify_cache=self._verify_cache,
         )
         self._abandoned_member_sweep = AbandonedMemberSweep()
         # This unit's side of the restart drain (task 5371): steers the merge
@@ -10614,6 +10617,7 @@ class Harness:
                 cancel_event=cancel_event,
                 task_verify=self._task_verify_dispatcher,
                 task_priority=self._task_priority,
+                verify_cache=self._verify_cache,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
                 # ε (task 3733): the harness IS the sink — it owns the streak,
@@ -12243,7 +12247,7 @@ class Harness:
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
-        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER, SpeculativeMergeWorker
 
         # K = verify hosts + 1 counts the frontier and sizes the worker's
         # speculation cap (speculation_depth).  Leased verifies are bounded by
@@ -12324,6 +12328,7 @@ class Harness:
             usage_gate=getattr(self, 'usage_gate', None),
             cost_store=getattr(self, 'cost_store', None),
             provenance_conflict_sink=self._provenance_conflict_sink,
+            verifier=PRODUCTION_VERIFIER.joined_to(self._verify_cache),
             deployed_sha=self._deployed_sha,
             verify_hosts=[r.name for r in self.config.verify_runners],
             runner_quarantine=self._runner_quarantine,

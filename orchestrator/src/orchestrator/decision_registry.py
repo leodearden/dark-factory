@@ -575,6 +575,23 @@ class DecisionCloseRefused(Exception):
     """
 
 
+def refuse_unclosable_arguments(decision_id: str, state: str, evidence: str) -> None:
+    """Raise DecisionCloseRefused unless *state* is a closing state and *evidence* is non-blank.
+
+    The close arguments no record could ever accept, checked without reading
+    one: close_decision_with_evidence runs it before its lock, and the
+    file-and-close-decision verb before its filing.
+    """
+    if state not in CLOSING_DECISION_STATES:
+        raise DecisionCloseRefused(
+            f'{decision_id}: close-decision closes to answered or dropped, not {str(state)!r}'
+        )
+    if not evidence.strip():
+        raise DecisionCloseRefused(
+            f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
+        )
+
+
 def close_decision_with_evidence(
     decision_id: str,
     state: str,
@@ -612,14 +629,7 @@ def close_decision_with_evidence(
     Concurrency: serialized per-decision-id via _mutate_decision, see
     DecisionRecord's docstring.
     """
-    if state not in CLOSING_DECISION_STATES:
-        raise DecisionCloseRefused(
-            f'{decision_id}: close-decision closes to answered or dropped, not {str(state)!r}'
-        )
-    if not evidence.strip():
-        raise DecisionCloseRefused(
-            f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
-        )
+    refuse_unclosable_arguments(decision_id, state, evidence)
 
     wanted = _decision_identity(expected_project, expected_escalations_dir)
 

@@ -8,7 +8,14 @@ from pathlib import Path
 import pytest
 from escalation.models import RESOLUTION_CLASSES
 from escalation.shadow_ruling import SHADOW_RULING_MARKER
-from orchestrator.decision_registry import DecisionRecord, decision_path_for_id, qualify_decision_id
+from orchestrator.decision_registry import (
+    DecisionRecord,
+    decision_path_for_id,
+    decisions_dir,
+    list_decisions,
+    normalize_escalations_dir,
+    write_decision,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import payloads as mod
 from sitting.inventory import OpenItem, decision_key, escalation_key, queue_tag
@@ -277,31 +284,55 @@ class TestCloseDecisionArgv:
     @pytest.mark.parametrize(
         ('queue_dir', 'local_id'), [(DF_QUEUE, 'esc-4803-2'), (DF_RECON_QUEUE, 'recon-esc-4803-2')]
     )
-    def test_an_unlinked_item_is_filed_and_closed_under_the_derived_id(self, queue_dir, local_id):
+    def test_an_unlinked_item_is_one_file_and_close_run_of_its_local_id(self, queue_dir, local_id):
         item = _l2(queue_dir)
 
-        write, close = _argvs(mod.close_decision_argv(item, 'dropped', 'Leo: drop it'))
+        (argv,) = _argvs(mod.close_decision_argv(item, 'dropped', 'Leo: drop it'))
 
-        assert (write[2], close[2]) == ('write-decision', 'close-decision')
-        assert _flag(write, '--id') == local_id
-        assert _flag(close, '--id') == mod.sitting_decision_id(item)
-        assert _flag(close, '--id') == qualify_decision_id(item.project, local_id)
-        for argv in (write, close):
-            assert _flag(argv, '--project') == item.project
-            assert _flag(argv, '--escalations-dir') == item.queue_dir
-        assert _flag(write, '--escalation-id') == 'esc-4803-2'
+        assert argv[2] == 'file-and-close-decision'
+        assert _flag(argv, '--id') == local_id
+        assert _flag(argv, '--project') == item.project
+        assert _flag(argv, '--escalations-dir') == item.queue_dir
+        assert _flag(argv, '--escalation-id') == 'esc-4803-2'
+        assert (_flag(argv, '--state'), _flag(argv, '--evidence')) == ('dropped', 'Leo: drop it')
+        assert 'close-decision' not in argv
+        assert 'write-decision' not in argv
 
     @pytest.mark.parametrize('queue_dir', [DF_QUEUE, DF_RECON_QUEUE])
     def test_the_filed_record_is_the_one_the_close_names(self, tmp_path, monkeypatch, queue_dir):
         monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-        item = _l2(queue_dir)
-        write, close = _argvs(mod.close_decision_argv(item, 'answered', 'gate evidence'))
+        argvs = _argvs(mod.close_decision_argv(_l2(queue_dir), 'answered', 'gate evidence'))
 
-        assert session_registry.main(write[2:]) == 0
-        assert session_registry.main(close[2:]) == 0
+        assert [session_registry.main(argv[2:]) for argv in argvs] == [0] * len(argvs)
 
-        path = decision_path_for_id(_flag(close, '--id'), root=tmp_path)
-        record = DecisionRecord.from_json(path.read_text())
+        (record,) = [
+            r for r in list_decisions(root=tmp_path)
+            if r.escalation_id == 'esc-4803-2' and r.escalations_dir == normalize_escalations_dir(queue_dir)
+        ]
+        assert (record.state, record.closing_evidence) == ('answered', 'gate evidence')
+
+    @pytest.mark.parametrize(
+        ('state', 'escalations_dir'),
+        [('dropped', ''), ('open', normalize_escalations_dir(DF_QUEUE))],
+        ids=['closed-unstamped', 'open-same-queue'],
+    )
+    def test_a_same_project_legacy_record_at_the_bare_id_is_continued_and_closed(
+        self, tmp_path, monkeypatch, state, escalations_dir
+    ):
+        """Task 7495: a record filed before ids were qualified by project is the one the close lands on."""
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        item = _l2(DF_QUEUE)
+        legacy = DecisionRecord(
+            id='esc-4803-2', project='dark_factory', text='old ask', filed_at='2026-08-01T00:00:00+00:00',
+            escalation_id='esc-4803-2', state=state, escalations_dir=escalations_dir,
+        )
+        write_decision(legacy, root=tmp_path)
+        argvs = _argvs(mod.close_decision_argv(item, 'answered', 'gate evidence'))
+
+        assert [session_registry.main(argv[2:]) for argv in argvs] == [0] * len(argvs)
+
+        assert sorted(path.name for path in decisions_dir(tmp_path).glob('*.json')) == ['esc-4803-2.json']
+        record = DecisionRecord.from_json(decision_path_for_id('esc-4803-2', root=tmp_path).read_text())
         assert (record.state, record.closing_evidence) == ('answered', 'gate evidence')
 
     @pytest.mark.parametrize('evidence', ['', '   '])
@@ -314,39 +345,38 @@ class TestCloseDecisionArgv:
             mod.close_decision_argv(_l2(), 'open', 'evidence')
 
 
-class TestSittingDecisionId:
-    def test_a_primary_queue_prefixes_the_project(self):
-        assert mod.sitting_decision_id(_l2()) == 'dark_factory-esc-4803-2'
+class TestUnlinkedFilingId:
+    """The project-LOCAL id an unlinked item's payload files; write-decision alone qualifies it by project."""
+
+    def _filed(self, item: OpenItem) -> str:
+        (argv,) = _argvs(mod.close_decision_argv(item, 'answered', 'gate evidence'))
+        return _flag(argv, '--id')
+
+    def test_a_primary_queue_files_the_bare_escalation_id(self):
+        assert self._filed(_l2()) == 'esc-4803-2'
 
     def test_a_recon_queue_adds_its_tag(self):
-        assert mod.sitting_decision_id(_l2(DF_RECON_QUEUE)) == 'dark_factory-recon-esc-4803-2'
+        assert self._filed(_l2(DF_RECON_QUEUE)) == 'recon-esc-4803-2'
 
     def test_any_other_queue_adds_its_digest_tag(self):
-        item = _l2('/elsewhere/queue')
+        assert self._filed(_l2('/elsewhere/queue')) == f'{queue_tag("/elsewhere/queue")}-esc-4803-2'
 
-        assert mod.sitting_decision_id(item) == f'dark_factory-{queue_tag("/elsewhere/queue")}-esc-4803-2'
-
-    def test_one_escalation_id_in_two_projects_or_two_queues_gives_distinct_ids(self):
-        ids = {
-            mod.sitting_decision_id(_l2()),
-            mod.sitting_decision_id(_l2(DF_RECON_QUEUE)),
-            mod.sitting_decision_id(_l2('/src/know-live/data/escalations', project='know_live')),
-        }
+    def test_one_escalation_id_in_three_queues_gives_distinct_ids(self):
+        ids = {self._filed(_l2(queue_dir)) for queue_dir in (DF_QUEUE, DF_RECON_QUEUE, '/elsewhere/queue')}
 
         assert len(ids) == 3
 
     @pytest.mark.parametrize('queue_dir', [DF_QUEUE, DF_RECON_QUEUE, '/elsewhere/queue'])
     def test_the_id_survives_the_registrys_sanitiser(self, tmp_path, queue_dir):
-        derived = mod.sitting_decision_id(_l2(queue_dir))
+        local = self._filed(_l2(queue_dir))
 
-        assert decision_path_for_id(derived, root=tmp_path).stem == derived
+        assert decision_path_for_id(local, root=tmp_path).stem == local
 
-    def test_an_item_with_no_escalation_id_is_refused(self):
-        item = OpenItem(key=decision_key('lone'), decision_id='lone', decision_project='dark_factory',
-                        project='dark_factory')
+    def test_an_item_with_no_decision_and_no_escalation_id_is_refused(self):
+        item = OpenItem(key=decision_key('lone'), project='dark_factory', queue_dir=DF_QUEUE)
 
-        with pytest.raises(ValueError):
-            mod.sitting_decision_id(item)
+        with pytest.raises(ValueError, match='only an escalation item'):
+            mod.close_decision_argv(item, 'answered', 'gate evidence')
 
 
 class TestMarkers:

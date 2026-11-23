@@ -9,8 +9,8 @@ from fused_memory.reconciliation.graphiti_degradation_probe import (
 )
 from fused_memory.reconciliation.policies import CONTAMINATION_CEILING_RETIRED_PROJECTS
 from fused_memory.reconciliation.prompts import (
-    _STAGE3_PROJECT_ID_GUIDELINE,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    PROJECT_ID_GUIDELINE,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
     render_finding_severity_vocabulary,
@@ -123,7 +123,7 @@ divergence between stores, or knowledge gaps.
 - Sample broadly: check a representative set, not just flagged items.
 - Report findings with specific evidence (IDs, content, contradictions).
 - Classify severity: {render_finding_severity_vocabulary()}.
-- {_STAGE3_PROJECT_ID_GUIDELINE}
+- {PROJECT_ID_GUIDELINE}
 
 {render_graphiti_degradation_probe_section(runs_probes=False)}
 

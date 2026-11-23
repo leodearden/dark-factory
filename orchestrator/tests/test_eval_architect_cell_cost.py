@@ -255,13 +255,53 @@ class TestArchitectCellResolvesCostProvenance:
         assert persisted['cost_usd'] != pytest.approx(99.0)
         assert result.metrics['cost_source'] == 'price_table'
 
+    async def test_priced_proxied_candidate_prices_its_cache_tokens(self):
+        """The architect's cache reads and writes are priced at their own
+        rates, not dropped from the figure."""
+        result, mocks = await run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(PROXY_ENV)),
+            produced_plan=well_formed_plan(),
+            arch_result=token_agent_result(
+                1_000_000, 500_000,
+                cache_read_tokens=2_000_000, cache_create_tokens=100_000, cost_usd=99.0,
+            ),
+            orch_prices={'qwen3-coder': {
+                'input_per_1m': 0.30, 'output_per_1m': 1.20,
+                'cached_input_per_1m': 0.03, 'cache_write_per_1m': 0.30,
+            }},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(0.30 + 0.60 + 0.06 + 0.03)
+        assert persisted['cost_usd'] == pytest.approx(0.99)
+        assert persisted['cost_source'] == 'price_table'
+        assert result.metrics['cost_source'] == 'price_table'
+
+    async def test_cache_only_cell_is_still_priced(self):
+        """A cell whose only spend is cache tokens is priced, not short-cut to
+        a $0.00 'cli' figure as though nothing had been spent."""
+        cached_rate = 0.03
+        result, mocks = await run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(PROXY_ENV)),
+            produced_plan=well_formed_plan(),
+            arch_result=token_agent_result(0, 0, cache_read_tokens=2_000_000, cost_usd=0.0),
+            orch_prices={'qwen3-coder': {
+                'input_per_1m': 0.30, 'output_per_1m': 1.20, 'cached_input_per_1m': cached_rate,
+            }},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(2_000_000 * cached_rate / 1e6)
+        assert persisted['cost_source'] == 'price_table'
+        assert result.metrics['cost_source'] == 'price_table'
+
     async def test_unpriced_proxied_candidate_warns_and_uses_defined_fallback(
         self, caplog,
     ):
         """A proxied candidate with NO price entry degrades to the DEFINED
-        ``_FALLBACK_PRICE`` and says so loudly — never a silent raw-CLI
+        ``FALLBACK_PRICE`` and says so loudly — never a silent raw-CLI
         number (the loud-over-silent-degradation norm)."""
-        from orchestrator.evals.metrics import _FALLBACK_PRICE
+        from orchestrator.agents.token_pricing import FALLBACK_PRICE
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
             result, mocks = await run_architect_eval_hermetic(
@@ -275,8 +315,8 @@ class TestArchitectCellResolvesCostProvenance:
         # change updates this expectation instead of leaving a stale magic
         # number (the single-home discipline of task 2459).
         expected = (
-            1_000_000 * _FALLBACK_PRICE['input_per_1m']
-            + 500_000 * _FALLBACK_PRICE['output_per_1m']
+            1_000_000 * FALLBACK_PRICE['input_per_1m']
+            + 500_000 * FALLBACK_PRICE['output_per_1m']
         ) / 1_000_000
         persisted = mocks['save'].call_args.args[0].metrics
         assert persisted['cost_source'] == 'unpriced_proxy'

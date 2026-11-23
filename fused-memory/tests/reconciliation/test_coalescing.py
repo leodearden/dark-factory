@@ -156,6 +156,8 @@ _KEY_FOR_FULL_PAYLOAD: dict[EventType, str | None] = {
     EventType.followup_held: None,
     EventType.followup_hold_backfilled: None,
     EventType.followup_holder_protected: None,
+    EventType.followup_promoted: None,
+    EventType.followup_promotion_deferred: None,
 }
 
 

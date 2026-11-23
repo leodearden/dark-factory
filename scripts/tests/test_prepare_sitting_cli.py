@@ -316,10 +316,10 @@ class TestRecommendOnly:
         assert resolve['args']['ruled_by_human'] is True
         assert resolve['args']['resolution_class'] in RESOLUTION_CLASSES
         assert close['tool'] == 'cli:session_registry'
-        argv = close['args'][-1]
-        assert argv[argv.index('close-decision') + 1:argv.index('close-decision') + 5] == [
-            '--id', f'{fold_project_token(env.df.name)}-esc-400-1', '--state', 'answered',
-        ]
+        (argv,) = close['args']
+        assert argv[2] == 'file-and-close-decision'
+        assert argv[argv.index('--id') + 1] == 'esc-400-1'
+        assert argv[argv.index('--state') + 1] == 'answered'
         assert argv[argv.index('--project') + 1] == closeable['esc-400-1']['project']
         assert argv[argv.index('--escalations-dir') + 1] == normalize_escalations_dir(env.queue)
         assert 'gate 6 sideways_check_ran: held' in argv[argv.index('--evidence') + 1]
@@ -370,7 +370,7 @@ class TestCloseCollision:
 
         runs = self._apply_the_close(env, capsys)
 
-        assert [run.returncode for run in runs] == [0, 0], [run.stderr for run in runs]
+        assert [run.returncode for run in runs] == [0], [run.stderr for run in runs]
         after = self._decision_files(env)
         closed = DecisionRecord.from_json(after.pop(f'{derived}.json').decode())
         assert after == before
@@ -383,15 +383,35 @@ class TestCloseCollision:
         other = self._seed_other_project(env, f'{fold_project_token(env.df.name)}-esc-400-1')
         before = self._decision_files(env)
 
-        write, close = self._apply_the_close(env, capsys)
+        (run,) = self._apply_the_close(env, capsys)
 
-        assert write.returncode == 0
-        assert close.returncode != 0
-        assert 'close-decision refused' in close.stderr
-        assert 'know_live' in close.stderr
+        assert run.returncode != 0
+        assert 'know_live' in run.stderr
         assert self._decision_files(env) == before
         untouched = DecisionRecord.from_json(other.read_text())
         assert (untouched.state, untouched.closing_evidence, untouched.closed_at) == ('open', '', '')
+
+    def test_a_same_project_legacy_record_at_the_bare_id_is_continued_and_closed(self, env, capsys):
+        """Task 7495: a closed record filed before ids were qualified by project stays unlinked, and still closes."""
+        project = fold_project_token(env.df.name)
+        legacy = DecisionRecord(id='esc-400-1', project=project, text='the earlier ask',
+                                filed_at='2026-08-01T09:00:00+00:00', state='dropped', escalation_id='esc-400-1',
+                                escalations_dir='')
+        (env.fleet / 'decisions' / 'esc-400-1.json').write_text(legacy.to_json())
+        names_before = set(self._decision_files(env))
+
+        (row,) = [r for r in _classify(capsys, env, '--apply-closes')['closeable'] if r['escalation_id'] == 'esc-400-1']
+        assert row['decision_id'] is None
+        runs = self._apply_the_close(env, capsys)
+
+        assert [run.returncode for run in runs] == [0], [run.stderr for run in runs]
+        files = self._decision_files(env)
+        assert set(files) == names_before
+        closed = DecisionRecord.from_json(files['esc-400-1.json'].decode())
+        assert closed.state == 'answered'
+        assert closed.closing_evidence
+        assert datetime.fromisoformat(closed.closed_at).tzinfo is not None
+        assert closed.escalations_dir == normalize_escalations_dir(env.queue)
 
 
 def _snapshot(*roots: Path) -> dict[Path, tuple[bytes, int]]:
