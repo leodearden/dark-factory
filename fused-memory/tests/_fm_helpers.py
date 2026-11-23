@@ -164,6 +164,8 @@ class MockEdge:
     # tests can express that signature (task 4714).
     expired_at: Any = None
     created_at: Any = None
+    # EntityEdge.group_id: the graph partition the edge is stored under (= project_id).
+    group_id: str | None = None
 
 
 @dataclass
