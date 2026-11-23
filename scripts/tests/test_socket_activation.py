@@ -42,15 +42,36 @@ def test_the_port_is_held_before_the_child_ever_listens() -> None:
     assert proc.poll() is not None
 
 
+def _first_bytes_from(port: int) -> bytes:
+    """What a loopback server on port sends first; b"" if it refuses or drops us."""
+    try:
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            return client.recv(64)
+    except ConnectionError:
+        return b""
+
+
 def test_the_child_serves_on_fd_3_addressed_to_its_own_pid(tmp_path: Path) -> None:
+    child_log = tmp_path / "child.log"
     stale = {**os.environ, "LISTEN_PID": "1", "LISTEN_FDNAMES": "stale"}
     with (
-        (tmp_path / "child.log").open("wb") as log,
+        child_log.open("wb") as log,
         socket_activated(
             lambda port: [sys.executable, "-I", "-c", _SERVE_ONE_GREETING_ON_FD_3, str(port)],
             env=stale,
             output=log,
         ) as (_proc, port),
-        socket.create_connection(("127.0.0.1", port)) as client,
     ):
-        assert client.recv(64) == b"served-on-fd-3"
+        greeting = _first_bytes_from(port)
+    assert greeting == b"served-on-fd-3", f"child log:\n{child_log.read_text()}"
+
+
+def test_the_child_holds_the_only_copy_of_the_listener() -> None:
+    with socket_activated(
+        lambda _port: [sys.executable, "-I", "-c", "pass"],
+        env=dict(os.environ),
+        output=subprocess.DEVNULL,
+    ) as (proc, port):
+        proc.wait()
+        with pytest.raises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", port)).close()
