@@ -82,7 +82,7 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
     'justification until it is offloaded.',
     _occurrence_keys(row[:3] for row in loop_blocking_allowlist.AUDITED_SITES),
     default=Debt(TaskRef(5270)),
-    default_covers=30,
+    default_covers=28,
     dispositions={
         'fused-memory/src/fused_memory/mcp_tools/scheduler_state.py::read_scheduler_events::14947dd93734': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator._invoke_curator::2be781b317a0': Debt(TaskRef(7572)),

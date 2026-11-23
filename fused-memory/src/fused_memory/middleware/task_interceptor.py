@@ -5485,7 +5485,7 @@ class TaskInterceptor:
                     edge, target_id=sibling_task, justification=onto_sibling,
                 )
             case 'combine', _:
-                self._audit_unmade_batch_combine(edge, sibling, ticket=ticket, candidate=candidate)
+                await self._audit_unmade_batch_combine(edge, sibling, ticket=ticket, candidate=candidate)
                 return CuratorDecision(
                     action='create',
                     justification=(
@@ -5511,7 +5511,8 @@ class TaskInterceptor:
         A drop rewrites nothing, so ``new`` repeats ``old``, read live from the
         target, and its items are the target's before and after. Best-effort
         like every audit row: a failed read or a malformed stored bundle logs
-        a WARNING, writes no row, and never changes the drop.
+        a WARNING, writes no row, and never changes the drop. The append runs
+        off the event loop.
         """
         try:
             tm = await self._ensure_taskmaster()
@@ -5535,7 +5536,8 @@ class TaskInterceptor:
         )
         if context is None:
             return
-        _append_combine_audit(
+        await asyncio.to_thread(
+            _append_combine_audit,
             project_id=ticket.project_id,
             target_id=target_id,
             old_title=title,
@@ -5548,7 +5550,7 @@ class TaskInterceptor:
         )
 
     @staticmethod
-    def _audit_unmade_batch_combine(
+    async def _audit_unmade_batch_combine(
         edge: CuratorDecision,
         sibling: _TicketLifecycle,
         *,
@@ -5560,6 +5562,7 @@ class TaskInterceptor:
         ``old`` is the sibling's candidate and terminal ticket status, and
         ``target_id`` the task it resolved to, if any. The candidate is created
         with its own items, so ``items_after`` is its keys and nothing is lost.
+        The append runs off the event loop.
         """
         logger.warning(
             '_resolve_batch_edge: ticket %s combines into ticket %s, which was %s and '
@@ -5582,7 +5585,8 @@ class TaskInterceptor:
                 ticket.metadata, source='TaskInterceptor._audit_unmade_batch_combine',
             ) or {},
         )
-        _append_combine_audit(
+        await asyncio.to_thread(
+            _append_combine_audit,
             project_id=ticket.project_id,
             target_id=sibling.task_id,
             old_title=old_title,
