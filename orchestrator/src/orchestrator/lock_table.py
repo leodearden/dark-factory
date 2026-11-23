@@ -62,6 +62,34 @@ class UncontestedAcquisition:
             raise ValueError(f'lock keys {both} cannot be both acquired and contested')
 
 
+@dataclass(frozen=True)
+class SuccessorRelation:
+    """An early-started dependent and the predecessor whose single-holder keys it shares.
+
+    ``plans/early-start-on-predecessor-branch-prd.md`` section 5.2: on a key
+    that allows one holder, neither member counts the other; every other
+    requester counts both.
+    """
+
+    successor: str
+    predecessor: str
+
+    def __post_init__(self) -> None:
+        if self.successor == self.predecessor:
+            raise ValueError(
+                f'task {self.successor!r} cannot be the successor of itself '
+                f'(predecessor {self.predecessor!r})'
+            )
+
+    def partner_of(self, task_id: str) -> str | None:
+        """The other member when *task_id* is one, else None."""
+        if task_id == self.successor:
+            return self.predecessor
+        if task_id == self.predecessor:
+            return self.successor
+        return None
+
+
 def one_holder_per_key(held_by_task: Mapping[str, Iterable[str]]) -> dict[str, str]:
     """``{key: task_id}`` from ``{task_id: keys}``: a key several tasks hold names only the last one iterated."""
     return {key: task_id for task_id, keys in held_by_task.items() for key in keys}
@@ -87,6 +115,8 @@ class ModuleLockTable:
     ):
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
+        # Each member of a live successor relation -> that relation.
+        self._relations: dict[str, SuccessorRelation] = {}
         # normalized_module -> LIFO stack of (owner_task_id, priority_rank).
         # Top = last element = the ACTIVE reservation.  Preemption by an entry
         # with a smaller _ParkKey PUSHES (shadows) the top entry instead of
@@ -131,9 +161,44 @@ class ModuleLockTable:
             and any(self._conflicts(held, module) for held in task_modules)
         }
 
-    def _count_conflicts(self, module: str, exclude_task: str | None = None) -> int:
-        """Count how many *other* tasks hold a lock that conflicts with ``module``."""
-        return len(self._conflicting_holders(module, exclude_task=exclude_task))
+    def _holders_counted_against(
+        self, module: str, requester: str, partner: str | None
+    ) -> set[str]:
+        """The holders of ``module`` that count against *requester*'s holder limit.
+
+        The plain :meth:`_conflicting_holders`, less *partner*, *requester*'s
+        successor partner, when ``module`` allows one holder (PRD section
+        5.2).  The one home of that exception: both acquires and
+        :meth:`blocking_holders` count through here, so the gates and the views
+        naming blockers cannot disagree (INV-5).  The reservation paths keep
+        the plain count.
+        """
+        holders = self._conflicting_holders(module, exclude_task=requester)
+        if partner is not None and self._limit_for(module) == 1:
+            holders.discard(partner)
+        return holders
+
+    def _admits(
+        self,
+        task_id: str,
+        modules: Iterable[str],
+        *,
+        partner: str | None,
+        admitted_parks: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Would every one of the normalized *modules* pass the held-lock gate and the park gate now?
+
+        *partner* is *task_id*'s successor partner, the one holder the gate
+        sets aside on a single-holder key (:meth:`_holders_counted_against`).
+        """
+        for module in modules:
+            # INV-3: live held-lock state, never bypassed by admitted_parks.
+            counted = self._holders_counted_against(module, task_id, partner)
+            if len(counted) >= self._limit_for(module):
+                return False
+            if self._is_parked_blocks(module, task_id, ignore_owners=admitted_parks):
+                return False
+        return True
 
     # --- Park (reservation) helpers ---
 
@@ -319,13 +384,15 @@ class ModuleLockTable:
 
         Honours ``_limit_for`` rather than mere presence: a module with
         headroom (``max_per_module`` > current holders) is free to take, so it
-        contributes no wait.  Built from the existing ``_conflicting_holders``
-        / ``_limit_for`` pair — no third conflict rule.
+        contributes no wait.  Built from the acquires' own
+        ``_holders_counted_against`` / ``_limit_for`` pair — no third conflict
+        rule.
         """
         depth = self._config.lock_depth
         result: dict[str, list[str]] = {}
+        partner = self._partner_of(exclude_task)
         for module in {normalize_lock(m, depth) for m in modules}:
-            holders = self._conflicting_holders(module, exclude_task=exclude_task)
+            holders = self._holders_counted_against(module, exclude_task, partner)
             if holders and len(holders) >= self._limit_for(module):
                 result[module] = sorted(holders)
         return result
@@ -982,25 +1049,91 @@ class ModuleLockTable:
         """
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
-
-        # Check every requested module against all other tasks' held locks and
-        # active reservations owned by other tasks.
-        for module in normalized:
-            # INV-3: live held-lock state, never bypassed by admitted_parks.
-            if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
-                return False
-            if self._is_parked_blocks(module, task_id, ignore_owners=admitted_parks):
-                return False
+        if not self._admits(
+            task_id,
+            normalized,
+            partner=self._partner_of(task_id),
+            admitted_parks=admitted_parks,
+        ):
+            return False
 
         self._held[task_id] = set(normalized)
         logger.info(f'Task {task_id} acquired locks: {normalized}')
         return True
 
-    def release(self, task_id: str) -> list[str]:
-        """Release all module locks held by a task. Returns the normalized
-        modules released (empty when the task held none), the same shape as
-        ``release_subset``.
+    def try_acquire_as_successor(
+        self, successor: str, modules: list[str], *, predecessor: str
+    ) -> bool:
+        """Declare *successor* the successor of *predecessor* and take *modules*, in one step.
+
+        The acquire is :meth:`try_acquire`'s, counted with *predecessor* as
+        *successor*'s partner (:meth:`_holders_counted_against`), so
+        *successor* may share a single-holder key *predecessor* holds.  The
+        relation is recorded only once the acquire is admitted, so a refusal
+        (False) or an error in the check leaves none behind.  It lasts until
+        either member's :meth:`release`.
+
+        Invariant 1 (PRD section 5.2) raises ValueError: *predecessor* must
+        hold locks, *successor* must hold none, and neither may already be in
+        a relation.
         """
+        relation = SuccessorRelation(successor=successor, predecessor=predecessor)
+        self._check_declarable(relation)
+        depth = self._config.lock_depth
+        normalized = list({normalize_lock(m, depth) for m in modules})
+        if not self._admits(successor, normalized, partner=predecessor):
+            return False
+
+        self._relations[successor] = self._relations[predecessor] = relation
+        self._held[successor] = set(normalized)
+        logger.info(
+            f'Task {successor} acquired locks as successor of {predecessor}: {normalized}'
+        )
+        return True
+
+    def _check_declarable(self, relation: SuccessorRelation) -> None:
+        for member in (relation.successor, relation.predecessor):
+            existing = self._relations.get(member)
+            if existing is not None:
+                raise ValueError(
+                    f'cannot declare {relation}: {member!r} is already in {existing}; '
+                    'a predecessor has one successor and a successor one predecessor'
+                )
+        if not self.is_held(relation.predecessor):
+            raise ValueError(
+                f'cannot declare {relation}: predecessor {relation.predecessor!r} holds no locks'
+            )
+        if self.is_held(relation.successor):
+            raise ValueError(
+                f'cannot declare {relation}: successor {relation.successor!r} already holds '
+                f'{sorted(self._held[relation.successor])}'
+            )
+
+    def _partner_of(self, task_id: str) -> str | None:
+        relation = self._relations.get(task_id)
+        return relation.partner_of(task_id) if relation is not None else None
+
+    def _drop_relation(self, task_id: str) -> None:
+        relation = self._relations.get(task_id)
+        if relation is not None:
+            del self._relations[relation.successor], self._relations[relation.predecessor]
+
+    def successor_relation(self, task_id: str) -> SuccessorRelation | None:
+        """The live relation *task_id* is a member of, from either side, or None. A READ."""
+        return self._relations.get(task_id)
+
+    def snapshot_successor_of(self) -> dict[str, str]:
+        """``{successor: predecessor}`` for every live relation, as a fresh dict."""
+        return {
+            relation.successor: relation.predecessor for relation in self._relations.values()
+        }
+
+    def release(self, task_id: str) -> list[str]:
+        """Release all module locks held by a task, and end its successor
+        relation if it is in one. Returns the normalized modules released
+        (empty when the task held none), the same shape as ``release_subset``.
+        """
+        self._drop_relation(task_id)
         released = sorted(self._held.pop(task_id, set()))
         if released:
             logger.info(f'Task {task_id} released locks: {released}')
@@ -1010,7 +1143,8 @@ class ModuleLockTable:
         """Drop a subset of the task's held modules. Returns the normalized
         modules actually released (may be empty). Removes the task's entry
         entirely when no held modules remain so downstream iteration over
-        ``_held`` behaves the same as after a full ``release``.
+        ``_held`` behaves the same as after a full ``release``.  A narrowing,
+        not a release: a successor relation stays in force.
         """
         held = self._held.get(task_id)
         if not held:
@@ -1037,12 +1171,8 @@ class ModuleLockTable:
         ]
         if not new_modules:
             return True
-
-        for module in new_modules:
-            if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
-                return False
-            if self._is_parked_blocks(module, task_id):
-                return False
+        if not self._admits(task_id, new_modules, partner=self._partner_of(task_id)):
+            return False
 
         self._held.setdefault(task_id, set()).update(new_modules)
         logger.info(f'Task {task_id} expanded locks: {new_modules}')
