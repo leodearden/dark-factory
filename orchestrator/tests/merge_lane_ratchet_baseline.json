@@ -87,7 +87,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1541, "function_local_imports": 4, "lines": 17010, "prose_lines": 9646, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1554, "function_local_imports": 4, "lines": 17141, "prose_lines": 9702, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 359, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 228, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_policy.py": {"cognitive": 24, "function_local_imports": 0, "lines": 125, "prose_lines": 18, "reexport_names": 0},
@@ -143,7 +143,7 @@
     "orchestrator/tests/conftest.py": {"cognitive": 55, "function_local_imports": 8, "lines": 1260, "prose_lines": 737, "reexport_names": 0}
   },
   "functions": {
-    "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 2,
+    "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 6,
     "orchestrator/src/orchestrator/git_ops.py::CitationPatternInvalid::__init__": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::__init__": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_abort_lane_acquisition": 20,
@@ -151,6 +151,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_acquire_warm_lane_impl": 104,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_anchor_diff_lines": 19,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_assemble_warm_lane_census": 4,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_attach_lane_to_branch": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_await_index_lock_clear": 9,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_batch_added_line_counts": 25,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_blob_oid_at": 2,
@@ -227,6 +228,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_resolve_predecessor_tip": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_resolve_warm_lane_script": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_resolve_warm_lane_script_logged": 3,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_restore_if_attach_dropped_commits": 5,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_reuse_warm_lane": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_no_ff_merge": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_warm_lane_audit": 6,
@@ -340,9 +342,9 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::quarantine_worktree": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::reap_interactive_worktrees": 46,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::reap_merge_verify_survivors": 8,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::rebase_onto_main": 2,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::rebase_onto_main": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::rebase_preserving_task_commits": 24,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::rebind_branch_to_head": 1,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::rebind_branch_to_head": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::reclaim_worktree_build_artifacts": 9,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::recover_red_main": 31,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::refresh_warm_base": 11,
@@ -1918,6 +1920,7 @@
     "orchestrator/tests/test_warm_lane_pool_shrink.py": {"patch_targets": [], "private_reads": 5},
     "orchestrator/tests/test_warm_lane_previous_occupant.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_warm_lane_reseed_verify.py": {"patch_targets": [], "private_reads": 8},
+    "orchestrator/tests/test_warm_lane_resume_foreign_head.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_warm_lane_script_resolution.py": {"patch_targets": [], "private_reads": 16},
     "orchestrator/tests/test_warm_lane_seed_scrub.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_warm_lane_soft_floor.py": {"patch_targets": [], "private_reads": 24},

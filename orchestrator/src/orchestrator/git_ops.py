@@ -96,6 +96,14 @@ from orchestrator.branch_stack import (
     rebase_own_delta,
 )
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
+from orchestrator.lane_attach import (
+    HeadRelation,
+    branch_tip,
+    check_out_branch_over_foreign_head,
+    describe_head,
+    head_relation,
+    restore_branch_tip,
+)
 from orchestrator.lane_branch_holder import (
     BranchCheckedOutElsewhere,
     BranchHolderAction,
@@ -2039,6 +2047,13 @@ class WorktreeConflictError(RuntimeError):
         )
 
 
+class GuardedStep(Enum):
+    """The step a :class:`BranchResetError` refused; its value names it in the message."""
+
+    REBASE = 'requeue/inter-iteration rebase'
+    RESUME_ATTACH = 'resume attach'
+
+
 class BranchResetError(RuntimeError):
     """Raised by :meth:`GitOps.rebase_preserving_task_commits` when a
     requeue/inter-iteration rebase would collapse a task branch to zero
@@ -2073,6 +2088,14 @@ class BranchResetError(RuntimeError):
     ``git reset --hard`` itself actually succeeded — when it did NOT, the
     work is not confirmed safe, and the message says so explicitly instead
     of asserting the pre-rebase HEAD was restored.
+
+    ``step`` names what was refused.  :attr:`GuardedStep.RESUME_ATTACH` is
+    raised by ``GitOps._reuse_warm_lane`` when re-attaching a resumed lane
+    lost commits the branch carried (task 10991).  That attach has already
+    run, so the message says it was undone, not refused; *pre_rebase_head* is
+    the branch's entry tip, the commit restored, and *n_before* its commits
+    over main.  Its restore is ``git reset --keep``, and only while the lane
+    is on the branch (``orchestrator/src/orchestrator/lane_attach.py::restore_branch_tip``).
     """
 
     def __init__(
@@ -2082,26 +2105,40 @@ class BranchResetError(RuntimeError):
         pre_rebase_head: str,
         n_before: int,
         restore_ok: bool = True,
+        *,
+        step: GuardedStep = GuardedStep.REBASE,
     ):
         self.worktree = worktree
         self.onto = onto
         self.pre_rebase_head = pre_rebase_head
         self.n_before = n_before
         self.restore_ok = restore_ok
+        self.step = step
+        if step is GuardedStep.RESUME_ATTACH:
+            lead = 'Undid' if restore_ok else 'Could not undo'
+            loss = (
+                f'it dropped commits the branch carried ({n_before} commit(s) '
+                f'over main at its entry tip {pre_rebase_head})'
+            )
+            restored = f'the branch to its entry tip {pre_rebase_head}'
+            why_not = "the lane was not on the branch or 'git reset --keep' refused"
+        else:
+            lead = 'Refusing'
+            loss = (
+                f'it would collapse the branch from {n_before} commit(s) over '
+                f'main to 0 (onto={onto})'
+            )
+            restored = f'pre-rebase HEAD {pre_rebase_head}'
+            why_not = "the recovery 'git reset --hard' itself failed"
         if restore_ok:
-            restore_note = f'restored pre-rebase HEAD {pre_rebase_head}'
+            restore_note = f'restored {restored}'
         else:
             restore_note = (
-                f'FAILED TO RESTORE pre-rebase HEAD {pre_rebase_head} — the '
-                f"recovery 'git reset --hard' itself failed, so the task's "
+                f"FAILED TO RESTORE {restored} — {why_not}, so the task's "
                 f'work may still be lost from the worktree; recover '
                 f'manually from git reflog before proceeding'
             )
-        super().__init__(
-            f'Refusing requeue/inter-iteration rebase in {worktree}: it '
-            f'would collapse the branch from {n_before} commit(s) over main '
-            f'to 0 (onto={onto}); {restore_note}'
-        )
+        super().__init__(f'{lead} {step.value} in {worktree}: {loss}; {restore_note}')
 
 
 class _ParkedBranchStranded(RuntimeError):
@@ -7669,6 +7706,12 @@ class GitOps:
             state.  ``expected_title=None`` (default) disables the guard and
             all existing callers/tests are unaffected.
 
+        **Prior occupant's interrupted operation** (task 10991):
+            Before routing, every acquire moves any rebase, merge, cherry-pick
+            or revert state left in the lane aside into a common-dir specimen
+            (``orchestrator/src/orchestrator/rebase_recovery.py::quarantine_interrupted_operation``),
+            never aborting it.  No ref, HEAD or tree moves, and it never raises.
+
         **Pre-acquire base-health gate** (task 2061, runs FIRST — before the ε
         disk-guard and before :func:`acquire_for`):
             Calls :meth:`_warm_lane_base_resolvable`.  A definite
@@ -8009,6 +8052,12 @@ class GitOps:
                     _orphan_confirmed_unregistered = True
             # else: not reused, already registered, or repair restored the
             # registration in place — proceed (possibly still reused) below.
+
+            # A prior occupant's interrupted rebase/merge rides along with the
+            # lane: a checkout does not remove rebase-merge/, and aborting it
+            # later resets THAT occupant's branch (reify _lane-20, task 10991).
+            # Moved aside on every route, before any of them touches the lane.
+            await asyncio.to_thread(rebase_recovery.quarantine_interrupted_operation, lane)
 
             if reused:
                 # ── Reuse path: live requeue of same task on same lane ────
@@ -8567,8 +8616,13 @@ class GitOps:
         :meth:`acquire_warm_lane`'s reuse and reattach routes and
         :meth:`_reattach_cold_worktree`.  Mirrors :meth:`create_worktree`'s
         cold-requeue reuse block:
-        1. Commit any uncommitted WIP so it is preserved across the rebase.
-        2. Re-attach the lane onto *full_branch*.
+        1. Attach the lane onto *full_branch* without moving the branch
+           backward or sideways — :meth:`_attach_lane_to_branch` — then
+           restore the entry tip and raise :class:`BranchResetError` if the
+           attach lost it (:meth:`_restore_if_attach_dropped_commits`).  The
+           rebase guard in step 3 measures from after the attach.
+        2. Commit any uncommitted WIP onto the branch so it is preserved
+           across the rebase.
         3. Un-stack, then rebase onto main (best-effort; log failure and
            continue on old base) — :meth:`_rebase_requeued_onto_main`.
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
@@ -8590,19 +8644,22 @@ class GitOps:
             WorktreeInfo for the reused lane.  Never raises — exceptions
             propagate to the caller's try/except-release wrapper.
         """
-        # 1. Commit WIP (returns None if nothing to commit — that's fine)
-        await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
-
-        # 2. Re-attach the lane, which release_warm_lane may have detached,
-        #    BEFORE the un-stack and the rebase (task-1923 residual), so both
-        #    move refs/heads/<full_branch> itself and the un-stack finds the
-        #    lane as the worktree holding the branch.  On an attached lane
-        #    this is a reset-to-self.  Best-effort: a failed rebind leaves the
+        # 1. Attach the lane, which release_warm_lane may have detached or a
+        #    foreign checkout may have left elsewhere, BEFORE the WIP commit
+        #    (so a foreign branch never receives it, task 10991) and before
+        #    the un-stack and the rebase (task-1923 residual), so both move
+        #    refs/heads/<full_branch> itself and the un-stack finds the lane
+        #    as the worktree holding the branch.  A failed rebind leaves the
         #    lane detached, holding no branch, so step 3 leaves the branch on
-        #    its old base.
-        #    NOTE: checkout -B bypasses git's single-checkout guard; a
-        #    concurrent worktree on full_branch is a duplicate-dispatch hazard.
-        await self.rebind_branch_to_head(lane_dir, full_branch)
+        #    its old base; a refused foreign check-out raises.  The attach is
+        #    guarded here, before the un-stack drops base commits by design;
+        #    the rebase guard in step 3 measures from after it.
+        entry_tip = await branch_tip(_run, lane_dir, full_branch)
+        await self._attach_lane_to_branch(lane_dir, full_branch)
+        await self._restore_if_attach_dropped_commits(lane_dir, full_branch, entry_tip)
+
+        # 2. Commit WIP (returns None if nothing to commit — that's fine)
+        await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
 
         # 3. Un-stack, then rebase onto main (best-effort; failure leaves the
         #    branch on its old base).  A BranchResetError (task 2403)
@@ -8636,6 +8693,52 @@ class GitOps:
             lane_dir, full_branch, base_commit[:8] if base_commit else '?', port,
         )
         return WorktreeInfo(path=lane_dir, base_commit=base_commit, reify_debug_port=port)
+
+    async def _attach_lane_to_branch(self, lane_dir: Path, full_branch: str) -> None:
+        """Put *lane_dir* on *full_branch* without moving it backward or sideways.
+
+        A HEAD on the branch, or at or past its tip, is rebound in place by
+        :meth:`rebind_branch_to_head`, best-effort as before.  Any other HEAD
+        is a foreign commit: the branch is checked out over it unmoved, or
+        ``RuntimeError`` is raised when that would discard tracked changes
+        (``orchestrator/src/orchestrator/lane_attach.py::check_out_branch_over_foreign_head``).
+        HEAD is classified once, and the rebind acts on that classification.
+        """
+        relation = await head_relation(_run, lane_dir, full_branch)
+        if relation is HeadRelation.FOREIGN:
+            await check_out_branch_over_foreign_head(_run, lane_dir, full_branch)
+            return
+        await self.rebind_branch_to_head(lane_dir, full_branch, relation=relation)
+
+    async def _restore_if_attach_dropped_commits(
+        self, lane_dir: Path, full_branch: str, entry_tip: str | None,
+    ) -> None:
+        """Restore *entry_tip* and raise if the attach left HEAD without it.
+
+        The task-2403 rebase guard measures from its own entry, after the
+        attach, so it cannot see commits the attach itself dropped (reify
+        task/10089, task 10991).  Containment of the branch's entry tip in
+        HEAD spans exactly the attach.  An unreadable answer counts as
+        dropped, failing toward restore as 2403 does for an unmeasurable
+        count.  The WIP commit runs after this, so the restore must keep
+        uncommitted work and move only *full_branch*
+        (``orchestrator/src/orchestrator/lane_attach.py::restore_branch_tip``).
+        """
+        if entry_tip is None:
+            return
+        _, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane_dir)
+        if head.strip() and await self.is_ancestor(entry_tip, head.strip()):
+            return
+        rc, count, _ = await _run(
+            ['git', 'rev-list', '--count', f'{self.config.main_branch}..{entry_tip}'],
+            cwd=lane_dir,
+        )
+        n_carried = int(count.strip()) if rc == 0 and count.strip().isdigit() else 0
+        restored = await restore_branch_tip(_run, lane_dir, full_branch, entry_tip)
+        raise BranchResetError(
+            lane_dir, None, entry_tip, n_carried,
+            restore_ok=restored, step=GuardedStep.RESUME_ATTACH,
+        )
 
     async def _rebase_requeued_onto_main(
         self, worktree: Path, full_branch: str, *, keep_stack: bool,
@@ -8672,31 +8775,44 @@ class GitOps:
             return False
         return await self.rebase_preserving_task_commits(worktree)
 
-    async def rebind_branch_to_head(self, worktree: Path, full_branch: str) -> bool:
-        """Rebind *full_branch* to the current HEAD of *worktree* and attach the lane.
+    async def rebind_branch_to_head(
+        self, worktree: Path, full_branch: str, *, relation: HeadRelation | None = None,
+    ) -> bool:
+        """Rebind *full_branch* to *worktree*'s HEAD, only forward or in place.
 
-        Runs ``git checkout -B <full_branch>`` (no explicit start point, so the
-        implicit start point is HEAD).  This both:
-        * resets ``refs/heads/<full_branch>`` to the worktree's current HEAD, and
-        * attaches the worktree onto the branch (no longer detached).
-
-        This mirrors the ``checkout -B`` idiom used by :meth:`_reset_warm_lane`
-        (without ``-f``, since _reuse_warm_lane's tree is already
-        committed/clean after :meth:`commit`).
+        Acts only when HEAD is already on *full_branch*, or detached at its tip
+        or a descendant of it, or *full_branch* does not exist yet
+        (``orchestrator/src/orchestrator/lane_attach.py::head_relation``).
+        Then it runs ``git checkout -B <full_branch>`` with no start point,
+        which moves the ref to HEAD and attaches the lane, keeping the working
+        tree.  Any other HEAD is refused with a WARNING and False, because
+        adopting it resets the branch to a commit that is not its own: reify
+        task/10089 lost its work that way (task 10991).  *relation* is HEAD's
+        classification when the caller has just made it; it is probed here
+        otherwise.
 
         **Best-effort / never-raise** (task-1923 live-requeue residual fix):
         ``git checkout -B`` bypasses git's linked-worktree single-checkout
         guard: if *full_branch* is currently checked out in another live
         worktree, the command still succeeds (rc=0), force-resets the ref to
         the current HEAD, and leaves both worktrees tracking the same branch —
-        a duplicate-dispatch hazard, NOT a safe fail-safe.  This method
-        returns ``False`` only on a genuine non-zero rc (e.g. an invalid
-        branch name); in that case it logs a WARNING and never raises.
+        a duplicate-dispatch hazard, NOT a safe fail-safe.  A non-zero rc
+        (e.g. an invalid branch name) is logged at WARNING and answered False.
         It never converts a reuse into a FAULT.
 
         Returns:
-            True on success (rc=0); False on any non-zero git rc.
+            True when the branch was rebound; False when refused or git failed.
         """
+        if relation is None:
+            relation = await head_relation(_run, worktree, full_branch)
+        if relation is HeadRelation.FOREIGN:
+            logger.warning(
+                'rebind_branch_to_head: refusing to rebind %s (tip %s) to HEAD '
+                '%s of %s: HEAD is neither on the branch nor at or past its tip',
+                full_branch, await branch_tip(_run, worktree, full_branch),
+                await describe_head(_run, worktree), worktree,
+            )
+            return False
         rc, _, err = await _run(
             ['git', 'checkout', '-B', full_branch],
             cwd=worktree,
@@ -10233,6 +10349,12 @@ class GitOps:
         Returns True on success.  On failure, ATTEMPTS a guarded abort and
         returns False — which does NOT imply a clean worktree: aborts fail.
 
+        It never aborts a rebase it did not start (task 10991).  Rebase state
+        already in *worktree* is classified first by
+        ``orchestrator/src/orchestrator/rebase_recovery.py::quarantine_stale_rebase``:
+        stale state is moved aside and the rebase proceeds, while a rebase
+        that may still be live is refused with False and left untouched.
+
         A commit the rebase drops because the target already carries its
         change is logged and recorded
         (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``).
@@ -10241,6 +10363,11 @@ class GitOps:
         outside the lock so multiple tasks can rebase concurrently in
         their own worktrees.
         """
+        prior = await asyncio.to_thread(
+            rebase_recovery.quarantine_stale_rebase, worktree,
+        )
+        if prior is rebase_recovery.PriorRebase.IN_PROGRESS:
+            return False
         target = onto if onto is not None else self.config.main_branch
         rebased = await run_rebase_reporting_drops(_run, worktree, onto=target)
         if not rebased.ok:
@@ -10323,6 +10450,10 @@ class GitOps:
         the suffix_graph frozen-tip rebase) intentionally keep calling the
         unguarded primitive directly — see this task's design decisions for
         why an unconditional guard on the primitive itself would be wrong.
+
+        The resume's own re-attach runs before this guard's baseline, so it
+        is guarded by ``_reuse_warm_lane``'s post-attach containment check
+        (:meth:`_restore_if_attach_dropped_commits`, task 10991), not here.
         """
         baseline_ref = onto if onto is not None else self.config.main_branch
         rc, baseline_out, _ = await _run(
