@@ -21,6 +21,7 @@ import logging
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,18 @@ from shared.config_dir import CONFIG_DIR_PREFIX, reset_sweep_once_state
 _RAISED_MESSAGE = 'codebook merge produced an invalid codebook'
 _PROJECT_ID = 'e2e_census_project'
 _SESSION_SWEEP_PREFIX = CONFIG_DIR_PREFIX + 'legibility-session-'
+
+
+@pytest.fixture(autouse=True)
+def private_tempdir(tmp_path, monkeypatch):
+    """The legibility entrypoints these tests drive resolve their dead-PID
+    sweeps and scratch config dirs under `tempfile.gettempdir()`. This points
+    that at a private dir, so no test here scans or deletes from the host /tmp
+    (task 11283)."""
+    root = tmp_path / 'tempdir'
+    root.mkdir()
+    monkeypatch.setattr(tempfile, 'tempdir', str(root))
+    return root
 
 
 def _write_legibility_yaml(project_root, *, escalation_port):
