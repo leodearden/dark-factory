@@ -102,15 +102,13 @@ const CP = {
   stranded: 'C_STRANDED',
 };
 
-const SPLIT_KEYS = ['in_progress_live', 'in_progress_stranded', 'in_progress_rows'];
-
 // A burndown block with a distinct array identity per series, so the tests can
 // assert each band is sourced from its OWN member's series by reference —
 // index-shifting one band onto another's series is the failure mode the
 // per-project call site (pb.*) is exposed to.
 function mkBlock() {
   const block = { labels: ['d1', 'd2'] };
-  [...Object.values(SERIES_KEYS), ...SPLIT_KEYS].forEach((key, i) => {
+  Object.values(SERIES_KEYS).forEach((key, i) => {
     block[key] = [i, i + 100];
   });
   return block;
@@ -165,16 +163,6 @@ test('burndownStacks: all nine band colours are pairwise distinct', () => {
     colors.length,
     `two bands share a colour and would be unreadable when stacked: ${colors.join(', ')}`,
   );
-});
-
-test('burndownStacks: the in-progress split is not stacked among the census members', () => {
-  // The split partitions in_progress_rows, the ROWS' count — another instant
-  // from the census members. Stacking it beside them would draw a total no
-  // census ever produced.
-  const keys = burndownStacks(mkBlock(), CP).map(s => s.key);
-  for (const split of SPLIT_KEYS) {
-    assert.ok(!keys.includes(split), `${split} was stacked among the census bands: ${keys.join(', ')}`);
-  }
 });
 
 test('burndownStacks: tolerates a null/undefined block without throwing', () => {

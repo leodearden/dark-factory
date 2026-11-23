@@ -292,10 +292,9 @@ window.DF_DATA = {
     // counts+rates, cap-hit rate, $/done, plus per-role turn-cap saturation.
     by_model_role: { rows: [], turn_cap_saturation: {} },
   },
-  // in_progress_live + in_progress_stranded band the in_progress census; the
-  // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
-  // a cold client renders empty bands and no banner, never `undefined` ones.
-  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
+  // The parity_* fields are the server's cap-breach verdict (task 3543). Seeded
+  // so a cold client renders empty bands and no banner, never `undefined` ones.
+  BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
