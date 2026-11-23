@@ -6,6 +6,8 @@ picture", invariant 12, test row 35 (task 10476).
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+
 import pytest
 from _scheduler_pass_scenario import (
     BOOSTED,
@@ -16,6 +18,7 @@ from _scheduler_pass_scenario import (
     HIGH_DEPENDENT,
     INHERITING_LOW,
     PINNED,
+    PLAIN_DONE_DEP,
     PLAIN_DONE_DEPENDENT,
     SCRIPT_DEP,
     SENTINEL_EXT_DEP,
@@ -121,10 +124,29 @@ class TestWritesNothing:
         scenario = build_scenario(tmp_path)
 
         await _picture(scenario)
+        first_fetches = scenario.session.count('get_task')
+        first_runs = count_script_runs(scenario.script_counter)
         await _picture(scenario)
 
-        assert scenario.session.count('get_task') == 2 * 4
-        assert count_script_runs(scenario.script_counter) == 2
+        assert first_fetches > 0 and first_runs > 0
+        assert scenario.session.count('get_task') == 2 * first_fetches
+        assert count_script_runs(scenario.script_counter) == 2 * first_runs
+
+    async def test_a_consumers_edit_to_a_picture_reaches_no_later_picture(self, tmp_path):
+        scenario = build_scenario(tmp_path)
+        await scenario.scheduler.acquire_next()
+
+        first = await _picture(scenario)
+        first.terminal_dep_records[PLAIN_DONE_DEP]['status'] = 'pending'
+        second = await _picture(scenario)
+
+        assert second.terminal_dep_records[PLAIN_DONE_DEP]['status'] == 'done'
+
+    async def test_its_override_and_tier_maps_are_read_only(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        for mapping in (picture.overrides, picture.effective_priorities, picture.transitive_counts):
+            assert not isinstance(mapping, MutableMapping)
 
     async def test_the_next_ordinary_passes_behave_as_if_no_picture_was_built(self, tmp_path):
         with_picture = build_scenario(tmp_path / 'a')

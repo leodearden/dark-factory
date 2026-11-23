@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -37,7 +38,6 @@ from shared.locking import (
 from shared.mcp_envelope import (
     EnvelopeShape,
     parse_tool_result,
-    resolver_failed,
     tool_error_text,
     tool_text_blocks,
 )
@@ -132,6 +132,17 @@ from orchestrator.recovery_emission import (
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.run_slots import DispatchScope
 from orchestrator.scheduler_priority_lookup import LookupPins, last_written_tiers
+from orchestrator.scheduler_reads import (
+    DeliveredCheckSweep,
+    DepStatusRead,
+    ErroredDep,
+    ExternalStatusRead,
+    OverrideRead,
+    PriorityRead,
+    TerminalRecordRead,
+    index_tasks,
+    is_unpending_watchdog_pin,
+)
 from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_cap import CapReport, cap_report, sync_cap_l1
 from orchestrator.starvation_state import WatchdogState
@@ -1189,160 +1200,6 @@ class _PinCandidate:
     pin_order: int
     tier: str
     signal: str | None
-
-
-# The read parts of the ordinary pass's six writing steps (task 10476,
-# plans/early-start-on-predecessor-branch-prd.md §5.4) return these values.
-# A read part consults the pass's caches only by key, and writes nothing.
-
-
-@dataclass(frozen=True)
-class _TaskIndex:
-    """The status and id indices of one task fetch, and its highest numeric id."""
-
-    status_map: dict[str, str]
-    tasks_by_id: dict[str, dict]
-    max_id: int
-
-
-def _index_tasks(tasks: Iterable[dict]) -> _TaskIndex:
-    status_map: dict[str, str] = {}
-    tasks_by_id: dict[str, dict] = {}
-    max_id = 0
-    for t in tasks:
-        tid = str(t.get('id', ''))
-        if not tid:
-            continue
-        status_map[tid] = t.get('status', 'unknown')
-        tasks_by_id[tid] = t
-        if tid.isdecimal():
-            max_id = max(max_id, int(tid))
-    return _TaskIndex(status_map, tasks_by_id, max_id)
-
-
-@dataclass(frozen=True)
-class _DepStatusRead:
-    """The ``get_statuses`` answer for the dep ids a task fetch left out."""
-
-    requested: tuple[str, ...] = ()
-    answered: Mapping[str, str] = field(default_factory=dict)
-    error: Exception | None = None
-
-    @property
-    def degraded(self) -> bool:
-        return bool(self.requested) and resolver_failed(self.answered, self.error)
-
-    @property
-    def resolved(self) -> Mapping[str, str]:
-        """The statuses to merge into the status map: none from a degraded read."""
-        return {} if self.degraded else self.answered
-
-    @property
-    def still_missing(self) -> frozenset[str]:
-        """Requested ids a clean answer left out."""
-        return frozenset() if self.degraded else frozenset(self.requested).difference(self.answered)
-
-
-@dataclass(frozen=True)
-class _TerminalRecordRead:
-    """Terminal dep records: served from the cross-tick cache, or fetched within the budget.
-
-    ``held``, ``new`` and ``revalidate`` are the fetch candidates by group,
-    ``ordered`` the fetches the budget allowed, and ``fetched`` each of those
-    ids' fresh record (``None`` when unreadable).
-    """
-
-    served: Mapping[str, dict] = field(default_factory=dict)
-    held: frozenset[str] = frozenset()
-    new: frozenset[str] = frozenset()
-    revalidate: frozenset[str] = frozenset()
-    ordered: tuple[str, ...] = ()
-    fetched: Mapping[str, dict | None] = field(default_factory=dict)
-
-    @property
-    def records(self) -> dict[str, dict]:
-        records = dict(self.served)
-        records.update((dep_id, rec) for dep_id, rec in self.fetched.items() if rec is not None)
-        return records
-
-    @property
-    def deferred(self) -> frozenset[str]:
-        return (self.held | self.new | self.revalidate).difference(self.ordered)
-
-    @property
-    def deferred_new(self) -> frozenset[str]:
-        """Never-cached deps the budget deferred: their dependents wait."""
-        return self.deferred & self.new
-
-
-@dataclass(frozen=True)
-class _ExternalStatusRead:
-    """Pending tasks with cross-project deps, and the one batched status answer for them."""
-
-    pending_with_external: tuple[dict, ...] = ()
-    statuses: Mapping[str, str] = field(default_factory=dict)
-    error: Exception | None = None
-
-
-@dataclass(frozen=True)
-class _ErroredDep:
-    """A checked dep left unresolved because a check ERRORED and none FAILED."""
-
-    dep_id: str
-    check_names: tuple[str | None, ...]
-    unreadable: tuple[object, ...]
-
-
-@dataclass(frozen=True)
-class _DeliveredCheckSweep:
-    """One evaluation of the checked terminal deps at main.
-
-    ``main_sha`` is ``None`` when there was nothing to check or main did not
-    resolve; the projection is then empty.  ``digests`` names each checked
-    dep's current descriptor digest, ``delivered_keys`` the cache keys found
-    DELIVERED by a run this sweep, and ``resolved`` every dep whose verdict
-    was definitive (served, delivered or failed).
-    """
-
-    main_sha: str | None = None
-    checked_deps: Mapping[str, dict] = field(default_factory=dict)
-    deps_by_dependent: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
-    digests: Mapping[str, str] = field(default_factory=dict)
-    projection: Mapping[str, bool] = field(default_factory=dict)
-    fail_details: Mapping[str, dict] = field(default_factory=dict)
-    delivered_keys: tuple[tuple[str, str, str], ...] = ()
-    resolved: tuple[str, ...] = ()
-    errored: tuple[_ErroredDep, ...] = ()
-
-
-@dataclass(frozen=True)
-class _OverrideRead:
-    """The stored override rows and the ones the ordinary pass's clean-up would remove.
-
-    ``terminal_or_missing`` is the id set the clean-up hands ``clear_terminal``
-    (terminal statuses, and rows whose task the fetch lacks).
-    """
-
-    rows: Mapping[str, OverrideRow] = field(default_factory=dict)
-    terminal_or_missing: frozenset[str] = frozenset()
-    unpending_watchdog: frozenset[str] = frozenset()
-    expired: frozenset[str] = frozenset()
-
-    @property
-    def in_force(self) -> dict[str, OverrideRow]:
-        gone = self.terminal_or_missing | self.unpending_watchdog | self.expired
-        return {tid: row for tid, row in self.rows.items() if tid not in gone}
-
-
-@dataclass(frozen=True)
-class _PriorityRead:
-    effective_priorities: Mapping[str, str]
-    transitive_counts: Mapping[str, int]
-
-
-def _is_unpending_watchdog_pin(row: OverrideRow, status: str | None) -> bool:
-    """A starvation-watchdog pin whose task is no longer pending: its pin goes."""
-    return row.source is OverrideSource.STARVATION_WATCHDOG and status != 'pending'
 
 
 @dataclass(frozen=True)
@@ -3520,7 +3377,7 @@ class Scheduler:
         status_map: Mapping[str, str],
         tasks_by_id: Mapping[str, dict] | None,
         terminal_dep_records: Mapping[str, dict] | None,
-    ) -> _DeliveredCheckSweep:
+    ) -> DeliveredCheckSweep:
         """The read part of :meth:`_compute_delivered_check_cache`: evaluate, write nothing.
 
         A DELIVERED verdict cached for main's sha and the dep's descriptor
@@ -3556,11 +3413,11 @@ class Scheduler:
         deps_by_dependent = {task_id: tuple(dep_ids) for task_id, dep_ids in dep_sets.items()}
 
         if not checked_deps:
-            return _DeliveredCheckSweep()
+            return DeliveredCheckSweep()
 
         main_sha = await self._resolve_main_sha()
         if main_sha is None:
-            return _DeliveredCheckSweep()
+            return DeliveredCheckSweep()
 
         budget = self.config.delivered_checks.max_checks_per_tick
         used = 0
@@ -3573,7 +3430,7 @@ class Scheduler:
         fail_details: dict[str, dict] = {}
         delivered_keys: list[tuple[str, str, str]] = []
         resolved: list[str] = []
-        errored: list[_ErroredDep] = []
+        errored: list[ErroredDep] = []
 
         for dep_id, dep_task in checked_deps.items():
             # The descriptor digest is part of the cache key (task 2975), so
@@ -3670,13 +3527,13 @@ class Scheduler:
 
             # At least one ERRORED and none FAILED: left unresolved (fail-safe
             # wait, retried next sweep with no backoff).
-            errored.append(_ErroredDep(
+            errored.append(ErroredDep(
                 dep_id,
                 tuple(c.get('name') for c, r in results if r is DeliveredCheckResult.ERRORED),
                 declared.unreadable,
             ))
 
-        return _DeliveredCheckSweep(
+        return DeliveredCheckSweep(
             main_sha=main_sha,
             checked_deps=checked_deps,
             deps_by_dependent=deps_by_dependent,
@@ -3689,7 +3546,7 @@ class Scheduler:
         )
 
     async def _apply_delivered_check_sweep(
-        self, sweep: _DeliveredCheckSweep, status_map: dict[str, str],
+        self, sweep: DeliveredCheckSweep, status_map: dict[str, str],
     ) -> dict[str, bool]:
         """The write part of :meth:`_compute_delivered_check_cache`; returns the projection.
 
@@ -4083,7 +3940,7 @@ class Scheduler:
         """
         released: list[str] = []
         for tid, row in overrides.items():
-            if _is_unpending_watchdog_pin(row, status_map.get(tid)) and self._release_watchdog_pin(tid):
+            if is_unpending_watchdog_pin(row, status_map.get(tid)) and self._release_watchdog_pin(tid):
                 released.append(tid)
         return released
 
@@ -5684,7 +5541,7 @@ class Scheduler:
 
     async def _read_dep_statuses(
         self, tasks: list[dict], status_map: Mapping[str, str],
-    ) -> _DepStatusRead:
+    ) -> DepStatusRead:
         """The read part of the dep-status backfill: ask for every dep id the fetch left out."""
         all_dep_ids: set[str] = set()
         for t in tasks:
@@ -5694,12 +5551,12 @@ class Scheduler:
                     all_dep_ids.add(dep_id)
         missing = sorted(all_dep_ids - set(status_map))
         if not missing:
-            return _DepStatusRead()
+            return DepStatusRead()
         answered, err = await self.get_statuses(ids=missing)
-        return _DepStatusRead(tuple(missing), answered, err)
+        return DepStatusRead(tuple(missing), answered, err)
 
     def _apply_dep_statuses(
-        self, tasks: list[dict], read: _DepStatusRead, status_map: dict[str, str],
+        self, tasks: list[dict], read: DepStatusRead, status_map: dict[str, str],
     ) -> None:
         """The write part: merge a clean answer into *status_map* and keep the backfill streaks."""
         if not read.requested:
@@ -5863,20 +5720,12 @@ class Scheduler:
         (reviewer_comprehensive robustness amendment): fail-safe-WAIT on
         every unfetchable record risks permanently deadlocking a dependent
         whose dep record genuinely can never be fetched. A bounded WARNING
-        names every such bypass. The whole
-        collection+fetch is further wrapped in try/except so an
-        unexpected failure logs a WARNING and leaves
-        ``ctx.terminal_dep_records`` as-is (fail-safe), mirroring
-        ``_phase_delivered_check_gate``. Always continues.
+        names every such bypass. An unexpected failure of the collection or
+        the fetch is handled by the read part's one fail-safe (see
+        :meth:`_read_terminal_dep_records`). Always continues.
         """
-        try:
-            read = await self._read_terminal_dep_records(ctx.tasks, ctx.status_map, ctx.tasks_by_id)
-            self._apply_terminal_dep_records(read, ctx)
-        except Exception:
-            logger.warning(
-                'acquire_next: terminal dep record backfill failed unexpectedly',
-                exc_info=True,
-            )
+        read = await self._read_terminal_dep_records(ctx.tasks, ctx.status_map, ctx.tasks_by_id)
+        self._apply_terminal_dep_records(read, ctx)
         return _CONTINUE
 
     async def _read_terminal_dep_records(
@@ -5884,13 +5733,38 @@ class Scheduler:
         tasks: list[dict],
         status_map: Mapping[str, str],
         tasks_by_id: Mapping[str, dict],
-    ) -> _TerminalRecordRead:
+    ) -> TerminalRecordRead:
         """The read part of the terminal-record backfill: serve from the cache, fetch the rest.
 
         Reads ``self._terminal_dep_record_cache`` by key only and never adds
-        to it.  A fetch failure leaves the served records in place, so a held
-        record stays held.
+        to it.  It never raises: this is the backfill's one fail-safe, for the
+        ordinary pass and the task picture alike.  An unexpected failure logs
+        a WARNING and answers with what was planned before it, so a failed
+        fetch still serves the cached records (a held record stays held) and
+        still names the deferred deps, while each of its fetches reads as
+        unreadable.
         """
+        read = TerminalRecordRead()
+        try:
+            read = self._plan_terminal_dep_fetches(tasks, status_map, tasks_by_id)
+            if not read.ordered:
+                return read
+            fetched = await asyncio.gather(*(self.get_task(dep_id) for dep_id in read.ordered))
+            return replace(read, fetched=dict(zip(read.ordered, fetched, strict=True)))
+        except Exception:
+            logger.warning(
+                'terminal dep record read failed unexpectedly — serving the cached records only',
+                exc_info=True,
+            )
+            return read
+
+    def _plan_terminal_dep_fetches(
+        self,
+        tasks: list[dict],
+        status_map: Mapping[str, str],
+        tasks_by_id: Mapping[str, dict],
+    ) -> TerminalRecordRead:
+        """Which terminal dep records the cache serves, and which the budget lets this read fetch."""
         needed: set[str] = set()
         for t in tasks:
             if t.get('status') != 'pending':
@@ -5922,30 +5796,21 @@ class Scheduler:
             else:
                 revalidate.append(dep_id)
         if not (held or new or revalidate):
-            return _TerminalRecordRead(served=served)
+            return TerminalRecordRead(served=served)
 
         # "Budget priority" in the phase docstring; each group sorted.
         budget = self.config.delivered_checks.max_record_fetches_per_tick
         held_cap = budget - 1 if new else budget
         ordered = (sorted(held)[:held_cap] + sorted(new) + sorted(revalidate))[:budget]
-        try:
-            fetched = await asyncio.gather(*(self.get_task(dep_id) for dep_id in ordered))
-        except Exception:
-            logger.warning(
-                'acquire_next: terminal dep record fetch failed unexpectedly',
-                exc_info=True,
-            )
-            fetched = [None] * len(ordered)
-        return _TerminalRecordRead(
+        return TerminalRecordRead(
             served=served,
             held=frozenset(held),
             new=frozenset(new),
             revalidate=frozenset(revalidate),
             ordered=tuple(ordered),
-            fetched=dict(zip(ordered, fetched, strict=True)),
         )
 
-    def _apply_terminal_dep_records(self, read: _TerminalRecordRead, ctx: TickContext) -> None:
+    def _apply_terminal_dep_records(self, read: TerminalRecordRead, ctx: TickContext) -> None:
         """The write part: hand the records to the pass and cache the fresh ones."""
         ctx.terminal_dep_records.update(read.records)
         deferred = read.deferred
@@ -6655,7 +6520,7 @@ class Scheduler:
         ctx.external_resolver_failed = read.error is not None
         return _CONTINUE
 
-    async def _read_external_statuses(self, tasks: list[dict]) -> _ExternalStatusRead:
+    async def _read_external_statuses(self, tasks: list[dict]) -> ExternalStatusRead:
         """The read part of the external-dep gate: one batched status call, or none."""
         pending_ext_deps: list[tuple[dict, list[str]]] = [
             (t, deps)
@@ -6664,10 +6529,10 @@ class Scheduler:
             and (deps := task_external_deps(t))
         ]
         if not pending_ext_deps:
-            return _ExternalStatusRead()
+            return ExternalStatusRead()
         dep_union: list[str] = list({dep for _, deps in pending_ext_deps for dep in deps})
         statuses, err = await self.get_external_statuses(dep_union)
-        return _ExternalStatusRead(tuple(t for t, _ in pending_ext_deps), statuses, err)
+        return ExternalStatusRead(tuple(t for t, _ in pending_ext_deps), statuses, err)
 
     async def _phase_delivered_check_gate(self, ctx: TickContext) -> object:
         """Delivered-check dep-gate per-tick sweep (capability-delivered-
@@ -6679,48 +6544,71 @@ class Scheduler:
         (``build_candidates`` / ``select_pins``), both of which forward the
         cache into ``_eligible_for_dispatch`` → ``_deps_satisfied``; park GC
         and the park-eviction drain read it through ``_park_hold_refusal``.
-        ``_compute_delivered_check_cache`` already collects the relevant
-        (terminal, checked) deps internally — a dep-free or check-free
-        pending task is a no-op for it — so this phase simply forwards all
-        pending tasks, mirroring how ``_apply_external_dep_policy`` is
-        itself the one that filters for relevant deps.
+        The gate's rules (the kill switch, the pending-task sweep and the
+        fail-safe empty cache) live in :meth:`_delivered_check_projection`,
+        which this phase drives with the writing sweep
+        ``_compute_delivered_check_cache``. Always continues.
+        """
+        ctx.delivered_check_cache = await self._delivered_check_projection(
+            ctx.tasks, ctx.status_map, ctx.tasks_by_id, ctx.terminal_dep_records,
+            sweep=self._compute_delivered_check_cache,
+        )
+        return _CONTINUE
 
-        The sweep call is wrapped in try/except so a failure (e.g. a
-        transient git error surfacing as an unexpected exception) degrades
-        to a fail-safe EMPTY cache instead of aborting the tick — no task
-        gated by an unverified delivered check dispatches this tick, and
-        the sweep retries next tick. Always continues.
+    async def _delivered_check_projection(
+        self,
+        tasks: list[dict],
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict],
+        terminal_dep_records: dict[str, dict],
+        *,
+        sweep: Callable[
+            [list[dict], dict[str, str], dict[str, dict], dict[str, dict]],
+            Awaitable[Mapping[str, bool]],
+        ],
+    ) -> dict[str, bool] | None:
+        """The delivered-check gate's projection over *tasks*, by *sweep*.
+
+        The one home of the gate's rules, for the ordinary pass (whose sweep
+        writes) and the task picture (whose sweep only reads). *sweep* is
+        handed every pending task; it collects the relevant (terminal,
+        checked) deps itself, so a dep-free or check-free task is a no-op.
+
+        A sweep that raises (e.g. a transient git error) degrades to a
+        fail-safe EMPTY cache: no task gated by an unverified delivered check
+        dispatches, and the sweep retries next tick.
 
         **Kill switch (task 2583, epsilon):** when ``delivered_checks.enabled``
-        is ``False``, short-circuits to ``ctx.delivered_check_cache = None``
-        BEFORE building ``_pending_tasks`` or calling
-        ``_compute_delivered_check_cache`` — skips the whole sweep (no git,
-        no streaks, no escalation), not just an empty result. This MUST be
-        ``None`` and not ``{}``: ``_deps_satisfied``'s delivered-check arm
-        only disables itself when the cache is exactly ``None``
-        (``if delivered_check_cache is not None``) — an empty dict would
-        still activate the arm and withhold every dep carrying
-        ``metadata.delivered_checks`` (``cache.get(dep_id)`` is ``None``,
-        not ``True`` → blocked).
+        is ``False`` the answer is ``None`` and *sweep* never runs (no git,
+        no streaks, no escalation). This MUST be ``None`` and not ``{}``:
+        ``_deps_satisfied``'s delivered-check arm only disables itself when
+        the cache is exactly ``None`` — an empty dict would still activate
+        the arm and withhold every dep carrying ``metadata.delivered_checks``
+        (``cache.get(dep_id)`` is ``None``, not ``True`` → blocked).
         """
         if not self.config.delivered_checks.enabled:
-            ctx.delivered_check_cache = None
-            return _CONTINUE
-        _pending_tasks = [t for t in ctx.tasks if t.get('status') == 'pending']
+            return None
+        pending = [t for t in tasks if t.get('status') == 'pending']
         try:
-            cache = await self._compute_delivered_check_cache(
-                _pending_tasks, ctx.status_map, ctx.tasks_by_id,
-                terminal_dep_records=ctx.terminal_dep_records,
-            )
+            return dict(await sweep(pending, status_map, tasks_by_id, terminal_dep_records))
         except Exception:
             logger.warning(
                 'Delivered-check gate sweep raised — degrading to fail-safe '
                 'empty cache this tick',
                 exc_info=True,
             )
-            cache = {}
-        ctx.delivered_check_cache = cache
-        return _CONTINUE
+            return {}
+
+    async def _read_delivered_check_projection(
+        self,
+        pending_tasks: list[dict],
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict],
+        terminal_dep_records: dict[str, dict],
+    ) -> Mapping[str, bool]:
+        """The read-only sweep: the projection :meth:`_read_delivered_checks` evaluates."""
+        sweep = await self._read_delivered_checks(pending_tasks, status_map, tasks_by_id, terminal_dep_records)
+        return sweep.projection
 
     async def _phase_stamp_milestone(self, ctx: TickContext) -> object:
         """Stamp the frozen-once ``milestone_deps_satisfied_at`` anchor.
@@ -6762,31 +6650,32 @@ class Scheduler:
 
     def _read_overrides(
         self, status_map: Mapping[str, str], tasks_by_id: Mapping[str, dict],
-    ) -> _OverrideRead:
-        """The read part of the override GC: the stored rows, classified, none removed."""
+    ) -> OverrideRead:
+        """The read part of the override GC: the stored rows and their terminal-or-missing ids."""
         store = self._override_store
         rows = store.get_overrides(self._project_root) if store else {}
         if store is None or not rows:
-            return _OverrideRead(rows=rows)
-        terminal_or_missing = frozenset(
-            {tid for tid, st in status_map.items() if st in TERMINAL_STATUSES}
-            | (set(rows) - set(tasks_by_id))
-        )
-        return _OverrideRead(
+            return OverrideRead(rows=rows)
+        return OverrideRead(
             rows=rows,
-            terminal_or_missing=terminal_or_missing,
-            unpending_watchdog=frozenset(
-                tid for tid, row in rows.items()
-                if tid not in terminal_or_missing
-                and _is_unpending_watchdog_pin(row, status_map.get(tid))
+            terminal_or_missing=frozenset(
+                {tid for tid, st in status_map.items() if st in TERMINAL_STATUSES}
+                | (set(rows) - set(tasks_by_id))
             ),
-            expired=frozenset(store.expired_ids(self._project_root, self._wall_now())),
         )
 
+    def _overrides_in_force(self, read: OverrideRead, status_map: Mapping[str, str]) -> dict[str, OverrideRow]:
+        """The rows :meth:`_apply_override_gc` would leave, found without removing any (the picture's view)."""
+        store = self._override_store
+        if store is None or not read.rows:
+            return dict(read.rows)
+        return read.in_force(status_map, frozenset(store.expired_ids(self._project_root, self._wall_now())))
+
     def _apply_override_gc(
-        self, read: _OverrideRead, status_map: Mapping[str, str],
+        self, read: OverrideRead, status_map: Mapping[str, str],
     ) -> dict[str, OverrideRow]:
-        """The write part: remove what the read classified; the rows the store still holds.
+        """The write part: ``clear_terminal`` on the read's terminal-or-missing ids, then the
+        store-side watchdog release and TTL sweep; the rows the store still holds.
 
         The result follows what the store actually cleared or released, so a
         failed delete leaves its row in force exactly as before the split.
@@ -6936,11 +6825,11 @@ class Scheduler:
         tasks_by_id: dict[str, dict],
         status_map: dict[str, str],
         overrides: Mapping[str, OverrideRow],
-    ) -> _PriorityRead:
+    ) -> PriorityRead:
         """The read part of the tier step: effective tiers (inheritance plus boosts) and CPM counts."""
         reverse_index = self._build_reverse_index(tasks)
         override_boosts = {tid: row.boost_tier for tid, row in overrides.items() if row.boost_tier}
-        return _PriorityRead(
+        return PriorityRead(
             effective_priorities=self._compute_effective_priorities(
                 tasks_by_id, reverse_index, status_map,
                 override_boosts=override_boosts or None,
@@ -7503,7 +7392,9 @@ class Scheduler:
         ``TickOutcome(TaskAssignment)`` on a successful dispatch, or
         ``TickOutcome(None)`` once the loop is exhausted with no acquire
         (the top candidate's skip counter is bumped either way it is
-        passed over). Higher score wins; equal scores dispatch the
+        passed over). When every candidate was started since the ready list
+        was built it returns ``TickOutcome(None)`` at once, bumping no skip
+        and writing no snapshot. Higher score wins; equal scores dispatch the
         numerically smaller (older) id first, and non-numeric ids after every
         numeric one, in string order.
         """
@@ -7784,7 +7675,7 @@ class Scheduler:
             self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None, scope)
             return None
 
-        index = _index_tasks(tasks)
+        index = index_tasks(tasks)
 
         # Maintain age anchors (resurrected tasks reset their anchor).
         self._journal_age_resets(self.age_anchors.observe(tasks, index.max_id))
@@ -7859,20 +7750,18 @@ class Scheduler:
         tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES, distinguish_failure=True)
         if tasks is None:
             return None
-        index = _index_tasks(tasks)
+        index = index_tasks(tasks)
         dep_statuses = await self._read_dep_statuses(tasks, index.status_map)
         status_map = {**index.status_map, **dep_statuses.resolved}
-        try:
-            records = await self._read_terminal_dep_records(tasks, status_map, index.tasks_by_id)
-        except Exception:
-            logger.warning('build_task_picture: terminal dep record read failed', exc_info=True)
-            records = _TerminalRecordRead()
-        terminal_dep_records = records.records
+        records = await self._read_terminal_dep_records(tasks, status_map, index.tasks_by_id)
+        # Copies, so a consumer's edit never reaches the cross-tick record cache.
+        terminal_dep_records = {dep_id: dict(record) for dep_id, record in records.records.items()}
         external = await self._read_external_statuses(tasks)
-        delivered = await self._read_picture_delivered_checks(
+        delivered = await self._delivered_check_projection(
             tasks, status_map, index.tasks_by_id, terminal_dep_records,
+            sweep=self._read_delivered_check_projection,
         )
-        overrides = self._read_overrides(status_map, index.tasks_by_id).in_force
+        overrides = self._overrides_in_force(self._read_overrides(status_map, index.tasks_by_id), status_map)
         priorities = self._read_priorities(tasks, index.tasks_by_id, status_map, overrides)
         return TaskPicture(
             built_at=built_at,
@@ -7885,28 +7774,10 @@ class Scheduler:
             external_statuses=dict(external.statuses),
             external_resolver_failed=external.error is not None,
             delivered_check_cache=delivered,
-            overrides=overrides,
-            effective_priorities=priorities.effective_priorities,
-            transitive_counts=priorities.transitive_counts,
+            overrides=MappingProxyType(overrides),
+            effective_priorities=MappingProxyType(priorities.effective_priorities),
+            transitive_counts=MappingProxyType(priorities.transitive_counts),
         )
-
-    async def _read_picture_delivered_checks(
-        self,
-        tasks: list[dict],
-        status_map: dict[str, str],
-        tasks_by_id: dict[str, dict],
-        terminal_dep_records: dict[str, dict],
-    ) -> dict[str, bool] | None:
-        """The delivered-check projection as :meth:`_phase_delivered_check_gate` would see it."""
-        if not self.config.delivered_checks.enabled:
-            return None
-        pending = [t for t in tasks if t.get('status') == 'pending']
-        try:
-            sweep = await self._read_delivered_checks(pending, status_map, tasks_by_id, terminal_dep_records)
-        except Exception:
-            logger.warning('build_task_picture: delivered-check read failed', exc_info=True)
-            return {}
-        return dict(sweep.projection)
 
     def _emit_tick_telemetry(
         self,

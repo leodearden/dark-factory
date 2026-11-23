@@ -8,7 +8,9 @@ judging its age by ``built_at``.
 
 It holds no locks, reservations, leases or waiting predecessors: those are
 read at claim time, never from a picture. The maps that the dependency
-predicate takes as ``dict`` stay ``dict``; treat them as read-only.
+predicate takes as ``dict`` stay ``dict``, and share nothing with the
+scheduler (the dependency records are copies of its cached ones); treat them
+as read-only. The other maps are read-only views.
 """
 
 from __future__ import annotations
