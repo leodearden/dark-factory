@@ -626,19 +626,20 @@ class ChildExitedBeforeRecording(AssertionError):
 
 
 async def await_recorded_cold_worktree(
-    pgf: Path, *, child_exit: Callable[[], int | None], watching: asyncio.Future[Any],
+    pgf: Path, *, child_returncode: Callable[[], int | None], watching: asyncio.Future[Any],
 ) -> Path:
     """The worktree recorded beside *pgf*, once it holds its cold ``.task/``.
 
-    It reads no clock.  It fails when the child has exited (*child_exit* gives
-    its returncode) or the *watching* call has ended; a child that lives on
-    without recording is left to the caller's per-test timeout.
+    It reads no clock.  It fails when the child has exited (*child_returncode*
+    gives its returncode, None while it runs) or the *watching* call has ended;
+    a child that lives on without recording is left to the caller's per-test
+    timeout.
     """
     while True:
         recorded = read_worktree_path(pgf)
         if recorded is not None and (recorded / '.task').is_dir():
             return recorded
-        if (returncode := child_exit()) is not None:
+        if (returncode := child_returncode()) is not None:
             raise ChildExitedBeforeRecording(pgf, returncode)
         if watching.done():
             watching.result()
@@ -832,7 +833,7 @@ class Scene:
         """Wait until *request_id*'s verify-task records its cold worktree, its child exits, or the call ends."""
         return await await_recorded_cold_worktree(
             pgid_file(self.laptop_worktree_base, request_id),
-            child_exit=functools.partial(self.children.returncode_of, request_id),
+            child_returncode=functools.partial(self.children.returncode_of, request_id),
             watching=watching,
         )
 
