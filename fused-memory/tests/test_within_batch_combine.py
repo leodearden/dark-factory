@@ -20,28 +20,17 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-import pytest_asyncio
 from _curator_helpers import (
     agent_result,
     candidate_titles,
-    escalator_double,
     invoke_by_role,
-    make_config,
-    prepared,
     submit_as_one_batch,
     tripwire,
 )
+from _real_batch_stack import RealBatchStack, real_batch_stack
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, item_key, observed_item
 from shared.task_metadata_wire import coerce_task_metadata
-
-from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
-from fused_memory.config.schema import TaskmasterConfig
-from fused_memory.middleware.curator_types import CandidateTask, PreparedCandidate
-from fused_memory.middleware.task_curator import TaskCurator
-from fused_memory.middleware.task_interceptor import TaskInterceptor
-from fused_memory.middleware.ticket_store import TicketStore
-from fused_memory.reconciliation.event_buffer import EventBuffer
 
 _PARENT = '8400'
 _ITEMS = {
@@ -128,67 +117,19 @@ def _audit_rows() -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-@pytest_asyncio.fixture
-async def store(tmp_path):
-    ticket_store = TicketStore(tmp_path / 'tickets.db')
-    await ticket_store.initialize()
-    yield ticket_store
-    await ticket_store.close()
-
-
-@pytest_asyncio.fixture
-async def event_buffer(tmp_path):
-    buffer = EventBuffer(db_path=tmp_path / 'events.db', buffer_size_threshold=100)
-    await buffer.initialize()
-    yield buffer
-    await buffer.close()
-
-
-@pytest_asyncio.fixture
-async def backend(tmp_path):
-    task_backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
-    await task_backend.start()
-    yield task_backend
-    await task_backend.close()
-
-
-@pytest.fixture
-def root(tmp_path) -> str:
-    return str(tmp_path)
-
-
 async def _drain_as_one_batch(
-    backend: SqliteTaskBackend,
-    store: TicketStore,
-    event_buffer: EventBuffer,
-    root: str,
-    names: Sequence[str],
-    invoke: AsyncMock,
+    stack: RealBatchStack, names: Sequence[str],
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    """Submit the filings *names* as one worker batch judged by a real curator; their tickets and answers."""
-    curator = TaskCurator(
-        config=make_config(), taskmaster=backend, escalator=escalator_double(), invoke=invoke,
+    """Submit the filings *names* as one worker batch; their tickets and answers."""
+    tickets = await submit_as_one_batch(
+        stack.interceptor, stack.curator, [_filing(name) for name in names], project_root=stack.root,
     )
-
-    async def bundle_for(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
-        return prepared(candidate.title, candidate=candidate)
-
-    curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
-    curator.record_task = AsyncMock()
-    curator.reembed_task = AsyncMock()
-    interceptor = TaskInterceptor(backend, None, event_buffer, ticket_store=store, curator=curator)
-    try:
-        tickets = await submit_as_one_batch(
-            interceptor, curator, [_filing(name) for name in names], project_root=root,
-        )
-        answers = [await interceptor.resolve_ticket(ticket, root, 30.0) for ticket in tickets]
-    finally:
-        await interceptor.close()
+    answers = [await stack.interceptor.resolve_ticket(ticket, stack.root, 30.0) for ticket in tickets]
     return tickets, answers
 
 
-async def _metadata(backend: SqliteTaskBackend, task_id: str, root: str) -> dict[str, Any]:
-    metadata = coerce_task_metadata((await backend.get_task(task_id, root))['metadata'])
+async def _metadata(stack: RealBatchStack, task_id: str) -> dict[str, Any]:
+    metadata = coerce_task_metadata((await stack.backend.get_task(task_id, stack.root))['metadata'])
     assert metadata is not None
     return metadata
 
@@ -198,20 +139,17 @@ def _item_keys(metadata: dict[str, Any]) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_two_combinable_siblings_in_one_batch_resolve_as_one_task(
-    backend, store, event_buffer, root,
-):
+async def test_two_combinable_siblings_in_one_batch_resolve_as_one_task(tmp_path):
     invoke = _answering(_create(), _combine_onto(0, 'A'), _create())
 
-    tickets, (a, b, c) = await _drain_as_one_batch(
-        backend, store, event_buffer, root, ['A', 'B', 'C'], invoke,
-    )
+    async with real_batch_stack(tmp_path, invoke) as stack:
+        tickets, (a, b, c) = await _drain_as_one_batch(stack, ['A', 'B', 'C'])
+        after = await _metadata(stack, a['task_id'])
 
     assert [answer['status'] for answer in (a, b, c)] == ['created', 'combined', 'created']
     task_x = a['task_id']
     assert b['task_id'] == task_x
     assert c['task_id'] != task_x
-    after = await _metadata(backend, task_x, root)
     assert _item_keys(after) == [_key('A'), _key('B')]
     assert after[DECLARED_SCOPE_METADATA_KEY]['basis'] == 'combine'
     [audit] = _audit_rows()
@@ -232,21 +170,19 @@ async def test_two_combinable_siblings_in_one_batch_resolve_as_one_task(
 
 
 @pytest.mark.asyncio
-async def test_a_combine_onto_a_dropped_sibling_degrades_to_create_and_is_audited(
-    backend, store, event_buffer, root,
-):
+async def test_a_combine_onto_a_dropped_sibling_degrades_to_create_and_is_audited(tmp_path):
     invoke = _answering(_create(), _drop_onto(0), _combine_onto(1, 'B'))
 
-    tickets, (c, b, a) = await _drain_as_one_batch(
-        backend, store, event_buffer, root, ['C', 'B', 'A'], invoke,
-    )
+    async with real_batch_stack(tmp_path, invoke) as stack:
+        tickets, (c, b, a) = await _drain_as_one_batch(stack, ['C', 'B', 'A'])
+        a_metadata = await _metadata(stack, a['task_id'])
 
     assert (c['status'], b['status'], a['status']) == ('created', 'combined', 'created')
     task_z = c['task_id']
     assert b['task_id'] == task_z
     assert a['task_id'] != task_z
     assert 'batch-target-not-create' in a['reason']
-    assert _item_keys(await _metadata(backend, a['task_id'], root)) == [_key('A')]
+    assert _item_keys(a_metadata) == [_key('A')]
     drop_row, refusal = _audit_rows()
     assert {key: drop_row.get(key) for key in ('action', 'target_id', 'batch_internal')} == {
         'action': 'drop', 'target_id': task_z, 'batch_internal': True,
@@ -255,6 +191,7 @@ async def test_a_combine_onto_a_dropped_sibling_degrades_to_create_and_is_audite
         key: refusal.get(key)
         for key in (
             'action', 'refused_reason', 'batch_internal', 'candidate_ticket_id', 'target_id', 'items_after',
+            'sibling_ticket_id', 'sibling_ticket_status',
         )
     } == {
         'action': 'combine',
@@ -263,23 +200,44 @@ async def test_a_combine_onto_a_dropped_sibling_degrades_to_create_and_is_audite
         'candidate_ticket_id': tickets[2],
         'target_id': task_z,
         'items_after': [_key('A')],
+        'sibling_ticket_id': tickets[1],
+        'sibling_ticket_status': 'combined',
     }
+    assert (refusal['old']['title'], refusal['old']['status']) == (_TITLES['B'], '')
 
 
 @pytest.mark.asyncio
-async def test_a_drop_onto_a_sibling_writes_an_audit_row(
-    backend, store, event_buffer, root,
-):
+async def test_a_mistargeted_combine_leaves_the_sibling_untouched_and_is_created_on_its_own(tmp_path):
+    """The kept LLM fingerprint is the one guard against a batch_target_index that names the wrong sibling."""
+    mistargeted = {**_combine_onto(0, 'A'), 'target_fingerprint': 'Some other title'}
+    invoke = _answering(_create(), mistargeted)
+
+    async with real_batch_stack(tmp_path, invoke) as stack:
+        _tickets, (a, b) = await _drain_as_one_batch(stack, ['A', 'B'])
+        task_a = await stack.backend.get_task(a['task_id'], stack.root)
+        a_metadata = await _metadata(stack, a['task_id'])
+        b_metadata = await _metadata(stack, b['task_id'])
+
+    assert (a['status'], b['status']) == ('created', 'created')
+    assert b['task_id'] != a['task_id']
+    assert task_a['title'] == _TITLES['A']
+    assert _item_keys(a_metadata) == [_key('A')]
+    assert _item_keys(b_metadata) == [_key('B')]
+    assert [row for row in _audit_rows() if 'refused_reason' not in row] == []
+
+
+@pytest.mark.asyncio
+async def test_a_drop_onto_a_sibling_writes_an_audit_row(tmp_path):
     invoke = _answering(_create(), _drop_onto(0))
 
-    tickets, (a, b) = await _drain_as_one_batch(
-        backend, store, event_buffer, root, ['A', 'B'], invoke,
-    )
+    async with real_batch_stack(tmp_path, invoke) as stack:
+        tickets, (a, b) = await _drain_as_one_batch(stack, ['A', 'B'])
+        a_metadata = await _metadata(stack, a['task_id'])
 
     assert (a['status'], b['status']) == ('created', 'combined')
     task_x = a['task_id']
     assert b['task_id'] == task_x
-    assert _item_keys(await _metadata(backend, task_x, root)) == [_key('A')]
+    assert _item_keys(a_metadata) == [_key('A')]
     [audit] = _audit_rows()
     assert {
         key: audit.get(key)
@@ -301,31 +259,28 @@ async def test_a_drop_onto_a_sibling_writes_an_audit_row(
 
 
 @pytest.mark.asyncio
-async def test_an_r4_hit_resolves_before_any_batch_edge_exists(
-    backend, store, event_buffer, root,
-):
-    seeded = await backend.add_task(
-        root,
-        title='Earlier follow-ups of the retry loop',
-        description='Filed before this batch.',
-        priority='medium',
-        metadata=json.dumps({
-            'source': 'agent-followup',
-            'spawn_context': 'agent_followup',
-            'spawned_from': _PARENT,
-            'files': list(_ITEMS['B']['files']),
-            FOLLOWUP_ITEMS_METADATA_KEY: [
-                observed_item(origin_task=_PARENT, **_ITEMS['B']).model_dump(mode='json'),
-            ],
-        }),
-    )
-    seeded_id = str(seeded['id'])
+async def test_an_r4_hit_resolves_before_any_batch_edge_exists(tmp_path):
     invoke = _answering(_create(), _combine_onto(0, 'A'))
 
-    _tickets, (a, b, c) = await _drain_as_one_batch(
-        backend, store, event_buffer, root, ['A', 'B', 'C'], invoke,
-    )
+    async with real_batch_stack(tmp_path, invoke) as stack:
+        seeded = await stack.backend.add_task(
+            stack.root,
+            title='Earlier follow-ups of the retry loop',
+            description='Filed before this batch.',
+            priority='medium',
+            metadata=json.dumps({
+                'source': 'agent-followup',
+                'spawn_context': 'agent_followup',
+                'spawned_from': _PARENT,
+                'files': list(_ITEMS['B']['files']),
+                FOLLOWUP_ITEMS_METADATA_KEY: [
+                    observed_item(origin_task=_PARENT, **_ITEMS['B']).model_dump(mode='json'),
+                ],
+            }),
+        )
+        _tickets, (a, b, c) = await _drain_as_one_batch(stack, ['A', 'B', 'C'])
 
+    seeded_id = str(seeded['id'])
     assert b == {'status': 'combined', 'task_id': seeded_id, 'reason': 'idempotency_hit'}
     [batch_prompt] = _batch_prompts(invoke)
     assert candidate_titles(batch_prompt) == [_TITLES['A'], _TITLES['C']]
