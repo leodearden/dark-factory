@@ -468,10 +468,10 @@ class _TicketLifecycle:
     ``ticket_data-space`` index remapping those arrays required.
 
     ``target`` is a DIRECT reference to the sibling record a within-batch
-    ``drop`` decision points at (resolved once, at decision-attach time,
-    from the curator's ``batch_target_index`` position within the
-    curatable slice) — never an integer index, so there is no second index
-    space left to get wrong.
+    ``drop`` or ``combine`` decision points at (resolved once, at
+    decision-attach time, from the curator's ``batch_target_index`` position
+    within the curatable slice) — never an integer index, so there is no
+    second index space left to get wrong.
     """
 
     ticket: _PreparedTicket
@@ -485,6 +485,25 @@ class _TicketLifecycle:
     status: str | None = None
     task_id: str | None = None
     dispatched: bool = False
+
+
+class _SiblingOutcome(StrEnum):
+    """Where a dispatched batch-edge target ended up, when it did not park."""
+
+    CREATED = 'created'
+    RESOLVED = 'resolved'  # onto a task it did not create
+    NO_TASK = 'no_task'
+
+
+def _sibling_outcome(sibling: _TicketLifecycle) -> _SiblingOutcome | DeferReason:
+    """What a batch edge onto dispatched *sibling* resolves against: why it parked, if it did."""
+    if sibling.decision is not None and sibling.decision.defer_reason is not None:
+        return sibling.decision.defer_reason
+    if not sibling.task_id:
+        return _SiblingOutcome.NO_TASK
+    if sibling.status == TicketStatus.CREATED:
+        return _SiblingOutcome.CREATED
+    return _SiblingOutcome.RESOLVED
 
 
 _HELD_BY_RESULT_KEY = 'held_by'
@@ -5418,6 +5437,116 @@ class TaskInterceptor:
         )
         return resolved
 
+    async def _resolve_batch_edge(
+        self,
+        edge: CuratorDecision,
+        sibling: _TicketLifecycle,
+        *,
+        ticket_id: str,
+        candidate: CandidateTask,
+        metadata: Any,
+        project_id: str,
+    ) -> CuratorDecision:
+        """The decision a drop or combine onto *sibling*, already dispatched, dispatches as.
+
+        Either edge parks with a parked sibling. A drop lands on any task the
+        sibling resolved to. A combine rewrites only a task the sibling
+        created, through :meth:`_execute_combine` and so every combine guard;
+        ``batch_target_index`` stays set, so its audit row is batch-internal.
+        An edge with nothing to land on is created on its own, and a combine
+        that could not be made is audited as refused.
+        """
+        onto_sibling = f'batch_target_index (ticket={sibling.ticket.ticket_id}): {edge.justification}'
+        match edge.action, _sibling_outcome(sibling):
+            case _, DeferReason() as reason:
+                return CuratorDecision.deferred(reason)
+            case 'drop', _SiblingOutcome.CREATED | _SiblingOutcome.RESOLVED:
+                return CuratorDecision(
+                    action='drop', target_id=sibling.task_id, justification=onto_sibling,
+                )
+            case 'drop', _:
+                logger.warning(
+                    '_resolve_batch_edge: ticket %s drops onto ticket %s, which has no '
+                    'task; degrading to create',
+                    ticket_id,
+                    sibling.ticket.ticket_id,
+                )
+                return CuratorDecision(
+                    action='create',
+                    justification='batch-sibling-failed: degraded to create',
+                    degraded=True,
+                )
+            case 'combine', _SiblingOutcome.CREATED:
+                return dataclasses.replace(
+                    edge, target_id=sibling.task_id, justification=onto_sibling,
+                )
+            case 'combine', _:
+                self._audit_unmade_batch_combine(
+                    edge, sibling, ticket_id=ticket_id, candidate=candidate,
+                    metadata=metadata, project_id=project_id,
+                )
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'{COMBINE_REFUSED_BATCH_TARGET_NOT_CREATE}: ticket '
+                        f'{sibling.ticket.ticket_id} was {sibling.status}, not created; '
+                        f'{edge.justification}'
+                    ),
+                    degraded=True,
+                )
+            case _:
+                return edge
+
+    @staticmethod
+    def _audit_unmade_batch_combine(
+        edge: CuratorDecision,
+        sibling: _TicketLifecycle,
+        *,
+        ticket_id: str,
+        candidate: CandidateTask,
+        metadata: Any,
+        project_id: str,
+    ) -> None:
+        """Audit a combine into *sibling* refused because the sibling was not created.
+
+        ``old`` is the sibling's candidate and terminal ticket status, and
+        ``target_id`` the task it resolved to, if any. The candidate is created
+        with its own items, so ``items_after`` is its keys and nothing is lost.
+        """
+        logger.warning(
+            '_resolve_batch_edge: ticket %s combines into ticket %s, which was %s and '
+            'not created; creating it on its own',
+            ticket_id,
+            sibling.ticket.ticket_id,
+            sibling.status,
+        )
+        origin = sibling.ticket.candidate
+        old_title, old_description = (origin.title, origin.description) if origin else ('', '')
+        rewrite = edge.rewritten_task
+        new_title, new_description = (rewrite.title, rewrite.description) if rewrite else ('', '')
+        context, _ = _combine_fold(
+            edge,
+            ticket_id=ticket_id,
+            target_title=old_title,
+            target_meta={},
+            candidate=candidate,
+            candidate_meta=extract_metadata_dict(
+                metadata, source='TaskInterceptor._audit_unmade_batch_combine',
+            ) or {},
+        )
+        _append_combine_audit(
+            project_id=project_id,
+            target_id=sibling.task_id,
+            old_title=old_title,
+            old_description=old_description,
+            old_status=sibling.status or '',
+            new_title=new_title,
+            new_description=new_description,
+            justification=edge.justification,
+            context=context,
+            refused_reason=COMBINE_REFUSED_BATCH_TARGET_NOT_CREATE,
+        )
+
     async def _process_add_tickets_batch_prepared(
         self,
         prepared_tickets: list[_PreparedTicket],
@@ -5446,8 +5575,9 @@ class TaskInterceptor:
         pool arm here serves only a pool error raised elsewhere in the
         pipeline, deferring every curatable ticket under the pool's reason. A
         submission the curator could not judge parks ``awaiting_curation``,
-        and a within-batch drop onto a parked sibling parks with it; nothing
-        is created for them.
+        and a within-batch drop or combine onto a parked sibling parks with
+        it; nothing is created for them. :meth:`_resolve_batch_edge` says what
+        every other within-batch edge dispatches as.
         """
         if self._ticket_store is None:
             return
@@ -5628,44 +5758,18 @@ class TaskInterceptor:
                         still_pending.append(rec)
                         continue
 
-                    # Resolve the decision: if this is a within-batch drop,
-                    # substitute the sibling's task_id (or degrade to create
-                    # if the sibling failed).
-                    effective_decision = dec
-                    if dec is not None and dec.action == 'drop' and target is not None:
-                        sibling_task_id = target.task_id
-                        sibling_deferral = (
-                            target.decision.defer_reason if target.decision is not None else None
-                        )
-                        if sibling_deferral is not None:
-                            effective_decision = CuratorDecision.deferred(sibling_deferral)
-                        elif sibling_task_id:
-                            # Sibling created or combined — use its task_id.
-                            effective_decision = CuratorDecision(
-                                action='drop',
-                                target_id=sibling_task_id,
-                                justification=(
-                                    f'batch_target_index (ticket={target.ticket.ticket_id}): '
-                                    f'{dec.justification}'
-                                ),
-                            )
-                        else:
-                            # Sibling failed — degrade this item to create.
-                            logger.warning(
-                                '_process_add_tickets_batch_prepared: '
-                                'batch_target_index for ticket %s pointed at '
-                                'ticket %s which had no task_id; degrading '
-                                'to create',
-                                rec.ticket.ticket_id,
-                                target.ticket.ticket_id,
-                            )
-                            effective_decision = CuratorDecision(
-                                action='create',
-                                justification='batch-sibling-failed: degraded to create',
-                                degraded=True,
-                            )
-
                     t = rec.ticket
+                    effective_decision = dec
+                    if dec is not None and target is not None and t.candidate is not None:
+                        effective_decision = await self._resolve_batch_edge(
+                            dec,
+                            target,
+                            ticket_id=t.ticket_id,
+                            candidate=t.candidate,
+                            metadata=t.metadata,
+                            project_id=project_id,
+                        )
+
                     status = TicketStatus.FAILED
                     task_id: str | None = None
                     reason: str | None = None
@@ -5739,7 +5843,7 @@ class TaskInterceptor:
 
                     self._signal_ticket_event(t.ticket_id)
 
-                    # Record this ticket's result for downstream sibling drops.
+                    # Record this ticket's result for downstream sibling edges.
                     rec.decision = effective_decision
                     rec.status = status
                     rec.task_id = task_id
@@ -6999,7 +7103,7 @@ def _combine_audit_path() -> Path:
     return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
 
 
-# Refusal-reason vocabulary for the combine audit (task 4035). Four stable
+# Refusal-reason vocabulary for the combine audit (task 4035). Stable
 # coarse tokens, deliberately NOT one per status: an operator greps these to
 # compute the refusal rate, while the record's own old.status field supplies
 # the per-status breakdown for free. A token per status would make this
@@ -7010,6 +7114,10 @@ COMBINE_REFUSED_NOT_PENDING = 'target_not_pending'
 COMBINE_REFUSED_CLAIMED = 'target_claimed'
 COMBINE_REFUSED_HAS_BRANCH = 'target_has_branch'
 COMBINE_REFUSED_HOLDER = 'target_is_holder'
+# A within-batch combine whose target sibling was not created (task 8416).
+# Hyphenated, unlike the tokens above, because it is also the justification
+# prefix of the create the combine degrades to.
+COMBINE_REFUSED_BATCH_TARGET_NOT_CREATE = 'batch-target-not-create'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7079,7 +7187,7 @@ def _combine_fold(
 def _append_combine_audit(
     *,
     project_id: str,
-    target_id: str,
+    target_id: str | None,
     old_title: str,
     old_description: str,
     old_status: str,
