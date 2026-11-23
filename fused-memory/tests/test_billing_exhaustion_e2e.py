@@ -27,7 +27,7 @@ from _fm_helpers import (
     wrap_like_graphiti,
 )
 from _fm_polling import poll_until
-from escalation.archive import ARCHIVE_SUBDIR
+from escalation.archive import archive_dir_for_date
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 from shared.project_layout import escalation_queue_dir
@@ -81,12 +81,18 @@ def _primary_root(svc: MemoryService) -> Path:
 
 
 def _records(root: Path, category: str) -> list[Escalation]:
-    """Every *category* record on disk, archive included; one moved mid-listing is skipped, not raised."""
-    scanned = (
-        read_escalation_for_scan(path, context='billing e2e')[0]
-        for path in iter_all_escalation_paths(escalation_queue_dir(root))
-    )
-    return [esc for esc in scanned if esc is not None and esc.category == category]
+    """Every *category* record on disk, archive included.
+
+    A record a concurrent resolve archives between the listing and its read is
+    skipped; an unreadable or unparsable record fails the test.
+    """
+    records: list[Escalation] = []
+    for path in iter_all_escalation_paths(escalation_queue_dir(root)):
+        esc, reason = read_escalation_for_scan(path, context='billing e2e')
+        assert reason in ('ok', 'vanished'), f'{path}: {reason}'
+        if esc is not None and esc.category == category:
+            records.append(esc)
+    return records
 
 
 async def _counts(svc: MemoryService) -> dict:
@@ -295,7 +301,9 @@ class TestReadingPagesWhileAResolveArchivesThem:
         )
         assert page_id
         doomed = escalation_queue_dir(tmp_path) / f'{page_id}.json'
-        archived = escalation_queue_dir(tmp_path) / ARCHIVE_SUBDIR / '2026-11-23' / doomed.name
+        archived = archive_dir_for_date(
+            escalation_queue_dir(tmp_path), '2026-11-23T00:00:00+00:00',
+        ) / doomed.name
         original_read_text = Path.read_text
 
         def read_text_racing_a_resolve(self: Path, *args, **kwargs) -> str:
@@ -307,6 +315,7 @@ class TestReadingPagesWhileAResolveArchivesThem:
         monkeypatch.setattr(Path, 'read_text', read_text_racing_a_resolve)
 
         assert [r.id for r in _records(tmp_path, _BILLING)] in ([], [page_id])
+        assert archived.exists() and not doomed.exists(), 'the read never raced an archive move'
         assert [r.id for r in _records(tmp_path, _BILLING)] == [page_id]
 
 
