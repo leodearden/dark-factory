@@ -130,6 +130,7 @@ PURE_STDLIB_LEAVES = (
     'verify_admission',
     'verify_scope_tag',
     'whole_tree_guard_family',
+    'write_queue_statuses',
 )
 
 # Child program: snapshot sys.modules, import argv[1], report the top-level

@@ -18,6 +18,7 @@ import pytest
 from _fm_polling import poll_until, poll_until_dead
 from _parked_queue_fixtures import Exhausted, RecordingParkPolicy
 from _queued_write_fixtures import queued
+from shared.write_queue_statuses import CLAIMABLE, WriteQueueStatus
 
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.queued_writes import QueueCallback, QueuedWrite
@@ -200,6 +201,41 @@ class TestWhatDoesNotPark:
             await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             assert execute.await_count == _MAX_ATTEMPTS
+        finally:
+            await q.close()
+
+
+class TestStatusVocabulary:
+    @pytest.mark.asyncio
+    async def test_every_status_get_stats_reports_is_in_the_shared_vocabulary(self, tmp_path):
+        async def execute(value: QueuedWrite) -> dict:
+            if value.written_text == 'parks':
+                raise Exhausted('no credits remaining')
+            if value.written_text == 'dies':
+                raise RuntimeError('boom')
+            return {'episode_uuid': 'ep-1'}
+
+        q = _queue(
+            tmp_path, execute, park_policy=RecordingParkPolicy(), retry_max_delay_seconds=60.0,
+        )
+        await q.initialize()
+        try:
+            for content in ('parks', 'dies', 'lands'):
+                await q.enqueue(_write(content))
+
+            async def one_of_each():
+                stats = await q.get_stats()
+                counts = stats['counts']
+                settled = (counts.get('parked'), counts.get('dead'), counts.get('completed'))
+                return stats if settled == (1, 1, 1) else None
+
+            stats = await poll_until(one_of_each)
+
+            assert {WriteQueueStatus(key) for key in stats['counts']} == {
+                WriteQueueStatus.PARKED, WriteQueueStatus.DEAD, WriteQueueStatus.COMPLETED,
+            }
+            assert [s for s in CLAIMABLE if stats['counts'].get(s)] == [WriteQueueStatus.PARKED]
+            assert stats['oldest_pending_age_seconds'] is not None
         finally:
             await q.close()
 
