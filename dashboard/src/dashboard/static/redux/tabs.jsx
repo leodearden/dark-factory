@@ -997,7 +997,7 @@ function MergeTab({ projectFilter }) {
                 </div>
 
                 {d.active.length > 0 && (
-                  <div className="col-span-6 panel">
+                  <div className="col-span-12 panel">
                     <div className="panel-head"><span className="title">Currently queued</span></div>
                     <div className="panel-body flush">
                       <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>State</th><th>Branch</th><th className="num">Age</th><th className="num">Pos</th><th>Waiter</th><th className="num">When</th></tr></thead>
@@ -1023,7 +1023,7 @@ function MergeTab({ projectFilter }) {
                   </div>
                 )}
 
-                <div className={d.active.length > 0 ? 'col-span-6 panel' : 'col-span-12 panel'}>
+                <div className="col-span-12 panel">
                   <div className="panel-head"><span className="title">Recent merges</span><span className="meta" title={windowTotal.reason || undefined}>{recentMergesCaption(d.recent.length, windowTotal.value, windowEcho(DF.__receipt, EP.mergeQueue))}</span></div>
                   <div className="panel-body flush">
                     <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>Outcome</th><th className="num">Duration</th><th className="num">When</th></tr></thead>
