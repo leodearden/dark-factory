@@ -28,7 +28,6 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import _checkout as _checkout
 from orchestrator.config import OrchestratorConfig, load_config
@@ -147,7 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
     parser.add_argument('--runs', type=int, default=5)
-    args: Any = parser.parse_args(argv)
+    args = parser.parse_args(argv)
     config = load_config(args.config)
     print(f'project_root={config.project_root} runs={args.runs}')
     with tempfile.TemporaryDirectory(prefix='measure-task-picture-') as workdir:
