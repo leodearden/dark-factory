@@ -15,6 +15,7 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,14 +38,29 @@ def make_harness(tmp_path: Path) -> Callable[[], Harness]:
     return merge_lane_harness_factory(tmp_path)
 
 
+class _RunRow(NamedTuple):
+    run_id: str
+    startup_completed_at: str | None
+    exit_reason: str | None
+    completed_at: str | None
+
+
+def _run_rows(db: Path) -> list[_RunRow]:
+    with closing(sqlite3.connect(db)) as conn:
+        return [
+            _RunRow._make(row)
+            for row in conn.execute(
+                'SELECT run_id, startup_completed_at, exit_reason, completed_at '
+                'FROM runs ORDER BY rowid',
+            )
+        ]
+
+
 def _runs(h: Harness) -> list[tuple[str | None, str | None]]:
-    conn = sqlite3.connect(runs_db(h.config.project_root))
-    try:
-        return conn.execute(
-            'SELECT startup_completed_at, exit_reason FROM runs ORDER BY rowid',
-        ).fetchall()
-    finally:
-        conn.close()
+    return [
+        (row.startup_completed_at, row.exit_reason)
+        for row in _run_rows(runs_db(h.config.project_root))
+    ]
 
 
 def _streak(h: Harness) -> StartupFailureStreak | None:
@@ -266,30 +282,24 @@ def _after_finish_startup(h: Harness, probe: Callable[[], None]) -> None:
     h.scheduler.get_statuses = AsyncMock(side_effect=statuses)
 
 
-def _run_row(db: Path) -> tuple[str | None, str | None, str | None]:
-    with closing(sqlite3.connect(db)) as conn:
-        return conn.execute(
-            'SELECT startup_completed_at, exit_reason, completed_at FROM runs '
-            'ORDER BY rowid DESC LIMIT 1',
-        ).fetchone()
-
-
 @pytest.mark.asyncio
 class TestStartupCompletionIsDurableBeforeExit:
     async def test_a_live_run_reads_startup_completed_before_run_returns(
         self, make_harness,
     ) -> None:
         h = make_harness()
-        live_rows: list[tuple[str | None, str | None, str | None]] = []
-        _after_finish_startup(h, lambda: live_rows.append(_run_row(runs_db(h.config.project_root))))
+        db = runs_db(h.config.project_root)
+        live_rows: list[_RunRow] = []
+        _after_finish_startup(h, lambda: live_rows.extend(_run_rows(db)))
 
         await h.run(prd_path=None, dry_run=True)
 
-        [(startup_completed_at, exit_reason, completed_at)] = live_rows
-        assert startup_completed_at is not None
-        assert exit_reason is None
-        assert completed_at is None
-        assert _run_row(runs_db(h.config.project_root))[0] == startup_completed_at
+        [live] = live_rows
+        assert live.startup_completed_at is not None
+        assert live.exit_reason is None
+        assert live.completed_at is None
+        [final] = _run_rows(db)
+        assert final.startup_completed_at == live.startup_completed_at
 
     async def test_a_run_sigkilled_after_startup_keeps_startup_completed_at(
         self, make_harness, tmp_path,
@@ -308,31 +318,29 @@ class TestStartupCompletionIsDurableBeforeExit:
 
         await h.run(prd_path=None, dry_run=True)
 
-        startup_completed_at, exit_reason, completed_at = _run_row(snapshot)
-        assert startup_completed_at is not None
-        assert exit_reason is None
-        assert completed_at is None
+        [sigkilled] = _run_rows(snapshot)
+        assert sigkilled.startup_completed_at is not None
+        assert sigkilled.exit_reason is None
+        assert sigkilled.completed_at is None
 
     async def test_a_failing_stamp_logs_a_warning_and_startup_still_completes(
         self, make_harness, caplog,
     ) -> None:
         h = make_harness()
+        injected = sqlite3.OperationalError('database is locked')
 
         with (
-            patch.object(
-                RunStore, 'mark_startup_completed',
-                side_effect=sqlite3.OperationalError('database is locked'),
-            ),
+            patch.object(RunStore, 'mark_startup_completed', side_effect=injected),
             caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
         ):
             await h.run(prd_path=None, dry_run=True)
 
         h.scheduler.finish_startup.assert_called_once()
-        db = runs_db(h.config.project_root)
-        assert _run_row(db)[1] is None
-        with closing(sqlite3.connect(db)) as conn:
-            [(run_id,)] = conn.execute('SELECT run_id FROM runs').fetchall()
-        assert any(
-            record.levelno == logging.WARNING and run_id in record.getMessage()
-            for record in caplog.records
-        )
+        [row] = _run_rows(runs_db(h.config.project_root))
+        assert row.exit_reason is None
+        [stamp_failure] = [
+            record for record in caplog.records
+            if record.exc_info is not None and record.exc_info[1] is injected
+        ]
+        assert stamp_failure.levelno == logging.WARNING
+        assert row.run_id in stamp_failure.getMessage()
