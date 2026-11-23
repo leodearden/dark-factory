@@ -27,6 +27,9 @@ from _fm_helpers import (
     wrap_like_graphiti,
 )
 from _fm_polling import poll_until
+from escalation.archive import ARCHIVE_SUBDIR
+from escalation.models import Escalation
+from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -35,11 +38,6 @@ from fused_memory.models.enums import SourceStore
 from fused_memory.models.scope import configured_primary_root
 from fused_memory.services.billing_exhaustion_alarm import ANCHOR_TASK_ID
 from fused_memory.services.memory_service import MemoryService
-
-pytest.importorskip('escalation.queue', reason='escalation package unavailable (minimal env)')
-from escalation.archive import ARCHIVE_SUBDIR  # noqa: E402
-from escalation.models import Escalation  # noqa: E402
-from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan  # noqa: E402
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
