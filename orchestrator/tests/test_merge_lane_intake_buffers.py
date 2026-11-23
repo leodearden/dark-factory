@@ -27,7 +27,12 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.halt import HaltState
-from orchestrator.merge_lane.intake_buffers import IntakeLifecycle, MergeIntake
+from orchestrator.merge_lane.intake_buffers import (
+    MERGE_WORKER_SHUTDOWN_REASON,
+    IntakeLifecycle,
+    MergeIntake,
+    survives_restart,
+)
 from orchestrator.merge_lane.types import (
     DecidedItem,
     ItemLifecycleState,
@@ -449,6 +454,39 @@ async def test_the_suffix_state_starts_empty_and_remembers_main(scene: Scene) ->
     scene.intake.note_main_sha('a' * 40)
 
     assert scene.intake.last_known_main_sha == 'a' * 40
+
+
+# ---------------------------------------------------------------------------
+# (h) Which requests come back on the next start
+# ---------------------------------------------------------------------------
+
+
+SettleFuture = Callable[[asyncio.Future[MergeOutcome]], object]
+
+
+@pytest.mark.parametrize(('settle', 'survives'), [
+    pytest.param(lambda fut: None, False, id='still-pending'),
+    pytest.param(lambda fut: fut.cancel(), True, id='cancelled'),
+    pytest.param(
+        lambda fut: fut.set_result(MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)),
+        True, id='shutdown-outcome',
+    ),
+    pytest.param(
+        lambda fut: fut.set_result(MergeOutcome('blocked', reason='merge conflict')),
+        False, id='other-blocked-outcome',
+    ),
+    pytest.param(lambda fut: fut.set_result(MergeOutcome('done')), False, id='done-outcome'),
+    pytest.param(
+        lambda fut: fut.set_exception(RuntimeError('merger error')), False, id='exception-set',
+    ),
+])
+async def test_only_a_cancelled_or_shut_down_request_survives_a_restart(
+    settle: SettleFuture, survives: bool,
+) -> None:
+    result: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    settle(result)
+
+    assert survives_restart(result) is survives
 
 
 # ---------------------------------------------------------------------------
