@@ -4,6 +4,7 @@
 **Source design:** `plans/merge-throughput-disjoint-former-design.md` (measurement-backed, reify `runs.db` 67d/97 runs + `main` first-parent 300 merges, 2026-06-09). Lever **C** is the primary recommendation (~85% P(improves throughput) if built); **A′** is the sibling `plans/merge-throughput-coupling-tolerant-train-former-prd.md`; **B** / disjoint-only batching are dead (design §9 — not relitigated here).
 **Approach:** **B + H** (contract + two-way boundary tests). This PRD sits on the load-bearing path to `main`; a remote PASS that would be a local FAIL = unverified code on `main` (constraint 3 violation). The fidelity invariant earns the full contract (§A) + boundary-test sketch (§B).
 **Scope guard (load-bearing):** every verify dispatched to any runner remains a **full, independent merge gate** (same scoped `run_scoped_verification` + the fail-closed `_run_unscoped_typechecks`). C buys throughput from **non-contending CPU capacity** (a second host), never from narrowing or skipping a gate.
+**Scope-guard rulings (2026-11-23):** a per-unit green replay under identical spec hash and keyed inputs is evidence, not a skipped gate (R-cache-1, Leo 2026-09-19), and greens serve across hosts (R-cache-2, Leo 2026-11-14); both in `plans/verify-result-cache-prd.md` § Pre-conditions for activating.
 
 ---
 
