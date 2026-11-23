@@ -15,17 +15,12 @@ import types
 from pathlib import Path
 
 from _git_fixtures import seed_repo
-from test_task_runtime import _make_task_artifacts
+from _task_runtime_fixtures import make_task_artifacts
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.task_runtime import build_task_runtime_snapshot
-
-# _make_task_artifacts is shared with test_task_runtime.py
-# (dark_factory's established cross-test-module reuse pattern — e.g.
-# test_merge_queue_dry_run_unblock.py importing from test_dry_run_unblock.py
-# — rather than duplicating the fixtures verbatim in both files).
 
 
 class TestHarnessDelegator:
@@ -36,7 +31,7 @@ class TestHarnessDelegator:
         assert not git_ops.pool_in_use()
         worktree_base = git_ops.worktree_base
 
-        ta = _make_task_artifacts(worktree_base, '77', '77')
+        ta = make_task_artifacts(worktree_base, '77', '77')
         ta.write_plan({'steps': [{'id': 's1', 'status': 'done'}]})
         ta.append_iteration_log({'note': 'iter-1'})
         ta.write_review('reviewer-a', {'verdict': 'PASS', 'issues': []})

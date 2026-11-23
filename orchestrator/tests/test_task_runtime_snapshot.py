@@ -15,9 +15,7 @@ This closes a seam neither leg's own unit tests exercise alone:
   ``build_task_runtime_snapshot`` directly and never goes through the tool.
 
 Every test below builds a REAL tmp git repo with real ``.lane-state`` /
-``.task-meta`` artifacts (reusing ``test_task_runtime.py``'s fixture
-builders — the established cross-test-module reuse pattern
-``test_harness_task_runtime.py`` already uses), wraps
+``.task-meta`` artifacts (through ``_task_runtime_fixtures``), wraps
 ``build_task_runtime_snapshot`` in a fixture harness, and drives the actual
 ``get_task_runtime_state`` MCP tool end-to-end — asserting on the wire-JSON
 dict it emits.
@@ -30,13 +28,13 @@ test passes on arrival).
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import types
 from pathlib import Path
 
 import pytest
 from _git_fixtures import seed_repo
 from _seed_script_stubs import seed_default_warm_base
+from _task_runtime_fixtures import make_task_artifacts, warm_config
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -45,38 +43,6 @@ from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneState
 from orchestrator.task_runtime import build_task_runtime_snapshot
-
-# ---------------------------------------------------------------------------
-# Sibling-fixture reuse, loaded by explicit file path rather than a bare
-# `from test_task_runtime import ...`. dashboard/tests/test_task_runtime.py
-# shares this module's bare name and defines none of
-# `_make_task_artifacts` / `_warm_config`. Both subprojects' conftest.py
-# insert their own tests/ dir at sys.path[0] (orchestrator/tests/conftest.py,
-# dashboard/tests/conftest.py), so a bare import's resolution is conftest-
-# load-order-dependent: collecting both suites together (e.g. `pytest
-# orchestrator/tests/test_task_runtime_snapshot.py dashboard/tests/
-# test_task_runtime_boundary.py`) reproducibly binds to the wrong module and
-# fails collection with a confusing ImportError (verified). Loading by
-# explicit path bypasses sys.path/sys.modules bare-name resolution entirely.
-# ---------------------------------------------------------------------------
-
-
-def _load_sibling_test_module(filename: str, unique_name: str):
-    """Load *filename* from this tests/ dir under *unique_name*, independent
-    of sys.path order or any bare-name entry already cached in sys.modules.
-    """
-    spec = importlib.util.spec_from_file_location(unique_name, Path(__file__).parent / filename)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_task_runtime_fixtures = _load_sibling_test_module(
-    'test_task_runtime.py', '_orchestrator_test_task_runtime_fixtures',
-)
-_make_task_artifacts = _task_runtime_fixtures._make_task_artifacts
-_warm_config = _task_runtime_fixtures._warm_config
 
 # ---------------------------------------------------------------------------
 # Repo fixture — mirrors test_task_runtime.py's git_repo fixture (redefined
@@ -135,13 +101,13 @@ class TestB1PooledRoundtrip:
         """A pooled, ASSIGNED lane's real .lane-state + .task-meta artifacts
         round-trip through the real tool onto the wire.
         """
-        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        git_ops = GitOps(warm_config(), git_repo, warm_lane_pool_size=1)
         assert git_ops.pool_in_use()
         worktree_base = git_ops.worktree_base
         lifecycle = git_ops._lane_lifecycle
 
         lifecycle.note_assigned('_lane-3', task_id='42')
-        ta = _make_task_artifacts(worktree_base, '_lane-3', '42')
+        ta = make_task_artifacts(worktree_base, '_lane-3', '42')
         ta.write_plan({'steps': [{'id': 's1', 'status': 'done'}]})
         ta.append_iteration_log({'note': 'iter-1'})
         ta.append_iteration_log({'note': 'iter-2'})
@@ -176,7 +142,7 @@ class TestB2NonPooled:
         assert not git_ops.pool_in_use()
         worktree_base = git_ops.worktree_base
 
-        ta = _make_task_artifacts(worktree_base, '42', '42')
+        ta = make_task_artifacts(worktree_base, '42', '42')
         ta.write_plan({'steps': [
             {'id': 's1', 'status': 'done'},
             {'id': 's2', 'status': 'pending'},
@@ -205,7 +171,7 @@ class TestB3Quarantined:
         end-to-end — the state the OLD dashboard hand reader (pre-2636) was
         blind to.
         """
-        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        git_ops = GitOps(warm_config(), git_repo, warm_lane_pool_size=1)
         lifecycle = git_ops._lane_lifecycle
         lifecycle.note_assigned('_lane-5', task_id='43')
         lifecycle.transition('_lane-5', LaneState.QUARANTINED)
@@ -229,11 +195,11 @@ class TestB4HonestZero:
         failure) reports an honest integer 0 end-to-end — never a missing/
         None/dropped entry (the structured-facts boundary).
         """
-        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        git_ops = GitOps(warm_config(), git_repo, warm_lane_pool_size=1)
         worktree_base = git_ops.worktree_base
         lifecycle = git_ops._lane_lifecycle
         lifecycle.note_assigned('_lane-7', task_id='44')
-        _make_task_artifacts(worktree_base, '_lane-7', '44')
+        make_task_artifacts(worktree_base, '_lane-7', '44')
         empty_log = TaskArtifacts.task_root_for(worktree_base, '44') / 'iterations.jsonl'
         empty_log.write_text('')
 
