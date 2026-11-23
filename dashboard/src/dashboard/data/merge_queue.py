@@ -286,6 +286,7 @@ class LandingRateSeries(ChartData):
     """Landings per day at each instant, each counted over the trailing window that ends there."""
 
     trailing_minutes: int
+    window_mean_per_day: float
 
 
 def trailing_landing_rates(
@@ -296,6 +297,10 @@ def trailing_landing_rates(
     *landed* is sorted ascending and reaches one trailing window before the
     first point, so every point counts a whole window: landings in
     ``(t - trailing, t]``, scaled to landings per day.
+
+    ``window_mean_per_day`` is the landings in ``(now - hours, now]`` per day
+    of the window. No reading of the points recovers it, because each point
+    counts only its own trailing window.
     """
     step = _bucket_minutes_for_window(hours)
     trailing = _trailing_minutes_for_window(hours)
@@ -309,10 +314,12 @@ def trailing_landing_rates(
         )
         for t in points
     ]
+    in_window = bisect_right(landed, now) - bisect_right(landed, now - timedelta(hours=hours))
     return {
         'labels': [t.isoformat() for t in points],
         'values': values,
         'trailing_minutes': trailing,
+        'window_mean_per_day': in_window * 24 / hours,
     }
 
 

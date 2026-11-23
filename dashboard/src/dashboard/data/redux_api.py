@@ -529,12 +529,17 @@ def _shape_depth(series: ChartData) -> dict[str, Any]:
 
 
 def _shape_landing_rate(series: LandingRateSeries) -> dict[str, Any]:
-    """Serve a landing rate as ``{labels, values, trailing_minutes}``, leading zero points trimmed."""
+    """Serve a landing rate as ``{labels, values, trailing_minutes, window_mean_per_day}``.
+
+    Leading zero points are trimmed; the window mean is the one the series
+    counted over its whole window, served as it is.
+    """
     trimmed = trim_leading_zero_buckets(series)
     return {
         'labels': list(trimmed['labels']),
         'values': list(trimmed['values']),
         'trailing_minutes': series['trailing_minutes'],
+        'window_mean_per_day': series['window_mean_per_day'],
     }
 
 
