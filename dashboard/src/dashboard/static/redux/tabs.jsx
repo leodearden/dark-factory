@@ -143,8 +143,6 @@ function DatumPanelHead({ title, datum, reading }) {
 }
 
 // A compact number: its reading over its label, and an optional hint line.
-const NUMBER_BASIS_PX = 88;
-
 function NumberCell({ label, hint, datum, format, color }) {
   return (
     <div>
@@ -156,6 +154,8 @@ function NumberCell({ label, hint, datum, format, color }) {
 }
 
 // The count of numbers sets both the card's columns and its flex weight in a .number-cards row.
+const NUMBER_BASIS_PX = 88;
+
 function NumberCard({ title, meta, numbers }) {
   return (
     <div className="panel" style={{ flexGrow: numbers.length, flexBasis: numbers.length * NUMBER_BASIS_PX }}>

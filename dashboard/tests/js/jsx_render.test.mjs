@@ -604,10 +604,16 @@ test('tabs.jsx::MergeTab sets Latency centiles, Speculative merge and Live merge
 
   const row = cards[0].parentElement;
   assert.ok(cards.every(card => card.parentElement === row), 'the number cards must share one row');
+  assert.ok(row.classList.contains('number-cards'), 'the shared row must be a .number-cards flex row');
+  assert.ok(row.classList.contains('col-span-12'), 'the number-card row must span the whole project row');
+  assert.ok(row.parentElement.classList.contains('cols-12'), "the number-card row must sit in the project's 12-column grid");
   assert.deepEqual([...row.children].map(panelTitleOf), titles, 'the row must hold exactly the three number cards, in order');
   const counts = cards.map(card => card.querySelector('.panel-body').children.length);
   assert.deepEqual(counts, [4, 3, 2]);
   assert.deepEqual(cards.map(card => Number(card.style.flexGrow)), counts, 'each card must be weighted by its count of numbers');
+  const basisPerNumber = cards.map((card, i) => parseFloat(card.style.flexBasis) / counts[i]);
+  assert.ok(basisPerNumber[0] > 0, `each card must carry a positive flex basis: ${cards.map(card => card.style.flexBasis)}`);
+  assert.ok(basisPerNumber.every(basis => basis === basisPerNumber[0]), `each card's flex basis must be proportional to its count of numbers: ${cards.map(card => card.style.flexBasis)}`);
 });
 
 const LIVE_METRIC_ARMS = [
