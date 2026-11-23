@@ -14649,8 +14649,9 @@ async def test_batch_combine_pointing_at_refused_candidate_degrades_to_create_an
     [audit] = _combine_audit_lines(audit_dir)
     assert {
         key: audit.get(key)
-        for key in ('refused_reason', 'batch_internal', 'candidate_ticket_id', 'target_id')
+        for key in ('action', 'refused_reason', 'batch_internal', 'candidate_ticket_id', 'target_id')
     } == {
+        'action': 'combine',
         'refused_reason': 'batch-target-not-create',
         'batch_internal': True,
         'candidate_ticket_id': ticket_ids[1],

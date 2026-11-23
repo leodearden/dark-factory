@@ -217,8 +217,11 @@ async def test_two_combinable_siblings_in_one_batch_resolve_as_one_task(
     [audit] = _audit_rows()
     assert {
         key: audit.get(key)
-        for key in ('target_id', 'batch_internal', 'candidate_ticket_id', 'items_before', 'items_after')
+        for key in (
+            'action', 'target_id', 'batch_internal', 'candidate_ticket_id', 'items_before', 'items_after',
+        )
     } == {
+        'action': 'combine',
         'target_id': task_x,
         'batch_internal': True,
         'candidate_ticket_id': tickets[1],
@@ -244,17 +247,57 @@ async def test_a_combine_onto_a_dropped_sibling_degrades_to_create_and_is_audite
     assert a['task_id'] != task_z
     assert 'batch-target-not-create' in a['reason']
     assert _item_keys(await _metadata(backend, a['task_id'], root)) == [_key('A')]
-    [refusal] = [row for row in _audit_rows() if row.get('refused_reason')]
+    drop_row, refusal = _audit_rows()
+    assert {key: drop_row.get(key) for key in ('action', 'target_id', 'batch_internal')} == {
+        'action': 'drop', 'target_id': task_z, 'batch_internal': True,
+    }
     assert {
         key: refusal.get(key)
-        for key in ('refused_reason', 'batch_internal', 'candidate_ticket_id', 'target_id', 'items_after')
+        for key in (
+            'action', 'refused_reason', 'batch_internal', 'candidate_ticket_id', 'target_id', 'items_after',
+        )
     } == {
+        'action': 'combine',
         'refused_reason': 'batch-target-not-create',
         'batch_internal': True,
         'candidate_ticket_id': tickets[2],
         'target_id': task_z,
         'items_after': [_key('A')],
     }
+
+
+@pytest.mark.asyncio
+async def test_a_drop_onto_a_sibling_writes_an_audit_row(
+    backend, store, event_buffer, root,
+):
+    invoke = _answering(_create(), _drop_onto(0))
+
+    tickets, (a, b) = await _drain_as_one_batch(
+        backend, store, event_buffer, root, ['A', 'B'], invoke,
+    )
+
+    assert (a['status'], b['status']) == ('created', 'combined')
+    task_x = a['task_id']
+    assert b['task_id'] == task_x
+    assert _item_keys(await _metadata(backend, task_x, root)) == [_key('A')]
+    [audit] = _audit_rows()
+    assert {
+        key: audit.get(key)
+        for key in (
+            'action', 'batch_internal', 'target_id', 'candidate_ticket_id',
+            'candidate_spawned_from', 'items_before', 'items_after',
+        )
+    } == {
+        'action': 'drop',
+        'batch_internal': True,
+        'target_id': task_x,
+        'candidate_ticket_id': tickets[1],
+        'candidate_spawned_from': _PARENT,
+        'items_before': [_key('A')],
+        'items_after': [_key('A')],
+    }
+    assert audit['new']['title'] == audit['old']['title'] == _TITLES['A']
+    assert 'refused_reason' not in audit
 
 
 @pytest.mark.asyncio
