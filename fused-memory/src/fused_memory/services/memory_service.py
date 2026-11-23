@@ -80,6 +80,7 @@ from fused_memory.models.memory import (
     EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
+    graphiti_hit_attribution,
     mem0_hit_attribution,
     render_add_memory_message,
 )
@@ -1596,6 +1597,7 @@ def _graph_search_result(
         )),
         metadata=metadata,
         created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
+        **graphiti_hit_attribution(getattr(edge, 'group_id', None)),
     )
 
 
