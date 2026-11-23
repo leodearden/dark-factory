@@ -2,7 +2,7 @@
 
 This file pins the harness's structural behaviour only: the nested session runs
 against its own copy of ``df_pytest_isolation`` in its own rootdir, the conftest
-template binds what it names, and the harness refuses inputs that would void
+template arms what it names, and the harness refuses inputs that would void
 that isolation. The guard modules' end-to-end classes, which drive every real
 nested run, remain the main regression detectors for it.
 """
@@ -13,11 +13,15 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from host_pytest_temp_root import listing, seed_dead_session_dirs
 from nested_pytest_session import (
     NESTED_SESSION_TIMEOUT_SECS,
-    binding_conftest,
+    arming_conftest,
     run_nested_pytest,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PROBE_SETUP = (
     'import df_pytest_isolation\n'
@@ -41,26 +45,36 @@ def test_the_session_imports_the_copy_not_the_repo_module():
     assert copy.parent == HERE
 
 
-def test_setup_is_spliced_in_before_the_binding():
+def test_setup_is_spliced_in_before_the_arming():
     assert sys.modules['df_pytest_isolation'].HARNESS_SPLICE_PROBE == 'spliced'
 
 
-def test_the_binding_registers_the_named_fixture(request):
+def test_the_arming_registers_the_named_fixture(request):
     assert '_df_fleet_dir_redirect' in request.fixturenames
 '''
 
 _TRIVIAL_TEST = 'def test_passes():\n    pass\n'
+
+_TEMPROOT_RECORDER = '''\
+import os
+from pathlib import Path
+
+
+def test_records_the_inherited_temproot(tmp_path):
+    record = Path(__file__).resolve().parent / 'inherited-temproot'
+    record.write_text(os.environ.get('PYTEST_DEBUG_TEMPROOT', ''))
+'''
 
 
 def _output(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout + result.stderr
 
 
-def test_a_bound_session_runs_against_its_own_copy_in_its_own_tree(tmp_path: Path) -> None:
+def test_an_armed_session_runs_against_its_own_copy_in_its_own_tree(tmp_path: Path) -> None:
     result = run_nested_pytest(
-        tmp_path / 'bound',
+        tmp_path / 'armed',
         {
-            'conftest.py': binding_conftest('_df_fleet_dir_redirect', setup=_PROBE_SETUP),
+            'conftest.py': arming_conftest('_df_fleet_dir_redirect', setup=_PROBE_SETUP),
             'test_probe.py': _PROBE_TESTS,
         },
     )
@@ -100,6 +114,46 @@ def test_a_source_may_not_replace_the_harness_own_files(
         run_nested_pytest(root, {relpath: '', 'test_one.py': _TRIVIAL_TEST})
 
     assert not root.exists()
+
+
+def test_a_nested_session_leaves_the_hosts_default_temp_root_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = tmp_path / 'host-temp'
+    seed_dead_session_dirs(host)
+    before = listing(host)
+    monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
+    root = tmp_path / 'temproot-probe'
+
+    result = run_nested_pytest(root, {'test_records_temproot.py': _TEMPROOT_RECORDER})
+
+    assert result.returncode == 0, _output(result)
+    assert '1 passed' in _output(result), _output(result)
+    assert (root / 'inherited-temproot').read_text() == str(host), (
+        'nested session did not inherit PYTEST_DEBUG_TEMPROOT'
+    )
+    after = listing(host)
+    assert after == before, (
+        "nested session touched the host's default temp root\n"
+        f'before: {before}\nafter:  {after}'
+    )
+
+
+@pytest.mark.parametrize(
+    'spelling', [('--basetemp={}',), ('--basetemp', '{}')], ids=['joined', 'separate'],
+)
+def test_a_basetemp_smuggled_through_targets_is_refused_before_any_session_starts(
+    tmp_path: Path, spelling: tuple[str, ...],
+) -> None:
+    smuggled = tmp_path / 'elsewhere'
+    targets = ('test_one.py', *(arg.format(smuggled) for arg in spelling))
+    root = tmp_path / 'smuggling'
+
+    with pytest.raises(ValueError, match='--basetemp') as refused:
+        run_nested_pytest(root, {'test_one.py': _TRIVIAL_TEST}, targets=targets)
+
+    assert targets[1] in str(refused.value)
+    assert not root.exists() and not smuggled.exists(), 'a session started anyway'
 
 
 def test_the_nested_cap_is_below_this_runs_per_test_timeout(

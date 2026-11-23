@@ -163,7 +163,7 @@ class TestRegistry:
         registration-lookup asymmetry (get_overlap_detector('') would fall
         through to the default, hiding the registration)."""
         stub = _StubDetector()
-        import pytest as _pytest  # noqa: PLC0415
+        import pytest as _pytest
 
         with _pytest.raises(ValueError, match="non-empty string"):
             register_overlap_detector("", stub)

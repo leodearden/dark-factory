@@ -31,7 +31,8 @@ Superseded by the task 6556 addendum: the rule is now
 Adopted wholesale from what this repo already justifies, rather than invented:
 
 - The **8x headroom factor** is
-  `orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR`.
+  `shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR`
+  (moved from `orchestrator/tests/_orch_helpers.py` by task 6555).
   8x rather than 2x because the xdist worker deaths the cap exists to avoid were
   observed at loadavg 250-423 — one inflation step PAST the load at which
   measurements can be taken — so the value has to clear a figure nobody has
@@ -869,3 +870,23 @@ discards an older unmarked figure. `shared/pyproject.toml` no longer says the
 default is floored at the family floor. Nothing mechanical read that coupling:
 `tests/scripts/test_pytest_per_test_timeout_policy.py` does not reference the
 floor.
+
+## Code-home addendum (task 10940, 2026-11-22)
+
+No value moved. The three anchors this file derives now have one code home,
+`shared/src/shared/testing_ceiling_anchors.py`:
+
+- `WHOLE_TREE_FAMILY_MEASURED_WORST_SECS` (148.65), which was
+  `orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE`;
+- `MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS` (61.52) and
+  `MAGICMOCK_REPO_SCAN_TEST_TIMEOUT` (540), which were literals in
+  `fused-memory/tests/test_check_bare_magicmock_config.py`;
+- `INI_DEFAULT_MEASURED_WORST_SECS` (45.48), which was prose in
+  `shared/pyproject.toml`.
+
+The guard tests import them from there. `registered_anchors()` pairs each with
+its ceiling and the population that ceiling bounds, decided by each test's
+closest timeout mark. `scripts/timeout_headroom_selfcheck.py` re-measures every
+registered anchor nightly against the archived verify junits and files a
+breach as an escalation. Re-anchoring an anchor is an edit to that module and
+an addendum here.

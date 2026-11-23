@@ -62,7 +62,8 @@ class PinOrder:
     every tier rank, and a lower pin_order is a better rank.  A negative
     pin_order clamps to 0, and pin orders at or past ``_PIN_RANK_SPAN - 1``
     all tie at rank -1 — a tie only matters if two such pins reserve one key
-    at once, where the earlier install then blocks the later one (INV-3).
+    at once, and tied pin ranks resolve by the park key's id tie-break
+    (``orchestrator/src/orchestrator/lock_table.py::_ParkKey``, INV-3).
     ``from_rank`` is the inverse: it answers the in-band pin order of a rank.
     """
 

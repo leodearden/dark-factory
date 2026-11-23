@@ -32,6 +32,7 @@ import sys
 import time
 
 ROLE_BY_NICE = {5: 'merge', 15: 'task', 19: 'background'}
+ORCHESTRATOR_FAMILIES = frozenset({'claude-cli', 'orch-main'})
 SCOPE_SLUG = {'df': 'dark-factory', 'reify': 'reify'}
 
 
@@ -92,6 +93,7 @@ def _is_verify(bk: str, proj: str) -> bool:
 
 
 def headline(run: collections.Counter, wait: collections.Counter, dt: float, psi: str, runq: str) -> dict:
+    """The df_*_workers classes count every process at that nice tier in a DF verify scope, and in the df unit every one except agents and orch-main."""
     def cls(pred):
         r = sum(run[k] for k in run if pred(k))
         w = sum(wait[k] for k in wait if pred(k))
@@ -99,12 +101,16 @@ def headline(run: collections.Counter, wait: collections.Counter, dt: float, psi
         return {'run_cores': round(r / 1e9 / dt, 2), 'wait_cores': round(w / 1e9 / dt, 2),
                 'stall_pct': round(100 * w / tot) if tot else None}
 
+    def df_verify(nice):
+        return cls(lambda k: _is_verify(k[0], 'df') and k[2] == nice
+                   and not (k[0] == 'df' and k[1] in ORCHESTRATOR_FAMILIES))
+
     return {
         'psi_cpu_some_avg10': psi, 'procs_running': runq, 'window_s': round(dt, 1),
         'df_agents': cls(lambda k: k[0] == 'df' and k[1] == 'claude-cli'),
-        'df_merge_workers': cls(lambda k: _is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 5),
-        'df_task_workers': cls(lambda k: _is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 15),
-        'df_background_workers': cls(lambda k: _is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 19),
+        'df_merge_workers': df_verify(5),
+        'df_task_workers': df_verify(15),
+        'df_background_workers': df_verify(19),
         'reify_agents': cls(lambda k: k[0] == 'reify' and k[1] == 'claude-cli'),
         'reify_merge_verify': cls(lambda k: _is_verify(k[0], 'reify') and k[1] in ('rustc', 'test-binary', 'cargo') and k[2] == 5),
         'reify_task_verify': cls(lambda k: _is_verify(k[0], 'reify') and k[1] in ('rustc', 'test-binary', 'cargo') and k[2] == 15),

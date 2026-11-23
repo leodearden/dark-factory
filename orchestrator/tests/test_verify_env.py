@@ -4,18 +4,17 @@ Guards the 2026-05-29 ghost-venv fix: a target project's verify/build/test
 subprocess must NOT inherit the orchestrator's own venv/uv activation vars, or
 the target's ``uv`` resolves dark-factory/.venv and a target ``uv sync``
 corrupts the orchestrator runtime interpreter. See
-orchestrator/src/orchestrator/verify.py: ``_VENV_ISOLATION_KEYS`` /
-``_strip_venv_bin_from_path`` / ``_target_subprocess_env``.
+shared/src/shared/python_env.py::without_python_env_selection and
+orchestrator/src/orchestrator/verify.py::_target_subprocess_env.
 """
 
 import os
 from pathlib import Path
 
+import pytest
+
 from orchestrator import verify
-from orchestrator.verify import (
-    _strip_venv_bin_from_path,
-    _target_subprocess_env,
-)
+from orchestrator.verify import _target_subprocess_env
 
 ORCH_VENV = "/home/leo/src/dark-factory/.venv"
 
@@ -271,23 +270,40 @@ class TestOrchEnvScrub:
         assert env["FOO_ORCH"] == "1"
 
 
-class TestStripVenvBinFromPath:
-    def test_removes_leading_venv_bin(self):
-        path = f"{ORCH_VENV}/bin:/home/leo/.cargo/bin:/usr/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV) == (
-            "/home/leo/.cargo/bin:/usr/bin"
+class TestAccountPoolScrub:
+    """A target verify child inherits every credential except the Claude OAuth
+    account pool (``CLAUDE_OAUTH_TOKEN_*``), so a target test that prints its
+    environment cannot write the pool into a verify log (task 6828)."""
+
+    def test_pool_scrubbed_and_other_credentials_kept(self, monkeypatch):
+        fake_environ = {
+            "CLAUDE_OAUTH_TOKEN_A": "pool-a-probe",
+            "CLAUDE_OAUTH_TOKEN_H": "pool-h-probe",
+            "OPENAI_API_KEY": "openai-probe",
+            "CLAUDE_CODE_OAUTH_TOKEN": "session-probe",
+            "HOME": "/home/leo",
+            "PATH": "/usr/bin:/bin",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None)
+
+        assert [k for k in env if k.startswith("CLAUDE_OAUTH_TOKEN_")] == []
+        assert env["OPENAI_API_KEY"] == "openai-probe"
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "session-probe"
+        assert env["HOME"] == "/home/leo"
+
+    @pytest.mark.asyncio
+    async def test_a_verify_leg_runs_without_the_pool(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "pool-b-probe")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-probe")
+
+        rc, out, timed_out = await verify._run_cmd(
+            'printf "%s|%s" "${CLAUDE_OAUTH_TOKEN_B-absent}" "${OPENAI_API_KEY-absent}"',
+            tmp_path,
+            timeout=5.0,
         )
 
-    def test_removes_venv_bin_even_when_not_leading(self):
-        path = f"/usr/bin:{ORCH_VENV}/bin:/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV) == "/usr/bin:/bin"
-
-    def test_noop_when_venv_is_none(self):
-        assert _strip_venv_bin_from_path("/a:/b", None) == "/a:/b"
-
-    def test_noop_when_path_is_none(self):
-        assert _strip_venv_bin_from_path(None, ORCH_VENV) is None
-
-    def test_trailing_slash_on_venv_is_normalized(self):
-        path = f"{ORCH_VENV}/bin:/usr/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV + "/") == "/usr/bin"
+        assert rc == 0, out
+        assert not timed_out
+        assert "absent|openai-probe" in out

@@ -21,7 +21,7 @@ REAL vs FAKED
 -------------
 REAL (composed as the genuine article, never hand-seeded): GitOps over a
 real git repo; ``derive_verify_plan``, ``classify_failure``, ``check_proposal``,
-``_run_post_merge_verify``, ``VerifyCmd`` + its mutators, ``VerifyAttempt``,
+``run_post_merge_verify``, ``VerifyCmd`` + its mutators, ``VerifyAttempt``,
 and ``ephemeral_worktree`` itself.
 
 FAKED (boundary only — the ssh/build/agent edges, never the decision layer):
@@ -78,6 +78,7 @@ import pytest
 # fixtures; test_golden_diffs_match_test_verify_plan_source() near the end of
 # the plan-golden section turns that copy's silent-drift risk into a loud
 # test failure instead.
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import FakeVerifier, VerifyScript
 from test_dry_run_unblock import _make_agent_result, _RecordingScheduler
 from test_verify_plan import (
@@ -94,13 +95,10 @@ from orchestrator import verify
 from orchestrator.b3_gate import ABORT, FRESH, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
-from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind, _run
-from orchestrator.merge_lane.worker import (
-    MergeRequest,
-    QueuedBranch,
-    _DryRunInvestigationHandles,
-    _run_post_merge_verify,
-)
+from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import DryRunInvestigationHandles
+from orchestrator.merge_lane.worker import MergeRequest, QueuedBranch
 from orchestrator.unblock_types import BlockClass, BlockRecord
 from orchestrator.verify import (
     CheckRun,
@@ -125,28 +123,12 @@ from orchestrator.verify_plan import (
     derive_verify_plan,
 )
 
-# ── Repo seeding (ported from test_merge_queue_two_layer_integration.py) ──────
-
-
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a minimal git repo with a README committed on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 # ── Fixtures (ported from test_merge_queue_two_layer_integration.py) ─────────
 
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -227,7 +209,7 @@ _PYTEST_UV_DIRECTORY_RAW = (
 
 # The historical broken lint/type_check &&-chain (orchestrator/config.yaml:50)
 # — recognised-but-unstructurable (ruff + a follow-up script, not pytest/cargo
-# chain-aware), classifies OPAQUE, and must never be scoped (P1).
+# chain-aware), resolves RUFF raw-retained, and must never be scoped (P1).
 _LINT_CHAIN_RAW = (
     'uv run ruff check shared escalation fused-memory orchestrator dashboard && '
     'python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests '
@@ -245,7 +227,7 @@ class TestVerifyCmdRoundTrip:
     and ACTUALLY EXECUTED (runner side) against a throwaway probe file,
     proving the two sides agree on what "scoped" means. Row 2/P1 pins the
     real historical broken lint/type_check &&-chain (orchestrator/config.yaml:50)
-    as OPAQUE and never scoped.
+    as raw-retained and never scoped.
 
     RED until step-2 GREEN imports parse_config_command/render/ToolKind/
     scope_to/strip_cwd/VerifyCmd from orchestrator.verify_cmd and adds the
@@ -330,16 +312,17 @@ class TestVerifyCmdRoundTrip:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert '1 passed' in proc.stdout
 
-    # ── scenario 2 / Row 2 / P1: OPAQUE is never scoped ──────────────────────
-    def test_opaque_lint_chain_is_never_scoped(self):
-        """The historical broken &&-chain classifies OPAQUE and scope_to no-ops on it.
+    # ── scenario 2 / Row 2 / P1: a raw-retained chain is never scoped ────────
+    def test_raw_retained_lint_chain_is_never_scoped(self):
+        """The historical broken &&-chain resolves RUFF, raw-retained, and scope_to no-ops on it.
 
         render(parse(x)) == x verbatim (raw retained unchanged) — this is the
         exact lint_command value at orchestrator/config.yaml:50 that regressed
         under the old string-surgery scoper.
         """
         cmd = parse_config_command(_LINT_CHAIN_RAW)
-        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.tool is ToolKind.RUFF
+        assert cmd.raw is not None
         assert scope_to(cmd, ['orchestrator/src/orchestrator/foo.py']) is cmd
         assert render(parse_config_command(_LINT_CHAIN_RAW)) == _LINT_CHAIN_RAW
 
@@ -685,10 +668,8 @@ def _check_run(
     """Build a CheckRun with sane defaults, overriding only what a case cares about.
 
     Ported from test_verify_attempt.py's ``_run`` builder, renamed
-    ``_check_run`` here — this module already imports
-    ``orchestrator.git_ops._run`` (the real subprocess runner
-    ``_setup_repo`` uses for the real-git-repo fixtures), and a same-named
-    module-level def would silently shadow it for every later caller.
+    ``_check_run`` here so it cannot be confused with
+    ``orchestrator.git_ops._run`` (the real subprocess runner).
     """
     return CheckRun(
         label=label, cmd=cmd, rc=rc, output=output, timed_out=timed_out,
@@ -709,10 +690,8 @@ class TestCheckRunTimeoutConsistency:
 
     RED until step-14 imports CheckRun/VerifyAttempt from orchestrator.verify
     and ports a CheckRun-builder helper from test_verify_attempt.py (named
-    ``_check_run`` here, NOT that module's bare ``_run`` — this file already
-    imports ``orchestrator.git_ops._run`` for the real-git-repo fixtures'
-    ``_setup_repo``, and a same-named module-level def would silently shadow
-    it for every later caller).
+    ``_check_run`` here, NOT that module's bare ``_run``, which would be
+    confused with ``orchestrator.git_ops._run``).
     """
 
     def test_timed_out_test_leg_drives_both_channels_into_agreement(self):
@@ -769,7 +748,7 @@ class _RealInvestigationVerifier(FakeVerifier):
 class TestMergeVerifyBlockProducesGateableProposal:
     """Scenario 9 — GOLDEN: a merge-verify RED (generic task-fault, non-timeout)
 
-    must, via the REAL (unpatched) _run_post_merge_verify + run_dry_run_unblock,
+    must, via the REAL (unpatched) run_post_merge_verify + run_dry_run_unblock,
     write a dry_run_proposals[] entry with block_class=MERGE_VERIFY_RED that
     b3_gate.check_proposal accepts as non-ABORT (B4) — closing the coverage
     gap where merge_queue's post-merge-verify block path produced a
@@ -782,11 +761,11 @@ class TestMergeVerifyBlockProducesGateableProposal:
     so the generic task-fault branch is reached rather than main-health-red),
     and orchestrator.dry_run_unblock.invoke_agent (-> a low-risk structured
     proposal). Everything else — GitOps, the real git_repo, the real
-    _run_post_merge_verify block path, the fire-and-forget spawn,
+    run_post_merge_verify block path, the fire-and-forget spawn,
     run_dry_run_unblock's own git-anchor capture, and check_proposal — runs
     for real.
 
-    RED until step-16 imports _run_post_merge_verify/_DryRunInvestigationHandles
+    RED until step-16 imports run_post_merge_verify/DryRunInvestigationHandles
     from orchestrator.merge_lane.worker, check_proposal/ABORT from
     orchestrator.b3_gate, BlockClass from orchestrator.unblock_types,
     VerifyResult from orchestrator.verify, and _RecordingScheduler/
@@ -801,7 +780,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
         merge_wt.mkdir()
 
         scheduler = _RecordingScheduler({'dry_run_proposals': []})
-        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+        handles = DryRunInvestigationHandles(scheduler=scheduler)
 
         compile_error_result = VerifyResult(
             passed=False,
@@ -827,7 +806,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
             reqs.append(req)
             with (
                 patch(
-                    'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(False, '')),
                 ),
                 patch(
@@ -846,7 +825,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
                     return_value=True,
                 ),
             ):
-                outcome = await _run_post_merge_verify(
+                outcome = await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},

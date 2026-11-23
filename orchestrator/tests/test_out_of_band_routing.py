@@ -32,8 +32,8 @@ from _orch_helpers import (
 from _recording_event_store import _RecordingEventStore
 from escalation.models import Escalation
 
-from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
-from orchestrator.event_store import EventType
+from orchestrator.config import EffortConfig, OrchestratorConfig, TranscriptArchiveConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoleDefaults, RoutingDecision
 from orchestrator.routing_dispatch import resolve_and_record_route
@@ -42,6 +42,12 @@ from orchestrator.verify import VerifyResult
 
 def _routing_entries(rec: _RecordingEventStore) -> list[dict]:
     return [entry for (etype, entry) in rec.events if etype == EventType.routing_decision]
+
+
+def _single_row(store: EventStore, event_type: EventType) -> dict:
+    rows = store.fetch_events_by_type(event_type)
+    assert len(rows) == 1, rows
+    return rows[0]
 
 
 def _stub_result():
@@ -159,6 +165,28 @@ class TestStewardMainAdoptsResolveRoute:
         assert mock_iwcr.call_args.kwargs['model'] == 'haiku'
         assert _routing_entries(rec)[0]['data']['source_layer'] == 'metadata_override'
 
+    async def test_routing_decision_phase_matches_invocation_end(
+        self, make_steward, tmp_path: Path,
+    ) -> None:
+        # Driven through _handle_escalation, not _invoke_with_session: the
+        # steward's invocation_end row is emitted by _handle_escalation after
+        # the invoke returns, so only this entry point writes both rows.
+        store = EventStore(tmp_path / 'runs.db', 'run-test')
+        task = {'id': '42', 'title': 't', 'description': 'd'}
+        steward = make_steward(task=task, event_store=store)
+        steward.escalation_queue.get.return_value = _mk_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())):
+            await steward._handle_escalation(_mk_escalation())
+
+        decision = _single_row(store, EventType.routing_decision)
+        end = _single_row(store, EventType.invocation_end)
+        assert decision['phase'] == 'escalated'
+        assert decision['phase'] == end['phase']
+
 
 @pytest.mark.asyncio
 class TestStewardTriageAdoptsResolveRoute:
@@ -222,6 +250,21 @@ class TestStewardTriageAdoptsResolveRoute:
         assert len(entries) == 1
         assert entries[0]['data']['role'] == 'triage'
         assert entries[0]['data']['model'] == 'sonnet'
+
+    async def test_routing_decision_carries_escalated_phase(
+        self, make_steward, tmp_path: Path,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-test')
+        task = {'id': '42', 'title': 't', 'description': 'd'}
+        steward = make_steward(task=task, event_store=store)
+
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())):
+            await steward._pre_triage_suggestions(self._esc())
+
+        decision = _single_row(store, EventType.routing_decision)
+        assert decision['role'] == 'triage'
+        assert decision['phase'] == 'escalated'
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +352,8 @@ class TestDeepReviewerAdoptsResolveRoute:
         mock_helper.assert_awaited_once()
         hk = mock_helper.call_args.kwargs
         assert hk['role_name'] == 'deep_reviewer'
+        # The layer-4 effort base is kept in lockstep with the config field default.
+        assert hk['role_defaults'].effort == EffortConfig().deep_reviewer
         # Project-level: no task identity flows into resolution / no mirror sink.
         assert hk.get('task_id') is None
         assert hk.get('task_metadata') is None
@@ -603,6 +648,26 @@ class TestUnblockAutoAdoptsResolveRoute:
         entries = _routing_entries(rec)
         assert len(entries) == 1
         assert entries[0]['data']['source_layer'] == 'role_default'
+
+    async def test_routing_decision_phase_matches_invocation_end(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = EventStore(tmp_path / 'runs.db', 'run-test')
+        scheduler = MagicMock()
+        scheduler.get_task = AsyncMock(return_value={'metadata': {}})
+        scheduler.update_task = AsyncMock()
+
+        with patch('orchestrator.dry_run_unblock.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())):
+            await _run_unblock(config=_unblock_config(), scheduler=scheduler,
+                               event_store=store, worktree=wt)
+
+        decision = _single_row(store, EventType.routing_decision)
+        end = _single_row(store, EventType.invocation_end)
+        assert decision['phase'] == 'blocked'
+        assert decision['phase'] == end['phase']
 
 
 # ---------------------------------------------------------------------------

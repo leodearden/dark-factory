@@ -20,7 +20,7 @@ from typing import Any
 if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
     sys.path.insert(0, _SHARED_SRC)
 
-from legibility import codebook, task_store, verdict
+from legibility import codebook, codebook_lifecycle, task_store, verdict
 from shared.toolcall_markup import escape_envelope_literals
 
 logger = logging.getLogger("legibility.disposition")
@@ -56,6 +56,7 @@ class Resolution(enum.StrEnum):
     COMBINED = "combined"
     REFUSED = "refused"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     EXISTING = "existing"
 
 
@@ -119,6 +120,7 @@ _RESOLUTION_OF = {
     task_store.TicketStatus.COMBINED: Resolution.COMBINED,
     task_store.TicketStatus.REFUSED: Resolution.REFUSED,
     task_store.TicketStatus.FAILED: Resolution.FAILED,
+    task_store.TicketStatus.CANCELLED: Resolution.CANCELLED,
 }
 
 _require_the_codebook_vocabulary("Step", (step.value for step in Step), codebook.FILED_TICKET_STEPS)
@@ -543,6 +545,14 @@ def _awaits_curator(row: Mapping[str, Any]) -> bool:
     return row.get("ticket") is not None and row.get("resolution") is None
 
 
+def entry_routed(entry: Mapping[str, Any]) -> bool:
+    """Whether a C1 back-link of *entry* routes it: a row naming a task, or a
+    row whose ticket awaits the curator (``Decision.routed`` over its rows)."""
+    return any(
+        row.get("task_id") is not None or _awaits_curator(row) for row in entry.get("filed_tickets") or []
+    )
+
+
 def _open_tickets(cb: dict, run_id: str) -> list[_OpenTicket]:
     """Every row of *cb* awaiting the curator, carried-over rows first."""
     open_tickets = [
@@ -622,8 +632,7 @@ class Backfill:
 def _entry_ids_by_filed_title(cb: Mapping[str, Any]) -> dict[str, str]:
     """Each entry under the task title its own title files as, and under that
     of any candidate promoted to it, which a later correction may have
-    retitled away from. Where titles collide the last entry wins, as in
-    census._find_adjudicated_candidate."""
+    retitled away from. Where titles collide the last entry wins."""
     promoted_titles: dict[str, list[str]] = {}
     for candidate in cb.get("candidates") or []:
         if isinstance(candidate.get("promoted_to"), str) and isinstance(candidate.get("title"), str):
@@ -830,13 +839,15 @@ def _answer(follow_up: FollowUp, rows: Iterable[Mapping[str, Any]]) -> Answer | 
 class TaskOutcome:
     """One back-linked task as this run read it. *ref* None is a ticket that
     names no task; a *ref* with *standing* None was not observed, and *note*
-    says why."""
+    says why. *corrects_record* marks a task the entry lists in
+    ``corrected_by``: it corrected the entry's record, not its defect."""
 
     ref: TaskRef | None
     ticket: str | None
     status: str | None
     standing: Standing | None
     note: str | None = None
+    corrects_record: bool = False
 
 
 @dataclass(frozen=True)
@@ -860,9 +871,15 @@ class EntryOutcome:
         the live task, and so may a linked task this run did not observe."""
         if self.awaiting:
             return f"ticket {self.awaiting[-1]} awaits the curator and may become the live task"
-        if any(task.ref is not None and task.standing is None for task in self.tasks):
+        if any(task.ref is not None and task.standing is None for task in self._deciding):
             return "another linked task was not observed"
         return None
+
+    @property
+    def _deciding(self) -> tuple[TaskOutcome, ...]:
+        """The tasks whose standing may decide the entry: every one but those
+        that only corrected its record."""
+        return tuple(task for task in self.tasks if not task.corrects_record)
 
     @property
     def governing(self) -> TaskOutcome | None:
@@ -873,7 +890,7 @@ class EntryOutcome:
             return None
         ranked = [
             (_rank(task.standing, task.ref.task_id), task)
-            for task in self.tasks
+            for task in self._deciding
             if task.standing is not None and task.ref is not None
         ]
         return min(ranked, key=lambda each: each[0])[1] if ranked else None
@@ -890,7 +907,6 @@ class Reverify:
 _ACCEPTED_STATUS = "accepted"
 _FIXED_STATUS = "fixed"
 _RETIRED_STATUS = "retired"
-_OPEN_STATUS = "open"
 _SETTLED_STATUSES = frozenset({_FIXED_STATUS, _RETIRED_STATUS})
 
 
@@ -964,8 +980,23 @@ def _ticket_only(row: Mapping[str, Any]) -> TaskOutcome:
     return TaskOutcome(None, row.get("ticket"), None, None, note)
 
 
+def _corrections_of(entry: Mapping[str, Any]) -> frozenset[TaskRef]:
+    """The tasks *entry*'s ``corrected_by`` names: each one's whole outcome for
+    the entry was a correction of its record (codebook.py's corrections op,
+    ``outcome_of_task``). A malformed item names nothing; validate() rejects
+    it at rest."""
+    return frozenset(
+        TaskRef(item["project_root"], item["task_id"])
+        for item in entry.get("corrected_by") or []
+        if isinstance(item, Mapping)
+        and _is_text(item.get("project_root"))
+        and type(item.get("task_id")) is int
+    )
+
+
 def _entry_outcome(entry: Mapping[str, Any], read: Callable[[TaskRef, str | None], TaskOutcome]) -> EntryOutcome:
     rows = entry.get("filed_tickets") or []
+    corrections = _corrections_of(entry)
     tasks: list[TaskOutcome] = []
     seen: set[TaskRef] = set()
     for row in rows:
@@ -975,7 +1006,7 @@ def _entry_outcome(entry: Mapping[str, Any], read: Callable[[TaskRef, str | None
         ref = TaskRef(row["project_root"], row["task_id"])
         if ref not in seen:
             seen.add(ref)
-            tasks.append(read(ref, row.get("ticket")))
+            tasks.append(replace(read(ref, row.get("ticket")), corrects_record=ref in corrections))
     awaiting = tuple(row["ticket"] for row in rows if _awaits_curator(row))
     outcome = EntryOutcome(entry["id"], entry.get("finding_key"), entry["status"], tuple(tasks), awaiting)
     governing = outcome.governing
@@ -1128,9 +1159,22 @@ class StatusChange:
 
 @dataclass(frozen=True)
 class _Projected:
-    status: str
+    """The transition a projection makes, None for one that keeps the status,
+    and the accepting task or fix sha it sets."""
+
+    transition: codebook_lifecycle.Transition | None
     accepted_by: int | None = None
     fixed_at_sha: str | None = None
+
+    def status(self, entry: Mapping[str, Any]) -> str:
+        if self.transition is None:
+            return entry["status"]
+        return codebook_lifecycle.TABLE[self.transition].target
+
+    def changes(self, entry: Mapping[str, Any]) -> bool:
+        return (self.status(entry), self.accepted_by, self.fixed_at_sha) != (
+            entry["status"], entry.get("accepted_by"), entry.get("fixed_at_sha"),
+        )
 
 
 def _projection(
@@ -1138,31 +1182,30 @@ def _projection(
 ) -> _Projected | None:
     """The one statement of how a task's outcome sets its entry's status
     (INV-9); None leaves the entry as it is. Only a re-verify that found the
-    finding gone at *as_of_sha* fixes it (INV-3)."""
+    finding gone at *as_of_sha* fixes it (INV-3), and a task the entry records
+    as its correction decides nothing (:attr:`EntryOutcome.governing`)."""
     governing = outcome.governing
     status = entry["status"]
     if status == _RETIRED_STATUS or governing is None or governing.ref is None:
         return None
     if governing.standing is Standing.ACCEPTED:
-        return _Projected(_ACCEPTED_STATUS, accepted_by=governing.ref.task_id)
+        return _Projected(codebook_lifecycle.Transition.ACCEPT, accepted_by=governing.ref.task_id)
     if (
         governing.standing is Standing.DONE
         and again is not None
         and again.result is ReverifyResult.GONE
         and again.task == governing.ref
     ):
-        return _Projected(_FIXED_STATUS, fixed_at_sha=as_of_sha)
+        return _Projected(codebook_lifecycle.Transition.FIX, fixed_at_sha=as_of_sha)
     if status == _FIXED_STATUS and governing.standing is not Standing.FILED:
         return None
-    return _Projected(_OPEN_STATUS if status in (_ACCEPTED_STATUS, _FIXED_STATUS) else status)
-
-
-def _projected_state(entry: Mapping[str, Any]) -> _Projected:
-    return _Projected(entry["status"], entry.get("accepted_by"), entry.get("fixed_at_sha"))
+    reopen = codebook_lifecycle.Transition.REOPEN
+    return _Projected(reopen if status in codebook_lifecycle.TABLE[reopen].sources else None)
 
 
 def _apply(entry: dict[str, Any], projected: _Projected) -> None:
-    entry["status"] = projected.status
+    if projected.transition is not None:
+        codebook_lifecycle.transit(entry, projected.transition)
     for field, value in (("accepted_by", projected.accepted_by), ("fixed_at_sha", projected.fixed_at_sha)):
         if value is None:
             entry.pop(field, None)
@@ -1185,10 +1228,10 @@ def project(
             None if outcome is None
             else _projection(entry, outcome, reverified.get(entry["id"]), as_of_sha=as_of_sha)
         )
-        if projected is None or projected == _projected_state(entry):
+        if projected is None or not projected.changes(entry):
             continue
         changes.append(StatusChange(
-            entry["id"], entry["status"], projected.status, projected.accepted_by, projected.fixed_at_sha,
+            entry["id"], entry["status"], projected.status(entry), projected.accepted_by, projected.fixed_at_sha,
         ))
         _apply(entry, projected)
     codebook.assert_no_deletion(cb, result)
@@ -1539,6 +1582,7 @@ class RowOutcome(enum.StrEnum):
     HELD = "held"
     UNOBSERVED = "unobserved"
     TICKET = "ticket"
+    CORRECTED = "corrected"
 
 
 _STANDING_OUTCOME = {Standing.FILED: RowOutcome.LIVE, Standing.ACCEPTED: RowOutcome.ACCEPTED}
@@ -1578,6 +1622,8 @@ class OutcomeReport:
     def _outcome(self, entry: EntryOutcome, task: TaskOutcome) -> tuple[RowOutcome, str | int | None]:
         if task.ref is None:
             return RowOutcome.TICKET, task.note
+        if task.corrects_record:
+            return RowOutcome.CORRECTED, task.note
         if task.standing is None:
             return RowOutcome.UNOBSERVED, task.note
         governing = entry.governing
@@ -1651,6 +1697,7 @@ _OUTCOME_CELLS = {
     RowOutcome.HELD: "{task_status} (not acted on: {detail})",
     RowOutcome.UNOBSERVED: "unobserved ({detail})",
     RowOutcome.TICKET: "ticket {detail}",
+    RowOutcome.CORRECTED: "corrected the entry's record, not its defect (decides no status)",
 }
 
 

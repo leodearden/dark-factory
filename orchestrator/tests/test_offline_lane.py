@@ -22,10 +22,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import shlex
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -46,12 +47,13 @@ from orchestrator.offline_lane_confirm import (
     outcome_to_json,
     serial_confirm_command,
 )
-from orchestrator.offline_lane_episode_state import PassEffect, PassObservation
+from orchestrator.offline_lane_episode_state import EPISODE_RETENTION, PassEffect, PassObservation
 from orchestrator.offline_lane_episodes import TickResult
 from orchestrator.offline_lane_pass import ConfirmSeam
 from orchestrator.offline_lane_records import (
     LEGACY_INFRA_COMMAND,
     LEGACY_NUMERIC_COMMAND,
+    RECORD_RETENTION,
     Leg,
     PassRecord,
     Phase,
@@ -302,11 +304,10 @@ class TestOfflineLaneCommandsReload:
             f'missing from RELOADABLE_FIELDS'
         )
 
-    def test_commands_edit_lands_in_applied_candidates(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_commands_edit_lands_in_applied_candidates(self):
         from orchestrator.config import LaneCommand, diff_config
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
         fresh = OrchestratorConfig(
             git=GitConfig(
@@ -319,11 +320,10 @@ class TestOfflineLaneCommandsReload:
         assert 'git.offline_lane_commands' in diff.applied_candidates
         assert 'git.offline_lane_commands' not in diff.restart_required
 
-    def test_apply_reload_applies_commands_in_place(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_commands_in_place(self):
         from orchestrator.config import LaneCommand, apply_reload
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
         fresh = OrchestratorConfig(
             git=GitConfig(
@@ -764,13 +764,7 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
         'DF_VERIFY_ROLE=offline must be set — the offline role footprint '
         '(nice/ionice) lives inside the script (Part A), not re-implemented here'
     )
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
-            f'not replace it (missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -781,16 +775,15 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('account_pool_in_env')
 async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: Path):
     """The default command_runner seam launches `nice -n19 ionice -c3 sh -c <cmd>`.
 
     A bare pytest does not self-nice (unlike the reify scripts), so the
     generic runner applies the idle nice/ionice prefix itself (D4). cwd is
-    <worktree>/<cmd.cwd>; env overlays DF_VERIFY_ROLE=offline onto a full
-    os.environ copy; rc + the decoded <=2000-char tail are returned.
-
-    Step 11 (RED): _default_run_command / the command_runner seam do not
-    exist — must fail before impl.
+    <worktree>/<cmd.cwd>; env overlays DF_VERIFY_ROLE=offline onto os.environ
+    minus the CLAUDE_OAUTH_TOKEN_* account pool; rc + the decoded
+    <=2000-char tail are returned.
     """
     from orchestrator.config import LaneCommand
 
@@ -823,14 +816,7 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
     assert kwargs['cwd'] == str(wt_path / 'fused-memory'), (
         'cwd must be <worktree>/<cmd.cwd>'
     )
-    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy '
-            f'(missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -970,14 +956,24 @@ def _children(*children: tuple[bytes, int]):
     return fake_exec
 
 
+@pytest.fixture
+def account_pool_in_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', 'pool-b-confirm')
+
+
 def _assert_lane_env(env: dict[str, str]) -> None:
     assert env['DF_VERIFY_ROLE'] == 'offline'
-    for key, value in os.environ.items():
-        if key != 'DF_VERIFY_ROLE':
-            assert env.get(key) == value, f'the lane env must overlay os.environ (missing/altered {key!r})'
+    pool = [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')]
+    assert pool == [], f'the lane env must not carry the CLAUDE_OAUTH_TOKEN_* account pool: {pool!r}'
+    altered = sorted(
+        k for k in os.environ
+        if k != 'DF_VERIFY_ROLE' and not k.startswith('CLAUDE_OAUTH_TOKEN_') and env.get(k) != os.environ[k]
+    )
+    assert altered == [], f'the lane env must overlay os.environ (missing/altered: {altered!r})'
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('account_pool_in_env')
 async def test_a_red_numeric_pass_runs_the_serial_confirm_failed_invocation(tmp_path: Path):
     """The default numeric confirm re-runs reify's script serially with ``--confirm-failed`` in the
     lane worktree, writes the confirm phase of the same pass, and reproduces the ids printed under exit 100.
@@ -1005,6 +1001,7 @@ async def test_a_red_numeric_pass_runs_the_serial_confirm_failed_invocation(tmp_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('account_pool_in_env')
 async def test_a_red_generic_pass_confirms_the_detected_failures_narrowed_and_serial(tmp_path: Path):
     """A structured pytest command's default confirm re-runs only the detection's failing tests, serially,
     at idle nice/ionice in the command's cwd, and reproduces those that fail again."""
@@ -1045,6 +1042,7 @@ async def test_a_red_generic_pass_confirms_the_detected_failures_narrowed_and_se
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('account_pool_in_env')
 async def test_a_red_infra_pass_confirms_the_failures_both_runs_name(tmp_path: Path):
     """The default infra confirm re-invokes H9 with the detect seam's argv/env/cwd; a test both runs name
     reproduces and one the confirm passed is cleared."""
@@ -1146,13 +1144,7 @@ async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: 
     assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
         'DF_VERIFY_ROLE=offline must be set, same as the numeric sub-run'
     )
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
-            f'not replace it (missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -1495,10 +1487,16 @@ async def test_a_pass_record_older_than_the_retention_survives_while_a_held_epis
     cmd = LaneCommand(name='q', command='pytest -m integration')
     clock = Clock()
     client = FakeLedgerClient([])
+    config = _make_config(
+        tmp_path,
+        offline_lane_legacy_numeric_enabled=False,
+        offline_lane_commands=[cmd],
+        offline_lane_red_unlanded_hours=240,
+    )
     worker = _make_worker(
         tmp_path,
         git_ops=_make_git_ops(head='HEAD1', worktree_path=tmp_path / '_offline-deep'),
-        config=_make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd]),
+        config=config,
         command_runner=AsyncMock(return_value=(1, 'tail')),
         confirm=_RecordingConfirm(_HELD),
         task_client=client,
@@ -1513,8 +1511,10 @@ async def test_a_pass_record_older_than_the_retention_survives_while_a_held_epis
     (task_id,) = client.tasks
     client.set_status(task_id, 'in-progress')
 
-    for _ in range(15):
-        clock.advance(hours=23)
+    cadence_hours = config.git.offline_lane_red_unlanded_hours - 1
+    assert timedelta(hours=cadence_hours) < EPISODE_RETENTION
+    for _ in range(math.ceil(RECORD_RETENTION / timedelta(hours=cadence_hours))):
+        clock.advance(hours=cadence_hours)
         await _drive_one_pass(worker, 'q')
 
     assert worker.records.load_pass('q', counted_pass_id) is not None
@@ -1791,15 +1791,35 @@ async def test_a_moved_head_runs_a_full_pass_instead_of_the_recheck(tmp_path: Pa
 @_inline_thread_hops()
 @virtual_clock_test
 async def test_a_raising_tick_costs_a_backoff_not_the_loop(tmp_path: Path, caplog: pytest.LogCaptureFixture):
-    """A tick that raises is logged as a failed pass and backed off (60s); the loop then ticks again
-    and goes on working: one bad tick never kills the worker."""
+    """A tick that raises is logged as a failed pass and backed off (60s); the loop then goes on working:
+    one bad tick never kills the worker. The raising tick at a never-run head had already armed the
+    backstop, so the full pass runs straight after the backoff, not after another poll."""
     rig = _LoopRig(tmp_path, [RuntimeError('tick boom')])
 
     with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane'):
         events = await rig.run_until(ticks=3)
 
-    assert events == ['tick@HEAD1', 'tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD1']
+    assert events == ['tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD1', 'tick@HEAD1']
     assert rig.engine.tick_times == [_POLL_SECS, 2 * _POLL_SECS + 60.0, 3 * _POLL_SECS + 60.0]
     assert [r.getMessage() for r in caplog.records] == [
         'offline-lane: run() pass failed (consecutive=1): RuntimeError: tick boom',
     ]
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_raising_tick_at_a_new_head_still_runs_a_full_pass_there(tmp_path: Path):
+    """Main moving with no trigger is caught by the next poll even when that poll's tick raises: the
+    backstop is armed before the tick, so the full pass at the new head runs straight after the backoff."""
+    rig = _LoopRig(tmp_path, [])
+
+    async def _main_moves_silently() -> None:
+        rig.head = 'HEAD2'
+
+    rig.during['r@HEAD1'] = _main_moves_silently
+    rig.engine.answers = [_NOTHING_DUE, RuntimeError('tick boom')]
+    events = await rig.run_until(ticks=3)
+
+    assert events == ['tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD2', *_FULL_PASS_AT_HEAD2, 'tick@HEAD2']
+    assert rig.engine.tick_times == [_POLL_SECS, 2 * _POLL_SECS, 3 * _POLL_SECS + 60.0]

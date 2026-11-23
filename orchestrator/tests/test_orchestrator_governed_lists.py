@@ -10,21 +10,32 @@ with no disposition fails this suite before any test runs.
 import sys
 from pathlib import Path
 
-from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
+from shared.governed_exceptions import Policy, governed_exceptions
+
+from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
 import governed_list_agreement
-import merge_lane_metrics
+import merge_lane_ratchet
 
 MERGE_LANE_RATCHET_BASELINE = governed_exceptions(
     'orchestrator.tests.merge_lane_ratchet_baseline.json',
     'Merge-lane quality measures frozen at their seeded values: each may fall and '
     'none may rise without an authorized raise, and a path or function absent from '
     'the baseline must meet the file-size and new-function complexity ceilings.',
-    [merge_lane_metrics.BASELINE_RELPATH],
-    default=Debt(TaskRef(5603)),
+    [merge_lane_ratchet.BASELINE_RELPATH],
+    default=Policy('inv12-shrink-only-baselines'),
     default_covers=1,
+)
+
+BY_DESIGN_SESSION_RESUME_REASONS = governed_exceptions(
+    'orchestrator.harness._BY_DESIGN_SESSION_RESUME_REASONS',
+    'A session-resume fallback reason that is expected by design and so does not feed '
+    'the session-resume fallback streak alarm.',
+    sorted(_BY_DESIGN_SESSION_RESUME_REASONS),
+    default=Policy('inv12-by-design-session-resume-reasons'),
+    default_covers=6,
 )
 
 

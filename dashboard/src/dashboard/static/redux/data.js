@@ -20,12 +20,13 @@ const {
   unknownDatum: unknownDatumPlaceholder,
 } = window.DF_DATUM;
 
-// The surface -> endpoint maps that decide what is polled (pollSetFor). Module
-// scope, no fallback, RENAMED, for the same reason as the destructure above.
+// poll_scope.js's surface -> endpoint maps, which decide what is polled
+// (pollSetFor). Module scope, no fallback, RENAMED, for the same reason as the
+// destructure above: poll_scope.js owns the bare names.
 const {
   TAB_ENDPOINTS: POLL_TAB_ENDPOINTS,
   CHROME_ENDPOINTS: POLL_CHROME_ENDPOINTS,
-} = window.DF_ENDPOINT_STALENESS;
+} = window.DF_POLL_SCOPE;
 
 // How the wire delivers a key: 'plain' is a bare value, 'datum' is the
 // five-key envelope data/datum.py::Datum.to_wire() emits. Two shared frozen
@@ -44,6 +45,13 @@ const {
 const PLAIN = Object.freeze({ kind: 'plain' });
 const DATUM = Object.freeze({ kind: 'datum' });
 
+// A keySpec whose value is read from the response body under `bodyKey` rather
+// than under its own DF_DATA key: an on-demand row whose body keys are fixed
+// but whose value depends on the request's param (ON_DEMAND_KEYS.quality).
+function fromBody(bodyKey, spec) {
+  return Object.freeze({ ...spec, bodyKey });
+}
+
 // Endpoint → {DF_DATA key: spec} map, parameterised on the active window chip.
 // Only the four windowed endpoints append ?window=; the rest stay static.
 //
@@ -53,14 +61,14 @@ const DATUM = Object.freeze({ kind: 'datum' });
 // endpoint is registered here by searching this shipped source for `'KEY'` or
 // `"KEY"`. Unquoting them is silent: the registry still works and those four
 // tests fail with "add it as the mapped key", naming a key that is in fact
-// already present. Same reasoning as DEFAULT_TIMEOUT_MS further down, which
-// two other Python tests parse straight out of this file.
+// already present.
 function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
     '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
-                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
+                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN,
+                                                        'TASKS_COUNT_STALE_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/invariants':                   { 'INVARIANTS': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
@@ -75,6 +83,7 @@ function endpointsFor(win) {
     '/api/v2/dashboard/escalations':                  { 'ESCALATIONS': PLAIN },
     '/api/v2/dashboard/escalation-analytics':         { 'ESCALATION_ANALYTICS': PLAIN },
     '/api/v2/dashboard/memory-evals':                 { 'MEMORY_EVALS': PLAIN },
+    '/api/v2/dashboard/prds':                         { 'PRD_VIEW': PLAIN, 'PRD_CONTENTION': PLAIN },
   };
 }
 
@@ -88,21 +97,32 @@ const NARROWED_POLL_URLS = Object.freeze({
 });
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
-// by the one value its caller already holds. Two declared rows today:
-// `terminal`, through which tab_tasks.jsx fetches `?terminal=<project>`, and
-// `taskProse`, the Task Detail pane's description/details for the selected
-// task, addressed by the row's own uid (`<project>/T-<id>`).
+// by the one value its caller already holds. Four declared rows today:
+// `terminal`, through which tab_tasks.jsx and, via
+// task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
+// `?terminal=<project>`; `taskProse`, a task's description/details
+// addressed by its row's own uid (`<project>/T-<id>`), which the Task Detail
+// pane reads for the selected task and the Escalations drawer for the linked
+// one; `quality`, the Quality tab's one read, addressed by the canonical
+// query qualityQuery builds; and `qualitySnapshotDiff`, one snapshot point's
+// instrument --diff text, addressed by the query snapshotDiffQuery builds.
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
 // the url/key pair is constructed in exactly one place and cannot drift.
 //
-// `key(param)` names BOTH what the response body calls the value and what
-// DF_DATA calls it. That is the same rule endpointsFor's rows already follow,
-// where a row's key name is simultaneously the body key and the DF_DATA key;
-// the only difference here is that the name is BUILT from a parameter instead
-// of written as a literal, which is why these keys cannot be seeded in the
-// DF_DATA block above and why datumFor exists.
+// For a row without `fields`, `key(param)` names BOTH what the response body
+// calls the value and what DF_DATA calls it. That is the same rule
+// endpointsFor's rows already follow, where a row's key name is simultaneously
+// the body key and the DF_DATA key; the only difference here is that the name
+// is BUILT from a parameter instead of written as a literal, which is why
+// these keys cannot be seeded in the DF_DATA block above and why datumFor
+// exists.
+//
+// A row WITH `fields` is answered by a body whose keys are fixed while its
+// value depends on the param, so each field lands under `key(param, field)`,
+// read from the body under the field's own name (fromBody). `key(param)` is
+// the first field's key, which is what useOnDemand reads.
 //
 // Note which half is encoded: the url must survive HTTP parsing, and the key
 // must be the name a caller can look up with the parameter it already holds.
@@ -128,7 +148,48 @@ const ON_DEMAND_KEYS = {
     spec: PLAIN,
     retain: 8,
   },
+  // Not polled: one read costs about a second and its data moves on the
+  // sampler's 600 s tick, and a polled row could not carry ?project=.
+  quality: {
+    url: query => `/api/v2/dashboard/quality?${query}`,
+    key: (query, field = 'QUALITY') => `${field}:${query}`,
+    spec: DATUM,
+    fields: Object.freeze(['QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS']),
+    retain: 4,
+  },
+  // The point the Quality tab's snapshot selector shows. PLAIN: the diff is
+  // the instrument's report text, not a measurement.
+  qualitySnapshotDiff: {
+    url: query => `/api/v2/dashboard/quality/snapshot-diff?${query}`,
+    key: (query, field = 'QUALITY_SNAPSHOT_DIFF') => `${field}:${query}`,
+    spec: PLAIN,
+    fields: Object.freeze(['QUALITY_SNAPSHOT_DIFF']),
+    retain: 8,
+  },
 };
+
+// A task row's uid, `<project>/T-<id>`: the taskProse param. It restates
+// active_tasks.py::task_uid, which builds the uid every served row carries.
+function taskUid(project, id) {
+  return `${project}/T-${id}`;
+}
+
+// The quality param: the route's query in one fixed key order, so equal
+// inputs give equal params. An opaque identity, never parsed back.
+function qualityQuery({ project, window: landingWindow, module: moduleName }) {
+  const parts = [['project', project], ['window', landingWindow]];
+  if (moduleName !== null && moduleName !== undefined && moduleName !== '') parts.push(['module', moduleName]);
+  return encodedQuery(parts);
+}
+
+// The qualitySnapshotDiff param, in one fixed key order as qualityQuery's is.
+function snapshotDiffQuery({ project, point }) {
+  return encodedQuery([['project', project], ['point', point]]);
+}
+
+function encodedQuery(parts) {
+  return parts.map(([name, value]) => `${name}=${encodeURIComponent(value)}`).join('&');
+}
 
 // Keys whose array reference is captured at module-load by shell.jsx — mutate
 // in place rather than reassigning, so cached references stay valid.
@@ -151,6 +212,8 @@ window.DF_DATA = {
   // the done count was never measured — neither offline nor degraded. Without
   // this list they would render as healthy with a confident "0 done".
   TASKS_COUNT_UNKNOWN_PROJECTS: [],
+  // Projects whose census is shown from its last measurement, with its age.
+  TASKS_COUNT_STALE_PROJECTS: [],
   // N for the banner's "k of N": how many task project roots the tasks handler
   // fanned out over. Comes from the server so it denominates the same
   // population TASKS_OFFLINE_PROJECTS is drawn from — PROJECTS (orchestrator-
@@ -165,13 +228,27 @@ window.DF_DATA = {
   //   Each rows Datum's value is a list of rows shaped {id, project, title,
   //   status, agent, started, loops, attempts, lane, phase, lane_state,
   //   runtime_offline, deps, meta_files, train, external_deps, prd,
-  //   claimant_run_id, heartbeat_at, stranded}.
+  //   claimant_run_id, heartbeat_at, stranded, created_at,
+  //   created_at_source}, plus `deferral` on a deferred
+  //   row from a backend that emits it: dashboard/src/dashboard/data/
+  //   deferral_summary.py's {label, state, age_seconds, needs_human, detail},
+  //   or null when the row carries no record.
   //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
   //   `stranded` (task 3543) is the independent liveness verdict, computed
   //   server-side from the claim columns via shared.task_claimant.is_stranded.
+  //   `created_at` is the filing time and `created_at_source` names its proxy
+  //   (shared/src/shared/task_created_at.py::CreatedAtSource); both are null
+  //   when the store predates the columns or the row is not yet backfilled
+  //   (dashboard/src/dashboard/data/tasks.py::_shape_task).
   //   Rows carry no description/details: the Task Detail pane fetches those
   //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
+  // PRD_VIEW, PRD_CONTENTION: {project: Datum} each, the /prds body's per-PRD
+  //   view and contention line. Seeded EMPTY and stamped with the /prds
+  //   receipt by prd_lanes_view.js's readers, as TASKS_SNAPSHOT is by
+  //   task_snapshot.js.
+  PRD_VIEW: {},
+  PRD_CONTENTION: {},
   // INVARIANTS: one claimant-invariant record per known root (E-1). Seeded
   //   EMPTY so a project with no record renders no chip: unknown is not clean.
   INVARIANTS: [],
@@ -194,14 +271,15 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
-  // MERGE_QUEUE: {project_label: {depth, outcomes, latency: {p50, p95, p99,
-  //   mean_ms, with_duration, without_duration}, recent, recent_total: Datum,
+  // MERGE_QUEUE: {project_label: {depth: Datum ({labels, values,
+  //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
+  //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
-  //   active_spark, halt, train_events:
+  //   runs_db_present, active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
-  //   member_task_ids, ...event-specific keys}}]}}; every recent and active
-  //   row's title is a Datum. The payload's top-level served_at is the receipt
-  //   merge_queue.js stamps those Datums with.
+  //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
+  //   every recent and active row's title is a Datum. The payload's top-level
+  //   served_at is the receipt merge_queue.js stamps those Datums with.
   MERGE_QUEUE: {},
   COSTS: {
     summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },
@@ -214,10 +292,9 @@ window.DF_DATA = {
     // counts+rates, cap-hit rate, $/done, plus per-role turn-cap saturation.
     by_model_role: { rows: [], turn_cap_saturation: {} },
   },
-  // in_progress_live + in_progress_stranded band the in_progress census; the
-  // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
-  // a cold client renders empty bands and no banner, never `undefined` ones.
-  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
+  // The parity_* fields are the server's cap-breach verdict (task 3543). Seeded
+  // so a cold client renders empty bands and no banner, never `undefined` ones.
+  BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
@@ -328,9 +405,14 @@ window.DF_DATA = {
   // Do not reintroduce it.
   __stale: {},
   // Per-endpoint RECEIPTS, keyed by the same flow-control key __stale uses:
-  // each entry is `{servedAt, receivedAt, window}`, published by refreshOne
-  // on the SUCCESS path only. datum.js::plainDatum reads this to give a value
-  // that is not yet served as a Datum the provenance it does have.
+  // each entry is `{servedAt, receivedAt, window, pacingHoldMs, assetBuild}`,
+  // published by refreshOne on the SUCCESS path only. datum.js::plainDatum reads this to
+  // give a value that is not yet served as a Datum the provenance it does have.
+  //
+  // `pacingHoldMs` is the slowness-pacing hold this success imposed, measured
+  // from its request's start (0 when not paced); datum.js::plainDatum adds it
+  // to its bound. It shares the success-only lifetime because it describes the
+  // delivery that put these values on screen.
   //
   // `window` is the served-window echo (`WINDOW: {requested, served, days}`)
   // the four windowed endpoints carry, or null. It lives here, not in the key
@@ -339,6 +421,11 @@ window.DF_DATA = {
   // it did not replace. (It also could not be a registry key: four endpoints
   // share the body key, and a registry key is both the body key and the
   // DF_DATA key.) window_chip.js::windowEcho validates it at read.
+  //
+  // `assetBuild` records WHICH server build served these values: `{started,
+  // onDisk}`, the raw values of the two RECEIPT_ASSET_BUILD_HEADERS, each null
+  // when absent. It shares the success-only lifetime for the same reason as
+  // `window`, and asset_skew.js validates it at read, as windowEcho does.
   //
   // DELIBERATELY NOT MERGED WITH __stale, which sits three lines above it.
   // The two answer different questions and have different lifetimes. __stale
@@ -436,7 +523,7 @@ function pollKey(url) {
 function stateFor(state, stateKey) {
   let st = state.get(stateKey);
   if (!st) {
-    st = { inFlight: false, failures: 0, nextAllowedAt: 0, lastSuccessAt: 0 };
+    st = { inFlight: false, deferredForceUrl: null, failures: 0, nextAllowedAt: 0, lastSuccessAt: 0 };
     state.set(stateKey, st);
   }
   return st;
@@ -456,9 +543,11 @@ function backoffDelay(failures) {
 // the TIMER path's backoff — otherwise repeated chip clicks during an
 // outage would inflate failures/nextAllowedAt derived from user action
 // alone, and the dashboard could stay dark longer than the real failure
-// history warrants once the server recovers.
-function recordFailure(st, deps) {
-  if (deps.ignoreBackoff) return;
+// history warrants once the server recovers. `forced` is refreshOne's gate
+// verdict: a chip's own attempt, or the one it deferred past the in-flight
+// guard.
+function recordFailure(st, forced, deps) {
+  if (forced) return;
   st.failures += 1;
   st.nextAllowedAt = deps.now() + backoffDelay(st.failures);
 }
@@ -472,22 +561,23 @@ function recordFailure(st, deps) {
 // data_poll.test.mjs's "Slowness pacing" section.
 const MAX_POLL_DUTY_CYCLE = 0.5;
 
-// Unlike recordFailure, a forced attempt still paces: pacing is a pure
-// function of the latest measurement, so clicks cannot inflate it.
 // Pacing never holds an endpoint past BACKOFF_MAX_MS after its request started.
 // The fetch deadline does not bound serviceMs: it races only fetchImpl, so a
 // slow body read, an injected deps.timeoutMs or a wall-clock jump
 // (suspend/resume) can each exceed it, and uncapped would freeze the endpoint
 // with failures at 0 and no staleness banner.
-function recordSuccess(st, deps, startedAt, receivedAt) {
-  const serviceMs = receivedAt - startedAt;
+function slownessPacingHoldMs(deps, serviceMs) {
   const paced = deps.pollIntervalMs !== undefined
     && serviceMs > MAX_POLL_DUTY_CYCLE * deps.pollIntervalMs;
+  return paced ? Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS) : 0;
+}
+
+// Unlike recordFailure, a forced attempt still paces: pacing is a pure
+// function of the latest measurement, so clicks cannot inflate it.
+function recordSuccess(st, startedAt, receivedAt, holdMs) {
   st.failures = 0;
   st.lastSuccessAt = receivedAt;
-  st.nextAllowedAt = paced
-    ? startedAt + Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS)
-    : 0;
+  st.nextAllowedAt = holdMs > 0 ? startedAt + holdMs : 0;
 }
 
 // Jitter: spreads the 13 endpoint fetches across part of the 3s interval
@@ -504,12 +594,7 @@ const JITTER_MAX_MS = 1500;
 // with an abort deadline; timing out is treated exactly like a thrown
 // fetch error (counts toward backoff, clears in-flight in `finally`).
 //
-// LEAVE THIS EXACTLY AS IT IS — same name, same literal, same assignment
-// shape. Two Python structural tests parse it straight out of this shipped
-// source with /DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/ — test_tasks_budget.py and
-// test_fetch_tasks_whole_operation_budget.py — where it is the ONLY ceiling
-// on the server-side budgets. Renaming it, or tidying it into a computed
-// expression, fails both loudly.
+// The server-side budget tests read the delay refreshOne arms through dashboard/tests/js/_abort_delay_probe.mjs.
 const DEFAULT_TIMEOUT_MS = 30000; // 10x the poll interval
 
 // A shorter deadline for an endpoint that has already demonstrated it is
@@ -560,9 +645,10 @@ function staleFailureThreshold() {
 }
 
 // The abort deadline for an endpoint's next attempt, given its failure streak.
-// A forced (ignoreBackoff) chip-click attempt gets the same deadline, so clicks
-// hold a wedged endpoint's socket no longer than the timer path does; it never
-// moves the streak (recordFailure), so it can neither trigger nor skip a probe.
+// A forced attempt (a chip click, or the attempt it deferred) gets the same
+// deadline, so clicks hold a wedged endpoint's socket no longer than the timer
+// path does; it never moves the streak (recordFailure), so it can neither
+// trigger nor skip a probe.
 function attemptDeadlineMs(failures) {
   const pastThreshold = failures - staleFailureThreshold();
   if (pastThreshold < 0) return DEFAULT_TIMEOUT_MS;
@@ -581,6 +667,22 @@ function publishStaleness(stateKey, st) {
   };
 }
 
+// The response headers naming the static/redux build the serving process
+// started with and the one on disk now (dashboard/src/dashboard/asset_build.py).
+const RECEIPT_ASSET_BUILD_HEADERS = Object.freeze({
+  started: 'X-DF-Asset-Build-Started',
+  onDisk: 'X-DF-Asset-Build-On-Disk',
+});
+
+function assetBuildOfResponse(resp) {
+  const headers = resp.headers;
+  if (!headers || typeof headers.get !== 'function') return { started: null, onDisk: null };
+  return {
+    started: headers.get(RECEIPT_ASSET_BUILD_HEADERS.started),
+    onDisk: headers.get(RECEIPT_ASSET_BUILD_HEADERS.onDisk),
+  };
+}
+
 // Record the provenance of the values this response just delivered. Called on
 // the SUCCESS path ONLY — pointedly NOT from `finally`, where publishStaleness
 // lives. See the __receipt seed block for why the asymmetry is the whole point.
@@ -596,11 +698,11 @@ function publishReceipt(stateKey, receipt) {
 // runs.
 //
 // THE POLL LOOP IGNORES THIS, and that is correct — the next tick retries, so
-// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx,
-// which requests a project's terminal window, has to tell "here are the rows"
-// from "the server said no" from "we did not even ask", and datumFor(key)
-// reports the same pre-request unknown Datum in all three cases, so it reads
-// onDemandDatum instead.
+// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx
+// and task_snapshot.js::createTerminalWindowHooks, which request a project's
+// terminal window, have to tell "here are the rows" from "the server said no"
+// from "we did not even ask", and datumFor(key) reports the same pre-request
+// unknown Datum in all three cases, so they read onDemandDatum instead.
 const REFRESH_OUTCOMES = Object.freeze({
   applied: 'applied',
   failed: 'failed',
@@ -635,14 +737,35 @@ const ON_DEMAND_HOLE_REASONS = Object.freeze({
 // receipt-stamped Datum once one has landed, else a hole naming what its own
 // request is doing — never datumFor's 'not yet fetched'. A PLAIN row has no
 // Datum to answer with, so asking for one is refused.
-function onDemandDatum(name, param, outcome) {
+function onDemandDatum(name, param, outcome, field) {
   const row = onDemandRow(name);
   if (row.spec !== DATUM) {
     throw new Error(`DF_DATA: on-demand key '${name}' is not datum-kinded, so it has no Datum to answer with`);
   }
-  const value = window.DF_DATA[row.key(param)];
+  const value = window.DF_DATA[row.key(param, field)];
   const view = onDemandView(value, outcome);
   return view === ON_DEMAND_VIEWS.ready ? value : unknownDatumPlaceholder(ON_DEMAND_HOLE_REASONS[view]);
+}
+
+// The on-demand protocol for a component, built over the caller's React as
+// task_snapshot.js::createTerminalWindowHooks is, since data.js also loads
+// under node without one. useOnDemand(name, param) requests the row's value
+// whenever `param` changes and ignores the answer to a request a newer param
+// superseded. It returns { view, value }: onDemandView's answer and the value
+// now in DF_DATA, so a caller only chooses what each view looks like.
+function createOnDemandHook({ useState, useEffect }) {
+  function useOnDemand(name, param) {
+    const [outcome, setOutcome] = useState(null);
+    useEffect(() => {
+      let current = true;
+      setOutcome(null);
+      requestOnDemand(name, param).then(settled => { if (current) setOutcome(settled); });
+      return () => { current = false; };
+    }, [name, param]);
+    const value = window.DF_DATA[onDemandRow(name).key(param)];
+    return { view: onDemandView(value, outcome), value };
+  }
+  return { useOnDemand };
 }
 
 // `stateKey` names the flow-control, staleness and receipt entry this request
@@ -660,10 +783,17 @@ function onDemandDatum(name, param, outcome) {
 // refreshDFData; when it is absent the request is one-shot and never paced.
 async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   const st = stateFor(state, stateKey);
-  // already in flight for this endpoint — skip this tick, do not queue
-  if (st.inFlight) return REFRESH_OUTCOMES.skippedInFlight;
+  // already in flight for this endpoint — skip this tick, do not queue. A
+  // forced attempt refused here is deferred, not dropped: the endpoint's next
+  // attempt is forced instead, unless the answer in flight is for that url.
+  if (st.inFlight) {
+    if (deps.ignoreBackoff) st.deferredForceUrl = url;
+    return REFRESH_OUTCOMES.skippedInFlight;
+  }
+  const forced = Boolean(deps.ignoreBackoff || st.deferredForceUrl);
   // still backed off
-  if (deps.now() < st.nextAllowedAt && !deps.ignoreBackoff) return REFRESH_OUTCOMES.skippedBackoff;
+  if (deps.now() < st.nextAllowedAt && !forced) return REFRESH_OUTCOMES.skippedBackoff;
+  st.deferredForceUrl = null;
   st.inFlight = true;
   // Fall back inline (not via DEFAULT_POLL_DEPS) so a caller that hand-builds
   // a partial deps object — e.g. refreshOne invoked directly with just
@@ -700,20 +830,28 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
       timedOut,
     ]);
     if (!resp.ok) {
-      recordFailure(st, deps);
+      recordFailure(st, forced, deps);
       return REFRESH_OUTCOMES.failed;
     }
     const body = await resp.json();
     // ONE clock reading for the whole response, so every key it carries shares
     // a single arrival instant — and so `lastSuccessAt` below cannot drift
     // from `receivedAt` by however long the applies took.
-    const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now(), window: body.WINDOW ?? null };
-    Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[k], spec, receipt));
-    recordSuccess(st, deps, startedAt, receipt.receivedAt);
+    const receivedAt = deps.now();
+    const pacingHoldMs = slownessPacingHoldMs(deps, receivedAt - startedAt);
+    const receipt = {
+      servedAt: body.served_at ?? null,
+      receivedAt,
+      window: body.WINDOW ?? null,
+      pacingHoldMs,
+      assetBuild: assetBuildOfResponse(resp),
+    };
+    Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[(spec && spec.bodyKey) || k], spec, receipt));
+    recordSuccess(st, startedAt, receivedAt, pacingHoldMs);
     publishReceipt(stateKey, receipt);
     return REFRESH_OUTCOMES.applied;
   } catch (err) {
-    recordFailure(st, deps);
+    recordFailure(st, forced, deps);
     // Network blip, or a timed-out/aborted request — keep the prior values
     // so the UI does not blank out.
     console.warn('DF_DATA fetch failed', url, err);
@@ -721,6 +859,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   } finally {
     clearTimeoutFn(timeoutId);
     st.inFlight = false;
+    if (st.deferredForceUrl === url) st.deferredForceUrl = null;
     // In `finally` so the `!resp.ok` early return is covered too, not just
     // the success and thrown-error paths.
     publishStaleness(stateKey, st);
@@ -733,9 +872,10 @@ let currentWin = '24h';
 
 // Module-scope tab — announced by app.jsx through scopePollingToTab(tab).
 //
-// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor): the open
-// tab's own endpoints in full, plus the always-on chrome, with /tasks narrowed
-// to ?projection=census whenever the tab itself does not list it.
+// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor), both
+// declared in poll_scope.js: the open tab's own endpoints in full, plus the
+// always-on chrome, with /tasks narrowed to ?projection=census whenever the
+// tab itself does not list it.
 //
 // UNTIL A TAB IS NAMED, OR FOR A TAB ID WITH NO TAB_ENDPOINTS ENTRY, EVERY
 // ENDPOINT IS POLLED. The script-load first poll runs before the text/babel
@@ -814,7 +954,9 @@ const DEFAULT_POLL_DEPS = {
 // clicks cannot escalate the timer path's own backoff schedule. The in-flight
 // check in refreshOne is unconditional regardless of ignoreBackoff, so a chip
 // change still cannot stack a second concurrent request for an endpoint
-// that's already running.
+// that's already running; the refused force is deferred to that endpoint's
+// next attempt instead (see refreshOne), so the hold the in-flight answer arms
+// cannot delay the chosen window past the next tick.
 //
 // While __DF_PAUSE is set a chip change fetches nothing (see refreshPollSet);
 // the window is recorded first, so the first tick after resume fetches it.
@@ -952,12 +1094,19 @@ function onDemandRow(name) {
   return row;
 }
 
+// The {DF_DATA key: spec} map one request for `param` lands.
+function onDemandKeySpecs(name, param) {
+  const row = ON_DEMAND_KEYS[name];
+  if (!row.fields) return { [row.key(param)]: row.spec };
+  return Object.fromEntries(row.fields.map(field => [row.key(param, field), fromBody(field, row.spec)]));
+}
+
 function startOnDemand(name, param, state, depsOverrides, ledger) {
   const row = ON_DEMAND_KEYS[name];
   const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0, pollIntervalMs: undefined };
   const request = refreshOne(
     row.url(param),
-    { [row.key(param)]: row.spec },
+    onDemandKeySpecs(name, param),
     state,
     deps,
     onDemandStateKey(name, param),
@@ -969,6 +1118,13 @@ function startOnDemand(name, param, state, depsOverrides, ledger) {
 
 function onDemandStateKey(name, param) {
   return `${pollKey(ON_DEMAND_KEYS[name].url(param))}#${name}:${param}`;
+}
+
+// The receipt of the latest landed request for `param` (its served/received
+// instants and WINDOW echo), or null before one lands.
+function onDemandReceipt(name, param) {
+  onDemandRow(name);
+  return window.DF_DATA.__receipt[onDemandStateKey(name, param)] ?? null;
 }
 
 // Per poll state, per row: every param requestOnDemand has asked for and not
@@ -1002,11 +1158,12 @@ function trimOnDemand(name, ledger, limit, state) {
 // entry and its __stale/__receipt records. The __loaded marker goes too, so it
 // never claims a value that is no longer there.
 function forgetOnDemand(name, param, state) {
-  const key = ON_DEMAND_KEYS[name].key(param);
   const stateKey = onDemandStateKey(name, param);
   state.delete(stateKey);
-  delete window.DF_DATA[key];
-  delete window.DF_DATA.__loaded[key];
+  for (const key of Object.keys(onDemandKeySpecs(name, param))) {
+    delete window.DF_DATA[key];
+    delete window.DF_DATA.__loaded[key];
+  }
   delete window.DF_DATA.__stale[stateKey];
   delete window.DF_DATA.__receipt[stateKey];
 }
@@ -1062,11 +1219,16 @@ const DF_DATA_LOADER_API = {
   pollKey,
   datumFor,
   ON_DEMAND_KEYS,
+  taskUid,
+  qualityQuery,
+  snapshotDiffQuery,
   requestOnDemand,
+  onDemandReceipt,
   REFRESH_OUTCOMES,
   ON_DEMAND_VIEWS,
   onDemandView,
   onDemandDatum,
+  createOnDemandHook,
   pollSetFor,
   scopePollingToTab,
 };

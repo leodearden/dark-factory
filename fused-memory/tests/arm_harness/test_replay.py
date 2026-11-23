@@ -21,11 +21,7 @@ from arm_harness._fakes import (
 from fused_memory.arm_harness.arm_config import llm_arm_config
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
 from fused_memory.arm_harness.metrics_record import IndexConfiguration
-from fused_memory.arm_harness.replay import (
-    MAX_CONSECUTIVE_FAILURES,
-    ConsecutiveFailureBreaker,
-    replay_arm,
-)
+from fused_memory.arm_harness.replay import MAX_CONSECUTIVE_FAILURES, replay_arm
 from fused_memory.arm_harness.replay_types import (
     ArmAbort,
     ReplayItem,
@@ -69,6 +65,10 @@ async def _replay(graph, items, *, spec=None, journal=None, **settings):
         journal=journal or RecordingJournal(),
         settings=_settings(**settings),
     )
+
+
+async def _time_out(call):
+    raise TimeoutError
 
 
 # ── INV-4 consecutive-failure abort ──
@@ -141,35 +141,33 @@ async def test_failures_are_counted_in_completion_order():
     assert result.cancelled_ids == ('ep-1',)
 
 
-def test_breaker_trips_on_the_fifth_consecutive_failure():
-    breaker = ConsecutiveFailureBreaker(arm_id='arm-a')
+@pytest.mark.asyncio
+async def test_the_abort_names_each_failed_item_with_its_own_error_class():
+    spec = llm_spec()
+    graph = FakeArmGraph({'ep-1': _time_out, 'ep-3': _time_out}, default=fail)
 
-    trips = [breaker.observe(f'ep-{i}', 'TimeoutError') for i in range(5)]
+    result = await _replay(graph, _items(6), spec=spec)
 
-    assert trips[:4] == [None] * 4
-    assert trips[4] == ArmAbort(
-        arm_id='arm-a',
+    assert len(graph.add_calls) == MAX_CONSECUTIVE_FAILURES
+    assert result.abort == ArmAbort(
+        arm_id=spec.arm_id,
         item_ids=tuple(f'ep-{i}' for i in range(5)),
-        error_classes=('TimeoutError',) * 5,
+        error_classes=(
+            'RuntimeError', 'TimeoutError', 'RuntimeError', 'TimeoutError', 'RuntimeError',
+        ),
     )
 
 
-def test_breaker_resets_on_success_and_honours_its_limit():
-    breaker = ConsecutiveFailureBreaker(arm_id='arm-a', limit=2)
+@pytest.mark.asyncio
+async def test_the_abort_lists_only_the_failures_after_the_last_success():
+    graph = FakeArmGraph({'ep-1': succeed}, default=fail)
 
-    assert breaker.observe('ep-0', 'RuntimeError') is None
-    assert breaker.observe('ep-1', None) is None
-    assert breaker.observe('ep-2', 'RuntimeError') is None
-    abort = breaker.observe('ep-3', 'ValueError')
+    result = await _replay(graph, _items(7))
 
-    assert abort is not None
-    assert abort.item_ids == ('ep-2', 'ep-3')
-    assert abort.error_classes == ('RuntimeError', 'ValueError')
-
-
-def test_breaker_rejects_a_non_positive_limit():
-    with pytest.raises(ValueError, match='limit'):
-        ConsecutiveFailureBreaker(arm_id='arm-a', limit=0)
+    assert len(result.outcomes) == 7
+    assert result.abort is not None
+    assert result.abort.item_ids == tuple(f'ep-{i}' for i in range(2, 7))
+    assert result.abort.error_classes == ('RuntimeError',) * 5
 
 
 # ── timeouts ──
@@ -177,10 +175,7 @@ def test_breaker_rejects_a_non_positive_limit():
 
 @pytest.mark.asyncio
 async def test_timeout_error_is_a_failure():
-    async def time_out(call):
-        raise TimeoutError
-
-    graph = FakeArmGraph({'ep-0': time_out})
+    graph = FakeArmGraph({'ep-0': _time_out})
 
     result = await _replay(graph, _items(1))
 

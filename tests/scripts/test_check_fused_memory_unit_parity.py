@@ -11,6 +11,7 @@ mirroring the pattern in tests/scripts/test_orchestrator_watchdog.py::_load_watc
 
 import ast
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -18,14 +19,21 @@ import types
 
 import pytest
 import systemd_unit_parity
+import yaml
 from setup_host_sections import (
     enabled_units,
+    install_recording_systemctl,
     run_section,
     slice_section,
+    stub_bin_dir,
     systemctl_calls,
     usage_error_checker,
     write_checker,
+    write_stub,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_fused_memory_unit_parity.py"
@@ -47,6 +55,22 @@ def _load_checker() -> types.ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _systemctl_is_a_recording_stub(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve every `systemctl` in this module to the recording stub.
+
+    main(--fix) shells out to `systemctl --user daemon-reload` through PATH;
+    this keeps every test in the module off the host's real user manager and
+    records each call for systemctl_calls(tmp_path).
+    """
+    monkeypatch.setenv(
+        "PATH",
+        f"{install_recording_systemctl(tmp_path)}{os.pathsep}{os.environ.get('PATH', '')}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +141,13 @@ Type=simple
 Environment=MEM0_TELEMETRY=false
 Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
 RestartSteps=4
 TimeoutStartSec=300
+KillMode=mixed
 TimeoutStopSec=90
 
 [Install]
@@ -194,7 +219,7 @@ Description=Drifted Service Missing Restart Directives
 Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 
 [Install]
@@ -213,7 +238,7 @@ Description=Installed Fused Memory (cap declared, no steps)
 Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
@@ -237,7 +262,7 @@ Description=Installed Fused Memory (divergent TimeoutStopSec)
 Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
@@ -296,6 +321,20 @@ def test_find_drift_detects_injected_timeout_stop_sec_divergence():
     assert "TimeoutStopSec=90" in drift
 
 
+def test_find_drift_detects_missing_kill_mode():
+    """An installed unit still on the default KillMode=control-group is drift (task 9493)."""
+    mod = _load_checker()
+    unit = _CLEAN_UNIT.replace("KillMode=mixed\n", "")
+    assert mod.find_drift(unit) == ["KillMode=mixed"]
+
+
+def test_find_drift_flags_a_control_group_kill_mode():
+    """An explicit KillMode=control-group is drift too: membership is exact."""
+    mod = _load_checker()
+    unit = _CLEAN_UNIT.replace("KillMode=mixed", "KillMode=control-group")
+    assert "KillMode=mixed" in mod.find_drift(unit)
+
+
 def test_parity_checker_subprocess_exit_1_on_divergent_timeout_stop_sec(
     tmp_path: pathlib.Path,
 ):
@@ -347,7 +386,7 @@ Description=Installed Fused Memory
 [Service]
 Type=notify
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/other
 
@@ -356,12 +395,14 @@ WantedBy=default.target
 """
 
 
-def test_fix_unit_text_adds_missing_directive():
-    """fix_unit_text inserts Environment=MEM0_TELEMETRY=false into [Service]."""
+def test_fix_unit_text_adds_every_missing_required_directive():
+    """fix_unit_text appends each REQUIRED_SERVICE_DIRECTIVES entry [Service] lacks,
+    so a newly required directive is covered without a test of its own."""
     mod = _load_checker()
     fixed = mod.fix_unit_text(_DRIFTED_WITH_HOST_SPECIFIC)
-    sections = mod.parse_unit_sections(fixed)
-    assert "Environment=MEM0_TELEMETRY=false" in sections["Service"]
+    service = mod.parse_unit_sections(fixed)["Service"]
+    still_missing = [d for d in mod.REQUIRED_SERVICE_DIRECTIVES if d not in service]
+    assert still_missing == []
 
 
 def test_fix_unit_text_preserves_host_specific_line():
@@ -398,6 +439,7 @@ Restart=on-failure
 RestartSec=5
 RestartSteps=4
 TimeoutStartSec=300
+KillMode=mixed
 TimeoutStopSec=90
 
 [Install]
@@ -444,6 +486,115 @@ def test_fix_unit_text_never_synthesizes_bare_execstartpre():
     assert not any(line.startswith("ExecStartPre=") for line in sections["Service"]), (
         "fix_unit_text must never synthesize an ExecStartPre= line (host-specific value)"
     )
+
+
+# ---------------------------------------------------------------------------
+# find_drift tests: the backing stores come up only through the AOF gate (task 6330)
+# ---------------------------------------------------------------------------
+
+_BARE_COMPOSE_UP_LINE = (
+    "ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml "
+    "up -d falkordb qdrant"
+)
+_GATE_LINE = (
+    "ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py "
+    "--compose-file /repo/fused-memory/docker/docker-compose.yml"
+)
+_BARE_COMPOSE_UP_UNIT = _CLEAN_UNIT.replace(_GATE_LINE, _BARE_COMPOSE_UP_LINE)
+_GATE_PLUS_BARE_COMPOSE_UP_UNIT = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{_BARE_COMPOSE_UP_LINE}")
+_EMBEDDER_UP_ARGS = "up -d --pull=never --no-deps embedder"
+_EMBEDDER_UP_LINE = (
+    "ExecStartPre=-/usr/bin/timeout 10 /usr/bin/docker compose "
+    f"-f /repo/fused-memory/docker/docker-compose.yml {_EMBEDDER_UP_ARGS}"
+)
+_COMPOSE_FILE = REPO_ROOT / "fused-memory" / "docker" / "docker-compose.yml"
+# The compose keys that make `up <service>` start another service too.
+_COMPOSE_DEPENDENCY_KEYS = ("depends_on", "links", "volumes_from")
+
+
+def test_find_drift_flags_a_unit_that_brings_the_stores_up_without_the_aof_gate():
+    mod = _load_checker()
+    assert _GATE_LINE in _CLEAN_UNIT
+
+    drift = mod.find_drift(_BARE_COMPOSE_UP_UNIT)
+
+    assert drift == [mod.AOF_GATE_DRIFT, mod.BARE_COMPOSE_UP_DRIFT]
+
+
+def test_find_drift_flags_a_bare_compose_up_beside_the_gate():
+    mod = _load_checker()
+
+    assert mod.find_drift(_GATE_PLUS_BARE_COMPOSE_UP_UNIT) == [mod.BARE_COMPOSE_UP_DRIFT]
+
+
+def test_find_drift_accepts_an_embedder_only_compose_up_beside_the_gate():
+    mod = _load_checker()
+
+    unit = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{_EMBEDDER_UP_LINE}")
+
+    assert mod.find_drift(unit) == []
+
+
+@pytest.mark.parametrize(
+    "compose_up_args",
+    ["up -d", "up -d embedder falkordb", "up -d qdrant", "up -d --pull never embedder"],
+)
+def test_find_drift_flags_any_compose_up_beyond_the_ungated_services(compose_up_args: str):
+    mod = _load_checker()
+    compose_up_line = _EMBEDDER_UP_LINE.replace(_EMBEDDER_UP_ARGS, compose_up_args)
+    assert compose_up_line != _EMBEDDER_UP_LINE
+
+    unit = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{compose_up_line}")
+
+    assert mod.find_drift(unit) == [mod.BARE_COMPOSE_UP_DRIFT]
+
+
+def test_compose_up_bypasses_aof_gate_reads_only_ungated_services():
+    mod = _load_checker()
+
+    assert mod.compose_up_bypasses_aof_gate(_EMBEDDER_UP_LINE) is False
+    assert mod.compose_up_bypasses_aof_gate(_BARE_COMPOSE_UP_LINE) is True
+    assert mod.compose_up_bypasses_aof_gate(_GATE_LINE) is False
+
+
+def test_every_ungated_compose_service_starts_alone():
+    mod = _load_checker()
+    services = yaml.safe_load(_COMPOSE_FILE.read_text(encoding="utf-8"))["services"]
+
+    for name in mod.UNGATED_COMPOSE_SERVICES:
+        service = services[name]
+        assert not set(_COMPOSE_DEPENDENCY_KEYS) & service.keys(), (name, service)
+        assert not str(service.get("network_mode", "")).startswith("service:"), (name, service)
+
+
+def test_main_names_the_flagged_compose_up_line_and_the_services_read_from_it(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    mod = _load_checker()
+    compose_up_line = _EMBEDDER_UP_LINE.replace(_EMBEDDER_UP_ARGS, "up -d --wait-timeout 30 embedder")
+    installed = _write_unit(tmp_path, _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{compose_up_line}"))
+
+    rc = mod.main(["--installed", str(installed)])
+
+    assert rc == 1
+    out = _untagged(capsys.readouterr().out)
+    assert f"  - {mod.BARE_COMPOSE_UP_DRIFT}\n      {compose_up_line}\n" in out
+    assert "      read as services: ['30', 'embedder']" in out
+
+
+def test_fix_never_synthesizes_the_aof_gate_and_reports_it_as_residual_drift(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+):
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _BARE_COMPOSE_UP_UNIT)
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    assert rc == 1
+    assert installed.read_text(encoding="utf-8") == _BARE_COMPOSE_UP_UNIT
+    combined = "".join(capsys.readouterr())
+    assert mod.AOF_GATE_DRIFT in combined and mod.BARE_COMPOSE_UP_DRIFT in combined
 
 
 # ---------------------------------------------------------------------------
@@ -495,18 +646,64 @@ def test_main_fix_rewrites_file(tmp_path: pathlib.Path):
     assert rc == 0
 
 
-def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
-    """main(--fix) on a drifted unit invokes daemon_reload()."""
+def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path):
+    """main(--fix) on a drifted unit issues exactly one `systemctl --user daemon-reload`.
+
+    Observed at the process boundary through this module's recording
+    `systemctl` stub, not by patching the checker.
+    """
     mod = _load_checker()
     installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
-    reload_calls: list[None] = []
-
-    def _fake_reload() -> None:
-        reload_calls.append(None)
-
-    monkeypatch.setattr(mod, "daemon_reload", _fake_reload)
     mod.main(["--installed", str(installed), "--fix"])
-    assert len(reload_calls) == 1
+    assert systemctl_calls(tmp_path) == [["--user", "daemon-reload"]]
+
+
+def test_main_fix_survives_a_failing_daemon_reload_with_tagged_warning(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """A failing reload is reported, tagged line by line, and does not change the verdict.
+
+    The stub's multi-line stderr is foreign text the checker interpolates into
+    its warning, so every physical line of it must still carry the log tag.
+    """
+    mod = _load_checker()
+    write_stub(
+        stub_bin_dir(tmp_path),
+        "systemctl",
+        "printf 'first failure line\\nsecond failure line\\n' >&2\nexit 5\n",
+    )
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    err_lines = [line for line in err.splitlines() if line.strip()]
+    assert all(line.startswith(f"[{mod.LOG_TAG}]") for line in err_lines), err
+    assert any(
+        "[warn] systemctl --user daemon-reload failed (exit 5)" in line
+        for line in err_lines
+    ), err
+    assert any(line.endswith("second failure line") for line in err_lines), err
+
+
+def test_main_fix_is_silent_when_systemctl_is_absent(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """With no `systemctl` on PATH, --fix still succeeds and says nothing about the reload."""
+    mod = _load_checker()
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "systemctl" not in captured.out + captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -887,7 +1084,6 @@ def test_log_tags_every_physical_line_of_a_multi_line_message(
 def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     """main(--fix) returns 1 (not a false 0) when a host-specific prefix directive remains.
 
@@ -898,7 +1094,6 @@ def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
     return — instead of falsely signalling parity with exit 0.
     """
     mod = _load_checker()
-    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
     rc = mod.main(["--installed", str(installed), "--fix"])
     assert rc == 1
@@ -911,7 +1106,6 @@ def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
 def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     """The '[fixed] Appended N' count reflects only the EXACT directives appended.
 
@@ -921,7 +1115,6 @@ def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
     therefore be the exact-directive count, never the inflated len(drift).
     """
     mod = _load_checker()
-    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     full_drift = mod.find_drift(_MISSING_MEM0_UNIT)
     exact_only = mod.find_drift(_MISSING_MEM0_UNIT, required_prefixes=())
     assert len(full_drift) == len(exact_only) + len(mod.REQUIRED_SERVICE_DIRECTIVE_PREFIXES)

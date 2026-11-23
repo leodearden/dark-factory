@@ -15,26 +15,31 @@ import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import (
-    FakeClock,
     FakeVerifier,
     hangs_until,
+    healthy_verify_clock,
     lane_scene_config,
     make_lane,
     running_lane,
 )
-from _orch_helpers import git_env_with_ceiling, wait_responsive
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MERGE_RESULT_TIMEOUT,
+    git_env_with_ceiling,
+    wait_responsive,
+)
 from df_pytest_isolation import git_redirect_env
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import GroupMergeRequest, MergeLane, MergeRequest, QueuedBranch
 from orchestrator.merge_lane.types import TrainCallbacks
-from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
+from orchestrator.verify import merge_verify_command_budget_secs
 
 pytestmark = pytest.mark.asyncio
 
@@ -43,7 +48,6 @@ _GIT = GitConfig(
     push_after_advance=False,
 )
 _SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='Initial commit')
-_GATE_REVERIFY_TARGET = 'orchestrator.merge_lane.worker.run_scoped_verification'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,12 +85,6 @@ async def _request(scene: _Scene, name: str, *, lane: str = 'normal') -> MergeRe
     )
 
 
-def _writing_clock() -> FakeClock:
-    """A fake clock on which a held verify keeps writing, so the lane's
-    no-progress watchdog never mistakes it for a dead one."""
-    return FakeClock(content_mtime=1.0, content_tick=1.0)
-
-
 async def _until(predicate: Callable[[], bool]) -> None:
     while not predicate():
         await asyncio.sleep(0)
@@ -118,7 +116,7 @@ async def test_a_halt_starts_nothing_new_and_lets_the_inflight_verify_land(
     scene: _Scene,
 ) -> None:
     release_first = asyncio.Event()
-    clock = _writing_clock()
+    clock = healthy_verify_clock()
     verifier = FakeVerifier(scripts={'first': hangs_until(release_first)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=clock)
@@ -170,7 +168,7 @@ async def test_a_merged_item_reaching_dispatch_under_a_halt_is_requeued_unverifi
     verifier = FakeVerifier(scripts={'first': hangs_until(release_first)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
-        scene.git_ops, queue, verifier=verifier, clock=_writing_clock(), speculation_depth=2,
+        scene.git_ops, queue, verifier=verifier, speculation_depth=2,
     )
     first = await _request(scene, 'first')
     second = await _request(scene, 'second')
@@ -252,7 +250,7 @@ async def _stacked_train(scene: _Scene) -> GroupMergeRequest:
 async def test_a_train_verifying_in_the_merger_is_in_flight(scene: _Scene) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
-    clock = _writing_clock()
+    clock = healthy_verify_clock()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
@@ -296,29 +294,6 @@ async def test_the_budget_is_the_longest_merge_command_timeout(tmp_path: Path) -
     )
     assert merge_verify_command_budget_secs(warm_heavy, []) == 9000.0
 
-
-
-def _green() -> VerifyResult:
-    return VerifyResult(
-        passed=True, test_output='', lint_output='', type_output='', summary='ok',
-    )
-
-
-class _HeldVerify:
-    """``run_scoped_verification`` stand-in for the gate re-verify, which the
-    lane runs outside its injected ``VerifyPort`` (task 6344): counts its
-    calls and holds each until released."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def run(self, *_args: Any, **_kwargs: Any) -> VerifyResult:
-        self.calls += 1
-        self.entered.set()
-        await self.release.wait()
-        return _green()
 
 
 async def test_a_train_parked_behind_its_predecessor_does_not_start_its_verify_under_a_halt(
@@ -375,45 +350,44 @@ def _git(cwd: Path, *args: str) -> str:
 
 async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: Path) -> None:
     """R2: a main that moves under a head's verify costs a gate re-verify, a
-    whole new verify; its deadline is measured from ITS start, not the first
-    verify's dispatch."""
+    whole new verify dispatched as the rebased head (task 8525); its deadline
+    is measured from ITS start, not the first verify's dispatch."""
     repo = seed_repo(tmp_path / 'repo', _SEED)
     scene = _Scene(
         repo=repo, git_ops=GitOps(_GIT, repo),
         config=lane_scene_config(repo, _GIT, merge_verify_breadth='full'),
     )
     release_first = asyncio.Event()
-    clock = _writing_clock()
-    verifier = FakeVerifier(scripts={'head': hangs_until(release_first)})
+    release_gate = asyncio.Event()
+    clock = healthy_verify_clock()
+    verifier = FakeVerifier(sequence=[hangs_until(release_first), hangs_until(release_gate)])
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=clock)
     head = await _request(scene, 'head')
     budget = merge_verify_command_budget_secs(scene.config, [])
-    reverify = _HeldVerify()
 
-    with patch(_GATE_REVERIFY_TARGET, side_effect=reverify.run):
-        async with running_lane(lane) as run:
-            await queue.put(head)
-            await wait_responsive(verifier.await_entry(1), label='head verify under way')
-            (first,) = _drain_view(lane)['verifies_in_flight']
-            (repo / 'drift.txt').write_text('moved under the verify\n')
-            _git(repo, 'add', '--', 'drift.txt')
-            _git(repo, 'commit', '-m', 'drift: direct commit')
-            clock.time += 5_000.0
+    async with running_lane(lane) as run:
+        await queue.put(head)
+        await wait_responsive(verifier.await_entry(1), label='head verify under way')
+        (first,) = _drain_view(lane)['verifies_in_flight']
+        (repo / 'drift.txt').write_text('moved under the verify\n')
+        _git(repo, 'add', '--', 'drift.txt')
+        _git(repo, 'commit', '-m', 'drift: direct commit')
+        clock.time += 5_000.0
 
-            release_first.set()
-            await wait_responsive(reverify.entered.wait(), label='gate re-verify under way')
-            (gate,) = _drain_view(lane)['verifies_in_flight']
+        release_first.set()
+        await wait_responsive(verifier.await_entry(2), label='gate re-verify under way')
+        (gate,) = _drain_view(lane)['verifies_in_flight']
 
-            reverify.release.set()
-            outcome = await run.outcome(head)
+        release_gate.set()
+        outcome = await run.outcome(head)
 
     assert first['kind'] == 'verify'
-    assert gate['kind'] == 'gate_reverify'
+    assert gate['kind'] == 'verify'
     assert gate['started_ts'] >= first['started_ts'] + 5_000.0
     assert gate['deadline_ts'] - gate['started_ts'] == budget
     assert outcome.status == 'done', outcome
-    assert reverify.calls == 1
+    assert verifier.verified == ['head', 'head']
 
 
 # ─── R6: a requeued predecessor is not waited for ───────────────────────────
@@ -425,6 +399,12 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
     """A halt requeues both a parked train T and the predecessor A it waited
     on, T ahead of A. Once admission resumes T must not park on A, which can
     only move after T: that would stall the merger for the whole park."""
+    # Deep chains off (task 7720): under the operational yaml's chain_cap the
+    # merger waits for pred's chain decision while pred waits for the one
+    # host, so it could not take T into the park this scene is about.
+    scene = dataclasses.replace(
+        scene, config=lane_scene_config(scene.repo, _GIT, merge_deep=MergeDeepConfig(chain_cap=0)),
+    )
     release_head = asyncio.Event()
     verifier = FakeVerifier(scripts={'head': hangs_until(release_head)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -435,15 +415,21 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
 
     async with running_lane(lane) as run:
         await queue.put(head)
-        await wait_responsive(verifier.await_entry(1), label='head verify under way')
+        await wait_responsive(
+            verifier.await_entry(1),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            label='head verify under way',
+        )
         await queue.put(pred)
         await wait_responsive(
             _until(lambda: _state(lane, pred) in {'awaiting_verify', 'awaiting_host'}),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='predecessor merged, waiting for the one host',
         )
         await queue.put(train)
         await wait_responsive(
             _until(lambda: _state(lane, train) == 'merging'),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='train parked behind the predecessor',
         )
 
@@ -452,12 +438,15 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
         assert (await run.outcome(head)).status == 'done'
         await wait_responsive(
             _until(lambda: (_state(lane, train), _state(lane, pred)) == ('queued', 'queued')),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='train and predecessor both requeued',
         )
 
         lane.resume_admission()
         train_outcome = await wait_responsive(
-            asyncio.shield(train.result), label='train lands without parking on pred',
+            asyncio.shield(train.result),
+            timeout=MERGE_RESULT_TIMEOUT,
+            label='train lands without parking on pred',
         )
         pred_outcome = await run.outcome(pred)
 

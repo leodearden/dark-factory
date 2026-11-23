@@ -17,8 +17,12 @@ from fused_memory.services.read_rollup import (
     COUNT_READ_SQL,
     DELETE_COUNT_ONLY_READS_SQL,
     FIRST_COUNT_ONLY_ROWID_SQL,
+    NON_PER_ROW_OPERATION_READ_PREDICATE,
+    PER_ROW_OPERATION_READ_PREDICATE,
+    PREWARM_PRIMARY_KEY_SQL,
     RAW_READS_BY_ROLLUP_KEY_SQL,
     READ_OP_COUNTS_SCHEMA_SQL,
+    READ_OPERATIONS_KEPT_PER_ROW,
     keeps_read_row,
 )
 from fused_memory.services.write_journal import SCHEMA_SQL as WRITE_OPS_SCHEMA_SQL
@@ -177,6 +181,32 @@ class TestCountOnlyPredicateAgreesWithKeepsReadRow:
 
         assert selected == expected_count_only
         assert expected_count_only
+
+
+class TestRetentionHorizonPredicatesPartitionReads:
+    def test_every_read_sits_on_exactly_one_horizon_and_no_write_on_either(self):
+        conn = sqlite3.connect(':memory:')
+        conn.execute('CREATE TABLE write_ops (kind TEXT, operation TEXT, success INTEGER)')
+        operations = [*sorted(READ_OPERATIONS_KEPT_PER_ROW), 'get_task', None]
+        for operation, success in itertools.product(operations, (0, 1)):
+            conn.execute(
+                "INSERT INTO write_ops VALUES ('read', ?, ?)", (operation, success)
+            )
+        conn.execute("INSERT INTO write_ops VALUES ('write', NULL, 1)")
+
+        def rowids(predicate: str) -> set[int]:
+            return {
+                row[0]
+                for row in conn.execute(f'SELECT rowid FROM write_ops WHERE {predicate}')
+            }
+
+        reads = rowids("kind = 'read'")
+        per_row = rowids(PER_ROW_OPERATION_READ_PREDICATE)
+        non_per_row = rowids(NON_PER_ROW_OPERATION_READ_PREDICATE)
+
+        assert not per_row & non_per_row, 'a read sits on both retention horizons'
+        assert per_row | non_per_row == reads, 'a read sits on neither horizon and is kept forever'
+        assert rowids(COUNT_ONLY_READ_PREDICATE) == non_per_row & rowids('success = 1')
 
 
 def _journal_db() -> sqlite3.Connection:
@@ -362,3 +392,14 @@ class TestMigrationQueryPlans:
         plan = self._plan(live_shaped_db, FIRST_COUNT_ONLY_ROWID_SQL)
 
         assert plan == 'SCAN write_ops', plan
+
+    def test_the_prewarm_selects_exactly_the_rows_the_delete_removes(self):
+        assert COUNT_ONLY_READ_PREDICATE in PREWARM_PRIMARY_KEY_SQL
+        assert COUNT_ONLY_READ_PREDICATE in DELETE_COUNT_ONLY_READS_SQL
+
+    def test_the_prewarm_walks_the_primary_key_index_for_the_rowid_range_only(self, live_shaped_db):
+        plan = self._plan(live_shaped_db, PREWARM_PRIMARY_KEY_SQL, (1, 5001))
+
+        assert 'SEARCH write_ops USING COVERING INDEX sqlite_autoindex_write_ops_1 (id=?)' in plan, plan
+        assert 'SEARCH write_ops USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)' in plan, plan
+        assert 'idx_wo' not in plan, plan

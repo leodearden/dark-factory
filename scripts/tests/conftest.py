@@ -5,13 +5,10 @@ Mirrors the repo root conftest.py sys.path-insertion pattern so that
 scripts/tests/ under importlib import mode.  No package __init__.py is
 needed (importlib mode does not require it).
 
-Also inserts scripts/legibility/ so flat modules nested one level down
-(e.g. `digest.py`, and its PRD-decomposition siblings — the sampler,
-merger, trickle coder, etc. all planned to live under scripts/legibility/)
-resolve via a bare `import digest` the same way top-level scripts/*.py
-modules do. Without this, scripts/ on sys.path alone only makes
-scripts/legibility/ importable as a namespace package (`import legibility`),
-not its contents as bare top-level names.
+scripts/ on sys.path makes scripts/legibility/ importable as the
+`legibility` namespace package, and its modules are imported only as
+`legibility.<mod>`: a bare name would load a second module object for the
+same file (scripts/tests/test_legibility_import_spelling.py).
 
 Also APPENDS scripts/tests/ itself, so non-test helper modules living beside
 the tests (`cli_subprocess_timeout`, `write_triage_attach_fixtures`) resolve
@@ -31,29 +28,53 @@ auto-resolve for every file in this directory, whereas a `from conftest import
 copies of one fake-httpx idiom spread across four of this directory's files.
 
 So do `runs_db_path` / `runs_db` (task 5441): a synthetic orchestrator runs.db
-shared by the model-admission audit and review suites.
+shared by the model-admission audit and review suites. `make_runs_db` (task
+5989), its event-dict factory, replaced the private copies in the wiped-metadata,
+merge-lane-throughput and speculation-depth suites.
 
 And `fake_claude_cli` / `pool_roster` / `sentinel_login` (task 6042): a
 JSON-mode fake `claude` binary keyed on the leased OAuth token, a hermetic
 account roster, and a decoy operator login, for the legibility suites that
-drive the shared session runner end to end.
+drive the shared session runner end to end. The real UsageGate those fixtures
+drive has its dead-PID probe-dir sweep confined by the plugin
+``pytest_configure`` arms (task 6275).
+
+And `fake_recorder` / `fake_timer_systemctl` (task 5285): an executable that records
+each call's argv and environment, replacing the private recorder and fake-`uv`
+copies in the flag-marker and reclaim wrapper suites, and a fake `systemctl`
+modelling the verbs the timer installers call, replacing the installer suites'
+private copies. Its `unit_values` reads a committed systemd unit's directives
+through the production parser, replacing those suites' hand-rolled parsers.
 """
 import json
 import os
-import shutil
 import sqlite3
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  A run rooted at
+# this directory does not load the repo-root conftest.py, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never
+# insert(0, ...): at sys.path[0] it would make the subproject directories
+# resolve as namespace packages pointing at the project folder instead of
+# src/<pkg>/, defeating the inserts below.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_fleet_dir_isolation,
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
+    reject_unsafe_basetemp,
+)
+
 _SCRIPTS_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
-
-_LEGIBILITY_DIR = _SCRIPTS_DIR / 'legibility'
-if str(_LEGIBILITY_DIR) not in sys.path:
-    sys.path.insert(0, str(_LEGIBILITY_DIR))
 
 # Same insert for scripts/local-model-serving/ (task 3713, LME-alpha).  That
 # directory name is HYPHENATED, so unlike a dotted package name it can never be
@@ -70,42 +91,27 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.append(str(_THIS_DIR))
 
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  A run rooted at
-# this directory does not load the repo-root conftest.py, so each test-root
-# conftest wires the defence itself.  APPEND the repo root, never
-# insert(0, ...): at sys.path[0] it would make the subproject directories
-# resolve as namespace packages pointing at the project folder instead of
-# src/<pkg>/, defeating the inserts above.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (  # noqa: E402
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_fleet_deploy_clock_redirect,  # noqa: F401  — the binding IS the wiring
-    _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_leaked_drain_processes,  # noqa: F401  — the binding IS the wiring
-    _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — binding IS wiring
-    reject_unsafe_basetemp,
-)
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Refuse an unsafe --basetemp (esc-3072-3); arm the suite-wide defences and UsageGate sweep confinement."""
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
+    arm_fleet_dir_isolation(config)
+    arm_leaked_drain_process_guard(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
 
 
 # The fleet-deploy-clock redirect this directory relied on used to be defined
 # HERE (task 3797). It is now the suite-wide default applied unconditionally by
-# df_pytest_isolation._df_deploy_clocks_unwritten, autoused into every conftest
-# that imports this module — not just this one (task 5299). This directory
-# keeps only the thin `_df_fleet_deploy_clock_redirect` NAME above, imported
-# rather than redefined, so `test_suite_never_stamps_the_repo_fleet_deploy_clock`
-# can still take the resolved path by fixture rather than reading os.environ
-# bare. See df_pytest_isolation.py's module docstring, SECOND DEFENCE, for the
-# full history.
+# df_pytest_isolation._df_deploy_clocks_unwritten in every test root (task
+# 5299). arm_test_root_isolation also arms the thin
+# `_df_fleet_deploy_clock_redirect` view, so
+# `test_suite_never_stamps_the_repo_fleet_deploy_clock` can still take the
+# resolved path by fixture rather than reading os.environ bare. See
+# df_pytest_isolation.py's module docstring, SECOND DEFENCE, for the full history.
 
 
 # ---------------------------------------------------------------------------
@@ -156,12 +162,13 @@ def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
 # Shared tasks.db fixtures (task 3336).
 #
 # _TASKS_SCHEMA is a deliberate SUBSET (of tables and columns) of
-# `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_SCHEMA_SQL`,
-# keeping only what the sweep scripts read, with the real shapes and NOT NULL
-# constraints of what it keeps rather than invented ones. For the full shape,
-# run `python scripts/tasks_db_schema.py`. It stays private to `make_tasks_db`,
-# which executes it on every use — that is the executable check, so no test
-# asserts on the literal.
+# `shared/src/shared/task_store_schema.py::TASK_STORE_DDL`, keeping only what
+# the sweep scripts read, with the real shapes and NOT NULL constraints of what
+# it keeps rather than invented ones. For the full shape, run
+# `python scripts/tasks_db_schema.py`. It stays private to `make_tasks_db`:
+# scripts/tests/test_make_tasks_db_schema.py builds a store through
+# `make_tasks_db` and checks it with `tasks_db_schema.columns_outside`, so no
+# test asserts on the literal.
 #
 # The schema is the SUPERSET of what the three sweep-script test files used
 # privately: audit_wiped_metadata_files' copy carries `priority TEXT`, the two
@@ -296,9 +303,8 @@ def install_fake_httpx(monkeypatch):
     httpx IS installed here — a direct dependency of ``shared``
     (``shared/pyproject.toml``, ``httpx>=0.27``, added for task 2965) — so the
     lazy, function-local ``import httpx`` in the modules under test resolves to
-    the real library and its POST genuinely goes out to
-    ``$FUSED_MEMORY_MCP_URL`` (default ``localhost:8002``).  On any box running
-    the fused-memory stack that POST SUCCEEDS, so a test leaning on ambient
+    the real library and its request genuinely goes out.  On any box where the
+    target is listening that request SUCCEEDS, so a test leaning on ambient
     unreachability flaps with the host's listener state — the exact defect
     tasks 3237/3291 fixed by injecting a fake.  Injecting makes both the
     request shape assertable and the failure path deterministic regardless of
@@ -309,19 +315,17 @@ def install_fake_httpx(monkeypatch):
 
     The stub exposes ``post``, and ``get``/``delete`` when a caller supplies
     one (task 3713: readiness polling hits GET ``/health`` and GET
-    ``/v1/models``, which a POST-only stub cannot express; task 3644:
-    ``census_trigger.post_mcp_envelope`` DELETEs the ``/mcp`` endpoint to
-    terminate the MCP session it opened, so the server does not leak one
-    session dict entry + one live anyio task per legibility escalation).
+    ``/v1/models``, which a POST-only stub cannot express).
     Both stay OPT-IN rather than no-arg defaults, so a module that starts
     issuing a verb without its test saying so still lands in the loud-miss
     path below instead of silently receiving a stub response nobody wrote.
 
     Any OTHER attribute is a loud ``pytest.fail`` rather than an
-    ``AttributeError``, because ``default_status_fetcher`` funnels every
-    ``Exception`` into ``StatusFetchUnavailable``: a future production change
-    reaching for e.g. ``httpx.Timeout`` or ``except httpx.HTTPError`` would
-    otherwise keep its test green off the stub's own miss.  ``pytest.fail``
+    ``AttributeError``, because a module under test whose error boundary is
+    ``except Exception`` would turn the miss into its own failure: a future
+    production change reaching for e.g. ``httpx.Timeout`` or
+    ``except httpx.HTTPError`` would otherwise keep its test green off the
+    stub's own miss.  ``pytest.fail``
     raises a ``BaseException``, which such a handler cannot swallow.  Dunders
     stay ordinary ``AttributeError``s so import machinery and introspection can
     still probe the module.
@@ -358,6 +362,8 @@ def install_fake_httpx(monkeypatch):
 # Moved here from test_audit_model_admission.py so the model-admission audit
 # and review suites seed ONE schema copy through one set of helpers. Fixtures
 # for the same importlib-mode reason as the tasks.db fixtures above.
+# `make_runs_db` (task 5989) is the event-dict factory that replaced the private
+# copies in the wiped-metadata, merge-lane-throughput and speculation-depth suites.
 #
 # RUNS_DB_SCHEMA is a VERBATIM copy of the four tables those scripts read,
 # captured with
@@ -427,6 +433,11 @@ CREATE TABLE runs (
 );
 """
 
+_INSERT_EVENT = (
+    'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
+    'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+)
+
 
 def _payload(value):
     """JSON-encode a dict/list payload; pass a str or None through VERBATIM.
@@ -465,8 +476,7 @@ class SeedingConnection(sqlite3.Connection):
     ):
         """Insert one `events` row, stating its payload as a dict rather than JSON text."""
         self.execute(
-            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
-            'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            _INSERT_EVENT,
             (
                 timestamp,
                 run_id,
@@ -554,17 +564,63 @@ class SeedingConnection(sqlite3.Connection):
         self.commit()
 
 
+_DEFAULT_EVENTS_EPOCH = datetime(2026, 7, 30, tzinfo=UTC)
+
+
 @pytest.fixture
-def runs_db_path(tmp_path):
+def make_runs_db(tmp_path):
+    """Factory: build a temp runs.db carrying :data:`RUNS_DB_SCHEMA`, seed *events*, return its Path.
+
+    Each event is a dict of column -> value. ``event_type`` is required.
+    ``run_id`` defaults to ``'run-1'``, and ``timestamp`` to one second per row
+    after a fixed epoch, so the defaults stay distinct and sort as TEXT however
+    many rows there are. ``task_id`` is stored as a str unless None. ``phase``,
+    ``role``, ``cost_usd`` and ``duration_ms`` stay NULL when omitted.
+
+    ``data`` follows :func:`_payload`: a str or None is stored VERBATIM — so
+    ``data=None`` is SQL NULL here, unlike :meth:`SeedingConnection.seed_event`,
+    which stores ``'{}'`` — and a dict/list is json-encoded. Rows are inserted
+    in list order, so *events* order IS ascending ``id`` order.
+
+    *directory* defaults to ``tmp_path`` and must already exist; pass it to
+    seed a db at a project-root-relative location such as
+    ``<root>/data/orchestrator/``. Building twice at one path raises
+    ``sqlite3.OperationalError`` rather than appending to the first db's rows.
+    """
+    def _make(events=(), name='runs.db', directory=None):
+        db_path = (Path(directory) if directory is not None else tmp_path) / name
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(RUNS_DB_SCHEMA)
+            for i, event in enumerate(events):
+                task_id = event.get('task_id')
+                conn.execute(
+                    _INSERT_EVENT,
+                    (
+                        event.get('timestamp')
+                        or (_DEFAULT_EVENTS_EPOCH + timedelta(seconds=i)).isoformat(),
+                        event.get('run_id', 'run-1'),
+                        None if task_id is None else str(task_id),
+                        event['event_type'],
+                        event.get('phase'),
+                        event.get('role'),
+                        _payload(event.get('data')),
+                        event.get('cost_usd'),
+                        event.get('duration_ms'),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path
+
+    return _make
+
+
+@pytest.fixture
+def runs_db_path(make_runs_db):
     """Path to a fresh, empty runs.db carrying :data:`RUNS_DB_SCHEMA`."""
-    path = tmp_path / 'runs.db'
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript(RUNS_DB_SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
-    return path
+    return make_runs_db()
 
 
 @pytest.fixture
@@ -588,9 +644,10 @@ def runs_db(runs_db_path):
 #
 # The legibility trickle and census spawn `claude` through the shared runner
 # (shared.cli_invoke.invoke_with_cap_retry -> invoke_claude_agent), which
-# resolves the BARE name against PATH. These fixtures put a fake first on PATH
-# and give it a per-token script, so a suite can drive a real UsageGate through
-# failover, auth rejection and caps without any real CLI being reachable.
+# resolves CLAUDE_BINARY, else the bare name, against PATH. These fixtures put a
+# fake first on PATH and give it a per-token script, so a suite can drive a real
+# UsageGate through failover, auth rejection and caps without any real CLI
+# being reachable.
 # ---------------------------------------------------------------------------
 
 _FAKE_CLAUDE_PLAN_ENV = 'FAKE_CLAUDE_PLAN'
@@ -709,12 +766,15 @@ class FakeClaudeCli:
 def fake_claude_cli(tmp_path, monkeypatch):
     """Install a :class:`FakeClaudeCli` as the only `claude` on PATH.
 
-    Prepended to PATH and then PROVEN to win: ``shutil.which('claude')`` must
-    resolve to the fake, so no test using this fixture can ever reach the real
-    CLI (real LLM spend, and a test passing for the wrong reason). The shebang
-    is ``sys.executable``, so the fake needs nothing else on PATH to start.
-    Starts with the default plan; call ``.plan(...)`` to script it.
+    Prepended to PATH and then PROVEN to win: ``resolve_claude_binary()``, the
+    resolution the spawn itself performs, must return the fake, so no test
+    using this fixture can ever reach the real CLI (real LLM spend, and a test
+    passing for the wrong reason). The shebang is ``sys.executable``, so the
+    fake needs nothing else on PATH to start. Starts with the default plan;
+    call ``.plan(...)`` to script it.
     """
+    from shared.cli_invoke import resolve_claude_binary
+
     bin_dir = tmp_path / 'fake-claude-bin'
     bin_dir.mkdir()
     state_dir = tmp_path / 'fake-claude-state'
@@ -728,9 +788,9 @@ def fake_claude_cli(tmp_path, monkeypatch):
     monkeypatch.setenv(_FAKE_CLAUDE_PLAN_ENV, str(fake._plan_path))
     monkeypatch.setenv(_FAKE_CLAUDE_CALLS_ENV, str(fake._calls_path))
     monkeypatch.setenv('PATH', f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-    assert shutil.which('claude') == str(fake.path), (
-        f"the fake claude at {fake.path} must be the one PATH resolves; "
-        f"got {shutil.which('claude')!r}"
+    assert resolve_claude_binary() == str(fake.path), (
+        f"the fake claude at {fake.path} must be the one the spawn resolves; "
+        f"got {resolve_claude_binary()!r}"
     )
     return fake
 
@@ -806,3 +866,261 @@ def sentinel_login(tmp_path, monkeypatch):
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-api-SENTINEL')
     monkeypatch.setattr(usage_gate, 'CREDENTIALS_PATH', credentials)
     return home
+
+
+# ---------------------------------------------------------------------------
+# Shared fake command recorder (task 5285).
+#
+# A wrapper suite points the wrapper's command seam (FLAG_MARKER_SWEEP_CMD,
+# RECLAIM_ORPHANED_WT_CMD, a `uv` on PATH, ...) at one of these and then asserts
+# on the argv and environment each call received. The state path is formatted
+# into the source, so a wrapper that rewrites its child's environment cannot
+# lose it, and the absolute shebang lets a fake start under an EMPTY PATH.
+# ---------------------------------------------------------------------------
+
+_FAKE_RECORDER_SOURCE = """\
+import json
+import os
+import sys
+
+state_path = {state_path!r}
+with open(state_path) as f:
+    state = json.load(f)
+argv = sys.argv[1:]
+state['calls'].append(argv)
+state['envs'].append(dict(os.environ))
+with open(state_path, 'w') as f:
+    json.dump(state, f)
+
+for token, reply in state['replies'].items():
+    if token in argv:
+        sys.stdout.write(reply['stdout'])
+        sys.exit(reply['exit_code'])
+sys.exit(state['exit_code'])
+"""
+
+
+class FakeRecorder:
+    """An executable at ``path`` that records every call, then exits.
+
+    ``calls()`` is each invocation's argv[1:] in call order and ``envs()`` the
+    matching ``os.environ`` snapshots. A call whose argv carries a ``replies``
+    token prints that reply's ``stdout`` and exits its ``exit_code``; any other
+    call prints nothing and exits the install-time ``exit_code``.
+    """
+
+    def __init__(self, path: Path, state_path: Path):
+        self.path = path
+        self.bin_dir = path.parent
+        self._state_path = state_path
+
+    def calls(self) -> list[list[str]]:
+        return json.loads(self._state_path.read_text())['calls']
+
+    def envs(self) -> list[dict[str, str]]:
+        return json.loads(self._state_path.read_text())['envs']
+
+
+def _checked_replies(replies) -> dict:
+    """*replies* as a dict, refused unless each is exactly ``{'stdout': str, 'exit_code': int}``.
+
+    Checked here, at install, because the fake reads a reply only inside the
+    child process: a malformed one would surface there as a traceback the
+    wrapper under test reports as its own failure.
+    """
+    checked = dict(replies or {})
+    for token, reply in checked.items():
+        well_formed = (
+            isinstance(reply, dict)
+            and set(reply) == {'stdout', 'exit_code'}
+            and isinstance(reply['stdout'], str)
+            and type(reply['exit_code']) is int
+        )
+        if not well_formed:
+            raise ValueError(
+                f"fake_recorder reply for {token!r} must be "
+                f"{{'stdout': str, 'exit_code': int}}; got {reply!r}")
+    return checked
+
+
+@pytest.fixture
+def fake_recorder(tmp_path):
+    """Factory: install a :class:`FakeRecorder` named *name*, return it.
+
+    *bin_dir* defaults to ``tmp_path / 'bin'`` and is created with its parents.
+    The caller puts it on PATH, or passes ``.path``, as the wrapper under test
+    needs. Installing a name again in the same *bin_dir* starts a fresh call log.
+    A malformed *replies* entry raises ValueError here, naming its token.
+    """
+    state_dir = tmp_path / 'fake-recorder-state'
+    state_paths: dict[Path, Path] = {}
+
+    def _install(name, *, bin_dir=None, exit_code=0, replies=None):
+        replies = _checked_replies(replies)
+        bin_dir = Path(bin_dir) if bin_dir is not None else tmp_path / 'bin'
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.mkdir(exist_ok=True)
+        path = bin_dir / name
+        state_path = state_paths.setdefault(path, state_dir / f'{len(state_paths)}-{name}.json')
+        state_path.write_text(json.dumps({
+            'calls': [], 'envs': [], 'exit_code': exit_code, 'replies': replies,
+        }))
+        path.write_text(f'#!{sys.executable}\n' + _FAKE_RECORDER_SOURCE.format(
+            state_path=str(state_path),
+        ))
+        path.chmod(0o755)
+        return FakeRecorder(path, state_path)
+
+    return _install
+
+
+# ---------------------------------------------------------------------------
+# Shared fake systemctl for the timer installers (task 5285).
+#
+# The union of the verbs the scripts/install-*.sh timer installers call. Every
+# installer's self-verify greps its unit name out of `list-timers`, so the
+# date on each listed line is cosmetic.
+# ---------------------------------------------------------------------------
+
+_FAKE_SYSTEMCTL_SOURCE = """\
+import json
+import os
+import sys
+
+STATE_PATH = {state_path!r}
+
+
+def main(argv):
+    args = [a for a in argv if a != '--user']
+    if not args:
+        return 1
+    verb, rest = args[0], args[1:]
+    units = [a for a in rest if not a.startswith('-')]
+
+    with open(STATE_PATH) as f:
+        state = json.load(f)
+    state['calls'].append(args)
+    if verb == 'enable':
+        for unit in units:
+            if unit not in state['enabled_timers']:
+                state['enabled_timers'].append(unit)
+    with open(STATE_PATH, 'w') as f:
+        json.dump(state, f)
+
+    if verb in ('daemon-reload', 'enable'):
+        return 0
+    if verb == 'start':
+        if os.environ.get('FAKE_SYSTEMCTL_FAIL_START') == '1':
+            unit = units[0] if units else '<unit>'
+            print('Job for %s failed. See "journalctl -xeu %s" for details.' % (unit, unit),
+                  file=sys.stderr)
+            return 1
+        return 0
+    if verb == 'show':
+        print(os.environ.get('FAKE_SYSTEMCTL_WORKDIR', ''))
+        return 0
+    if verb == 'list-timers':
+        enabled = state['enabled_timers']
+        if os.environ.get('FAKE_SYSTEMCTL_OMIT_LIST_TIMERS') == '1':
+            enabled = []
+        for unit in enabled:
+            service = unit.replace('.timer', '.service')
+            print('Mon 2026-07-14 03:00:00 UTC  8h left  n/a  n/a  %s  %s' % (unit, service))
+        print('%d timers listed.' % len(enabled))
+        return 0
+    return 1
+
+
+sys.exit(main(sys.argv[1:]))
+"""
+
+
+class FakeTimerSystemctl:
+    """A fake ``systemctl`` at ``path`` that models the timer installers' verbs.
+
+    ``--user`` is dropped and every call is recorded, before it is answered,
+    into ``calls()``. ``daemon-reload`` succeeds. ``enable`` marks each
+    non-flag argument enabled. ``list-timers`` prints one line per enabled
+    unit, then ``N timers listed.``. ``show`` prints $FAKE_SYSTEMCTL_WORKDIR.
+    ``start`` succeeds. Any other verb exits 1, so an installer that starts
+    calling a new verb fails loudly.
+
+    Two env vars, read per call, inject faults. FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1
+    makes ``list-timers`` list nothing. FAKE_SYSTEMCTL_FAIL_START=1 makes
+    ``start`` print systemd's own ``Job for <unit> failed.`` wording and exit 1.
+    That text shares a stream with the script under test's own stderr, so a
+    test must assert on a token only that script prints.
+
+    State persists across calls until ``reset()``.
+    """
+
+    def __init__(self, bin_dir: Path, state_path: Path):
+        self.bin_dir = bin_dir
+        self.path = bin_dir / 'systemctl'
+        self._state_path = state_path
+
+    def calls(self) -> list[list[str]]:
+        return json.loads(self._state_path.read_text())['calls']
+
+    def reset(self) -> None:
+        self._state_path.write_text(json.dumps({'calls': [], 'enabled_timers': []}))
+
+
+@pytest.fixture
+def fake_timer_systemctl(tmp_path):
+    """A :class:`FakeTimerSystemctl` installed at ``tmp_path / 'bin' / 'systemctl'``.
+
+    The caller prepends ``.bin_dir`` to the PATH of the installer it runs.
+    """
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    fake = FakeTimerSystemctl(bin_dir, tmp_path / 'fake-timer-systemctl-state.json')
+    fake.path.write_text(f'#!{sys.executable}\n' + _FAKE_SYSTEMCTL_SOURCE.format(
+        state_path=str(fake._state_path),
+    ))
+    fake.path.chmod(0o755)
+    fake.reset()
+    return fake
+
+
+# ---------------------------------------------------------------------------
+# Committed systemd unit readers (task 5285).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unit_values():
+    """``values(path, section, key)``: every value *key* takes under ``[section]``.
+
+    Installer suites assert on a committed unit's directives through this
+    rather than on raw substrings, which cannot tell a live directive from the
+    comment that explains it. It returns a list, not a scalar, so ``== ['x']``
+    also pins "declared exactly once": a second ``OnCalendar=`` is an extra
+    firing. The parsing rules are the production parser's,
+    ``scripts/systemd_unit_parity.py::parse_unit_directives``.
+    """
+    import systemd_unit_parity
+
+    def values(path: Path, section: str, key: str) -> list[str]:
+        directives = systemd_unit_parity.parse_unit_directives(path.read_text(encoding='utf-8'))
+        return directives.get(section, {}).get(key, [])
+
+    return values
+
+
+@pytest.fixture
+def unit_environment():
+    """``environment(path, section)``: the ``{VAR: value}`` map ``[section]``'s ``Environment=`` lines set.
+
+    Read the way systemd reads them, by the production reader
+    ``scripts/systemd_unit_parity.py::environment_map``: several assignments
+    per line, quoted values, and a later assignment winning. A reflow of a
+    unit between those spellings therefore leaves every assertion standing.
+    """
+    import systemd_unit_parity
+
+    def environment(path: Path, section: str) -> dict[str, str]:
+        directives = systemd_unit_parity.parse_unit_directives(path.read_text(encoding='utf-8'))
+        return systemd_unit_parity.environment_map(directives, section)
+
+    return environment

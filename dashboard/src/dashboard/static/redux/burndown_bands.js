@@ -1,8 +1,9 @@
 // burndown_bands.js — the pure render DECISIONS behind the Burndown tab
 // (tabs.jsx BurnTab, aggregate and per-project views alike): the nine bands of
 // the stacked status-mix chart and the legend that explains them, whether the
-// concurrency-parity banner draws, and the reader that stamps the burndown
-// payload's served Datums for the tiles, pips and cells.
+// concurrency-parity banner draws, the reader that stamps the burndown
+// payload's served Datums for the tiles, pips and cells, and the reader that
+// rebuilds a project's own label row from its label_spans.
 //
 // LOAD CONTRACT. It destructures window.DF_DATUM and window.DF_TASK_VOCAB at
 // module scope with no fallback, so index.html loads it after datum.js and
@@ -28,11 +29,7 @@
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
-const {
-  isDatum: isBurndownDatum,
-  withReceipt: stampBurndownReceipt,
-  unknownDatum: unknownBurndownDatum,
-} = window.DF_DATUM;
+const { servedDatum: servedBurndownDatum } = window.DF_DATUM;
 const {
   MEMBERS: BAND_MEMBERS,
   VIEWS: BAND_VIEWS,
@@ -41,11 +38,10 @@ const {
 } = window.DF_TASK_VOCAB;
 
 // ── The nine stacked bands of the status-mix chart ──
-// One band per census member, keyed and sourced by the member's series key.
-// The in-progress live/stranded split is NOT stacked: it partitions
-// in_progress_rows, the rows' count, which is a different instant from the
-// census members, so stacking it among them would draw a total no census ever
-// produced. It stays on the wire for the parity alarm.
+// One band per census member, keyed and sourced by the member's series key:
+// exactly the series the wire carries
+// (dashboard/src/dashboard/data/redux_api.py::_BURNDOWN_KEYS). The parity
+// verdict arrives pre-computed.
 //
 // Stacked bottom-up terminal → backlog → in_flight, members in TaskStatus
 // declaration order inside each view. The three members task 5591 added
@@ -127,21 +123,55 @@ function parityBannerState(block, projects) {
 // ── A served burndown Datum, stamped with the burndown receipt ──
 // Every burndown block carries two served Datums, `latest` and `forecast`.
 // data.js registers BURNDOWN / BURNDOWN_BY_PROJECT as PLAIN, so the Datums
-// nested in them arrive carrying no receipt of their own; this stamps a COPY
-// with the /burndown receipt so datum.js can age it (task_snapshot.js's
-// snapshotDatum is the same reader for the /tasks unit). No receipt outranks
-// everything else: before the first payload, nothing absent is yet evidence of
-// anything.
+// nested in them arrive carrying no receipt of their own and need the
+// /burndown receipt stamped on before datum.js can age them. The receipt rule
+// is datum.js::servedDatum's; task_snapshot.js::snapshotDatum reads the /tasks
+// unit the same way.
 const BURNDOWN_ENDPOINT = '/api/v2/dashboard/burndown';
 
 function burndownDatum(data, block, field) {
-  const receipt = (data.__receipt || {})[BURNDOWN_ENDPOINT];
-  if (!receipt) return unknownBurndownDatum('not yet fetched');
-  const served = (block || {})[field];
-  if (!isBurndownDatum(served)) {
-    return unknownBurndownDatum('the burndown payload has no ' + field + ' Datum');
+  return servedBurndownDatum(
+    (block || {})[field],
+    BURNDOWN_ENDPOINT,
+    'the burndown payload has no ' + field + ' Datum',
+    data.__receipt || {},
+  );
+}
+
+// ── A project's burndown block, with its own label row rebuilt ──
+// The wire sends each BURNDOWN_BY_PROJECT block's label row as label_spans:
+// half-open [start, stop) index ranges into BURNDOWN.labels, in the row's own
+// order. This returns a copy of the block carrying that row as `labels`, so
+// every `pb.labels` reader pairs the project's series with its OWN instants.
+// The encoder is dashboard/src/dashboard/data/label_spans.py::label_spans.
+//
+// An absent block is null, as burndownStacks tolerates for the render before
+// the first payload. A present block with missing or malformed spans is a
+// server contract break, and throws rather than drawing a shifted chart.
+function projectBurndownBlock(data, projectId) {
+  const block = (data.BURNDOWN_BY_PROJECT || {})[projectId];
+  if (!block) return null;
+  const union = (data.BURNDOWN || {}).labels || [];
+  const spans = block.label_spans;
+  if (!Array.isArray(spans)) {
+    throw new Error(
+      `burndown project ${projectId} carries no label_spans list ` +
+        `(union has ${union.length} labels)`,
+    );
   }
-  return stampBurndownReceipt(served, receipt);
+  const labels = spans.flatMap(span => union.slice(...checkedLabelSpan(span, union.length, projectId)));
+  return { ...block, labels };
+}
+
+function checkedLabelSpan(span, unionLength, projectId) {
+  const entry = `burndown project ${projectId} has label_spans entry ${JSON.stringify(span)}`;
+  if (!(Array.isArray(span) && span.length === 2 && span.every(Number.isInteger))) {
+    throw new Error(`${entry} that is not a [start, stop) pair of ints (union has ${unionLength} labels)`);
+  }
+  if (!(0 <= span[0] && span[0] < span[1] && span[1] <= unionLength)) {
+    throw new Error(`${entry} outside 0 <= start < stop <= union length ${unionLength}`);
+  }
+  return span;
 }
 
 // ── How the Forecast tile reads a served forecast value ──
@@ -162,6 +192,7 @@ const BURNDOWN_BANDS_API = {
   parityBannerState,
   burndownDatum,
   forecastText,
+  projectBurndownBlock,
   BURNDOWN_ENDPOINT,
 };
 

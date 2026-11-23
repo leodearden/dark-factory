@@ -24,6 +24,7 @@ from dashboard.data.datum import (
     DatumInvariant,
     DatumState,
     aged_at,
+    map_datum,
     validate_datum,
 )
 
@@ -360,6 +361,57 @@ def test_unknown_datum_builds_the_triad_validate_accepts():
 
 
 # ---------------------------------------------------------------------------
+# map_datum — the envelope's provenance over a projected value. A shaper that
+# serves a reshaped payload keeps the producer's as_of, state, reason and
+# bound; an unknown datum has no value to project and stays unknown.
+# ---------------------------------------------------------------------------
+
+
+def _never_called(value):
+    raise AssertionError(f'an unknown datum has no value to project, got {value!r}')
+
+
+def test_map_datum_projects_a_fresh_value_and_keeps_its_provenance():
+    datum = datum_measured_at(AS_OF)
+
+    mapped = map_datum(datum, lambda value: value * 10)
+
+    assert mapped.value == 50
+    assert (mapped.as_of, mapped.state, mapped.reason, mapped.freshness_bound_seconds) == (
+        AS_OF, DatumState.FRESH, None, BOUND_SECONDS,
+    )
+
+
+def test_map_datum_keeps_a_stale_datums_state_and_reason_verbatim():
+    datum = datum_measured_at(AS_OF, state=DatumState.STALE, reason='refresh failed')
+
+    mapped = map_datum(datum, str)
+
+    assert mapped.value == '5'
+    assert (mapped.state, mapped.reason) == (DatumState.STALE, 'refresh failed')
+
+
+def test_map_datum_never_projects_an_unknown_datum():
+    datum = datum_module.unknown_datum('no runs.db is open', 45)
+
+    mapped = map_datum(datum, _never_called)
+
+    assert (mapped.value, mapped.as_of, mapped.state) == (None, None, DatumState.UNKNOWN)
+    assert (mapped.reason, mapped.freshness_bound_seconds) == ('no runs.db is open', 45)
+
+
+@pytest.mark.parametrize('state', [DatumState.FRESH, DatumState.STALE, DatumState.UNKNOWN])
+def test_a_mapped_datum_validates_and_leaves_its_input_untouched(state):
+    datum = datum_in_state(state, None if state is DatumState.FRESH else 'refresh failed')
+    before = dataclasses.astuple(datum)
+
+    mapped = map_datum(datum, lambda value: {'wrapped': value})
+
+    validate_datum(mapped, AS_OF)
+    assert dataclasses.astuple(datum) == before
+
+
+# ---------------------------------------------------------------------------
 # Invariant 4 — every instant is tz-aware. A naive datetime is a wall-clock
 # reading, not an instant: it makes the freshness subtraction raise a bare
 # TypeError (which sails past the access layer's `except DatumContractError`)
@@ -449,6 +501,22 @@ def test_validate_accepts_an_envelope_wrapping_a_census():
 def test_to_wire_still_passes_a_payload_with_no_wire_shape_through(payload):
     """The pass-through arm is unchanged: no to_wire means emitted verbatim."""
     assert fresh_datum(value=payload).to_wire()['value'] == payload
+
+
+class _WireDict(dict):
+    """A dict subclass that declares its own wire shape."""
+
+    def to_wire(self):
+        return {'rendered': True}
+
+
+def test_to_wire_renders_a_dict_subclass_that_knows_its_wire_shape():
+    """Only an EXACT builtin skips the wire-shape check; a subclass still renders itself."""
+    assert fresh_datum(value=_WireDict(a=1)).to_wire()['value'] == {'rendered': True}
+    assert wire_value(fresh_datum(value=[_WireDict(a=1), {'plain': 1}]).to_wire()) == [
+        {'rendered': True},
+        {'plain': 1},
+    ]
 
 
 # ---------------------------------------------------------------------------

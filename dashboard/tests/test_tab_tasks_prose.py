@@ -1,7 +1,7 @@
 """Wiring of the Task Detail pane's prose fetch in tab_tasks.jsx (task 5815).
 
-The ACTIVE_TASKS rows no longer carry description/details, so TaskDetail
-delegates them to a TaskProse child that fetches them per selection through
+The snapshot rows (``TASKS_SNAPSHOT[p].rows``) carry no description/details,
+so TaskDetail delegates them to a TaskProse child that fetches them per selection through
 data.js's on-demand seam. This file pins only the WIRING, on comment-stripped
 code: this repo has no DOM harness (see pins_recovery.js's CANONICAL header),
 and the render DECISION is covered behaviourally by
@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
+from _jsx_source_helpers import extract_function_body, strip_js_comments, walk_balanced
 
 
 @pytest.fixture(scope='module')

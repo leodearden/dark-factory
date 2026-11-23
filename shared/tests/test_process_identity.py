@@ -2,7 +2,9 @@
 
 Boundary rows 12 (liveness) and 26 (unreadable /proc) of
 plans/deferral-flip-condition-prd.md §6. Fake proc roots go through the public
-``proc_root`` keyword; nothing private is patched.
+``proc_root`` keyword; nothing private is patched. Whether a pid exists is
+asked of the kernel, not of the proc root, so a fake root must name a pid whose
+host liveness the test controls.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import pytest
 from _child_processes import spawned_children
 from test_pure_stdlib_leaves import run_python_child
 
+from shared.proc_group import MalformedStatLine
 from shared.process_identity import (
     Liveness,
     ProcessIdentity,
@@ -28,6 +31,9 @@ from shared.process_identity import (
     command_name,
     liveness,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _LIVE_BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
 _FORGED_BOOT_ID = '00000000-0000-0000-0000-000000000000'
@@ -128,11 +134,16 @@ def test_other_host_is_decided_before_any_proc_read(live_child, tmp_path):
     assert liveness(elsewhere, proc_root=tmp_path / 'absent') is Liveness.OTHER_HOST
 
 
-def test_unreaped_zombie_is_dead(live_child):
+def test_unreaped_zombie_is_alive_and_captured_until_reaped(live_child):
     identity = _captured(live_child.pid)
 
     os.kill(live_child.pid, signal.SIGKILL)
     os.waitid(os.P_PID, live_child.pid, os.WEXITED | os.WNOWAIT)
+
+    assert liveness(identity) is Liveness.ALIVE
+    assert capture(live_child.pid) == identity
+
+    live_child.wait()
 
     assert liveness(identity) is Liveness.DEAD
     assert capture(live_child.pid) is None
@@ -171,6 +182,18 @@ def test_absent_pid_with_visible_pid_1_is_positive_evidence_of_death(live_child,
     assert liveness(identity, proc_root=fake) is Liveness.DEAD
     assert capture(identity.pid, proc_root=fake) is None
     assert command_name(identity.pid, proc_root=fake) is None
+
+
+def test_kernel_absence_outranks_a_stale_stat_in_the_proc_root(live_child, tmp_path):
+    identity = _captured(live_child.pid)
+    stale_stat = _live_stat_line(live_child.pid)
+
+    _kill_and_reap(live_child)
+    fake = _fake_proc_root(tmp_path / 'proc', boot_id=identity.boot_id)
+    _write_pid_files(fake, identity.pid, stat=stale_stat)
+
+    assert capture(identity.pid, proc_root=fake) is None
+    assert liveness(identity, proc_root=fake) is Liveness.DEAD
 
 
 def test_printed_liveness_of_the_current_process_reads_alive():
@@ -227,6 +250,28 @@ def _boot_id_missing(root: Path, identity: ProcessIdentity) -> Path:
 
 _ALL_READS = ('capture', 'liveness', 'command_name')
 _STAT_READS = ('capture', 'liveness')
+_MALFORMED_STAT_ROOTS = [
+    pytest.param(
+        _malformed_stat(lambda pid: _live_stat_line(pid).replace(')', ' ')),
+        id='stat-without-paren',
+    ),
+    pytest.param(
+        _malformed_stat(lambda pid: f'{pid} (sleep) S 1 2 3\n'),
+        id='stat-too-few-fields',
+    ),
+    pytest.param(
+        _malformed_stat(lambda pid: _with_start_ticks(_live_stat_line(pid), 'soon')),
+        id='stat-start-ticks-not-a-number',
+    ),
+    pytest.param(
+        _malformed_stat(lambda pid: _with_start_ticks(_live_stat_line(pid), '-1')),
+        id='stat-start-ticks-negative',
+    ),
+    pytest.param(
+        _malformed_stat(lambda pid: _with_start_ticks(_live_stat_line(pid), '1_0')),
+        id='stat-start-ticks-underscored',
+    ),
+]
 _UNREADABLE_PROC_ROOTS = [
     pytest.param(_proc_not_mounted, _ALL_READS, id='proc-not-mounted'),
     pytest.param(_every_pid_invisible, _ALL_READS, id='hidepid-invisible'),
@@ -236,20 +281,9 @@ _UNREADABLE_PROC_ROOTS = [
         id='eacces',
         marks=pytest.mark.skipif(os.geteuid() == 0, reason='root ignores file modes'),
     ),
-    pytest.param(
-        _malformed_stat(lambda pid: _live_stat_line(pid).replace(')', ' ')),
-        _STAT_READS,
-        id='stat-without-paren',
-    ),
-    pytest.param(
-        _malformed_stat(lambda pid: f'{pid} (sleep) S 1 2 3\n'),
-        _STAT_READS,
-        id='stat-too-few-fields',
-    ),
-    pytest.param(
-        _malformed_stat(lambda pid: _with_start_ticks(_live_stat_line(pid), 'soon')),
-        _STAT_READS,
-        id='stat-start-ticks-not-a-number',
+    *(
+        pytest.param(*row.values, _STAT_READS, id=row.id, marks=row.marks)
+        for row in _MALFORMED_STAT_ROOTS
     ),
     pytest.param(_boot_id_missing, _STAT_READS, id='boot-id-missing'),
 ]
@@ -284,6 +318,22 @@ def test_unreadable_proc_raises_and_never_reads_as_dead(
             pytest.fail(f'{name} answered {answer!r} from an unreadable proc root')
         assert str(raised.value.path) in str(raised.value), name
         assert raised.value.path.is_relative_to(proc_root), name
+
+
+@pytest.mark.parametrize('build_proc_root', _MALFORMED_STAT_ROOTS)
+def test_a_malformed_stat_is_unreadable_and_chained_from_the_shared_stat_parse(
+    build_proc_root, live_child, tmp_path
+):
+    identity = _captured(live_child.pid)
+    proc_root = build_proc_root(tmp_path / 'proc', identity)
+
+    for name in _STAT_READS:
+        with pytest.raises(ProcessIdentityUnreadable) as raised:
+            _read(name, identity, proc_root)
+        cause = raised.value.__cause__
+        assert isinstance(cause, MalformedStatLine), name
+        assert cause.path == raised.value.path, name
+        assert cause.reason in raised.value.cause, name
 
 
 def test_unreadable_is_not_an_os_error():

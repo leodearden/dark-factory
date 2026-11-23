@@ -1,8 +1,9 @@
 // Module-contract tests for burndown_bands.js — the pure render DECISIONS
 // behind the Burndown tab: the nine stacked status-mix bands, their legend,
-// the concurrency-parity banner, and the reader that stamps the burndown
-// payload's served Datums (tabs.jsx BurnTab, both the aggregate and the
-// per-project views).
+// the concurrency-parity banner, the reader that stamps the burndown payload's
+// served Datums, and the reader that rebuilds a project's own label row from
+// its label_spans (tabs.jsx BurnTab, both the aggregate and the per-project
+// views).
 //
 // WHAT THIS SUITE ASSERTS, AND WHAT IT DELIBERATELY DOES NOT. Only the RENDER
 // decisions: which bands exist in which order, which colour each gets, whether
@@ -53,9 +54,10 @@ function loadBurndownBands() {
 
 const { api: bands, window: loadedWindow } = loadBurndownBands();
 const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = bands;
+const { projectBurndownBlock } = bands;
 const { BURNDOWN_ENDPOINT } = bands;
 const { MEMBERS, TONES, SERIES_KEYS } = loadedWindow.DF_TASK_VOCAB;
-const { datumView } = loadedWindow.DF_DATUM;
+const { datumView, servedDatum } = loadedWindow.DF_DATUM;
 
 const EXPECTED_FUNCTION_NAMES = [
   'burndownStacks',
@@ -63,6 +65,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'parityBannerState',
   'burndownDatum',
   'forecastText',
+  'projectBurndownBlock',
 ];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'BURNDOWN_ENDPOINT'];
 
@@ -99,15 +102,13 @@ const CP = {
   stranded: 'C_STRANDED',
 };
 
-const SPLIT_KEYS = ['in_progress_live', 'in_progress_stranded', 'in_progress_rows'];
-
 // A burndown block with a distinct array identity per series, so the tests can
 // assert each band is sourced from its OWN member's series by reference —
 // index-shifting one band onto another's series is the failure mode the
 // per-project call site (pb.*) is exposed to.
 function mkBlock() {
   const block = { labels: ['d1', 'd2'] };
-  [...Object.values(SERIES_KEYS), ...SPLIT_KEYS].forEach((key, i) => {
+  Object.values(SERIES_KEYS).forEach((key, i) => {
     block[key] = [i, i + 100];
   });
   return block;
@@ -162,16 +163,6 @@ test('burndownStacks: all nine band colours are pairwise distinct', () => {
     colors.length,
     `two bands share a colour and would be unreadable when stacked: ${colors.join(', ')}`,
   );
-});
-
-test('burndownStacks: the in-progress split is not stacked among the census members', () => {
-  // The split partitions in_progress_rows, the ROWS' count — another instant
-  // from the census members. Stacking it beside them would draw a total no
-  // census ever produced.
-  const keys = burndownStacks(mkBlock(), CP).map(s => s.key);
-  for (const split of SPLIT_KEYS) {
-    assert.ok(!keys.includes(split), `${split} was stacked among the census bands: ${keys.join(', ')}`);
-  }
 });
 
 test('burndownStacks: tolerates a null/undefined block without throwing', () => {
@@ -387,6 +378,19 @@ test('burndownDatum: a stamped FRESH reading within its bound draws no badge', (
   assert.equal(view.title, null);
 });
 
+test("burndownDatum: a receipt that cannot age a Datum is no receipt — servedDatum's own verdict", () => {
+  for (const receipt of [{ servedAt: SERVED_AT }, { servedAt: SERVED_AT, receivedAt: 'not a clock' }]) {
+    const data = { __receipt: { [BURNDOWN_ENDPOINT]: receipt } };
+    const block = { latest: servedLatest() };
+
+    const datum = burndownDatum(data, block, 'latest');
+
+    const label = JSON.stringify(receipt);
+    assert.equal(datum.state, 'unknown', `${label} stamped a Datum it cannot age`);
+    assert.deepEqual(datum, servedDatum(block.latest, BURNDOWN_ENDPOINT, 'unused', data.__receipt), label);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // forecastText — the Forecast tile's reading of a served forecast value
 // ---------------------------------------------------------------------------
@@ -395,3 +399,98 @@ test('forecastText: one number when the two forecasts agree, a range when they d
   assert.equal(forecastText({ forecast_low: 12, forecast_high: 12 }), '12d');
   assert.equal(forecastText({ forecast_low: 10, forecast_high: 14 }), '10–14d');
 });
+
+// ---------------------------------------------------------------------------
+// projectBurndownBlock — a project's block with its own label row rebuilt
+// from label_spans over the aggregate union
+// ---------------------------------------------------------------------------
+
+const UNION = ['t0', 't1', 't2', 't3', 't4', 't5'];
+
+function servedProjectBlock(labelSpans) {
+  const block = mkBlock();
+  delete block.labels;
+  block.label_spans = labelSpans;
+  block.latest = servedLatest();
+  block.parity_alarm = false;
+  return block;
+}
+
+function servedBurndown(projects) {
+  return { BURNDOWN: { labels: UNION.slice() }, BURNDOWN_BY_PROJECT: projects };
+}
+
+test("projectBurndownBlock: rebuilds the project's own label row from its spans over the union", () => {
+  const data = servedBurndown({ alpha: servedProjectBlock([[0, 2], [3, 5]]) });
+
+  assert.deepEqual(projectBurndownBlock(data, 'alpha').labels, ['t0', 't1', 't3', 't4']);
+});
+
+test('projectBurndownBlock: every other field comes back, each series by identity', () => {
+  const served = servedProjectBlock([[0, 2]]);
+  const pb = projectBurndownBlock(servedBurndown({ alpha: served }), 'alpha');
+
+  for (const [key, value] of Object.entries(served)) {
+    assert.equal(pb[key], value, `${key} is not the served value`);
+  }
+  for (const band of burndownStacks(pb, CP)) {
+    assert.equal(band.values, served[band.key], `${band.member} does not draw the served series`);
+  }
+});
+
+test('projectBurndownBlock: the served block is not mutated', () => {
+  const served = servedProjectBlock([[1, 3]]);
+  const before = JSON.parse(JSON.stringify(served));
+
+  projectBurndownBlock(servedBurndown({ alpha: served }), 'alpha');
+
+  assert.ok(!('labels' in served), 'the decoded labels were written onto the served block');
+  assert.deepEqual(served, before);
+});
+
+test('projectBurndownBlock: no block before the first payload is null, not a throw', () => {
+  assert.equal(projectBurndownBlock(servedBurndown({ alpha: servedProjectBlock([[0, 1]]) }), 'beta'), null);
+  assert.equal(projectBurndownBlock({ BURNDOWN: { labels: UNION.slice() } }, 'alpha'), null);
+  assert.equal(projectBurndownBlock({}, 'alpha'), null);
+});
+
+test('projectBurndownBlock: a block without label_spans is a loud contract break', () => {
+  const served = servedProjectBlock([[0, 1]]);
+  delete served.label_spans;
+
+  assert.throws(
+    () => projectBurndownBlock(servedBurndown({ alpha: served }), 'alpha'),
+    error => error instanceof Error
+      && error.message.includes('label_spans')
+      && error.message.includes('alpha')
+      && error.message.includes(String(UNION.length)),
+  );
+});
+
+// The violation each message reports, worded as label_spans.py::_checked_span
+// words it for the same span.
+const OUT_OF_RANGE = 'outside 0 <= start < stop';
+const NOT_A_PAIR = 'not a [start, stop) pair of ints';
+
+for (const [name, badSpan, violation] of [
+  ['runs past the union', [4, 7], OUT_OF_RANGE],
+  ['starts below 0', [-1, 2], OUT_OF_RANGE],
+  ['is empty (start == stop)', [3, 3], OUT_OF_RANGE],
+  ['is reversed (start > stop)', [4, 2], OUT_OF_RANGE],
+  ['is not a two-int pair', [1], NOT_A_PAIR],
+  ['carries non-int bounds', ['0', '1'], NOT_A_PAIR],
+]) {
+  test(`projectBurndownBlock: a span that ${name} is a loud contract break naming it`, () => {
+    const data = servedBurndown({ alpha: servedProjectBlock([[0, 1], badSpan]) });
+
+    assert.throws(
+      () => projectBurndownBlock(data, 'alpha'),
+      error => error instanceof Error
+        && error.message.includes(violation)
+        && error.message.includes('label_spans')
+        && error.message.includes('alpha')
+        && error.message.includes(JSON.stringify(badSpan))
+        && error.message.includes(String(UNION.length)),
+    );
+  });
+}

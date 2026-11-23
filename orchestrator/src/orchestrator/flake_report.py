@@ -3,14 +3,18 @@
 This is PRD §1 surface 3: the one surface in the flake subsystem an operator can run
 without wondering what it changed.  It aggregates the ledger written by task α
 (:mod:`orchestrator.flake_ledger`) into three outputs — open debt, per-test recurrence
-chains, and the three §5.6 health counters — and renders them as text.
+chains, and the three §5.6 health counters, gate-blind and systemic per call site — and
+renders them as text.
 
 BINDING CONTRACT — READ ONLY.  Nothing in this module opens debt, files a task,
 resolves anything, or escalates.  All ledger DATA comes from α's public READ API
-(``list_open_debt`` / ``read_occurrences`` / ``read_debt_many`` / ``summarize_due``);
+(``list_open_debt`` / ``read_occurrences`` / ``read_debt_many`` / ``summarize_due`` /
+``read_call_sites_written``);
 the only SQL of its
 own is :func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly
-less than those readers do (no DDL, no journal-mode pragma).  One consequence is not
+less than those readers do (no DDL, no journal-mode pragma).  The only read outside the
+ledger is :func:`corroborate_owners`' caller-supplied ``get_statuses`` read of the open
+rows' owners, and it writes nothing.  One consequence is not
 obvious and is enforced by :func:`build_report`'s guards: α's readers PROVISION on read
 (``_open`` does ``parent.mkdir`` → ``connect`` → ``executescript(_SCHEMA)``), so calling
 one against a project that has no ledger would create ``data/orchestrator/runs.db`` plus
@@ -42,11 +46,15 @@ echoes it — the same split as ``eval-list-fixtures`` →
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
+
+from shared.task_statuses import OwnerLiveness, owner_liveness
 
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
@@ -58,6 +66,7 @@ from orchestrator.flake_ledger import (
     FlakeOccurrenceRow,
     FlakeVerdict,
     list_open_debt,
+    read_call_sites_written,
     read_debt_many,
     read_occurrences,
     summarize_due,
@@ -92,6 +101,9 @@ DEFAULT_SYSTEMIC_WINDOW_MINUTES = 60
 # design — α's module docstring, §11 Q1).  A read that fills this limit is surfaced as
 # truncated rather than silently yielding a rate over an unknown window.
 DEFAULT_OCCURRENCE_READ_LIMIT = 20000
+
+# An interactive report must not ride out fused-memory's ~120s restart retry window.
+DEFAULT_OWNER_READ_BUDGET_SECS = 15.0
 
 
 # --- ledger reachability -----------------------------------------------------
@@ -294,6 +306,27 @@ def compute_gate_blind(
 
 
 @dataclass(frozen=True)
+class OwnerStatuses:
+    """One successful live read of the open rows' owners.  An id the read omitted is a
+    corroborated absence, so it classifies ``CLOSED``."""
+
+    statuses: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'statuses', MappingProxyType(dict(self.statuses)))
+
+    def liveness(self, owner_task_id: str) -> OwnerLiveness:
+        return owner_liveness(self.statuses.get(owner_task_id))
+
+
+@dataclass(frozen=True)
+class OwnerReadFailed:
+    """The owner read produced nothing, so no verdict on any owner is made."""
+
+    error: str
+
+
+@dataclass(frozen=True)
 class NonConvergenceCounter:
     """Open debt that is not resolving: recurrence, age, and unowned rows."""
 
@@ -309,6 +342,24 @@ class NonConvergenceCounter:
     # stamps from remote hosts, so skew between such a host and the dispatcher lands
     # here.  Counted separately because the two have different fixes.
     future_dated: int = 0
+    # Owned rows whose owner reads DONE / cancelled-or-gone; None = owners not read.
+    owner_done_tests: int | None = None
+    owner_closed_tests: int | None = None
+
+
+def _terminal_owner_counts(
+    open_debt_rows: Sequence[DebtRow],
+    owner_statuses: OwnerStatuses | None,
+) -> tuple[int | None, int | None]:
+    """(DONE, CLOSED) owned-row counts, or ``(None, None)`` when the owners were not read."""
+    if owner_statuses is None:
+        return None, None
+    verdicts = [
+        owner_statuses.liveness(row.owner_task_id)
+        for row in open_debt_rows
+        if row.owner_task_id
+    ]
+    return verdicts.count(OwnerLiveness.DONE), verdicts.count(OwnerLiveness.CLOSED)
 
 
 def compute_non_convergence(
@@ -316,6 +367,7 @@ def compute_non_convergence(
     now: datetime,
     *,
     age_days: int = DEFAULT_DEBT_AGE_ESCALATE_DAYS,
+    owner_statuses: OwnerStatuses | None = None,
 ) -> NonConvergenceCounter:
     """Summarise open debt against §5.6's class-2 triggers.
 
@@ -330,7 +382,10 @@ def compute_non_convergence(
     breach, and the single most consequential state this report can encounter, because
     §5.7's suppression LANDS the merge: once a test is suppressed, nothing except the
     debt invariant keeps it visible at all.  Counting it (and rendering it loudly) is a
-    READ of the ledger; ι files nothing.
+    READ of the ledger; ι files nothing.  An owner that *owner_statuses* reads DONE or
+    cancelled/gone is the same §5.9 breach, since no live task owns the test; those are
+    counted separately (``owner_done_tests`` / ``owner_closed_tests``) because the
+    remedies differ.
 
     An unparseable ``opened_at`` is counted in its own bucket and contributes to neither
     ``over_age_tests`` nor ``oldest_age``, so a row whose clock cannot be read is
@@ -360,6 +415,7 @@ def compute_non_convergence(
             over_age += 1
         if oldest is None or age > oldest:
             oldest = age
+    owner_done, owner_closed = _terminal_owner_counts(open_debt_rows, owner_statuses)
     return NonConvergenceCounter(
         open_tests=len(open_debt_rows),
         recurrent_tests=recurrent,
@@ -369,6 +425,8 @@ def compute_non_convergence(
         oldest_age=oldest,
         age_threshold_days=age_days,
         future_dated=future_dated,
+        owner_done_tests=owner_done,
+        owner_closed_tests=owner_closed,
     )
 
 
@@ -611,6 +669,10 @@ class FlakeLedgerReport:
     read, so reading an absent DB would hand back an empty result set from a database
     this report had just created.
 
+    The gate-blind and systemic counters are keyed by STORED ``call_site`` string, one
+    entry for every :class:`FlakeCallSite` member and for any other spelling in the
+    window, so a lane row can never move the merge gate's numbers.
+
     ``db_status`` carries the same distinction one layer down, for a file that IS present
     (see :func:`probe_ledger`).  :attr:`measured` is the single predicate every consumer
     should ask — including task θ, which must not act on counters that were never read.
@@ -624,16 +686,82 @@ class FlakeLedgerReport:
     window_since: str | None
     open_debt: list[DebtReportRow]
     chains: list[ChainRow]
-    gate_blind: GateBlindCounter
+    gate_blind_by_call_site: Mapping[str, GateBlindCounter]
     non_convergence: NonConvergenceCounter
-    systemic: SystemicCounter
+    systemic_by_call_site: Mapping[str, SystemicCounter]
     db_status: str = LEDGER_OK
     due: DueSummary | None = None
+    # Every call site that has EVER written a row; None = not read, so no
+    # never-written claim is made.
+    call_sites_written: frozenset[str] | None = None
+    # The live read of the open rows' owners; None means the owners were not read.
+    owner_read: OwnerStatuses | OwnerReadFailed | None = None
+
+    def __post_init__(self) -> None:
+        gate_blind, systemic = set(self.gate_blind_by_call_site), set(self.systemic_by_call_site)
+        if gate_blind != systemic or FlakeCallSite.merge_gate.value not in gate_blind:
+            raise ValueError(
+                'the per-call-site counters must share one key set that includes '
+                f'merge_gate; gate-blind keys {sorted(gate_blind)}, systemic keys '
+                f'{sorted(systemic)}'
+            )
 
     @property
     def measured(self) -> bool:
         """True only when the counters are an actual reading of an actual ledger."""
         return self.db_present and self.db_status == LEDGER_OK
+
+
+def _group_by_call_site(
+    occurrences: Sequence[FlakeOccurrenceRow],
+) -> dict[str, list[FlakeOccurrenceRow]]:
+    """*occurrences* by their STORED ``call_site``, uncoerced, so an off-vocabulary
+    spelling stays visible under its own key instead of folding into a member."""
+    groups: dict[str, list[FlakeOccurrenceRow]] = {}
+    for row in occurrences:
+        groups.setdefault(row.call_site, []).append(row)
+    return groups
+
+
+def _call_site_keys(groups: Mapping[str, object]) -> list[str]:
+    """The one spelling of the counters' key universe: every member, plus any other
+    stored spelling, sorted."""
+    return sorted({m.value for m in FlakeCallSite} | groups.keys())
+
+
+def _counters_by_call_site(
+    occurrences: Sequence[FlakeOccurrenceRow],
+    *,
+    truncated: bool,
+    window_hours: int,
+    gate_blind_threshold: float,
+    gate_blind_min_observations: int,
+    systemic_distinct_tests: int,
+    systemic_window_minutes: int,
+) -> tuple[dict[str, GateBlindCounter], dict[str, SystemicCounter]]:
+    """The gate-blind and systemic counters, computed once per call site over its own
+    rows (an empty group for a call site with none in the window)."""
+    groups = _group_by_call_site(occurrences)
+    keys = _call_site_keys(groups)
+    gate_blind = {
+        key: compute_gate_blind(
+            groups.get(key, []),
+            threshold=gate_blind_threshold,
+            min_observations=gate_blind_min_observations,
+            window_hours=window_hours,
+            truncated=truncated,
+        )
+        for key in keys
+    }
+    systemic = {
+        key: compute_systemic(
+            groups.get(key, []),
+            distinct_tests=systemic_distinct_tests,
+            window_minutes=systemic_window_minutes,
+        )
+        for key in keys
+    }
+    return gate_blind, systemic
 
 
 def _unmeasured_report(
@@ -655,6 +783,15 @@ def _unmeasured_report(
     threshold the operator is being measured against stays visible, and
     :attr:`FlakeLedgerReport.measured` is what says the numbers are not a reading.
     """
+    gate_blind, systemic = _counters_by_call_site(
+        [],
+        truncated=False,
+        window_hours=window_hours,
+        gate_blind_threshold=gate_blind_threshold,
+        gate_blind_min_observations=gate_blind_min_observations,
+        systemic_distinct_tests=systemic_distinct_tests,
+        systemic_window_minutes=systemic_window_minutes,
+    )
     return FlakeLedgerReport(
         db_path=db_path,
         db_present=db_present,
@@ -663,18 +800,9 @@ def _unmeasured_report(
         window_since=None,
         open_debt=[],
         chains=[],
-        gate_blind=compute_gate_blind(
-            [],
-            threshold=gate_blind_threshold,
-            min_observations=gate_blind_min_observations,
-            window_hours=window_hours,
-        ),
+        gate_blind_by_call_site=gate_blind,
         non_convergence=compute_non_convergence([], now, age_days=age_days),
-        systemic=compute_systemic(
-            [],
-            distinct_tests=systemic_distinct_tests,
-            window_minutes=systemic_window_minutes,
-        ),
+        systemic_by_call_site=systemic,
     )
 
 
@@ -693,7 +821,8 @@ def build_report(
     """Read the ledger at *db_path* and aggregate it into a :class:`FlakeLedgerReport`.
 
     All ledger DATA comes from α's public read API — ``list_open_debt`` /
-    ``read_occurrences`` / ``read_debt_many`` / ``summarize_due``; the only SQL of this module's own is
+    ``read_occurrences`` / ``read_debt_many`` / ``summarize_due`` /
+    ``read_call_sites_written``; the only SQL of this module's own is
     :func:`probe_ledger`'s ``sqlite_master`` SELECT, which decides whether those readers
     are safe to call at all.  *now* defaults to the wall clock and is injectable so the
     whole report is deterministic under test.
@@ -762,6 +891,15 @@ def build_report(
     pending_since = {} if due is None else due.pending_since
     occurrences = read_occurrences(db_path, since=since, limit=occurrence_limit)
     truncated = len(occurrences) >= occurrence_limit
+    gate_blind, systemic = _counters_by_call_site(
+        occurrences,
+        truncated=truncated,
+        window_hours=window_hours,
+        gate_blind_threshold=gate_blind_threshold,
+        gate_blind_min_observations=gate_blind_min_observations,
+        systemic_distinct_tests=systemic_distinct_tests,
+        systemic_window_minutes=systemic_window_minutes,
+    )
 
     # The chain build reads debt for every test in the universe, and it must cost a
     # CONSTANT number of ledger connections rather than one per test: each `read_debt`
@@ -805,20 +943,72 @@ def build_report(
         window_since=since,
         open_debt=open_debt,
         chains=build_chains(occurrences, open_rows, _debt_lookup),
-        gate_blind=compute_gate_blind(
-            occurrences,
-            threshold=gate_blind_threshold,
-            min_observations=gate_blind_min_observations,
-            window_hours=window_hours,
-            truncated=truncated,
-        ),
+        gate_blind_by_call_site=gate_blind,
         non_convergence=compute_non_convergence(open_rows, now, age_days=age_days),
-        systemic=compute_systemic(
-            occurrences,
-            distinct_tests=systemic_distinct_tests,
-            window_minutes=systemic_window_minutes,
-        ),
+        systemic_by_call_site=systemic,
         due=due,
+        call_sites_written=read_call_sites_written(db_path),
+    )
+
+
+# --- live owner corroboration -----------------------------------------------
+
+# The FlakeLedgerTaskClient.get_statuses shape: a SchedulerChronicFlakeTaskClient's bound
+# get_statuses is passed as-is, so this module imports nothing from chronic_flake.
+OwnerStatusReader = Callable[[list[str]], Awaitable[tuple[Mapping[str, str], Exception | None]]]
+
+
+def _owner_ids(report: FlakeLedgerReport) -> list[str]:
+    """The open rows' distinct owner ids, sorted: what one owner read asks about."""
+    return sorted({row.debt.owner_task_id for row in report.open_debt if row.debt.owner_task_id})
+
+
+async def _read_owner_statuses(
+    read_statuses: OwnerStatusReader, ids: list[str], budget_secs: float,
+) -> OwnerStatuses | OwnerReadFailed:
+    """*ids*' live statuses, bounded by *budget_secs*.  A raise, the budget expiring and
+    an in-band error all land on the one failure path, as in
+    :func:`flake_ledger._read_owner`; a TimeoutError the reader raises itself keeps its
+    own message."""
+    deadline = asyncio.timeout(budget_secs)
+    try:
+        async with deadline:
+            statuses, error = await read_statuses(ids)
+        if error is None:
+            return OwnerStatuses(statuses)
+    except TimeoutError as exc:
+        error = TimeoutError(f'no answer within {budget_secs}s') if deadline.expired() else exc
+    except Exception as exc:
+        error = exc
+    return OwnerReadFailed(f'{type(error).__name__}: {error}')
+
+
+async def corroborate_owners(
+    report: FlakeLedgerReport,
+    read_statuses: OwnerStatusReader,
+    *,
+    budget_secs: float = DEFAULT_OWNER_READ_BUDGET_SECS,
+) -> FlakeLedgerReport:
+    """*report* with its open rows' owners read live and its non-convergence recomputed.
+
+    READ ONLY, and never raises.  This is §5.9's second enforcement point, INV-3 on the
+    read side: a stored owner is a snapshot, so a DONE or vanished owner shows only when
+    it is read.  An unmeasured report comes back unchanged and unread.  Task θ calls this
+    with its own task client.
+    """
+    if not report.measured:
+        return report
+    ids = _owner_ids(report)
+    read = await _read_owner_statuses(read_statuses, ids, budget_secs) if ids else OwnerStatuses({})
+    return replace(
+        report,
+        owner_read=read,
+        non_convergence=compute_non_convergence(
+            [row.debt for row in report.open_debt],
+            report.generated_at,
+            age_days=report.non_convergence.age_threshold_days,
+            owner_statuses=read if isinstance(read, OwnerStatuses) else None,
+        ),
     )
 
 
@@ -844,6 +1034,122 @@ def _due_line(report: FlakeLedgerReport) -> str:
     )
 
 
+_NEVER_WRITTEN = 'no rows ever written from this call site'
+
+_OWNER_LIVENESS_SUFFIX: Mapping[OwnerLiveness, str] = MappingProxyType({
+    OwnerLiveness.DONE: ' *** OWNER DONE, DEBT CYCLE NOT CLOSED (invariant breach) ***',
+    OwnerLiveness.CLOSED: ' *** OWNER CANCELLED OR GONE (invariant breach) ***',
+    OwnerLiveness.DEFERRED: ' (deferred: filed, never released)',
+    OwnerLiveness.OPEN: '',
+})
+
+_STORED_POINTER_CAVEAT = 'the owners above are stored pointers, not live statuses'
+
+
+def _owner_cell(row: DebtReportRow, owner_read: OwnerStatuses | OwnerReadFailed | None) -> str:
+    """*row*'s owner cell.  A §5.9 breach renders loudly, never as a blank cell:
+    suppression LANDS the merge (§5.7), so a test with no live owner is silently no
+    longer blocking anything and nobody owns fixing it.  An item on the due list means
+    the drain has not filed the owner YET, which is expected, not a breach.  Only a
+    successful live read marks an owned row; a stored owner alone proves nothing."""
+    d = row.debt
+    if not d.owner_task_id:
+        if row.pending_since is not None:
+            return f'filing pending since {row.pending_since}'
+        return '*** NO OWNER (invariant breach) ***'
+    suffix = (
+        _OWNER_LIVENESS_SUFFIX[owner_read.liveness(d.owner_task_id)]
+        if isinstance(owner_read, OwnerStatuses) else ''
+    )
+    return f'owner={d.owner_task_id}{suffix}'
+
+
+def _count_or_na(count: int | None) -> str:
+    return 'n/a' if count is None else str(count)
+
+
+def _owner_liveness_lines(report: FlakeLedgerReport) -> list[str]:
+    """A WARNING per kind of dead owner, then the one line saying whether the owners were
+    read live, could not be read, or were not consulted.  Nothing for an unmeasured
+    report: its header already says the counters are not a measurement, and it has no
+    owners to speak of."""
+    if not report.measured:
+        return []
+    nc = report.non_convergence
+    lines: list[str] = []
+    if nc.owner_done_tests:
+        lines.append(
+            f'      WARNING: {nc.owner_done_tests} row(s) are owned by a DONE de-flake task '
+            'whose debt cycle never closed, so no live task owns them (a §5.9 breach)'
+        )
+    if nc.owner_closed_tests:
+        lines.append(
+            f'      WARNING: {nc.owner_closed_tests} row(s) are owned by a cancelled or '
+            'deleted task, so no live task owns them (a §5.9 breach)'
+        )
+    match report.owner_read:
+        case OwnerStatuses():
+            lines.append(f'      owner liveness: read live ({len(_owner_ids(report))} owner(s))')
+        case OwnerReadFailed(error=error):
+            lines.append(f'      owner liveness: READ FAILED ({error}) — {_STORED_POINTER_CAVEAT}')
+        case None:
+            lines.append(f'      owner liveness: not consulted — {_STORED_POINTER_CAVEAT}')
+    return lines
+
+
+def _gate_blind_lines(gb: GateBlindCounter, *, measured: bool) -> list[str]:
+    lines = [f'    gate blind (class 1, {gb.window_hours}h window):']
+    if not gb.total:
+        lines.append('        no occurrences in window')
+    # `n/a`, never `0.00`: α warns that a zero-row answer "reads as healthy rather than
+    # as a broken query", and "we cannot tell" must not print as "the gate is fine".
+    rate_txt = 'n/a' if gb.rate is None else f'{gb.rate:.2f}'
+    lines.append(
+        f'        unconfirmable rate: {rate_txt}  '
+        f'({gb.unconfirmable} unconfirmable / {gb.total} observations)  '
+        f'threshold={gb.threshold:.2f}'
+    )
+    if not measured:
+        # `ok` is a claim about the ledger, and there is no ledger reading to make it
+        # from.  Saying "not measured" is the whole point of the guards in build_report.
+        lines.append('        status: not measured (no ledger reading)')
+    elif not gb.sufficient:
+        # DISTINCT from "below threshold": those two states mean opposite things.
+        lines.append(
+            f'        status: insufficient observations '
+            f'(need {gb.min_observations}, have {gb.total})'
+        )
+    else:
+        lines.append(f'        status: {"OVER THRESHOLD" if gb.exceeds_threshold else "ok"}')
+    return lines
+
+
+def _systemic_lines(sy: SystemicCounter, *, measured: bool) -> list[str]:
+    psi_txt = 'n/a' if sy.peak_window_psi is None else f'{sy.peak_window_psi:.1f}'
+    status = (
+        'not measured (no ledger reading)' if not measured
+        else 'OVER THRESHOLD' if sy.exceeds_threshold else 'ok'
+    )
+    return [
+        f'    systemic (class 3, {sy.window_minutes}m window):',
+        f'        peak distinct tests: {sy.peak_distinct_tests}  threshold={sy.threshold}  '
+        f'peak_window_start={sy.peak_window_start or "-"}  peak_psi_cpu_some10={psi_txt}',
+        f'        status: {status}',
+    ]
+
+
+def _call_site_block(report: FlakeLedgerReport, call_site: str) -> list[str]:
+    """One call site's counters; a measured call site that has never written a row says
+    so, which is a different fact from having no rows in the window."""
+    lines = [f'  call site {call_site}:']
+    written = report.call_sites_written
+    if report.measured and written is not None and call_site not in written:
+        return [*lines, f'    {_NEVER_WRITTEN}']
+    lines += _gate_blind_lines(report.gate_blind_by_call_site[call_site], measured=report.measured)
+    lines += _systemic_lines(report.systemic_by_call_site[call_site], measured=report.measured)
+    return lines
+
+
 def render_report(report: FlakeLedgerReport) -> str:
     """Render *report* as text.
 
@@ -853,7 +1159,7 @@ def render_report(report: FlakeLedgerReport) -> str:
     ``format_stratification_table``'s determinism property.  No ``click`` import: this
     returns a string and the CLI only echoes it.
     """
-    gb, nc, sy = report.gate_blind, report.non_convergence, report.systemic
+    nc = report.non_convergence
     lines: list[str] = [
         f'flake ledger: {report.db_path}',
         f'generated_at: {report.generated_at.isoformat()}',
@@ -878,7 +1184,7 @@ def render_report(report: FlakeLedgerReport) -> str:
         )
     else:
         lines.append(f'window since: {report.window_since}')
-    if gb.truncated:
+    if any(c.truncated for c in report.gate_blind_by_call_site.values()):
         # α's read_occurrences docstring: a count over a limit-capped read is a count
         # over an unknown window, and dividing by it is meaningless.  The counters are
         # still printed — a bounded read is better than an unbounded one — but they are
@@ -895,18 +1201,7 @@ def render_report(report: FlakeLedgerReport) -> str:
         lines.append('  (no open debt)')
     for row in report.open_debt:
         d = row.debt
-        # A blank owner cell would render a §5.9 breach as MISSING DATA.  It is instead
-        # the single most consequential state this report can encounter: suppression
-        # LANDS the merge (§5.7), so an unowned debt row means a flaky test is silently
-        # no longer blocking anything and nobody owns fixing it.  Naming it loudly is a
-        # READ of the ledger — ι files nothing.  An item on the due list for the test
-        # means the drain has not filed the owner YET, which is expected, not a breach.
-        if d.owner_task_id:
-            owner = f'owner={d.owner_task_id}'
-        elif row.pending_since is not None:
-            owner = f'filing pending since {row.pending_since}'
-        else:
-            owner = '*** NO OWNER (invariant breach) ***'
+        owner = _owner_cell(row, report.owner_read)
         # Same predicate the `over_age=N` summary below counts with — never a second
         # spelling of the comparison (INV-5).
         over = ' OVER-AGE' if _is_over_age(row.age, nc.age_threshold_days) else ''
@@ -942,34 +1237,15 @@ def render_report(report: FlakeLedgerReport) -> str:
 
     # --- section 3: health counters ---
     lines += ['', 'HEALTH COUNTERS', '-' * 60]
-    lines.append(f'  gate blind (class 1, {gb.window_hours}h window):')
-    if not gb.total:
-        lines.append('      no occurrences in window')
-    # `n/a`, never `0.00`: α warns that a zero-row answer "reads as healthy rather than
-    # as a broken query", and "we cannot tell" must not print as "the gate is fine".
-    rate_txt = 'n/a' if gb.rate is None else f'{gb.rate:.2f}'
-    lines.append(
-        f'      unconfirmable rate: {rate_txt}  '
-        f'({gb.unconfirmable} unconfirmable / {gb.total} observations)  '
-        f'threshold={gb.threshold:.2f}'
-    )
-    if not report.measured:
-        # `ok` is a claim about the ledger, and there is no ledger reading to make it
-        # from.  Saying "not measured" is the whole point of the guards in build_report.
-        lines.append('      status: not measured (no ledger reading)')
-    elif not gb.sufficient:
-        # DISTINCT from "below threshold": those two states mean opposite things.
-        lines.append(
-            f'      status: insufficient observations '
-            f'(need {gb.min_observations}, have {gb.total})'
-        )
-    else:
-        lines.append(f'      status: {"OVER THRESHOLD" if gb.exceeds_threshold else "ok"}')
+    for call_site in sorted(report.gate_blind_by_call_site):
+        lines += _call_site_block(report, call_site)
 
     lines.append(f'  non-convergence (class 2, age backstop {nc.age_threshold_days}d):')
     lines.append(
         f'      open={nc.open_tests}  recurrent={nc.recurrent_tests}  '
         f'over_age={nc.over_age_tests}  unowned={nc.unowned_tests}  '
+        f'owner_done={_count_or_na(nc.owner_done_tests)}  '
+        f'owner_closed={_count_or_na(nc.owner_closed_tests)}  '
         f'oldest={format_age(nc.oldest_age)}'
     )
     if nc.unparseable_opened_at:
@@ -984,16 +1260,6 @@ def render_report(report: FlakeLedgerReport) -> str:
             f'      WARNING: {nc.future_dated} row(s) are FUTURE-DATED (opened_at is '
             'ahead of now — clock skew) and can never reach the age backstop'
         )
-
-    lines.append(f'  systemic (class 3, {sy.window_minutes}m window):')
-    psi_txt = 'n/a' if sy.peak_window_psi is None else f'{sy.peak_window_psi:.1f}'
-    lines.append(
-        f'      peak distinct tests: {sy.peak_distinct_tests}  threshold={sy.threshold}  '
-        f'peak_window_start={sy.peak_window_start or "-"}  peak_psi_cpu_some10={psi_txt}'
-    )
-    if not report.measured:
-        lines.append('      status: not measured (no ledger reading)')
-    else:
-        lines.append(f'      status: {"OVER THRESHOLD" if sy.exceeds_threshold else "ok"}')
+    lines += _owner_liveness_lines(report)
 
     return '\n'.join(lines)

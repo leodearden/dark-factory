@@ -1,6 +1,7 @@
 """Tests for fused_memory.reconciliation.flag_dedup module.
 
-Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
+The flag_identity functions flag_dedup imports are tested in
+tests/reconciliation/test_flag_identity.py.
 """
 from __future__ import annotations
 
@@ -41,62 +42,6 @@ def _reset_flag_type_family_collision_warning_cache():
     flag_dedup._WARNED_FLAG_TYPE_FAMILY_COLLISIONS.clear()
     yield
     flag_dedup._WARNED_FLAG_TYPE_FAMILY_COLLISIONS.clear()
-
-
-# ---------------------------------------------------------------------------
-# compute_flag_signature tests (step-1)
-# ---------------------------------------------------------------------------
-
-
-class TestComputeFlagSignature:
-    """Tests for compute_flag_signature(flag) -> tuple[str, str] | None."""
-
-    def test_returns_tuple_with_both_fields_int_task_id(self):
-        """Returns ('123', 'missing_deliverable') when task_id is int and flag_type is str."""
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
-
-        flag = {'task_id': 123, 'flag_type': 'missing_deliverable'}
-        result = compute_flag_signature(flag)
-        assert result == ('123', 'missing_deliverable')
-
-    def test_returns_tuple_with_both_fields_str_task_id(self):
-        """Returns ('123', 'missing_deliverable') when task_id is str."""
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
-
-        flag = {'task_id': '123', 'flag_type': 'missing_deliverable'}
-        result = compute_flag_signature(flag)
-        assert result == ('123', 'missing_deliverable')
-
-    def test_returns_none_when_task_id_missing(self):
-        """Returns None when task_id is absent."""
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
-
-        flag = {'flag_type': 'missing_deliverable'}
-        assert compute_flag_signature(flag) is None
-
-    def test_returns_none_when_flag_type_missing(self):
-        """Returns None when flag_type is absent."""
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
-
-        flag = {'task_id': '42'}
-        assert compute_flag_signature(flag) is None
-
-    def test_returns_none_when_both_missing(self):
-        """Returns None when both task_id and flag_type are absent."""
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
-
-        flag = {'description': 'some flag'}
-        assert compute_flag_signature(flag) is None
-
-    def test_returns_tuple_when_task_id_is_zero(self):
-        """task_id=0 is a falsy-but-valid value; should produce a signature, not None."""
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
-
-        flag = {'task_id': 0, 'flag_type': 'missing_deliverable'}
-        result = compute_flag_signature(flag)
-        assert result == ('0', 'missing_deliverable'), (
-            'task_id=0 must not be silently discarded by a falsy check'
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -692,79 +637,6 @@ async def test_dedup_flags_multiple_flags_one_ledger_failure_does_not_poison_bat
 
 
 # ---------------------------------------------------------------------------
-# canonical_flag_type_family helper (task 2503 step-1/step-2)
-# ---------------------------------------------------------------------------
-
-
-class TestCanonicalFlagTypeFamily:
-    """Tests for canonical_flag_type_family(flag_type) -> str.
-
-    Pure, sync, no-I/O helper that collapses case/separator/whitespace/
-    word-order variants of a flag_type into one deterministic family key —
-    used by filter_suppressed (reader) and write_suppression_record's
-    pre-write coverage check (writer) to recognize a reworded/reordered
-    flag_type as the same underlying finding (task 2503, causes #2/#3 of the
-    stage1_flag_suppression companion-record sprawl).
-
-    No literal-key pinning beyond the empty case — assertions compare
-    equality/inequality between inputs so the tests stay robust to the
-    exact canonicalization algorithm.
-    """
-
-    def test_case_variant_maps_to_same_family(self):
-        """'Missing_Deliverable' and 'missing_deliverable' collapse to the same key."""
-        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
-
-        assert canonical_flag_type_family('Missing_Deliverable') == canonical_flag_type_family(
-            'missing_deliverable'
-        )
-
-    def test_separator_variants_map_to_same_family(self):
-        """Hyphen, underscore, and space separators all collapse to the same key."""
-        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
-
-        underscore = canonical_flag_type_family('missing_deliverable')
-        hyphen = canonical_flag_type_family('missing-deliverable')
-        space = canonical_flag_type_family('missing deliverable')
-        assert underscore == hyphen == space
-
-    def test_word_order_variant_maps_to_same_family(self):
-        """Reordered tokens ('deliverable_missing') collapse to the same
-        family key as 'missing_deliverable' — the core fix for a reworded
-        flag_type evading exact-string suppression matching."""
-        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
-
-        assert canonical_flag_type_family('deliverable_missing') == canonical_flag_type_family(
-            'missing_deliverable'
-        )
-
-    def test_distinct_findings_stay_distinct(self):
-        """Genuinely different flag_types must NOT collapse to the same family."""
-        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
-
-        assert canonical_flag_type_family('missing_deliverable') != canonical_flag_type_family(
-            'stale_metadata'
-        )
-
-    @pytest.mark.parametrize('value', ['', '   ', '___', '---'])
-    def test_degenerate_input_collapses_to_empty_string(self, value):
-        """Empty/whitespace/all-separator input collapses to ''."""
-        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
-
-        assert canonical_flag_type_family(value) == ''
-
-    def test_idempotent(self):
-        """Applying the helper to its own output is a no-op — the output is
-        already lowercase, sorted, and '_'-joined."""
-        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
-
-        for value in ('missing_deliverable', 'Missing-Deliverable Foo', ''):
-            once = canonical_flag_type_family(value)
-            twice = canonical_flag_type_family(once)
-            assert once == twice
-
-
-# ---------------------------------------------------------------------------
 # TestFilterSuppressed (task-1186 step-1; rewritten onto the ledger at task
 # 2227 step-4) — filter_suppressed reads the ReconLedgerStore's indexed
 # list_suppressions(project_id) query; no Mem0 search.
@@ -1322,7 +1194,7 @@ async def test_dedup_flags_none_signature_flags_not_collapsed_when_repeated():
 @pytest.mark.asyncio
 async def test_dedup_flags_invalid_tid_flags_not_collapsed_when_repeated():
     """Guard: two flags sharing the same invalid task_id (fails
-    _is_valid_marker_task_id) must both pass through unchanged — the in-batch
+    is_valid_marker_task_id) must both pass through unchanged — the in-batch
     memo must sit AFTER the invalid-tid guard so invalid-tid flags are never
     collapsed together.
 
@@ -3137,7 +3009,7 @@ class TestFilterFalsePhantomTaskCreationFlags:
     async def test_phantom_finding_dropped_when_title_matches_modulo_case_and_whitespace(self):
         """Title comparison tolerates case/whitespace differences.
 
-        Mirrors _normalize_content_description's casefold + whitespace-collapse,
+        Mirrors normalize_description's casefold + whitespace-collapse,
         so a genuinely-matching cited task is still corroborated and dropped
         even when the two title strings differ only in case or spacing.
         """
@@ -3905,177 +3777,6 @@ class TestCitedTaskTitleTruncationParity:
             f'a long live title must not be corroborated by a short prefix; got {live_title!r}'
         )
 
-# ---------------------------------------------------------------------------
-# task-1654 step-1 — RED: compute_content_fingerprint_signature tests
-# ---------------------------------------------------------------------------
-
-
-class TestComputeContentFingerprintSignature:
-    """Tests for compute_content_fingerprint_signature(flag) -> tuple[str, str] | None.
-
-    This function is a NEW helper introduced in task-1654 (Fix 2) to route
-    null-task_id findings that lack cited_tasks through a deterministic content
-    fingerprint so dedup_flags can write/match a stage1_flag_marker and stop
-    re-escalating each cycle.
-
-    All tests import from flag_dedup; they will fail with ImportError until
-    step-2 adds the implementation.
-    """
-
-    def test_returns_deterministic_fp_tuple_for_null_task_id_flag(self):
-        """(a) null task_id + valid description + flag_type set -> non-None (fp:<hex>, flag_type)."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-        )
-
-        flag = {
-            'task_id': None,
-            'flag_type': 'stale_edge',
-            'description': 'An orphaned edge with no known task anchor',
-        }
-        result = compute_content_fingerprint_signature(flag)
-
-        assert result is not None, 'Expected a 2-tuple, got None'
-        assert isinstance(result, tuple) and len(result) == 2, (
-            f'Expected 2-tuple, got {result!r}'
-        )
-        fp, ftype = result
-        assert fp.startswith('fp:'), (
-            f'Fingerprint must be prefixed with "fp:"; got {fp!r}'
-        )
-        assert ftype == 'stale_edge', (
-            f'flag_type element must equal "stale_edge"; got {ftype!r}'
-        )
-        # Deterministic: calling again with the same flag returns the same result
-        assert compute_content_fingerprint_signature(flag) == result, (
-            'compute_content_fingerprint_signature must be deterministic'
-        )
-
-    def test_whitespace_and_case_variants_produce_identical_signature(self):
-        """(b) Two descriptions differing only by whitespace/case -> identical signature."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-        )
-
-        flag_a = {
-            'task_id': None,
-            'flag_type': 'stale_edge',
-            'description': 'orphaned edge found in graph',
-        }
-        flag_b = {
-            'task_id': None,
-            'flag_type': 'stale_edge',
-            'description': '  Orphaned   EDGE  found   in   Graph  ',  # extra spaces + mixed case
-        }
-        result_a = compute_content_fingerprint_signature(flag_a)
-        result_b = compute_content_fingerprint_signature(flag_b)
-
-        assert result_a is not None and result_b is not None
-        assert result_a == result_b, (
-            f'Whitespace/case variants must produce the same signature; '
-            f'got {result_a!r} vs {result_b!r}'
-        )
-
-    def test_genuinely_different_descriptions_produce_different_signatures(self):
-        """(c) Two genuinely different descriptions -> different signatures."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-        )
-
-        flag_a = {
-            'task_id': None,
-            'flag_type': 'stale_edge',
-            'description': 'orphaned edge found in graph',
-        }
-        flag_b = {
-            'task_id': None,
-            'flag_type': 'stale_edge',
-            'description': 'completely different finding about missing memory',
-        }
-        result_a = compute_content_fingerprint_signature(flag_a)
-        result_b = compute_content_fingerprint_signature(flag_b)
-
-        assert result_a is not None and result_b is not None
-        assert result_a != result_b, (
-            f'Different descriptions must produce different signatures; '
-            f'both returned {result_a!r}'
-        )
-
-    def test_blank_description_returns_none(self):
-        """(d-a) Blank (whitespace-only) description -> None (not a meaningful dedup key)."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-        )
-
-        flag = {'task_id': None, 'flag_type': 'stale_edge', 'description': '   '}
-        assert compute_content_fingerprint_signature(flag) is None, (
-            'Whitespace-only description must return None'
-        )
-
-    def test_missing_description_returns_none(self):
-        """(d-b) Missing description key -> None."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-        )
-
-        flag = {'task_id': None, 'flag_type': 'stale_edge'}
-        assert compute_content_fingerprint_signature(flag) is None, (
-            'Missing description must return None'
-        )
-
-    def test_with_top_level_task_id_returns_none(self):
-        """(e-a) flag with non-None task_id -> None (defers to compute_flag_signature)."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-        )
-
-        flag = {
-            'task_id': 42,
-            'flag_type': 'stale_edge',
-            'description': 'Has a task_id — should use compute_flag_signature instead',
-        }
-        assert compute_content_fingerprint_signature(flag) is None, (
-            'Non-None task_id must return None (defer to compute_flag_signature)'
-        )
-
-    def test_with_non_empty_cited_tasks_returns_none(self):
-        """(e-b) flag with non-empty cited_tasks -> None (defers to compute_flag_signature)."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-        )
-
-        flag = {
-            'task_id': None,
-            'flag_type': 'stale_edge',
-            'description': 'Has cited_tasks — compute_flag_signature fallback handles this',
-            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
-        }
-        assert compute_content_fingerprint_signature(flag) is None, (
-            'Non-empty cited_tasks must return None (defer to compute_flag_signature)'
-        )
-
-    def test_null_flag_type_uses_sentinel_constant(self):
-        """(f) flag_type=None + valid description -> 2nd element is _CONTENT_FP_FLAG_TYPE sentinel."""
-        from fused_memory.reconciliation.flag_dedup import (
-            _CONTENT_FP_FLAG_TYPE,
-            compute_content_fingerprint_signature,
-        )
-
-        flag = {
-            'task_id': None,
-            'flag_type': None,
-            'description': 'Finding without a flag_type — use sentinel',
-        }
-        result = compute_content_fingerprint_signature(flag)
-
-        assert result is not None, 'Should still return a tuple even when flag_type is None'
-        fp, ftype = result
-        assert fp.startswith('fp:'), f'fp must start with "fp:"; got {fp!r}'
-        assert ftype == _CONTENT_FP_FLAG_TYPE, (
-            f'When flag_type is None, the 2nd element must be _CONTENT_FP_FLAG_TYPE '
-            f'({_CONTENT_FP_FLAG_TYPE!r}), got {ftype!r}'
-        )
-
 
 # ---------------------------------------------------------------------------
 # task-1654 step-3 — RED: dedup_flags cross-cycle dedup via content fingerprint
@@ -4101,10 +3802,8 @@ class TestDedupFlagsContentFingerprintPath:
         fp:+32-hex keys. The flag is returned unchanged (no persisted_from_run
         annotation on a fresh signature).
         """
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_content_fingerprint_signature
 
         flag = {
             'task_id': None,
@@ -4146,10 +3845,8 @@ class TestDedupFlagsContentFingerprintPath:
 
         Updated by task-1670 (Option A): the guard now accepts fp: keys.
         """
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_content_fingerprint_signature
 
         flag = {
             'task_id': None,
@@ -4207,9 +3904,9 @@ class TestDedupFlagsDedupedAgainstEnrichment:
         """Fresh signature: a content-fingerprint flag carrying
         deduped_against=['m1','m2'] -> the ledger row's payload.deduped_against
         == ['m1', 'm2'] and payload.task_id is a canonical fp:+32hex key."""
-        from fused_memory.reconciliation.flag_dedup import (
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import (
             compute_content_fingerprint_signature,
-            dedup_flags,
             is_content_fingerprint_task_id,
         )
 
@@ -4244,10 +3941,8 @@ class TestDedupFlagsDedupedAgainstEnrichment:
     async def test_recurring_fp_row_still_carries_deduped_against(self, ledger_memory_service):
         """Recurring signature: with a prior fp: row present, the re-upserted
         row ALSO carries payload.deduped_against == ['m1', 'm2']."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_content_fingerprint_signature
 
         flag = {
             'task_id': None,
@@ -4307,10 +4002,8 @@ class TestDedupFlagsDedupedAgainstEnrichment:
     async def test_fp_flag_with_no_uuid_fields_no_deduped_against(self, ledger_memory_service):
         """fp: flag with no UUID-bearing fields -> row written with no
         deduped_against key (extraction correctly returns empty -> field omitted)."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_content_fingerprint_signature
 
         flag = {
             'task_id': None,
@@ -4342,10 +4035,8 @@ class TestDedupFlagsDedupedAgainstEnrichment:
         notice so alias-sourced enrichment is observable (task-2047 amendment)."""
         import logging
 
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_content_fingerprint_signature
 
         flag = {
             'task_id': None,
@@ -4384,10 +4075,8 @@ class TestDedupFlagsDedupedAgainstEnrichment:
         flag alias-ONLY enrichment (task-2047 amendment)."""
         import logging
 
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_content_fingerprint_signature
 
         flag = {
             'task_id': None,
@@ -4479,9 +4168,10 @@ class TestMarkerPayloadKeyInvariant:
     ):
         """RED: a flag citing a FOREIGN task must not persist ``cited_tasks``
         — a ``compute_flag_signature`` input — in its marker payload."""
-        from fused_memory.reconciliation.flag_dedup import (
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import (
             compute_flag_signature,
-            dedup_flags,
+            compute_marker_signature,
         )
 
         flag = {
@@ -4494,7 +4184,9 @@ class TestMarkerPayloadKeyInvariant:
         assert sig == ('3839,598', self.FLAG_TYPE), (
             f'pre-1 measured signature must still hold; got {sig!r}'
         )
-        tid, ftype = sig
+        marker_sig = compute_marker_signature(flag, project_id='know_live')
+        assert marker_sig is not None, 'a well-formed flag must yield a marker identity'
+        tid, ftype = marker_sig
 
         await dedup_flags(
             memory_service=ledger_memory_service,
@@ -4616,10 +4308,8 @@ class TestMarkerPayloadKeyInvariant:
         only because they hand-seeded a payload row dedup_flags itself can
         never write.
         """
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_marker_signature
 
         citing_flag = {
             'task_id': 598,
@@ -4657,10 +4347,10 @@ class TestMarkerPayloadKeyInvariant:
             f'cycle did, so it must be a MISS; got {r2[0]!r}'
         )
 
-        # (c) both rows exist, at compute_flag_signature of each cycle's own
+        # (c) both rows exist, at compute_marker_signature of each cycle's own
         # flag, and those two signatures DIFFER.
-        citing_sig = compute_flag_signature(citing_flag)
-        citation_less_sig = compute_flag_signature(citation_less_flag)
+        citing_sig = compute_marker_signature(citing_flag, project_id=self.PROJECT)
+        citation_less_sig = compute_marker_signature(citation_less_flag, project_id=self.PROJECT)
         assert citing_sig is not None, 'a well-formed citing flag must yield a signature'
         assert citation_less_sig is not None, (
             'a well-formed citation-less flag must yield a signature'
@@ -4814,9 +4504,11 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
 
     @staticmethod
     def _signature(flag):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_identity import compute_marker_signature
 
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(
+            flag, project_id=TestDedupFlagsCrossProjectFixTaskSuppression.PROJECT
+        )
         assert sig is not None
         return sig
 
@@ -5430,7 +5122,7 @@ class TestDedupFlagsCrossProjectDiscovery:
     Everything the task-4381 gate does stays exactly as ruled — this only
     supplies the citation the gate could never get.  The anti-relocation
     assertion below is the load-bearing one: ``cited_tasks`` is a
-    ``compute_flag_signature`` INPUT read at the TOP of the per-flag loop, so
+    ``compute_marker_signature`` INPUT read at the TOP of the per-flag loop, so
     a discovered citation that reached the flag dict would move the marker to
     a different row.  Since the gate is HIT-only, the first enriched cycle
     would become a MISS; and because discovery matches a live backlog that
@@ -5447,9 +5139,8 @@ class TestDedupFlagsCrossProjectDiscovery:
     #: The signature a citation-less flag keys to — the identity that must
     #: SURVIVE a discovery-driven suppression untouched.
     CITATION_FREE_TID = '598'
-    #: What the row would relocate to if a discovered citation ever reached
-    #: the flag dict before compute_flag_signature read it.
-    RELOCATED_TID = '3839,598'
+    #: The foreign fix task discovery finds for this class's flag.
+    DISCOVERED_CITE = {'project_id': 'dark_factory', 'task_id': '3839'}
 
     @classmethod
     def _flag(cls, task_id: int = 598, description: str | None = None,
@@ -5531,15 +5222,20 @@ class TestDedupFlagsCrossProjectDiscovery:
         pinned at once: the surviving row's task_id, the absence of the
         relocated row, and the flag dict itself.
         """
-        from fused_memory.reconciliation.flag_dedup import (
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import (
             compute_flag_signature,
-            dedup_flags,
+            compute_marker_signature,
         )
 
         flag = self._flag()
         assert compute_flag_signature(flag) == (
             self.CITATION_FREE_TID, self.FLAG_TYPE,
         ), 'fixture must key to the citation-less signature'
+        relocated_sig = compute_marker_signature(
+            self._flag(cited_tasks=[self.DISCOVERED_CITE]), project_id=self.PROJECT,
+        )
+        assert relocated_sig is not None and relocated_sig[0] != self.CITATION_FREE_TID
         await _seed_marker(
             ledger_memory_service.recon_ledger, self.PROJECT,
             self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
@@ -5565,12 +5261,10 @@ class TestDedupFlagsCrossProjectDiscovery:
         )
         assert row.task_id == self.CITATION_FREE_TID
 
-        relocated = await _get_marker(
-            ledger, self.PROJECT, self.RELOCATED_TID, self.FLAG_TYPE,
-        )
+        relocated = await _get_marker(ledger, self.PROJECT, *relocated_sig)
         assert relocated is None, (
-            'a discovered citation must never reach compute_flag_signature: a '
-            f'row at {self.RELOCATED_TID!r} means the marker RELOCATED, which '
+            'a discovered citation must never reach compute_marker_signature: a '
+            f'row at {relocated_sig[0]!r} means the marker RELOCATED, which '
             'would make every enriched cycle a MISS under a HIT-only gate'
         )
 
@@ -5622,10 +5316,8 @@ class TestDedupFlagsCrossProjectDiscovery:
         """(iv) When the flag's OWN citations already name a live foreign fix
         task, discovery must not run at all — it is the fallback for findings
         that cite nothing usable, not a second sweep on every cycle."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_marker_signature
 
         cite = {
             'project_id': 'dark_factory',
@@ -5633,7 +5325,7 @@ class TestDedupFlagsCrossProjectDiscovery:
             'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
         }
         flag = self._flag(cited_tasks=[cite])
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=self.PROJECT)
         assert sig is not None
         await _seed_marker(
             ledger_memory_service.recon_ledger, self.PROJECT, sig[0], sig[1],
@@ -5790,10 +5482,8 @@ class TestDedupFlagsCrossProjectDiscovery:
         task is read exactly once across both resolver passes: the gate cannot
         be looking at a different snapshot than the one discovery matched.
         """
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_flag_signature
 
         own = {'project_id': self.PROJECT, 'task_id': '601', 'title': 'The subject'}
         flag = self._flag(cited_tasks=[own])
@@ -5849,14 +5539,12 @@ class TestDedupFlagsCrossProjectDiscovery:
         """(vii) Same branch via the other route: a FOREIGN citation the
         backend cannot confirm.  The near-miss must not short-circuit the
         fallback."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_marker_signature
 
         stale = {'project_id': 'dark_factory', 'task_id': '404', 'title': 'Gone'}
         flag = self._flag(cited_tasks=[stale])
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=self.PROJECT)
         assert sig is not None, f'the flag must have a signature; got {flag!r}'
         tid, ftype = sig
         await _seed_marker(
@@ -6266,10 +5954,8 @@ class TestCrossProjectFixTaskProducerToGateSeam:
     ):
         """THE ACCEPTANCE TEST. Cycle 1 records the marker and re-asserts the
         finding; cycle 2 suppresses it — on a citation this test never wrote."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_flag_signature
 
         assert compute_flag_signature(self._flag()) == (self.TID, self.FLAG_TYPE), (
             'the finding must key to the CITATION-LESS identity — the whole '
@@ -6424,7 +6110,7 @@ class TestCrossProjectFixTaskProducerToGateSeam:
 
 @pytest.mark.asyncio
 class TestDedupFlagsWriteGuard:
-    """Integration tests for the _is_valid_marker_task_id guard wired into
+    """Integration tests for the is_valid_marker_task_id guard wired into
     dedup_flags' ledger-backed marker path.
 
     fp: MISS and HIT path coverage lives in TestDedupFlagsContentFingerprintPath
@@ -6491,7 +6177,7 @@ class TestDedupFlagsWriteGuard:
     async def test_invalid_tid_write_guard_returns_flag_unchanged_no_io(
         self, ledger_memory_service
     ):
-        """(c) dedup_flags' own _is_valid_marker_task_id guard rejects a
+        """(c) dedup_flags' own is_valid_marker_task_id guard rejects a
         genuinely-invalid tid 'abc' before any ledger I/O: the flag passes
         through unchanged, no ledger row is created, and no Mem0 mirror
         add_memory call is made.
@@ -6525,13 +6211,11 @@ class TestDedupFlagsWriteGuard:
           persisted_from_run="c1" → no re-escalation, and the SAME row is
           UPSERTed again (still exactly one row, refreshed to cycle 2).
 
-        Uses compute_content_fingerprint_signature / _content_fingerprint to derive the
+        Uses compute_content_fingerprint_signature / content_fingerprint to derive the
         expected fp: value (no hardcoded hashes — anti-drift).
         """
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+        from fused_memory.reconciliation.flag_identity import compute_content_fingerprint_signature
 
         flag = {
             'task_id': None,
@@ -6581,310 +6265,6 @@ class TestDedupFlagsWriteGuard:
         payload_c2 = json.loads(row_c2.payload_json)
         assert payload_c2['run_id'] == 'c2'
         assert payload_c2['last_seen_run_id'] == 'c2'
-
-
-# ---------------------------------------------------------------------------
-# amend: normalizer parity — _normalize_content_description must stay aligned
-# with recon_report._normalize_description (Suggestion 3).
-# A shared test set pins both implementations to identical output so silent
-# drift between the local copies is caught by CI.
-# ---------------------------------------------------------------------------
-
-
-class TestNormalizerParity:
-    """Both _normalize_content_description (flag_dedup) and _normalize_description
-    (recon_report) must produce identical output for the same inputs.
-
-    The implementations are kept as local copies to avoid a server<-reconciliation
-    import inversion.  This test class pins them to the same behaviour so that a
-    future edit to one is immediately flagged when the other diverges.
-    """
-
-    # Shared inputs that exercise whitespace collapse, casefold, and
-    # combinations of both.
-    _CASES = [
-        'Stale edge d592ca46 has no known task anchor',
-        '  Leading  and   trailing  whitespace  ',
-        'UPPERCASE DESCRIPTION',
-        'MiXeD CaSe  with  extra  spaces',
-        'single',
-        '',
-    ]
-
-    def test_identical_output_for_all_cases(self):
-        from fused_memory.reconciliation.flag_dedup import (
-            _normalize_content_description,
-        )
-        from fused_memory.server.recon_report import _normalize_description
-
-        for raw in self._CASES:
-            fd_result = _normalize_content_description(raw)
-            rr_result = _normalize_description(raw)
-            assert fd_result == rr_result, (
-                f'Normaliser drift detected for input {raw!r}:\n'
-                f'  flag_dedup._normalize_content_description → {fd_result!r}\n'
-                f'  recon_report._normalize_description       → {rr_result!r}'
-            )
-
-
-# ---------------------------------------------------------------------------
-# task-1656 step-1 — RED: _is_valid_marker_task_id unit tests
-# ---------------------------------------------------------------------------
-
-
-class TestIsValidMarkerTaskId:
-    """Unit tests for _is_valid_marker_task_id(tid: str) -> bool.
-
-    The helper must ACCEPT bare non-negative integers and comma-joined
-    lists of them (the cited_tasks fallback shape), and REJECT content-
-    fingerprint keys ('fp:…'), the empty string, non-numeric strings,
-    and malformed comma forms.
-    """
-
-    # ----- ACCEPT cases -----
-
-    def test_accepts_bare_integer(self):
-        """'42' — canonical single-task marker key."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('42') is True, "'42' must be accepted"
-
-    def test_accepts_zero(self):
-        """'0' — smallest valid non-negative integer."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('0') is True, "'0' must be accepted"
-
-    def test_accepts_large_integer(self):
-        """'99999' — large task id within normal range."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('99999') is True, "'99999' must be accepted"
-
-    def test_accepts_comma_joined_two_ids(self):
-        """'12,15' — the cited_tasks fallback shape (multi-task finding)."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('12,15') is True, "'12,15' must be accepted"
-
-    def test_accepts_comma_joined_three_ids(self):
-        """'1,2,3' — three tasks cited by one finding."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('1,2,3') is True, "'1,2,3' must be accepted"
-
-    def test_accepts_comma_joined_with_spaces(self):
-        """'12, 15' — components with surrounding whitespace must be stripped before check."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('12, 15') is True, "'12, 15' must be accepted (strip spaces)"
-
-    # ----- REJECT cases -----
-
-    def test_accepts_content_fingerprint_key(self):
-        """'fp:9216e85ac497b68d93043b64684eb049' — canonical fp:+32 lowercase hex must be accepted."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        tid = 'fp:9216e85ac497b68d93043b64684eb049'
-        assert _is_valid_marker_task_id(tid) is True, (
-            f'{tid!r} must be accepted (canonical fp:+32 lowercase hex)'
-        )
-
-    def test_rejects_empty_string(self):
-        """'' — falsy input must be rejected."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('') is False, "'' must be rejected"
-
-    def test_rejects_non_numeric_string(self):
-        """'abc' — plain non-numeric string must be rejected."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('abc') is False, "'abc' must be rejected"
-
-    def test_rejects_trailing_comma(self):
-        """'12,' — trailing comma produces an empty component, which is non-numeric."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('12,') is False, "'12,' must be rejected"
-
-    def test_rejects_comma_with_fp_component(self):
-        """'12,fp:abc' — mixed numeric + fp: component must be rejected."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('12,fp:abc') is False, "'12,fp:abc' must be rejected"
-
-    def test_rejects_negative_integer_string(self):
-        """'-1' — negative integer: leading minus is not a digit."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('-1') is False, "'-1' must be rejected"
-
-    def test_rejects_float_string(self):
-        """'1.5' — dot is not a digit (mirrors _looks_like_task_id dot-rejecting convention)."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('1.5') is False, "'1.5' must be rejected"
-
-    # ----- Anti-drift: guard accept-pattern tied to the real emitter -----
-
-    def test_accepts_anti_drift_roundtrip(self):
-        """_is_valid_marker_task_id(_content_fingerprint(x)) must be True for any non-blank x.
-
-        Ties the guard's accept-pattern to _content_fingerprint's actual output so that
-        accept/emit drift is caught as a test failure rather than a silent dedup outage.
-        """
-        from fused_memory.reconciliation.flag_dedup import (
-            _content_fingerprint,
-            _is_valid_marker_task_id,
-        )
-
-        description = 'Any non-blank description for anti-drift validation'
-        fp = _content_fingerprint(description)
-        assert _is_valid_marker_task_id(fp) is True, (
-            f'_content_fingerprint output {fp!r} must be accepted by '
-            f'_is_valid_marker_task_id (anti-drift invariant)'
-        )
-
-    # ----- REJECT: malformed fp: forms -----
-
-    def test_rejects_fp_empty_hex(self):
-        """'fp:' (no hex digits) — prefix alone is not a valid fp: key."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        assert _is_valid_marker_task_id('fp:') is False, "'fp:' must be rejected (no hex digits)"
-
-    def test_rejects_fp_too_short_hex(self):
-        """'fp:' + 30 hex chars — too short (canonical format requires exactly 32 lowercase hex)."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        tid = 'fp:' + 'a' * 30
-        assert _is_valid_marker_task_id(tid) is False, (
-            f'{tid!r} must be rejected (30 hex chars, need 32)'
-        )
-
-    def test_rejects_fp_too_long_hex(self):
-        """'fp:' + 64 hex chars — too long; the spec's /^fp:[0-9a-f]{64}$/ shape is wrong.
-
-        The real emitter (_content_fingerprint) produces only 32 hex chars (digest[:32]).
-        A 64-hex key would never be emitted, so accepting it would silently break dedup.
-        """
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        tid = 'fp:' + 'a' * 64
-        assert _is_valid_marker_task_id(tid) is False, (
-            f'{tid!r} must be rejected (64 hex chars — too long; real emitter produces 32)'
-        )
-
-    def test_rejects_fp_uppercase_hex(self):
-        """'fp:' + uppercase 32 hex chars — fp: keys must use lowercase hex (SHA-256 hexdigest)."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        tid = 'fp:' + 'A' * 32
-        assert _is_valid_marker_task_id(tid) is False, (
-            f'{tid!r} must be rejected (uppercase hex; fp: must be lowercase)'
-        )
-
-    def test_rejects_fp_nonhex_char(self):
-        """'fp:' + 31 hex chars + 'g' — non-hex character in the body must be rejected."""
-        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
-
-        tid = 'fp:' + 'a' * 31 + 'g'
-        assert _is_valid_marker_task_id(tid) is False, (
-            f'{tid!r} must be rejected (non-hex char "g" at position 35)'
-        )
-
-
-# ---------------------------------------------------------------------------
-# is_content_fingerprint_task_id helper (task-2047 step-3 / step-4)
-# ---------------------------------------------------------------------------
-
-
-class TestIsContentFingerprintTaskId:
-    """Unit tests for is_content_fingerprint_task_id(tid) -> bool.
-
-    Unlike _is_valid_marker_task_id (which also accepts numeric and
-    comma-joined tids), this helper is the fp:-ONLY gate: True iff *tid* is
-    a canonical 'fp:' + exactly 32 lowercase hex digits key, False for
-    every other shape (including otherwise-valid numeric/comma-joined
-    marker keys).
-    """
-
-    def test_true_for_canonical_fp_key(self):
-        """A canonical fp:+32-lowercase-hex key (real emitter output) -> True."""
-        from fused_memory.reconciliation.flag_dedup import (
-            _content_fingerprint,
-            is_content_fingerprint_task_id,
-        )
-
-        tid = _content_fingerprint('x')
-        assert is_content_fingerprint_task_id(tid) is True, (
-            f'{tid!r} must be accepted (canonical fp:+32-hex key)'
-        )
-
-    def test_false_for_bare_numeric_tid(self):
-        """A bare numeric tid ('42') is a valid marker key but NOT an fp: key -> False."""
-        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-
-        assert is_content_fingerprint_task_id('42') is False
-
-    def test_false_for_comma_joined_numerics(self):
-        """A comma-joined numeric tid ('12,15') is a valid marker key but NOT an fp: key -> False."""
-        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-
-        assert is_content_fingerprint_task_id('12,15') is False
-
-    def test_false_for_empty_string(self):
-        """Empty string -> False."""
-        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-
-        assert is_content_fingerprint_task_id('') is False
-
-    def test_false_for_fp_prefix_with_no_hex(self):
-        """'fp:' alone (no hex digits) -> False."""
-        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-
-        assert is_content_fingerprint_task_id('fp:') is False
-
-    def test_false_for_fp_too_short_hex(self):
-        """'fp:' + 30 hex chars (too short) -> False."""
-        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-
-        assert is_content_fingerprint_task_id('fp:' + 'a' * 30) is False
-
-    def test_false_for_fp_too_long_hex(self):
-        """'fp:' + 64 hex chars (too long) -> False."""
-        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-
-        assert is_content_fingerprint_task_id('fp:' + 'a' * 64) is False
-
-    def test_false_for_fp_uppercase_hex(self):
-        """'fp:' + uppercase hex (real emitter only produces lowercase) -> False."""
-        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-
-        assert is_content_fingerprint_task_id('fp:' + 'A' * 32) is False
-
-    def test_false_for_arbitrary_string(self):
-        """An arbitrary non-fp: string -> False."""
-        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-
-        assert is_content_fingerprint_task_id('not-a-marker-key-at-all') is False
-
-    def test_anti_drift_roundtrip_with_content_fingerprint(self):
-        """is_content_fingerprint_task_id(_content_fingerprint(<desc>)) must be True
-        for any non-blank description — ties the gate to the real emitter's output
-        so accept/emit drift is caught as a test failure."""
-        from fused_memory.reconciliation.flag_dedup import (
-            _content_fingerprint,
-            is_content_fingerprint_task_id,
-        )
-
-        description = 'Any non-blank description for anti-drift validation'
-        fp = _content_fingerprint(description)
-        assert is_content_fingerprint_task_id(fp) is True, (
-            f'_content_fingerprint output {fp!r} must be accepted by '
-            f'is_content_fingerprint_task_id (anti-drift invariant)'
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -7118,6 +6498,51 @@ class TestFilterTerminalMetadataFlags:
         assert result == [], (
             'task_metadata_stale alias must also be dropped for cancelled tasks'
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['Stale-Metadata', 'metadata_stale', 'Task Metadata Stale', 'STALE_TASK_METADATA'],
+    )
+    async def test_canonical_variant_spellings_are_dropped_for_a_terminal_task(self, flag_type):
+        """A case/separator/word-order respelling of a known spelling is checked and dropped.
+
+        This widening (task 6005) is intentional: the filter matches through
+        STALE_METADATA_FAMILY, and the drop still requires a live terminal status.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+
+        flag = {'task_id': '1703', 'flag_type': flag_type}
+        result = await filter_terminal_metadata_flags(taskmaster, '/proj', [flag])
+
+        assert result == []
+        taskmaster.get_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        flags = [
+            {'task_id': None, 'flag_type': 'stale_task_reference'},
+            {'task_id': None, 'flag_type': 'Stale_Metadata'},
+            {'task_id': None, 'flag_type': 'orphaned_knowledge'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_identity'):
+            await filter_terminal_metadata_flags(AsyncMock(), '/proj', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'terminal_metadata_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith('reconciliation.terminal_metadata_filter_possible_drift ')
+        assert 'family=stale_metadata' in drift[0]
+        assert "unmatched_flag_types=['stale_task_reference']" in drift[0]
 
 
 # ---------------------------------------------------------------------------
@@ -7414,6 +6839,32 @@ class TestFilterStaleBulkGetStatusesFlags:
             'scoped reads must be issued only for the two task-bearing matching '
             'flags (100, 200) — never for the non-matching (999) or no-task-id flag'
         )
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        flags = [
+            {'task_id': None, 'flag_type': 'get_statuses_latency_regression'},
+            {'task_id': None, 'flag_type': 'Bulk-Get-Statuses-Stale'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_identity'):
+            await filter_stale_bulk_get_statuses_flags(taskmaster, '/proj', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'stale_bulk_get_statuses_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith(
+            'reconciliation.stale_bulk_get_statuses_filter_possible_drift '
+        )
+        assert 'family=stale_bulk_get_statuses' in drift[0]
+        assert "unmatched_flag_types=['get_statuses_latency_regression']" in drift[0]
+        taskmaster.get_statuses.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -7716,24 +7167,18 @@ class TestFilterStaleCountSnapshotCorrections:
 
 
 # ---------------------------------------------------------------------------
-# filter_blocked_snapshot_findings (task-1840 step-3 RED / step-4 GREEN)
+# filter_task_count_snapshot_findings
 # ---------------------------------------------------------------------------
 
 
-class TestFilterBlockedSnapshotFindings:
-    """Pure-function tests for filter_blocked_snapshot_findings(flags, project_id).
-
-    All tests call the function directly — no mocks, no I/O.
-
-    RED until step-4 adds filter_blocked_snapshot_findings to flag_dedup.py.
-    """
-
-    # -----------------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------------
+class TestFilterTaskCountSnapshotFindings:
+    """No project keeps a task-count snapshot (task 10081), so a Stage-3
+    missing_knowledge or memory_stale finding that one is absent or stale is
+    dropped for every project. Other categories, and findings not about a
+    task-count snapshot, pass through."""
 
     @staticmethod
-    def _make_flag(category: str, description: str, suggested_action: str = '') -> dict:
+    def _flag(category: str, description: str, suggested_action: str = '') -> dict:
         return {
             'task_id': None,
             'flag_type': 'missing_knowledge',
@@ -7743,270 +7188,65 @@ class TestFilterBlockedSnapshotFindings:
             'actionable': False,
         }
 
-    # -----------------------------------------------------------------------
-    # Blocked project — dropped cases
-    # -----------------------------------------------------------------------
-
-    def test_missing_knowledge_absence_finding_dropped_for_blocked_project(self):
-        """Case (a): missing_knowledge finding about a task-count snapshot absence is DROPPED.
-
-        The description uses the 'task-count snapshot' marker phrase (no raw numbers),
-        which is the shape of an 'absence' finding from Stage 3.
-        """
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='autopilot_video has no task-count snapshot temporal_fact edge',
-            suggested_action='Add a count snapshot temporal_fact for autopilot_video',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert result == [], (
-            "missing_knowledge finding about task-count snapshot absence must be DROPPED "
-            f"for autopilot_video (snapshot writes blocked-by-design); got {result!r}"
+    def test_missing_knowledge_absence_finding_is_dropped(self):
+        flag = self._flag(
+            'missing_knowledge',
+            'reify has no task-count snapshot temporal_fact edge',
+            'Add a count snapshot temporal_fact for reify',
         )
 
-    def test_memory_stale_raw_count_finding_dropped_for_blocked_project(self):
-        """Case (b): memory_stale finding quoting raw paired count snapshot is DROPPED.
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == []
 
-        The description contains a raw paired count snapshot string (e.g. '607 done /
-        148 cancelled') which is_count_snapshot() detects.
-        """
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='memory_stale',
-            description=(
-                'task-count snapshot edge records 607 done / 148 cancelled '
-                'but the tree shows more'
-            ),
-            suggested_action='Update the snapshot edge to reflect current counts',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert result == [], (
-            "memory_stale finding quoting raw count snapshot must be DROPPED "
-            f"for autopilot_video; got {result!r}"
+    def test_memory_stale_raw_count_finding_is_dropped(self):
+        flag = self._flag(
+            'memory_stale',
+            'task-count snapshot edge records 607 done / 148 cancelled but the tree shows more',
+            'Update the snapshot edge to reflect current counts',
         )
 
-    # -----------------------------------------------------------------------
-    # Blocked project — kept cases (category gate and signature gate)
-    # -----------------------------------------------------------------------
-
-    def test_missing_deliverable_finding_kept_for_blocked_project(self):
-        """Case (c): missing_deliverable finding is KEPT (category gate passes only missing_knowledge/memory_stale)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_deliverable',
-            description='autopilot_video task 42 has no task-count snapshot temporal_fact',
-            suggested_action='Add the deliverable',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert flag in result, (
-            "missing_deliverable finding must be KEPT (not in suppressed categories); "
-            f"got {result!r}"
-        )
-
-    def test_memory_contradiction_finding_kept_for_blocked_project(self):
-        """Case (c): memory_contradiction finding is KEPT (category gate)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='memory_contradiction',
-            description='count snapshot contradicts task tree',
-            suggested_action='Investigate',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert flag in result, (
-            "memory_contradiction finding must be KEPT (category not in suppressed set); "
-            f"got {result!r}"
-        )
-
-    def test_missing_knowledge_unrelated_to_snapshot_kept(self):
-        """Case (d): missing_knowledge finding unrelated to snapshots is KEPT (signature gate)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='task 5 has no design doc and no implementation notes',
-            suggested_action='Add a design doc for task 5',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert flag in result, (
-            "missing_knowledge finding unrelated to count snapshots must be KEPT; "
-            f"got {result!r}"
-        )
-
-    def test_empty_list_returns_empty(self):
-        """Case (e): empty list → empty list."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        result = filter_blocked_snapshot_findings([], project_id='autopilot_video')
-        assert result == []
-
-    # -----------------------------------------------------------------------
-    # Non-blocked project — fail-open (all flags pass through)
-    # -----------------------------------------------------------------------
-
-    def test_snapshot_absence_finding_kept_for_non_blocked_project(self):
-        """For reify (not in blocked set), same missing_knowledge absence finding is KEPT."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='reify has no task-count snapshot temporal_fact edge',
-            suggested_action='Add a count snapshot temporal_fact for reify',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='reify')
-        assert flag in result, (
-            "For non-blocked project 'reify', missing_knowledge snapshot finding "
-            f"must pass through unchanged (fail-open); got {result!r}"
-        )
-
-    def test_raw_count_finding_kept_for_non_blocked_project(self):
-        """For reify, same memory_stale raw-count finding is KEPT (fail-open)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='memory_stale',
-            description='task-count snapshot edge records 607 done / 148 cancelled',
-            suggested_action='Update the snapshot',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='reify')
-        assert flag in result, (
-            "For non-blocked project 'reify', memory_stale count snapshot finding "
-            f"must pass through unchanged (fail-open); got {result!r}"
-        )
-
-    def test_both_snapshot_findings_survive_for_non_blocked_project(self):
-        """For reify both the snapshot-absence and raw-count findings survive."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        absence_flag = self._make_flag(
-            category='missing_knowledge',
-            description='reify has no task-count snapshot temporal_fact edge',
-        )
-        stale_flag = self._make_flag(
-            category='memory_stale',
-            description='count snapshot edge records 607 done / 148 cancelled',
-        )
-        result = filter_blocked_snapshot_findings(
-            [absence_flag, stale_flag], project_id='reify'
-        )
-        assert len(result) == 2, (
-            f"Both findings must survive for non-blocked 'reify'; got {result!r}"
-        )
-
-    # -----------------------------------------------------------------------
-    # Coverage-gap tests: suggested_action-only path + 'account snapshot' negative
-    # -----------------------------------------------------------------------
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == []
 
     def test_marker_in_suggested_action_only_is_dropped(self):
-        """_is_task_count_snapshot_finding detects via suggested_action when description is empty.
-
-        The combined text is f'{description} {suggested_action}', so a marker phrase
-        appearing only in suggested_action must still trigger suppression.
-        """
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='',  # empty — marker only in suggested_action
-            suggested_action='Add a task-count snapshot temporal_fact edge for autopilot_video',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert result == [], (
-            "missing_knowledge finding whose marker phrase appears only in suggested_action "
-            f"must be DROPPED for autopilot_video; got {result!r}"
+        flag = self._flag(
+            'missing_knowledge',
+            '',
+            'Add a task-count snapshot temporal_fact edge for dark_factory',
         )
 
-    def test_account_snapshot_phrase_not_dropped(self):
-        """'account snapshot' must NOT be mistaken for a task-count snapshot finding.
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == []
 
-        The bare substring 'count snapshot' was intentionally removed from the marker
-        list to avoid this false positive.  A finding mentioning 'account snapshot'
-        (with no task-count-snapshot marker and no raw count pairs) must be KEPT.
-        """
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+    @pytest.mark.parametrize('category', ['missing_deliverable', 'memory_contradiction'])
+    def test_snapshot_finding_in_another_category_passes_through(self, category):
+        flag = self._flag(category, 'task 42 has no task-count snapshot temporal_fact')
 
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='autopilot_video account snapshot is missing from the knowledge graph',
-            suggested_action='Add the account snapshot edge for project tracking',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert flag in result, (
-            "Finding about 'account snapshot' must NOT be suppressed — "
-            f"'count snapshot' is a substring of 'account snapshot' but must not match; "
-            f"got {result!r}"
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == [flag]
+
+    def test_finding_not_about_a_snapshot_passes_through(self):
+        flag = self._flag(
+            'missing_knowledge',
+            'task 5 has no design doc and no implementation notes',
+            'Add a design doc for task 5',
         )
 
-    # -----------------------------------------------------------------------
-    # know_live registration (task 1943 — mirrors autopilot_video / task 1840)
-    # -----------------------------------------------------------------------
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == [flag]
 
-    def test_missing_knowledge_absence_finding_dropped_for_know_live(self):
-        """Case (a) mirrored for know_live: missing_knowledge absence finding is DROPPED."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='know_live has no task-count snapshot temporal_fact edge',
-            suggested_action='Add a count snapshot temporal_fact for know_live',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
-        assert result == [], (
-            "missing_knowledge finding about task-count snapshot absence must be DROPPED "
-            f"for know_live (snapshot writes blocked-by-design); got {result!r}"
+    def test_account_snapshot_phrase_is_not_a_task_count_snapshot(self):
+        flag = self._flag(
+            'missing_knowledge',
+            'reify account snapshot is missing from the knowledge graph',
+            'Add the account snapshot edge for project tracking',
         )
 
-    def test_memory_stale_raw_count_finding_dropped_for_know_live(self):
-        """Case (b) mirrored for know_live: memory_stale raw-count finding is DROPPED."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == [flag]
 
-        flag = self._make_flag(
-            category='memory_stale',
-            description=(
-                'task-count snapshot edge records 607 done / 148 cancelled '
-                'but the tree shows more'
-            ),
-            suggested_action='Update the snapshot edge to reflect current counts',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
-        assert result == [], (
-            "memory_stale finding quoting raw count snapshot must be DROPPED "
-            f"for know_live; got {result!r}"
-        )
+    def test_only_the_snapshot_finding_is_dropped_from_a_mixed_list(self):
+        snapshot = self._flag('memory_stale', 'count snapshot edge records 607 done / 148 cancelled')
+        unrelated = self._flag('missing_knowledge', 'task 5 has no design doc')
 
-    def test_missing_knowledge_unrelated_to_snapshot_kept_for_know_live(self):
-        """Case (d) mirrored for know_live: unrelated missing_knowledge finding is KEPT (signature gate)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+        assert flag_dedup.filter_task_count_snapshot_findings([snapshot, unrelated]) == [unrelated]
 
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='task 5 has no design doc and no implementation notes',
-            suggested_action='Add a design doc for task 5',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
-        assert flag in result, (
-            "missing_knowledge finding unrelated to count snapshots must be KEPT; "
-            f"got {result!r}"
-        )
-
-    def test_memory_contradiction_finding_kept_for_know_live(self):
-        """Case (c) mirrored for know_live: memory_contradiction finding is KEPT (category gate)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='memory_contradiction',
-            description='count snapshot contradicts task tree',
-            suggested_action='Investigate',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
-        assert flag in result, (
-            "memory_contradiction finding must be KEPT (category not in suppressed set); "
-            f"got {result!r}"
-        )
+    def test_empty_list_returns_empty(self):
+        assert flag_dedup.filter_task_count_snapshot_findings([]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -8016,10 +7256,8 @@ class TestFilterBlockedSnapshotFindings:
 
 class TestFilterContaminationCeilingFindings:
     """Pure-function tests for _is_contamination_ceiling_finding and
-    filter_contamination_ceiling_findings(flags, project_id).
-
-    Mirrors TestFilterBlockedSnapshotFindings one-to-one for the retired
-    autopilot_video Stage-1 task-ID "contamination ceiling" (task 2818/2826).
+    filter_contamination_ceiling_findings(flags, project_id), the gate for the
+    retired autopilot_video Stage-1 task-ID "contamination ceiling" (task 2818/2826).
     All tests call the functions directly — no mocks, no I/O.
 
     RED until step-4 adds the symbols to flag_dedup.py.
@@ -8254,103 +7492,6 @@ class TestFilterContaminationCeilingFindings:
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# filter_snapshot_stat_edge_findings — task 3487 code-side backstop
-# ---------------------------------------------------------------------------
-
-
-class TestFilterSnapshotStatEdgeFindings:
-    """Drops a Stage-3 finding that pairs a ``task_count_snapshot*`` stat with
-    a missing Graphiti temporal_facts edge, for EVERY project: snapshot stats
-    are Mem0-only, so no such edge is ever written (Snapshot Discipline)."""
-
-    @staticmethod
-    def _flag(description, suggested_action='Investigate', **extra):
-        flag = {
-            'task_id': None,
-            'flag_type': 'stats_mismatch',
-            'category': 'memory_stale',
-            'description': description,
-            'suggested_action': suggested_action,
-        }
-        flag.update(extra)
-        return flag
-
-    @pytest.mark.parametrize(
-        'description',
-        [
-            'Stage 2 reported task_count_snapshot_mem0_written=1 but no Graphiti '
-            'temporal_facts edge exists',
-            'TASK_COUNT_SNAPSHOT_MEM0_PRUNED=2 yet no temporal fact was found',
-            'task_count_snapshot_mem0_written=1 with no matching Graphiti edge',
-            'task_count_snapshot_mem0_written=1 has no graphiti temporal record',
-        ],
-        ids=['temporal_fact', 'temporal-fact-uppercase-stat', 'graphiti-edge', 'graphiti-temporal'],
-    )
-    def test_drops_a_stat_plus_edge_finding(self, description):
-        assert flag_dedup.filter_snapshot_stat_edge_findings([self._flag(description)]) == []
-
-    def test_signals_may_be_split_across_description_and_suggested_action(self):
-        flag = self._flag(
-            'Stage 2 reported task_count_snapshot_mem0_written=1',
-            suggested_action='Write the missing Graphiti temporal_facts edge',
-        )
-
-        assert flag_dedup.filter_snapshot_stat_edge_findings([flag]) == []
-
-    @pytest.mark.parametrize(
-        'flag',
-        [
-            {'description': 'task_count_snapshot_mem0_written=1 looks low',
-             'suggested_action': 'Check Mem0'},
-            {'description': 'Graphiti temporal_facts edge for task 12 is stale',
-             'suggested_action': 'Refresh it'},
-            {'description': None, 'suggested_action': None},
-            {},
-            {'description': 'task 42 has no design doc', 'suggested_action': 'Add one'},
-        ],
-        ids=['stat-only', 'edge-only', 'none-fields', 'empty', 'unrelated'],
-    )
-    def test_keeps_anything_short_of_both_signals(self, flag):
-        assert flag_dedup.filter_snapshot_stat_edge_findings([flag]) == [flag]
-
-    def test_is_project_agnostic(self):
-        import inspect
-
-        params = inspect.signature(flag_dedup.filter_snapshot_stat_edge_findings).parameters
-        assert list(params) == ['flags']
-
-    def test_preserves_order_and_returns_a_new_list(self):
-        keep_a = self._flag('task 1 has no design doc')
-        drop = self._flag(
-            'task_count_snapshot_mem0_written=1 but no Graphiti temporal_facts edge',
-        )
-        keep_b = self._flag('task 2 has no tests')
-        flags = [keep_a, drop, keep_b]
-
-        kept = flag_dedup.filter_snapshot_stat_edge_findings(flags)
-
-        assert kept == [keep_a, keep_b]
-        assert kept is not flags
-        assert flags == [keep_a, drop, keep_b]
-
-    def test_logs_one_debug_line_per_drop(self, caplog):
-        caplog.set_level(logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup')
-        drops = [
-            self._flag('task_count_snapshot_mem0_written=1 but no temporal fact', task_id=str(i))
-            for i in range(2)
-        ]
-
-        flag_dedup.filter_snapshot_stat_edge_findings([*drops, self._flag('unrelated')])
-
-        lines = [
-            r for r in caplog.records
-            if r.levelno == logging.DEBUG
-            and 'filter_snapshot_stat_edge_findings' in r.getMessage()
-        ]
-        assert len(lines) == 2
-
-
 class TestAcknowledgeFlagMarkerLedger:
     """acknowledge_flag_marker(memory_service, ...) maps to
     memory_service.recon_ledger.mark_addressed — no Mem0 find_prior_memories
@@ -8530,10 +7671,8 @@ class TestAcknowledgeResolvedFlags:
         no-signature flag skipped; total is the summed count.
         """
         import fused_memory.reconciliation.flag_dedup as flag_dedup_mod
-        from fused_memory.reconciliation.flag_dedup import (
-            acknowledge_resolved_flags,
-            compute_content_fingerprint_signature,
-        )
+        from fused_memory.reconciliation.flag_dedup import acknowledge_resolved_flags
+        from fused_memory.reconciliation.flag_identity import compute_content_fingerprint_signature
 
         calls: list[tuple[str, str, str]] = []
 
@@ -11231,11 +10370,11 @@ class TestCrossProjectGateAmendments:
             flag['cited_tasks'] = cited
         return flag
 
-    @staticmethod
-    def _sig(flag):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+    @classmethod
+    def _sig(cls, flag):
+        from fused_memory.reconciliation.flag_identity import compute_marker_signature
 
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=cls.PROJECT)
         assert sig is not None, f'the flag must have a signature; got {flag!r}'
         return sig
 
@@ -11250,7 +10389,7 @@ class TestCrossProjectGateAmendments:
     async def _seed(self, ledger, flag, **extra_payload):
         """Seed the prior-cycle marker for *flag* (the gate is HIT-only).
 
-        The identity is DERIVED from compute_flag_signature, which unions the
+        The identity is DERIVED from compute_marker_signature, which unions the
         top-level task_id with every cited_tasks id — hardcoding the top-level
         id would seed a row the gate never reads, and the test would pass
         vacuously.
@@ -11938,7 +11077,7 @@ class TestFilterStyleOnlyAuthorshipFlags:
 
     @pytest.mark.asyncio
     async def test_non_candidate_flag_type_passes_through_without_lookup(self):
-        """(SCOPE) Only AUTHORSHIP_SUSPICION_FLAG_TYPES are checked."""
+        """(SCOPE) Only flag_types AUTHORSHIP_SUSPICION_FAMILY matches are checked."""
         from fused_memory.reconciliation.flag_dedup import (
             filter_style_only_authorship_flags,
         )
@@ -12088,6 +11227,69 @@ class TestFilterStyleOnlyAuthorshipFlags:
             'the input list itself must never be mutated'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['Prompt-Injection', 'injection_possible', 'Foreign Authorship', 'CONTENT_FABRICATED'],
+    )
+    async def test_canonical_variant_spellings_are_candidates_and_dropped_when_house_authored(
+        self, flag_type,
+    ):
+        """A case/separator/word-order respelling of a known spelling is a candidate.
+
+        This widening (task 6005) is intentional and safe: the filter matches
+        through AUTHORSHIP_SUSPICION_FAMILY, and dropping still requires
+        wholly-house-authored provenance.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(flag_type=flag_type)
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == []
+        memory_service.get_memory_by_id.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flags = [
+            {'flag_type': 'injection_risk_detected'},
+            {'flag_type': 'fabrication_suspected'},
+            {'flag_type': 'foreign_key_violation'},
+            {'flag_type': 'Possible-Injection'},
+            {'flag_type': 'stale_metadata'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_identity'):
+            await filter_style_only_authorship_flags(AsyncMock(), 'dark_factory', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'style_only_authorship_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith(
+            'reconciliation.style_only_authorship_filter_possible_drift '
+        )
+        assert 'family=authorship_suspicion' in drift[0]
+        assert (
+            "unmatched_flag_types=['injection_risk_detected', 'fabrication_suspected', "
+            "'foreign_key_violation']"
+        ) in drift[0]
+
 
 # ---------------------------------------------------------------------------
 # ---- task 3476 step-1 ----
@@ -12196,48 +11398,6 @@ class TestIsClusterGrowthFlagType:
             f'{flag_type!r} is not a str; the predicate must return False rather '
             'than raise (flag dicts are LLM-authored and unvalidated)'
         )
-
-
-class TestFlagTypeFamily:
-    """`FlagTypeFamily` (task 5271 amendment): one value per Stage-1 finding's
-    spellings, shared by the accounting gates and sweep_deletion_guard."""
-
-    _FAMILY = flag_dedup.FlagTypeFamily(
-        name='widget_anomaly',
-        spellings=frozenset({'widget_anomaly_detected'}),
-        drift_token='widget',
-    )
-
-    def test_without_unseen_tokens_only_canonical_variants_match(self):
-        assert self._FAMILY.matches('Detected-Widget Anomaly') is True
-        assert self._FAMILY.matches('widget_anomaly_detected_again') is False, (
-            'a family with no unseen_spelling_tokens must not admit an added word'
-        )
-
-    def test_log_drift_names_the_event_the_family_and_only_unmatched_types(self, caplog):
-        flags = [
-            {'flag_type': 'widget_anomaly_detected'},
-            {'flag_type': 'widget_drift_suspected'},
-            {'flag_type': 'stale_metadata'},
-            {'flag_type': None},
-        ]
-
-        with caplog.at_level(logging.INFO):
-            self._FAMILY.log_drift(flags, log_event='reconciliation.widget_filter_possible_drift')
-
-        messages = [r.getMessage() for r in caplog.records]
-        assert len(messages) == 1, messages
-        assert messages[0].startswith('reconciliation.widget_filter_possible_drift ')
-        assert 'family=widget_anomaly' in messages[0]
-        assert "unmatched_flag_types=['widget_drift_suspected']" in messages[0]
-
-    def test_log_drift_is_silent_when_every_token_bearer_matches(self, caplog):
-        with caplog.at_level(logging.INFO):
-            self._FAMILY.log_drift(
-                [{'flag_type': 'Widget-Anomaly Detected'}], log_event='reconciliation.x',
-            )
-
-        assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------
@@ -12878,7 +12038,7 @@ class TestFilterAccountedClusterGrowthFlags:
         WARNING, not debug: a swallowed lookup error means the filter cannot
         tell whether the flag is accounted for, and a broad handler returning
         an empty value with no WARN+ log trips
-        shared/tests/test_silent_fallthrough_gate.py.
+        tests/repo_guards/test_silent_fallthrough_gate.py.
         """
         from fused_memory.reconciliation.flag_dedup import (
             filter_accounted_cluster_growth_flags,
@@ -13582,88 +12742,18 @@ class TestFilterAlreadyRecordedCaveatFlags:
 # Entity-standing-decision (Hook A / γ, task 2896) — pure match helpers
 # ---------------------------------------------------------------------------
 #
-# _extract_uuids / _flag_text_blob / _flag_type_in_grounds_family are the three
-# pure, sync building blocks the FALLBACK (stamps-omitted) match path composes.
+# _flag_type_in_grounds_family is the pure, sync flag_type gate the FALLBACK
+# (stamps-omitted) match path composes with flag_identity.extract_flag_uuids.
 # (Constants imported at module top.)
 
 # Deterministic sample UUIDs (canonical 8-4-4-4-12 hex form).
 _ESD_U1 = 'b0057f3d-1234-4abc-8def-0123456789ab'
 _ESD_U1_UPPER = 'B0057F3D-1234-4ABC-8DEF-0123456789AB'
 _ESD_U2 = 'a1b2c3d4-5678-4901-8234-567890abcdef'
-_ESD_U3 = 'ffeeddcc-0011-4223-8445-66778899aabb'
 
 
 class TestEntityStandingMatchHelpers:
     """Pure/sync building blocks for the γ fallback match (task 2896 step-1)."""
-
-    # ---- _extract_uuids ---------------------------------------------------
-
-    def test_extract_uuids_empty_when_no_uuid(self):
-        assert flag_dedup._extract_uuids('no uuids here at all, just 12345') == set()
-
-    def test_extract_uuids_empty_string(self):
-        assert flag_dedup._extract_uuids('') == set()
-
-    def test_extract_uuids_single_mixed_case_normalized_lower(self):
-        """A single mixed-case UUID is extracted and lowercased."""
-        result = flag_dedup._extract_uuids(
-            f'the entity {_ESD_U1_UPPER} is fine'
-        )
-        assert result == {_ESD_U1}
-
-    def test_extract_uuids_two_distinct(self):
-        """Two distinct UUIDs → a set of size 2 containing both (lowercased)."""
-        result = flag_dedup._extract_uuids(f'{_ESD_U1} and also {_ESD_U2}')
-        assert result == {_ESD_U1, _ESD_U2}
-        assert len(result) == 2
-
-    def test_extract_uuids_repeated_same_deduped_to_one(self):
-        """The same UUID repeated collapses to a single set element."""
-        result = flag_dedup._extract_uuids(f'{_ESD_U1} cites {_ESD_U1} again')
-        assert result == {_ESD_U1}
-        assert len(result) == 1
-
-    def test_extract_uuids_repeated_mixed_case_is_one_distinct(self):
-        """Upper- and lower-case spellings of the same UUID are one distinct value."""
-        result = flag_dedup._extract_uuids(f'{_ESD_U1_UPPER} vs {_ESD_U1}')
-        assert result == {_ESD_U1}
-        assert len(result) == 1
-
-    # ---- _flag_text_blob --------------------------------------------------
-
-    def test_flag_text_blob_collects_nested_str_values(self):
-        """A UUID in a top-level field, a nested dict, and a nested list-of-dicts
-        is all findable in the blob; non-str values are ignored."""
-        flag = {
-            'flag_type': 'topic_conflation',
-            'description': f'entity {_ESD_U1} is too big',
-            'evidence': {'note': f'see {_ESD_U2}'},
-            'items': [{'ref': f'cited {_ESD_U3}'}, 'plain text'],
-            'edge_count': 777,          # non-str value → ignored
-            'nothing': None,            # non-str value → ignored
-        }
-        blob = flag_dedup._flag_text_blob(flag)
-        assert _ESD_U1 in blob
-        assert _ESD_U2 in blob
-        assert _ESD_U3 in blob
-        # Non-str values are not stringified into the blob.
-        assert '777' not in blob
-
-    def test_flag_text_blob_finds_all_three_via_extract_uuids(self):
-        """End-to-end: the blob feeds _extract_uuids to recover every cited UUID."""
-        flag = {
-            'description': f'{_ESD_U1}',
-            'evidence': {'deep': {'deeper': f'{_ESD_U2}'}},
-            'list': [f'{_ESD_U3}'],
-        }
-        uuids = flag_dedup._extract_uuids(flag_dedup._flag_text_blob(flag))
-        assert uuids == {_ESD_U1, _ESD_U2, _ESD_U3}
-
-    def test_flag_text_blob_empty_flag_is_empty_or_blank(self):
-        """A flag with no str values yields a blob with no UUIDs."""
-        assert flag_dedup._extract_uuids(
-            flag_dedup._flag_text_blob({'a': 1, 'b': None, 'c': [2, 3]})
-        ) == set()
 
     # ---- _flag_type_in_grounds_family ------------------------------------
 
@@ -13743,28 +12833,6 @@ class TestEntityStandingMatchHelpers:
         assert flag_dedup._flag_type_in_grounds_family(
             'Oversized_Entity', GROUNDS_STRUCTURAL_SIZE_CONFLATION
         ) is True
-
-
-class TestExtractFlagUuids:
-    """`extract_flag_uuids` is the public seam other modules read a flag's
-    named UUIDs through (task 5271)."""
-
-    def test_collects_lowercased_uuids_from_every_nested_str_value(self):
-        flag = {
-            'description': f'deleted {_ESD_U1_UPPER}',
-            'evidence': [f'see {_ESD_U2}', {'note': f'and {_ESD_U3}'}],
-            'cited_memories': [{'memory_id': _ESD_U1, 'store': 'mem0'}],
-        }
-
-        assert flag_dedup.extract_flag_uuids(flag) == {_ESD_U1, _ESD_U2, _ESD_U3}
-
-    def test_non_str_values_are_ignored(self):
-        flag = {'task_id': 165, 'score': 0.5, 'ok': True, 'none': None, 'd': f'{_ESD_U2}'}
-
-        assert flag_dedup.extract_flag_uuids(flag) == {_ESD_U2}
-
-    def test_empty_flag_yields_empty_set(self):
-        assert flag_dedup.extract_flag_uuids({}) == set()
 
 
 # ---------------------------------------------------------------------------

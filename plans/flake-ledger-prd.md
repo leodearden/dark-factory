@@ -10,6 +10,8 @@ escalation's *instruction* — that is task **3774** (§7).
 
 > **Amended 2026-10-18** by plans/offline-lane-red-path-prd.md (ε0, task 6934): the §5.9 owner is still filed inside `open_debt()`, but no longer on the observation path — the recorder (§8.3) writes a suppression's occurrence rows and one item per suppressed test on the ledger's due list (`flake_debt_due`) in one local transaction, and the ledger's drain (`orchestrator/src/orchestrator/flake_debt_drain.py`) calls `open_debt()` for each item afterwards, so task 4974's per-observation filing cap and 120-second budget are retired. `open_debt()` gains one rule: when the stored owner is done and the observation's head does not contain its fix commit, the cycle closes and is not re-opened, and no `regressed_after_resolution` escalation fires.
 
+> **Amended 2026-10-19** by plans/offline-lane-red-path-prd.md (ε1, task 6864): §5.3's `call_site` vocabulary gains `offline_lane`; §5.9's `open_debt()` takes an optional debt context, and the de-flake task is built from the debt row and that context, with the cycle in every title; §8 and §8.4 gain optional per-test evidence on `FlakeSuppression`, kept in `flake_occurrence.detail` and on the wire; §8.1 and §8.3 now have one recorder body for every call site, with the storm alarm staying the merge gate's alone; and the gate-blind and systemic counters are reported per call site. That PRD's D6, §5.6 and §5.8 are the normative text.
+
 Goal, in Leo's words: *not to accept flaky tests, but to efficiently detect them, track them, limit
 the damage for as long as they exist, and de-flake them conclusively* — as a **mostly-unattended
 orchestrator subsystem** that escalates only on exceptional difficulty.
@@ -300,7 +302,7 @@ filing.* The ledger never marks a task done, never blocks one, never reprioritis
 task's lifecycle belongs to the orchestrator; the ledger only observes it.
 
 **"Removing the test from the ledger" is the ledger's act, not the agent's.** The de-flake task's
-text (`flake_ledger.py::RESPONSIBILITY_REMOVE_FROM_LEDGER`) tells the agent the ledger closes the cycle
+text (`flake_ledger.py::RESPONSIBILITY_KEEP_NODE_ID_STABLE`) tells the agent the ledger closes the cycle
 itself once it observes the task `done`. The agent cannot do it: the ledger is the main checkout's
 `data/orchestrator/runs.db` (`flake_ledger.py::ledger_db_path`), outside the task worktree the agent
 works in, and the agent's own task is not `done` while it runs. The close is `resolve_debt`'s, on a

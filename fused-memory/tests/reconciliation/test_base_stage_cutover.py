@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import sqlite3
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageAgentOutcome, StageId, Watermark
+from fused_memory.models.reconciliation import (
+    ReconciliationRun,
+    RunStatus,
+    RunType,
+    StageAgentOutcome,
+    StageId,
+    Watermark,
+)
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA, StageResult
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from reconciliation.consolidator_fixtures import make_consolidator
+from reconciliation.harness_fixtures import make_harness, open_journal
 
 
 class _StubStage(BaseStage):
@@ -55,15 +62,6 @@ def _make_stage(
         recon_report_state=recon_report_state,
     )
     return stage
-
-
-def _sqlite_busy_error() -> sqlite3.OperationalError:
-    """The journal lock error, carrying the classification the sqlite3 module
-    stamps on errors it raises itself (mirrors tests/test_harness.py::_sqlite_busy_error)."""
-    err = sqlite3.OperationalError('database is locked')
-    err.sqlite_errorname = 'SQLITE_BUSY'
-    err.sqlite_errorcode = 5
-    return err
 
 
 class _FakeReconState:
@@ -350,22 +348,14 @@ class TestHarnessForwardsReconState:
     """ReconciliationHarness must accept recon_report_state and forward it to all stages."""
 
     def _make_harness(self, state):
-        from unittest.mock import MagicMock
-
         from fused_memory.config.schema import FusedMemoryConfig
-        from fused_memory.reconciliation.harness import ReconciliationHarness
 
-        config = FusedMemoryConfig()
-        memory_mock = AsyncMock()
-        journal_mock = AsyncMock()
-        event_buffer_mock = MagicMock()
-
-        harness = ReconciliationHarness(
-            memory_service=memory_mock,
+        harness = make_harness(
+            journal=AsyncMock(),
+            event_buffer=MagicMock(),
+            memory_service=AsyncMock(),
             taskmaster=None,
-            journal=journal_mock,
-            event_buffer=event_buffer_mock,
-            config=config,
+            config=FusedMemoryConfig(),
             recon_report_state=state,
         )
         # Task 2146 β: the harness no longer pre-builds a long-lived `self.stages`
@@ -422,17 +412,16 @@ class TestMainWiringReconState:
     def test_harness_preserves_state_identity(self):
         """ReconciliationHarness preserves the exact state object passed at construction."""
         from fused_memory.config.schema import FusedMemoryConfig, ServerConfig
-        from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.server.main import _build_recon_report_components
 
         config = FusedMemoryConfig(server=ServerConfig(recon_report_port=8099))
         state, _, _ = _build_recon_report_components(config)
 
-        harness = ReconciliationHarness(
-            memory_service=AsyncMock(),
-            taskmaster=None,
+        harness = make_harness(
             journal=AsyncMock(),
             event_buffer=MagicMock(),
+            memory_service=AsyncMock(),
+            taskmaster=None,
             config=config,
             recon_report_state=state,
         )
@@ -843,387 +832,195 @@ class TestProseCitationScanWiring:
             assert report.stats[f'{prefix}_{suffix}'] == 0
 
 
-class TestSessionCaptureLifecycle:
-    """BaseStage.run mints a CLI session, persists it (record_run_session) BEFORE
-    launching the stage subprocess, forwards session_id + a per-run TaskConfigDir
-    into run_stage_via_cli, and clears the session afterwards — even when the stage
-    subprocess raises (finally path) — per task 2744."""
-
-    def _make_stage_with_real_journal_dir(self, tmp_path):
-        """_StubStage whose journal has a real data_dir + AsyncMock session methods."""
-        stage = _make_stage(recon_report_state=None)
-        journal = MagicMock()
-        journal.data_dir = tmp_path
-        journal.record_run_session = AsyncMock()
-        journal.clear_run_session = AsyncMock()
-        stage.journal = journal
-        return stage, journal
+class TestSessionMintAndRunRow:
+    """BaseStage.run mints a uuid4 CLI session and a per-run TaskConfigDir and
+    forwards both to run_stage_via_cli (task 2744); it writes nothing to the run
+    row (task 8745)."""
 
     @pytest.mark.asyncio
-    async def test_session_minted_persisted_and_forwarded(self, tmp_path):
+    async def test_session_minted_and_forwarded(self, tmp_path):
         from shared.config_dir import TaskConfigDir
 
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
-        watermark = Watermark(project_id='test_project')
-
-        call_log: list[str] = []
+        stage = _make_stage(recon_report_state=None)
+        stage.journal = MagicMock(data_dir=tmp_path)
         captured: dict = {}
 
-        async def _record(run_id, *, session_id, stage_cursor):
-            call_log.append('record')
-
         async def _runner(**kwargs):
-            call_log.append('runner')
             captured.update(kwargs)
             return StageResult(report={}, success=True)
-
-        async def _clear(run_id):
-            call_log.append('clear')
-
-        journal.record_run_session.side_effect = _record
-        journal.clear_run_session.side_effect = _clear
 
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
             new=AsyncMock(side_effect=_runner),
         ):
-            await stage.run([], watermark, [], run_id='run-sc1')
+            await stage.run([], Watermark(project_id='test_project'), [], run_id='run-sc1')
 
-        # (a) record_run_session BEFORE the runner; clear_run_session AFTER.
-        assert call_log == ['record', 'runner', 'clear'], (
-            f'expected mint-before-spawn / clear-after ordering, got {call_log!r}'
+        assert uuid.UUID(captured['session_id']).version == 4, (
+            'session_id must be a uuid4 string'
         )
-
-        # record_run_session got (run_id, session_id=<uuid4>, stage_cursor=<stage>).
-        journal.record_run_session.assert_awaited_once()
-        rc = journal.record_run_session.await_args
-        assert rc.args[0] == 'run-sc1'
-        session_id = rc.kwargs['session_id']
-        assert uuid.UUID(session_id).version == 4, 'session_id must be a uuid4 string'
-        assert rc.kwargs['stage_cursor'] == StageId.memory_consolidator.value
-
-        # (b) the runner received the SAME session_id and a per-run TaskConfigDir
-        #     under <data_dir>/recon-config.
-        assert captured['session_id'] == session_id
         cfg = captured['config_dir']
         assert isinstance(cfg, TaskConfigDir)
         assert cfg.path.parent == tmp_path / 'recon-config'
         assert cfg.path.name == 'claude-config-run-sc1'
 
-        # (c) clear_run_session was awaited with the run_id.
-        journal.clear_run_session.assert_awaited_once_with('run-sc1')
-
     @pytest.mark.asyncio
-    async def test_clear_runs_even_when_runner_raises(self, tmp_path):
-        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
-        watermark = Watermark(project_id='test_project')
+    async def test_a_stage_run_leaves_its_run_row_untouched(self, tmp_path):
+        async with open_journal(tmp_path / 'journal') as journal:
+            await journal.start_run(ReconciliationRun(
+                id='run-row-untouched',
+                project_id='test_project',
+                run_type=RunType.full,
+                trigger_reason='unit-test',
+                started_at=datetime.now(UTC),
+                status=RunStatus.running,
+            ))
+            before = await journal.get_run('run-row-untouched')
+            stage = _make_stage(recon_report_state=None)
+            stage.journal = journal
+            stage.config = ReconciliationConfig(explore_codebase_root=str(tmp_path / 'proj'))
 
-        with patch(
-            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(side_effect=RuntimeError('subprocess boom')),
-        ), pytest.raises(RuntimeError):
-            await stage.run([], watermark, [], run_id='run-sc2')
+            with patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=StageResult(report={}, success=True)),
+            ):
+                await stage.run(
+                    [], Watermark(project_id='test_project'), [], run_id='run-row-untouched',
+                )
 
-        # Mint-before-spawn happened, and clear ran in the finally despite the raise.
-        journal.record_run_session.assert_awaited_once()
-        journal.clear_run_session.assert_awaited_once_with('run-sc2')
+            after = await journal.get_run('run-row-untouched')
 
-    @pytest.mark.asyncio
-    async def test_preserves_session_snapshot_on_cancel(self, tmp_path):
-        """On asyncio.CancelledError from the runner (a restart interrupting an
-        in-flight stage), the session snapshot is PRESERVED — clear_run_session
-        is NOT called — so the interrupted run row retains session_id +
-        stage_cursor for the startup adopt-and-resume pass (task σ).
-
-        Contrast test_clear_runs_even_when_runner_raises: a NON-cancel exception
-        still clears (only a genuine cancellation preserves the snapshot)."""
-        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
-        watermark = Watermark(project_id='test_project')
-
-        with patch(
-            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(side_effect=asyncio.CancelledError()),
-        ), pytest.raises(asyncio.CancelledError):
-            await stage.run([], watermark, [], run_id='run-cancel')
-
-        # Mint-before-spawn happened...
-        journal.record_run_session.assert_awaited_once()
-        # ...but clear_run_session was NOT called on cancellation — the snapshot
-        # survives on the interrupted run row for the resume pass.
-        journal.clear_run_session.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_clear_called_exactly_once_on_normal_return(self, tmp_path):
-        """Complement to the cancel case: a normal runner return DOES clear the
-        session snapshot, exactly once."""
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
-        watermark = Watermark(project_id='test_project')
-
-        with patch(
-            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(return_value=StageResult(report={}, success=True)),
-        ):
-            await stage.run([], watermark, [], run_id='run-normal')
-
-        journal.clear_run_session.assert_awaited_once_with('run-normal')
-
-    @staticmethod
-    def _one_snapshot_warning(caplog, op: str) -> str:
-        lines = [
-            r.getMessage() for r in caplog.records
-            if r.name == 'fused_memory.reconciliation.stages.base'
-            and r.levelno == logging.WARNING
-            and op in r.getMessage()
-        ]
-        assert len(lines) == 1, f'expected exactly one {op!r} WARNING, got {lines!r}'
-        return lines[0]
-
-    @pytest.mark.asyncio
-    async def test_record_session_failure_is_logged_and_stage_still_runs(
-        self, tmp_path, caplog,
-    ):
-        """The snapshot is advisory: a journal lock on record_run_session must
-        not stop the stage from running (task 5561)."""
-        from fused_memory.models.reconciliation import StageReport
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
-        journal.record_run_session.side_effect = _sqlite_busy_error()
-        runner = AsyncMock(return_value=StageResult(report={}, success=True))
-
-        with caplog.at_level(
-            logging.WARNING, logger='fused_memory.reconciliation.stages.base',
-        ), patch('fused_memory.reconciliation.stages.base.run_stage_via_cli', new=runner):
-            report = await stage.run(
-                [], Watermark(project_id='test_project'), [], run_id='run-rec-locked',
-            )
-
-        assert isinstance(report, StageReport)
-        runner.assert_awaited_once()
-        journal.clear_run_session.assert_awaited_once_with('run-rec-locked')
-        line = self._one_snapshot_warning(caplog, 'record_run_session')
-        assert 'run-rec-locked' in line
-        assert stage.stage_id.value in line
-        assert 'sqlite_errorname=SQLITE_BUSY' in line
-
-    @pytest.mark.asyncio
-    async def test_clear_session_failure_does_not_replace_a_successful_return(
-        self, tmp_path, caplog,
-    ):
-        from fused_memory.models.reconciliation import StageReport
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
-        journal.clear_run_session.side_effect = _sqlite_busy_error()
-
-        with caplog.at_level(
-            logging.WARNING, logger='fused_memory.reconciliation.stages.base',
-        ), patch(
-            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(return_value=StageResult(report={}, success=True)),
-        ):
-            report = await stage.run(
-                [], Watermark(project_id='test_project'), [], run_id='run-clr-locked',
-            )
-
-        assert isinstance(report, StageReport)
-        line = self._one_snapshot_warning(caplog, 'clear_run_session')
-        assert 'run-clr-locked' in line
-        assert 'sqlite_errorname=SQLITE_BUSY' in line
-
-    @pytest.mark.asyncio
-    async def test_clear_session_failure_does_not_mask_the_stage_exception(self, tmp_path):
-        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
-        journal.clear_run_session.side_effect = _sqlite_busy_error()
-
-        with patch(
-            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(side_effect=RuntimeError('subprocess boom')),
-        ), pytest.raises(RuntimeError, match='subprocess boom'):
-            await stage.run(
-                [], Watermark(project_id='test_project'), [], run_id='run-clr-mask',
-            )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('cancelled_write', ['record_run_session', 'clear_run_session'])
-    async def test_session_write_cancellation_still_propagates(
-        self, tmp_path, cancelled_write,
-    ):
-        """Best-effort means Exception only: a cancellation landing in either
-        snapshot write still cancels the stage."""
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
-        getattr(journal, cancelled_write).side_effect = asyncio.CancelledError()
-        runner = AsyncMock(return_value=StageResult(report={}, success=True))
-
-        with patch(
-            'fused_memory.reconciliation.stages.base.run_stage_via_cli', new=runner,
-        ), pytest.raises(asyncio.CancelledError):
-            await stage.run(
-                [], Watermark(project_id='test_project'), [], run_id='run-cancel-write',
-            )
-
-        if cancelled_write == 'record_run_session':
-            runner.assert_not_awaited()
+        assert before is not None and after is not None
+        assert after == before, (
+            'a stage run must leave its run row untouched: '
+            f'before (session_id, stage_cursor, attempt) = '
+            f'{(before.session_id, before.stage_cursor, before.attempt)!r}, '
+            f'after = {(after.session_id, after.stage_cursor, after.attempt)!r}'
+        )
 
 
-class TestBaseStageResumeSession:
-    """BaseStage.run(resume_session_id=...) — the task σ resume seam.
+class TestStageTranscriptArchival:
+    """BaseStage.run COPIES each stage transcript into the archive on every exit,
+    leaving the source for the harness teardown to archive-then-delete (task 3972).
 
-    When the startup adopt-and-resume pass supplies the in-flight session id, the
-    stage validates that session's transcript is still on disk in this run's
-    per-run config dir (record_run_session's snapshot is best-effort), and if so
-    --resumes it by delivering a purpose-written recovery prompt
-    (resume_delivers_prompt=True) instead of the bare CRASH_RECOVERY placeholder.
-    A missing/empty transcript drops --resume and runs the stage fresh."""
+    Every stage gets an explicit tmp ``explore_codebase_root``: the schema
+    default '.' would make archival write into the test cwd."""
 
-    def _make_stage_with_real_journal_dir(self, tmp_path):
-        """_StubStage whose journal has a real data_dir + AsyncMock session methods."""
+    ENC = '-home-leo-src-dark-factory'
+    TRANSCRIPT = b'{"type":"user","message":"stage payload"}\n'
+
+    def _make_archiving_stage(self, tmp_path, **config_overrides):
         stage = _make_stage(recon_report_state=None)
-        journal = MagicMock()
-        journal.data_dir = tmp_path
-        journal.record_run_session = AsyncMock()
-        journal.clear_run_session = AsyncMock()
-        stage.journal = journal
-        return stage, journal
-
-    @pytest.mark.asyncio
-    async def test_valid_transcript_resumes_with_recovery_prompt(self, tmp_path):
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, _journal = self._make_stage_with_real_journal_dir(tmp_path)
-        watermark = Watermark(project_id='test_project')
-
-        captured: dict = {}
-
-        async def _runner(**kwargs):
-            captured.update(kwargs)
-            return StageResult(report={'summary': 'ok'}, success=True)
-
-        with patch(
-            'fused_memory.reconciliation.stages.base.read_transcript_records',
-            return_value=[{'type': 'assistant'}],
-        ) as mock_read, patch(
-            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(side_effect=_runner),
-        ):
-            await stage.run(
-                [], watermark, [], run_id='run-resume', resume_session_id='S-old'
-            )
-
-        # (a) the transcript was validated for the RESUME session over the per-run
-        #     config dir (keyed on run_id, so stable across the interrupt).
-        mock_read.assert_called_once()
-        assert mock_read.call_args.args[1] == 'S-old', (
-            'read_transcript_records must be validated against the resume_session_id'
+        stage.journal = MagicMock(data_dir=tmp_path / 'data')
+        stage.config = ReconciliationConfig(
+            explore_codebase_root=str(tmp_path / 'proj'), **config_overrides,
         )
+        return stage
 
-        # (b) the resume seam is forwarded to the runner.
-        assert captured['resume_session_id'] == 'S-old'
-        assert captured['resume_delivers_prompt'] is True
-
-        # (c) the delivered prompt is a purpose-written recovery prompt — interrupted
-        #     framing, write_journal / causation_id run_id guidance — NOT the bare
-        #     CRASH_RECOVERY placeholder; and it retains the full stage payload so a
-        #     fresh-fallback (resume failure) still carries full context.
-        prompt = captured['payload']
-        assert 'write_journal' in prompt
-        assert 'causation_id' in prompt
-        assert 'run-resume' in prompt
-        assert 'test payload' in prompt, 'full stage payload must be retained for fresh-fallback'
-
-        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT
-
-        assert prompt != CRASH_RECOVERY_RESUME_PROMPT
-
-    @pytest.mark.asyncio
-    async def test_missing_transcript_drops_resume_and_runs_fresh(self, tmp_path):
+    def _transcript_writing_runner(self, captured: dict, raises=None):
+        """Plant the transcript where the CLI writes it, in the forwarded config dir."""
         from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, _journal = self._make_stage_with_real_journal_dir(tmp_path)
-        watermark = Watermark(project_id='test_project')
-
-        captured: dict = {}
 
         async def _runner(**kwargs):
             captured.update(kwargs)
-            return StageResult(report={'summary': 'ok'}, success=True)
+            session_dir = kwargs['config_dir'].path / 'projects' / self.ENC
+            session_dir.mkdir(parents=True, exist_ok=True)
+            source = session_dir / f"{kwargs['session_id']}.jsonl"
+            source.write_bytes(self.TRANSCRIPT)
+            captured['source'] = source
+            if raises is not None:
+                raise raises
+            return StageResult(report={}, success=True)
 
-        with patch(
-            'fused_memory.reconciliation.stages.base.read_transcript_records',
-            return_value=None,  # transcript file could not be located
-        ), patch(
-            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(side_effect=_runner),
-        ):
-            await stage.run(
-                [], watermark, [], run_id='run-fresh', resume_session_id='S-stale'
-            )
+        return AsyncMock(side_effect=_runner)
 
-        # --resume dropped: fresh invocation, no recovery prompt.
-        assert captured['resume_session_id'] is None
-        assert captured['resume_delivers_prompt'] is False
-        assert 'write_journal' not in captured['payload'], (
-            'a fresh (dropped-resume) run must not carry recovery framing'
+    def _archived(self, tmp_path, run_id, session_id):
+        return (
+            tmp_path / 'proj' / 'data' / 'orchestrator' / 'agent-transcripts'
+            / f'recon-{run_id}' / self.ENC / f'{session_id}.jsonl'
         )
 
     @pytest.mark.asyncio
-    async def test_empty_transcript_list_also_drops_resume(self, tmp_path):
-        """read_transcript_records returning [] (file located, no parseable records)
-        is treated identically to None — drop --resume, run fresh."""
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, _journal = self._make_stage_with_real_journal_dir(tmp_path)
-        watermark = Watermark(project_id='test_project')
-
+    async def test_stage_transcript_is_copied_to_the_archive(self, tmp_path):
+        stage = self._make_archiving_stage(tmp_path)
         captured: dict = {}
 
-        async def _runner(**kwargs):
-            captured.update(kwargs)
-            return StageResult(report={'summary': 'ok'}, success=True)
-
         with patch(
-            'fused_memory.reconciliation.stages.base.read_transcript_records',
-            return_value=[],
-        ), patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(side_effect=_runner),
+            new=self._transcript_writing_runner(captured),
         ):
-            await stage.run(
-                [], watermark, [], run_id='run-empty', resume_session_id='S-empty'
-            )
+            await stage.run([], Watermark(project_id='test_project'), [], run_id='run-a1')
 
-        assert captured['resume_session_id'] is None
-        assert captured['resume_delivers_prompt'] is False
+        archived = self._archived(tmp_path, 'run-a1', captured['session_id'])
+        assert archived.read_bytes() == self.TRANSCRIPT
 
     @pytest.mark.asyncio
-    async def test_no_resume_session_id_is_todays_fresh_behaviour(self, tmp_path):
-        """Omitting resume_session_id (the default) never touches the transcript
-        validator and forwards no --resume — today's behaviour verbatim."""
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-
-        stage, _journal = self._make_stage_with_real_journal_dir(tmp_path)
-        watermark = Watermark(project_id='test_project')
-
+    async def test_source_transcript_survives_the_archival(self, tmp_path):
+        """The producer COPIES: deleting the source is the teardown half's job."""
+        stage = self._make_archiving_stage(tmp_path)
         captured: dict = {}
 
-        async def _runner(**kwargs):
-            captured.update(kwargs)
-            return StageResult(report={'summary': 'ok'}, success=True)
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(captured),
+        ):
+            await stage.run([], Watermark(project_id='test_project'), [], run_id='run-a2')
+
+        assert self._archived(tmp_path, 'run-a2', captured['session_id']).exists()
+        assert captured['source'].read_bytes() == self.TRANSCRIPT
+
+    @pytest.mark.asyncio
+    async def test_archival_runs_even_when_the_stage_is_cancelled(self, tmp_path):
+        """A cancelled stage still archives its transcript."""
+        stage = self._make_archiving_stage(tmp_path)
+        captured: dict = {}
 
         with patch(
-            'fused_memory.reconciliation.stages.base.read_transcript_records',
-        ) as mock_read, patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(side_effect=_runner),
-        ):
-            await stage.run([], watermark, [], run_id='run-noresume')
+            new=self._transcript_writing_runner(
+                captured, raises=asyncio.CancelledError(),
+            ),
+        ), pytest.raises(asyncio.CancelledError):
+            await stage.run([], Watermark(project_id='test_project'), [], run_id='run-a3')
 
-        mock_read.assert_not_called()
-        assert captured['resume_session_id'] is None
-        assert captured['resume_delivers_prompt'] is False
+        archived = self._archived(tmp_path, 'run-a3', captured['session_id'])
+        assert archived.read_bytes() == self.TRANSCRIPT
+
+    @pytest.mark.asyncio
+    async def test_disabled_config_archives_nothing(self, tmp_path):
+        stage = self._make_archiving_stage(
+            tmp_path, transcript_archive_enabled=False,
+        )
+        captured: dict = {}
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(captured),
+        ):
+            report = await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-a5',
+            )
+
+        assert report is not None
+        assert not (tmp_path / 'proj' / 'data' / 'orchestrator').exists()
+
+    @pytest.mark.asyncio
+    async def test_a_broken_archive_root_does_not_fail_the_stage(self, tmp_path):
+        """The archive root's parent is a regular FILE, so its mkdir raises
+        (binding even under root, unlike chmod); the hook is total."""
+        (tmp_path / 'proj').mkdir()
+        (tmp_path / 'proj' / 'blocker').write_text('not a directory')
+        stage = self._make_archiving_stage(
+            tmp_path, transcript_archive_root='blocker/archive',
+        )
+        captured: dict = {}
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(captured),
+        ):
+            report = await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-a6',
+            )
+
+        assert report is not None
+        assert captured['source'].read_bytes() == self.TRANSCRIPT

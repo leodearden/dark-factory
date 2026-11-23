@@ -5,8 +5,9 @@ post-merge-pyright gates, the advance-finalize and advance-failure-mapping
 functions, the ``merge_attempt`` event emitter they share with the worker,
 and their supporting types and reason-prefix constants.
 
-Verify EXECUTION (``_run_post_merge_verify`` and its cluster) stays in the
-worker — this module owns gate POLICY, not verify execution (PRD Open Q1).
+Verify EXECUTION (``merge_lane/post_merge_verify.py::run_post_merge_verify``
+and its cluster) lives outside this module — this module owns gate POLICY,
+not verify execution (PRD Open Q1).
 Where a gate needs a worker function, the worker injects it: the re-verify
 through ``_reverify_rebased_tree``'s *run_post_merge_verify*, the γ2
 auto-chain through :class:`_GenerationChainContext`.  This module never
@@ -17,13 +18,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import os
 import posixpath
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -31,13 +33,25 @@ from typing import TYPE_CHECKING, Literal
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence
+from orchestrator.merge_lane.reverify_gate_decision import (
+    MAX_LOGGED_OVERLAP_PATHS,
+    GateClearance,
+    ReverifyDispatch,
+    ReverifyGateDecision,
+    ReverifyGateReason,
+    emit_reverify_gate_decision,
+)
 from orchestrator.merge_lane.types import (
     MergeOutcome,
     MergeRequest,
     OutcomeKind,
     TerminalOutcomeRetention,
 )
+from orchestrator.rebase_drops import DroppedCommit, RebaseDropLedger
 from orchestrator.verify import VerifyResult, run_verification
+from orchestrator.verify_evidence import GREEN_OUTCOMES, Leg, module_leg_name, units_from_wire
+from orchestrator.verify_plan import full_suite_type_check_modules, merge_breadth_is_full
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -76,6 +90,7 @@ async def _run_unscoped_typechecks(
     *,
     block_on_timeout: bool,
     task_id: str | None = None,
+    executed: VerifyResult | None = None,
 ) -> PostMergePyrightResult:
     """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
 
@@ -93,12 +108,19 @@ async def _run_unscoped_typechecks(
             When ``False``, a timed-out module is appended only to
             ``timed_out_subprojects`` (fail-open, for the post-advance check).
         task_id: Optional task identifier for log messages.
+        executed: The scoped verify this gate follows (pre-advance only). At
+            breadth ``'full'`` a module it already type-checked green is not
+            re-run; see :func:`_type_covered_modules`.
 
     Returns:
         :class:`PostMergePyrightResult` with the classification of each
         module's type-check outcome.
     """
-    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    covered = _type_covered_modules(executed, config)
+    active = [
+        mc for mc in module_configs
+        if mc.type_check_command is not None and mc.prefix not in covered
+    ]
     if not active:
         return PostMergePyrightResult()
 
@@ -146,6 +168,24 @@ async def _run_unscoped_typechecks(
     )
 
 
+def _type_covered_modules(executed: VerifyResult | None, config: OrchestratorConfig) -> frozenset[str]:
+    """The modules whose unscoped pyright *executed* already ran green, or replayed.
+
+    Task 5294: the gate consults what the scoped leg ran rather than handing
+    ``LocalRunner`` a second module set (INV-5). Only breadth ``'full'``
+    consults, so ``'scoped'`` is unchanged. A module counts when the executed
+    plan holds a FULL_SUITE pyright run with a command and its type unit is
+    green; a result without units (an older remote) is decided by its plan.
+    """
+    if executed is None or not merge_breadth_is_full(config):
+        return frozenset()
+    planned = full_suite_type_check_modules(executed.plan)
+    if executed.units is None:
+        return planned
+    green = {unit.unit for unit in units_from_wire(executed.units) if unit.outcome in GREEN_OUTCOMES}
+    return frozenset(prefix for prefix in planned if module_leg_name(prefix, Leg.TYPE) in green)
+
+
 def _elapsed_ms(start: float | None) -> int | None:
     """Milliseconds since *start* (a ``time.monotonic()`` value).
 
@@ -183,6 +223,8 @@ def _emit_merge_attempt(
     origin_host: Literal['local', 'remote'] | None = None,
     probe_host: Literal['local', 'remote'] | None = None,
     skew_evidence: SkewEvidence | None = None,
+    gate_clearance: GateClearance | None = None,
+    conflict_evidence: ConflictEvidence | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -234,6 +276,18 @@ def _emit_merge_attempt(
     is made self-describing. When omitted or None (every pre-3178 call site), no
     key is added — existing callers' payloads stay byte-identical.
 
+    *gate_clearance* is why a rebased tree cleared
+    :func:`_reverify_rebased_tree` (task 6647), written under
+    ``'gate_clearance'`` on a ``gate_retry`` row.  When omitted (every other
+    call site), no key is added -- existing callers' payloads stay
+    byte-identical.
+
+    *conflict_evidence* is the conflicted paths of a ``conflict`` outcome
+    (task 7302), written through :meth:`ConflictEvidence.to_event_payload` so
+    this row spells them exactly as the workflow's ``merge_blocked`` row does.
+    When omitted (every non-conflict call site), no key is added -- existing
+    callers' payloads stay byte-identical.
+
     This helper is deliberately disposition-AGNOSTIC about evidence: it writes
     whatever bundle it is handed, and deciding *when* to emit at all is the
     caller's guard. That is what lets one code path serve both the
@@ -253,6 +307,8 @@ def _emit_merge_attempt(
             data['origin_host'] = origin_host
         if probe_host is not None:
             data['probe_host'] = probe_host
+        if gate_clearance is not None:
+            data['gate_clearance'] = gate_clearance.value
         if skew_evidence is not None:
             for key, items in (
                 ('failing_tests', skew_evidence.failing_tests),
@@ -263,55 +319,60 @@ def _emit_merge_attempt(
                 # Recorded unconditionally: a reader never has to know the cap
                 # to tell a short citation from a truncated one.
                 data[f'{key}_total'] = len(items)
+        if conflict_evidence is not None:
+            data.update(conflict_evidence.to_event_payload())
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
         )
 
 
-#: Bounded FIFO of main-tip SHAs this process's merge queue itself landed —
-#: i.e. the main tips a GREEN gate run has actually been observed on.
+#: Per repository, a bounded FIFO of the main-tip SHAs that repository's merge
+#: queue itself landed — i.e. the main tips a GREEN gate run has actually been
+#: observed on.
 #:
 #: Written at the single clean-landing return of :func:`_finalize_advanced_merge`
 #: (shared by SpeculativeMergeWorker's CAS advance and the train pipeline), read
 #: by :func:`_reverify_rebased_tree` to decide whether footprint-disjointness may
 #: be trusted (see :func:`_disjoint_skip_blockers`).
 #:
-#: Process-global rather than worker-owned on purpose: there is exactly one merge
-#: queue per orchestrator process, both landing paths funnel through
-#: ``_finalize_advanced_merge``, and the alternative (threading a handle through
-#: the module-level finalize/advance helpers and the ``_TrainMergeHost`` protocol)
-#: would fan the same one fact out across four signatures.  Same shape as
-#: ``verify._suppressed_flake_records`` and ``MergeProvenance``'s process-global
-#: facade.
+#: Module-level storage keyed by the landing queue's ``GitOps.project_root``, so
+#: the stored fact is "this queue landed it green", not "some queue in this
+#: process did".  A byte-identical commit in another repository is never vouched
+#: for; such commits are routine for test fixtures copied from one template and
+#: committed within one second.  Pinned by
+#: orchestrator/tests/test_merge_reverify_gate_record.py::TestReverifyGateRecordsItsDecision::test_a_tip_another_repositorys_queue_landed_does_not_vouch_for_this_one.
 #:
 #: NOT durable, and deliberately so: after a restart the set is empty, every
 #: rebase-under-drift re-verifies, and the registry refills from the first
 #: landing onward.  Empty means "I have not seen this tip go green", which is
 #: the fail-SAFE answer — the same direction ``_OVERLAP_GIT_ERROR_SENTINEL``
-#: fails.
-_QUEUE_VERIFIED_MAIN_TIPS: list[str] = []
+#: fails.  A root spelled differently from the landing queue's (a symlink, a
+#: relative path) gets that same answer: keys compare as given, unresolved, and
+#: every production writer and reader passes the worker's one ``GitOps``.
+_QUEUE_VERIFIED_MAIN_TIPS: dict[Path, list[str]] = {}
 
-#: Cap on :data:`_QUEUE_VERIFIED_MAIN_TIPS`.  Only the most recent tips can ever
-#: be a rebase target (a rebase is onto CURRENT main), so a short window is
-#: sufficient; the bound exists so a long-lived process cannot grow the list
-#: without limit.
+#: Per-repository cap on :data:`_QUEUE_VERIFIED_MAIN_TIPS`.  Only the most
+#: recent tips can ever be a rebase target (a rebase is onto CURRENT main), so a
+#: short window is sufficient; the bound exists so a long-lived process cannot
+#: grow the list without limit.
 _QUEUE_VERIFIED_MAIN_TIPS_CAP = 64
 
 
-def note_queue_verified_main_tip(sha: str) -> None:
-    """Record *sha* as a main tip this queue landed after a green gate run."""
+def note_queue_verified_main_tip(project_root: Path, sha: str) -> None:
+    """Record *sha* as a main tip *project_root*'s queue landed after a green gate run."""
     if not sha:
         return
-    if sha in _QUEUE_VERIFIED_MAIN_TIPS:
+    tips = _QUEUE_VERIFIED_MAIN_TIPS.setdefault(project_root, [])
+    if sha in tips:
         return
-    _QUEUE_VERIFIED_MAIN_TIPS.append(sha)
-    del _QUEUE_VERIFIED_MAIN_TIPS[:-_QUEUE_VERIFIED_MAIN_TIPS_CAP]
+    tips.append(sha)
+    del tips[:-_QUEUE_VERIFIED_MAIN_TIPS_CAP]
 
 
-def main_tip_is_queue_verified(sha: str) -> bool:
-    """True iff *sha* is a main tip this queue landed after a green gate run."""
-    return bool(sha) and sha in _QUEUE_VERIFIED_MAIN_TIPS
+def main_tip_is_queue_verified(project_root: Path, sha: str) -> bool:
+    """True iff *sha* is a main tip *project_root*'s queue landed after a green gate run."""
+    return bool(sha) and sha in _QUEUE_VERIFIED_MAIN_TIPS.get(project_root, ())
 
 
 @dataclass
@@ -333,9 +394,12 @@ class PlanFilesTouchedResult:
 
     Attributes:
         not_touched: Plan-file entries that the branch's history did NOT
-            touch.  Non-empty means the architect declared work that the
-            branch never actually delivered.  Empty list means every plan
-            entry is covered by some commit on the branch.
+            touch, so the gate fails when it is non-empty.  Empty list means
+            every plan entry is covered by some commit on the branch.  Why an
+            entry is untouched is told by the fields below: a stale path
+            (``missing_from_tree``) or a change a rebase dropped
+            (``dropped_by_rebase``) is not under-delivery; an entry in
+            neither is.
         missing_from_tree: Declared entries that do NOT exist in the branch
             tree at ``branch_head`` and for which no rename resolved.
             ALWAYS a subset of ``not_touched`` (a stale entry is reported in
@@ -357,11 +421,36 @@ class PlanFilesTouchedResult:
             architect's spelling, pre-normalization) so the diagnostic names
             exactly what plan.json says.  A resolution alone never passes the
             gate — the resolved path must additionally be in the touched set.
+        dropped_by_rebase: Declared entry → the commits a rebase dropped
+            from the branch that wrote it, keyed by the ORIGINAL declared
+            string like ``resolved_renames``.  ALWAYS a subset of
+            ``not_touched`` and disjoint from ``missing_from_tree``, which
+            construction enforces.  A key means the branch DID write a change
+            to that entry and a later rebase dropped it because the rebase
+            target already carried the change (task 4669) — not
+            under-delivery.
+        touched_set_error: The branch's history scan failed, so
+            ``not_touched`` lists every declared entry UNMEASURED and
+            nothing about the branch can be concluded from it.  ``None``
+            when the touched set was read.
     """
 
     not_touched: list[str] = field(default_factory=list)
     missing_from_tree: list[str] = field(default_factory=list)
     resolved_renames: dict[str, str] = field(default_factory=dict)
+    dropped_by_rebase: dict[str, tuple[DroppedCommit, ...]] = field(default_factory=dict)
+    touched_set_error: str | None = None
+
+    def __post_init__(self) -> None:
+        dropped = set(self.dropped_by_rebase)
+        not_untouched = sorted(dropped - set(self.not_touched))
+        missing = sorted(dropped & set(self.missing_from_tree))
+        if not_untouched or missing:
+            raise ValueError(
+                'dropped_by_rebase must be a subset of not_touched and disjoint '
+                f'from missing_from_tree; not in not_touched: {not_untouched}, '
+                f'in missing_from_tree: {missing}'
+            )
 
 
 DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
@@ -379,6 +468,76 @@ the branch's history (``base..HEAD``) doesn't touch them, the implementation
 hasn't actually delivered against the plan — short-circuit straight to L1
 without involving the steward (mutating plan.json to silence the gate
 would defeat its purpose)."""
+
+
+def plan_files_not_touched_reason(check: PlanFilesTouchedResult) -> str:
+    """The block reason for a failed plan-files gate, scoped class by class.
+
+    The head, :data:`PLAN_FILES_NOT_TOUCHED_REASON_PREFIX` plus every
+    untouched entry, is the contract
+    ``orchestrator/src/orchestrator/unblock_types.py::classify_block_reason``
+    keys on via ``startswith``.  Each clause after it names only its own
+    class, because each class is a different failure: entries no commit
+    touched, entries a rebase dropped (task 4669), entries absent from the
+    tree (task 3110), and the rename audit trail.
+    """
+    stale_set = set(check.missing_from_tree)
+    live = [e for e in check.not_touched if e not in stale_set]
+    return ''.join((
+        f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: {", ".join(check.not_touched)}. ',
+        _unwritten_clause([e for e in live if e not in check.dropped_by_rebase]),
+        _dropped_clause({
+            e: check.dropped_by_rebase[e] for e in live if e in check.dropped_by_rebase
+        }),
+        _stale_clause([e for e in check.not_touched if e in stale_set]),
+        _rename_clause(check.resolved_renames),
+    )).strip()
+
+
+def _unwritten_clause(entries: list[str]) -> str:
+    if not entries:
+        return ''
+    return (
+        f'The architect declared these files but no commit on the branch '
+        f'touched them: {", ".join(entries)}.  '
+        f'Implementation has not delivered against the plan.  '
+    )
+
+
+def _dropped_clause(dropped: dict[str, tuple[DroppedCommit, ...]]) -> str:
+    if not dropped:
+        return ''
+    entries = '; '.join(
+        f'{entry} (by {", ".join(commit.label for commit in commits)})'
+        for entry, commits in dropped.items()
+    )
+    return (
+        f'These changes were written on this branch and then dropped by a '
+        f'rebase whose target already carried them, so this is not an '
+        f'implementation gap: {entries}.  Re-derive each change against '
+        f'current main (a version or cache-buster bump must be recomputed '
+        f"past main's value), commit it, and re-submit.  "
+    )
+
+
+def _stale_clause(entries: list[str]) -> str:
+    if not entries:
+        return ''
+    return (
+        f'Declared path does not exist in the tree at branch HEAD (renamed or '
+        f'never created), so the branch-touched set was not consulted for: '
+        f'{", ".join(entries)} — investigate the declared path, not the '
+        f'branch.  '
+    )
+
+
+def _rename_clause(resolved_renames: dict[str, str]) -> str:
+    if not resolved_renames:
+        return ''
+    pairs = ', '.join(
+        f'{declared} -> {resolved}' for declared, resolved in resolved_renames.items()
+    )
+    return f'Rename resolution: {pairs}.'
 
 
 CROSS_REPO_DELIVERABLE_REASON_PREFIX = 'Cross-repo deliverable'
@@ -454,10 +613,10 @@ before this prefix may be used, and for the three traps a naive version misses.
 
 ALREADY_LANDED_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
-    r'\(#?{tid}\)!?:'
-    r'|^Merge task/{tid} into '
+    r'\(#?{tid}([ ,/][^)]*)?\)!?:'
+    r'|{merge_subject}'
 )
-r"""STRICTER citation template for :func:`_resolve_already_landed_branch`.
+r"""Scope-position citation template for :func:`_resolve_already_landed_branch`.
 
 ``GitOps.DEFAULT_COMMIT_CITATION_PATTERN`` is deliberately permissive — it
 also accepts the UNANCHORED ``\(#?{tid}\)`` / ``\(task {tid}\)`` alternatives
@@ -471,18 +630,29 @@ wrong for THIS question, which is "is this commit this task's own delivery":
 and both touch exactly the paths the original landing touched, so signal 3
 (coverage) passes too and the branch is declared already-landed on a commit
 that is the OPPOSITE of its delivery.  Requiring the id in the
-conventional-commit SCOPE position — ``impl(3717):`` — is what separates an
-AUTHORED delivery from a commit that merely mentions the id.
+conventional-commit SCOPE position is what separates an AUTHORED delivery
+from a commit that merely mentions the id.  The id may close the scope
+(``impl(3717):``) or be followed by a qualifier (``impl(3717 step-8):``,
+``feat(3717/step-2):``); a qualifier is still scope position, so the reading
+holds, and only the scope's LEADING id attributes (``fix(4200/3717):`` is
+4200's).  Why the qualifier separator class is closed to ``[ ,/]`` (no dot,
+no hyphen) is stated once, in the doc comment of
+``orchestrator/src/orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN``;
+``orchestrator/tests/test_already_landed_citation_pattern.py`` pins that the
+two templates agree on scope-position subjects, with one exception: a
+``#``-led qualified scope (``fix(#3717 step-1):``) attributes here, but the
+default does not cite it at all.
 
-Measured before narrowing, on this repo's last 4000 main commits: 1298
-subjects match this strict form, and exactly ONE subject matched only the
-dropped arms (itself a body-line false-cite, not a real citation).  So the
-narrowing costs no real attribution and removes the whole false-cite class.
-Anything it does miss falls through to the UNCHANGED
+The narrowing trades recall for precision: a delivery cited only outside
+scope position, as in ``fix(git_ops): ... (task 3717)``, is not attributed
+here (census: the message of commit ``impl(6221 step-2): accept the qualified
+scope``).  Anything this template misses falls through to the UNCHANGED
 ``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
 
 Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
-``find_task_citation_commit`` requires of any override.
+``find_task_citation_commit`` requires of any override; its ``{merge_subject}``
+arm is filled by ``orchestrator/src/orchestrator/git_ops.py::render_citation_pattern``
+from the GitOps config.
 """
 
 
@@ -903,7 +1073,10 @@ async def _finalize_advanced_merge(
     from :class:`~orchestrator.git_ops.AdvanceOutcome`.advanced_sha (task
     1997) — callers must pass ``outcome.advanced_sha`` from the
     ``advance_main`` call that preceded this one.  ``None`` (e.g. no rebase
-    occurred) falls back to *merge_commit_fallback*.
+    occurred) falls back to *merge_commit_fallback*.  One caller lands nothing
+    itself: ``worker.py::SpeculativeMergeWorker._finalize_landed_by_successor``
+    passes a verified commit a later landing already carried onto main, so
+    there *advanced_sha* is on main but behind its tip (task 7196).
     """
     cas_retries.pop(req.task_id, None)
     timeouts.pop(req.task_id, None)
@@ -1019,14 +1192,17 @@ async def _finalize_advanced_merge(
     # so consecutive tip-advances count is cleared for this branch.
     if chain_ctx is not None:
         chain_ctx.counts.pop(req.branch.bare_id, None)
-    # Main is now at *advanced_sha* and every post-advance gate passed, so this
-    # tip is one a green gate run has been observed on.  Recorded here — the
+    # *advanced_sha* is on main and every post-advance gate passed, so it is a
+    # commit a green gate run has been observed on.  For every caller but
+    # _finalize_landed_by_successor it is main's tip; that caller's sha sits
+    # behind the tip and can never be a rebase target, so recording it is
+    # inert there.  Recorded here — the
     # single clean-landing return shared by the speculative CAS advance and the
     # train pipeline — so that a LATER request rebased onto it may trust the
     # disjoint-delta fast path (premise P2 in _disjoint_skip_blockers).  A tip
     # produced by any other writer (nightly job, direct commit, push) never
     # reaches this line and is therefore never trusted.
-    note_queue_verified_main_tip(advanced_sha)
+    note_queue_verified_main_tip(git_ops.project_root, advanced_sha)
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
@@ -1292,17 +1468,6 @@ async def _map_advance_failure(
             f'{f" (+{len(at_risk) - 20} more)" if len(at_risk) > 20 else ""}.'
             if at_risk else ''
         )
-        # WORDING CONSTRAINT — do not reintroduce the token 'ff' (as in
-        # "stood off") or the word 'advanced' anywhere in this reason.
-        # workflow.py's blocked path infers the merge-failure review category
-        # with a bare substring test
-        # (`'ff' in reason.lower() or 'advanced' in reason.lower()`
-        # -> category 'merge_ff_failed'), which then flows into
-        # `_write_merge_failure_review`, the merge_blocked event's
-        # data.category, and the signature-aware L1 dedup key.  "stood off"
-        # matched it, durably filing every index-lock stand-off as a
-        # fast-forward failure.  Pinned by
-        # test_reason_is_not_miscategorised_as_a_ff_failure.
         return MergeOutcome(
             'blocked',
             reason=(
@@ -1811,7 +1976,7 @@ async def resolve_already_landed_branch(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'already-landed: probe raised for task_id=%s branch=%s — failing '
             'closed (the unchanged plan_files_not_touched path runs)',
@@ -1884,7 +2049,7 @@ async def _resolve_already_landed_branch(
     evidence exactly: 3604's landed file set equals its 3 declared plan
     files, 3572's equals its 7.
 
-    **4. SURVIVAL** — :meth:`GitOps.commit_effect_present_in_main` says the
+    **4. SURVIVAL** — ``describe_commit_effect_in_main(...).present`` says the
     attributing commit's own effect is STILL PRESENT at main's current HEAD
     (amendment pass, review finding #1).  Signals 1-3 are all statements about
     IMMUTABLE HISTORY: a merge commit stays an ancestor of main forever, and
@@ -2011,18 +2176,17 @@ async def _resolve_already_landed_branch(
         return None
 
     # --- signal 3: the landing COVERS every declared entry -----------------
-    touched = await git_ops.get_files_touched_in_branch(
+    touched, touched_err = await git_ops.get_files_touched_in_branch(
         f'{landed_sha}^1', landed_sha,
     )
     touched_set = set(touched)
-    if not touched_set:
-        # `get_files_touched_in_branch` fails OPEN with [] on a git error, so
-        # an empty set is indistinguishable from "could not measure".  Either
-        # way there is no coverage evidence, so decline.
+    if touched_err is not None or not touched_set:
+        # An unreadable history and a landing that touched nothing are both
+        # absent coverage evidence, so decline either way.
         logger.warning(
             'already-landed: attributing commit %s (mechanism=%s) touched no '
-            'measurable files task_id=%s — failing closed',
-            landed_sha, mechanism, task_id,
+            'measurable files task_id=%s err=%s — failing closed',
+            landed_sha, mechanism, task_id, touched_err,
         )
         return None
 
@@ -2056,13 +2220,23 @@ async def _resolve_already_landed_branch(
     # the reconcile sweep applies before MARK_DONE (harness.py, the FIX 1'
     # effect-present refinement), so the two seams answer "is it still there"
     # identically instead of drifting.
-    if not await git_ops.commit_effect_present_in_main(landed_sha):
+    effect = await git_ops.describe_commit_effect_in_main(landed_sha)
+    if not effect.present:
         logger.warning(
             'already-landed: landing %s (mechanism=%s) for task_id=%s is an '
-            'ancestor of main but its effect is NOT present at current HEAD '
-            '(post-hoc revert) — failing closed rather than telling an '
-            'operator to close a task whose work is no longer on main',
-            landed_sha, mechanism, task_id,
+            'ancestor of main but the effect check did not confirm it '
+            'survives at current HEAD (failure=%s aggregate_survival=%s '
+            'added_lines_total=%s aggregate_threshold=%s '
+            'worst_guarded_path=%s worst_guarded_survival=%s '
+            'per_file_threshold=%s vacuous_paths=%s) — this check cannot '
+            'tell a genuine revert from a heavy later rewrite of the same '
+            'lines; failing closed rather than telling an operator to close '
+            'a task whose work may no longer be on main',
+            landed_sha, mechanism, task_id, effect.failure,
+            effect.aggregate_survival, effect.added_lines_total,
+            effect.aggregate_threshold, effect.worst_guarded_path,
+            effect.worst_guarded_survival, effect.per_file_threshold,
+            list(effect.vacuous_paths),
         )
         return None
 
@@ -2146,6 +2320,42 @@ def _entry_covered(norm: str, touched_set: set[str]) -> bool:
     return (
         _entry_touched_exactly(norm, touched_set)
         or _entry_touched_beneath(norm, touched_set)
+    )
+
+
+@dataclass(frozen=True)
+class DeclarationCoverage:
+    undeclared: tuple[str, ...]
+    """Changed paths no declared entry covers, sorted."""
+    undelivered: tuple[str, ...]
+    """Declared entries, exactly as written, that cover no changed path, sorted."""
+
+
+def declaration_coverage(
+    declared: Iterable[str], paths: Iterable[str],
+) -> DeclarationCoverage:
+    """Difference a declaration against changed paths, in both directions.
+
+    The git-free half of :func:`_check_plan_files_touched_in_branch`'s
+    coverage rule (:func:`_normalize_plan_path` + :func:`_entry_covered`),
+    applied per changed path for ``undeclared`` and per declared entry for
+    ``undelivered``.  The gate's existence probe and rename arm need git and
+    are not applied, so a renamed declared path reads as one undelivered
+    entry plus one undeclared path.  Caller:
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope``.
+    """
+    norms = {entry: _normalize_plan_path(entry) for entry in declared if entry}
+    path_set = set(paths)
+    undeclared = sorted(
+        p for p in path_set
+        if not any(_entry_covered(norm, {p}) for norm in norms.values())
+    )
+    undelivered = sorted(
+        entry for entry, norm in norms.items()
+        if not _entry_covered(norm, path_set)
+    )
+    return DeclarationCoverage(
+        undeclared=tuple(undeclared), undelivered=tuple(undelivered),
     )
 
 
@@ -2586,6 +2796,12 @@ async def _resolve_renamed_plan_path(
     return candidates
 
 
+def _with_git_stderr(err: Exception) -> str:
+    """*err* as text, carrying git's own message when *err* has a ``stderr``."""
+    stderr = (getattr(err, 'stderr', None) or '').strip()
+    return f'{err}: {stderr[:200]}' if stderr else str(err)
+
+
 async def _check_plan_files_touched_in_branch(
     plan_files: list[str],
     base_sha: str,
@@ -2593,6 +2809,7 @@ async def _check_plan_files_touched_in_branch(
     git_ops: GitOps,
     *,
     task_id: str | None = None,
+    branch: str | None = None,
 ) -> PlanFilesTouchedResult:
     """Pre-merge Decision-1 check: every plan file must be touched on the branch.
 
@@ -2620,14 +2837,33 @@ async def _check_plan_files_touched_in_branch(
 
     Empty ``plan_files`` returns no entries — vacuously satisfied.
 
-    Fail-open on git error (matches :func:`_check_plan_targets_in_tree`):
-    return an empty ``PlanFilesTouchedResult`` so a transient diff error
-    doesn't block a real merge.  Loud-log so regressions surface in ops.
+    With *branch* (the full branch name), each untouched entry not classified
+    as missing from the tree is matched against the commits a rebase dropped
+    from that branch (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``)
+    and reported in ``dropped_by_rebase``.  That attribution only explains a
+    failure; it never passes the gate.
+
+    When the branch's history cannot be read the gate fails CLOSED but
+    says so: every non-empty declared entry is returned in ``not_touched``
+    with ``touched_set_error`` set, and no per-entry probe runs, so the
+    caller can report the delivery as unmeasured rather than undelivered.
     """
     if not plan_files:
         return PlanFilesTouchedResult()
 
-    touched = await git_ops.get_files_touched_in_branch(base_sha, branch_head)
+    touched, touched_err = await git_ops.get_files_touched_in_branch(
+        base_sha, branch_head,
+    )
+    if touched_err is not None:
+        logger.warning(
+            'plan-files-touched: touched set unreadable task_id=%s base=%s '
+            'head=%s err=%s — every declared entry is unmeasured',
+            task_id or '<unknown>', base_sha, branch_head, touched_err,
+        )
+        return PlanFilesTouchedResult(
+            not_touched=[entry for entry in plan_files if entry],
+            touched_set_error=_with_git_stderr(touched_err),
+        )
     touched_set = set(touched)
 
     # Lazily-computed, once-per-invocation listing of every path in the
@@ -2764,19 +3000,56 @@ async def _check_plan_files_touched_in_branch(
 
         not_touched.append(entry)
 
+    dropped_by_rebase = await _attribute_rebase_drops(
+        [e for e in not_touched if e not in missing_from_tree],
+        branch, git_ops, task_id=task_id,
+    )
     if not_touched:
         logger.warning(
             'plan-files-touched: not_touched task_id=%s '
             'base=%s head=%s entries=%r '
-            'missing_from_tree=%r resolved_renames=%r',
+            'missing_from_tree=%r resolved_renames=%r dropped_by_rebase=%r',
             task_id or '<unknown>', base_sha, branch_head, not_touched,
-            missing_from_tree, resolved_renames,
+            missing_from_tree, resolved_renames, dropped_by_rebase,
         )
     return PlanFilesTouchedResult(
         not_touched=not_touched,
         missing_from_tree=missing_from_tree,
         resolved_renames=resolved_renames,
+        dropped_by_rebase=dropped_by_rebase,
     )
+
+
+async def _attribute_rebase_drops(
+    entries: list[str],
+    branch: str | None,
+    git_ops: GitOps,
+    *,
+    task_id: str | None,
+) -> dict[str, tuple[DroppedCommit, ...]]:
+    """Map each of *entries* to the commits a rebase dropped from *branch*
+    that covered it, through the same exact-or-beneath predicate
+    (:func:`_entry_covered`) the already-landed resolver uses.
+
+    Fail-open: a ledger that cannot be read attributes nothing.
+    """
+    if branch is None or not entries:
+        return {}
+    try:
+        dropped = await RebaseDropLedger(git_ops.project_root, _run).dropped_of(branch)
+    except Exception as exc:
+        logger.warning(
+            'plan-files-touched: could not read rebase drops task_id=%s branch=%s: %s',
+            task_id or '<unknown>', branch, exc,
+        )
+        return {}
+    attributed: dict[str, tuple[DroppedCommit, ...]] = {}
+    for entry in entries:
+        norm = _normalize_plan_path(entry)
+        covering = tuple(c for c in dropped if _entry_covered(norm, set(c.paths)))
+        if covering:
+            attributed[entry] = covering
+    return attributed
 
 
 async def _rename_aware_compare_set(
@@ -3217,6 +3490,7 @@ async def _rebase_delta_touched_overlap(
 def _disjoint_skip_blockers(
     req: MergeRequest,
     *,
+    project_root: Path,
     rebased_onto: str,
 ) -> list[str]:
     """Reasons footprint-disjointness may NOT be trusted for this rebase.
@@ -3241,20 +3515,21 @@ def _disjoint_skip_blockers(
         The gate's verdict decomposes over disjoint file sets — i.e. every check
         it runs is diff-scoped.  A whole-tree check violates this by
         construction: its entire premise is that an unrelated file can fail you.
-        Signal used: ``merge_verify_breadth == 'full'``, the EXISTING per-project
-        declaration that the merge gate runs every registered module's suite
-        rather than just the touched ones.  It is a declaration, not a gate name,
-        so this stays project-agnostic.  It is also only a PARTIAL detector of a
-        non-compositional gate (a project whose own verify script runs whole-tree
-        checks internally reads as 'scoped' here — reify is exactly that), which
-        is why P2 below, not P1, is the arm that actually closes the incident.
+        Signal used: ``merge_verify_breadth == 'full'`` (the shipped default,
+        task 7008): the merge gate runs every registered module's suite, not
+        just the touched ones.  A config value, not a gate name, so this stays
+        project-agnostic.  It is only a PARTIAL detector of a non-compositional
+        gate (a project that runs whole-tree checks inside its own verify
+        script but opts down to 'scoped' reads as compositional here), which is
+        why P2 below, not P1, is the arm that actually closes the incident.
 
     P2 (the drift is itself green)
         Main at *rebased_onto* passes the gate on its own.  This premise is
         needed even for a perfectly diff-scoped gate — a merge onto an
         already-red base is red — and it is the one the incident violated.
         Signal used: :func:`main_tip_is_queue_verified`, i.e. *rebased_onto* is
-        a tip THIS queue landed after a green gate run.  Drift from any other
+        a tip THIS queue, the one landing into *project_root*, landed after a
+        green gate run.  Drift from any other
         writer (an unattended job, a direct commit, a push) has unknown health.
         Generic and observed, not declared: it needs no project config at all.
 
@@ -3280,9 +3555,9 @@ def _disjoint_skip_blockers(
     blockers: list[str] = []
     config = getattr(req, 'config', None)
 
-    # P1 — project-declared whole-tree merge gate.  Deliberately NOT covered by
-    # the kill switch: a project that has declared its merge gate whole-tree has
-    # declared this skip unsound outright, not merely expensive.
+    # P1 — whole-tree merge gate.  Deliberately NOT covered by the kill switch:
+    # a project whose merge gate is whole-tree has made this skip unsound
+    # outright, not merely expensive.
     if getattr(config, 'merge_verify_breadth', None) == 'full':
         blockers.append('whole-tree merge gate (merge_verify_breadth=full)')
 
@@ -3292,7 +3567,7 @@ def _disjoint_skip_blockers(
         config, 'merge_disjoint_skip_requires_verified_drift', True,
     )
     if requires_verified_drift is not False and not main_tip_is_queue_verified(
-        rebased_onto,
+        project_root, rebased_onto,
     ):
         blockers.append(
             f'intervening main tip {rebased_onto[:8]} was not landed green by '
@@ -3302,11 +3577,97 @@ def _disjoint_skip_blockers(
     return blockers
 
 
+async def _same_tree(git_ops: GitOps, a: str, b: str) -> bool:
+    """True only when commits *a* and *b* positively resolve to one git tree.
+
+    An empty sha, a git error or any unexpected output answers False, the
+    fail-CLOSED direction of ``_OVERLAP_GIT_ERROR_SENTINEL``: a false "differs"
+    costs one verify, a false "same" lands an unverified tree.
+    """
+    if not a or not b:
+        return False
+    rc, out, _ = await _run(
+        ['git', 'rev-parse', f'{a}^{{tree}}', f'{b}^{{tree}}'],
+        cwd=git_ops.project_root,
+    )
+    trees = out.split()
+    return rc == 0 and len(trees) == 2 and trees[0] == trees[1]
+
+
+def _declared_history_leg(req: MergeRequest) -> str | None:
+    """The project's same-tree history leg command, or None when it declares none."""
+    command = getattr(req.config, 'merge_gate_history_test_command', None)
+    return command if isinstance(command, str) and command.strip() else None
+
+
+async def _decide_reverify_gate(
+    git_ops: GitOps,
+    req: MergeRequest,
+    *,
+    verified_merge_sha: str,
+    merge_sha: str,
+    rebased_from: str,
+    rebased_onto: str,
+) -> ReverifyGateDecision:
+    """Classify one rebased tree for :func:`_reverify_rebased_tree`, running no verify."""
+    decide = functools.partial(
+        ReverifyGateDecision,
+        task_id=req.task_id,
+        merge_sha=merge_sha,
+        verified_merge_sha=verified_merge_sha,
+        rebased_from=rebased_from,
+        rebased_onto=rebased_onto,
+    )
+    history_pure = getattr(req.config, 'merge_gate_history_pure', False) is True
+    if history_pure and await _same_tree(git_ops, verified_merge_sha, merge_sha):
+        if (history_leg_command := _declared_history_leg(req)) is not None:
+            return decide(
+                reason=ReverifyGateReason.same_tree_history_leg,
+                history_leg_command=history_leg_command,
+            )
+        return decide(reason=ReverifyGateReason.same_tree)
+    overlap = await _rebase_delta_touched_overlap(
+        req.worktree, rebased_from, rebased_onto, git_ops,
+        task_id=req.task_id,
+    )
+    if overlap == _OVERLAP_GIT_ERROR_SENTINEL:
+        return decide(reason=ReverifyGateReason.overlap_unknown)
+    if overlap:
+        return decide(reason=ReverifyGateReason.overlap, overlap=tuple(overlap))
+    blockers = _disjoint_skip_blockers(
+        req, project_root=git_ops.project_root, rebased_onto=rebased_onto,
+    )
+    if blockers:
+        return decide(reason=ReverifyGateReason.disjoint_untrusted, blockers=tuple(blockers))
+    return decide(reason=ReverifyGateReason.disjoint)
+
+
+def _log_reverify_gate_decision(decision: ReverifyGateDecision) -> None:
+    """One line per gate decision: INFO for a skip, WARNING for a fire.
+
+    A disjoint_untrusted fire names the premises it could not establish;
+    see :func:`_disjoint_skip_blockers` for what they are.
+    """
+    logger.log(
+        logging.WARNING if decision.reverifies else logging.INFO,
+        'Task %s: re-verify gate %s (%s) for rebased tree %s, verified %s, '
+        'delta %s..%s; overlap %d file(s) [%s]; blockers [%s]',
+        decision.task_id,
+        're-verifying' if decision.reverifies else 'skipping re-verify',
+        decision.reason,
+        decision.merge_sha[:8], decision.verified_merge_sha[:8],
+        decision.rebased_from[:8], decision.rebased_onto[:8],
+        len(decision.overlap), ', '.join(decision.overlap[:MAX_LOGGED_OVERLAP_PATHS]),
+        '; '.join(decision.blockers),
+    )
+
+
 async def _reverify_rebased_tree(
     git_ops: GitOps,
     req: MergeRequest,
     merge_wt: Path,
     *,
+    verified_merge_sha: str,
     rebased_from: str,
     rebased_onto: str,
     timeouts: dict[str, int],
@@ -3316,7 +3677,9 @@ async def _reverify_rebased_tree(
     merge_sha: str = '',
     keep_worktrees: Collection[Path] | None = None,
     run_post_merge_verify: Callable[..., Awaitable[MergeOutcome | None]],
-) -> MergeOutcome | None:
+    event_store: EventStore | None,
+    dispatch_reverify: bool = False,
+) -> MergeOutcome | GateClearance | ReverifyDispatch:
     """Shared gate for the disjoint-delta re-verify check.
 
     Called by both CAS loops after ``advance_main`` returns
@@ -3326,25 +3689,45 @@ async def _reverify_rebased_tree(
     every member's commits, so the branch-touched set is the train's union
     footprint, not the tip member's own diff.
 
+    Returns the :class:`GateClearance` the caller may advance on, the
+    ``MergeOutcome`` that ends the attempt, or, under *dispatch_reverify*, the
+    :class:`ReverifyDispatch` that hands a full re-verify back to the caller.
+
     Algorithm
     ---------
-    1. Call ``_rebase_delta_touched_overlap`` to compute the intersection of
-       the branch-touched file set and the intervening main delta.
-    2. **Disjoint** (empty intersection): consult
-       :func:`_disjoint_skip_blockers`.  With NO blockers, return ``None`` —
-       the caller can advance immediately and no extra verify call is made.
-       With blockers, fall through to the re-verify in step 3 exactly as an
-       overlap would, logging which premise of the disjointness inference could
-       not be established.  Disjointness alone is NOT sufficient: see that
-       function's docstring for the two premises and the incident that proved
-       skipping on the intersection alone unsound.
-    3. **Overlapping** (non-empty intersection): log a warning and delegate to
-       ``_run_post_merge_verify``, which runs the full post-merge scoped
-       verification against the rebased *merge_wt*.
+    :func:`_decide_reverify_gate` classifies the rebased tree, the decision
+    is logged and written to *event_store* as a ``merge_reverify_gate`` row
+    BEFORE any verify runs, and then:
 
-       * ``None`` return → verification passed; caller may advance.
-       * ``MergeOutcome`` return → verification failed or disk-guard fired;
-         *merge_wt* has already been cleaned up by ``_run_post_merge_verify``.
+    0. **Same tree**, only when the project declares
+       ``merge_gate_history_pure``: when *merge_sha*'s tree equals
+       *verified_merge_sha*'s, clear as ``GateClearance.same_tree`` with no
+       verify.  PRECONDITION: the gate's verdict is a function of the tree
+       alone, except the tests ``merge_gate_history_test_command`` selects.
+       A gate leg that reads git history (ancestry of HEAD, a merge-base) can
+       turn red on the same tree under a new parent, so for a project that
+       cannot name those tests the key stays False and the tree is
+       re-verified.  When the project declares that command, only it runs, on
+       *merge_wt*, through *run_post_merge_verify* with
+       ``history_leg_command``: a pass clears as
+       ``GateClearance.history_leg``, and a red or unrunnable leg gets the
+       re-verify's full failure handling.  Under the precondition a gate that
+       passed tree T sees exactly T again, and neither premise of
+       :func:`_disjoint_skip_blockers` is consulted.
+    1. **Disjoint** (``_rebase_delta_touched_overlap`` is empty) with no
+       :func:`_disjoint_skip_blockers`: clear as ``GateClearance.disjoint``
+       with no verify.  Disjointness alone is NOT sufficient: see that
+       function's docstring for the two premises.
+    2. Otherwise (an overlap, an unknown overlap, or untrusted disjointness):
+       delegate to *run_post_merge_verify* against the rebased *merge_wt*;
+       the worker's handles it carries write the re-verify's ``merge_verify``
+       row.  ``None`` from it → ``GateClearance.reverified``; a
+       ``MergeOutcome`` → verification failed or the disk guard fired, and
+       *merge_wt* has already been cleaned up.  Under the keyword-only
+       *dispatch_reverify* opt-in this arm runs no verify and returns
+       ``ReverifyDispatch(decision)`` instead: the single-branch caller
+       re-verifies the rebased tree as an ordinary dispatch of the rebased
+       head (task 8525).  The history leg still runs here.
 
     Parameters
     ----------
@@ -3354,54 +3737,44 @@ async def _reverify_rebased_tree(
         The MergeRequest whose worktree and task_id are inspected.
     merge_wt:
         The merge worktree, currently positioned at the rebased SHA.
+    verified_merge_sha:
+        The commit whose tree the lane already holds verified green: the
+        verified merge commit, or the tip a previous gate cleared.
     rebased_from:
         The original ``expected_main`` SHA (pre-churn main tip).
     rebased_onto:
         The current main SHA the branch was rebased onto.
     timeouts / enospc_retries / max_timeouts / max_enospc:
-        Forwarded verbatim to ``_run_post_merge_verify``.
+        Forwarded verbatim to ``merge_lane/post_merge_verify.py::run_post_merge_verify``.
     keep_worktrees:
         Additional worktrees to protect from disk-guard pruning — forwarded
-        verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
+        verbatim to ``merge_lane/post_merge_verify.py::run_post_merge_verify``.  Default ``None`` produces
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     run_post_merge_verify:
-        The worker's ``_run_post_merge_verify``, which this gate delegates the
-        re-verify to when the delta overlaps.
+        The worker's verify callable, carrying the worker's handles, its
+        event store included.  This gate delegates the re-verify to it when
+        it fires, and the declared history leg to it, as
+        ``history_leg_command``, on a same tree.
+    event_store:
+        Receives the decision row only.
+    dispatch_reverify:
+        Hand a full re-verify back as a :class:`ReverifyDispatch` rather than
+        running it.  Trains leave it False and re-verify inline.
     """
-    overlap = await _rebase_delta_touched_overlap(
-        req.worktree, rebased_from, rebased_onto, git_ops,
-        task_id=req.task_id,
+    decision = await _decide_reverify_gate(
+        git_ops, req,
+        verified_merge_sha=verified_merge_sha,
+        merge_sha=merge_sha,
+        rebased_from=rebased_from,
+        rebased_onto=rebased_onto,
     )
-
-    if not overlap:
-        blockers = _disjoint_skip_blockers(req, rebased_onto=rebased_onto)
-        if not blockers:
-            # Disjoint AND both premises hold: the intervening main churn does
-            # not intersect the branch's touched files, and that churn is itself
-            # a tip this queue landed green.  Safe to advance without re-verify.
-            logger.debug(
-                'Task %s: rebased tree disjoint from intervening delta (%s..%s) '
-                '— skipping re-verify',
-                req.task_id, rebased_from[:8], rebased_onto[:8],
-            )
-            return None
-        logger.warning(
-            'Task %s: rebased tree is disjoint from the intervening delta '
-            '(%s..%s) but disjointness is NOT trustworthy here [%s] — '
-            'triggering re-verify. Footprint-disjointness only licenses a skip '
-            'when the gate is diff-scoped AND the drift is itself known green; '
-            'see _disjoint_skip_blockers.',
-            req.task_id, rebased_from[:8], rebased_onto[:8],
-            ', '.join(blockers),
-        )
-    else:
-        logger.warning(
-            'Task %s: rebased tree overlaps intervening delta (%s..%s) '
-            'on %d file(s) [%s] — triggering re-verify',
-            req.task_id, rebased_from[:8], rebased_onto[:8],
-            len(overlap), ', '.join(overlap[:5]),
-        )
-    return await run_post_merge_verify(
+    _log_reverify_gate_decision(decision)
+    emit_reverify_gate_decision(event_store, decision)
+    if (clearance := decision.reason.skip_clearance) is not None:
+        return clearance
+    if dispatch_reverify and decision.dispatches:
+        return ReverifyDispatch(decision)
+    failure = await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,
         enospc_retries=enospc_retries,
@@ -3409,7 +3782,13 @@ async def _reverify_rebased_tree(
         max_enospc=max_enospc,
         merge_sha=merge_sha,
         keep_worktrees=keep_worktrees,
+        history_leg_command=decision.history_leg_command,
     )
+    if failure is not None:
+        return failure
+    if decision.history_leg_command is None:
+        return GateClearance.reverified
+    return GateClearance.history_leg
 
 
 async def _check_post_merge_pyright(

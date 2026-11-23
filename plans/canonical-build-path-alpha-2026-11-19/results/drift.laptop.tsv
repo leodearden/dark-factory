@@ -1,0 +1,30 @@
+rustc.vV	commit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96 host: x86_64-unknown-linux-gnu release: 1.96.0 LLVM version: 22.1.2 
+rustc.bin	ba4b837efb6612df
+sysroot.lib	396df3cbbdfa77ba
+sysroot.rustlib	ca8b3c7163f04134
+toolchain.pin	channel = "1.96.0"
+cc.driver	1b99826121ae6682
+cc.version	13.3.0 
+c++.driver	1353e9bdd29a7295
+c++.version	13.3.0 
+cc1	5d1679131184e2de
+cc1plus	840b332fb62ec6f6
+as	21aff249b692b5c3
+dpkg.toolchain	binutils=2.42-4ubuntu2.10 cpp-13=13.3.0-6ubuntu2~24.04.1 g++-13=13.3.0-6ubuntu2~24.04.1 gcc-13=13.3.0-6ubuntu2~24.04.1 libc6-dev=2.39-0ubuntu8.12 libgcc-13-dev=13.3.0-6ubuntu2~24.04.1 libstdc++-13-dev=13.3.0-6ubuntu2~24.04.1 linux-libc-dev=6.8.0-149.149 
+dpkg.occt	46dc79130c3c7627
+occt.include.tree	426c51a48337da67
+reify-deps.conda-meta	f0e30c1a1896470d
+reify-deps.static-archives	9f477b5a5fbe9223
+deps.occt.header-closure	4419ad5ac019f879
+deps.openvdb.header-closure	707a577e0b502cfc
+native-dep.resolution	gmsh.include=/opt/reify-deps/include gmsh.lib=/opt/reify-deps/lib occt.include=/usr/include/opencascade occt.lib=/usr/lib/x86_64-linux-gnu openvdb.include=/opt/reify-deps/include openvdb.lib=/opt/reify-deps/lib
+pkg-config.slvs	Package slvs was not found in the pkg-config search path.; header=y
+tree-sitter.cli	tree-sitter 0.26.8 c9df3abd70adb4ee 
+env.cflags	e3b0c44298fc1c14
+env.cargo-vars	CARGO_HOME=/tmp/reify-agent-cargo-home 
+env.read-by-env-macro	e3b0c44298fc1c14
+user.home	leo /home/leo
+cargo.home	/tmp/reify-agent-cargo-home
+cargo.config	/media/leo/Internal-2nd/canon-alpha-20261119/wt/probe/.cargo/config.toml=85c97fc4265c2583 
+sccache.version	sccache 0.14.0
+#info.cpu	 AMD Ryzen 9 7940HS w/ Radeon 780M Graphics

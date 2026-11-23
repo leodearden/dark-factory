@@ -53,8 +53,8 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
     @dataclass and other reflection-based decorators work correctly (they
     call sys.modules.get(cls.__module__)).  Both keys are SHARED — with
     ``test_bake_off_storage_shape.py``, with ``test_bake_off_fetch_cache.py``
-    and with the script-side ``read_transform_selection._load_script`` — which
-    is what makes reuse, rather than an unconditional re-exec, correct here.
+    and with ``read_transform_selection.bake_off()`` — which is what makes
+    reuse, rather than an unconditional re-exec, correct here.
 
     A named seam rather than a direct call at each use site, so the
     load-once property has something uncached to assert against.
@@ -77,9 +77,9 @@ class TestTheScriptsAreLoadedOnceNotReExecuted:
 
     An unconditional re-exec mints a SECOND module object under the same
     ``sys.modules`` key, and whichever loader ran last wins.  The concrete
-    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
-    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
-    serves whichever object a test module last registered under
+    hazard: ``read_transform_selection.bake_off()`` loads that key through
+    ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``, so
+    it serves whichever object a test module last registered under
     ``'bake_off_storage_shape'``.  Three test modules register that key, and
     ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto --dist
     loadgroup"``, so collection order is not stable.
@@ -89,7 +89,7 @@ class TestTheScriptsAreLoadedOnceNotReExecuted:
     """
 
     def test_the_bake_off_script_is_loaded_once(self):
-        import sys  # noqa: PLC0415
+        import sys
 
         first = _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
         second = _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
@@ -100,7 +100,7 @@ class TestTheScriptsAreLoadedOnceNotReExecuted:
         assert sys.modules['bake_off_storage_shape'] is first
 
     def test_the_selection_script_is_loaded_once(self):
-        import sys  # noqa: PLC0415
+        import sys
 
         first = _load_script(SCRIPT_PATH, 'read_transform_selection')
         second = _load_script(SCRIPT_PATH, 'read_transform_selection')
@@ -131,7 +131,7 @@ def _assert_reexported_from_bake_off(mod: types.ModuleType, name: str) -> None:
     not, is a different object than whatever lives at
     `sys.modules['bake_off_storage_shape']` under this name.
     """
-    import sys  # noqa: PLC0415
+    import sys
 
     fn = getattr(mod, name)  # forces bake_off() to load+register if absent
     assert fn is getattr(sys.modules['bake_off_storage_shape'], name)
@@ -802,7 +802,7 @@ class TestTheContestedTermIsStructurallyZeroToday:
     """
 
     def test_contested_is_not_a_live_vocabulary_key(self):
-        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS
 
         assert 'contested' not in RESERVED_VOCABULARY_KEYS
         assert set(RESERVED_VOCABULARY_KEYS) == {
@@ -2004,7 +2004,7 @@ PRODUCTION_FIXTURE = FIXTURES_DIR / 'production_query_sample.jsonl'
 
 def _prod_rows(tmp_path, rows):
     """Write `rows` as a production-shaped JSONL fixture."""
-    import json  # noqa: PLC0415
+    import json
 
     path = tmp_path / 'prod.jsonl'
     path.write_text(''.join(json.dumps(r, sort_keys=True) + '\n' for r in rows))
@@ -2703,7 +2703,7 @@ class TestTheV2Impossibility:
 
     def test_the_named_set_matches_the_live_one(self):
         """A hard-coded list here would rot silently the day a key is added."""
-        from fused_memory.memory_metadata import (  # noqa: PLC0415
+        from fused_memory.memory_metadata import (
             RESERVED_VOCABULARY_KEYS,
         )
 
@@ -2849,14 +2849,14 @@ class TestInv5IsLoadOrderIndependent:
         unconditionally execs a new module and overwrites `sys.modules`,
         exactly what a sibling test module's load does.
         """
-        import sys  # noqa: PLC0415
+        import sys
 
         saved = sys.modules.get('bake_off_storage_shape')
         _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
         return saved
 
     def _restore_bake_off_module(self, saved):
-        import sys  # noqa: PLC0415
+        import sys
 
         if saved is None:
             sys.modules.pop('bake_off_storage_shape', None)
@@ -3473,6 +3473,25 @@ class TestTheGuardIsWiredNotMerelyAvailable:
 
         assert 'e2_query_set.jsonl' in str(excinfo.value)
 
+    def test_score_from_cache_ignores_a_drifted_registry_digest(self, tmp_path):
+        """The topic registry is pinned by the corpus fingerprint, not its
+        bytes, so `score_from_cache` must not compare a registry digest even
+        when the cache carries one that disagrees with the tree."""
+        mod = _mod()
+        bake = _bake_off()
+        doc = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))
+        [registry_row] = bake.fixture_digests([bake.DEFAULT_REGISTRY_PATH])
+        doc['provenance']['fixtures'].append(
+            {'path': registry_row['path'], 'sha256': 'deadbeef' * 8},
+        )
+        target = tmp_path / 'e2_fetch_cache.json'
+        target.write_text(json.dumps(doc, indent=2, sort_keys=True) + '\n',
+                          encoding='utf-8')
+
+        scored = mod.score_from_cache(fetch_cache=target)
+
+        assert set(scored['e2']) == set(mod.ARM_KEYS)
+
     def test_main_reports_the_refusal_without_a_traceback(
         self, tmp_path, capsys,
     ):
@@ -3637,8 +3656,8 @@ class TestFetchProductionRankingsHoldsALease:
         it fires before any collection exists — the instant the lease has to
         already be live.
         """
-        import fused_memory.config.schema as schema_mod  # noqa: PLC0415
-        import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+        import fused_memory.config.schema as schema_mod
+        import fused_memory.services.memory_service as service_mod
 
         bake = _bake_off()
         reaper = bake.load_cleanup_script()
@@ -3688,14 +3707,14 @@ class TestFetchProductionRankingsHoldsALease:
         service is built right after it, both before the `with`.  A
         `bake.load_cleanup_script()` evaluated in the `with` header would sit
         after both and before the `try` — the one window where a raise
-        (`_load_sibling_script` raises `FixtureError` when the spec cannot be
-        built) leaks the directory and skips `close()`.
+        (a sibling whose body raises on first load propagates out of
+        `load_script`) leaks the directory and skips `close()`.
 
         Asserted as "NO resolution happens once a resource exists": the
         `ephemeral_collection_prefix()` call above resolves the reaper either
         way, so an index comparison would pass on the unfixed driver.
         """
-        import tempfile  # noqa: PLC0415
+        import tempfile
 
         mod = _mod()
         bake = _bake_off()

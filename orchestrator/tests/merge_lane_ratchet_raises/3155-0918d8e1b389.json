@@ -1,0 +1,60 @@
+{
+  "task_id": "3155",
+  "reason": "net-additive, task-meta task keying (plans/task-meta-task-keying-prd.md task beta): GitOps._meta_roots_naming also parks/evidences the task-lifetime .task-meta/task-<id> root via TaskArtifacts.task_root_for so a recut task cannot inherit its prior plan (guarded against non-task-id branch names); test_crash_recovery gains task-root recovery rows (TestRecoveryReadsTheTaskRoot) using the file's existing harness-internal seams, as no public accessor for recovered plans exists",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1472,
+      "current": 1473
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_meta_roots_naming",
+      "baseline": 6,
+      "current": 7
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 16177,
+      "current": 16185
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_crash_recovery.py",
+      "baseline": 272,
+      "current": 285
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9347,
+      "current": 9349
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4992,
+      "current": 4993
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58693,
+      "current": 58701
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6602,
+      "current": 6615
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31953,
+      "current": 31955
+    }
+  ]
+}

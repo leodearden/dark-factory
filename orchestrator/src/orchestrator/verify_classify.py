@@ -24,6 +24,7 @@ import signal
 
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_cmd import ToolKind
+from orchestrator.verify_event_channel import VerifyEventChannel
 
 # ---------------------------------------------------------------------------
 # EXTERNAL termination signals (task 3173). ``_run_cmd`` returns
@@ -58,8 +59,32 @@ def is_external_kill_rc(rc: int) -> bool:
     shell-reported ``128 + N`` status (e.g. 137 for SIGKILL) is NOT treated as
     a kill, because the predicate must not guess at shell conventions — a
     plain positive rc is a real exit status the process chose to return.
+    A caller that interposed the shell itself reads that convention with
+    ``is_shell_reported_external_kill`` instead.
     """
     return rc < 0 and -rc in _EXTERNAL_KILL_SIGNALS
+
+
+_SHELL_REPORTED_KILL_SIGNALS: frozenset[int] = _EXTERNAL_KILL_SIGNALS - {signal.SIGKILL}
+
+
+def is_shell_reported_external_kill(rc: int) -> bool:
+    """Return True when *rc* is a shell's ``128 + N`` report of an external
+    SIGTERM, SIGINT or SIGHUP.
+
+    PRECONDITION: *rc* is the exit status of a POSIX shell the CALLER
+    interposed, so ``128 + N`` means that shell's child died of signal N.
+    ``verify.classify_leg`` is the caller: every leg runs under
+    ``_run_cmd``'s ``/bin/bash`` wrapper. Calling this on any other rc is the
+    shell-convention guessing ``is_external_kill_rc`` refuses.
+
+    SIGKILL is excluded: a positive 137 is the ordinary branch-caused OOM of a
+    memory-hungry grandchild.
+
+    It decides nothing alone. The caller must also establish that the leg
+    printed no failure verdict.
+    """
+    return rc > 128 and (rc - 128) in _SHELL_REPORTED_KILL_SIGNALS
 
 # ---------------------------------------------------------------------------
 # Shared regex primitives — patterns that legitimately belong to more than
@@ -187,7 +212,7 @@ def reports_disk_full(text: str) -> bool:
 
     The one disk-full text predicate, shared by ``_classify_environmental``,
     ``git_ops.py::_worktree_add_failure_is_retryable`` and
-    ``merge_lane/worker.py::_verify_hit_enospc``. Known residual: a failing
+    ``merge_lane/verify_failure_outcome.py::verify_hit_enospc``. Known residual: a failing
     test whose own message quotes the full phrase still reads as disk-full.
     """
     folded = text.casefold()
@@ -207,6 +232,8 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # task 3679: LINE-ANCHORED, producer-grounded slot-timeout markers — the
 # POSITIVE detector for the SEMAPHORE_TIMEOUT arm, replacing the whole-output
 # token co-occurrence above (deleted in the follow-up step).
+# Task 6856: these text arms are consulted only when the verify's event
+# channel is absent (`_reports_fatal_slot_timeout`, C3 rules 2 and 4).
 #
 # ANCHORING CONTRACT: `^` + re.MULTILINE, tolerating LEADING HORIZONTAL
 # WHITESPACE ONLY — deliberately NOT an arbitrary leading log/harness prefix.
@@ -712,7 +739,17 @@ _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-def _classify_environmental(output: str) -> FailureCategory | None:
+def _reports_fatal_slot_timeout(
+    scoped: str, event_channel: VerifyEventChannel | None,
+) -> bool:
+    if event_channel is not None and event_channel.present:
+        return event_channel.fatal_slot_timeouts > 0
+    return bool(_has_fatal_slot_timeout_sentinel(scoped) or _SLOT_ACQUIRE_DEADLINE_RE.search(scoped))
+
+
+def _classify_environmental(
+    output: str, event_channel: VerifyEventChannel | None = None,
+) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
     ``_merge-verify`` worktree, incl. restart collateral; mis-resolved pyright
     interpreter) / SEMAPHORE_TIMEOUT.
@@ -981,8 +1018,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     #      removed) ===` marker a test could legitimately replay. Scoping one
     #      arm would leave the class alive under a different label — the
     #      shape-N+1 treadmill (2748 -> 2821 -> 3679 -> 4212) this exists to end.
-    #   3. ORDERING IS UNCHANGED (DISK_FULL, the three ENV_TRANSIENT
-    #      branches, then SEMAPHORE_TIMEOUT last). The ORDERING note above
+    #   3. ORDERING IS UNCHANGED (DISK_FULL, the ENV_TRANSIENT branches,
+    #      then SEMAPHORE_TIMEOUT last). The ORDERING note above
     #      stays load-bearing; scoping changes WHICH TEXT each arm reads,
     #      never the order they are tried in.
     scoped = _redact_passed_suite_blocks(output)
@@ -1003,12 +1040,15 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     # task 4212: sentinel half is gated on disposition
     # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
     # basename half stays ungated — its emitters carry no `disposition` field.
-    if _has_fatal_slot_timeout_sentinel(scoped) or _SLOT_ACQUIRE_DEADLINE_RE.search(scoped):
+    if _reports_fatal_slot_timeout(scoped, event_channel):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
 
-def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> FailureCategory:
+def classify_failure(
+    tool: ToolKind, rc: int, output: str, timed_out: bool, *,
+    event_channel: VerifyEventChannel | None = None,
+) -> FailureCategory:
     """Classify a command failure into a ``FailureCategory``, dispatched by tool.
 
     Guards (checked before any per-tool dispatch, identically for every
@@ -1031,9 +1071,10 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        see ``_EXTERNAL_KILL_SIGNALS``.
     3. ``_classify_environmental(output)`` -> ``FailureCategory.DISK_FULL``,
        ``FailureCategory.SEMAPHORE_TIMEOUT``, or ``FailureCategory.ENV_TRANSIENT``
-       (broken ``_merge-verify`` worktree; or a mis-resolved pyright
+       (broken ``_merge-verify`` worktree; a mis-resolved pyright
        interpreter holding none of the workspace's third-party packages —
-       task 3367) when grounded in *output* (wins over any per-tool output
+       task 3367)
+       when grounded in *output* (wins over any per-tool output
        pattern for the same "root cause is the environment, not the command
        output" reason as guard 2 — a host condition like a full disk, a
        lock/semaphore-slot timeout, an unreadable worktree lockfile, or an
@@ -1044,7 +1085,8 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        reported zero failures is no longer evidence about the failure being
        classified; its one veto still reads the full *output*, which keeps
        the change able to move a classification only AWAY from a guard-3
-       category, never toward one.
+       category, never toward one. Task 6856: a PRESENT *event_channel*
+       alone decides SEMAPHORE_TIMEOUT (its fatal slot_timeout records).
 
     SCOPING BOUNDARY — a RECORDED CHOICE, not an oversight (review amendment
     #5). Guard 3 is the ONLY consumer of the scoped text. Guards 1/2/2.5 and
@@ -1082,13 +1124,15 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
       ``_classify_cargo``, the text table.
     - ``ToolKind.NPX`` -> ``_classify_npx``.
     - ``ToolKind.PYRIGHT`` -> a structured ``--outputjson`` parse
-      (``_parse_pyright_json``) is attempted FIRST (Invariant C2); otherwise
-      falls back to ``_classify_opaque`` (no dedicated PYRIGHT text table —
-      preserves today's on-the-wire mapping).
+      (``_parse_pyright_json``, yielding ``TYPE_ERROR``) is attempted FIRST
+      (Invariant C2); otherwise falls back to ``_classify_opaque``. There is
+      deliberately no PYRIGHT text table, so human-text output takes the
+      OPAQUE ladder unchanged.
     - ``ToolKind.RUFF`` -> a structured ``--output-format json`` parse
-      (``_parse_ruff_json``) is attempted FIRST (Invariant C2); otherwise
-      falls back to ``_classify_opaque`` (no dedicated RUFF text table —
-      preserves today's on-the-wire mapping).
+      (``_parse_ruff_json``, yielding ``LINT_ERROR``) is attempted FIRST
+      (Invariant C2); otherwise falls back to ``_classify_opaque``. There is
+      deliberately no RUFF text table, so human-text output takes the OPAQUE
+      ladder unchanged.
     - ``ToolKind.OPAQUE`` -> ``_classify_opaque``, the FULL legacy generic
       ladder (moved verbatim from verify.py's ``_CLASSIFY_PATTERNS``) — the
       ONLY survivor of the tool-blind ladder.
@@ -1110,7 +1154,7 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
         return FailureCategory.INFRA_TIMEOUT
     if is_external_kill_rc(rc):
         return FailureCategory.INFRA_KILL
-    environmental_category = _classify_environmental(output)
+    environmental_category = _classify_environmental(output, event_channel)
     if environmental_category is not None:
         return environmental_category
 
@@ -1188,8 +1232,8 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # producer, so any reasoning that relied on env_transient implying the failing
 # leg was the TEST leg must be re-derived rather than assumed. The one place
 # that reasoning was load-bearing is verify.py's env-recovery retry gate, which
-# task 3367 tightens with an explicit `attempt.test.rc != 0` check instead of
-# leaning on the retired corollary.
+# now reads the TEST leg's own classification (task 4843; task 3367 first
+# restricted it to the test leg) instead of leaning on the retired corollary.
 # ---------------------------------------------------------------------------
 
 # Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from
@@ -1367,11 +1411,11 @@ def _classify_npx(output: str) -> FailureCategory:
 
 
 # ---------------------------------------------------------------------------
-# ToolKind.PYRIGHT — structured JSON only (Invariant C2); no dedicated text
-# table exists — non-JSON PYRIGHT output falls through to the OPAQUE
-# placeholder ladder (see classify_failure's docstring), preserving today's
-# on-the-wire mapping. Adding a dedicated PYRIGHT/type-check FailureCategory
-# is out of scope for this task.
+# ToolKind.PYRIGHT — structured JSON only (Invariant C2). An error
+# diagnostic is TYPE_ERROR (task 4843). There is still NO classification
+# text table, so non-JSON PYRIGHT output deliberately falls through to the
+# OPAQUE ladder
+# (Invariants C1/C2; see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -1387,8 +1431,7 @@ def _parse_pyright_json(output: str) -> FailureCategory | None:
         ], "summary": {...}}
 
     A ``generalDiagnostics`` entry with ``severity == "error"`` maps to
-    ``UNKNOWN_TEST_FAILURE`` — the preserved on-the-wire category (no
-    dedicated PYRIGHT category exists — see module docstring). Exception-safe:
+    ``TYPE_ERROR``; warnings and information alone claim nothing. Exception-safe:
     *output* that isn't valid JSON, or isn't shaped like this schema, returns
     ``None`` rather than raising, so the caller falls back to
     ``_classify_opaque``, the text table.
@@ -1404,16 +1447,15 @@ def _parse_pyright_json(output: str) -> FailureCategory | None:
         return None
     for diagnostic in diagnostics:
         if isinstance(diagnostic, dict) and diagnostic.get('severity') == 'error':
-            return FailureCategory.UNKNOWN_TEST_FAILURE
+            return FailureCategory.TYPE_ERROR
     return None
 
 
 # ---------------------------------------------------------------------------
-# ToolKind.RUFF — structured JSON only (Invariant C2); no dedicated text
-# table exists — non-JSON RUFF output falls through to the OPAQUE placeholder
-# ladder (see classify_failure's docstring), preserving today's on-the-wire
-# mapping. Adding a dedicated RUFF/lint FailureCategory is out of scope for
-# this task.
+# ToolKind.RUFF — structured JSON only (Invariant C2). A violations array is
+# LINT_ERROR (task 4843). There is still NO classification text table, so
+# non-JSON RUFF output deliberately falls through to the OPAQUE ladder
+# (Invariants C1/C2; see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -1427,9 +1469,8 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
         [{"cell": null, "code": "F821", "filename": "...",
           "message": "...", "severity": "error", ...}]
 
-    A non-empty violations array maps to ``UNKNOWN_TEST_FAILURE`` — the
-    preserved on-the-wire category (no dedicated RUFF category exists — see
-    module docstring). Exception-safe: *output* that isn't valid JSON, or
+    A non-empty violations array maps to ``LINT_ERROR``; an empty one claims
+    nothing. Exception-safe: *output* that isn't valid JSON, or
     isn't shaped like this schema, returns ``None`` rather than raising, so
     the caller falls back to ``_classify_opaque``, the text table.
     """
@@ -1441,7 +1482,52 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
         return None
     if not any(isinstance(item, dict) for item in payload):
         return None
-    return FailureCategory.UNKNOWN_TEST_FAILURE
+    return FailureCategory.LINT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# ToolKind.RUFF / ToolKind.PYRIGHT — the no-finding witness of a killed leg
+# (task 6461): the lines each tool prints without having found anything.
+# verify.classify_leg consults it; classify_failure never does, so it is not
+# a classification table.
+# ---------------------------------------------------------------------------
+
+# bash's report that its child died of SIGTERM or SIGHUP. The bare word
+# 'Terminated' was measured 2026-11-12; the job-report long form was measured
+# on bash 5.2.21 by task 4843.
+_SHELL_KILL_REPORT = r'(?:\S+: line \d+: +\d+ +)?(?:Terminated|Hangup)(?: .*)?'
+
+_NO_FINDING_LINE_BY_TOOL: dict[ToolKind, re.Pattern[str]] = {
+    # ruff's `warning:` lines are its own notices, printed during the run;
+    # no ruff finding starts that way, in any output format.
+    ToolKind.RUFF: re.compile(rf'(?:All checks passed!|warning: .+|{_SHELL_KILL_REPORT})'),
+    # The zero-error summary only: a diagnostic line of ANY severity is a
+    # finding, so none is admitted.
+    ToolKind.PYRIGHT: re.compile(
+        rf'(?:0 errors, \d+ warnings?, \d+ informations?|{_SHELL_KILL_REPORT})',
+    ),
+}
+
+
+def output_proves_no_finding(tool: ToolKind, output: str) -> bool:
+    """Return True when *output* proves that *tool*, a lint or type checker
+    with a known no-finding vocabulary, reached no finding.
+
+    Every non-blank line must be one *tool* prints without having found
+    anything, or bash's report of its kill. An unrecognised line counts as a
+    finding, so any real diagnostic wins. Empty output qualifies, because
+    these tools print a summary only on completion. A tool with no known
+    vocabulary never qualifies: False means unproven, not a finding.
+
+    Output only: whether the leg was killed is the caller's to decode
+    (``is_shell_reported_external_kill``). Pure and total.
+    """
+    pattern = _NO_FINDING_LINE_BY_TOOL.get(tool)
+    if pattern is None:
+        return False
+    return all(
+        pattern.fullmatch(line.rstrip()) for line in output.splitlines() if line.strip()
+    )
 
 
 # ---------------------------------------------------------------------------

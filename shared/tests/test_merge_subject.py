@@ -21,6 +21,9 @@ from shared.merge_subject import (
     parse_merge_subject,
     rendered_prefix,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _BRANCHES = ['feat/12', 'task/v1.0', 'rel.v1+(x)/5', 'a/b/c', 'ünï/7', '\x00BRANCH\x00']
 _MAINS = ['trunk', 'main', 'release/2.0']

@@ -16,8 +16,41 @@ from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import _async_mock_orphans
 import pytest
 import pytest_asyncio
+from _agent_cli_guard import assert_no_agent_cli_spawns, install_agent_cli_guard
+from _harness_store_paths import point_harness_stores_at
+from _live_mcp_guard import (
+    REAL_MCP_SESSION_MARKER,
+    assert_no_live_attempts,
+    install_live_mcp_guard,
+)
+from _tree_pass_workers import TreePass, pass_requested_by
+
+# Repo root of this worktree.  Also used by the autouse ``_isolate_orch_config``
+# fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
+# ``dark-factory-orchestrator.yaml`` (task 2719: the transitional
+# ``orchestrator/config.yaml`` symlink was retired, so the old CWD-relative
+# ``Path('config.yaml')`` fallback no longer resolves to the operational config).
+#
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd orchestrator && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so this suite wires
+# the defence itself.  APPEND the repo root, never insert(0, ...): at sys.path[0]
+# it would make orchestrator/, shared/ etc. resolve as namespace packages
+# pointing at the project folder instead of src/<pkg>/, and the src dirs
+# inserted below would lose.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_fleet_dir_isolation,
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
+    reject_unsafe_basetemp,
+)
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -35,51 +68,34 @@ if str(_ESCALATION_SRC) not in sys.path:
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+_CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / "cross_suite_helpers"
+if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
-# Repo root of this worktree.  Used by the autouse ``_isolate_orch_config``
-# fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
-# ``dark-factory-orchestrator.yaml`` (task 2719: the transitional
-# ``orchestrator/config.yaml`` symlink was retired, so the old CWD-relative
-# ``Path('config.yaml')`` fallback no longer resolves to the operational config).
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd orchestrator && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so this suite wires
-# the defence itself.  APPEND the repo root, never insert(0, ...): at sys.path[0]
-# it would make orchestrator/, shared/ etc. resolve as namespace packages
-# pointing at the project folder instead of src/<pkg>/, and the src dirs
-# inserted above would lose.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
 
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
 # Must be set BEFORE any `orchestrator.merge_lane.worker` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
+# Why: test_suite_loads_no_dotenv.py.
+os.environ['PYTHON_DOTENV_DISABLED'] = '1'
+
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
     ample_disk_usage,
-    drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
-    track_async_mock_coroutines,
-)
-from df_pytest_isolation import (  # noqa: E402
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
-    reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
+from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
+    fake_clock as fake_clock,
+)
 
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
@@ -98,7 +114,7 @@ from orchestrator.merge_lane import worker  # noqa: E402
 # module-level _DEBUG_ASSERTS seed at False.
 worker._DEBUG_ASSERTS = True
 
-track_async_mock_coroutines()
+_async_mock_orphans.track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -289,6 +305,20 @@ def pristine_repo_templates(
         yield templates
 
 
+@pytest.fixture(scope='session')
+def tree_pass(request: pytest.FixtureRequest) -> TreePass:
+    """The one streaming whole-tree pass every ``TREE_ANALYSES`` consumer shares.
+
+    LAZY: only a worker that runs a consumer pays for it, and that cost is
+    billed to the first consumer item it runs, which is why every consumer
+    carries the whole-tree family mark.  NOT prebuilt at collection time
+    (unlike shared/tests/session_prebuild.py): every xdist worker collects
+    every item, so a prebuild would make every worker parse.  ``_tree_scan``
+    holds the mechanism; ``_tree_pass_workers`` runs it in worker processes.
+    """
+    return pass_requested_by(request.session.items)
+
+
 @pytest.fixture
 def briefing(tmp_path: Path) -> BriefingAssembler:
     """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
@@ -331,19 +361,22 @@ def _isolate_orch_config(monkeypatch, tmp_path):
 
     Precedence keeps this safe: explicit kwargs still win over the env, which overrides
     only ``project_root`` and the host-reaching knobs: laptop runner, ``prefer_remote``
-    (task 5053) and ``verify_use_cgroup_scope`` (task 5206), so a bare config never
-    ssh's the laptop or spawns a real systemd scope; all else loads from yaml/defaults.
+    (task 5053), ``verify_use_cgroup_scope`` (task 5206) and
+    ``verify_cold_preprovision_command`` (task 6917), so a bare config never ssh's the
+    laptop, spawns a real systemd scope or runs a real ``uv sync``; all else loads from
+    yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
     wins (re-pointing ORCH_CONFIG_PATH at a guaranteed-absent file) for the
-    default-asserting / scoped-behaviour tests.
+    default-asserting tests.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
     monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
+    monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
 
 
 @pytest.fixture
@@ -360,28 +393,29 @@ def code_default_config(monkeypatch, tmp_path):
     live operational overrides (commit b012af0e0e:
     ``merge_verify_breadth='full'``, ``merge_train_former_enabled=true``,
     ``merge_train_coalesce_enabled=true``) then bleed into any bare
-    ``OrchestratorConfig()``.
+    ``OrchestratorConfig()``.  Since task 7008 the code defaults carry
+    ``merge_verify_breadth='full'`` too, so breadth no longer differs between
+    them.
 
-    Tests that assert the CODE DEFAULTS (``defaults.yaml``:
-    ``merge_verify_breadth='scoped'``, trains OFF) — or that exercise the
-    default *scoped* merge-verify behaviour — must construct the config in
-    isolation from those live overrides.  Pointing ``ORCH_CONFIG_PATH`` at a
-    guaranteed-absent file makes ``YamlSettingsSource.__call__`` skip the
-    layer-2 project file (its ``.exists()`` is False) and load ONLY the
-    package-bundled ``defaults.yaml`` -> pure code defaults.  ``project_root``
-    still resolves to ``tmp_path`` via ``ORCH_PROJECT_ROOT`` (set by the autouse
-    fixture, which runs first), so bare-config tests still never write into the
-    live tree.
+    Tests that assert the CODE DEFAULTS (``defaults.yaml``: trains OFF) must be
+    isolated from those live overrides; scoped-merge tests pin breadth to
+    ``'scoped'`` explicitly rather than rely on this hatch.  Pointing
+    ``ORCH_CONFIG_PATH`` at a guaranteed-absent file makes
+    ``YamlSettingsSource.__call__`` skip the layer-2 project file (its
+    ``.exists()`` is False) and load ONLY the package-bundled ``defaults.yaml``
+    -> pure code defaults.  ``project_root`` still resolves to ``tmp_path`` via
+    ``ORCH_PROJECT_ROOT`` (set by the autouse fixture, which runs first), so
+    bare-config tests still never write into the live tree.
 
     Opt-in via ``@pytest.mark.usefixtures("code_default_config")`` (or a direct
-    request) on exactly the default-asserting / scoped-behaviour tests — NEVER
-    autouse, which would strip config.yaml from the ~10k tests that legitimately
-    rely on it.
+    request) on exactly the default-asserting tests — NEVER autouse, which
+    would strip config.yaml from the ~10k tests that legitimately rely on it.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
     monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
     monkeypatch.delenv("ORCH_VERIFY_HOST_POLICY", raising=False)
     monkeypatch.delenv("ORCH_VERIFY_USE_CGROUP_SCOPE", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", raising=False)
 
 
 #: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
@@ -431,56 +465,46 @@ def _isolate_warm_lane_script_dir(monkeypatch):
     )
 
 
+#: The repr of every unittest.mock class, plus its sqlite -wal/-shm/-journal sidecars.
+_MOCK_REPR_ENTRY_GLOB = '<*Mock *'
+
+
+def _mock_repr_entries(directory: Path) -> frozenset[Path]:
+    return frozenset(directory.glob(_MOCK_REPR_ENTRY_GLOB))
+
+
 @pytest.fixture(autouse=True)
-def _no_mock_derived_stray_dirs(request):
-    """Fail any test that leaves a ``MagicMock/`` DIRECTORY in the process CWD.
+def _no_mock_repr_stray_entries(request):
+    """Fail any test that leaves a NEW ``<...Mock ...>`` repr-named entry in the CWD.
 
-    **Mechanism.**  ``unittest.mock.MagicMock`` configures ``__fspath__`` as a
-    supported magic method whose default return value is a genuine ``str``.  A
-    MagicMock is therefore a *fully valid* ``os.PathLike[str]``, and
-    ``os.fspath()`` of one is derived from its repr, so it ALWAYS begins with a
-    literal ``MagicMock`` path component::
-
-        os.fspath(MagicMock().project_root / 'data' / 'x.json')
-        # -> 'MagicMock/mock.project_root.__truediv__()...()/1404727137'
-
-    Any production code that coerces such an object with ``Path()`` and then
-    creates directories materialises that tree for real, relative to the
-    process CWD.  Task 3223 hit exactly this: ``merge_queue`` read
-    ``project_root`` off a MagicMock, handed the derived path to
-    ``LandedOutbox``, and ``shared.safe_io.atomic_write_text(..., mkdir=True)``
-    dutifully created it — landing a junk tree in a commit.  The write
-    primitive cannot detect this (there is no type-level signal separating a
-    mock from a genuine relative path), so the fence belongs here.
-
-    The fixture REMOVES the tree as well as failing, so a single polluting test
-    does not cascade into a failure for every subsequent test sharing the same
-    xdist worker's CWD.
-
-    **Deliberately narrow — directory shape only.**  This does NOT match the
-    ``<MagicMock name='...' id='...'>`` FILE shape.  That is the
-    ``str(mock)``/repr shape, it is pre-existing on main and unrelated to task
-    3223 (produced by ``sqlite3.connect(str(...))`` at
-    ``park_eviction_requests.py:84``, not by ``safe_io``), and it is already
-    contained by the ``<MagicMock*`` entry at ``.gitignore:50`` — dozens of
-    such files currently sit untracked in the main checkout, so a guard
-    matching them would go red on day one for reasons this task cannot fix.
-    That pollution is tracked separately as follow-up ticket
-    ``tkt_0RRXS67RDHVVRVM811KFCAPSX8``.
+    ``str()`` of a mock is its repr, so a mock-derived path reaching
+    ``sqlite3.connect(str(...))`` or ``open()`` creates a real file named after
+    it.  Only entries absent from the setup snapshot are blamed and removed, so
+    strays that predate the test can neither turn it red nor cascade onto later
+    tests.  Pinned by ``test_mock_repr_stray_guard.py``.
     """
+    cwd = Path.cwd()
+    before = _mock_repr_entries(cwd)
     yield
-    stray = Path.cwd() / "MagicMock"
-    if not stray.exists():
+    new = sorted(_mock_repr_entries(cwd) - before)
+    if not new:
         return
-    shutil.rmtree(stray, ignore_errors=True)
+    for entry in new:
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
     pytest.fail(
-        f"{request.node.nodeid} left a mock-derived directory at {stray}. "
-        "A MagicMock is a valid os.PathLike[str] whose os.fspath() is "
-        "repr-derived, so passing one where real code calls Path(...).mkdir() "
-        "creates a real tree under the CWD. Give the mock a genuine path "
-        "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
-        "attribute to auto-spec into a child mock. The stray tree has been "
-        "removed so following tests are unaffected."
+        f"{request.node.nodeid} left mock-repr entries in {cwd}: "
+        f"{[entry.name for entry in new]}. str() of a MagicMock is its repr, so "
+        "a mock-derived path reaching sqlite3.connect(str(...)) or open() "
+        "creates a real file in the CWD. Give the mock a genuine path (e.g. "
+        "`req.config.project_root = tmp_path`); for a locally built Harness "
+        "config, call `_harness_store_paths.point_harness_stores_at(config, "
+        "tmp_path)` or use conftest's mock_orch_config. The entries have been "
+        "removed. Under xdist every worker shares this CWD, so a test running "
+        "concurrently on another worker may be the true source; rerun that "
+        "module with `-n 0` to attribute exactly."
     )
 
 
@@ -549,12 +573,16 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, then register ``real_psi_reader`` (task 2418).
+    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register the opt-out markers.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
     task worktree, where every git command this suite runs would resolve against
     the enclosing worktree's repo (task 3355, incident esc-3072-3).
+
+    It also arms the UsageGate probe-dir sweep confinement (task 6275),
+    importing ``shared.usage_gate`` here because a module-level import after
+    this file's ``sys.path`` setup would need a new ``E402`` suppression.
 
     ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
     list is outside this task's locked scope, so the marker used by the
@@ -567,12 +595,24 @@ def pytest_configure(config: pytest.Config) -> None:
     load-bearing yet.
     """
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
+    arm_fleet_dir_isolation(config)
+    arm_leaked_drain_process_guard(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
         'patch so it exercises the REAL `shared.psi.read_psi_sample` bound at '
         'Scheduler construction instead of the deterministic idle-sample stub. '
         'Default: autouse idle-PSI patch installed in conftest.py (task 2418).',
+    )
+    config.addinivalue_line(
+        'markers',
+        f'{REAL_MCP_SESSION_MARKER}: opt a test OUT of the autouse forbid_live_mcp '
+        'guard so shared.mcp_session.McpSession runs for real (stub server / '
+        'mocked transport only) — task 7802',
     )
 
 
@@ -650,78 +690,20 @@ def _hermetic_disk_usage(monkeypatch):
     monkeypatch.setattr(shutil, 'disk_usage', ample_disk_usage)
 
 
-@pytest.fixture
-def forbid_live_mcp(monkeypatch):
-    """Opt-in guard: fail the test if a live fused-memory MCP round-trip is attempted.
+@pytest.fixture(autouse=True)
+def forbid_live_mcp(monkeypatch, request):
+    """Autouse guard: fail the test at once if it attempts a live fused-memory MCP round-trip.
 
-    Task 2644 — de-flaking harness tests that build a real ``Scheduler`` with
-    no injected ``mcp_session`` and no ``McpLifecycle.start()``.  In that
-    configuration ``Scheduler.dispatch_tool`` (scheduler.py:1787-1794) falls
-    through to the LIVE ``mcp_call(...)`` HTTP branch, which — because the
-    module-global ``mcp_lifecycle._session`` is ``None`` in unit tests —
-    constructs a one-shot ``McpSession`` and calls ``initialize()`` /
-    ``_raw_call()`` against the real ``http://localhost:8002``.  Under
-    ``pytest -n auto`` that shared server saturates under load (observed
-    ~100x latency), and these multi-call paths can exceed the suite's 60s
-    per-test timeout — which (``timeout_method='thread'``) ``os._exit()``s
-    the xdist worker rather than just failing the one test.
-
-    Patches the ``McpSession`` CLASS in ``orchestrator.mcp_lifecycle`` —
-    NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
-    ``mcp_call`` via ``from ... import``, a distinct binding from the
-    canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
-    ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
-    ultimately constructs/uses an ``McpSession`` and issues its first
-    network I/O through ``McpSession.initialize`` -> ``_raw_call`` (the
-    one-shot fallback path inside ``mcp_call``, since the module-global
-    ``_session`` is ``None`` in unit tests) — patching the class methods is
-    the single binding-independent network chokepoint every alias funnels
-    through.
-
-    RECORDS each attempt into the yielded list (rather than only raising)
-    because the two dominant live seams here swallow exceptions:
-    ``Scheduler.set_task_claimant`` wraps ``dispatch_tool`` in a bare
-    ``try/except`` (and ``Harness._run_slot``'s ``finally`` additionally
-    wraps that call in ``contextlib.suppress(Exception)``), and
-    ``Scheduler.get_tasks`` wraps it in a ``try/except`` that returns
-    ``[]``.  A raise-only spy would be silently absorbed by either path,
-    reproducing a false "zero calls" result.  Recording the attempt at the
-    seam — before/independent of the raise — and asserting the recorder is
-    empty at teardown guarantees a swallowed live round-trip still fails
-    the test.  The raised ``AssertionError`` still gives non-suppressed
-    callers a fast, clear failure message.
-
-    NOT autouse — request by name in tests that inject a hermetic
-    ``mcp_session`` and need a guarantee that they actually did so.
+    A test opts out with the ``real_mcp_session`` marker. Yields the attempt
+    log, which a test provoking an attempt on purpose reads and clears.
+    Teardown fails a test whose caller swallowed the refusal. Mechanism,
+    rationale and when to opt out: ``_live_mcp_guard.py``.
     """
-    recorder: list[tuple[str, str]] = []
-
-    async def _fake_initialize(self) -> None:
-        recorder.append((self.base_url, 'initialize'))
-        raise AssertionError(
-            f'live fused-memory MCP round-trip attempted: initialize at '
-            f'{self.base_url!r} — inject a HermeticMcpSession into the '
-            'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
-        )
-
-    async def _fake_raw_call(self, method: str, params=None, timeout: float = 30) -> dict:
-        recorder.append((self.base_url, method))
-        raise AssertionError(
-            f'live fused-memory MCP round-trip attempted: {method!r} at '
-            f'{self.base_url!r} — inject a HermeticMcpSession into the '
-            'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
-        )
-
-    monkeypatch.setattr('orchestrator.mcp_lifecycle.McpSession.initialize', _fake_initialize)
-    monkeypatch.setattr('orchestrator.mcp_lifecycle.McpSession._raw_call', _fake_raw_call)
+    recorder = install_live_mcp_guard(monkeypatch, request.node)
 
     yield recorder
 
-    assert recorder == [], (
-        f'forbid_live_mcp: {len(recorder)} live fused-memory MCP round-trip(s) '
-        f'were attempted (some may have been swallowed by caller exception '
-        f'handling): {recorder!r}'
-    )
+    assert_no_live_attempts(recorder)
 
 
 @pytest.fixture(autouse=True)
@@ -741,6 +723,21 @@ def _no_dry_run_unblock(monkeypatch, request):
         return None
 
     monkeypatch.setattr('orchestrator.workflow.run_dry_run_unblock', _noop)
+
+
+@pytest.fixture(autouse=True)
+def _forbid_agent_cli_spawn(monkeypatch, request):
+    """Fail any test that starts an agent CLI (``_agent_cli_guard.AGENT_CLI_BINARIES``).
+
+    Fails at the spawn seam, and again at teardown for a spawn whose raise a
+    caller absorbed. Mechanism and the opt-out marker: ``_agent_cli_guard.py``;
+    tests: ``test_agent_cli_guard.py``.
+    """
+    guard = install_agent_cli_guard(monkeypatch, request.node)
+
+    yield guard
+
+    assert_no_agent_cli_spawns(guard)
 
 
 @pytest.fixture(autouse=True)
@@ -898,18 +895,17 @@ def _neutralize_verify_admission(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _drain_async_mock_coroutines():
-    """Close this test's un-awaited AsyncMock call coroutines before the next test starts.
+    """Fail this test if it called an AsyncMock without awaiting it, closing the orphan first.
 
-    Task 1714 / esc-1702-13; rationale in ``_orch_helpers.py::drain_async_mock_coroutines``.
-    ``track_async_mock_coroutines()`` runs when this conftest is imported, so
-    mocks called during collection are covered too.
+    Tasks 1714 / 5669; rationale in ``_async_mock_orphans.py``.
+    ``track_async_mock_coroutines()`` runs at conftest import, so collection-time mocks are covered.
 
     KNOWN LIMITATION: an orphan created in the teardown of a fixture set up
-    BEFORE this one (module- or session-scoped) is created after this drain has
-    run, so it is closed at the next test's boundary rather than this one's.
+    BEFORE this one (module- or session-scoped) is created after this check has
+    run, so the NEXT test fails instead; the message names where it was created.
     """
     yield
-    drain_async_mock_coroutines()
+    _async_mock_orphans.fail_on_orphaned_async_mock_calls()
 
 
 @pytest.fixture
@@ -1011,6 +1007,10 @@ def make_steward(tmp_path: Path):
       - ``steward_max_timeouts_per_escalation`` = 3,
         ``steward_max_empty_outputs_per_escalation`` = 2
       - ``suggestion_triage_threshold`` = 10
+      - ``steward_session_mode`` = the Field's own production default, read off
+        ``OrchestratorConfig.model_fields`` so mode-agnostic tests run the
+        shipped arm (an unassigned knob would be a MagicMock that silently
+        selects one)
       - triage + steward ``models`` / ``budgets`` / ``max_turns`` / ``effort`` / ``backends``
       - ``escalation.host`` / ``escalation.port``
       - ``timeouts.steward`` / ``steward_completion_timeout`` — the
@@ -1078,6 +1078,7 @@ def make_steward(tmp_path: Path):
         config.steward_max_timeouts_per_escalation = 3
         config.steward_max_empty_outputs_per_escalation = 2
         config.suggestion_triage_threshold = 10
+        config.steward_session_mode = OrchestratorConfig.model_fields['steward_session_mode'].default
         config.models.triage = 'sonnet'
         config.budgets.triage = 2.0
         config.max_turns.triage = 25
@@ -1154,8 +1155,8 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
       - ``sandbox.backend`` = 'auto'
       - ``fused_memory`` = pre-created sub-section mock (no default value)
       - ``escalation`` = pre-created sub-section mock (no default value)
-      - ``overrides_db_path`` = ``tmp_path / 'overrides.db'``
-      - ``park_eviction_requests_db_path`` = ``tmp_path / 'park_eviction_requests.db'``
+      - every Harness-wired sqlite store's ``*_db_path`` under ``tmp_path``
+        (``_harness_store_paths.point_harness_stores_at``)
 
     The top-level mock and each sub-section (usage_cap, review, sandbox,
     fused_memory, escalation) are spec_set'd against their pydantic model's
@@ -1204,6 +1205,8 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
+    # Harness.run builds RunSlots from this; a spec'd MagicMock raises TypeError in asyncio.Semaphore.
+    config.main_health_fix_reserved_slots = 1
     # Task 3540: harness._resume_repend_liveness feeds this straight into
     # timedelta(seconds=...); a spec_set MagicMock attribute raises
     # TypeError there. THIS is the single owner of the value for the suite —
@@ -1251,19 +1254,14 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # asyncio.sleep() argument instead of a MagicMock crash.
     config.warm_lane_gc_enabled = False
     config.warm_lane_gc_interval_secs = 600.0
-    # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
-    # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
-    # is a @property on OrchestratorConfig (see config.py) and Harness wires
-    # OverrideStore.from_config(config) at construction (task 1313).
-    config.overrides_db_path = tmp_path / 'overrides.db'
-    # Real Path so ParkEvictionRequestStore.from_config(config) can call
-    # .parent.mkdir() and sqlite3.connect(str(...)) without stringifying an
-    # unpatched MagicMock into a stray on-disk file — park_eviction_requests_db_path
-    # is a @property on OrchestratorConfig (see config.py) and Harness wires
-    # ParkEvictionRequestStore.from_config(config) at construction (task 1871).
-    # Same failure mode as overrides_db_path above (tasks 1313/1339); this
-    # instance of it is task 2045.
-    config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Gates both the deterministic recon sweep and the scheduled-deploy
+    # settler, which share this interval.
+    config.deterministic_recon_sweep_enabled = False
+    config.deterministic_recon_sweep_interval_secs = 900.0
+    # Always-on services (task 5344): no enable gate, so the interval must be real.
+    config.merge_heartbeat_interval_secs = 15.0
+    config.stale_service_restart_interval_secs = 15.0
+    point_harness_stores_at(config, tmp_path)
     # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
     # read a truthy Mock and run every mock-config workflow test strictly scoped.
     config.strict_mcp_config = False

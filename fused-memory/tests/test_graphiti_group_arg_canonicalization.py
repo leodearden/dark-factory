@@ -23,6 +23,7 @@ Organised by pipeline layer / test focus:
 
 from __future__ import annotations
 
+import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -251,15 +252,30 @@ class TestGroupIdsFilterAgreement:
         backend.client.build_communities.assert_not_called()
 
 
+_POSITIVE_PATH_COVERED = frozenset({
+    'get_nodes_by_exact_name',
+    'find_duplicate_entity_nodes',
+    'add_episode',
+    'search',
+    'search_nodes',
+    'build_communities',
+})
+
+
+def _public_group_arg_methods() -> set[str]:
+    return {
+        name
+        for name, method in inspect.getmembers(GraphitiBackend, inspect.isfunction)
+        if not name.startswith('_')
+        and {'group_id', 'group_ids'} & inspect.signature(method).parameters.keys()
+    }
+
+
 # (method_name, positional args, kwargs — group_id/group_ids set to the
 # path-shaped constant) for every public group-arg GraphitiBackend method
-# NOT already covered by the step-1/3/5 positive-path tests
-# (get_nodes_by_exact_name, find_duplicate_entity_nodes, add_episode,
-# search, search_nodes, build_communities). Together these 41 + 6 = 47
-# cover GraphitiBackend's full public group-arg surface (excluding
-# _driver_for/_graph_for/_ensure_indices/_resolve_or_create_entity/
-# node_count, which are deliberately undecorated, and _identity_lock_for,
-# covered separately by step-9/10).
+# NOT in _POSITIVE_PATH_COVERED. TestCompletenessSweep derives that surface
+# from the method signatures, so a new public method taking group_id or
+# group_ids fails it until it gains a row here.
 #
 # `ensure_indices` (task 3707, β) joined the table when it was added: it
 # resolves a FalkorDB graph KEY via _graph_for for its CREATE statements, so
@@ -284,15 +300,40 @@ class TestGroupIdsFilterAgreement:
 #
 # `enumerate_valid_edges_mentioning` (task 4851) joined for the same reason as
 # enumerate_all_valid_edges, whose narrowed sibling it is.
+#
+# `get_edges_by_uuids` (task 6137) joined because it resolves a graph key via
+# _graph_for, as its single-edge sibling get_edge_text does.
+#
+# `get_node_names_by_uuids` (task 10080) joined for the same reason as its
+# single-node sibling get_node_text.
+#
+# `ensure_entity_node` (task 3335, row added by task 6778) is the public
+# resolve-or-mint sibling of resolve_entity_by_name. The private
+# _mint_entity_node stays out (task 5003 D4): its rejection is pinned in
+# test_write_time_identity.py::TestMintEntityNode.
+#
+# `count_foreign_relationships`, `entity_uuids_with_prefix`,
+# `edge_uuids_with_prefix`, `reassign_edge` and `redact_episode_content` had
+# been decorated without a row; the derived-surface check (task 6778) found
+# them.
 _ALL_GROUP_ARG_SWEEP_CASES = [
     ('get_episode_by_uuid', ('ep1',), {'group_id': _PATH_SHAPED}),
     ('remove_episode', ('ep1',), {'group_id': _PATH_SHAPED}),
+    ('redact_episode_content', ('ep1',), {'group_id': _PATH_SHAPED, 'new_content': 'c'}),
     ('remove_edge', ('e1',), {'group_id': _PATH_SHAPED}),
     ('update_edge', ('e1',), {'fact': 'f', 'group_id': _PATH_SHAPED}),
+    (
+        'reassign_edge',
+        ('e1', 'n2'),
+        {'which_end': 'source', 'group_id': _PATH_SHAPED},
+    ),
     ('query_stale_node_embeddings', (10,), {'group_id': _PATH_SHAPED}),
     ('query_stale_edge_embeddings', (10,), {'group_id': _PATH_SHAPED}),
+    ('entity_uuids_with_prefix', ('ab',), {'group_id': _PATH_SHAPED}),
+    ('edge_uuids_with_prefix', ('ab',), {'group_id': _PATH_SHAPED}),
     ('query_edges_by_time_range', ('2020-01-01', '2020-01-02'), {'group_id': _PATH_SHAPED}),
     ('get_valid_edges_for_node', ('n1',), {'group_id': _PATH_SHAPED}),
+    ('count_foreign_relationships', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_connected_entity_uuids', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_all_valid_edges', (), {'group_id': _PATH_SHAPED}),
     ('enumerate_all_valid_edges', (), {'group_id': _PATH_SHAPED}),
@@ -305,7 +346,9 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('delete_entity', ('n1',), {'group_id': _PATH_SHAPED}),
     ('delete_entity_node', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_node_text', ('n1',), {'group_id': _PATH_SHAPED}),
+    ('get_node_names_by_uuids', (['n1'],), {'group_id': _PATH_SHAPED}),
     ('resolve_entity_by_name', ('Foo',), {'group_id': _PATH_SHAPED}),
+    ('ensure_entity_node', ('Foo',), {'group_id': _PATH_SHAPED}),
     ('find_entity_nodes_by_name_substring', ('605',), {'group_id': _PATH_SHAPED}),
     ('refresh_entity_summary', ('n1',), {'group_id': _PATH_SHAPED}),
     ('set_entity_summary', ('n1', 's'), {'group_id': _PATH_SHAPED}),
@@ -321,6 +364,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('update_node_name', ('n1', 'Name'), {'group_id': _PATH_SHAPED}),
     ('get_edge_text', ('e1',), {'group_id': _PATH_SHAPED}),
     ('get_edge_invalid_at', ('e1',), {'group_id': _PATH_SHAPED}),
+    ('get_edges_by_uuids', (['e1'],), {'group_id': _PATH_SHAPED}),
     ('update_node_embedding', ('n1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('update_edge_embedding', ('e1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('list_indices', (), {'group_id': _PATH_SHAPED}),
@@ -335,23 +379,21 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
 
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 44, (
-    'Sweep must cover exactly the 44 public group-arg GraphitiBackend methods '
-    'this table claims: every one not covered by the step-1/3/5 positive-path '
-    'tests, plus find_entity_nodes_by_name_substring, which is in both (see the '
-    'comment above) — update this table if the decorated surface ever changes.'
-)
-
 
 class TestCompletenessSweep:
     """Behavioral sweep: EVERY remaining public group-arg GraphitiBackend
     method rejects a path-shaped group_id/group_ids element before any DB
-    call — rejection happens at the decorator, before any body logic runs.
+    call.
 
     Guards every method not individually tested above, and any method
-    added in the future — canonicalize-and-reject is the first group_id
-    operation for every one of them.
+    added in the future — the surface check fails until a new method gains
+    a row in _ALL_GROUP_ARG_SWEEP_CASES.
     """
+
+    def test_sweep_and_positive_path_tests_cover_every_public_group_arg_method(self):
+        swept = {case[0] for case in _ALL_GROUP_ARG_SWEEP_CASES}
+
+        assert swept | _POSITIVE_PATH_COVERED == _public_group_arg_methods()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

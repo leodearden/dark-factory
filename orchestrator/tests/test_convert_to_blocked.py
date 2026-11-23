@@ -43,6 +43,7 @@ Covers:
 from __future__ import annotations
 
 import pytest
+from _git_fixtures import seed_repo
 from shared.deploy_state import DeployPhase
 from shared.strand_conversion import StrandConverted
 from shared.task_statuses import TaskStatus
@@ -355,7 +356,11 @@ def applier_harness(tmp_path, mock_orch_config):
     import shutil
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from _orch_helpers import wire_clear_claim_then_set_status, wire_scheduler_liveness_mock
+    from _orch_helpers import (
+        wire_clear_claim_then_set_status,
+        wire_live_status_from_get_task,
+        wire_scheduler_liveness_mock,
+    )
     from escalation.queue import EscalationQueue
 
     from orchestrator.config import RecoveryEmissionConfig
@@ -370,6 +375,7 @@ def applier_harness(tmp_path, mock_orch_config):
     h.scheduler = MagicMock()
     wire_scheduler_liveness_mock(h.scheduler)
     wire_clear_claim_then_set_status(h.scheduler)
+    wire_live_status_from_get_task(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(
         return_value=({_TID: str(TaskStatus.IN_PROGRESS)}, None),
@@ -1173,19 +1179,8 @@ from orchestrator.git_ops import GitOps, _run  # noqa: E402
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """A real temporary git repository with an initial commit on `main`."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     return repo
-
-
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 @pytest.fixture
@@ -1236,7 +1231,7 @@ async def _land_via_merge(
     """Commit *paths_content* on *branch*, then no-ff merge it into *main*.
 
     The merge subject defaults to the canonical ``Merge <branch> into <main>``
-    that ``git_ops._merge_subject`` derives and ``find_merge_marker`` greps
+    that ``shared.merge_subject.format_merge_subject`` derives (git_ops' writer) and ``find_merge_marker`` greps
     for — writer and reader share one derivation in production, and this
     helper reproduces that exact string so the probe under test is exercised
     against the real format rather than a paraphrase.  Returns the merge SHA.
@@ -1586,7 +1581,7 @@ class TestResolveAlreadyLandedBranch:
         parked = await _head_of(git_repo)
         await _reseed(git_repo, 'task/908', parked)
 
-        async def boom(*a, **k):  # noqa: ARG001
+        async def boom(*a, **k):
             raise RuntimeError('probe exploded')
         monkeypatch.setattr('orchestrator.merge_lane.gates._run', boom)
 
@@ -1612,7 +1607,7 @@ class TestResolveAlreadyLandedBranch:
     ) -> None:
         """Cancellation is not a git error.  Swallowing it would strand the
         awaiting task in a state the caller believes it left."""
-        async def cancel(*a, **k):  # noqa: ARG001
+        async def cancel(*a, **k):
             raise asyncio.CancelledError
         monkeypatch.setattr('orchestrator.merge_lane.gates._run', cancel)
 
@@ -1727,6 +1722,63 @@ class TestResolveAlreadyLandedBranch:
             'file, but its effect is gone from main — signal 4 must decline'
         )
 
+    async def test_a_heavy_rewrite_is_logged_as_a_survival_reject_not_a_revert(
+        self, git_repo: Path, git_ops: GitOps,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A rewrite still fails signal 4, but must not be logged as a revert.
+
+        Signal 4 is a line-SURVIVAL threshold test, so rewriting every added
+        line on main rejects the landing exactly as a revert would, while
+        the deliverable is still on main.  The decision stays fail-closed;
+        the WARNING must report what the check measured, not claim a cause.
+        """
+        plan_files = ['src/pkg/rewritten.py']
+        merge_sha = await _land_via_merge(
+            git_repo, 'task/925',
+            {plan_files[0]: ''.join(f'value_{i} = {i}\n' for i in range(30))},
+        )
+        (git_repo / plan_files[0]).write_text(
+            ''.join(f'renamed_{i} = {i}\n' for i in range(30)),
+        )
+        rc, _, err = await _run(
+            ['git', 'commit', '-am', 'impl(925): rewrite every line'],
+            cwd=git_repo,
+        )
+        assert rc == 0, err
+        parked = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/925', parked)
+
+        # Guard the guard: the deliverable is still on main (a rewrite, not a
+        # revert) and attribution still resolves to the MERGE commit.
+        assert (git_repo / plan_files[0]).exists()
+        assert await git_ops.find_merge_marker(
+            'task/925', gate_on_existing_ref=False,
+        ) == merge_sha
+
+        with caplog.at_level('WARNING', logger='orchestrator.merge_lane'):
+            result = await _resolve(
+                plan_files, parked, parked, git_ops,
+                task_id='925', branch='task/925',
+            )
+
+        assert result is None
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelname == 'WARNING'
+            and 'already-landed:' in r.getMessage()
+            and merge_sha in r.getMessage()
+        ]
+        assert len(messages) == 1, messages
+        msg = messages[0]
+        assert 'post-hoc revert' not in msg
+        assert 'failure=effect_not_survived' in msg
+        assert 'added_lines_total=30' in msg
+        assert 'aggregate_survival=0.0 ' in msg
+        assert 'worst_guarded_path=src/pkg/rewritten.py' in msg
+        assert 'worst_guarded_survival=0.0 ' in msg
+        assert not any(r.exc_info for r in caplog.records)
+
     # --- (9) SIGNAL 2 PRECISION — a mention is not a delivery ---------------
     #
     # Amendment pass, review finding #2.  `DEFAULT_COMMIT_CITATION_PATTERN`
@@ -1839,7 +1891,7 @@ class TestResolveAlreadyLandedBranch:
 
         assert await widened.get_files_touched_in_branch(
             f'{revert_sha}^1', revert_sha,
-        ) == plan_files
+        ) == (plan_files, None)
         assert await widened.commit_effect_present_in_main(revert_sha)
 
         assert await _resolve(
@@ -1928,11 +1980,11 @@ class TestSubmitToMergeQueueAlreadyLanded:
         escalation — a clean assertion failure rather than an
         ``await MagicMock`` crash.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -1940,7 +1992,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
 
         emits: list = []
 
-        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
+        def fake_emit(event_store, task_id, outcome, **kwargs):
             emits.append(outcome)
         monkeypatch.setattr(
             'orchestrator.merge_lane.worker._emit_merge_attempt', fake_emit,
@@ -2046,13 +2098,15 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert 'task_citation' in reason
         assert kwargs.get('escalate_to_human') is not True
 
-    async def test_the_predicate_is_given_the_branch_and_the_recorded_base(
+    async def test_the_predicate_is_given_the_branch_and_the_own_work_base(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
         """The predicate cannot measure the range or find the marker without
         both, and a plausible-looking wiring that passes neither would make
         every case fail closed — i.e. silently restore the bug."""
         wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+        wf.artifacts.init(wf.task_id, 'T', 'd', base_commit='stored_sha')
         seen: list = []
         self._stub_predicate(monkeypatch, self._landed(), seen=seen)
         self._wire(wf, monkeypatch)
@@ -2062,7 +2116,10 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert len(seen) == 1
         plan_files, base_sha, branch_head, kw = seen[0]
         assert plan_files == ['a.py', 'b.py', 'c.py']
-        assert base_sha == 'base_sha', 'the branch\'s RECORDED base, not HEAD'
+        assert base_sha == 'stored_sha', (
+            'the own-work base (here the stored base: the fixture worktree is '
+            'not a checkout), not wf._base_commit and not HEAD'
+        )
         assert branch_head == 'fake_head_sha'
         assert kw.get('task_id') == wf.task_id
         # EXACT, not a substring: the merge-marker probe greps for the literal
@@ -2117,7 +2174,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
 
         # Re-stub the gate to PASS, overriding _wire's failing stub.
-        async def passing_check(*a, **k):  # noqa: ARG001
+        async def passing_check(*a, **k):
             return PlanFilesTouchedResult()
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -2131,10 +2188,10 @@ class TestSubmitToMergeQueueAlreadyLanded:
         class _ReachedEnqueue(Exception):
             pass
 
-        async def boom(*a, **k):  # noqa: ARG001
+        async def boom(*a, **k):
             raise _ReachedEnqueue
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.register_and_enqueue_merge_request', boom,
+            'orchestrator.merge_lane.intake.register_and_enqueue_merge_request', boom,
         )
 
         with pytest.raises(_ReachedEnqueue):
@@ -2158,7 +2215,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         wf = _make_workflow(tmp_path=tmp_path)
         order: list[str] = []
 
-        async def fake_resolve(*a, **k):  # noqa: ARG001
+        async def fake_resolve(*a, **k):
             order.append('predicate')
             return self._landed()
         monkeypatch.setattr(
@@ -2210,11 +2267,11 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
 
         from escalation.queue import EscalationQueue
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -2379,12 +2436,19 @@ class TestLandedButPinnedZombieLoop:
 
     # --- ENTRY half ---------------------------------------------------------
 
+    @pytest.mark.parametrize('creation_base', ['re_cut', 'rebased_away'])
     async def test_entry_the_gate_no_longer_mints_the_pin(
         self, git_repo: Path, git_ops: GitOps, tmp_path: Path, monkeypatch,
+        creation_base: str,
     ) -> None:
         """Over a REAL repo in the measured parked shape, the gate must not
         produce the ``escalate_to_human=True`` block whose default
-        ``category='task_failure'`` is the loop's only fuel."""
+        ``category='task_failure'`` is the loop's only fuel.
+
+        The stored base is ``parked`` either way: from the re-cut, or from an
+        inter-iteration rebase that dropped every commit while the
+        creation-time base stayed on main before the landing (task 7668)."""
+        pre_landing = await git_ops.get_main_sha()
         merge_sha = await _land_via_merge(
             git_repo, 'task/3717',
             {f: f'# {f}\n' for f in self._PLAN_FILES},
@@ -2398,15 +2462,17 @@ class TestLandedButPinnedZombieLoop:
 
         wf = _make_workflow(tmp_path=tmp_path / 'wf', task_id='3717')
         wf.plan = {'files': list(self._PLAN_FILES)}
-        wf._base_commit = parked
+        wf._base_commit = parked if creation_base == 're_cut' else pre_landing
+        assert wf.artifacts is not None
+        wf.artifacts.init('3717', 'T', 'd', base_commit=parked)
         wf.git_ops = git_ops
         wf.config.project_root = git_repo
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, f'{parked}\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             # The REAL gate's verdict for this shape: the empty range touches
             # none of the declared files.  Stubbed rather than run so this
             # test pins the CARVE-OUT, not a second copy of the gate (which
@@ -2419,7 +2485,7 @@ class TestLandedButPinnedZombieLoop:
         emits: list = []
         monkeypatch.setattr(
             'orchestrator.merge_lane.worker._emit_merge_attempt',
-            lambda es, tid, outcome, **k: emits.append(outcome),  # noqa: ARG005
+            lambda es, tid, outcome, **k: emits.append(outcome),
         )
         narrow = AsyncMock(return_value=False)
         wf._try_narrow_plan = narrow  # type: ignore[method-assign]
@@ -2688,3 +2754,86 @@ class TestConvertScopingClauseTracksTheBlockedArm:
         assert await _reconcile_stranded(
             enforce_harness, _TID, 'in-progress', mid_run=False,
         ) != _CONVERTED
+
+
+#: Task 4645: the escalation whose ask an ON-MAIN landing satisfies.  Pinned to
+#: the literal on purpose — this suite asserts the category's behaviour, and the
+#: set it belongs to is pinned in `test_recovery_pins.py`.
+PREEXISTING_MAIN_BREAK_PIN = EscalationRef(
+    id='esc-4645-pmb', level=1, category='preexisting_main_break', severity='blocking',
+)
+
+
+@pytest.mark.asyncio
+class TestConvertScopingClauseFollowsTheOnMainRelaxation:
+    """The ON_MAIN clause relaxes one more category than the recovery predicate.
+
+    The scoping clause asks "would the blocked arm move this row next sweep?",
+    so it must follow BOTH clauses: an in-progress on-main row pinned only by a
+    `preexisting_main_break` record would otherwise convert and then be marked
+    done by the ON_MAIN clause one sweep later (task 4645).
+    """
+
+    @pytest.mark.parametrize(
+        'kind', [BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER],
+    )
+    async def test_an_on_main_preexisting_main_break_pin_is_held_not_converted(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        from orchestrator.event_store import EventType
+
+        _bind(enforce_harness, _pinned_in_progress(
+            kind, refs=[PREEXISTING_MAIN_BREAK_PIN],
+        ))
+
+        result = await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        assert enforce_harness.scheduler.set_task_status.await_count == 0
+        rows = _recovery_rows(enforce_harness)
+        assert len(rows) == 1, rows
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['data'].get('reason') == 'escalation_pinned'
+
+    @pytest.mark.parametrize(
+        'kind', [BranchStateKind.EXISTS_OFF_MAIN, BranchStateKind.GONE_NO_MARKER],
+    )
+    async def test_an_off_main_preexisting_main_break_pin_still_converts(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """Off main the ask is unmet and the recovery predicate still pins it,
+        so `blocked` is genuinely at rest — the relaxation is ON_MAIN only."""
+        _bind(enforce_harness, _pinned_in_progress(
+            kind, refs=[PREEXISTING_MAIN_BREAK_PIN],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_an_on_main_task_failure_pin_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """Control: a human-concern pin is in neither set, on main or off."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[PIN_REFS[1]],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_a_preexisting_main_break_beside_a_human_concern_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """B8 through this clause: `all(...)` keeps the human concern pinning."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN,
+            refs=[PREEXISTING_MAIN_BREAK_PIN, PIN_REFS[2]],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED

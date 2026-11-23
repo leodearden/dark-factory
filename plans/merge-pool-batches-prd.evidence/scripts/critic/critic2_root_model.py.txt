@@ -1,0 +1,84 @@
+"""Draft 2 section 6.4 model with the root unknown, by brute force.
+
+A tree is red when its root is red or it holds a defective key; else red w.p. f.
+obs: list of (root, keys, 'red'|'pass').  proved: set of roots proved sound.
+"""
+from itertools import product
+from math import comb
+
+
+def post(obs, d, f, m, proved=()):
+    cleared = set()
+    for root, keys, v in obs:
+        if v == 'pass':
+            cleared |= set(keys)
+    reds = [(root, [k for k in keys if k not in cleared]) for root, keys, v in obs if v == 'red']
+    keys = sorted({k for _, ks in reds for k in ks})
+    roots = sorted({r for r, _ in reds if r not in proved})
+    Z = 0.0
+    pk = {k: 0.0 for k in keys}
+    pr = {r: 0.0 for r in roots}
+    for kb in product([0, 1], repeat=len(keys)):
+        bad = {k for k, b in zip(keys, kb) if b}
+        for rb in product([0, 1], repeat=len(roots)):
+            rbad = {r for r, b in zip(roots, rb) if b}
+            w = 1.0
+            for b in kb:
+                w *= d if b else 1 - d
+            for b in rb:
+                w *= m if b else 1 - m
+            for root, ks in reds:
+                w *= 1.0 if (root in rbad or bad & set(ks)) else f
+            Z += w
+            for k in bad:
+                pk[k] += w
+            for r in rbad:
+                pr[r] += w
+    return {k: v / Z for k, v in pk.items()}, {r: v / Z for r, v in pr.items()}
+
+
+def show(t, *a, **kw):
+    k, r = post(*a, **kw)
+    print(t, {x: round(v, 3) for x, v in k.items()}, 'roots red:', {x: round(v, 3) for x, v in r.items()})
+
+
+A = ['a', 'b', 'c']
+print('== the draft\'s worked value: last member, root unproved, d=.14 f=.01 m=.06')
+show(' ', [('M', A, 'red'), ('M2', ['a'], 'pass'), ('M2', ['b'], 'pass')], 0.14, 0.01, 0.06)
+print('== same, at the main_red value the estimator reaches with no probe-confirmed red in 200 outside roots (1/217)')
+for f in (0.011, 0.018, 0.026):
+    show('  f=%.3f' % f, [('M', A, 'red'), ('M2', ['a'], 'pass'), ('M2', ['b'], 'pass')], 0.14, f, 1 / 217)
+print('== heal through the lane: reds on root M (red, probe missed), then the fix F passes ON M -> "M proved sound"')
+obs = [('M', A, 'red'), ('M', ['d', 'e', 'g'], 'red'), ('M', ['h'], 'red')]
+show('  before the fix passes      ', obs, 0.14, 0.011, 0.06)
+show('  after (M counted as proved) ', obs + [('M', ['F'], 'pass')], 0.14, 0.011, 0.06, proved={'M'})
+show('  then a, b pass on the new main', obs + [('M', ['F'], 'pass'), ('M1', ['a'], 'pass'), ('M1', ['b'], 'pass')], 0.14, 0.011, 0.06, proved={'M'})
+print('== two and three unrelated single reds on one unproved root')
+show('  2', [('M', ['x'], 'red'), ('M', ['y'], 'red')], 0.14, 0.026, 0.06)
+show('  3', [('M', ['x'], 'red'), ('M', ['y'], 'red'), ('M', ['z'], 'red')], 0.14, 0.026, 0.06)
+
+print('== switch: P(at most 1 sound in 10 truths) by true precision; P(>=5 sound in 20) by observed wrong share')
+B = lambda n, k, p: comb(n, k) * p ** k * (1 - p) ** (n - k)
+for prec in (0.95, 0.9, 0.8, 0.7, 0.6, 0.5):
+    print('  precision %.2f: ON window %.3f ; re-arm (<=1 of 20) %.4f' % (prec, sum(B(10, k, 1 - prec) for k in (0, 1)), sum(B(20, k, 1 - prec) for k in (0, 1))))
+for w in (0.06, 0.1, 0.2, 0.3, 0.5):
+    for r in (1.0, 0.5, 0.25):
+        p = w * r
+        print('  wrong share %.2f, returned-unchanged share %.2f: P(suspend on a window of 20) %.3f' % (w, r, 1 - sum(B(20, k, p) for k in range(5))))
+
+print('== sliding window: chance SHADOW->ON fires within N truths at a given precision (Monte Carlo)')
+import random
+random.seed(1)
+for prec in (0.7, 0.6, 0.5):
+    for N in (20, 50, 100):
+        hit = 0
+        for _ in range(20000):
+            w = []
+            ok = False
+            for i in range(N):
+                w.append(random.random() > prec)
+                if len(w) >= 10 and sum(w[-10:]) <= 1:
+                    ok = True
+                    break
+            hit += ok
+        print('  precision %.1f, within %3d truths: %.2f' % (prec, N, hit / 20000))

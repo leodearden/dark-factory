@@ -16,6 +16,7 @@ from datetime import timedelta
 import pytest
 import pytest_asyncio
 from _auto_consolidation_fakes import (
+    CATEGORY,
     NOW,
     PROJECT_ID,
     PROPOSED_AT,
@@ -31,13 +32,23 @@ from shared.task_metadata import HUMAN_CURATOR_GATE_KEY
 
 from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.models.reconciliation import StageId, StageReport
-from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
+from fused_memory.reconciliation.consolidation_auto import (
+    UNREADABLE,
+    AutoOutcome,
+    AutoProposal,
+    build_auto_canonical,
+    evaluate_auto_predicate,
+)
 from fused_memory.reconciliation.consolidation_auto_executor import (
     BACKLOG_CATEGORY,
     CANONICAL_SLUG_LIMIT,
     REFUSED_CATEGORY,
+    ClusterFacts,
     RevertNotAuthorized,
+    apply_auto_verdict,
     auto_consolidation_initial_stats,
+    read_canonical_slugs,
+    read_cluster_facts,
     revert_auto_consolidation,
     run_auto_consolidation,
 )
@@ -50,6 +61,7 @@ from fused_memory.reconciliation.consolidation_proposal import (
     record_outcome,
 )
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.services.consolidation_ops import RetainArmApplied
 
 TOPIC = 'auto-topic-alpha'
 EXEC_RUN = 'run-exec'
@@ -985,3 +997,188 @@ class TestReversal:
             await revert_auto_consolidation(svc, await _row(ledger), agent_id='someone-else')
 
         assert svc.write_awaits() == writes_before
+
+
+HELPER_RUN = 'run-m1'
+HELPER_AGENT = 'curator-test'
+HELPER_SOURCE = 'auto_consolidation_migration'
+
+
+@pytest.fixture
+def bare():
+    return FakeMemoryService(None)
+
+
+async def _verdict(svc, member_ids, topic=TOPIC):
+    facts = await read_cluster_facts(
+        svc, project_id=PROJECT_ID, topic=topic, member_ids=member_ids,
+    )
+    verdict = evaluate_auto_predicate(
+        AutoProposal(topic=topic, member_ids=tuple(member_ids), category=CATEGORY),
+        members=facts.members,
+        canonical_count=facts.canonical_count,
+        open_gate_id=None,
+        existing_canonical_slugs=await read_canonical_slugs(svc, PROJECT_ID) or (),
+        config=svc.config.consolidation_auto,
+    )
+    return verdict, facts
+
+
+async def _apply(svc, verdict, facts, *, claim, topic=TOPIC):
+    return await apply_auto_verdict(
+        svc,
+        project_id=PROJECT_ID,
+        run_id=HELPER_RUN,
+        now=NOW,
+        topic=topic,
+        claim=claim,
+        category=CATEGORY,
+        verdict=verdict,
+        members=facts.members,
+        agent_id=HELPER_AGENT,
+        source=HELPER_SOURCE,
+    )
+
+
+class TestReadCanonicalSlugs:
+    @pytest.mark.asyncio
+    async def test_the_sorted_distinct_slugs_of_canonicals(self, bare):
+        bare.seed(topic='zeta-topic-one', canonical=True)
+        bare.seed(topic='alpha-topic-two', canonical=True)
+        bare.seed(topic='alpha-topic-two', canonical=True)
+        bare.seed(topic='beta-not-canonical')
+
+        assert await read_canonical_slugs(bare, PROJECT_ID) == (
+            'alpha-topic-two', 'zeta-topic-one',
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_scroll_is_none(self, bare):
+        bare.scroll_error = TimeoutError('qdrant down')
+
+        assert await read_canonical_slugs(bare, PROJECT_ID) is None
+
+    @pytest.mark.asyncio
+    async def test_a_full_page_is_none(self, bare):
+        for n in range(CANONICAL_SLUG_LIMIT):
+            bare.seed(topic=f'filler-topic-{n}', canonical=True)
+
+        assert await read_canonical_slugs(bare, PROJECT_ID) is None
+
+
+class TestReadClusterFacts:
+    @pytest.mark.asyncio
+    async def test_live_missing_and_unreadable_members_are_told_apart(self, bare):
+        live = bare.seed()
+        unreadable = bare.seed()
+        bare.read_errors[unreadable] = TimeoutError('read timed out')
+        missing = new_id()
+        bare.seed(topic=TOPIC, canonical=True)
+
+        facts = await read_cluster_facts(
+            bare, project_id=PROJECT_ID, topic=TOPIC, member_ids=[live, missing, unreadable],
+        )
+
+        assert isinstance(facts, ClusterFacts)
+        assert facts.members[live] == bare.records[live]
+        assert facts.members[missing] is None
+        assert facts.members[unreadable] is UNREADABLE
+        assert facts.canonical_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_count_that_raises_is_none(self, bare):
+        member = bare.seed()
+        bare.count_error = TimeoutError('count timed out')
+
+        facts = await read_cluster_facts(
+            bare, project_id=PROJECT_ID, topic=TOPIC, member_ids=[member],
+        )
+
+        assert facts.canonical_count is None
+
+
+class TestApplyAutoVerdict:
+    @pytest.mark.asyncio
+    async def test_a_pass_mints_the_canonical_and_tags_only_unstamped_members(self, bare):
+        fresh = bare.seed_many(3)
+        stamped = bare.seed(topic=TOPIC)
+        stamped_before = bare.snapshot(stamped)
+        verdict, facts = await _verdict(bare, [*fresh, stamped])
+        assert verdict.outcome is AutoOutcome.PASS
+
+        arm = await _apply(bare, verdict, facts, claim=VALID_CLAIM)
+
+        assert isinstance(arm, RetainArmApplied)
+        (canonical_id,) = bare.canonical_ids()
+        assert arm.canonical_id == canonical_id
+        canonical = bare.records[canonical_id]
+        assert canonical['content'] == build_auto_canonical(
+            VALID_CLAIM, TOPIC, len(verdict.retain_ids), HELPER_RUN,
+        )
+        assert canonical['metadata']['topic'] == TOPIC
+        assert canonical['metadata']['canonical'] is True
+        assert canonical['metadata']['x_auto_consolidated'] == {
+            'run_id': HELPER_RUN,
+            'predicate_version': verdict.predicate_version,
+            'members_count': len(verdict.retain_ids),
+            'at': NOW.isoformat(),
+        }
+        for member in fresh:
+            assert bare.metadata_of(member)['topic'] == TOPIC
+            assert bare.metadata_of(member)['x_auto_consolidated_run'] == HELPER_RUN
+        assert bare.snapshot(stamped) == stamped_before
+
+    @pytest.mark.asyncio
+    async def test_tag_only_with_no_claim_leaves_the_incumbent_untouched(self, bare):
+        canonical, stamped = _seed_consolidated(bare)
+        fresh = bare.seed_many(2)
+        before = bare.snapshot(canonical)
+        verdict, facts = await _verdict(bare, [*stamped, *fresh])
+        assert verdict.outcome is AutoOutcome.PASS_TAG_ONLY
+
+        arm = await _apply(bare, verdict, facts, claim=None)
+
+        assert isinstance(arm, RetainArmApplied)
+        assert arm.canonical_id == canonical
+        patched = [c.kwargs['memory_id'] for c in bare.update_memory.await_args_list]
+        assert patched == fresh
+        for member in fresh:
+            assert bare.metadata_of(member)['topic'] == TOPIC
+            assert bare.metadata_of(member)['x_auto_consolidated_run'] == HELPER_RUN
+        assert bare.snapshot(canonical) == before
+        bare.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_pass_with_no_claim_raises_before_any_read_or_write(self, bare):
+        verdict, facts = await _verdict(bare, bare.seed_many(3))
+        assert verdict.outcome is AutoOutcome.PASS
+        reads_before = bare.get_memory_by_id.await_count
+
+        with pytest.raises(ValueError, match=TOPIC):
+            await _apply(bare, verdict, facts, claim=None)
+
+        assert bare.write_awaits() == (0, 0, 0, 0)
+        assert bare.get_memory_by_id.await_count == reads_before
+
+    @pytest.mark.asyncio
+    async def test_a_noop_verdict_raises(self, bare):
+        _, stamped = _seed_consolidated(bare)
+        verdict, facts = await _verdict(bare, stamped)
+        assert verdict.outcome is AutoOutcome.NOOP
+
+        with pytest.raises(ValueError, match='noop'):
+            await _apply(bare, verdict, facts, claim=VALID_CLAIM)
+
+        assert bare.write_awaits() == (0, 0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_a_fail_verdict_raises(self, bare):
+        members = bare.seed_many(3)
+        bare.read_errors[members[0]] = TimeoutError('read timed out')
+        verdict, facts = await _verdict(bare, members)
+        assert verdict.outcome is AutoOutcome.FAIL
+
+        with pytest.raises(ValueError, match='fail'):
+            await _apply(bare, verdict, facts, claim=VALID_CLAIM)
+
+        assert bare.write_awaits() == (0, 0, 0, 0)

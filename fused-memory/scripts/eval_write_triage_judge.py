@@ -35,18 +35,20 @@ Usage
   # A cheap live smoke over a few cases, kept off the committed artifact.
   python scripts/eval_write_triage_judge.py --limit 5 --report-path /tmp/smoke.json
 
-  # The committed arbiter (plans/write-triage-flip-readiness-prd.md C2'):
-  # production's retrieval, bands and attach targets, every case dumped as it
-  # completes.
-  python scripts/eval_write_triage_judge.py --slate-mode retrieved --project-id reify \\
-      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
-      --report-path calibration/write_triage_judge_accuracy_report.json \\
-      --cases-path calibration/write_triage_judge_accuracy_report.cases.jsonl
+A live judge is refused unless ``write_triage.judge_api_url`` and
+``write_triage.judge_api_key`` are both set, so no run can bill
+``OPENAI_API_KEY``; ``config.yaml`` fills them from the ChatGPT-plan proxy's
+``OPENAI_PLAN_PROXY_URL`` and ``OPENAI_PLAN_PROXY_KEY`` (task 9946).
+
+The committed arbiter (plans/write-triage-flip-readiness-prd.md C2'), which is
+production's retrieval, bands, routes and attach targets with every case dumped
+as it completes, is the first of the 2x2 judge arms. All four are run as
+``calibration/write_triage_judge_arms/README.md`` sets out.
 """
 from __future__ import annotations
 
 import contextlib
-import importlib.util
+import itertools
 import json
 import logging
 import sys
@@ -56,6 +58,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.server.write_triage import OUTCOME_STORED
+from fused_memory.utils.script_loader import load_script
 
 logger = logging.getLogger(__name__)
 
@@ -71,23 +74,8 @@ _DEFAULT_REPORT_PATH = str(
     _PACKAGE_ROOT / 'calibration' / 'write_triage_judge_accuracy_report.json'
 )
 
-
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+#: The corpus a retrieved run retrieves against when ``--project-id`` is omitted.
+_DEFAULT_PROJECT_ID = 'reify'
 
 
 def _load_calibrate() -> types.ModuleType:
@@ -101,7 +89,7 @@ def _load_calibrate() -> types.ModuleType:
     a fifth label fails loudly at
     ``eval_write_triage_cases.py::build_judge_cases``.
     """
-    return _load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
+    return load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
 
 
 _calibrate = _load_calibrate()
@@ -109,25 +97,24 @@ _calibrate = _load_calibrate()
 
 # Pyright cannot follow the by-path loader, so it alone resolves `_scoring`,
 # `_cases` and `_live_judge` through the scripts/ extraPath; at runtime each is
-# the by-path load.
+# the by-path load. `_retrieval` is a type-checking name only: at runtime the
+# retrieval edge is loaded lazily, by `load_retrieval`.
 if TYPE_CHECKING:
     import eval_write_triage_cases as _cases
     import eval_write_triage_live_judge as _live_judge
+    import eval_write_triage_retrieval as _retrieval
     import eval_write_triage_scoring as _scoring
 else:
-    _scoring = _load_script(
+    _scoring = load_script(
         _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring',
     )
-    _cases = _load_script(
+    _cases = load_script(
         _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_cases.py', 'eval_write_triage_cases',
     )
-    _live_judge = _load_script(
+    _live_judge = load_script(
         _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_live_judge.py',
         'eval_write_triage_live_judge',
     )
-
-# PRD C2' and task 5807 call this at eval_write_triage_judge.py::score_attachments.
-score_attachments = _scoring.score_attachments
 
 
 _RETRIEVAL_PATH = _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_retrieval.py'
@@ -139,7 +126,7 @@ def load_retrieval() -> types.ModuleType:
     Deliberately NOT loaded at import: it pulls in the server's retrieval
     stack, and the whole pure core below is testable without it.
     """
-    return _load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
+    return load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
 
 
 _WORDING_PATH = _PACKAGE_ROOT / 'scripts' / 'write_triage_judge_wording.py'
@@ -151,7 +138,7 @@ def load_wording() -> types.ModuleType:
     Loaded at import, unlike the retrieval edge: it pulls in only the judge
     module, and the guard's default wording is one of its names.
     """
-    return _load_script(_WORDING_PATH, 'write_triage_judge_wording')
+    return load_script(_WORDING_PATH, 'write_triage_judge_wording')
 
 
 _wording = load_wording()
@@ -296,7 +283,8 @@ def run_judge_eval(
     report = _scoring.build_report(
         scored=scored,
         provenance=run_provenance,
-        production_shape=score_attachments(rows),
+        production_shape=_scoring.score_attachments(rows),
+        routing=_scoring.score_routing(rows),
     )
 
     # `markdown_path` was composed (and its collision with `report_path`
@@ -380,7 +368,7 @@ def _is_committed_report(report_path: str) -> bool:
 
 def guard_committed_report(
     report_path: str, *, dry_run: bool, limit: int | None, slate_mode: str,
-    wording: str = _wording.WORDING_SHIPPED,
+    wording: str = _wording.WORDING_SHIPPED, judge_model: str | None = None,
 ) -> str:
     """Keep a non-measurement run from publishing itself as the measurement.
 
@@ -400,6 +388,8 @@ def guard_committed_report(
       committed one.
     - a non-shipped ``--wording`` measures a prompt production does not
       send, so it is refused outright beside the slate-mode refusal.
+    - a ``--judge-model`` override measures a model other than the
+      configured judge the arbiter measures, so it is refused likewise.
     - ``--limit N`` measures REALLY, just partially. Its numbers are the
       judge's own, and ``provenance.limit`` records the truncation in the
       artifact itself, so an operator (and
@@ -412,7 +402,7 @@ def guard_committed_report(
         return report_path
 
     if dry_run:
-        import tempfile  # noqa: PLC0415
+        import tempfile
 
         redirected = str(Path(tempfile.gettempdir()) / _DRY_RUN_REPORT_NAME)
         logger.warning(
@@ -434,6 +424,12 @@ def guard_committed_report(
         raise ValueError(
             f'the committed artifact measures the shipped wording; pass '
             f'--report-path for a {wording} run',
+        )
+
+    if judge_model is not None:
+        raise ValueError(
+            f'the committed artifact measures the configured judge model; pass '
+            f'--report-path for a --judge-model {judge_model} run',
         )
 
     if limit is not None:
@@ -462,7 +458,7 @@ def apply_field_chars(config: Any, requested: int | None) -> int:
     A negative width is refused: the resolver would silently read the default
     instead, so the provenance would record a width the judge never used.
     """
-    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (
         resolve_judge_field_chars,
     )
 
@@ -538,60 +534,142 @@ def _retrieved_plan(
     judge_candidate_count: int,
     aliases: Mapping[str, str],
 ) -> _cases.EvalPlan:
-    """Retrieve, band and trim every labelled record exactly as production would.
+    """Retrieve, band, route and trim every labelled record as production would, or replay that.
 
-    The retrieval width and both band edges come from the SAME config the
-    shipped ``triage_write`` reads, so a re-calibration moves this eval with it.
+    ``--slates-in`` replays a :func:`_retrieve_snapshot` an earlier run wrote
+    with ``--slates-out``, so several runs judge one retrieval; its project,
+    band edges and width are the provenance, since they are what the slates
+    were measured at, and a ``--project-id`` naming another project is refused.
     """
-    import asyncio  # noqa: PLC0415
-
-    from fused_memory.server.write_triage import (  # noqa: PLC0415
-        resolve_bands,
-        resolve_candidate_k,
-    )
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
-
     retrieval = load_retrieval()
-    service = types.SimpleNamespace(config=config)
-    k = resolve_candidate_k(service)
-    t_high, t_low = resolve_bands(service)
     labelled = [r for r in records if str(r['label']) != _scoring.LABEL_CANONICAL]
-    logger.info(
-        'Retrieving %d slate(s) from project_id=%s at k=%d, bands t_high=%s '
-        't_low=%s', len(labelled), args.project_id, k, t_high, t_low,
-    )
-
-    async def prefetch() -> dict[str, dict[str, Any]]:
-        memory = MemoryService(config)
-        await memory.initialize()
-        try:
-            return await retrieval.prefetch_retrievals(
-                memory, labelled, project_id=args.project_id, k=k,
-            )
-        finally:
-            await memory.close()
-
-    slates = retrieval.retrieved_slates(
-        labelled, asyncio.run(prefetch()),
-        t_high=t_high, t_low=t_low,
-        judge_candidate_count=judge_candidate_count,
-    )
+    if args.slates_in is not None:
+        snapshot = retrieval.SlateSnapshot.load(args.slates_in)
+        _check_snapshot(
+            snapshot, labelled, judge_candidate_count=judge_candidate_count,
+            project_id=args.project_id, path=args.slates_in,
+        )
+        logger.info(
+            'Judging %d slate(s) retrieved from project_id=%s, read from %s',
+            len(snapshot.slates), snapshot.project_id, args.slates_in,
+        )
+    else:
+        snapshot = _retrieve_snapshot(
+            args, config, labelled, judge_candidate_count=judge_candidate_count,
+        )
+        if args.slates_out is not None:
+            snapshot.dump(args.slates_out)
+            logger.info('Wrote the retrieved slates to %s', args.slates_out)
+    slates = snapshot.slates
     return _cases.plan_from_slates(records, slates, provenance={
-        'project_id': args.project_id,
-        't_high': t_high,
-        't_low': t_low,
-        'candidate_k': k,
+        'project_id': snapshot.project_id,
+        't_high': snapshot.t_high,
+        't_low': snapshot.t_low,
+        'candidate_k': snapshot.candidate_k,
         'canonical_absent': sum(1 for s in slates if not s.canonical_present),
         'degraded_retrievals': sum(1 for s in slates if s.degraded),
         'self_retrieved': sum(1 for s in slates if s.self_retrieved),
     }, aliases=aliases, fixture=fixture)
 
 
-def _run(args: Any) -> int:
-    import os  # noqa: PLC0415
+def _retrieve_snapshot(
+    args: Any,
+    config: Any,
+    labelled: Sequence[Mapping[str, Any]],
+    *,
+    judge_candidate_count: int,
+) -> _retrieval.SlateSnapshot:
+    """One production retrieval of *labelled*, banded, routed and trimmed.
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+    The retrieval width and both band edges come from the SAME config the
+    shipped ``triage_write`` reads, so a re-calibration moves this eval with it.
+    """
+    import asyncio
+
+    from fused_memory.maintenance._utils import maintenance_service
+    from fused_memory.server.write_triage import (
+        resolve_bands,
+        resolve_candidate_k,
+    )
+
+    retrieval = load_retrieval()
+    service = types.SimpleNamespace(config=config)
+    k = resolve_candidate_k(service)
+    t_high, t_low = resolve_bands(service)
+    project_id = _DEFAULT_PROJECT_ID if args.project_id is None else args.project_id
+    logger.info(
+        'Retrieving %d slate(s) from project_id=%s at k=%d, bands t_high=%s '
+        't_low=%s', len(labelled), project_id, k, t_high, t_low,
+    )
+
+    async def prefetch() -> dict[str, dict[str, Any]]:
+        async with maintenance_service(config=config) as (_, memory):
+            return await retrieval.prefetch_retrievals(
+                memory, labelled, project_id=project_id, k=k,
+            )
+
+    slates = retrieval.retrieved_slates(
+        labelled, asyncio.run(prefetch()),
+        t_high=t_high, t_low=t_low,
+        judge_candidate_count=judge_candidate_count,
+    )
+    return retrieval.SlateSnapshot(
+        project_id=project_id, t_high=t_high, t_low=t_low, candidate_k=k,
+        judge_candidate_count=judge_candidate_count, slates=tuple(slates),
+    )
+
+
+def _check_snapshot(
+    snapshot: _retrieval.SlateSnapshot,
+    labelled: Sequence[Mapping[str, Any]],
+    *,
+    judge_candidate_count: int,
+    project_id: str | None,
+    path: str,
+) -> None:
+    """Refuse a snapshot that is not a retrieval of this run's population at its width.
+
+    *project_id* is the run's ``--project-id`` as given, ``None`` when omitted:
+    omitted, the run takes the snapshot's project.
+    """
+    expected = [str(record['memory_id']) for record in labelled]
+    measured = [slate.memory_id for slate in snapshot.slates]
+    if measured != expected:
+        raise ValueError(
+            f'{path}: its slates\' memory_ids are not this run\'s {len(expected)} '
+            f'labelled record(s) in order: {_first_divergence(measured, expected)}; '
+            'write the snapshot with the same --fixture and --limit',
+        )
+    if snapshot.judge_candidate_count != judge_candidate_count:
+        raise ValueError(
+            f'{path}: judge_candidate_count {snapshot.judge_candidate_count} is not '
+            f"this run's {judge_candidate_count}",
+        )
+    if project_id is not None and project_id != snapshot.project_id:
+        raise ValueError(
+            f'{path}: retrieved from project_id {snapshot.project_id!r}, not the '
+            f'--project-id {project_id!r} given; omit --project-id to judge it',
+        )
+
+
+def _first_divergence(measured: Sequence[str], expected: Sequence[str]) -> str:
+    """Where a snapshot's slate ids first part from the run's record ids, as an operator reads it."""
+    pairs = itertools.zip_longest(measured, expected)
+    index, (slate_id, record_id) = next(
+        (index, pair) for index, pair in enumerate(pairs) if pair[0] != pair[1]
+    )
+    if record_id is None:
+        return f'slate {index} ({slate_id}) is past this run\'s last record'
+    if slate_id is None:
+        return f'record {index} ({record_id}) has no slate'
+    return f'slate {index} is {slate_id} where this run\'s record {index} is {record_id}'
+
+
+def _run(args: Any) -> int:
+    import os
+
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.server.write_triage_judge import (
         resolve_judge_candidate_count,
         resolve_judge_enabled,
         resolve_judge_model,
@@ -609,13 +687,20 @@ def _run(args: Any) -> int:
     # redirected); rejecting here just means the operator is told now instead
     # of after a corpus-wide run they paid for.
     markdown_sibling(args.report_path)
+    if args.slate_mode != _scoring.SLATE_RETRIEVED:
+        for flag, value in (('--slates-in', args.slates_in), ('--slates-out', args.slates_out)):
+            if value is not None:
+                raise ValueError(
+                    f'{flag} snapshots a retrieval, so it needs --slate-mode '
+                    f'{_scoring.SLATE_RETRIEVED}, not {args.slate_mode}',
+                )
 
     # BEFORE any work, and outside the --limit block: a bare --dry-run also
     # defaults to the committed path, and used to rewrite both committed
     # artifacts with fixed-answer numbers.
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
-        slate_mode=args.slate_mode, wording=args.wording,
+        slate_mode=args.slate_mode, wording=args.wording, judge_model=args.judge_model,
     )
     aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
@@ -626,6 +711,8 @@ def _run(args: Any) -> int:
     # `judge_write` applies to it.
     if args.judge_candidate_count is not None:
         config.write_triage.judge_candidate_count = args.judge_candidate_count
+    if args.judge_model is not None:
+        config.write_triage.judge_model = args.judge_model
     field_chars = apply_field_chars(config, args.field_chars)
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
@@ -641,18 +728,8 @@ def _run(args: Any) -> int:
     judge_candidate_count = resolve_judge_candidate_count(service)
     judge_enabled = resolve_judge_enabled(service)
 
-    fixture = load_fixture(args.fixture)
-    logger.info('Loaded %d labeled record(s) from %s', len(fixture), args.fixture)
-    records = fixture if args.limit is None else _limited(fixture, args.limit)
-
-    if args.slate_mode == _scoring.SLATE_RETRIEVED:
-        plan = _retrieved_plan(
-            args, config, records, fixture=fixture,
-            judge_candidate_count=judge_candidate_count, aliases=aliases,
-        )
-    else:
-        plan = _cases.seeded_plan(records, distractors=args.distractors, aliases=aliases)
-
+    # BEFORE the fixture and the plan: a live builder refuses a judge off the
+    # ChatGPT-plan proxy, and that refusal must precede any retrieval.
     if args.dry_run:
         judge_fn = _dry_run_judge_fn()
         provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
@@ -666,6 +743,18 @@ def _run(args: Any) -> int:
             if args.slate_mode == _scoring.SLATE_RETRIEVED
             else _live_judge.build_judge_fn(config)
         )
+
+    fixture = load_fixture(args.fixture)
+    logger.info('Loaded %d labeled record(s) from %s', len(fixture), args.fixture)
+    records = fixture if args.limit is None else _limited(fixture, args.limit)
+
+    if args.slate_mode == _scoring.SLATE_RETRIEVED:
+        plan = _retrieved_plan(
+            args, config, records, fixture=fixture,
+            judge_candidate_count=judge_candidate_count, aliases=aliases,
+        )
+    else:
+        plan = _cases.seeded_plan(records, distractors=args.distractors, aliases=aliases)
 
     with _wording.judge_wording(args.wording) as prompt_sha256:
         report = run_judge_eval(
@@ -702,7 +791,7 @@ def _run(args: Any) -> int:
 
 
 def main() -> int:
-    import argparse  # noqa: PLC0415
+    import argparse
 
     repo = Path(__file__).parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
@@ -729,9 +818,11 @@ def main() -> int:
                              'winner and the band all come from a real '
                              'retrieval against the live store, as production '
                              'would produce them (default: seeded)')
-    parser.add_argument('--project-id', dest='project_id', default='reify',
-                        help='the corpus retrieved against under '
-                             '--slate-mode retrieved (default: reify)')
+    parser.add_argument('--project-id', dest='project_id', default=None,
+                        help='the corpus retrieved against under --slate-mode '
+                             f'retrieved (default: {_DEFAULT_PROJECT_ID}). Under '
+                             "--slates-in the snapshot's project is used, and "
+                             'any other given here is refused')
     parser.add_argument('--field-chars', dest='field_chars', type=int, default=None,
                         help="override the judge's per-field prompt budget for "
                              'this run; 0 renders every field UN-elided. '
@@ -753,12 +844,26 @@ def main() -> int:
                              'named, attach target, band, verdict, outcome and '
                              'elision flags (default: no per-case dump)')
     parser.add_argument('--wording', default=_wording.WORDING_SHIPPED,
-                        choices=_wording.WORDINGS,
+                        choices=_wording.SELECTABLE_WORDINGS,
                         help='the judge system prompt the run is made under; '
-                             'pre-psi is the pre-psi wording as an eval-side '
-                             'override. Recorded as '
+                             'pre-psi is the pre-psi wording and psi the '
+                             'prompt shipped from task 6149 until task 7155, '
+                             'each as an eval-side override. Recorded as '
                              'provenance.judge_system_prompt_sha256 '
                              '(default: shipped)')
+    parser.add_argument('--judge-model', dest='judge_model', default=None,
+                        help='override write_triage.judge_model for this run, '
+                             'in memory only — config.yaml is not written. '
+                             'Recorded as provenance.judge_model')
+    snapshots = parser.add_mutually_exclusive_group()
+    snapshots.add_argument('--slates-out', dest='slates_out', default=None,
+                           help='--slate-mode retrieved only: write the retrieved '
+                                'slates to this JSON file, for --slates-in runs '
+                                'to judge the same population')
+    snapshots.add_argument('--slates-in', dest='slates_in', default=None,
+                           help='--slate-mode retrieved only: judge the slates a '
+                                '--slates-out run wrote instead of retrieving; '
+                                'its project, band edges and width are recorded')
     return _run(parser.parse_args())
 
 

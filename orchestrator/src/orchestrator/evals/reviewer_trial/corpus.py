@@ -7,8 +7,14 @@ for evaluating reviewer panel configurations.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import MappingProxyType
+
+from orchestrator.evals import paths
+
+_PROJECT_SUBDIRS: Mapping[str, tuple[str, str]] = MappingProxyType({'reify-gui': ('reify', 'gui')})
 
 
 @dataclass
@@ -51,6 +57,15 @@ class FixtureTaskRecord:
             id=data.get('id'),
             record_source=data.get('record_source'),
         )
+
+    def as_task_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'title': self.title,
+            'description': self.description,
+            'details': self.details,
+            'testStrategy': self.test_strategy,
+        }
 
 
 @dataclass
@@ -100,11 +115,20 @@ class CorpusDiff:
     diff_text: str
     description: str
     ground_truth: list[GroundTruthIssue]
-    project: str | None = None  # for cwd resolution
+    project: str | None = None  # selects the fixture's source checkout (source_dir)
     cwd: Path | None = None
     split: str | None = None       # "train" | "selection" | "test"
     provenance: dict | None = None  # mining provenance: runs.db refs, escalation refs, merge_sha
     context: FixtureContext | None = None  # task record, plan, base/branch shas, changed files
+
+    def source_dir(self) -> Path:
+        """The checkout this fixture is read from; raises CheckoutRootError when none is derivable."""
+        if self.cwd is not None:
+            return self.cwd
+        if self.project is None:
+            return paths.main_checkout()
+        project_id, subdir = _PROJECT_SUBDIRS.get(self.project, (self.project, ''))
+        return paths.project_checkout(project_id) / subdir
 
     def blocking_issues(self) -> list[GroundTruthIssue]:
         return [gt for gt in self.ground_truth if gt.severity == 'blocking']
@@ -206,11 +230,6 @@ class CorpusManifest:
                 if ann_data.get('context') is not None:
                     context = FixtureContext.from_dict(ann_data['context'])
 
-            cwd = None
-            project = entry.get('project')
-            if project:
-                cwd = _resolve_project_cwd(project)
-
             diffs.append(CorpusDiff(
                 diff_id=diff_id,
                 language=entry['language'],
@@ -218,8 +237,7 @@ class CorpusManifest:
                 diff_text=diff_text,
                 description=entry['description'],
                 ground_truth=ground_truth,
-                project=project,
-                cwd=cwd,
+                project=entry.get('project'),
                 split=entry.get('split'),
                 provenance=provenance,
                 context=context,
@@ -230,15 +248,3 @@ class CorpusManifest:
             version=raw.get('version', '1.0'),
             split_seed=raw.get('split_seed'),
         )
-
-
-# Project → working directory mapping for invoke_agent cwd
-_PROJECT_CWD_MAP = {
-    'dark-factory': Path('/home/leo/src/dark-factory'),
-    'reify': Path('/home/leo/src/reify'),
-    'reify-gui': Path('/home/leo/src/reify/gui'),
-}
-
-
-def _resolve_project_cwd(project: str) -> Path | None:
-    return _PROJECT_CWD_MAP.get(project)

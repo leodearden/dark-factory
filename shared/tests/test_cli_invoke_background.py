@@ -1,14 +1,16 @@
 """Tests for the background-task abandonment detector + downgrade (task 2761).
 
 Layer 2 of the headless ``--print`` background-task footgun fix: detect when an
-otherwise-successful ``claude --print`` run ended its turn while a backgrounded
-Bash command was still pending (launched via ``Bash run_in_background=true``,
-never subsequently reaped), and downgrade ``success``→failure so existing
+otherwise-successful ``claude --print`` run ended its turn while a background
+task it started was still pending, and downgrade ``success``→failure so existing
 non-success handling retries/resumes instead of proceeding on a half-done tree.
+What counts as a launch is defined once, by the contract in
+``shared.cli_invoke.detect_ended_awaiting_background``'s docstring.
 
-A session reaps either by calling a background-management tool named in
-``_BACKGROUND_REAP_TOOLS`` or — the tool-agnostic second clause (task 3639) — by
-issuing any tool_use whose input references the task's id or output-file path.
+A session reaps by calling a background-management tool named in
+``_BACKGROUND_REAP_TOOLS``, by issuing any tool_use whose input references the
+task's id or output-file path (the tool-agnostic clause, task 3639), or by
+having a task-notification naming the task delivered to it (task 5986).
 The tool names appearing in the fixtures below are test DATA standing in for
 whatever a CLI build might emit, not a claim that each is live — only
 ``TaskStop`` is (task 5332).  Exercising the accept set's full membership is
@@ -26,104 +28,117 @@ complete and exited success, silently abandoning the work mid-task.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
+from _transcript_fixtures import (
+    assistant_record,
+    bash_launch,
+    bg_launch_result,
+    bg_log_path,
+    confirmed_bash_launch,
+)
 
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
+    SubprocessResult,
     _content_blocks,
     _iter_result_texts,
-    _parse_claude_output,
-    _SubprocessResult,
     classify_agent_failure,
     detect_ended_awaiting_background,
     ended_awaiting_background_for_session,
+    parse_claude_output,
 )
 
 # ── Fixture builders ────────────────────────────────────────────────────────
-# Hand-authored assistant/user record dicts mirroring the on-disk transcript
-# JSONL shape: an assistant record carries content blocks either nested under
-# ``record['message']['content']`` (the real CLI shape) or flat under
-# ``record['content']`` (the shape used by the existing read_transcript_records
-# tests).  tool_use blocks carry ``name`` + ``input``.
+# The confirmed-launch records come from _transcript_fixtures (shared with the
+# other suites that build a transcript ending on one); the builders below are
+# this suite's own.
 
 
-def _assistant(blocks: list, *, nested: bool = True) -> dict:
-    """An assistant transcript record wrapping *blocks*.
-
-    ``nested=True`` → record['message']['content'] (real CLI shape).
-    ``nested=False`` → flat record['content'].
-    """
-    if nested:
-        return {'type': 'assistant', 'message': {'role': 'assistant', 'content': blocks}}
-    return {'type': 'assistant', 'content': blocks}
-
-
-def _bash_launch(
-    *,
-    background: bool = True,
-    command: str = 'sleep 9999',
-    tool_id: str = 'toolu_1',
-) -> dict:
-    """A Bash tool_use block.  Real CLI blocks carry an ``id``; it is emitted
-    unconditionally (with a default) so the pre-existing tests are unaffected
-    while the bg-log-reap tests can correlate a launch with its tool_result."""
+def _user_result(tool_id: str, content: str, tool_use_result: object, *, is_error: bool) -> dict:
     return {
-        'type': 'tool_use',
-        'id': tool_id,
-        'name': 'Bash',
-        'input': {'command': command, 'run_in_background': background},
-    }
-
-
-def _bg_log_path(task_id: str = 'bz89cdzmh') -> str:
-    """The CLI's background-output path shape: the task id is a substring of it."""
-    return f'/tmp/claude-1000/-w-3639/sess/tasks/{task_id}.output'
-
-
-def _bg_launch_result(
-    tool_id: str = 'toolu_1',
-    task_id: str = 'bz89cdzmh',
-    log_path: str | None = None,
-    *,
-    structured: bool = True,
-    in_text: bool = True,
-) -> dict:
-    """The ``user`` tool_result record the CLI emits for a background launch.
-
-    Mirrors the REAL shape sampled from ``~/.claude/projects/*/*.jsonl``: the
-    record carries BOTH a structured ``toolUseResult.backgroundTaskId`` and a
-    result-text sentence naming the output file.  ``structured=False`` drops the
-    former and ``in_text=False`` drops the latter, so the detector's two
-    token-extraction sources can be exercised independently.
-    """
-    log_path = log_path if log_path is not None else _bg_log_path(task_id)
-    text = f'Command running in background with ID: {task_id}.'
-    if in_text:
-        text += (
-            f' Output is being written to: {log_path}.'
-            ' You will be notified when it completes.'
-            ' To check interim output, use Read on that file path.'
-        )
-    record: dict = {
         'type': 'user',
         'message': {
             'role': 'user',
             'content': [
-                {'type': 'tool_result', 'tool_use_id': tool_id, 'content': text},
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': tool_id,
+                    'content': content,
+                    'is_error': is_error,
+                },
             ],
         },
+        'toolUseResult': tool_use_result,
     }
-    if structured:
-        record['toolUseResult'] = {'stdout': '', 'backgroundTaskId': task_id}
-    return record
 
 
-def _fg_bash(command: str) -> dict:
+def _ran_in_foreground_result(
+    tool_id: str = 'toolu_1', stdout: str = 'PASS: 17 | FAIL: 0 | SKIP: 3'
+) -> dict:
+    """The result of a run_in_background call the CLI ran in the FOREGROUND:
+    finished output, no background id.  Shape of reify 4996 lane-10, session
+    a88d703e-2307-40b9-8460-8448202ab597."""
+    return _user_result(
+        tool_id,
+        stdout,
+        {
+            'stdout': stdout,
+            'stderr': '',
+            'interrupted': False,
+            'isImage': False,
+            'noOutputExpected': False,
+        },
+        is_error=False,
+    )
+
+
+def _rejected_result(tool_id: str = 'toolu_1') -> dict:
+    """The result of a call the user REJECTED.  Shape of dark-factory 3395,
+    session 34bc8499-8e42-41cc-b726-f5c9797ce123."""
+    return _user_result(
+        tool_id,
+        "The user doesn't want to proceed with this tool use. The tool use was"
+        ' rejected (eg. if it was a file edit, the new_string was NOT written to'
+        ' the file). STOP what you are doing and wait for the user to tell you'
+        ' how to proceed.',
+        'User rejected tool use',
+        is_error=True,
+    )
+
+
+def _auto_backgrounded_result(tool_id: str = 'toolu_fg', task_id: str = 'bd9xuykdj') -> dict:
+    """The result of a FOREGROUND Bash the CLI moved to the background after its
+    timeout.  Shape of dark-factory 3799, session
+    14a8ad8b-2a6b-405a-afcc-ae084b3dce9a."""
+    return _user_result(
+        tool_id,
+        'Command did not complete within its 120s timeout and was moved to the'
+        f' background (ID: {task_id}). Output is being written to:'
+        f' {bg_log_path(task_id)}. You will be notified when it completes.'
+        ' To check interim output, use Read on that file path.',
+        {
+            'stdout': '',
+            'stderr': '',
+            'interrupted': False,
+            'isImage': False,
+            'noOutputExpected': False,
+            'backgroundTaskId': task_id,
+            'timedOutAfterMs': 120000,
+        },
+        is_error=False,
+    )
+
+
+def _fg_bash(command: str, *, tool_id: str | None = None) -> dict:
     """A FOREGROUND Bash tool_use (no run_in_background) — not a launch."""
-    return {'type': 'tool_use', 'name': 'Bash', 'input': {'command': command}}
+    block: dict = {'type': 'tool_use', 'name': 'Bash', 'input': {'command': command}}
+    if tool_id is not None:
+        block['id'] = tool_id
+    return block
 
 
 def _verdict_submit(name: str) -> dict:
@@ -133,7 +148,7 @@ def _verdict_submit(name: str) -> dict:
 
 
 # A second bg-log path used by the malformed-record tolerance test.
-LOG_ALT = _bg_log_path('zz99alt00')
+LOG_ALT = bg_log_path('zz99alt00')
 
 
 def _bash_output(shell_id: str = 'sh-1') -> dict:
@@ -146,6 +161,147 @@ def _kill_shell(shell_id: str = 'sh-1', *, name: str = 'KillShell') -> dict:
 
 def _text(text: str = 'thinking') -> dict:
     return {'type': 'text', 'text': text}
+
+
+MONITOR_TASK_ID = 'byk7waubd'
+
+
+def _monitor_call(
+    *,
+    tool_id: str = 'toolu_mon1',
+    command: str = 'until [ -s /tmp/x.log ]; do sleep 10; done; tail -8 /tmp/x.log',
+    timeout_ms: int = 900000,
+) -> dict:
+    """A ``Monitor`` tool_use block, in the CLI's measured input shape."""
+    return {
+        'type': 'tool_use',
+        'id': tool_id,
+        'name': 'Monitor',
+        'input': {
+            'command': command,
+            'description': 'test run completion',
+            'timeout_ms': timeout_ms,
+            'persistent': False,
+        },
+    }
+
+
+def _monitor_armed(
+    tool_id: str = 'toolu_mon1',
+    task_id: object = MONITOR_TASK_ID,
+    timeout_ms: int = 900000,
+    *,
+    nested: bool = True,
+) -> dict:
+    """The ``user`` record confirming a Monitor arm: a tool_result naming the
+    call plus the structured ``toolUseResult`` carrying the armed task's id.
+    ``nested=False`` puts the content list flat under ``record['content']``."""
+    content = [
+        {
+            'type': 'tool_result',
+            'tool_use_id': tool_id,
+            'content': (
+                f'Monitor started (task {task_id}, timeout {timeout_ms}ms).'
+                ' You will be notified on each event.'
+                ' Keep working — do not poll or sleep.'
+            ),
+        },
+    ]
+    record: dict = {
+        'type': 'user',
+        'toolUseResult': {'taskId': task_id, 'timeoutMs': timeout_ms, 'persistent': False},
+    }
+    if nested:
+        record['message'] = {'role': 'user', 'content': content}
+    else:
+        record['content'] = content
+    return record
+
+
+def _monitor_rejected(tool_id: str = 'toolu_mon1') -> dict:
+    """The ``user`` record for a Monitor call the CLI REJECTED: nothing armed."""
+    return {
+        'type': 'user',
+        'message': {
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': tool_id,
+                    'is_error': True,
+                    'content': (
+                        '<tool_use_error>InputValidationError: Monitor failed due to'
+                        ' the following issues:\nThe required parameter `description`'
+                        ' is missing</tool_use_error>'
+                    ),
+                },
+            ],
+        },
+        'toolUseResult': 'InputValidationError: [...]',
+    }
+
+
+# The call and its confirming result, for each launch kind.
+_EACH_LAUNCH_KIND = [
+    pytest.param(bash_launch(), bg_launch_result(), id='bash'),
+    pytest.param(_monitor_call(), _monitor_armed(), id='monitor'),
+]
+
+
+def _monitor_event_text(
+    task_id: str = MONITOR_TASK_ID,
+    event: str = '4953 passed, 1 skipped in 262.80s',
+    summary: str = 'test sweep result',
+) -> str:
+    """The text of a Monitor event (or expiry) notification."""
+    return (
+        '<task-notification>\n'
+        f'<task-id>{task_id}</task-id>\n'
+        f'<summary>Monitor event: "{summary}"</summary>\n'
+        f'<event>{event}</event>\n'
+        '</task-notification>'
+    )
+
+
+def _bash_completion_text(task_id: str = 'bz89cdzmh', tool_use_id: str = 'toolu_1') -> str:
+    """The text of a background Bash completion notification."""
+    return (
+        '<task-notification>\n'
+        f'<task-id>{task_id}</task-id>\n'
+        f'<tool-use-id>{tool_use_id}</tool-use-id>\n'
+        f'<output-file>{bg_log_path(task_id)}</output-file>\n'
+        '<status>completed</status>\n'
+        '<summary>Background command "cargo test" completed (exit code 0)</summary>\n'
+        '</task-notification>'
+    )
+
+
+def _delivered_mid_turn(text: str) -> dict:
+    """A notification delivered to the model inside the running turn."""
+    return {
+        'type': 'attachment',
+        'attachment': {
+            'type': 'queued_command',
+            'prompt': text,
+            'commandMode': 'task-notification',
+        },
+    }
+
+
+def _delivered_new_turn(text: str, *, as_blocks: bool = False) -> dict:
+    """A notification delivered to the model as the prompt of a new turn.
+    ``as_blocks=True`` carries the text as a ``text`` sub-block list."""
+    content: object = [{'type': 'text', 'text': text}] if as_blocks else text
+    return {
+        'type': 'user',
+        'message': {'role': 'user', 'content': content},
+        'origin': {'kind': 'task-notification', 'producer': 'session-task'},
+    }
+
+
+def _enqueued_only(text: str) -> dict:
+    """Queue bookkeeping for a notification: NOT a delivery to the model."""
+    return {'type': 'queue-operation', 'operation': 'enqueue', 'content': text}
 
 
 def _write_transcript(base: Path, session_id: str, records: list) -> Path:
@@ -171,41 +327,41 @@ class TestDetectEndedAwaitingBackground:
     def test_no_background_launch_is_false(self) -> None:
         """A foreground Bash (run_in_background falsy/absent) is not a launch → False."""
         records = [
-            _assistant([_text('run the tests')]),
-            _assistant([_bash_launch(background=False, command='pytest -q')]),
-            _assistant([{'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'ls'}}]),
+            assistant_record([_text('run the tests')]),
+            assistant_record([bash_launch(background=False, command='pytest -q')]),
+            assistant_record([{'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'ls'}}]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
     def test_single_abandoned_launch_is_true(self) -> None:
         """A single background launch with nothing after it → True (the RCA)."""
         records = [
-            _assistant([_text('kick off the long build')]),
-            _assistant([_bash_launch(command='./occt-test.sh')]),
+            assistant_record([_text('kick off the long build')]),
+            *confirmed_bash_launch(command='./occt-test.sh'),
         ]
         assert detect_ended_awaiting_background(records) is True
 
     def test_launch_then_bashoutput_is_false(self) -> None:
         """Launch later polled by BashOutput → engaged → False."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([_bash_output()]),
+            *confirmed_bash_launch(),
+            assistant_record([_bash_output()]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
     def test_launch_then_killshell_is_false(self) -> None:
         """Launch later killed by KillShell → engaged → False."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([_kill_shell()]),
+            *confirmed_bash_launch(),
+            assistant_record([_kill_shell()]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
     def test_launch_then_killbash_is_false(self) -> None:
         """KillBash is also a reap (older CLI tool name) → False."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([_kill_shell(name='KillBash')]),
+            *confirmed_bash_launch(),
+            assistant_record([_kill_shell(name='KillBash')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -213,18 +369,18 @@ class TestDetectEndedAwaitingBackground:
         """Two launches; the reap sits BEFORE the second launch, which is never
         reaped → last launch after last reap → True."""
         records = [
-            _assistant([_bash_launch(command='job-a')]),
-            _assistant([_kill_shell()]),
-            _assistant([_bash_launch(command='job-b')]),
+            *confirmed_bash_launch(command='job-a', tool_id='toolu_a', task_id='aaa11111'),
+            assistant_record([_kill_shell()]),
+            *confirmed_bash_launch(command='job-b', tool_id='toolu_b', task_id='bbb22222'),
         ]
         assert detect_ended_awaiting_background(records) is True
 
     def test_launch_reaped_then_second_launch_abandoned_is_true(self) -> None:
         """launch → BashOutput (reaps first) → a SECOND launch left abandoned → True."""
         records = [
-            _assistant([_bash_launch(command='job-a')]),
-            _assistant([_bash_output()]),
-            _assistant([_bash_launch(command='job-b')]),
+            *confirmed_bash_launch(command='job-a', tool_id='toolu_a', task_id='aaa11111'),
+            assistant_record([_bash_output()]),
+            *confirmed_bash_launch(command='job-b', tool_id='toolu_b', task_id='bbb22222'),
         ]
         assert detect_ended_awaiting_background(records) is True
 
@@ -234,11 +390,11 @@ class TestDetectEndedAwaitingBackground:
         records = [
             {'type': 'assistant', 'message': {'role': 'assistant'}},  # message w/o content
             {'type': 'assistant', 'content': None},  # content not a list
-            _assistant([_text('planning')], nested=False),  # flat text
+            assistant_record([_text('planning')], nested=False),  # flat text
             {'type': 'user', 'content': [{'type': 'tool_result', 'content': 'x'}]},
-            _assistant(['not-a-dict-block', 42, {'type': 'text'}], nested=False),  # junk blocks
-            _assistant([{'type': 'tool_use', 'name': 'Bash'}]),  # Bash tool_use w/o input
-            _assistant([_bash_launch(command='./occt-test.sh')], nested=True),  # the launch
+            assistant_record(['not-a-dict-block', 42, {'type': 'text'}], nested=False),  # junk blocks
+            assistant_record([{'type': 'tool_use', 'name': 'Bash'}]),  # Bash tool_use w/o input
+            *confirmed_bash_launch(command='./occt-test.sh', nested=True),  # the launch
         ]
         assert detect_ended_awaiting_background(records) is True
 
@@ -256,8 +412,8 @@ class TestDetectEndedAwaitingBackground:
         """A launch (nested) later reaped by a BashOutput authored in the flat
         shape → still recognised as a reap → False."""
         records = [
-            _assistant([_bash_launch()], nested=True),
-            _assistant([_bash_output()], nested=False),
+            *confirmed_bash_launch(nested=True),
+            assistant_record([_bash_output()], nested=False),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -281,10 +437,10 @@ class TestDetectEndedAwaitingBackground:
         which pins the same verdict for the FINISHED-then-moved-on shape.)
         """
         records = [
-            _assistant([_text('kick off the long OCCT test')]),
-            _assistant([_bash_launch(command='./occt-test.sh')]),
-            _assistant([_bash_output()]),  # polled once — still running
-            _assistant([_text('I will wait for the background test to finish')]),
+            assistant_record([_text('kick off the long OCCT test')]),
+            *confirmed_bash_launch(command='./occt-test.sh'),
+            assistant_record([_bash_output()]),  # polled once — still running
+            assistant_record([_text('I will wait for the background test to finish')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -303,33 +459,33 @@ class TestForegroundBgLogReadIsAReap:
     ``Output is being written to: <path>`` sentence.
     """
 
-    LOG = _bg_log_path()
+    LOG = bg_log_path()
 
     def test_foreground_tail_of_bg_log_is_false(self) -> None:
         """The `_lane-31` shape: launch → its tool_result → foreground `tail` of
         the reported bg-log → engaged → False."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(),
-            _assistant([_fg_bash(f'tail -50 {self.LOG}')]),
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record([_fg_bash(f'tail -50 {self.LOG}')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
     def test_foreground_cat_of_bg_log_is_false(self) -> None:
         """`cat <bg-log>` is the same reap, with no shell-verb enumeration."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(),
-            _assistant([_fg_bash(f'cat {self.LOG}')]),
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record([_fg_bash(f'cat {self.LOG}')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
     def test_foreground_grep_of_bg_log_is_false(self) -> None:
         """`grep -c FAILED <bg-log>` likewise."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(),
-            _assistant([_fg_bash(f'grep -c FAILED {self.LOG}')]),
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record([_fg_bash(f'grep -c FAILED {self.LOG}')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -338,7 +494,7 @@ class TestForegroundBgLogReadIsAReap:
         recommends ("use Read on that file path") → False.
 
         This is also the shape
-        orchestrator/src/orchestrator/agents/roles.py::WAIT_PATTERN_GUIDANCE
+        orchestrator/src/orchestrator/agents/harness_guidance.py::WAIT_PATTERN_GUIDANCE
         now steers every Bash-capable role into (task 5332), which is why
         correcting those prompts needed no change to the detector. Keep it: it
         is the executable form of that claim, and narrowing
@@ -346,18 +502,18 @@ class TestForegroundBgLogReadIsAReap:
         silently downgrading every correctly-behaved session to failure.
         """
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(),
-            _assistant([{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': self.LOG}}]),
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record([{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': self.LOG}}]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
     def test_grep_tool_of_bg_log_is_false(self) -> None:
         """`Grep` with the bg-log as ``path`` → tool-agnostic token match → False."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(),
-            _assistant(
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record(
                 [
                     {
                         'type': 'tool_use',
@@ -374,19 +530,19 @@ class TestForegroundBgLogReadIsAReap:
         result text carries no ``Output is being written to:`` sentence) — the
         task id is a substring of the log path, so the later `tail` matches."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(structured=True, in_text=False),
-            _assistant([_fg_bash(f'tail -50 {self.LOG}')]),
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(in_text=False),
+            assistant_record([_fg_bash(f'tail -50 {self.LOG}')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
     def test_token_from_result_text_only_is_false(self) -> None:
-        """Token recovered from the result TEXT alone (no structured
-        ``toolUseResult``) — tolerates CLI versions emitting only one source."""
+        """Token recovered from the result TEXT alone: the structured id names
+        another task, so only the reported output path matches the `tail`."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(structured=False, in_text=True),
-            _assistant([_fg_bash(f'tail -50 {self.LOG}')]),
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(task_id='qq77other', log_path=self.LOG),
+            assistant_record([_fg_bash(f'tail -50 {self.LOG}')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -394,8 +550,8 @@ class TestForegroundBgLogReadIsAReap:
         """2761 PRESERVATION: launch → its tool_result → nothing.  The genuine
         Reify-5164 abandonment shape must still fire."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(),
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
         ]
         assert detect_ended_awaiting_background(records) is True
 
@@ -404,10 +560,10 @@ class TestForegroundBgLogReadIsAReap:
         bg-log token is not a reap → still True (no blanket "did anything
         afterwards" mute)."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _bg_launch_result(),
-            _assistant([_fg_bash('git status')]),
-            _assistant(
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record([_fg_bash('git status')]),
+            assistant_record(
                 [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]
             ),
         ]
@@ -417,11 +573,11 @@ class TestForegroundBgLogReadIsAReap:
         """launch A → A's result → read A's log → launch B → B's result →
         nothing: the reap is positional, so B's abandonment still fires."""
         records = [
-            _assistant([_bash_launch(command='job-a', tool_id='toolu_a')]),
-            _bg_launch_result(tool_id='toolu_a', task_id='aaa11111'),
-            _assistant([_fg_bash(f'tail -50 {_bg_log_path("aaa11111")}')]),
-            _assistant([_bash_launch(command='job-b', tool_id='toolu_b')]),
-            _bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
+            assistant_record([bash_launch(command='job-a', tool_id='toolu_a')]),
+            bg_launch_result(tool_id='toolu_a', task_id='aaa11111'),
+            assistant_record([_fg_bash(f'tail -50 {bg_log_path("aaa11111")}')]),
+            assistant_record([bash_launch(command='job-b', tool_id='toolu_b')]),
+            bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
         ]
         assert detect_ended_awaiting_background(records) is True
 
@@ -431,7 +587,8 @@ class TestForegroundBgLogReadIsAReap:
         rather than raising, and a text-derived token from a well-formed sibling
         still clears the verdict → False."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(in_text=False),
             {'type': 'user', 'toolUseResult': 'not-a-dict', 'message': {'content': 'not-a-list'}},
             {'type': 'user', 'toolUseResult': {'backgroundTaskId': ''}, 'content': None},
             {'type': 'user', 'toolUseResult': {'backgroundTaskId': 42}, 'content': [None, 7]},
@@ -441,7 +598,7 @@ class TestForegroundBgLogReadIsAReap:
                     {'type': 'tool_result', 'content': f'Output is being written to: {LOG_ALT}.'}
                 ],
             },
-            _assistant([_fg_bash(f'tail -50 {LOG_ALT}')]),
+            assistant_record([_fg_bash(f'tail -50 {LOG_ALT}')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -461,16 +618,16 @@ class TestTaskToolReaps:
     def test_task_output_after_launch_is_false(self) -> None:
         """TaskOutput collects a backgrounded task's result → reap → False."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([{'type': 'tool_use', 'name': 'TaskOutput', 'input': {'task_id': 't1'}}]),
+            *confirmed_bash_launch(),
+            assistant_record([{'type': 'tool_use', 'name': 'TaskOutput', 'input': {'task_id': 't1'}}]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
     def test_task_stop_after_launch_is_false(self) -> None:
         """TaskStop terminates a backgrounded task → reap → False."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([{'type': 'tool_use', 'name': 'TaskStop', 'input': {'task_id': 't1'}}]),
+            *confirmed_bash_launch(),
+            assistant_record([{'type': 'tool_use', 'name': 'TaskStop', 'input': {'task_id': 't1'}}]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -478,9 +635,9 @@ class TestTaskToolReaps:
         """The reap sits BEFORE a second, unreaped launch → still True (mirrors
         test_second_launch_with_reap_before_it_is_true)."""
         records = [
-            _assistant([_bash_launch(command='job-a')]),
-            _assistant([{'type': 'tool_use', 'name': 'TaskOutput', 'input': {'task_id': 't1'}}]),
-            _assistant([_bash_launch(command='job-b')]),
+            *confirmed_bash_launch(command='job-a', tool_id='toolu_a', task_id='aaa11111'),
+            assistant_record([{'type': 'tool_use', 'name': 'TaskOutput', 'input': {'task_id': 't1'}}]),
+            *confirmed_bash_launch(command='job-b', tool_id='toolu_b', task_id='bbb22222'),
         ]
         assert detect_ended_awaiting_background(records) is True
 
@@ -488,8 +645,8 @@ class TestTaskToolReaps:
         """The reap authored in the flat (nested=False) record shape is still
         recognised (mirrors test_reap_after_launch_across_nesting_styles_is_false)."""
         records = [
-            _assistant([_bash_launch()], nested=True),
-            _assistant(
+            *confirmed_bash_launch(nested=True),
+            assistant_record(
                 [{'type': 'tool_use', 'name': 'TaskOutput', 'input': {'task_id': 't1'}}],
                 nested=False,
             ),
@@ -513,8 +670,8 @@ class TestVerdictSubmissionClearsVerdict:
     def test_review_verdict_submission_is_false(self) -> None:
         """The `_lane-31` final action: launch → submit_review_verdict → False."""
         records = [
-            _assistant([_bash_launch(command='cargo test --all')]),
-            _assistant([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
+            *confirmed_bash_launch(command='cargo test --all'),
+            assistant_record([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -529,8 +686,8 @@ class TestVerdictSubmissionClearsVerdict:
     def test_each_terminal_submission_is_false(self, tool_name: str) -> None:
         """All four verdict-tools submissions clear the verdict, not just review."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([_verdict_submit(tool_name)]),
+            *confirmed_bash_launch(),
+            assistant_record([_verdict_submit(tool_name)]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -538,8 +695,8 @@ class TestVerdictSubmissionClearsVerdict:
         """Matching is on the segment after the last ``__``, so the server prefix
         is not load-bearing (robust to a rename or an unprefixed exposure)."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([_verdict_submit('submit_review_verdict')]),
+            *confirmed_bash_launch(),
+            assistant_record([_verdict_submit('submit_review_verdict')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -548,9 +705,9 @@ class TestVerdictSubmissionClearsVerdict:
         what harmless work it does afterwards (a literal last-action check would
         wrongly fire here)."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
-            _assistant([{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]),
+            *confirmed_bash_launch(),
+            assistant_record([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
+            assistant_record([{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -558,19 +715,34 @@ class TestVerdictSubmissionClearsVerdict:
         """The suppression is POSITIONAL, not a global "verdict anywhere" mute:
         a launch after the submission outranks it → True."""
         records = [
-            _assistant([_bash_launch(command='job-a')]),
-            _assistant([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
-            _assistant([_bash_launch(command='job-b')]),
+            *confirmed_bash_launch(command='job-a', tool_id='toolu_a', task_id='aaa11111'),
+            assistant_record([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
+            *confirmed_bash_launch(command='job-b', tool_id='toolu_b', task_id='bbb22222'),
         ]
         assert detect_ended_awaiting_background(records) is True
+
+    @pytest.mark.parametrize(('launch_call', 'confirmation'), _EACH_LAUNCH_KIND)
+    def test_submission_beside_the_launch_call_is_false(
+        self, launch_call: dict, confirmation: dict
+    ) -> None:
+        """A parallel batch.  The CLI writes every tool_use of a message before
+        any tool_result, so a submission issued beside a launch call sits
+        before the launch's confirmation.  The deliverable is written whatever
+        is still pending, so the submission outranks that launch → False."""
+        records = [
+            assistant_record([launch_call]),
+            assistant_record([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
+            confirmation,
+        ]
+        assert detect_ended_awaiting_background(records) is False
 
     def test_submit_task_is_not_a_terminal_submission(self) -> None:
         """NEGATIVE control (no over-widening): filing a follow-up task is not a
         terminal verdict — agents call it mid-session while a background command
         is genuinely still running, which is exactly the 2761 abandonment."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([_verdict_submit('mcp__fused-memory__submit_task')]),
+            *confirmed_bash_launch(),
+            assistant_record([_verdict_submit('mcp__fused-memory__submit_task')]),
         ]
         assert detect_ended_awaiting_background(records) is True
 
@@ -578,8 +750,601 @@ class TestVerdictSubmissionClearsVerdict:
         """NEGATIVE control: confirm_plan is deliberately outside the set — the
         architect may legitimately keep working after it."""
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([_verdict_submit('mcp__plan-tools__confirm_plan')]),
+            *confirmed_bash_launch(),
+            assistant_record([_verdict_submit('mcp__plan-tools__confirm_plan')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+
+class TestMonitorArmIsALaunch:
+    """A CONFIRMED Monitor arm is a launch (task 5986).
+
+    The launch is the ``user`` record whose tool_result names an earlier
+    ``Monitor`` call and whose structured ``toolUseResult.taskId`` is a usable
+    token — not the call, which the CLI may reject.  The Monitor call itself is
+    neither a launch nor a reap, and the armed task's id becomes a reap token.
+    """
+
+    def test_armed_monitor_then_turn_ends_is_true(self) -> None:
+        """Specimens df 3220 / reify 5690: arm, announce standing by, end."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record([_text('Monitor armed. Standing by for the ratchet test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_flat_arm_result_is_a_launch(self) -> None:
+        """The confirming record is found in the flat content shape too."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(nested=False),
+            assistant_record([_text('Monitor armed. Standing by for the ratchet test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_monitor_tailing_a_pending_bg_log_is_true(self) -> None:
+        """Specimen df 2889: a Monitor whose command watches the pending Bash
+        launch's bg-log is a new wait, not a reap of that launch."""
+        log = bg_log_path()
+        records = [
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record([_monitor_call(command=f'until grep -q "test result" {log}; do sleep 10; done')]),
+            _monitor_armed(),
+            assistant_record([_text('Monitor armed. Waiting for the test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_rejected_monitor_naming_the_bg_log_does_not_reap_it(self) -> None:
+        """Specimen reify 5536: a REJECTED Monitor naming the bg-log armed
+        nothing and engaged with nothing, so the Bash launch stays pending."""
+        log = bg_log_path()
+        records = [
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record([_monitor_call(command=f'tail -f {log}')]),
+            _monitor_rejected(),
+            assistant_record([_text('Waiting for the sweep to finish.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_unrelated_activity_after_arm_is_true(self) -> None:
+        """Activity that never references the armed task is not a reap."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record([_fg_bash('git status')]),
+            assistant_record(
+                [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_rejected_monitor_alone_is_false(self) -> None:
+        """Specimen df 2849: a rejected call armed nothing, so nothing is pending."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_rejected(),
+            assistant_record([_text('done')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_monitor_call_with_no_result_is_false(self) -> None:
+        """A call with no confirming record is not a launch."""
+        records = [
+            assistant_record([_monitor_call()]),
+            assistant_record([_text('done')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_task_id_result_for_a_non_monitor_call_is_not_a_launch(self) -> None:
+        """A ``taskId`` result confirms a launch only when it answers a Monitor call."""
+        records = [
+            assistant_record([{'type': 'tool_use', 'id': 'toolu_some', 'name': 'SomeTool', 'input': {}}]),
+            {
+                'type': 'user',
+                'message': {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'tool_result', 'tool_use_id': 'toolu_some', 'content': 'ok'},
+                    ],
+                },
+                'toolUseResult': {'taskId': 'bq9imj9co'},
+            },
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize('degenerate_id', ['', 'a', 'xyz', 42])
+    def test_degenerate_monitor_task_id_is_not_a_launch(self, degenerate_id: object) -> None:
+        """An id no notification could ever be matched on is not a launch:
+        honoring it would fire on every such session."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(task_id=degenerate_id),
+            assistant_record([_text('Monitor armed.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_task_stop_of_armed_monitor_is_false(self) -> None:
+        """Stopping the armed Monitor reaps it."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record(
+                [{'type': 'tool_use', 'name': 'TaskStop', 'input': {'task_id': MONITOR_TASK_ID}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_reference_to_the_monitor_task_id_is_false(self) -> None:
+        """The arm's ``taskId`` is harvested as a token, so reading the armed
+        task's output file reaps it."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record(
+                [
+                    {
+                        'type': 'tool_use',
+                        'name': 'Read',
+                        'input': {'file_path': f'/tmp/claude-1000/s/tasks/{MONITOR_TASK_ID}.output'},
+                    }
+                ]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+
+
+class TestBashLaunchNeedsConfirmation:
+    """A run_in_background Bash is a launch only once its result confirms it
+    (task 11122).
+
+    The launch is the ``user`` record whose tool_result answers the call and
+    whose structured ``toolUseResult.backgroundTaskId`` is a usable token: the
+    rule ``TestMonitorArmIsALaunch`` pins for Monitor.  The call itself is
+    classified like any tool_use, so one naming a pending task's token reaps
+    it.
+
+    Census of 2026-11-21 over every archived top-level dark-factory and reify
+    session (61,768 files).  Of the detector's 280 fires, 140 ended on an
+    unconfirmed launch: 131 ran in the foreground (117 of them on a clean
+    end_turn), 8 were rejected or errored, and 1 had no result.  545 of the
+    13,489 archived run_in_background results ran in the foreground, and no
+    result carried exactly one of the two identity sources (the structured id
+    and the output-file sentence).
+    """
+
+    def test_launch_the_cli_ran_in_the_foreground_is_false(self) -> None:
+        """Specimen reify 4996 lane-10: the CLI ran the call to completion, so
+        nothing was left pending."""
+        records = [
+            assistant_record([bash_launch(command='./run-tests.sh')]),
+            _ran_in_foreground_result(),
+            assistant_record([_text('All 17 tests pass.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_rejected_launch_is_false(self) -> None:
+        """A rejected call started nothing."""
+        records = [
+            assistant_record([bash_launch()]),
+            _rejected_result(),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_launch_with_no_result_is_false(self) -> None:
+        """The CLI died mid-call, so no result confirms the launch.
+
+        Decided not a launch, mirroring test_monitor_call_with_no_result_is_false.
+        Counting it would add 1 fire in 61,768 archived sessions, and that
+        session ended stop_reason=tool_use: a CLI killed mid-call leaves no
+        success envelope to downgrade.
+        """
+        records = [
+            assistant_record([_text('kick off the long build')]),
+            assistant_record([bash_launch(command='./occt-test.sh')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize('degenerate_id', ['', 'a', 'xyz', 42])
+    def test_degenerate_background_task_id_is_not_a_launch(self, degenerate_id: object) -> None:
+        """An id no later reference could be matched on is not a launch:
+        honoring it would fire on every such session."""
+        records = [
+            assistant_record([bash_launch()]),
+            _user_result(
+                'toolu_1',
+                'Command running in background with ID: x.',
+                {'stdout': '', 'backgroundTaskId': degenerate_id},
+                is_error=False,
+            ),
+            assistant_record([_text('Waiting for the build.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_output_file_sentence_without_structured_id_does_not_confirm(self) -> None:
+        """Only the structured id confirms: a command's own output can quote
+        the CLI's launch sentence."""
+        stdout = (
+            '... Output is being written to:'
+            ' /tmp/claude-1000/x/tasks/qq77other0.output. ...'
+        )
+        records = [
+            assistant_record([bash_launch(command='grep -n "written to" shared/src/shared/cli_invoke.py')]),
+            _ran_in_foreground_result(stdout=stdout),
+            assistant_record([_text('Found the sentence.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_foreground_run_after_a_pending_launch_is_true(self) -> None:
+        """A later call the CLI ran in the foreground leaves the earlier
+        confirmed launch pending."""
+        records = [
+            *confirmed_bash_launch(command='cargo test'),
+            assistant_record([bash_launch(command='git status', tool_id='toolu_2')]),
+            _ran_in_foreground_result('toolu_2'),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_foreground_run_reading_a_pending_launch_reaps_it(self) -> None:
+        """A backgrounded call is classified like any tool_use, so one that
+        reads a pending task's log engages it."""
+        records = [
+            *confirmed_bash_launch(),
+            assistant_record([bash_launch(command=f'tail -50 {bg_log_path()}', tool_id='toolu_2')]),
+            _ran_in_foreground_result('toolu_2'),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_confirmed_launch_naming_a_pending_launch_is_true(self) -> None:
+        """A waiter on a pending task is itself a launch, confirmed after the
+        call that names the earlier token, so it is the final event."""
+        records = [
+            *confirmed_bash_launch(),
+            assistant_record([
+                bash_launch(
+                    command=f'until grep -q done {bg_log_path()}; do sleep 5; done',
+                    tool_id='toolu_2',
+                ),
+            ]),
+            bg_launch_result('toolu_2', 'bbb22222'),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_background_task_id_answering_a_non_launch_call_is_not_a_launch(self) -> None:
+        """A ``backgroundTaskId`` confirms a launch only when it answers a
+        run_in_background Bash call."""
+        records = [
+            assistant_record([{'type': 'tool_use', 'id': 'toolu_some', 'name': 'SomeTool', 'input': {}}]),
+            _user_result('toolu_some', 'ok', {'backgroundTaskId': 'bq9imj9co'}, is_error=False),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        ('launch_call', 'other_kinds_confirmation'),
+        [
+            pytest.param(
+                bash_launch(),
+                _user_result(
+                    'toolu_1',
+                    'Command running in background with ID: bq9imj9co.',
+                    {'stdout': '', 'taskId': 'bq9imj9co'},
+                    is_error=False,
+                ),
+                id='bash-answered-by-taskId',
+            ),
+            pytest.param(
+                _monitor_call(),
+                _user_result(
+                    'toolu_mon1',
+                    f'Monitor started (task {MONITOR_TASK_ID}, timeout 900000ms).',
+                    {'backgroundTaskId': MONITOR_TASK_ID},
+                    is_error=False,
+                ),
+                id='monitor-answered-by-backgroundTaskId',
+            ),
+        ],
+    )
+    def test_a_launch_is_confirmed_only_by_its_own_kinds_field(
+        self, launch_call: dict, other_kinds_confirmation: dict
+    ) -> None:
+        """Each launch kind has one confirming field: ``backgroundTaskId`` for
+        a run_in_background Bash, ``taskId`` for a Monitor.  The other kind's
+        field confirms nothing."""
+        records = [
+            assistant_record([launch_call]),
+            other_kinds_confirmation,
+            assistant_record([_text('Waiting for it to finish.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(('launch_call', 'confirmation'), _EACH_LAUNCH_KIND)
+    def test_reap_beside_the_launch_call_does_not_outrank_it(
+        self, launch_call: dict, confirmation: dict
+    ) -> None:
+        """A launch is ordered at its confirmation.  A reap issued beside its
+        call, in the same parallel batch, sits before that confirmation and
+        cannot engage a task not yet started, so the launch stays the final
+        event → True.  Contrast
+        TestVerdictSubmissionClearsVerdict::test_submission_beside_the_launch_call_is_false."""
+        records = [
+            *confirmed_bash_launch(command='job-a', tool_id='toolu_a', task_id='aaa11111'),
+            assistant_record([launch_call]),
+            assistant_record(
+                [{'type': 'tool_use', 'name': 'TaskStop', 'input': {'task_id': 'aaa11111'}}]
+            ),
+            confirmation,
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_auto_backgrounded_foreground_bash_is_false_documented_gap(self) -> None:
+        """DOCUMENTED, ACCEPTED false negative.  Specimen dark-factory 3799: the
+        CLI moved a foreground Bash to the background after its 120s timeout,
+        and the session ended waiting on it.  That result answers no launch
+        call, so it is not a launch → False.
+
+        Counting it was measured and rejected (task 11122, 2026-11-21).  Over
+        61,768 archived sessions it would have added 86 verdicts, 56 on a
+        clean end_turn.  36 of the 56 carried the structured auto-background
+        id, and only 9 of those were waiting on work they still needed.  27
+        had finished, leaving a redundant `find /` or `grep -r` running.  The
+        other 20 were foreground output quoting the CLI's launch sentence.  A
+        downgrade that is right a quarter of the time is refused.  Sibling of
+        test_earlier_completion_after_later_launch_is_false_documented_gap.
+        """
+        records = [
+            assistant_record([_fg_bash('cargo test --all', tool_id='toolu_fg')]),
+            _auto_backgrounded_result(),
+            assistant_record([_text('Waiting for the test run to finish.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+_EXPIRY = '[Monitor expired after 10m with 2 events delivered. Re-arm it if you still need the watch.]'
+
+
+class TestDeliveredNotificationIsAReap:
+    """A task-notification DELIVERED to the model whose text names a harvested
+    token is a reap, for every launch kind (task 5986).
+
+    Delivery takes one of two shapes: a mid-turn ``attachment`` record
+    (``queued_command`` with ``commandMode`` ``task-notification``), or a
+    ``user`` record whose ``origin.kind`` is ``task-notification`` — the shape
+    a headless session that outlived its turn uses.  ``queue-operation``
+    records are queue bookkeeping, not delivery.
+    """
+
+    def test_monitor_event_delivered_mid_turn_then_more_work_is_false(self) -> None:
+        """Specimen df 2991: the Monitor's event reached the model mid-turn."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record([_fg_bash('git status')]),
+            _delivered_mid_turn(_monitor_event_text()),
+            assistant_record([_fg_bash('git diff --stat')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_monitor_expiry_delivered_as_new_turn_is_false(self) -> None:
+        """Specimen reify 7838: the CLI stayed alive after the turn ended and
+        delivered the Monitor's expiry as a new turn."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record([_text('Standing by for the eval result.')]),
+            _delivered_new_turn(_monitor_event_text(event=_EXPIRY)),
+            assistant_record([_text('The watch expired after both results arrived. Done.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_bash_completion_delivered_mid_turn_is_false(self) -> None:
+        """The dominant false-downgrade shape of a Bash-only reap rule: the
+        completion reached the model and the session moved on."""
+        records = [
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            _delivered_mid_turn(_bash_completion_text()),
+            assistant_record(
+                [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_bash_completion_delivered_as_new_turn_is_false(self) -> None:
+        """The session ended its turn to wait, and the CLI delivered the
+        completion as a new turn rather than exiting."""
+        records = [
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            assistant_record([_text("I'll wait for the notification.")]),
+            _delivered_new_turn(_bash_completion_text()),
+            assistant_record([_text('All tests passed.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        'launch_result',
+        [
+            bg_launch_result(in_text=False),
+            bg_launch_result(task_id='qq77other', log_path=bg_log_path()),
+        ],
+        ids=['task-id-token', 'log-path-token'],
+    )
+    def test_completion_matches_on_either_token(self, launch_result: dict) -> None:
+        """The completion names both the task id and the output file, so either
+        harvested token identifies it."""
+        records = [
+            assistant_record([bash_launch(command='cargo test --all')]),
+            launch_result,
+            _delivered_mid_turn(_bash_completion_text()),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_text_sub_block_content_is_read(self) -> None:
+        """A new-turn delivery whose content is a list of text sub-blocks."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record([_text('Standing by for the eval result.')]),
+            _delivered_new_turn(_monitor_event_text(event=_EXPIRY), as_blocks=True),
+            assistant_record([_text('Done.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_streamed_monitor_event_then_end_is_false_documented_gap(self) -> None:
+        """DOCUMENTED, ACCEPTED false negative.  Specimen reify 5623: a
+        progress-streaming Monitor delivered a mid-stream event and the session
+        ended awaiting a later one → the delivery reaps → False.
+
+        No structured flag tells a terminal event from a mid-stream one; only
+        the notification text does, and parsing it is the fragility the
+        detector refuses.  The Monitor analogue of
+        test_poll_once_still_running_then_end_is_false_documented_gap.
+        """
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            _delivered_mid_turn(
+                _monitor_event_text(event='progress: 74 suites finished, 0 failures/errors so far')
+            ),
+            assistant_record([_text('Suite still running clean. Waiting for completion.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        'later_launch',
+        [
+            [assistant_record([_monitor_call()]), _monitor_armed()],
+            [
+                assistant_record([bash_launch(command='job-b', tool_id='toolu_b')]),
+                bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
+            ],
+        ],
+        ids=['later-monitor-arm', 'later-bash-launch'],
+    )
+    def test_earlier_completion_after_later_launch_is_false_documented_gap(
+        self, later_launch: list
+    ) -> None:
+        """DOCUMENTED, ACCEPTED false negative.  Reaps are positional, not per
+        launch: Bash A launches, a later launch L follows, A's completion is
+        delivered, and the turn ends with L still pending → the delivery is
+        the final event → False.
+
+        A notification arrives asynchronously, so it can land after a launch
+        the agent made later, unlike a tool_use reap the agent issues itself.
+        Per-launch tracking was measured and rejected (task 7127,
+        2026-11-21).  Over the dark-factory and reify transcript archives it
+        would have added 24 verdicts on sessions that ended a clean turn,
+        beside the positional rule's 191.  Only 10 of the 24 were waiting on
+        work they still needed.  11 had finished, and the pending launch was
+        a redundant waiter whose target had already reported.  2 had
+        finished with a non-essential check still running.  1 ended on an
+        API error.  A downgrade that is wrong about half the time is the
+        direction this module refuses.  Sibling of
+        test_streamed_monitor_event_then_end_is_false_documented_gap.
+        """
+        records = [
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            *later_launch,
+            _delivered_mid_turn(_bash_completion_text()),
+            assistant_record([_text('Tests passed. Standing by for the second result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_notification_for_an_unknown_task_is_not_a_reap(self) -> None:
+        """A delivery that names no harvested token engages with nothing pending."""
+        records = [
+            assistant_record([bash_launch(command='cargo test --all')]),
+            bg_launch_result(),
+            _delivered_mid_turn(_monitor_event_text(task_id='zz99other')),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_enqueued_but_undelivered_is_not_a_reap(self) -> None:
+        """An event enqueued after the final turn, by a process that then
+        exited, never reached the agent."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record([_text('Monitor armed. Standing by.')]),
+            _enqueued_only(_monitor_event_text()),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_launch_after_a_delivered_notification_is_true(self) -> None:
+        """The reap is positional: a later launch outranks it."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            _delivered_mid_turn(_monitor_event_text()),
+            assistant_record([bash_launch(command='job-b', tool_id='toolu_b')]),
+            bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            {'type': 'attachment', 'attachment': 'junk'},
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'task-notification', 'prompt': None,
+                },
+            },
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'task-notification', 'prompt': 42,
+                },
+            },
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'prompt',
+                    'prompt': _monitor_event_text(),
+                },
+            },
+            {
+                'type': 'user',
+                'origin': 'task-notification',
+                'message': {'role': 'user', 'content': _monitor_event_text()},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'other'},
+                'message': {'role': 'user', 'content': _monitor_event_text()},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'task-notification'},
+                'message': {'role': 'user', 'content': None},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'task-notification'},
+                'message': {'role': 'user', 'content': 42},
+            },
+        ],
+        ids=[
+            'attachment-not-a-dict',
+            'prompt-none',
+            'prompt-int',
+            'command-mode-prompt',
+            'origin-not-a-dict',
+            'origin-kind-other',
+            'content-none',
+            'content-int',
+        ],
+    )
+    def test_malformed_notification_records_never_raise(self, record: dict) -> None:
+        """Records that are not a well-formed delivery reap nothing and never raise."""
+        records = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            record,
         ]
         assert detect_ended_awaiting_background(records) is True
 
@@ -603,8 +1368,8 @@ class TestEndedAwaitingBackgroundForSession:
             tmp_path,
             sid,
             [
-                _assistant([_text('start the long build')]),
-                _assistant([_bash_launch(command='./occt-test.sh')]),
+                assistant_record([_text('start the long build')]),
+                *confirmed_bash_launch(command='./occt-test.sh'),
             ],
         )
         assert ended_awaiting_background_for_session(tmp_path, sid) is True
@@ -616,8 +1381,8 @@ class TestEndedAwaitingBackgroundForSession:
             tmp_path,
             sid,
             [
-                _assistant([_bash_launch()]),
-                _assistant([_bash_output()]),
+                *confirmed_bash_launch(),
+                assistant_record([_bash_output()]),
             ],
         )
         assert ended_awaiting_background_for_session(tmp_path, sid) is False
@@ -635,17 +1400,17 @@ class TestEndedAwaitingBackgroundForSession:
         BashOutput/KillShell/KillBash anywhere, final action a review-verdict
         submission → the run completed and must NOT be downgraded."""
         sid = 'sess-lane31'
-        records: list = [_assistant([_text('run the crate test suites in parallel')])]
+        records: list = [assistant_record([_text('run the crate test suites in parallel')])]
         for n in range(4):
             tool_id = f'toolu_{n}'
             task_id = f'bg{n}0000{n}'
             records.append(
-                _assistant([_bash_launch(command=f'cargo test -p crate{n}', tool_id=tool_id)])
+                assistant_record([bash_launch(command=f'cargo test -p crate{n}', tool_id=tool_id)])
             )
-            records.append(_bg_launch_result(tool_id=tool_id, task_id=task_id))
-            records.append(_assistant([_fg_bash(f'tail -50 {_bg_log_path(task_id)}')]))
+            records.append(bg_launch_result(tool_id=tool_id, task_id=task_id))
+            records.append(assistant_record([_fg_bash(f'tail -50 {bg_log_path(task_id)}')]))
         records.append(
-            _assistant(
+            assistant_record(
                 [
                     {
                         'type': 'tool_use',
@@ -665,15 +1430,49 @@ class TestEndedAwaitingBackgroundForSession:
         is an unreaped launch → the genuine abandonment still fires (True)."""
         sid = 'sess-lane31-abandoned'
         records: list = [
-            _assistant([_bash_launch(command='cargo test -p crate0', tool_id='toolu_0')]),
-            _bg_launch_result(tool_id='toolu_0', task_id='bg000000'),
-            _assistant([_fg_bash(f'tail -50 {_bg_log_path("bg000000")}')]),
-            _assistant([_bash_launch(command='cargo test -p crate1', tool_id='toolu_1')]),
-            _bg_launch_result(tool_id='toolu_1', task_id='bg111111'),
-            _assistant([_text('I will wait for the background test to finish')]),
+            assistant_record([bash_launch(command='cargo test -p crate0', tool_id='toolu_0')]),
+            bg_launch_result(tool_id='toolu_0', task_id='bg000000'),
+            assistant_record([_fg_bash(f'tail -50 {bg_log_path("bg000000")}')]),
+            assistant_record([bash_launch(command='cargo test -p crate1', tool_id='toolu_1')]),
+            bg_launch_result(tool_id='toolu_1', task_id='bg111111'),
+            assistant_record([_text('I will wait for the background test to finish')]),
         ]
         _write_transcript(tmp_path, sid, records)
         assert ended_awaiting_background_for_session(tmp_path, sid) is True
+
+    def test_monitor_armed_transcript_is_true(self, tmp_path: Path) -> None:
+        """Specimen df 3220: the session arms a Monitor and ends its turn
+        standing by, so the process exits before the result arrives."""
+        sid = 'sess-monitor-armed'
+        records: list = [
+            assistant_record([_text('arm a watch on the ratchet test')]),
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record([_text('Monitor armed. Standing by for the ratchet test result.')]),
+        ]
+        _write_transcript(tmp_path, sid, records)
+        assert ended_awaiting_background_for_session(tmp_path, sid) is True
+
+    def test_reify7838_shaped_transcript_is_false(self, tmp_path: Path) -> None:
+        """Specimen reify 7838: both Monitor events were delivered mid-turn, the
+        turn ended, and the CLI stayed alive to deliver the expiry as a new
+        turn.  The session engaged with everything it armed."""
+        sid = 'sess-reify7838'
+        expiry = _monitor_event_text(event=_EXPIRY)
+        records: list = [
+            assistant_record([_monitor_call()]),
+            _monitor_armed(),
+            assistant_record([_fg_bash('cargo run --bin eval')]),
+            _delivered_mid_turn(_monitor_event_text(event='eval rc=0')),
+            assistant_record([_fg_bash('git commit -am "eval green"')]),
+            _delivered_mid_turn(_monitor_event_text(event='stdlib rc=0\n[exited with code 0]')),
+            assistant_record([_text('Both suites are green and committed.')]),
+            _enqueued_only(expiry),
+            _delivered_new_turn(expiry),
+            assistant_record([_text('The watch expired after delivering both results.')]),
+        ]
+        _write_transcript(tmp_path, sid, records)
+        assert ended_awaiting_background_for_session(tmp_path, sid) is False
 
 
 # A clean success envelope: subtype='success', is_error absent, returncode 0 —
@@ -692,7 +1491,7 @@ _SUCCESS_ENVELOPE = json.dumps(
 
 class TestEndedAwaitingBackgroundField:
     """The new boolean outcome flag mirrors schema_salvaged / schema_tool_denied:
-    it defaults False on both AgentResult and _SubprocessResult."""
+    it defaults False on both AgentResult and SubprocessResult."""
 
     def test_agent_result_defaults_false(self) -> None:
         """AgentResult.ended_awaiting_background defaults to False."""
@@ -700,38 +1499,38 @@ class TestEndedAwaitingBackgroundField:
         assert result.ended_awaiting_background is False
 
     def test_subprocess_result_defaults_false(self) -> None:
-        """_SubprocessResult.ended_awaiting_background defaults to False."""
-        result = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
+        """SubprocessResult.ended_awaiting_background defaults to False."""
+        result = SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
         assert result.ended_awaiting_background is False
 
 
 class TestParseClaudeOutputDowngrade:
-    """_parse_claude_output downgrades success→failure when the subprocess was
+    """parse_claude_output downgrades success→failure when the subprocess was
     flagged ended_awaiting_background, and propagates the flag on every path."""
 
     def test_success_envelope_flagged_is_downgraded(self) -> None:
         """subtype=success + ended_awaiting_background=True → success False, flag True."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout=_SUCCESS_ENVELOPE,
             stderr='',
             returncode=0,
             duration_ms=681_000,
             ended_awaiting_background=True,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is False
         assert agent.ended_awaiting_background is True
 
     def test_success_envelope_unflagged_stays_success(self) -> None:
         """subtype=success + ended_awaiting_background=False → success stays True, flag False."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout=_SUCCESS_ENVELOPE,
             stderr='',
             returncode=0,
             duration_ms=681_000,
             ended_awaiting_background=False,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is True
         assert agent.ended_awaiting_background is False
 
@@ -739,14 +1538,14 @@ class TestParseClaudeOutputDowngrade:
         """An already-failing empty-stdout result + flag=True → success stays
         False and the flag is still propagated (downgrade is an idempotent no-op
         on an already-failing result; no crash)."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='',
             stderr='boom',
             returncode=1,
             duration_ms=100,
             ended_awaiting_background=True,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is False
         assert agent.ended_awaiting_background is True
 
@@ -813,30 +1612,31 @@ class TestDetectorTotalityAndTokenHygiene:
     records/blocks ... are skipped, never raise" previously covered only
     records), a degenerate identity token cannot mute the whole verdict, and
     the token scan sees the same strings the old whole-input ``json.dumps``
-    exposed.
+    exposed.  Task 5986 adds a fourth: that scan reaches the bottom of an
+    input of any depth.
     """
 
     def test_non_str_tool_use_name_never_raises(self) -> None:
         """A tool_use block whose ``name`` is unhashable is skipped, not fatal.
 
         Pre-amendment this raised ``TypeError: unhashable type`` at ``name in
-        _BACKGROUND_REAP_TOOLS``.  The call site in ``_run_subprocess`` is
+        _BACKGROUND_REAP_TOOLS``.  The call site in ``run_cli_subprocess`` is
         unguarded, so the exception would fail the whole agent invocation —
         a malformed block breaking a completed run.
         """
         records = [
-            _assistant([_bash_launch()]),
-            _assistant([{'type': 'tool_use', 'name': ['weird'], 'input': {}}]),
+            *confirmed_bash_launch(),
+            assistant_record([{'type': 'tool_use', 'name': ['weird'], 'input': {}}]),
         ]
         assert detect_ended_awaiting_background(records) is True
 
     def test_non_str_name_block_still_reaps_by_token(self) -> None:
         """Name normalization does not cost the block its token-based reap."""
         records = [
-            _assistant([_bash_launch()]),
-            _bg_launch_result(),
-            _assistant([
-                {'type': 'tool_use', 'name': None, 'input': {'file_path': _bg_log_path()}},
+            assistant_record([bash_launch()]),
+            bg_launch_result(),
+            assistant_record([
+                {'type': 'tool_use', 'name': None, 'input': {'file_path': bg_log_path()}},
             ]),
         ]
         assert detect_ended_awaiting_background(records) is False
@@ -851,13 +1651,13 @@ class TestDetectorTotalityAndTokenHygiene:
         ``Write`` has nothing to do with the launch, so the run IS abandoned.
         """
         records = [
-            _assistant([_bash_launch()]),
+            *confirmed_bash_launch(),
             {
                 'type': 'user',
                 'toolUseResult': {'stdout': '', 'backgroundTaskId': degenerate_id},
                 'message': {'role': 'user', 'content': []},
             },
-            _assistant([
+            assistant_record([
                 {'type': 'tool_use', 'name': 'Write',
                  'input': {'file_path': '/tmp/notes.md', 'content': 'a b1 xyz'}},
             ]),
@@ -867,9 +1667,9 @@ class TestDetectorTotalityAndTokenHygiene:
     def test_real_length_task_id_is_still_a_usable_token(self) -> None:
         """The length floor is inert for a real id (9 chars, e.g. ``b1ucu6z5t``)."""
         records = [
-            _assistant([_bash_launch()]),
-            _bg_launch_result(task_id='b1ucu6z5t', in_text=False),
-            _assistant([_fg_bash('tail -50 /tmp/x/tasks/b1ucu6z5t.output')]),
+            assistant_record([bash_launch()]),
+            bg_launch_result(task_id='b1ucu6z5t', in_text=False),
+            assistant_record([_fg_bash('tail -50 /tmp/x/tasks/b1ucu6z5t.output')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
@@ -881,26 +1681,46 @@ class TestDetectorTotalityAndTokenHygiene:
         a nested dict must still count as a reap.
         """
         records = [
-            _assistant([_bash_launch()]),
-            _bg_launch_result(),
-            _assistant([{
+            assistant_record([bash_launch()]),
+            bg_launch_result(),
+            assistant_record([{
                 'type': 'tool_use',
                 'name': 'SomeTool',
                 'input': {
                     'n': 3,
                     'flag': True,
-                    'nested': {'paths': [None, {'p': _bg_log_path()}]},
+                    'nested': {'paths': [None, {'p': bg_log_path()}]},
                 },
             }]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
+    @pytest.mark.parametrize(
+        ('innermost', 'expected'),
+        [(bg_log_path(), False), ('/etc/hosts', True)],
+        ids=['token-at-the-bottom-reaps', 'no-token-still-fires'],
+    )
+    def test_input_nested_past_the_recursion_limit_is_scanned_whole(
+        self, innermost: str, expected: bool
+    ) -> None:
+        """``json.loads`` decodes a transcript line nested far deeper than the
+        interpreter's recursion limit, so the token scan must walk such an
+        input to the bottom rather than raise or give up partway."""
+        depth = sys.getrecursionlimit() + 500
+        deep_input = json.loads('[' * depth + json.dumps(innermost) + ']' * depth)
+        records = [
+            assistant_record([bash_launch()]),
+            bg_launch_result(),
+            assistant_record([{'type': 'tool_use', 'name': 'SomeTool', 'input': {'deep': deep_input}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is expected
+
     def test_input_with_no_strings_is_not_a_reap(self) -> None:
         """An input carrying no ``str`` anywhere cannot match a token."""
         records = [
-            _assistant([_bash_launch()]),
-            _bg_launch_result(),
-            _assistant([
+            assistant_record([bash_launch()]),
+            bg_launch_result(),
+            assistant_record([
                 {'type': 'tool_use', 'name': 'SomeTool', 'input': {'n': 1, 'ok': False}},
             ]),
         ]

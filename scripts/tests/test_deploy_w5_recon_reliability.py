@@ -18,6 +18,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / "deploy-w5-recon-reliability.sh"
 UNIT = "fused-memory.service"
@@ -40,10 +43,10 @@ RECON_MARKER = "test-recon-marker-xyz"
 # edit exactly one comment.
 #
 # It is a duplicated value only because scripts/tests/ cannot import a
-# tests/scripts/ helper: scripts/tests/conftest.py puts scripts/,
-# scripts/legibility/ and scripts/local-model-serving/ on sys.path and NOT
-# tests/scripts/, and widening that conftest to make one constant importable is
-# a directory-boundary change well outside what this constant is worth. Should
+# tests/scripts/ helper: scripts/tests/conftest.py puts scripts/ and
+# scripts/local-model-serving/ on sys.path and NOT tests/scripts/, and widening
+# that conftest to make one constant importable is a directory-boundary change
+# well outside what this constant is worth. Should
 # the boundary ever open, this becomes an import.
 BULK_BYTES = 262144
 

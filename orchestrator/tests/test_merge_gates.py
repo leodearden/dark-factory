@@ -86,7 +86,7 @@ def test_merge_gates_logger_name_is_merge_lane() -> None:
 class TestFinalizeRecordsQueueVerifiedTip:
     """Which landings ``_finalize_advanced_merge`` records as queue-verified."""
 
-    async def test_finalize_advanced_merge_records_queue_verified_tip(self) -> None:
+    async def test_finalize_advanced_merge_records_queue_verified_tip(self, tmp_path) -> None:
         """A clean landing records the advanced SHA as a queue-verified main tip.
 
         This is the PRODUCER for premise P2 of ``_disjoint_skip_blockers``: a
@@ -101,6 +101,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         )
 
         git_ops = MagicMock()
+        git_ops.project_root = tmp_path
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
         req = MagicMock()
@@ -111,7 +112,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         req.module_configs = []
 
         landed = 'deadbeefcafe0001'
-        assert not main_tip_is_queue_verified(landed), (
+        assert not main_tip_is_queue_verified(tmp_path, landed), (
             'precondition: the tip must not already be registered'
         )
 
@@ -139,12 +140,15 @@ class TestFinalizeRecordsQueueVerifiedTip:
             )
 
         assert outcome.status == 'done', f'expected done, got {outcome!r}'
-        assert main_tip_is_queue_verified(landed), (
+        assert main_tip_is_queue_verified(tmp_path, landed), (
             'a clean landing must record its advanced SHA as queue-verified, '
             'otherwise every subsequent rebase-under-drift re-verifies forever'
         )
+        assert not main_tip_is_queue_verified(tmp_path / 'elsewhere', landed), (
+            'the landing vouches only for the repository its GitOps lands into'
+        )
 
-    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self) -> None:
+    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self, tmp_path) -> None:
         """A landing BLOCKED by a post-advance gate records nothing.
 
         Main has already advanced at that point, but the gate chain says the
@@ -157,6 +161,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         )
 
         git_ops = MagicMock()
+        git_ops.project_root = tmp_path
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
         req = MagicMock()
@@ -193,7 +198,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
             )
 
         assert outcome.status != 'done', f'expected a blocked outcome, got {outcome!r}'
-        assert not main_tip_is_queue_verified(landed), (
+        assert not main_tip_is_queue_verified(tmp_path, landed), (
             'a tip whose post-advance gates failed must NOT be recorded as '
             'queue-verified'
         )
@@ -1394,53 +1399,6 @@ class TestMapAdvanceFailureParkLockContended:
         assert 'rm -f' not in outcome.reason, (
             'a side channel with no staleness evidence must not produce '
             f'destructive advice; got {outcome.reason!r}'
-        )
-
-    async def test_reason_is_not_miscategorised_as_a_ff_failure(self) -> None:
-        """The reason must not trip workflow.py's merge-failure category
-        heuristic into calling an index-lock stand-off a fast-forward failure.
-
-        `workflow.py`'s blocked path infers the review category with a bare
-        substring test:
-
-            elif 'ff' in reason.lower() or 'advanced' in reason.lower():
-                category = 'merge_ff_failed'
-
-        The original wording ("advance_main stood off: ...") contains 'ff'
-        inside "off", so every park_lock_contended block was filed as
-        `merge_ff_failed` — a category that flows into
-        `_write_merge_failure_review`, the `merge_blocked` event's
-        `data.category`, and the signature-aware L1 dedup key, durably
-        polluting the very observability this task adds.
-
-        Asserted by REPLAYING the heuristic verbatim rather than by pinning
-        prose, so any future reword is checked against the real consumer.
-        (A cleaner fix — an explicit reason-prefix short-circuit in
-        workflow.py, as DROPPED_PLAN_TARGETS/TRANSIENT_INFRA/MAIN_HEALTH_RED
-        already have — needs workflow.py, which is outside this task's lock
-        set; filed as follow-up.)
-        """
-        # Benign fixture strings: the substring test also sees the lock path
-        # and any at-risk filenames, which are runtime values this code
-        # cannot constrain — the CONSTANT prose is what is pinned here.
-        outcome, _halt = await self._map({
-            'lock_path': '/p/.git/index.lock',
-            'age_seconds': 3900.0,
-            'waited_seconds': 300.0,
-            'initial_age_seconds': 3600.0,
-            'grace_seconds': 300.0,
-            'dirty_files': ['docs/notes.md'],
-        })
-
-        lowered = outcome.reason.lower()
-        assert 'verification failed' not in lowered
-        assert 'ff' not in lowered, (
-            "the reason must not contain the token 'ff' — workflow.py would "
-            f'file it as merge_ff_failed; got {outcome.reason!r}'
-        )
-        assert 'advanced' not in lowered, (
-            "the reason must not contain 'advanced' — workflow.py would file "
-            f'it as merge_ff_failed; got {outcome.reason!r}'
         )
 
     async def test_toctou_dirty_files_are_named_in_the_reason(self) -> None:

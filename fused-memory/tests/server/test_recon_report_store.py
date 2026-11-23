@@ -4,6 +4,7 @@ Covers:
 - Config schema field recon_report_persist_enabled (TestConfigSchema)
 - ReconReportStore sync lifecycle (TestReconReportStore)
 - _serialize_entry / _deserialize_entry round-trip (TestEntrySerialization)
+- A pre-index entry_json row hydrates and dedups (TestPreZetaEntryJsonHydrates)
 - Write-through on every mutator (TestWriteThrough)
 - hydrate_from_store readback after a simulated restart (TestHydrateReadback)
 - Run-quiescence GC deletes a run's rows (TestStoreGC)
@@ -300,35 +301,30 @@ class TestEntrySerialization:
             completed_at=completed_at,
             created_at=100.0,
         )
-        entry._signature_to_finding = {
-            ('42', 'orphaned_knowledge'): f_real.finding_id,
-            (None, 'ft'): 'ffffffff-ffff-ffff-ffff-ffffffffffff',
-            ('123', None): 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
-        }
-        entry._deschash_to_finding = {
-            'deadbeef' * 8: f_nullnull.finding_id,
-        }
         return entry
 
-    def _slices(self):
-        sig_anchor_slice = {
-            ('99', 'cross_project_info'): '33333333-3333-3333-3333-333333333333',
-            (None, 'other_ft'): 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
-        }
-        cited_task_slice = {
-            'dark_factory:99': '33333333-3333-3333-3333-333333333333',
-        }
-        return sig_anchor_slice, cited_task_slice
+    def _slice(self):
+        from fused_memory.server.recon_finding_index import PersistedSlice
+
+        return PersistedSlice(
+            signature_to_finding={
+                ('42', 'orphaned_knowledge'): '11111111-1111-1111-1111-111111111111',
+                (None, 'ft'): 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+                ('123', None): 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+            },
+            deschash_to_finding={'deadbeef' * 8: '22222222-2222-2222-2222-222222222222'},
+            sig_anchor_slice={
+                ('99', 'cross_project_info'): '33333333-3333-3333-3333-333333333333',
+                (None, 'other_ft'): 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+            },
+            cited_task_slice={'dark_factory:99': '33333333-3333-3333-3333-333333333333'},
+        )
 
     def test_roundtrip_preserves_entry_with_completed_at_set(self):
         from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
 
         entry = self._build_entry(completed_at=555.5)
-        sig_anchor_slice, cited_task_slice = self._slices()
-        raw = _serialize_entry(
-            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
-        )
-        restored = _deserialize_entry(raw)
+        restored = _deserialize_entry(_serialize_entry(entry, self._slice()))
         assert restored == entry
         assert restored.completed_at == 555.5
 
@@ -336,11 +332,7 @@ class TestEntrySerialization:
         from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
 
         entry = self._build_entry(completed_at=None)
-        sig_anchor_slice, cited_task_slice = self._slices()
-        raw = _serialize_entry(
-            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
-        )
-        restored = _deserialize_entry(raw)
+        restored = _deserialize_entry(_serialize_entry(entry, self._slice()))
         assert restored == entry
         assert restored.completed_at is None
 
@@ -348,11 +340,7 @@ class TestEntrySerialization:
         from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
 
         entry = self._build_entry(completed_at=None)
-        sig_anchor_slice, cited_task_slice = self._slices()
-        raw = _serialize_entry(
-            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
-        )
-        restored = _deserialize_entry(raw)
+        restored = _deserialize_entry(_serialize_entry(entry, self._slice()))
 
         assert [f.finding_id for f in restored.findings] == [f.finding_id for f in entry.findings]
         cited = restored.findings[2]
@@ -363,56 +351,125 @@ class TestEntrySerialization:
         assert cited.cited_memories == expected.cited_memories
         assert cited.cited_runs == expected.cited_runs
 
-    def test_roundtrip_preserves_per_entry_dedup_mirrors_with_tuple_keys(self):
-        from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
-
-        entry = self._build_entry(completed_at=None)
-        sig_anchor_slice, cited_task_slice = self._slices()
-        raw = _serialize_entry(
-            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
-        )
-        restored = _deserialize_entry(raw)
-
-        assert restored._signature_to_finding == entry._signature_to_finding
-        # None must survive as real None, never coerced to the string 'None'.
-        assert (None, 'ft') in restored._signature_to_finding
-        assert ('123', None) in restored._signature_to_finding
-        assert restored._deschash_to_finding == entry._deschash_to_finding
-
-    def test_fold_anchor_slices_roundtrip_preserving_tuple_keys_and_none(self):
+    def test_persisted_slice_roundtrips_preserving_tuple_keys_and_none(self):
         from fused_memory.server.recon_report import (
-            _deserialize_fold_anchor_slices,
+            _deserialize_persisted_slice,
             _serialize_entry,
         )
 
-        entry = self._build_entry(completed_at=None)
-        sig_anchor_slice, cited_task_slice = self._slices()
-        raw = _serialize_entry(
-            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
-        )
+        persisted = self._slice()
+        raw = _serialize_entry(self._build_entry(completed_at=None), persisted)
 
-        out_sig_slice, out_cited_task_slice = _deserialize_fold_anchor_slices(raw)
-        assert out_sig_slice == sig_anchor_slice
-        assert out_cited_task_slice == cited_task_slice
-        assert (None, 'other_ft') in out_sig_slice
-        # Keys must be real tuples with a real None, not '(None, ...)' strings.
-        assert all(isinstance(k, tuple) for k in out_sig_slice)
-        assert all(k[0] is None or isinstance(k[0], str) for k in out_sig_slice)
+        restored = _deserialize_persisted_slice(raw)
+        assert restored == persisted
+        # None must survive as real None, never coerced to the string 'None'.
+        assert (None, 'ft') in restored.signature_to_finding
+        assert ('123', None) in restored.signature_to_finding
+        assert (None, 'other_ft') in restored.sig_anchor_slice
+        for keys in (restored.signature_to_finding, restored.sig_anchor_slice):
+            assert all(isinstance(k, tuple) for k in keys)
+            assert all(k[0] is None or isinstance(k[0], str) for k in keys)
+
+    def test_entry_json_top_level_keys_are_unchanged(self):
+        import json
+
+        from fused_memory.server.recon_report import _serialize_entry
+
+        raw = _serialize_entry(self._build_entry(completed_at=None), self._slice())
+        assert set(json.loads(raw)) == {
+            'run_id', 'stage', 'project_id', 'findings', 'stats', 'summary',
+            'summary_warnings', 'completed_at', 'created_at', 'purged_findings',
+            'purged_findings_overflow', 'signature_to_finding',
+            'deschash_to_finding', 'sig_anchor_slice', 'cited_task_slice',
+        }
 
     def test_stats_summary_and_summary_warnings_roundtrip(self):
         from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
 
         entry = self._build_entry(completed_at=None)
-        sig_anchor_slice, cited_task_slice = self._slices()
-        raw = _serialize_entry(
-            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
-        )
-        restored = _deserialize_entry(raw)
+        restored = _deserialize_entry(_serialize_entry(entry, self._slice()))
 
         assert restored.stats == entry.stats
         assert restored.summary == entry.summary
         assert restored.summary_warnings == entry.summary_warnings
         assert restored.created_at == entry.created_at
+
+
+class TestPreZetaEntryJsonHydrates:
+    """A row written before the run finding index existed hydrates and dedups."""
+
+    _RUN = 'legacy-run'
+
+    def _legacy_row_json(self):
+        import json
+
+        from fused_memory.reconciliation.flag_identity import description_digest
+
+        def finding(finding_id, task_id, flag_type, description, cited_tasks=()):
+            return {
+                'finding_id': finding_id, 'severity': 'moderate',
+                'category': 'memory_stale', 'description': description,
+                'suggested_action': 'act', 'actionable': True,
+                'task_id': task_id, 'flag_type': flag_type,
+                'cited_entities': [], 'cited_edges': [],
+                'cited_tasks': list(cited_tasks), 'cited_memories': [],
+                'cited_runs': [], 'standing_decision_id': None,
+                'citation_failures': [], 'superseded_by': None, 'supersedes': None,
+            }
+
+        return json.dumps({
+            'run_id': self._RUN,
+            'stage': 'task_knowledge_sync',
+            'project_id': 'dark_factory',
+            'findings': [
+                finding('fid-sig', '42', 'X', 'ordinary'),
+                finding('fid-note', None, None, 'legacy note'),
+                finding(
+                    'fid-anchor', None, 'Y', 'anchor',
+                    [{'project_id': 'dark_factory', 'task_id': '7', 'title': 'T-7'}],
+                ),
+            ],
+            'stats': {},
+            'summary': '',
+            'summary_warnings': [],
+            'completed_at': None,
+            'created_at': 1.0,
+            'purged_findings': [],
+            'purged_findings_overflow': 0,
+            'signature_to_finding': [['42', 'X', 'fid-sig'], [None, 'Y', 'fid-anchor']],
+            'deschash_to_finding': {description_digest('legacy note'): 'fid-note'},
+            'sig_anchor_slice': [['7', 'Y', 'fid-anchor']],
+            'cited_task_slice': {'dark_factory:7': 'fid-anchor'},
+        })
+
+    def test_legacy_row_hydrates_and_dedups(self, tmp_path):
+        from fused_memory.server.recon_report import ReconReportState
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            store.upsert_entry(
+                run_id=self._RUN, stage='task_knowledge_sync', project_id='dark_factory',
+                is_active=True, entry_json=self._legacy_row_json(), updated_at=1.0,
+            )
+            state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0, store=store)
+            state.hydrate_from_store()
+            assert state.violations() == []
+
+            def refile(task_id, flag_type, description):
+                return state.add_finding(
+                    run_id=self._RUN, severity='moderate', category='memory_stale',
+                    description=description, suggested_action='act',
+                    task_id=task_id, flag_type=flag_type,
+                )
+
+            assert refile('42', 'X', 'again')['existing_finding_id'] == 'fid-sig'
+            assert refile(None, None, 'Legacy  NOTE')['existing_finding_id'] == 'fid-note'
+            assert refile('7', 'Y', 'derived')['existing_finding_id'] == 'fid-anchor'
+            assert state.violations() == []
+        finally:
+            store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -682,8 +739,7 @@ class TestHydrateReadback:
                 actionable=True, task_id='99', flag_type='systemic',
             )
             # Null-task finding + cite_task → registers a project-scoped cited-task
-            # fold anchor in _run_cited_task_index (a run-level index that must be
-            # rebuilt on hydrate).
+            # fold anchor in the run's finding index (rebuilt on hydrate).
             fid_s2_anchor = state_a.add_finding(
                 run_id=run_id, severity='minor', category='other',
                 description='stage2 anchor observation', suggested_action='note',
@@ -715,6 +771,7 @@ class TestHydrateReadback:
         try:
             state_b = self._make_state(store_b)
             state_b.hydrate_from_store()
+            assert state_b.violations() == []
 
             # (1) Readback identical to state A (findings, citation lists, stats).
             assert state_b.get_assembled_report(run_id, s1) == report_a_s1
@@ -731,12 +788,12 @@ class TestHydrateReadback:
                 assert fb['cited_edges'] == fa['cited_edges']
                 assert fb['cited_memories'] == fa['cited_memories']
 
-            # (2) _active restored — active_run_for_stage resolves the LIVE stage
+            # (2) Active stage restored — active_run_for_stage resolves the LIVE stage
             #     (stage 2), and NOT the completed earlier stage.
             assert state_b.active_run_for_stage(s2, 'dark_factory') == run_id
             assert state_b.active_run_for_stage(s1, 'dark_factory') is None
 
-            # (3) Signature dedup index (_run_sig_index) rebuilt: a follow-up
+            # (3) Signature dedup keys rebuilt: a follow-up
             #     add_finding duplicating a hydrated (task_id, flag_type) returns
             #     duplicate_finding carrying the ORIGINAL finding_id.
             dup_b = state_b.add_finding(
@@ -747,7 +804,7 @@ class TestHydrateReadback:
             assert dup_b.get('error') == 'duplicate_finding'
             assert dup_b['existing_finding_id'] == fid_real
 
-            # (3b) Description-hash dedup index (_run_desc_index) rebuilt across
+            # (3b) Description-hash dedup keys rebuilt across
             #      stages: a null/null finding repeating stage-1's description
             #      folds onto the original stage-1 finding.
             dup_desc = state_b.add_finding(
@@ -757,7 +814,7 @@ class TestHydrateReadback:
             assert dup_desc.get('error') == 'duplicate_finding'
             assert dup_desc['existing_finding_id'] == fid_s1_null
 
-            # (3c) Cited-task fold anchor index (_run_cited_task_index) rebuilt:
+            # (3c) Cited-task fold anchor keys rebuilt:
             #      a new null-task finding citing the hydrated anchor's task
             #      folds onto the original anchor finding.
             fid_new_anchor = state_b.add_finding(
@@ -770,10 +827,11 @@ class TestHydrateReadback:
             assert fold_res['existing_finding_id'] == fid_s2_anchor
 
             # (4) cite_entity on a hydrated STAGE-1 finding_id resolves via the
-            #     rebuilt cross-stage _run_finding_index (while stage 2 is active).
+            #     rebuilt cross-stage finding index (while stage 2 is active).
             cite_b = await state_b.cite_entity(run_id, fid_real, 'Foo')
             assert 'error' not in cite_b
             assert cite_b['entity_uuid'] == entity_uuid
+            assert state_b.violations() == []
         finally:
             store_b.close()
 
@@ -861,8 +919,37 @@ class TestStoreGC:
             assert evicted == 1  # R/stage2 evicted
             assert run_r not in self._run_ids_in_store(store)  # GC'd with the run
             assert run_live in self._run_ids_in_store(store)  # different run untouched
-            # In-memory run-level indices for R released at quiescence.
-            assert run_r not in state._run_finding_index
+            # R's in-memory finding index released at quiescence.
+            assert state.run_index(run_r) is None
+            assert state.violations() == []
+        finally:
+            store.close()
+
+    def test_rows_gcd_at_quiescence_stay_gcd_when_the_run_id_is_reused(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store, t)
+            run_id = 'gc-reuse-run'
+            state.start_report(run_id=run_id, stage='memory_consolidator', project_id='dark_factory')
+            self._add(state, run_id, 'stage1 finding')
+            state.complete(run_id, 's1 done')
+            state.start_report(run_id=run_id, stage='task_knowledge_sync', project_id='dark_factory')
+            self._add(state, run_id, 'stage2 finding')
+            state.complete(run_id, 's2 done')
+
+            t[0] = 301.0
+            assert state.tick() == 2
+            assert run_id not in self._run_ids_in_store(store)
+
+            state.start_report(run_id=run_id, stage='remediation', project_id='dark_factory')
+
+            assert {
+                r['stage'] for r in store.load_all() if r['run_id'] == run_id
+            } == {'remediation'}
         finally:
             store.close()
 
@@ -883,7 +970,7 @@ class TestStoreGC:
         evicted = state.tick()  # must not raise
         assert evicted == 1
         assert (run_id, stage) not in state._state
-        assert run_id not in state._run_finding_index
+        assert state.run_index(run_id) is None
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +987,7 @@ class TestSupersedeAcrossEviction:
     stays live for minutes, and ``tick()``'s own docstring describes Stage 1
     filing a finding and completing early while Stage 2/3 + remediation keep the
     run alive.  Stage 1's entry therefore leaves ``_state`` mid-run while
-    ``_run_finding_index`` deliberately keeps it reachable until run quiescence
+    the run's finding index deliberately keeps it reachable until run quiescence
     so its findings stay citable — which is precisely the
     later-stage-retires-an-earlier-completed-stage's-claim case that
     ``add_finding``'s ``supersedes`` docstring calls supersession's whole purpose.
@@ -965,8 +1052,11 @@ class TestSupersedeAcrossEviction:
         clock_holder[0] = 301.0  # 301-0 > ttl(300) for s1; s2 is in-progress
         assert state.tick() == 1
         assert (self._RUN, self._S1) not in state._state
-        assert stage1_fid in state._run_finding_index[self._RUN]
+        run_index = state.run_index(self._RUN)
+        assert run_index is not None
+        assert run_index.owner_of(stage1_fid) is not None
         assert self._RUN in self._run_ids_in_store(state._store)
+        assert state.violations() == []
 
     def _supersede(self, state, stage1_fid):
         return state.add_finding(
@@ -1005,6 +1095,7 @@ class TestSupersedeAcrossEviction:
             assert target.superseded_by == stage2_fid  # in-memory reach is wide
 
             assert self._persisted_finding(store, stage1_fid)['superseded_by'] == stage2_fid
+            assert state.violations() == []
         finally:
             store.close()
 
@@ -1030,6 +1121,7 @@ class TestSupersedeAcrossEviction:
         try:
             state_b = self._make_state(store_b, [0.0])
             state_b.hydrate_from_store()
+            assert state_b.violations() == []
 
             resolved = state_b._resolve_finding(self._RUN, stage1_fid)
             assert resolved is not None, 'the stage-1 row did not hydrate'
@@ -1073,6 +1165,7 @@ class TestSupersedeAcrossEviction:
             assert state.delete_finding(self._RUN, stage2_fid) == {
                 'status': 'deleted', 'finding_id': stage2_fid,
             }
+            assert state.violations() == []
 
             resolved = state._resolve_finding(self._RUN, stage1_fid)
             assert resolved is not None
@@ -1088,6 +1181,7 @@ class TestSupersedeAcrossEviction:
         try:
             state_b = self._make_state(store_b, [0.0])
             state_b.hydrate_from_store()
+            assert state_b.violations() == []
 
             report = state_b.get_assembled_report(self._RUN, self._S1)
             assert report is not None
@@ -1100,13 +1194,13 @@ class TestSupersedeAcrossEviction:
             store_b.close()
 
     def test_restarted_stage_shadowing_an_evicted_twin_persists_the_live_row(
-        self, tmp_path
+        self, tmp_path, caplog
     ):
         """A same-name stage restarted after eviction must persist the LIVE row.
 
         ``start_report``'s docstring documents this path as reachable (task
         3988): Stage 1 completes, ``tick()`` evicts it from ``_state`` while the
-        run stays live (so ``_run_finding_index`` still holds it), and a later
+        run stays live (so the run's finding index still holds it), and a later
         ``start_report`` naming that same stage takes the fresh-create path.
         Two distinct entry objects then share one ``(run_id, stage)`` — the
         store's primary key.
@@ -1118,8 +1212,13 @@ class TestSupersedeAcrossEviction:
         Persisted state then diverged from memory and ``hydrate_from_store``
         resurrected the dead entry while dropping every finding the live stage
         had filed.
+
+        The twin's findings are purged when it is displaced: its row is about
+        to be overwritten, so keeping them resolvable in memory would only
+        last until the next restart.
         """
         import json
+        import logging
 
         from fused_memory.server.recon_report_store import ReconReportStore
 
@@ -1133,9 +1232,21 @@ class TestSupersedeAcrossEviction:
             self._evict_stage1(state, t, stage1_fid)
 
             # Stage 1 restarts under the same name, shadowing the evicted twin.
-            state.start_report(
-                run_id=self._RUN, stage=self._S1, project_id='dark_factory'
-            )
+            with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+                state.start_report(
+                    run_id=self._RUN, stage=self._S1, project_id='dark_factory'
+                )
+            (purge_record,) = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and 'purged 1 finding' in r.getMessage()
+            ]
+            assert self._RUN in purge_record.getMessage()
+            assert self._S1 in purge_record.getMessage()
+            run_index = state.run_index(self._RUN)
+            assert run_index is not None
+            assert run_index.owner_of(stage1_fid) is None
+            assert state.violations() == []
+
             restarted_fid = state.add_finding(
                 run_id=self._RUN, severity='moderate', category='memory_stale',
                 description='filed by the RESTARTED stage 1',
@@ -1158,8 +1269,19 @@ class TestSupersedeAcrossEviction:
             )
 
             # ...because exactly one row per (run_id, stage) is emitted at all.
-            reachable = state._reachable_run_entries(self._RUN)
+            reachable = run_index.reachable_entries()
             assert len({(e.run_id, e.stage) for e in reachable}) == len(reachable)
+
+            # The twin's claim no longer blocks a re-filing of its signature.
+            refiled = state.add_finding(
+                run_id=self._RUN, severity='moderate', category='memory_stale',
+                description='mechanism X contradicts Y, re-filed', suggested_action='act',
+                actionable=True, task_id='999',
+                flag_type='memory_mechanism_contradiction',
+            )
+            assert set(refiled) == {'finding_id'}, refiled
+            assert refiled['finding_id'] != stage1_fid
+            assert state.violations() == []
         finally:
             store_a.close()
 
@@ -1171,6 +1293,64 @@ class TestSupersedeAcrossEviction:
             state_b.hydrate_from_store()
             assert state_b._resolve_finding(self._RUN, restarted_fid) is not None
             assert state_b._resolve_finding(self._RUN, stage1_fid) is None
+            assert state_b.violations() == []
+        finally:
+            store_b.close()
+
+    def test_displaced_twin_superseder_is_purged_and_its_target_unstamped(
+        self, tmp_path
+    ):
+        """A restarted stage displaces an evicted twin that held a superseder:
+        the purge repairs the target's pointer in memory and on its row, so a
+        restart hydrates the target live and actionable again."""
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store_a, t)
+            target_fid = self._stage1_files_and_completes(state)
+            superseder_fid = self._supersede(state, target_fid)['finding_id']
+            state.complete(self._RUN, 'stage2 summary')
+            state.start_report(
+                run_id=self._RUN, stage='integrity_check', project_id='dark_factory'
+            )
+            assert state.violations() == []
+
+            t[0] = 301.0
+            assert state.tick() == 2
+            assert state.violations() == []
+
+            state.start_report(
+                run_id=self._RUN, stage=self._S2, project_id='dark_factory'
+            )
+            run_index = state.run_index(self._RUN)
+            assert run_index is not None
+            assert run_index.owner_of(superseder_fid) is None
+            target_owner = run_index.owner_of(target_fid)
+            assert target_owner is not None
+            (target,) = [f for f in target_owner.findings if f.finding_id == target_fid]
+            assert target.superseded_by is None
+            assert self._persisted_finding(store_a, target_fid)['superseded_by'] is None
+            assert state.violations() == []
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b, [0.0])
+            state_b.hydrate_from_store()
+            assert state_b.violations() == []
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [
+                i for i in report['flagged_items'] if i['finding_id'] == target_fid
+            ]
+            assert item['superseded_by'] is None
+            assert item['actionable'] is True
         finally:
             store_b.close()
 
@@ -1492,6 +1672,7 @@ class TestReconReportStoreWiredAtBoot:
         pre-populated DB is read back into memory); stop_persistence() closes it
         and is idempotent."""
         from fused_memory.server.main import _build_recon_report_components
+        from fused_memory.server.recon_finding_index import PersistedSlice
         from fused_memory.server.recon_report import (
             _Finding,
             _ReportEntry,
@@ -1520,9 +1701,7 @@ class TestReconReportStoreWiredAtBoot:
             pre_store.upsert_entry(
                 run_id=run_id, stage=stage, project_id='dark_factory',
                 is_active=True,
-                entry_json=_serialize_entry(
-                    entry, sig_anchor_slice={}, cited_task_slice={}
-                ),
+                entry_json=_serialize_entry(entry, PersistedSlice()),
                 updated_at=1.0,
             )
         finally:

@@ -8,10 +8,11 @@
 // the two halves findable from each other.
 //
 // THE CLIENT NEVER CONSTRUCTS OR MUTATES A SERVER DATUM — datum.py's dataclass
-// is frozen for the same reason. Four client-built envelopes are sanctioned
-// and no more: unknownDatum, plainDatum, derivedDatum and combinedDatum, each
-// below with the gap it covers. combinedDatum is the only one built FROM served
-// Datums: a cross-project total the server serves per project only.
+// is frozen for the same reason. Five client-built envelopes are sanctioned
+// and no more: unknownDatum, plainDatum, derivedDatum, combinedDatum and its
+// lower-bound sibling lowerBoundCombinedDatum, each below with the gap it
+// covers. The two totals are the only ones built FROM served Datums: a
+// cross-project total the server serves per project only.
 //
 // A PLAIN-JS CLASSIC SCRIPT, NOT A .jsx MODULE, so the render decision is
 // EXECUTABLE: the .jsx files are `type="text/babel"` behind CDN Babel with no
@@ -246,18 +247,37 @@ function datumView(datum, opts) {
 }
 
 // ── How long a plain-wrapped value may sit before its tile badges ──
-// TWELVE SECONDS = FOUR POLL INTERVALS. data.js polls every 3000ms with up to
-// 1500ms of jitter, so a healthy endpoint's receipt is at most ~4.5s old; 12s
-// is ~2.6x headroom, enough that a jittered late poll never makes a working
-// tile twitch.
+// 12s is the BASE: four poll intervals for an UNPACED endpoint, whose receipt
+// is at most ~4.5s old (3000ms tick + 1500ms jitter). A receipt's pacingHoldMs
+// (data.js::refreshOne) adds the slowness-pacing hold the poll loop deliberately
+// leaves between request starts, so a slow-but-healthy endpoint keeps the same
+// 7.5s of headroom and never twitches; only a value overdue past its own cadence
+// badges. An absent or malformed hold reads as the base, failing toward badging.
 //
-// ORDERED FINE-THEN-COARSE AGAINST THE BANNER, deliberately not aligned with
-// it: endpoint_staleness.js declares an endpoint stale after ~21s of backoff,
-// so badging at 12s makes the tile the FIRST per-value signal and the banner
-// the later per-endpoint explanation — one authority each. Matching 21s would
+// THE BASE IS ORDERED FINE-THEN-COARSE, not aligned with endpoint_staleness.js's
+// banner (~21s of backoff): for an unpaced endpoint the tile badges first per
+// value and the banner explains later per endpoint, one authority each. A paced
+// bound can outlast the banner, so a paced endpoint that starts failing may
+// raise the banner first, which then names a real failure. Matching 21s would
 // read as a duplicate of the banner; the PRD's suggested 6s would badge a
 // healthy tile whenever a jittered poll ran late.
 const PLAIN_DATUM_BOUND_SECONDS = 12;
+
+function plainBoundSecondsFor(receipt) {
+  const holdMs = receipt.pacingHoldMs;
+  const paced = Number.isFinite(holdMs) && holdMs > 0;
+  return paced ? PLAIN_DATUM_BOUND_SECONDS + holdMs / 1000 : PLAIN_DATUM_BOUND_SECONDS;
+}
+
+// ── Has this endpoint delivered yet? ──
+// The one answer, for a caller that needs the hole rather than a value: the
+// 'not yet fetched' hole before endpointKey's first receipt, null once it has
+// one.
+const DATUM_NOT_YET_FETCHED = 'not yet fetched';
+
+function undeliveredDatum(endpointKey, receipts) {
+  return endpointReceipt(endpointKey, receipts) ? null : unknownDatum(DATUM_NOT_YET_FETCHED);
+}
 
 // ── Provenance for a value the server does not yet serve as a Datum ──
 // Every polled payload is still a bare number: PRD leaf beta has not landed.
@@ -296,7 +316,7 @@ const PLAIN_DATUM_BOUND_SECONDS = 12;
 // way a missing payload field reaches a tile.
 function plainDatum(value, endpointKey, receipts) {
   const receipt = endpointReceipt(endpointKey, receipts);
-  if (!receipt) return unknownDatum('not yet fetched');
+  if (!receipt) return unknownDatum(DATUM_NOT_YET_FETCHED);
   if (value === null || value === undefined) {
     return unknownDatum('no value in the payload');
   }
@@ -307,7 +327,7 @@ function plainDatum(value, endpointKey, receipts) {
       as_of: receipt.servedAt || new Date(receipt.receivedAt).toISOString(),
       state: 'fresh',
       reason: null,
-      freshness_bound_seconds: PLAIN_DATUM_BOUND_SECONDS,
+      freshness_bound_seconds: plainBoundSecondsFor(receipt),
     },
     receipt,
   );
@@ -330,16 +350,14 @@ function plainDatum(value, endpointKey, receipts) {
 // payload resolves, a value derived from DF_DATA's seeds is null for a reason
 // that is not the domain's — an empty seed array has no last bucket — so
 // 'no ops in the last 24h' there would be a confident lie about data this
-// browser has never seen. That question stays plainDatum's and is ASKED rather
-// than re-implemented: a probe value it cannot call absent comes back unknown
-// only when there is no receipt. The probe is never rendered.
+// browser has never seen. That question is undeliveredDatum's, and is asked of
+// it rather than re-implemented here.
 //
 // `absentReason` is REQUIRED. A caller with nothing better to say than 'no
 // value in the payload' is describing the payload and should call plainDatum.
 function derivedDatum(value, endpointKey, absentReason, receipts) {
   if (value !== null && value !== undefined) return plainDatum(value, endpointKey, receipts);
-  const probe = plainDatum(0, endpointKey, receipts);
-  return probe.state === 'unknown' ? probe : unknownDatum(absentReason);
+  return undeliveredDatum(endpointKey, receipts) || unknownDatum(absentReason);
 }
 
 // ── A Datum the server DID serve, nested inside a PLAIN-registered payload ──
@@ -355,7 +373,7 @@ function derivedDatum(value, endpointKey, absentReason, receipts) {
 // and names what the delivered payload lacks where the caller looked.
 function servedDatum(served, endpointKey, absentReason, receipts) {
   const receipt = endpointReceipt(endpointKey, receipts);
-  if (!receipt) return unknownDatum('not yet fetched');
+  if (!receipt) return unknownDatum(DATUM_NOT_YET_FETCHED);
   if (!isDatum(served)) return unknownDatum(absentReason);
   return withReceipt(served, receipt);
 }
@@ -369,6 +387,7 @@ function servedDatum(served, endpointKey, absentReason, receipts) {
 // A HOLE ANYWHERE IS A HOLE IN THE TOTAL. A partial sum is an under-count passed
 // off as a total, so `combine` never runs over a scope with a gap in it, and the
 // reason names every missing part so the operator reads which one and why.
+// lowerBoundCombinedDatum below is the sibling that serves it as a floor instead.
 //
 // OTHERWISE THE WORST PART DECIDES THE STATE: lower_bound > stale > fresh,
 // lower_bound first so both the '≥' and the age badge survive.
@@ -383,14 +402,55 @@ function servedDatum(served, endpointKey, absentReason, receipts) {
 const COMBINED_STATE_PRECEDENCE = ['lower_bound', 'stale', 'fresh'];
 
 function combinedDatum(partsByLabel, combine, emptyReason) {
-  const parts = partsByLabel.map(([label, part]) => [label, assertDatum(part, 'combinedDatum')]);
+  const parts = labelledDatums(partsByLabel, 'combinedDatum');
   if (parts.length === 0) return unknownDatum(emptyReason);
 
-  const holes = parts.filter(([, part]) => part.state === 'unknown');
+  const holes = parts.filter(isHolePart);
   if (holes.length > 0) return unknownDatum(labelledReasons(holes));
 
-  const measured = parts.map(([, part]) => part);
-  const ages = displayedAgesOf(measured);
+  return measuredTotal(parts, parts.map(([, part]) => part), combine, 'combinedDatum');
+}
+
+// ── A FLOOR over several served Datums, for a MONOTONE combine ──
+// PRECONDITION: adding a part never lowers `combine`'s result — a sum or a max,
+// never a ratio. That is what makes the measured parts' total a true '≥' of
+// the whole when some parts are holes: it is served lower_bound, its reason
+// names every non-fresh part (holes included, in part order), and the hole
+// labels travel as `_missing_parts`, a client annotation underscored like
+// withReceipt's, which missingParts reads. Every part a hole is no floor at
+// all, so it is unknown; no hole at all is exactly combinedDatum.
+function lowerBoundCombinedDatum(partsByLabel, combine, emptyReason) {
+  const parts = labelledDatums(partsByLabel, 'lowerBoundCombinedDatum');
+  if (parts.length === 0) return unknownDatum(emptyReason);
+
+  const holes = parts.filter(isHolePart);
+  if (holes.length === parts.length) return unknownDatum(labelledReasons(holes));
+
+  const measured = parts.filter(labelled => !isHolePart(labelled)).map(([, datum]) => datum);
+  const total = measuredTotal(parts, measured, combine, 'lowerBoundCombinedDatum');
+  if (holes.length === 0) return total;
+  return { ...total, state: 'lower_bound', _missing_parts: holes.map(([label]) => label) };
+}
+
+// The labels of the parts a lower-bound total could not read, in part order;
+// [] for every other Datum.
+function missingParts(datum) {
+  const missing = datum ? datum._missing_parts : undefined;
+  return Array.isArray(missing) ? [...missing] : [];
+}
+
+function labelledDatums(partsByLabel, who) {
+  return partsByLabel.map(([label, part]) => [label, assertDatum(part, who)]);
+}
+
+function isHolePart([, part]) {
+  return part.state === 'unknown';
+}
+
+// The total over the `measured` Datums among the labelled `parts`, by the
+// state, age, bound and receipt rules stated above combinedDatum.
+function measuredTotal(parts, measured, combine, who) {
+  const ages = displayedAgesOf(measured, who);
   const oldestAge = Math.max(...ages);
   const oldest = measured[ages.indexOf(oldestAge)];
   const unfresh = parts.filter(([, part]) => part.state !== 'fresh');
@@ -411,17 +471,17 @@ function combinedDatum(partsByLabel, combine, emptyReason) {
 }
 
 // Every part's displayed age at ONE instant. Displayed ages all grow at the
-// same rate, so their order and their differences — all combinedDatum reads —
+// same rate, so their order and their differences — all measuredTotal reads —
 // hold at every later render. A part with no receipt has no displayed age to
 // compare, and a total over it could not say how old it looks: a caller's
 // error, thrown like assertDatum's.
-function displayedAgesOf(parts) {
+function displayedAgesOf(parts, who) {
   const now = Date.now();
   return parts.map(part => {
     const age = displayedAgeMs(part, now);
     if (age === null) {
       throw new TypeError(
-        'combinedDatum was given a part with no displayed age — stamp every served part ' +
+        who + ' was given a part with no displayed age — stamp every served part ' +
           'with its receipt (withReceipt) before combining.',
       );
     }
@@ -462,7 +522,10 @@ const DATUM_API = {
   plainDatum,
   derivedDatum,
   servedDatum,
+  undeliveredDatum,
   combinedDatum,
+  lowerBoundCombinedDatum,
+  missingParts,
   PLAIN_DATUM_BOUND_SECONDS,
 };
 

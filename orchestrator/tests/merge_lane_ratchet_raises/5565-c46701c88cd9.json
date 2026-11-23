@@ -1,0 +1,36 @@
+{
+  "task_id": "5565",
+  "reason": "Amendment pass on task 5565 (reviewer suggestions 1 and 6), net-additive: the startup shrink diagnostic now WARNs only for over-cap lanes that may still hold an assignment (durable record ASSIGNED/IN_USE or missing) and names drained ones at INFO, so the warning clears once a shrink drains -- one extra branch in GitOps.warn_on_warm_lane_pool_shrink plus the OverCapLane.may_hold_assignment predicate. The over-cap index rule now lives in one helper, WarmLanePool._over_cap_index, used by both canonical_lane and over_cap_report; it replaces _over_cap_slot and the test-only is_over_cap, so canonical_lane rises 1->2 while those two removals offset it at file level.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1497,
+      "current": 1498
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::warn_on_warm_lane_pool_shrink",
+      "baseline": 5,
+      "current": 6
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/warm_lane_pool.py",
+      "baseline": 74,
+      "current": 75
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/warm_lane_pool.py::WarmLanePool::canonical_lane",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5049,
+      "current": 5051
+    }
+  ]
+}

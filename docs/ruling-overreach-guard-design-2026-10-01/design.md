@@ -658,3 +658,77 @@ id.
   `scripts/local_memory_models_eval/build_corpus.py::EpisodeReader`, and the
   migration also covers `scripts/audit_ruling_overreach.py::GraphReader`. The
   ticket carries the edge-census `count(r)` gotcha: `tkt_0RV9EQ11QMC9WK79B74XBJ549H`.
+
+## 10. Measurement gate result (2026-11-09, task 6218)
+
+Gate task 6218 (esc-6218-1) evaluated the §6.1 trigger on 2026-11-09. Leo
+ruled on the result the same day.
+
+### 10.1 Offline leg (1): FAILED
+
+`eval_overreach_judge.py --mode offline` ran over a worksheet from
+`audit_ruling_overreach.py --emit-worksheet` on the default frozen window. The
+judge was gpt-4o-mini, prompt `overreach-judge-v1-ee6466c52d67`, with one
+call per episode, 48 episodes and no failures. The output is
+`judge-eval-offline-2026-11-09.json`, in this directory.
+
+| check | bar | measured (population-weighted) | unweighted |
+|---|---|---|---|
+| precision | ≥ 0.80 | **0.267** | 5/18 = 0.278 |
+| precision, Wilson lower bound | ≥ 0.65 | **0.107** [0.107–0.525], effective n 14.4 | |
+| recall | ≥ 0.50 | **0.147** [0.058–0.323], effective n 27.0 | 5/34 |
+
+* Even the upper bound of the precision interval (0.525) is under the bar,
+  so run-to-run LLM variation cannot flip the result. The gate ran once.
+* The judge is lenient. Of its 29 false negatives it labelled 27 `holding`.
+  13 of its 18 flags were wrong (`disagreements`).
+* The live sample now mints 286 edges, not 291. The 5 missing edges were all
+  `holding` verdicts, and `load_verdicts` treats them as stale. Recall is
+  unaffected.
+
+The online leg (2) was not run, because §6.1 requires both legs. So no second
+adjudication exists, and inter-rater agreement (§7) is still unmeasured.
+
+### 10.2 What the shadow showed on live writes
+
+These figures come from read-only joins of `overreach_shadow.db` against the
+graphs. They are not trigger measurements.
+
+* **Volume.** The shadow judged 10,712 class episodes from 2026-10-24 to
+  2026-11-09, about 670/day across 10 graphs. §6 estimated 16/day across 2.
+* **The O4 handoff retires flagged edges.** Edges the judge flagged are
+  invalidated at 14–21% across dark_factory, reify, scoping_intake and
+  solar_challenge. Edges it labelled `holding` are invalidated at about 1%
+  (≈600 edges per arm per graph). Almost all of these invalidations are
+  `invalid_at` without `expired_at`, the shape of Stage 1's `update_edge` path.
+* **What Stage 1 retires is overreach.** Twenty such edges were drawn at
+  random (10 dark_factory, 10 reify) and adjudicated blind under §2.6. 18 are
+  overreach, 1 is holding and 1 is borderline, so the judge+Stage 1 composite
+  retires at about 0.90 precision. This is a single-adjudicator spot-check at
+  n=20, not pre-registered. See `stage1-retirement-spotcheck-2026-11-09.md`.
+  Almost all of the 18 are garbles: inverted relations, rejected options stated
+  as adopted, and symbols placed in the wrong module.
+
+### 10.3 Decision (Leo, 2026-11-09)
+
+* The judge **stays in shadow**. No marker is written, and leaf 6
+  (enforcement) is not filed.
+* The shadow and the O4 handoff **keep running** unchanged, because §10.2
+  shows the composite retiring real overreach.
+* The lever choice re-opens as design **task 9040**: replay O1 on the same 48
+  episodes, score the O3+O4 composite as a candidate in its own right, and
+  decide whether a stronger extraction model belongs among the levers.
+* Sidecar retention (task 7487) now **depends on 9040**. No rows may be
+  pruned until 9040 has ruled, because its evidence is in the sidecar.
+
+### 10.4 Re-opened lever choice (task 9040, 2026-11-10)
+
+Task 9040 measured the re-opened choice in
+`docs/ruling-overreach-lever-reopen-2026-11-10/`, whose `design.md` is now
+authoritative over §6.1 here. O1, replayed on the same 48 episodes, reduced
+overreach to 0.59× per minted edge and 0.72× per day, short of the halving
+bar. The O3+O4 composite retired flagged edges at 0.937 precision [0.811–0.981].
+So **the composite, as it runs today, is the lever**: the judge stays
+record-only, Stage 1 keeps retiring its flags, the §6.1 trigger to an
+enforcing marker is withdrawn, and a stronger extraction model (O6) is the
+next lever to measure, with a costed trigger.

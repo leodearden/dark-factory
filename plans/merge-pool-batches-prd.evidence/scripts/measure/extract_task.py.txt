@@ -1,0 +1,10 @@
+import json, sqlite3
+DB = '/home/leo/src/dark-factory/data/orchestrator/runs.db'
+conn = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
+out = []
+for t in ('task_started', 'phase_enter', 'invocation_end'):
+    for id_, ts, task, role, phase in conn.execute(
+            "SELECT id,timestamp,task_id,role,phase FROM events WHERE event_type=? AND timestamp>='2026-11-04'", (t,)):
+        out.append({'id': id_, 'ts': ts, 'task': task, 'type': t, 'role': role, 'phase': phase})
+json.dump(out, open('/tmp/gate-10069/measure/task_events.json', 'w'))
+print(len(out))

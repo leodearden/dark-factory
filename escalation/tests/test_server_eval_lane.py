@@ -16,7 +16,8 @@ from unittest.mock import AsyncMock
 import pytest
 from _escalation_http import escalation_http_call
 from _escalation_seed import seed_escalation
-from _filing_tools import call_blocker, call_info
+from _filing_tools import call_blocker, call_info, call_promote
+from fastmcp import FastMCP
 
 from escalation.action_effects import WORKFLOW_NONE, effect_for
 from escalation.models import Escalation
@@ -45,7 +46,7 @@ def _server(
     *,
     status: str | None = 'in-progress',
     claimant: str | None = 'run-live',
-) -> tuple[object, AsyncMock, AsyncMock]:
+) -> tuple[FastMCP, AsyncMock, AsyncMock]:
     status_lookup = AsyncMock(return_value=status)
     claimant_lookup = AsyncMock(return_value=claimant)
     server = create_server(
@@ -216,11 +217,6 @@ class TestProductionFilingsStillQueue:
         assert [e.id for e in queue.get_pending()] == [result['id']]
 
 
-async def _promote(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('promote_to_l2')
-    return await tool.fn(**kwargs)
-
-
 def _promote_args(task_id: str, member_ids: list[str], root_cause: str) -> dict[str, Any]:
     return {
         'task_id': task_id,
@@ -251,7 +247,7 @@ class TestPromoteToL2RefusesEvalLane:
         files_before = _queue_files(queue)
         member_before = queue.get(member.id).to_dict()
 
-        result = await _promote(
+        result = await call_promote(
             server,
             **_promote_args(
                 task_id,
@@ -269,14 +265,14 @@ class TestPromoteToL2RefusesEvalLane:
     async def test_eval_lane_promote_never_folds_into_a_production_l2(self, queue):
         server = create_server(queue, startup_sweep=False)
         prod_member = seed_escalation(queue, level=1, task_id='3096')
-        created = await _promote(
+        created = await call_promote(
             server, **_promote_args('3096', [prod_member.id], 'shared-root-cause')
         )
         assert created['status'] == 'created', created
         prod_l2_before = queue.get(created['id'])
         eval_member = seed_escalation(queue, level=1, task_id=ADV_FIXTURE_ID)
 
-        result = await _promote(
+        result = await call_promote(
             server, **_promote_args(ADV_FIXTURE_ID, [eval_member.id], 'shared-root-cause')
         )
 
@@ -299,7 +295,7 @@ class TestPromoteToL2RefusesEvalLane:
         eval_member = seed_escalation(queue, level=1, **eval_member_fields)
         files_before = _queue_files(queue)
 
-        result = await _promote(
+        result = await call_promote(
             server,
             **_promote_args('3096', [prod_member.id, eval_member.id], 'mixed-cluster'),
         )
@@ -312,14 +308,14 @@ class TestPromoteToL2RefusesEvalLane:
     async def test_eval_lane_member_never_folds_into_a_production_l2(self, queue):
         server = create_server(queue, startup_sweep=False)
         prod_member = seed_escalation(queue, level=1, task_id='3096')
-        created = await _promote(
+        created = await call_promote(
             server, **_promote_args('3096', [prod_member.id], 'shared-root-cause')
         )
         assert created['status'] == 'created', created
         prod_l2_before = queue.get(created['id'])
         eval_member = seed_escalation(queue, level=1, task_id=ADV_FIXTURE_ID)
 
-        result = await _promote(
+        result = await call_promote(
             server, **_promote_args('3096', [eval_member.id], 'shared-root-cause')
         )
 
@@ -334,7 +330,7 @@ class TestPromoteToL2RefusesEvalLane:
         server = create_server(queue, startup_sweep=False)
         member = seed_escalation(queue, level=1, task_id=task_id)
 
-        result = await _promote(
+        result = await call_promote(
             server, **_promote_args(task_id, [member.id], f'production-cause-{task_id}')
         )
 

@@ -48,11 +48,13 @@ ls "$TARGET_CONFIG"
 ```
 
 As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
-The legacy spellings (`orchestrator.yaml`, `orchestrator-config.yaml`, `config.yaml`,
-`orchestrator/config.yaml`) are honoured only as a discovery fallback for a not-yet-migrated
-project, never as a choice for a new one — and a stray legacy file can sit BESIDE the canonical
-one (autopilot-video still has a `config.yaml`, pump-web-ui an `orchestrator.yaml`), so never let a
-glob over the legacy names win over the canonical path when both exist.
+Dashboard discovery reads only that name: task 7138 retired the legacy spellings
+(`orchestrator.yaml`, `orchestrator-config.yaml`, `orchestrator/config.yaml`), and a bare
+`config.yaml` was never read. A project using any other name still shows its tasks, but until
+renamed its escalation-backed views (escalations, merge queue and halt status, task runtime
+state) go dark and its burndown run-slot capacity reads as unknown. A stray legacy file can still sit BESIDE the canonical one (autopilot-video has a
+`config.yaml`, solar-challenge-platform an `orchestrator.yaml` symlink), so never let a glob over
+the legacy names win over the canonical path when both exist.
 
 Verify the file actually points at the target:
 
@@ -171,6 +173,9 @@ elif resolve["status"] == "refused":
     # is no task_id. Intended outcome — record resolve["reason"] and move on.
     # Do NOT retry and do NOT record a task id.
     note_refused(resolve["reason"])
+elif resolve["status"] in ("pending", "awaiting_curation"):  # open — resolve the SAME ticket again, never re-submit (skills/_shared/ticket-failure-handling.md)
+    # No task_id yet. Still open after the re-resolve: record the ticket id.
+    note_parked(ticket)
 elif resolve["status"] == "failed":
     # On `failed`: surface the reason to the user and skip this task (user can
     # resubmit manually after investigating).
@@ -261,7 +266,7 @@ The orchestrator will:
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
 
-That is one landing per verify, which is the stock pipeline. When `merge_deep.chain_cap > 0` and the queue holds 2 or more mergeable items, a single verify instead covers a **chain** of queued items: the chain is built in one lane by merging them onto the head in submission order, only its tip is verified, and on a pass the whole verified prefix is CAS-landed in submission order — so one passing verify lands several tasks. The shipped default `chain_cap=0` disables this entirely, leaving the pipeline exactly as described above. A tip failure lands nothing via the chain and leaves the queue untouched, and the next round halves its target depth (any pass resets it) — see OPERATIONS.md §5 "Deep merge-ahead chains" and `plans/deep-merge-ahead-prd.md` for the full contract.
+That is one landing per verify, which is the stock pipeline. When `merge_deep.chain_cap > 0` and the queue holds 2 or more mergeable items, a single verify instead covers a **chain** of queued items: the chain is built in one lane by merging them onto the head in submission order, only its tip is verified, and on a pass the whole verified prefix is CAS-landed in submission order — so one passing verify lands several tasks. `chain_cap` is only the kill switch: the shipped default `0` disables this entirely, leaving the pipeline exactly as described above, and any positive value turns it on. How deep a chain goes comes from `merge_deep.depth_table` and the rolling pass estimate. A tip failure lands nothing via the chain; each of its items then verifies alone, so a good one lands and the bad one is blocked. See OPERATIONS.md §5 "Deep merge-ahead chains", `plans/merge-lane-policy-prd.md` D6/D7 and `plans/deep-merge-ahead-prd.md` for the full contract.
 
 The **debugger** is a distinct agent role invoked automatically on each verify failure. It receives the failure report (test output, lint errors, type errors) and makes targeted fixes. The verify→debug loop repeats up to `max_verify_attempts` times (default 5) before the task blocks.
 
@@ -343,11 +348,11 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 |---|---|
 | Per-role `models` / `budgets` / `max_turns` / `effort` / `timeouts` / `backends` | Reload |
 | `routing.*` (`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules`) | Reload |
-| Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`) | Reload |
+| Steward (`steward_completion_timeout`, `steward_lifetime_budget`, `steward_session_mode`) | Reload |
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, persist passes, recheck seconds, red-unlanded hours) | Reload |
-| `merge_deep.chain_cap` — the deep merge-ahead chain cap; `0` is the shipped default and the kill switch (mechanism: OPERATIONS.md §5 "Deep merge-ahead chains") | Reload |
+| `merge_deep.*` — deep merge-ahead chains: `chain_cap` is the kill switch (`0`, the shipped default, is off; any positive value is on) and `depth_table` sets depth (mechanism: OPERATIONS.md §5 "Deep merge-ahead chains") | Reload |
 | `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
 | Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
 
@@ -378,7 +383,7 @@ When unsure, reload first — it's cheap and non-destructive (fail-closed on bad
 
 Every call — success or failure — appends a `config_reload` event row to `runs.db` and fires a WARNING journal line whenever `restart_required` is non-empty or `reloaded=false`, so an AFK operator can audit what happened after the fact.
 
-See `CLAUDE.md`'s "Orchestrator Config Reload" section for the quick-reference tier summary, and `plans/config-hot-reload-prd.md` for the full allowlist and invariants.
+See `OPERATIONS.md` §"Config reload vs restart" for the tier summary, and `plans/config-hot-reload-prd.md` for the full allowlist and invariants.
 
 ---
 
@@ -524,7 +529,7 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
    ```
    `kind` is **required** — `_validate_done_provenance` (`fused-memory/src/fused_memory/middleware/task_interceptor.py`) rejects a kind-less blob with `done_provenance.kind is required`, and `DoneProvenance.kind` (`shared/src/shared/task_metadata.py`) has no default. Use `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge you just performed — **the normal case here**, since step 5 merged by hand; use `{"kind": "found_on_main", "commit": "<sha>", "note": "<why>"}` when the work was already on main.
 
-   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the one step 5 captured: `{"kind": "merged", "commit": "$MERGE_SHA"}`. It is attributable because step 5 proved its **second parent is this branch's tip** — that is what makes it a merge commit that brought *this* branch in, not whatever has landed on main since — and it was captured on `main`. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only. If step 5's chain printed no `MERGE_SHA=`, this carve-out does **not** apply: fall through to **If `MERGE_SHA` is not in hand** below, which re-derives from the hand-merge subject, proves containment, and already bans a bare `git rev-parse HEAD`.
+   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped marker subject `Merge task/<task-id> into main` deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the one step 5 captured: `{"kind": "merged", "commit": "$MERGE_SHA"}`. It is attributable because step 5 proved its **second parent is this branch's tip** — that is what makes it a merge commit that brought *this* branch in, not whatever has landed on main since — and it was captured on `main`. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only. If step 5's chain printed no `MERGE_SHA=`, this carve-out does **not** apply: fall through to **If `MERGE_SHA` is not in hand** below, which re-derives from the hand-merge subject, proves containment, and already bans a bare `git rev-parse HEAD`.
 
    **If `MERGE_SHA` is not in hand** — step 6 reached in a fresh shell, a resumed session, or a merge performed earlier — do **not** substitute `git rev-parse HEAD`. Re-derive by the *hand-merge* subject and prove containment first:
    ```bash
@@ -538,7 +543,7 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 
    **Otherwise** — when the work was already on main and you are deriving rather than recording a merge you performed — derive the sha with the task-scoped ladder, never from main's current HEAD and never from an eyeballed listing: [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the single normative copy (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full. Two adaptations for this call site: run every command in `$TARGET_PROJECT`, not dark-factory, and the shared doc writes the task id as `<TASK_ID>` where this workflow writes `<task-id>` — same value.
 
-   On the ladder's genuine not-landed outcomes — rc=0's **phantom-branch** exit, and, both **outside** the `coalesce-*` arm, rc=1 and rc=128 with an empty marker search — stamp nothing and report, rather than substituting a convenient sha. A citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict: stamp nothing there either, and report it as un-evaluable rather than as not-landed.
+   On the ladder's genuine not-landed outcomes — rc=0's **phantom-branch** exit, rc=1 **outside** both the `coalesce-*` and [rebased-solo-landing](../_shared/deriving-landed-sha.md#rebased-solo-landing) arms, and rc=128 with an empty marker search **outside** the `coalesce-*` arm — stamp nothing and report, rather than substituting a convenient sha. A citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict, and nor does the ladder's [landing-unattributable](../_shared/deriving-landed-sha.md#landing-unattributable) verdict: stamp nothing on either, and report each as such rather than as not-landed.
 
    A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<the commit on main that cites this task>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
@@ -553,10 +558,11 @@ If the block was caused by missing architectural context, write it to memory so 
 
 ```
 add_memory(
-  content="<the decision or convention that was missing>",
+  content="Task 3127 was blocked on <the decision or convention that was missing>",
   category="decisions_and_rationale",  # or "preferences_and_norms" for conventions
   project_id="<target project_id from TARGET_CONFIG>",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the blocked task id here and in content; [] if none
 )
 ```
 

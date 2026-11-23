@@ -16,17 +16,13 @@ import json
 from pathlib import Path
 
 import pytest
-from _fm_helpers import load_script_module
 from shared.briefing_queries import QUERY_SPECS, BriefingScope, queries_for
 
-SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
+from fused_memory.eval import topic_registry
+
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
 
 _SCOPE_KEYS = frozenset({'task_id', 'title', 'files'})
-
-
-def _mod():
-    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_retrieval_probe')
 
 
 def _briefing_scope(raw: dict) -> BriefingScope:
@@ -94,7 +90,7 @@ def briefing_drift(registry) -> list[str]:
 
 @pytest.fixture(scope='module')
 def registry():
-    return _mod().load_topic_registry(REGISTRY_PATH)
+    return topic_registry.load_topic_registry(REGISTRY_PATH)
 
 
 def _briefing_entries(registry):
@@ -134,7 +130,7 @@ class TestBriefingTopicsArePinnedToTheirSource:
         path = tmp_path / 'registry.json'
         path.write_text(json.dumps(payload), encoding='utf-8')
 
-        drift = briefing_drift(_mod().load_topic_registry(path))
+        drift = briefing_drift(topic_registry.load_topic_registry(path))
 
         assert drift
         assert any(line.startswith(f'{topic}:') for line in drift), drift

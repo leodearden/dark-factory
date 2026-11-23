@@ -86,9 +86,9 @@ def test_the_production_resolver_lands_in_tmp_space_for_this_run(
         'That is a MACHINE-GLOBAL, CROSS-PROJECT rendezvous directory holding '
         "seven projects' live orchestrator heartbeats, and ~20 modules in this "
         'suite drive harness.run() for real — each one writing into it. '
-        'orchestrator/tests/conftest.py must import _df_fleet_dir_redirect from '
-        'df_pytest_isolation (the import IS the wiring, since pytest only '
-        "collects fixtures bound into a conftest's namespace)."
+        'orchestrator/tests/conftest.py must call arm_fleet_dir_isolation(config) '
+        'from its pytest_configure (that call IS the wiring, since pytest only '
+        'collects fixtures a plugin or conftest registers).'
     )
     assert resolved.resolve().is_relative_to(basetemp), (
         f'resolve_fleet_dir() returned {resolved}, which is outside this run\'s '
@@ -105,7 +105,7 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     """``ORCH_FLEET_DIR`` points somewhere hermetic for the WHOLE session.
 
     Takes the redirect from the fixture BY NAME rather than reading
-    ``os.environ`` bare: deleting the conftest binding then fails SETUP with a
+    ``os.environ`` bare: deleting the conftest's arm call then fails SETUP with a
     message naming ``_df_fleet_dir_redirect``, instead of this test quietly
     passing off some other suite's leftover env var or failing with a bare
     KeyError that names nothing.
@@ -124,7 +124,7 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
 
     # The fixture's yielded value IS the redirect, not a parallel path. This is
     # the part that is genuinely per-root: it proves THIS rootdir's conftest
-    # bound the fixture that set the variable checked above.
+    # armed the fixture that set the variable checked above.
     assert Path(_df_fleet_dir_redirect).resolve() == Path(value or '').resolve()
 
 
@@ -148,10 +148,10 @@ class TestBothFixturesAreLiveInThisRun:
     while adding a second body to keep in sync.  That is the same drift hazard
     that put :func:`fleet_dir_redirect_violation_reason` in the shared module
     rather than in each root's test.  The existence check would additionally be
-    unfalsifiable here: ``orchestrator/tests/conftest.py`` imports both fixture
-    names, so a missing attribute aborts collection with an ImportError long
-    before any assertion in this file could run.  What is genuinely per-root is
-    whether THIS conftest bound them — this class, plus
+    unfalsifiable here: ``orchestrator/tests/conftest.py`` arms both through
+    ``arm_fleet_dir_isolation``, so a missing attribute aborts the session at
+    configure time long before any assertion in this file could run.  What is
+    genuinely per-root is whether THIS conftest armed them — this class, plus
     ``test_fleet_dir_is_redirected_away_from_the_live_checkout`` above, which
     requests the redirect by name.
 
@@ -169,21 +169,21 @@ class TestBothFixturesAreLiveInThisRun:
 
     @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
     def test_the_fixture_is_registered_in_this_run(self, name: str, request) -> None:
-        """The conftest binding is real WIRING, not a dormant definition.
+        """The conftest's arm call is real WIRING, not a dormant definition.
 
-        pytest only collects fixtures bound into a conftest's namespace, which
-        is why they are imported there under
-        ``# noqa: F401 — the binding IS the wiring``.  Deleting that import
-        breaks nothing visible in this whole module except this assertion.
+        pytest only collects fixtures a plugin or conftest registers, which is
+        why the conftest calls ``arm_fleet_dir_isolation(config)`` from its
+        ``pytest_configure``.  Deleting that call breaks nothing visible in this
+        whole module except this assertion.
         """
         try:
             request.getfixturevalue(name)
         except pytest.FixtureLookupError:
             pytest.fail(
-                f'{name} is not registered for this rootdir. Wire '
-                'orchestrator/tests/conftest.py to import it from '
-                'df_pytest_isolation (`# noqa: F401 — the binding IS the '
-                'wiring`); the repo-root conftest cannot cover this suite, '
+                f'{name} is not registered for this rootdir. Call '
+                'arm_fleet_dir_isolation(config) from '
+                'orchestrator/tests/conftest.py\'s pytest_configure; the '
+                'repo-root conftest cannot cover this suite, '
                 'because the verify lane runs `cd orchestrator && uv run pytest '
                 'tests/` and rootdir is therefore the SUBPROJECT.',
                 pytrace=False,

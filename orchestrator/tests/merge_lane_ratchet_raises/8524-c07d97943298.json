@@ -1,0 +1,42 @@
+{
+  "task_id": "8524",
+  "reason": "amendment pass (review of task 8524): NoHost's cap_permit invariant check; _dispatch_item's launch guarded so a raise after a dispatch-time re-merge frees the replacement's permit and worktree; the dispatch re-merge tells the merger of the dead commit on its raise path; _claim_for_request folded into _claim_remerge_base (no net change across the two); _merger_live_tip hands the merger the tip's owner so pending_spec_base and pending_predecessor move together; _merge_lane_fakes.remerge_on_main routes 18 direct test _remerge calls through one private read",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 91,
+      "current": 92
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1957,
+      "current": 1965
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_claim_remerge_base",
+      "baseline": 1,
+      "current": 3
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_merger_live_tip",
+      "baseline": 0,
+      "current": 3
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/_merge_lane_fakes.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5134,
+      "current": 5142
+    }
+  ]
+}

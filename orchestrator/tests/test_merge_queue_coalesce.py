@@ -20,20 +20,29 @@ Task δ/1720 additions (merge-ready confidence gate):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
-from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until
+from _git_fixtures import seed_repo
+from _live_merge_worker import (
+    REAL_GIT_MERGE_RESULT_TIMEOUT,
+    REAL_GIT_TRAIN_MAX_WALL_S,
+    REAL_GIT_TRAIN_TIMEOUT,
+    running_merge_worker,
+)
+from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until, lane_scene_config
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.merge_lane.landing_evidence import LandingEvidenceVerdict
 from orchestrator.merge_lane.types import QueuedBranch
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from orchestrator.config import OrchestratorConfig
     from orchestrator.git_ops import GitOps
     from orchestrator.merge_lane.worker import (
@@ -58,17 +67,9 @@ class TestConfigAndEventType:
         """
         import tempfile
 
-        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.config import OrchestratorConfig
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = OrchestratorConfig(
-                project_root=Path(tmp),
-                git=GitConfig(
-                    main_branch='main',
-                    branch_prefix='task/',
-                    remote='origin',
-                    worktree_dir='.worktrees',
-                ),
-            )
+            cfg = OrchestratorConfig(project_root=Path(tmp))
             assert cfg.merge_train_coalesce_enabled is False
 
     def test_event_type_train_coalesced(self):
@@ -80,10 +81,10 @@ class TestConfigAndEventType:
 # ─── helpers shared across steps ────────────────────────────────────────────
 
 def _make_config(tmp_path: Path, *, coalesce_enabled: bool = False) -> OrchestratorConfig:
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
+    from orchestrator.config import GitConfig
+    return lane_scene_config(
+        tmp_path,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
@@ -193,13 +194,13 @@ class TestNoOpGuards:
 
         req1 = _make_single_req('t1', config=cfg)
         req2 = _make_single_req('t2', config=cfg)
-        worker._lane_buffers['normal'].append(req1)
-        worker._lane_buffers['normal'].append(req2)
+        worker._intake.buffer_owned_request(req1)
+        worker._intake.buffer_owned_request(req2)
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is False, 'should return False when knob is disabled'
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         assert buf == [req1, req2], 'buffer must be unchanged'
         # No futures resolved
         assert not req1.result.done()
@@ -212,12 +213,12 @@ class TestNoOpGuards:
         worker = _make_worker(queue, cfg, factory=_stub_factory())
 
         req1 = _make_single_req('t1', config=cfg)
-        worker._lane_buffers['normal'].append(req1)
+        worker._intake.buffer_owned_request(req1)
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is False
-        assert list(worker._lane_buffers['normal']) == [req1]
+        assert list(worker._intake.buffered('normal')) == [req1]
         assert not req1.result.done()
 
     async def test_no_factory_returns_false(self, tmp_path: Path):
@@ -228,8 +229,8 @@ class TestNoOpGuards:
 
         req1 = _make_single_req('t1', config=cfg)
         req2 = _make_single_req('t2', config=cfg)
-        worker._lane_buffers['normal'].append(req1)
-        worker._lane_buffers['normal'].append(req2)
+        worker._intake.buffer_owned_request(req1)
+        worker._intake.buffer_owned_request(req2)
 
         result = await worker._maybe_coalesce_waiting_singles()
 
@@ -240,22 +241,9 @@ class TestNoOpGuards:
 
 # ─── git repo fixtures ───────────────────────────────────────────────────────
 
-async def _setup_repo(repo: Path) -> None:
-    from orchestrator.git_ops import _run
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -278,18 +266,24 @@ def git_ops(git_config, git_repo: Path):
 
 @pytest.fixture
 def config(git_repo: Path, git_config) -> OrchestratorConfig:
-    from orchestrator.config import OrchestratorConfig
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 @pytest.fixture
 def coalesce_config(git_repo: Path, git_config) -> OrchestratorConfig:
-    """Config with merge_train_coalesce_enabled=True."""
-    from orchestrator.config import OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=git_repo,
-        git=git_config,
+    """Config with merge_train_coalesce_enabled=True, in the train-only regime.
+
+    ``merge_deep`` is pinned to ``chain_cap=0`` because a deep chain built at
+    verify dispatch takes the same buffered singles the coalescer scans, so
+    these scenes would otherwise assert trains under whatever cap the
+    operational yaml (loaded via conftest's ``ORCH_CONFIG_PATH``) ships.
+    """
+    from orchestrator.config import MergeDeepConfig
+    return lane_scene_config(
+        git_repo,
+        git_config,
         merge_train_coalesce_enabled=True,
+        merge_deep=MergeDeepConfig(chain_cap=0),
     )
 
 
@@ -410,7 +404,7 @@ class TestCoreFormation:
         req1 = _make_req('t1', 'task/t1', wt1, coalesce_config)
         req2 = _make_req('t2', 'task/t2', wt2, coalesce_config)
         req3 = _make_req('t3', 'task/t3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         # ── invoke ──────────────────────────────────────────────────────────
         result = await worker._maybe_coalesce_waiting_singles()
@@ -419,7 +413,7 @@ class TestCoreFormation:
         assert result is True, 'should return True when a train is formed'
 
         # (b) buffer has exactly 1 GroupMergeRequest; all 3 singles removed.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         assert len(buf) == 1, f'Expected 1 item in buffer, got {len(buf)}: {buf}'
         group_req = buf[0]
         assert isinstance(group_req, GroupMergeRequest), (
@@ -480,7 +474,7 @@ class TestExclusionIdempotency:
         """(a) IN-FLIGHT NEVER ABSORBED.
 
         A request registered at ItemLifecycleState.MERGING (not in
-        _lane_buffers) must never be touched by the pass — its future remains
+        the lane buffers) must never be touched by the pass — its future remains
         unresolved and its task_id does not appear in the train's
         member_task_ids.
         """
@@ -511,7 +505,7 @@ class TestExclusionIdempotency:
         worker._register_item(req0, initial=ItemLifecycleState.MERGING)
 
         # Only req1 and req2 are in the buffer.
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
@@ -524,7 +518,7 @@ class TestExclusionIdempotency:
         )
 
         # req0's task_id must not appear in the formed train's member_task_ids.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         assert len(buf) == 1 and isinstance(buf[0], GroupMergeRequest)
         group_req = buf[0]
         assert 'in0' not in group_req.member_task_ids, (
@@ -564,7 +558,7 @@ class TestExclusionIdempotency:
         req3.result.cancel()
         assert req3.result.cancelled(), 'precondition: req3 future is cancelled'
 
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
@@ -576,7 +570,7 @@ class TestExclusionIdempotency:
         )
 
         # req3 must still be in the buffer (it was not absorbed).
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         task_ids_in_buf = [
             r.task_id for r in buf if not isinstance(r, GroupMergeRequest)
         ]
@@ -640,7 +634,7 @@ class TestExclusionIdempotency:
         )
 
         # Put the existing group first, then the 2 singles.
-        worker._lane_buffers['normal'].extend([existing_group, req1, req2])
+        worker._intake.replace_lane('normal', [existing_group, req1, req2])
 
         await worker._maybe_coalesce_waiting_singles()
 
@@ -650,7 +644,7 @@ class TestExclusionIdempotency:
         )
 
         # (c2) The existing GroupMergeRequest must still be in the buffer.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         group_reqs = [r for r in buf if isinstance(r, GroupMergeRequest)]
         group_train_ids = {gr.train_id for gr in group_reqs}
         assert 'train-existing' in group_train_ids, (
@@ -702,7 +696,7 @@ class TestPartialStackability:
         req2 = _make_req('ov2', 'task/ov2', tmp_path / 'wt-ov2', coalesce_config)
         req3 = _make_req('ov3', 'task/ov3', tmp_path / 'wt-ov3', coalesce_config)
 
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         # ov1 and ov2 both touch file_a.py lines 1–5 / 3–7 → overlapping → NOT stackable.
         # ov3 touches file_b.py only → disjoint from both → stackable with ov1.
@@ -723,7 +717,7 @@ class TestPartialStackability:
 
         assert result is True, 'pass must form a train from the 2 stackable tasks'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         # ov2 must remain as a solo in the buffer (not absorbed).
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
         assert len(solos) == 1, f'Expected 1 solo; got {[r.task_id for r in solos]}'
@@ -768,9 +762,9 @@ class TestPartialStackability:
         req2 = _make_req('ej2', 'task/ej2', tmp_path / 'wt-ej2', coalesce_config)
         req3 = _make_req('ej3', 'task/ej3', tmp_path / 'wt-ej3', coalesce_config)
 
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
-        # All disjoint → _select_train_members selects all 3.
+        # All disjoint → select_train_members selects all 3.
         async def _mock_gcr(task_id: str):
             return {
                 'ej1': {'fa.py': [(1, 2)]},
@@ -790,7 +784,7 @@ class TestPartialStackability:
 
         assert result is True, 'pass must form a train from ej1+ej2 survivors'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         # ej3 must remain in the buffer as a solo.
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
         assert len(solos) == 1 and solos[0].task_id == 'ej3', (
@@ -840,7 +834,7 @@ class TestPartialStackability:
         req2 = _make_req('ns2', 'task/ns2', tmp_path / 'wt-ns2', coalesce_config)
         req3 = _make_req('ns3', 'task/ns3', tmp_path / 'wt-ns3', coalesce_config)
 
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         async def _mock_gcr(task_id: str):
             return {}  # all disjoint → all selected
@@ -856,7 +850,7 @@ class TestPartialStackability:
         assert result is False, 'must return False when survivors < 2'
 
         # All 3 candidates must remain in the buffer unchanged.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         buf_ids = [r.task_id for r in buf]
         assert set(buf_ids) == {'ns1', 'ns2', 'ns3'}, (
             f'all candidates must remain in buffer; got {buf_ids}'
@@ -898,7 +892,7 @@ class TestDebounce:
 
         req1 = _make_req('db1', 'task/db1', tmp_path / 'wt-db1', coalesce_config)
         req2 = _make_req('db2', 'task/db2', tmp_path / 'wt-db2', coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         # Spy on get_changed_line_ranges (non-stackable: both touch the same file).
         call_count = 0
@@ -949,7 +943,7 @@ class TestDebounce:
 
         req1 = _make_req('ra1', 'task/ra1', tmp_path / 'wt-ra1', coalesce_config)
         req2 = _make_req('ra2', 'task/ra2', tmp_path / 'wt-ra2', coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         call_count = 0
 
@@ -975,7 +969,7 @@ class TestDebounce:
 
             # Add a new request — different signature → must re-run.
             req3 = _make_req('ra3', 'task/ra3', tmp_path / 'wt-ra3', coalesce_config)
-            worker._lane_buffers['normal'].append(req3)
+            worker._intake.buffer_owned_request(req3)
 
             await worker._maybe_coalesce_waiting_singles()
             assert call_count > calls_after_first, (
@@ -1009,7 +1003,7 @@ class TestDebounce:
 
         req1 = _make_req('sc1', 'task/sc1', wt1, coalesce_config)
         req2 = _make_req('sc2', 'task/sc2', wt2, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         # First call: successful coalesce (real git: disjoint files → stackable).
         result = await worker._maybe_coalesce_waiting_singles()
@@ -1265,14 +1259,14 @@ class TestMergeReadyPredicateSeam:
         req1 = _make_req('p1', 'task/p1', wt1, coalesce_config)
         req2 = _make_req('p2', 'task/p2', wt2, coalesce_config)
         req3 = _make_req('p3', 'task/p3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         # (a) returns True — a train was formed
         assert result is True, 'pass must form a train with the 2 eligible candidates'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
 
@@ -1360,13 +1354,13 @@ class TestBlockedHistoryGate:
         req1 = _make_req('bh1', 'task/bh1', wt1, coalesce_config)
         req2 = _make_req('bh2', 'task/bh2', wt2, coalesce_config)
         req3 = _make_req('bh3', 'task/bh3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is True, 'pass must form a train from the 2 clean candidates'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
 
@@ -1428,13 +1422,13 @@ class TestBlockedHistoryGate:
         req1 = _make_req('nh1', 'task/nh1', wt1, coalesce_config)
         req2 = _make_req('nh2', 'task/nh2', wt2, coalesce_config)
         req3 = _make_req('nh3', 'task/nh3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is True, 'pass must form a train when no risk signals'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         assert len(trains) == 1
         assert set(trains[0].member_task_ids) == {'nh1', 'nh2', 'nh3'}
@@ -1495,13 +1489,13 @@ class TestOneStrikeExclusion:
         req1 = _make_req('os1', 'task/os1', wt1, coalesce_config)
         req2 = _make_req('os2', 'task/os2', wt2, coalesce_config)
         req3 = _make_req('os3', 'task/os3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is True, 'pass must form a train from the 2 clean candidates'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
 
@@ -1719,7 +1713,7 @@ class TestSuppressionObservability:
 
         req1 = _make_req('sup1', 'task/sup1', wt1, coalesce_config)
         req2 = _make_req('sup2', 'task/sup2', wt2, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
@@ -1729,7 +1723,7 @@ class TestSuppressionObservability:
         )
 
         # No train formed in the buffer
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         assert len(trains) == 0, f'no train must form; found {len(trains)}'
 
@@ -2687,6 +2681,128 @@ class TestCoalesceRedriveEndToEnd:
 # ─── merge-train-coalesce-gate ───────────────────────────────────────────────
 
 
+class _HealthyBurst(NamedTuple):
+    db_path: Path
+    warm_req: MergeRequest
+    follower_reqs: dict[str, MergeRequest]
+    mark_done_calls: list[tuple[str, str]]
+
+
+async def _poll_events(db_path: Path, event_type: str, timeout: float) -> list[dict]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        events = _events_of_type(db_path, event_type)
+        if events:
+            return events
+        await asyncio.sleep(0.05)
+    return []
+
+
+@contextlib.asynccontextmanager
+async def _healthy_burst(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    tmp_path: Path,
+) -> AsyncIterator[_HealthyBurst]:
+    """Run a live worker through a warm-up merge followed by a four-item burst.
+
+    Five disjoint-file branches: one warm-up single (hm0) whose verify is gated
+    open, then four followers (hm1..hm4).  The followers arrive as ONE
+    synchronous burst (put_nowait never yields) only once hm0 has been merged
+    and handed to the verifier, so the merger takes exactly one of them and
+    finds the other three still buffered while hm0's merge commit is
+    unadvanced.  The body runs with the worker live and the gate released.
+    """
+    from orchestrator.event_store import EventStore
+    from orchestrator.merge_lane.types import TrainCallbacks
+    from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+
+    wt_warm = await _make_branch_with_file(
+        git_ops, 'hm0', 'file_hm0.py', 'h0 = 0\n')
+    follower_wts = {
+        tid: await _make_branch_with_file(
+            git_ops, tid, f'file_{tid}.py', f'{tid} = 1\n')
+        for tid in ('hm1', 'hm2', 'hm3', 'hm4')
+    }
+
+    db_path = tmp_path / 'healthy_coalesce.db'
+    es = EventStore(db_path=db_path, run_id='healthy-coalesce')
+
+    mark_done_calls: list[tuple[str, str]] = []
+
+    async def _mark_done(task_id: str, sha: str) -> None:
+        mark_done_calls.append((task_id, sha))
+
+    status_check = AsyncMock(return_value={
+        tid: 'merge-deferred' for tid in follower_wts
+    })
+
+    def factory(train_id: str) -> TrainCallbacks:
+        return TrainCallbacks(
+            status_check=status_check,
+            mark_member_done=AsyncMock(side_effect=_mark_done),
+        )
+
+    queue: asyncio.Queue = asyncio.Queue()
+    gate_release = asyncio.Event()
+    gate_entered = asyncio.Event()
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, event_store=es, train_callback_factory=factory,
+        verifier=_first_verify_gated(gate_release, gate_entered),
+    )
+
+    warm_req = _make_req('hm0', 'hm0', wt_warm, config)
+    follower_reqs = {
+        tid: _make_req(tid, tid, wt, config)
+        for tid, wt in follower_wts.items()
+    }
+
+    # While the warm-up's verify is held, hm0's merge commit is on the
+    # verifier queue and main has NOT advanced to it — the exact "merge
+    # succeeded, look-ahead left speculation state behind" condition the
+    # old gate read as busy.
+    await queue.put(warm_req)
+    async with running_merge_worker(worker):
+        try:
+            await wait_responsive(
+                gate_entered.wait(),
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='warm-up hm0 verify entry',
+            )
+
+            for req in follower_reqs.values():
+                queue.put_nowait(req)
+
+            # Hold the gate until a follower has actually been dequeued, so the
+            # first coalesce evaluation provably happened with hm0's merge
+            # commit still unadvanced.  Releasing before that could hand the
+            # coalescer a settled pipeline — the sterile state every other test
+            # already covers.
+            deadline = asyncio.get_running_loop().time() + 60
+            while asyncio.get_running_loop().time() < deadline:
+                dequeued = {
+                    e['task_id'] for e in _events_of_type(db_path, 'merge_dequeued')
+                }
+                if dequeued & set(follower_reqs):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail('no follower was dequeued within 60s')
+        finally:
+            # Release now: with speculation depth K=1 the merger blocks on the
+            # speculation permit at its next look-ahead until the verifier
+            # drains, so holding the gate any longer would stall the run rather
+            # than test it.  Every later coalesce evaluation still carries a
+            # non-None spec_base from the preceding look-ahead — which is
+            # exactly the state the old is_idle() gate read as busy.  On a
+            # give-up or failed poll above too, so the worker's stop never
+            # meets hm0's verify still parked on the gate.
+            gate_release.set()
+
+        yield _HealthyBurst(db_path, warm_req, follower_reqs, mark_done_calls)
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(360)  # a headroom widening of the earlier 300, not a summed wait bill
 class TestCoalesceAfterHealthyMerge:
@@ -2717,109 +2833,11 @@ class TestCoalesceAfterHealthyMerge:
         coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
-        from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
-        from orchestrator.merge_lane.types import TrainCallbacks
-        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-        # Five disjoint-file branches: one warm-up single whose verify is gated
-        # open, then four followers.  The followers arrive as ONE synchronous
-        # burst (put_nowait never yields), so the merger takes exactly one of
-        # them and finds the other three still buffered at the coalesce point.
-        wt_warm = await _make_branch_with_file(
-            git_ops, 'hm0', 'file_hm0.py', 'h0 = 0\n')
-        follower_wts = {
-            tid: await _make_branch_with_file(
-                git_ops, tid, f'file_{tid}.py', f'{tid} = 1\n')
-            for tid in ('hm1', 'hm2', 'hm3', 'hm4')
-        }
-
-        db_path = tmp_path / 'healthy_coalesce.db'
-        es = EventStore(db_path=db_path, run_id='healthy-coalesce')
-
-        mark_done_calls: list[tuple[str, str]] = []
-        coalesced_members: list[str] = []
-
-        async def _mark_done(task_id: str, sha: str) -> None:
-            mark_done_calls.append((task_id, sha))
-
-        status_check = AsyncMock(return_value={
-            tid: 'merge-deferred' for tid in follower_wts
-        })
-
-        def factory(train_id: str) -> TrainCallbacks:
-            return TrainCallbacks(
-                status_check=status_check,
-                mark_member_done=AsyncMock(side_effect=_mark_done),
-            )
-
-        queue: asyncio.Queue = asyncio.Queue()
-        gate_release = asyncio.Event()
-        gate_entered = asyncio.Event()
-        worker = SpeculativeMergeWorker(
-            git_ops, queue, event_store=es, train_callback_factory=factory,
-            verifier=_first_verify_gated(gate_release, gate_entered),
-        )
-
-        warm_req = _make_req('hm0', 'hm0', wt_warm, coalesce_config)
-        follower_reqs = {
-            tid: _make_req(tid, tid, wt, coalesce_config)
-            for tid, wt in follower_wts.items()
-        }
-
-        async def _poll_events(event_type: str, timeout: float) -> list[dict]:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            while loop.time() < deadline:
-                events = _events_of_type(db_path, event_type)
-                if events:
-                    return events
-                await asyncio.sleep(0.05)
-            return []
-
-        # While the warm-up's verify is held, hm0's merge commit is on the
-        # verifier queue and main has NOT advanced to it — the exact "merge
-        # succeeded, look-ahead left speculation state behind" condition the
-        # old gate read as busy.
-        await queue.put(warm_req)
-        async with running_merge_worker(worker):
-            try:
-                await wait_responsive(
-                    gate_entered.wait(),
-                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-                    label='warm-up hm0 verify entry',
-                )
-
-                for req in follower_reqs.values():
-                    queue.put_nowait(req)
-
-                # Hold the gate until a follower has actually been dequeued, so the
-                # first coalesce evaluation provably happened with hm0's merge
-                # commit still unadvanced.  Releasing before that could hand the
-                # coalescer a settled pipeline — the sterile state every other test
-                # already covers.
-                deadline = asyncio.get_running_loop().time() + 60
-                while asyncio.get_running_loop().time() < deadline:
-                    dequeued = {
-                        e['task_id'] for e in _events_of_type(db_path, 'merge_dequeued')
-                    }
-                    if dequeued & set(follower_reqs):
-                        break
-                    await asyncio.sleep(0.05)
-                else:
-                    pytest.fail('no follower was dequeued within 60s')
-            finally:
-                # Release now: with speculation depth K=1 the merger blocks on the
-                # speculation permit at its next look-ahead until the verifier
-                # drains, so holding the gate any longer would stall the run rather
-                # than test it.  Every later coalesce evaluation still carries a
-                # non-None spec_base from the preceding look-ahead — which is
-                # exactly the state the old is_idle() gate read as busy.  On a
-                # give-up or failed poll above too, so the worker's stop never
-                # meets hm0's verify still parked on the gate.
-                gate_release.set()
-
-            events = await _poll_events('train_coalesced', timeout=120)
+        async with _healthy_burst(git_ops, coalesce_config, tmp_path) as burst:
+            db_path, warm_req, follower_reqs, mark_done_calls = burst
+            events = await _poll_events(db_path, 'train_coalesced', timeout=120)
             assert events, (
                 'no train_coalesced event: the coalescer never ran while a '
                 'merge was in flight — every merge in this sequence succeeded, '
@@ -2843,14 +2861,19 @@ class TestCoalesceAfterHealthyMerge:
                     f'got {outcome.status!r}'
                 )
 
-            warm_outcome = await asyncio.wait_for(warm_req.result, timeout=120)
+            warm_outcome = await wait_responsive(
+                warm_req.result,
+                timeout=REAL_GIT_TRAIN_TIMEOUT,
+                max_wall_s=REAL_GIT_TRAIN_MAX_WALL_S,
+                label='warm-up hm0 landed beside the coalesced train',
+            )
             assert warm_outcome.status == 'done', (
                 f'warm-up merge must land cleanly; got {warm_outcome.status!r}'
             )
 
             # The train lands only after its members are marked done, which is
             # the last step of _do_train_merge's success path.
-            merged = await _poll_events('train_merged', timeout=180)
+            merged = await _poll_events(db_path, 'train_merged', timeout=180)
             assert merged, (
                 'train_coalesced but never train_merged: the train derailed. '
                 'Read its train_derailed derail_reason — a predecessor that '
@@ -2897,6 +2920,56 @@ class TestCoalesceAfterHealthyMerge:
                 'old gate shut'
             )
 
+
+    async def test_a_deep_chain_lands_the_burst_before_any_train_forms(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """Chains and trains compete for the same buffered singles.
+
+        Under ``chain_cap>0`` the follower dispatched after hm0's verify drains
+        builds a deep chain over the followers still buffered behind it, and a
+        passing tip lands them all before the merger's next coalesce pass finds
+        two candidates.  That is a healthy outcome, not a lost train: every
+        item lands, through the chain, and no train forms.
+        """
+        from orchestrator.config import DepthRow, MergeDeepConfig
+        from orchestrator.git_ops import _run
+
+        deep_config = coalesce_config.model_copy(
+            update={'merge_deep': MergeDeepConfig(chain_cap=6, depth_table=[DepthRow(0.0, 6)])},
+        )
+        async with _healthy_burst(git_ops, deep_config, tmp_path) as burst:
+            all_reqs = {'hm0': burst.warm_req, **burst.follower_reqs}
+            outcomes = {
+                tid: await wait_responsive(
+                    req.result,
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label=f'{tid} outcome',
+                )
+                for tid, req in all_reqs.items()
+            }
+
+        assert {tid: o.status for tid, o in outcomes.items()} == dict.fromkeys(
+            all_reqs, 'done'), 'every burst item must land'
+        for tid in ('hm2', 'hm3', 'hm4'):
+            assert outcomes[tid].landed_via_chain == 1, (
+                f'{tid} was buffered behind the dispatched follower, so it must '
+                f'land via the chain; got {outcomes[tid].landed_via_chain!r}'
+            )
+        assert not _events_of_type(burst.db_path, 'train_coalesced'), (
+            'a train formed over items the chain had already taken'
+        )
+        assert burst.mark_done_calls == []
+
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        for tid in all_reqs:
+            assert f'file_{tid}.py' in main_files, tid
 
 @pytest.mark.asyncio
 class TestAwaitUnadvancedPredecessor:

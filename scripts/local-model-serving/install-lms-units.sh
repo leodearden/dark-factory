@@ -162,4 +162,4 @@ fi
 
 echo "install-lms-units.sh: ${UNIT_TEMPLATE} installed."
 echo "install-lms-units.sh: start an arm with:"
-echo "    uv run --project shared python scripts/local-model-serving/lms_ctl.py start <arm_id>"
+echo "    uv run --no-sync --project shared python scripts/local-model-serving/lms_ctl.py start <arm_id>"

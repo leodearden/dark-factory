@@ -3,7 +3,7 @@
 //
 // This is a plain-JS module: no JSX, no Babel. It is loaded two ways:
 //   - In the browser, via a classic `<script src="/static/redux/tasks_offline_banner.js">`
-//     tag (like task_status_counts.js / prd_grouping.js), which assigns
+//     tag (like task_snapshot.js / prd_grouping.js), which assigns
 //     `window.DF_TASKS_OFFLINE_BANNER`.
 //   - In node (no package.json in this repo, so this file resolves as
 //     CommonJS), via `require`/`import` for the `node --test` suite under
@@ -27,13 +27,15 @@
 // emphatically available.
 //
 // The honest distinction is now made SERVER-SIDE, in `app.api_tasks`, which
-// emits four separate facts (TASKS_OFFLINE = no root produced rows AND at
+// emits five separate facts (TASKS_OFFLINE = no root produced rows AND at
 // least one demonstrably failed; TASKS_OFFLINE_PROJECTS = roots whose fetch
 // demonstrably failed; TASKS_DEGRADED_PROJECTS = roots the handler ran out of
 // budget for, whose state is UNKNOWN; TASKS_COUNT_UNKNOWN_PROJECTS = roots
-// whose rows are current but whose done count was never measured), plus
+// whose rows are current but whose done count has no value to show;
+// TASKS_COUNT_STALE_PROJECTS = roots whose rows were read but whose done
+// count is served from its last measurement, with its age), plus
 // TASKS_PROJECT_COUNT as the denominator the "k of N" copy below needs. Each
-// of the four gets its own notice kind here. This module only RENDERS that
+// of the five gets its own notice kind here. This module only RENDERS that
 // distinction — it must not re-derive it, or the two would drift.
 //
 // Nothing here reads `window` or `document`: a module that reached for browser
@@ -76,7 +78,7 @@ function countPhrase(k, total) {
  *
  *   'global'   — no root produced rows and at least one demonstrably failed:
  *                fused-memory itself is unreachable. Carries the verbatim
- *                outage copy, and SUBSUMES the other three (its "task data
+ *                outage copy, and SUBSUMES the others (its "task data
  *                unavailable" already covers everything they could add).
  *                The parenthetical names the roots that demonstrably failed,
  *                which in a hang is a SUBSET of the roots without rows (the
@@ -90,12 +92,19 @@ function countPhrase(k, total) {
  *                outage; it says the view is partial. Composes with 'partial'
  *                (a project can fail while a different one times out).
  *   'count-unknown'
- *              — the rows for these roots are current, but their compact
- *                status map failed, so the done count was never measured and
- *                the terminal window was skipped. Neither offline nor
- *                degraded, so it never claims an outage either. Without this
- *                notice such a project renders as healthy with a confident
- *                "0 done".
+ *              — the rows for these roots are current, but their census has
+ *                no value: the compact status map failed with no last good
+ *                one to serve, so the done count was never measured and the
+ *                terminal window was skipped. Neither offline nor degraded,
+ *                so it never claims an outage either. Without this notice
+ *                such a project renders as healthy with a confident "0 done".
+ *   'count-stale'
+ *              — the census for these roots is a value with an age: its last
+ *                measurement, which every census surface renders with an age
+ *                badge. The age itself is those badges' to show, not repeated
+ *                here. Says nothing about the rows: a unit served past its
+ *                freshness bound lands here with BOTH halves aged, and the
+ *                rows carry their own age.
  *
  * Every input is optional and defaulted: this runs against window.DF_DATA's
  * pre-fetch defaults on the very first render, so a missing key must produce
@@ -106,6 +115,7 @@ function tasksBannerNotices(state) {
   const offlineProjects = asList(s.offlineProjects)
   const degradedProjects = asList(s.degradedProjects)
   const countUnknownProjects = asList(s.countUnknownProjects)
+  const countStaleProjects = asList(s.countStaleProjects)
 
   // The server already decided whether this is a total outage; do not
   // re-derive it from the lists here (see the header note on drift).
@@ -150,6 +160,17 @@ function tasksBannerNotices(state) {
     })
   }
 
+  if (countStaleProjects.length > 0) {
+    notices.push({
+      kind: 'count-stale',
+      text:
+        'the completed-task count is not current for ' +
+        countPhrase(countStaleProjects.length, s.totalProjects) +
+        ' (' + nameList(countStaleProjects) + ') — done counts show the ' +
+        'last measured value with its age',
+    })
+  }
+
   return notices
 }
 
@@ -163,6 +184,7 @@ function tasksBannerNoticesFor(data) {
     offlineProjects: d.TASKS_OFFLINE_PROJECTS || [],
     degradedProjects: d.TASKS_DEGRADED_PROJECTS || [],
     countUnknownProjects: d.TASKS_COUNT_UNKNOWN_PROJECTS || [],
+    countStaleProjects: d.TASKS_COUNT_STALE_PROJECTS || [],
     totalProjects: d.TASKS_PROJECT_COUNT || 0,
   })
 }

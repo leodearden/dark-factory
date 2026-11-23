@@ -3,14 +3,14 @@
 Covers:
   step-9  RED   — SpeculativeMergeWorker._verify_frontier_depth() pure unit test
   step-10 GREEN — _verify_frontier_depth() implementation
-  step-11 RED   — depth/speculative plumbing: _run_post_merge_verify's
+  step-11 RED   — depth/speculative plumbing: run_post_merge_verify's
                   pool.dispatch forwarding + _run_inflight_verify caller wiring
-  step-12 GREEN — thread depth/speculative through _run_post_merge_verify /
-                  _run_inflight_verify / _dispatch_item
+  step-12 GREEN — thread depth/speculative through run_post_merge_verify /
+                  _run_inflight_verify / VerifyDispatcher.dispatch
   step-13 RED   — speculative_merge event carries depth
   step-14 GREEN — classify_and_merge threads worker._verify_frontier_depth()
                   into the speculative_merge _emit_speculative call
-  amend         — TestDispatchItemDepthAheadOfItem: _dispatch_item reads the
+  amend         — TestDispatchItemDepthAheadOfItem: VerifyDispatcher.dispatch reads the
                   frozen-frontier count BEFORE the dispatching item joins it
                   (review followup: reviewer_comprehensive/test_coverage)
 
@@ -26,11 +26,12 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_fakes import FakeVerifier, lane_scene_config
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
@@ -42,6 +43,7 @@ from orchestrator.merge_lane.types import (
     QueuedBranch,
 )
 from orchestrator.merge_lane.worker import (
+    PRODUCTION_VERIFIER,
     InflightEntry,
     MergedOk,
     MergeRequest,
@@ -53,15 +55,15 @@ from orchestrator.verify import VerifyResult
 
 
 def _sentinel_entry() -> InflightEntry:
-    """Opaque, identity-only stand-in for a real ``InflightEntry``.
+    """Stand-in for a frozen ``InflightEntry`` that is built on nothing.
 
-    Mirrors test_merge_queue_single_writer_asserts.py's ``_sentinel_entry``:
-    the tests below only care about the *count* of frozen entries
-    (``_verify_frontier_depth`` is a pure ``len()`` delegation), never their
-    fields, so a bare ``object()`` cast to ``InflightEntry`` is enough at
-    runtime without constructing a real merge-result/lease graph.
+    The tests below care about the *count* of frozen entries
+    (``_verify_frontier_depth`` is a pure ``len()`` delegation).  Dispatch
+    also reads each entry's ``item``, ``gate`` and ``chain`` for the bases a
+    new item may stack on; ``None`` for all three contributes no base commit,
+    so no real merge-result/lease graph is needed.
     """
-    return cast(InflightEntry, object())
+    return cast(InflightEntry, SimpleNamespace(item=None, gate=None, chain=None))
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +96,7 @@ def _make_request(
 
 
 def _make_git_ops_mock() -> MagicMock:
-    """Mock git_ops sufficient for _run_post_merge_verify's pre-verify guards.
+    """Mock git_ops sufficient for run_post_merge_verify's pre-verify guards.
 
     Mirrors TestRunPostMergeVerifyRunnerParam._make_git_ops_mock in
     test_merge_queue_concurrent_verify.py.
@@ -103,7 +105,7 @@ def _make_git_ops_mock() -> MagicMock:
     mock.get_main_sha = AsyncMock(return_value='main-sha')
     mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
     mock.cleanup_merge_worktree = AsyncMock()
-    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    mock.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
     return mock
 
 
@@ -144,7 +146,7 @@ class _CapturingEventStore(EventStore):
 
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyDepthPlumbing:
-    """_run_post_merge_verify threads depth/speculative into pool.dispatch
+    """run_post_merge_verify threads depth/speculative into pool.dispatch
     (task 2340), which threads them into the emitted merge_verify event.
 
     RED until step-12 GREEN adds the depth/speculative kwargs.
@@ -153,18 +155,19 @@ class TestRunPostMergeVerifyDepthPlumbing:
     async def test_depth_and_speculative_propagate_into_merge_verify_event(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-depth', 'task/t-depth', tmp_path, config)
         git_ops = _make_git_ops_mock()
         es = _CapturingEventStore()
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={}, max_timeouts=2, max_enospc=1,
             merge_sha='abc123', runner=_fake_pass_runner(), event_store=es,
             depth=3, speculative=True,  # RED: these kwargs don't exist yet
+            verifier=PRODUCTION_VERIFIER,
         )
 
         assert outcome is None  # verify passed
@@ -177,17 +180,18 @@ class TestRunPostMergeVerifyDepthPlumbing:
         self, tmp_path: Path,
     ) -> None:
         """Legacy call form (no depth/speculative kwargs) -> both None in the event."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-nodepth', 'task/t-nodepth', tmp_path, config)
         git_ops = _make_git_ops_mock()
         es = _CapturingEventStore()
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={}, max_timeouts=2, max_enospc=1,
             merge_sha='abc123', runner=_fake_pass_runner(), event_store=es,
+            verifier=PRODUCTION_VERIFIER,
         )
 
         assert outcome is None
@@ -198,7 +202,7 @@ class TestRunPostMergeVerifyDepthPlumbing:
 
 
 # ---------------------------------------------------------------------------
-# step-7 RED / step-8 GREEN (task 3185, PRD γ): _run_post_merge_verify forwards
+# step-7 RED / step-8 GREEN (task 3185, PRD γ): run_post_merge_verify forwards
 # chain_items to ALL THREE pool.dispatch sites.
 #
 # Unlike depth/speculative (which default to None), chain_items defaults to 1 —
@@ -236,12 +240,12 @@ class TestRunPostMergeVerifyChainItemsPlumbing:
     async def _dispatch_calls(
         self, tmp_path: Path, results: list[VerifyResult], **kwargs,
     ) -> list[dict]:
-        """Run _run_post_merge_verify with a scripted dispatch and return kwargs.
+        """Run run_post_merge_verify with a scripted dispatch and return kwargs.
 
         *results* is consumed one per ``pool.dispatch`` call (the last is
         repeated if the code dispatches more times than scripted).
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-chain', 'task/t-chain', tmp_path, config)
@@ -259,11 +263,12 @@ class TestRunPostMergeVerifyChainItemsPlumbing:
         with patch(
             'orchestrator.verify_runner.VerifyRunnerPool.dispatch', _fake_dispatch,
         ):
-            await _run_post_merge_verify(
+            await run_post_merge_verify(
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={}, max_timeouts=2, max_enospc=1,
                 merge_sha='abc123', runner=_fake_pass_runner(),
                 event_store=_CapturingEventStore(),
+                verifier=PRODUCTION_VERIFIER,
                 **kwargs,
             )
         return captured
@@ -341,7 +346,7 @@ class TestRunInflightVerifyDepthWiring:
 
     Observed where the two fields are consumed — verify_runner.py's
     ``EventType.merge_verify`` emit — rather than by capturing the kwargs of
-    the _run_post_merge_verify call in between.
+    the run_post_merge_verify call in between.
     """
 
     async def test_depth_and_speculative_reach_the_merge_verify_event(
@@ -354,7 +359,7 @@ class TestRunInflightVerifyDepthWiring:
             verifier=FakeVerifier(),
         )
 
-        await worker._run_inflight_verify(item, lease, depth=2)
+        await worker.verify_dispatch.run_inflight_verify(item, lease, depth=2)
 
         (event,) = es.events_of(EventType.merge_verify)
         assert event['data']['depth'] == 2
@@ -362,7 +367,7 @@ class TestRunInflightVerifyDepthWiring:
 
 
 # ---------------------------------------------------------------------------
-# step-9 RED / step-10 GREEN (task 3185, PRD γ): _dispatch_item computes a
+# step-9 RED / step-10 GREEN (task 3185, PRD γ): VerifyDispatcher.dispatch computes a
 # TRUTHFUL chain_items and threads it through _run_inflight_verify.
 #
 # chain_items is a fact about the TREE ACTUALLY VERIFIED, so it is derived from
@@ -385,7 +390,7 @@ class TestRunInflightVerifyChainItemsWiring:
             verifier=FakeVerifier(),
         )
 
-        await worker._run_inflight_verify(item, lease, **verify_kwargs)
+        await worker.verify_dispatch.run_inflight_verify(item, lease, **verify_kwargs)
 
         (event,) = es.events_of(EventType.merge_verify)
         return event['data']
@@ -405,7 +410,7 @@ class TestRunInflightVerifyChainItemsWiring:
 
 @pytest.mark.asyncio
 class TestDispatchItemComputesTruthfulChainItems:
-    """_dispatch_item emits chain_items in CHAIN-ITEM units: a flat 1.
+    """VerifyDispatcher.dispatch emits chain_items in CHAIN-ITEM units: a flat 1.
 
     A dispatch contributes exactly one chain item — the dispatching item
     itself, chain item #1 — and only the deep-chain arm of
@@ -429,7 +434,7 @@ class TestDispatchItemComputesTruthfulChainItems:
     async def _dispatch_kwargs(
         self, tmp_path: Path, *, frontier: int, speculative: bool, probe=None,
     ) -> dict:
-        """Drive _dispatch_item far enough to capture _run_inflight_verify's kwargs."""
+        """Drive VerifyDispatcher.dispatch far enough to capture _run_inflight_verify's kwargs."""
         from orchestrator.verify_runner import HostLease
 
         config = _make_bare_config()
@@ -455,14 +460,14 @@ class TestDispatchItemComputesTruthfulChainItems:
                 outcome=None, merge_wt=None, status=InflightStatus.REQUEUED,
             )
 
-        worker._run_inflight_verify = _fake_run_inflight_verify  # type: ignore[method-assign]
+        vars(worker.verify_dispatch)['run_inflight_verify'] = _fake_run_inflight_verify
         lease = HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
         worker._acquire_host_lease_for = AsyncMock(  # type: ignore[method-assign]
             return_value=(lease, None),
         )
 
-        entry = await worker._dispatch_item(item)
-        if entry is not None and entry.verify_task is not None:
+        entry = await worker.verify_dispatch.dispatch(item)
+        if isinstance(entry, InflightEntry) and entry.verify_task is not None:
             await entry.verify_task
         return captured
 
@@ -586,7 +591,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_branch_with_file(

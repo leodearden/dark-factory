@@ -1,0 +1,33 @@
+# The only list of merge screen checks: plans/merge-pre-verify-screen-prd.md §6.
+# Node ids are relative to the module's test_command cwd.
+checks:
+  - id: inline_suppressions  # C1
+    module: scripts
+    node_ids:
+      - scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded
+  - id: remote_gate_wire_fingerprint  # C8
+    module: orchestrator
+    node_ids:
+      - tests/test_remote_gate.py::test_wire_fingerprint_is_pinned_for_todays_wire_classes
+      - tests/test_remote_gate.py::test_parse_gate_identity_rejects_anything_else
+  - id: watchdog_fake_systemctl  # C11
+    module: tests/scripts
+    node_ids:
+      - tests/scripts/test_orchestrator_watchdog.py::test_boundary_fake_systemctl_matches_unit_suite_verbatim
+      - tests/scripts/test_orchestrator_watchdog.py::test_boundary_fake_systemctl_rejects_a_real_unit_name
+  - id: subproject_test_collection  # C14
+    module: tests/scripts
+    node_ids:
+      - tests/scripts/test_pytest_workspace_collection.py
+  - id: uv_run_venv_isolation  # C15
+    module: tests/scripts
+    node_ids:
+      - tests/scripts/test_uv_run_venv_isolation.py
+  - id: recovery_veto_predicate_collapse  # C18
+    module: orchestrator
+    node_ids:
+      - tests/test_recovery_veto_predicate_collapse.py
+  - id: disjoint_skip_breadth_yaml  # C20
+    module: orchestrator
+    node_ids:
+      - tests/test_config_disjoint_skip_reload.py

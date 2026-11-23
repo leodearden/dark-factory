@@ -1,11 +1,12 @@
 """Shared scaffolding for the task-4427 campaign-gate pins.
 
-Three test files pin the same contract from different entry points —
+Four test files pin the same contract from different entry points —
 ``test_eval_driver.py`` (the four stage fan-outs and the two cell executors),
-``test_runner_matrix.py`` (``run_eval_matrix``) and ``test_eval_architect.py``
-(``run_architect_eval`` plus the CM itself) — so the probe, the sentinels, the
-assertion bodies and the base-config builder live here rather than being cloned
-into each. They were cloned once already (reviewer: duplication), which is how
+``test_runner_matrix.py`` (``run_eval_matrix``),
+``test_eval_architect_usage_gate.py`` (``run_architect_eval`` plus the CM
+itself) and ``test_eval_cli_dispatch.py`` (``evals.cli._run_single_eval``) — so
+the probe, the sentinels, the assertion bodies and the base-config builder live
+here rather than being cloned into each. They were cloned once already (reviewer: duplication), which is how
 the in-cell teardown guard came to be wrong in two places at once.
 
 Not ``_orch_helpers.py``: this is one task's scaffolding for one contract, and a
@@ -16,6 +17,7 @@ module of its own keeps that scope legible (heuristic 6) without growing the
 from __future__ import annotations
 
 import asyncio
+import functools
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -26,8 +28,8 @@ from orchestrator.evals.results import EvalResult
 # Distinguishes "this case passed no usage_gate at all" (the OWNED path, where
 # the executor builds and tears down its own) from "this case passed
 # usage_gate=None" (a campaign owner that is deliberately ungated). The
-# production _GATE_UNSET sentinel exists for exactly this distinction; the
-# tests need their own because a plain None default could not express it.
+# production eval_gate.GATE_UNSET sentinel exists for exactly this distinction;
+# the tests need their own because a plain None default could not express it.
 NO_INJECTED_GATE = object()
 
 # The same distinction read from the other end: what a recording fake saw when
@@ -69,10 +71,12 @@ def stage_task_loader(path: Path) -> dict:
 class CampaignGateProbe:
     """Records what each cell of a campaign fan-out was handed.
 
-    ``_build_eval_usage_gate`` MUST be patched for any of this: the base config
-    is a REAL config whose packaged default is ``usage_cap.enabled=true``, so
-    the unpatched builder would construct a live ``UsageGate`` (probe dirs,
-    account state, a SIGHUP handler).
+    The campaign's gate builder MUST be replaced for any of this: the base
+    config is a REAL config whose packaged default is ``usage_cap.enabled=true``,
+    so the production builder would construct a live ``UsageGate`` (probe dirs,
+    account state, a SIGHUP handler). The probe rebinds
+    ``runner.campaign_usage_gate`` to the real context manager with
+    ``self.build`` as its ``factory``.
 
     OBSERVE IN THE FAKE, ASSERT IN THE HELPER. The fake runs as a CELL, and
     every campaign loop here log-and-continues on non-cancel exceptions, so an
@@ -85,7 +89,7 @@ class CampaignGateProbe:
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, gate=None):
-        from orchestrator.evals import runner
+        from orchestrator.evals import eval_gate, runner
 
         self._runner = runner
         self._monkeypatch = monkeypatch
@@ -102,7 +106,10 @@ class CampaignGateProbe:
         # helper can tell an expected drop from a swallowed accident.
         self.raised: list[str] = []
         self.build = AsyncMock(return_value=gate)
-        monkeypatch.setattr(runner, '_build_eval_usage_gate', self.build)
+        monkeypatch.setattr(
+            runner, 'campaign_usage_gate',
+            functools.partial(eval_gate.campaign_usage_gate, factory=self.build),
+        )
         monkeypatch.setattr(runner, 'load_task', stage_task_loader)
 
     def install(self, *executor_names: str, fail_on: str | None = None,

@@ -1,7 +1,7 @@
 """Boundary row B3, end-to-end on the DISPATCHER (PRD task ε).
 
 `plans/flake-ledger-prd.md` §5.8.  The discriminator runs wherever the
-worktree is; the recorder runs in ``merge_queue._run_post_merge_verify``, the one
+worktree is; the recorder runs in ``merge_queue.run_post_merge_verify``, the one
 scope where a local OR remote ``VerifyResult`` sits alongside ``event_store``,
 ``escalation_queue``, ``project_root``, ``merge_sha`` and ``task_id`` at once.
 
@@ -10,7 +10,7 @@ BY CONSTRUCTION rather than dependent on which host ran the verify.  Before ε a
 REMOTE merge verify landed ZERO of the three — no ledger row (there was no ledger
 call anywhere), no ``merge_flake_suppressed`` fact (the remote host has no event
 store), and a storm streak that reset with the remote process.  These tests drive
-the REAL ``_run_post_merge_verify`` over both hosts and assert the outcome is
+the REAL ``run_post_merge_verify`` over both hosts and assert the outcome is
 identical.
 
 Modelled on test_merge_boundary_effective_module_configs.py, which already drives
@@ -26,6 +26,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _flake_golden import merge_gate_deflake_description
 from escalation.queue import EscalationQueue
 from test_flake_debt_drain import _FakeLedgerTaskClient
 from test_merge_boundary_effective_module_configs import (
@@ -53,15 +54,14 @@ from orchestrator.flake_ledger import (
     FlakeVerdict,
     ledger_db_path,
     list_open_debt,
+    read_debt,
     read_due_items,
     read_occurrences,
 )
 from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
-from orchestrator.merge_lane.worker import (
-    PRODUCTION_VERIFIER,
-    _run_post_merge_verify,
-)
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import VerifyRunner, result_from_json, result_to_json
 
@@ -134,14 +134,14 @@ class _ScriptedRed:
 
     ``ProductionVerifier`` holds one zero-argument RESOLVER per leg, so
     replacing ``scoped`` and ``unscoped`` states this file's scene through the
-    port ``_run_post_merge_verify`` already takes — and no wider.  That pair is
+    port ``run_post_merge_verify`` already takes — and no wider.  That pair is
     leg-for-leg what the two ``orchestrator.merge_lane.worker`` patches
     (``run_scoped_verification``, ``_run_unscoped_typechecks``) did before the
     port existed, so the other five legs — the disk guard, post-merge pyright,
     post-merge equivalence, cold shadow and dry-run — stay genuinely
     production here, exactly as they were then.  A blanket fake port would
     answer all seven clean and silently narrow what this file exercises
-    ``_run_post_merge_verify`` on, which no row here asks for.
+    ``run_post_merge_verify`` on, which no row here asks for.
 
     The scripted red is the boundary's INPUT, not its answer: it carries
     ``flake_suppression=None``, so every observation these tests assert on is
@@ -195,7 +195,7 @@ async def _drive(
     max_enospc: int = 1,
     verifier: VerifyPort | None = None,
 ):
-    """Drive the REAL ``_run_post_merge_verify``.
+    """Drive the REAL ``run_post_merge_verify``.
 
     On the LOCAL path (*runner* None) the boundary builds its own ``LocalRunner``
     over the INJECTED ``VerifyPort``, so *verifier*'s scoped leg answers the red
@@ -238,7 +238,7 @@ async def _drive(
             else _failing_scoped_result(_BETA_FAILING_ID),
         ),
     ):
-        return await _run_post_merge_verify(
+        return await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={},
             enospc_retries={},
@@ -568,7 +568,7 @@ class TestDispatcherEnqueuesDebt:
 
     The merge path files nothing: the de-flake task is the drain's job, afterwards.
     That the debt appears only once the drain runs is this task's user-observable
-    signal, so it is asserted through the REAL ``_run_post_merge_verify`` and the REAL
+    signal, so it is asserted through the REAL ``run_post_merge_verify`` and the REAL
     ``run_drain_pass``, not at the recorder's own seam.
     """
 
@@ -657,11 +657,21 @@ class TestDispatcherEnqueuesDebt:
             )
             assert outcome is None, f'suppression {n} must still land; got {outcome!r}'
 
-        assert len(_rows(tmp_path)) == 5, _rows(tmp_path)
+        rows = _rows(tmp_path)
+        assert sorted(r.task_id or '' for r in rows) == [f'storm-{n}' for n in range(5)], rows
+        for r in rows:
+            assert (r.test_id, r.verdict, r.call_site, r.runner, r.merge_sha, r.detail) == (
+                _BETA_FAILING_ID, 'passes_in_isolation', 'merge_gate', _REMOTE, _MERGE_SHA, '{}',
+            )
         assert len(_due_items(tmp_path)) == 5
         assert _debt(tmp_path) == [], 'nothing is filed before the drain runs'
-        storm = queue.get_by_task('merge-flake-suppression-storm', status='pending', level=2)
-        assert len(storm) == 1, storm
+        (storm,) = queue.get_by_task('merge-flake-suppression-storm', status='pending', level=2)
+        assert (storm.category, storm.severity, storm.summary) == (
+            'merge_flake_suppression_storm',
+            'critical',
+            'Flake-suppression storm: isolated re-runs have suppressed 5 reds since the '
+            'last reset (merge_gate: merge-verify reds)',
+        )
 
         client = _FakeLedgerTaskClient()
         report = await run_drain_pass(
@@ -675,4 +685,18 @@ class TestDispatcherEnqueuesDebt:
         debt = _debt(tmp_path)
         assert [d.test_id for d in debt] == [_BETA_FAILING_ID], debt
         assert debt[0].owner_task_id, f'section 5.9 breach - the row has no owner: {debt[0]}'
-        assert len(client.submit_calls) == 1, client.submit_calls
+        (block,) = client.submit_calls
+        row = read_debt(ledger_db_path(tmp_path), _BETA_FAILING_ID)
+        assert row is not None
+        assert block['title'] == (
+            f'Flake debt: {_BETA_FAILING_ID} — passes_in_isolation after a merge-gate red '
+            f'was suppressed, cycle 1'
+        )
+        assert block['description'] == merge_gate_deflake_description(row)
+        assert block['metadata'] == {
+            'spawn_context': 'flake_ledger_debt',
+            'flake_debt_test': _BETA_FAILING_ID,
+            'flake_debt_open_count': 1,
+            'flake_debt_opened_at': row.opened_at,
+        }
+        assert (block['priority'], block['planning_mode']) == ('medium', True)

@@ -10,14 +10,15 @@ committed YAML on every run.
 
 What the corpus is FOR: it is the set of command shapes ``split_chain_tail``'s
 accept/reject gate must classify correctly. The lint chains are SIBLING-CHECKER
-chains — a ruff/pyright invocation followed by an independent
-``python3 fused-memory/scripts/check_*.py <dir>`` clause that would have run
-anyway — so the scoper accepts them and preserves the tail. The root
+chains — a ruff/pyright invocation followed by independent ``python3 <checker>.py
+<dir>`` clauses that would have run anyway (``fused-memory/scripts/check_*.py``,
+and since task 6230 ``tests/scripts/raw_envelope_literal_guard.py`` ending every
+module's chain) — so the scoper accepts them and preserves the tail. The root
 type/test chains are cwd-sequenced same-tool fan-outs (``cd a && npx pyright &&
 cd ../b && npx pyright``), where the tail is *more of the same tool in other
-directories*; the scoper rejects those and keeps today's truncation. A third
-shape, ``SCRIPTS_LINT_COMMAND``, is CHAINLESS — one segment, so there is no
-tail to accept or reject and the gate must leave it alone.
+directories*; the scoper rejects those and keeps today's truncation. No live
+lint command is chainless since task 6230; ``test_verify_cmd.py`` pins the
+gate's chainless behaviour on a synthetic literal.
 
 A ``_``-prefixed, uniquely-named sibling module (like ``_orch_helpers.py``,
 ``_merge_queue_harness.py``): ``conftest.py`` inserts ``_TESTS_DIR`` on
@@ -27,8 +28,14 @@ A ``_``-prefixed, uniquely-named sibling module (like ``_orch_helpers.py``,
 across sibling subprojects under ``sys.modules['conftest']`` — see that file's
 docstring.
 
-Importing this module performs NO disk I/O: the constants are plain literals,
-and ``load_config_scalar`` reads only when a drift test calls it.
+The root fleet chains are COMPOSED from ordered member tuples and literal
+clauses, so a new workspace member is one tuple entry per chain (plus the yaml
+edit the drift gate then demands). Consumers derive counts, positions and
+labels from these parts rather than restating the chain's shape.
+
+Importing this module performs NO disk I/O: the constants are composed from
+in-module literals, and ``load_config_scalar`` reads only when a drift test
+calls it.
 """
 
 from __future__ import annotations
@@ -157,26 +164,28 @@ def discover_lint_command_modules() -> set[str]:
 # number: line numbers rot, and ``test_verify_config_corpus.py`` now pins each
 # value against its key anyway.
 
-# fused-memory/orchestrator.yaml::lint_command — the only 3-segment chain
-# (two sibling checkers rather than one).
+# fused-memory/orchestrator.yaml::lint_command — a 4-segment chain (three
+# sibling checkers).
 FM_LINT_COMMAND = (
     'uv run --directory fused-memory ruff check src/ tests/'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
     ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+    ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory'
 )
 
-# dashboard/orchestrator.yaml::lint_command — the SECOND 3-segment chain (two
-# sibling checkers rather than one), alongside FM_LINT_COMMAND above. Task 4485
-# added the module-local-TestClient checker as dashboard's second leg, which is
-# why dashboard no longer fits the 2-segment comprehension below.
+# dashboard/orchestrator.yaml::lint_command — the SECOND 4-segment chain (three
+# sibling checkers), alongside FM_LINT_COMMAND above. Task 4485 added the
+# module-local-TestClient checker as dashboard's second leg, which is why
+# dashboard does not fit the 3-segment comprehension below.
 DASHBOARD_LINT_COMMAND = (
     'uv run --directory dashboard ruff check src/ tests/'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
     ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
+    ' && python3 tests/scripts/raw_envelope_literal_guard.py dashboard'
 )
 
 # cockpit/escalation/orchestrator/sampler/shared
-# orchestrator.yaml::lint_command — each the same 2-segment shape, differing
+# orchestrator.yaml::lint_command — each the same 3-segment shape, differing
 # only in the module name.
 #
 # Deliberately an explicit pinned literal rather than discovery from disk:
@@ -190,43 +199,73 @@ MODULE_LINT_COMMANDS = {
     module: (
         f'uv run --directory {module} ruff check src/ tests/'
         f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
+        f' && python3 tests/scripts/raw_envelope_literal_guard.py {module}'
     )
-    for module in ('cockpit', 'escalation', 'orchestrator', 'sampler', 'shared')
+    for module in ('client-feed', 'cockpit', 'escalation', 'orchestrator', 'sampler', 'shared')
 }
 
-# scripts/orchestrator.yaml::lint_command — the lone CHAINLESS lint command: a
-# single segment, no sibling checker, nothing for the gate to preserve or drop.
-# It gets a dedicated constant rather than a MODULE_LINT_COMMANDS entry because
-# it does not share that dict's 2-segment shape (same reason FM_LINT_COMMAND is
-# separate, in the other direction). Its scoper golden is
-# ``TestSplitChainTail::test_scripts_lint_command_has_no_chain_to_split``.
-SCRIPTS_LINT_COMMAND = 'uv run --project shared ruff check scripts/'
-
-# dark-factory-orchestrator.yaml::lint_command
-ROOT_LINT_COMMAND = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard sampler'
-    ' cockpit conftest.py df_pytest_isolation.py skills'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
-    ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-    ' sampler/tests cockpit/tests'
+# scripts/orchestrator.yaml::lint_command — a 2-segment chain whose one sibling
+# checker is the envelope-literal guard (task 6230; chainless before). It gets a
+# dedicated constant rather than a MODULE_LINT_COMMANDS entry because it does
+# not share that dict's 3-segment shape (same reason FM_LINT_COMMAND is
+# separate, in the other direction).
+SCRIPTS_LINT_COMMAND = (
+    'uv run --project shared ruff check scripts/'
+    ' && python3 tests/scripts/raw_envelope_literal_guard.py scripts'
 )
+
+
+def _cd_fan_out(members: tuple[str, ...], clause: str) -> str:
+    """`cd <first> && <clause> && cd ../<next> && <clause> ...` over *members*, in order."""
+    return ' && '.join(
+        f'cd {"" if i == 0 else "../"}{member} && {clause}' for i, member in enumerate(members)
+    )
+
+
+# Each root chain has its own member tuple because the yaml orders the
+# members differently in each.
+
+# dark-factory-orchestrator.yaml::lint_command — one ruff clause over every
+# member plus the root-level targets, then one checker clause over every
+# member's tests dir.
+FLEET_LINT_MEMBERS = (
+    'shared', 'escalation', 'fused-memory', 'orchestrator', 'dashboard', 'sampler', 'cockpit',
+    'client-feed',
+)
+ROOT_LINT_RUFF_CLAUSE = 'uv run ruff check ' + ' '.join(
+    (*FLEET_LINT_MEMBERS, 'conftest.py', 'df_pytest_isolation.py', 'skills'),
+)
+ROOT_LINT_CHECKER_CLAUSE = 'python3 fused-memory/scripts/check_bare_magicmock_config.py ' + ' '.join(
+    f'{member}/tests' for member in FLEET_LINT_MEMBERS
+)
+ROOT_LINT_COMMAND = f'{ROOT_LINT_RUFF_CLAUSE} && {ROOT_LINT_CHECKER_CLAUSE}'
 
 # dark-factory-orchestrator.yaml::type_check_command
-ROOT_TYPE_CHECK_COMMAND = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
-    ' && cd ../dashboard && npx pyright && cd ../shared && npx pyright'
-    ' && cd ../escalation && npx pyright && cd ../sampler && npx pyright'
-    ' && cd ../cockpit && npx pyright'
+FLEET_TYPE_CHECK_MEMBERS = (
+    'fused-memory', 'orchestrator', 'dashboard', 'shared', 'escalation', 'sampler', 'cockpit',
+    'client-feed',
 )
+ROOT_TYPE_CHECK_COMMAND = _cd_fan_out(FLEET_TYPE_CHECK_MEMBERS, 'npx pyright')
 
-# dark-factory-orchestrator.yaml::test_command
+# dark-factory-orchestrator.yaml::test_command — one `cd <member> && pytest`
+# pair per member, then `cd ..` and the clauses run at the worktree root.
+FLEET_TEST_MEMBERS = (
+    'shared', 'escalation', 'orchestrator', 'fused-memory', 'dashboard', 'sampler', 'client-feed',
+)
+FLEET_MEMBER_TEST_CLAUSE = 'uv run pytest tests/ --timeout=300'
+FLEET_COCKPIT_TEST_CLAUSE = (
+    '( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
+)
+FLEET_SCRIPTS_TEST_CLAUSE = (
+    'uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
+)
+FLEET_ROOT_TEST_CLAUSES = (
+    FLEET_COCKPIT_TEST_CLAUSE,
+    FLEET_SCRIPTS_TEST_CLAUSE,
+    'uv run --project shared pytest tests/repo_guards/ --timeout=300',
+)
 ROOT_TEST_COMMAND = (
-    'cd shared && uv run pytest tests/ --timeout=300'
-    ' && cd ../escalation && uv run pytest tests/ --timeout=300'
-    ' && cd ../orchestrator && uv run pytest tests/ --timeout=300'
-    ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
-    ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
-    ' && cd ../sampler && uv run pytest tests/ --timeout=300'
-    ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
+    _cd_fan_out(FLEET_TEST_MEMBERS, FLEET_MEMBER_TEST_CLAUSE)
+    + ' && cd .. && '
+    + ' && '.join(FLEET_ROOT_TEST_CLAUSES)
 )

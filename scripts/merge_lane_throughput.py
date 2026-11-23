@@ -6,10 +6,11 @@ as one runnable report, so the PRD's downstream decompositions read one table
 instead of each hand-writing its own SQL (and each getting a slightly different
 answer).
 
-Sections: landings/day, the four-segment lead-time split, verify duration by
+Sections: landings/day, the lead-time split, verify duration by
 runner, remote-host occupancy (three estimators, side by side), heartbeat queue
 depth, merge_attempt/merge_finalized outcome mixes, and — behind flags — the
-speculation and merge-ahead-chain sections.
+speculation and merge-ahead-chain sections, plus `--policy`: the lane policy
+signals of `plans/merge-lane-policy-prd.md` D10.
 
 STRICTLY READ-ONLY.  Every connection is a `mode=ro` SQLite URI
 (:func:`_connect_ro`); this script writes nothing, files nothing, and emits no
@@ -36,6 +37,7 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -350,9 +352,9 @@ def _series(values: Sequence[float]) -> dict[str, Any]:
 def _by_task(events: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Index events by their ``task_id`` COLUMN, preserving row order.
 
-    The COLUMN is the only join key available: `merge_queued` / `merge_dequeued`
-    carry just ``{branch, queue_depth}``, with no ``request_id`` (that key
-    exists on `merge_finalized` alone), so a request-scoped join is impossible.
+    The COLUMN is the join key used here: rows written before task 9908 carry
+    just ``{branch, queue_depth}`` on `merge_queued` / `merge_dequeued`, with no
+    ``request_id``, so a request-scoped join covers only newer rows.
     Rows with a NULL task_id (e.g. `merge_heartbeat`) are dropped.
     """
     index: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -396,23 +398,58 @@ def _any_between(
     return False
 
 
-def _first_at_or_after(
-    events: Sequence[dict[str, Any]], cutoff: datetime
-) -> tuple[datetime, dict[str, Any]] | None:
-    """The earliest event at or after *cutoff*, with its parsed timestamp."""
-    best: tuple[datetime, dict[str, Any]] | None = None
-    for event in events:
-        ts = _parse_ts(event.get('timestamp'))
-        if ts is None or ts < cutoff:
-            continue
-        if best is None or ts < best[0]:
-            best = (ts, event)
-    return best
+def _rows_in(
+    events: Sequence[dict[str, Any]], lo: datetime, hi: datetime
+) -> list[tuple[datetime, dict[str, Any]]]:
+    """Events stamped in the half-open ``[lo, hi)``, in time order, with timestamps."""
+    stamped = [(_parse_ts(event.get('timestamp')), event) for event in events]
+    in_span = [(ts, event) for ts, event in stamped if ts is not None and lo <= ts < hi]
+    return sorted(in_span, key=lambda pair: pair[0])
+
+
+def _minutes(earlier: datetime, later: datetime) -> float:
+    return (later - earlier).total_seconds() / 60.0
 
 
 # ---------------------------------------------------------------------------
-# Section: the four-segment lead-time split.
+# Section: the lead-time split.
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LandingSplit:
+    """One landing's lead time in minutes; ``None`` is unattributable, not 0."""
+
+    lead: float
+    wait: float | None
+    requeued: float | None
+    verify: float | None
+    residual: float | None
+    last_verify_to_land: float | None
+
+
+def _split_landing(
+    queued_ts: datetime,
+    finalized_ts: datetime,
+    dequeue_rows: Sequence[dict[str, Any]],
+    verify_rows: Sequence[dict[str, Any]],
+) -> LandingSplit:
+    dispatches = [ts for ts, _ in _rows_in(dequeue_rows, queued_ts, finalized_ts)]
+    attempt_start = dispatches[-1] if dispatches else queued_ts
+    attempt = [
+        (ts, minutes)
+        for ts, row in _rows_in(verify_rows, attempt_start, finalized_ts)
+        if (minutes := _duration_minutes(row.get('data', {}))) is not None
+    ]
+    lead = _minutes(queued_ts, finalized_ts)
+    verify = sum(minutes for _, minutes in attempt) if attempt else None
+    to_land = _minutes(attempt[-1][0], finalized_ts) if attempt else None
+    if not dispatches:
+        return LandingSplit(lead, None, None, verify, None, to_land)
+    wait = _minutes(queued_ts, dispatches[0])
+    requeued = _minutes(dispatches[0], dispatches[-1])
+    residual = lead - wait - requeued - (verify or 0.0)
+    return LandingSplit(lead, wait, requeued, verify, residual, to_land)
 
 
 def compute_lead_time(
@@ -423,9 +460,9 @@ def compute_lead_time(
     lo: datetime,
     hi: datetime,
 ) -> dict[str, Any]:
-    """Split merge lead time into queue wait, verify, and a finalize+CAS residual.
+    """Split merge lead time into queue wait, re-queued, verify and finalize+CAS.
 
-        merge_queued -> merge_dequeued -> sum(merge_verify) -> merge_finalized
+        merge_queued -> merge_dequeued+ -> sum(merge_verify) -> merge_finalized
 
     THE JOIN (plan decision 2, validated live).  For each landing — a
     `merge_finalized` row with ``data['state'] == 'done'`` — the lead-time
@@ -442,65 +479,57 @@ def compute_lead_time(
     timestamp, so every duration here is a difference of row ``timestamp``
     columns.  Verify time is the sum of ``data['duration_ms']`` — read via
     :func:`_duration_minutes`, NOT the events table's ``duration_ms`` COLUMN,
-    which `event_store.py` leaves NULL for this event type — over the task's
-    `merge_verify` rows in ``[queued_ts, finalized_ts)``.
+    which `event_store.py` leaves NULL for this event type.
 
-    THE VERIFY SUM IS SCOPED TO THE JOINED ATTEMPT, for the same reason the
-    lead join is.  A task that re-queued has `merge_verify` rows from its
-    earlier, superseded attempts still in the window under the same task_id;
-    summing every one of them charges this attempt for work it did not do, and
-    the residual then goes negative — a task queued 00:00, verified 50 min,
-    re-queued 02:00, verified 5 min and landed 02:20 gives lead 20.0, wait
-    2.0, verify 55.0 and a meaningless residual of -37.0.  Restricting the sum
-    to the joined attempt's span is what makes ``lead = wait + verify +
-    residual`` an actual decomposition.  This is not a hypothetical: over the
-    dated window below, the unscoped sum gave a NEGATIVE residual on 20 of 199
-    landings (worst -124.3 min) and inflated verify p90 from 52.5 to 70.3;
-    scoped, 0 of 199 are negative and the residual's own minimum is +0.08.  A
-    residual could still go negative if a single verify's duration reached
-    back before its own queue row (the event is emitted at completion, so a
-    long verify straddling the join is timestamped in-span), so
-    ``n_negative_residual`` counts them rather than letting them hide inside a
-    percentile.
+    THE DISPATCHES.  An internal re-queue
+    (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._requeue_request`)
+    emits no `merge_queued`, so it shows only as a further `merge_dequeued`
+    under the same joined queue row.  :func:`_split_landing` cuts each landing
+    at its dispatches, the `merge_dequeued` rows in ``[queued_ts,
+    finalized_ts)``: queue wait runs to the first, re-queued from the first to
+    the last (aborted attempts plus their re-queue waits), and
+    ``lead = wait + requeued + verify + residual``.  A dequeue stamped at or
+    after the landing (a stale duplicate request later found already_merged)
+    is no landing's wait.
+
+    THE VERIFY SUM IS SCOPED TO THE LANDING ATTEMPT, ``[last dispatch,
+    finalized_ts)`` (``[queued_ts, finalized_ts)`` without a dispatch), for
+    the same reason the lead join is: earlier attempts' `merge_verify` rows
+    are still in the window under the same task_id, and re-queued already
+    holds their time, so summing them too drives the residual negative.  Over
+    the PRD's dated window an unscoped sum gave a NEGATIVE residual on 20 of
+    199 landings (worst -124.3 min) and inflated verify p90 from 52.5 to 70.3.
+    One verify whose duration reaches back before its own dispatch (the event
+    is emitted at completion) still can, so ``n_negative_residual`` counts
+    them rather than letting them hide inside a percentile.
 
     Segment availability differs per task, so each series carries its own ``n``:
       lead      every matched landing
-      wait      landings with a `merge_dequeued` at or after the joined queue row
-      verify    landings with at least one in-window `merge_verify` row — a task
-                with none is EXCLUDED rather than contributing 0.0, which would
-                read as an instantaneous verify
-      residual  lead - wait - verify, over landings that have a wait (without
-                one the remainder is not attributable to finalize+CAS).  A
-                missing verify counts as 0 there, so a task whose verify rows
-                fell outside the window inflates its residual.
+      wait      landings with at least one dispatch
+      requeued  the same landings; 0.0 for a single dispatch
+      verify    landings with a usable `merge_verify` row in the attempt scope
+                — one with none is EXCLUDED, not 0.0 (an instantaneous verify)
+      residual  lead - wait - requeued - verify (a missing verify counts as 0),
+                over landings with a dispatch: without one it is not finalize+CAS
+      last_verify_to_land
+                landing minus the attempt's latest `merge_verify` row, over the
+                verify landings: finalize time alone.  NOT additive, because the
+                residual also holds the gap from the last dispatch to its verify.
 
     WINDOW EDGE.  A landing early in the window is often `unmatched` only
     because its `merge_queued` row predates *lo*; that is a truncation
     artefact, not evidence the task was never queued.  The resolved bounds are
     returned so a caller can say so.
 
-    RE-MEASURED on this branch against the live dark_factory store over the
-    PRD's dated window 2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00
-    (n=199 matched landings, 1 unmatched at the window's leading edge):
-    lead p50/p90 = 49.9/172.0 min against the PRD's 50.0/171.7, and queue wait
-    p50/p90 = 0.0/110.7 against the PRD's "~0 / 110.4".  Verify p50/p90 =
-    40.7/52.5 and residual p50/p90 = 2.0/24.6, with no negative residual.
-    Neither the lead nor the wait figure moved when the verify sum was scoped
-    — those two are joins, not sums — so the PRD rows this reproduces are
-    unaffected by that correction.
-
-    Returns ``{'lead', 'wait', 'verify', 'residual', 'matched', 'unmatched',
-    'unmatched_task_ids', 'n_negative_residual', 'window'}``; the four series
-    are :func:`_series` dicts.
+    Returns the six :func:`_series` dicts keyed by the :class:`LandingSplit`
+    field names, plus ``'matched'``, ``'unmatched'``, ``'unmatched_task_ids'``,
+    ``'n_negative_residual'`` and ``'window'``.
     """
     queued_by_task = _by_task(queued_events)
     dequeued_by_task = _by_task(dequeued_events)
     verify_by_task = _by_task(verify_events)
 
-    lead: list[float] = []
-    wait: list[float] = []
-    verify: list[float] = []
-    residual: list[float] = []
+    columns: dict[str, list[float]] = {f.name: [] for f in fields(LandingSplit)}
     matched = 0
     unmatched_task_ids: list[str] = []
 
@@ -517,49 +546,23 @@ def compute_lead_time(
         if joined is None:
             unmatched_task_ids.append(task_id)
             continue
-        queued_ts, _ = joined
         matched += 1
-
-        lead_min = (finalized_ts - queued_ts).total_seconds() / 60.0
-        lead.append(lead_min)
-
-        # Scoped to THIS attempt, exactly as the lead join is.  A task that
-        # re-queues has `merge_verify` rows from its earlier, superseded
-        # attempts still sitting in the window under the same task_id; summing
-        # all of them charges the current attempt for work it did not do and
-        # can drive the residual negative, which is meaningless as a
-        # "finalize+CAS" figure.  So only rows in [queued_ts, finalized_ts) —
-        # the span the lead was measured over — count.
-        verify_min: float | None = None
-        attempt_minutes: list[float] = []
-        for row in verify_by_task.get(task_id, []):
-            row_ts = _parse_ts(row.get('timestamp'))
-            if row_ts is None or row_ts < queued_ts or row_ts >= finalized_ts:
-                continue
-            minutes = _duration_minutes(row.get('data', {}))
-            if minutes is not None:
-                attempt_minutes.append(minutes)
-        if attempt_minutes:
-            verify_min = sum(attempt_minutes)
-            verify.append(verify_min)
-
-        dequeued = _first_at_or_after(dequeued_by_task.get(task_id, []), queued_ts)
-        if dequeued is not None:
-            wait_min = (dequeued[0] - queued_ts).total_seconds() / 60.0
-            wait.append(wait_min)
-            residual.append(lead_min - wait_min - (verify_min or 0.0))
+        split = _split_landing(
+            joined[0], finalized_ts,
+            dequeued_by_task.get(task_id, []), verify_by_task.get(task_id, []),
+        )
+        for name, value in asdict(split).items():
+            if value is not None:
+                columns[name].append(value)
 
     return {
-        'lead': _series(lead),
-        'wait': _series(wait),
-        'verify': _series(verify),
-        'residual': _series(residual),
+        **{name: _series(values) for name, values in columns.items()},
         'matched': matched,
         'unmatched': len(unmatched_task_ids),
         'unmatched_task_ids': unmatched_task_ids,
-        # Surfaced, not swallowed: a negative residual means the three
-        # segments did not decompose the lead for that landing.
-        'n_negative_residual': sum(1 for value in residual if value < 0),
+        # Surfaced, not swallowed: a negative residual means the segments did
+        # not decompose the lead for that landing.
+        'n_negative_residual': sum(1 for value in columns['residual'] if value < 0),
         'window': (_iso(lo), _iso(hi)),
     }
 
@@ -795,9 +798,8 @@ def _depth_distribution(
 ) -> dict[str, Any]:
     """Histogram ``data['depth']`` with a None-safe ``int()`` coercion.
 
-    Mirrors `analyze_speculation_depth.py::compute_per_depth`: an absent, None
-    or unparseable depth is SKIPPED and counted in ``n_skipped`` rather than
-    raising or landing in a 0 bucket.  Historical (pre-task-2340) `merge_verify`
+    An absent, None or unparseable depth is SKIPPED and counted in
+    ``n_skipped`` rather than raising or landing in a 0 bucket.  Historical (pre-task-2340) `merge_verify`
     rows carry no depth at all.
     """
     counts: Counter[int] = Counter()
@@ -1060,12 +1062,14 @@ def compute_speculation(
 # Section: queue depth and the outcome/state mixes.
 # ---------------------------------------------------------------------------
 
-# Mirrors `merge_types.py::_NON_TERMINAL_OUTCOMES` — the OutcomeKind members
+# Mirrors `orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES` — the OutcomeKind members
 # for which the attempt/merge is still live. Copied as literal strings, NOT
 # imported: scripts/ must stay importable without the orchestrator package
-# (this module's test gate runs under `uv run --project shared`). The set is
-# documented there as a FROZEN CONTRACT, already mirrored by the dashboard.
-_NON_TERMINAL_OUTCOMES = frozenset({
+# (this module's test gate runs under `uv run --project shared`). The name is
+# public because the set is a cross-layer contract:
+# `orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract`
+# loads this file by path and fails if the two sets differ.
+NON_TERMINAL_OUTCOMES = frozenset({
     'cas_retry', 'gate_retry', 'post_merge_generation_chained',
     'plan_files_narrowed',
 })
@@ -1122,7 +1126,7 @@ def compute_mixes(
     row with the key missing buckets under :data:`UNKNOWN`.
 
     Outcomes are additionally split terminal / non-terminal (see
-    :data:`_NON_TERMINAL_OUTCOMES`): ``gate_retry`` and ``cas_retry`` mean the
+    :data:`NON_TERMINAL_OUTCOMES`): ``gate_retry`` and ``cas_retry`` mean the
     attempt is still live, so folding them in with terminal outcomes makes the
     mix read as a landing tally when it is not.
 
@@ -1133,9 +1137,9 @@ def compute_mixes(
     )
     counts: dict[str, int] = outcomes['counts']
     non_terminal = {
-        k: v for k, v in counts.items() if k in _NON_TERMINAL_OUTCOMES
+        k: v for k, v in counts.items() if k in NON_TERMINAL_OUTCOMES
     }
-    terminal = {k: v for k, v in counts.items() if k not in _NON_TERMINAL_OUTCOMES}
+    terminal = {k: v for k, v in counts.items() if k not in NON_TERMINAL_OUTCOMES}
     outcomes.update({
         'non_terminal': non_terminal,
         'terminal': terminal,
@@ -1227,11 +1231,93 @@ def compute_chains(
 
 
 # ---------------------------------------------------------------------------
+# Section: lane policy signals (--policy) — merge-lane-policy PRD D10.
+# ---------------------------------------------------------------------------
+
+
+def _usable_number(raw: Any) -> float | None:
+    """*raw* as a float, or ``None`` for a missing, null, bool or non-numeric value."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw)
+
+
+def _observed(events: Iterable[dict[str, Any]], key: str) -> dict[str, Any]:
+    """Tally ``data[key]`` as observed; a missing or null value is :data:`UNKNOWN`."""
+    return _tally(str(e.get('data', {}).get(key) or UNKNOWN) for e in events)
+
+
+def _cancelled_verifies(cancelled_events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    datas = [e.get('data', {}) for e in cancelled_events]
+    elapsed = [ms for d in datas if (ms := _usable_number(d.get('elapsed_ms'))) is not None]
+    fractions = [f for d in datas if (f := _usable_number(d.get('fraction'))) is not None]
+    return {
+        'n': len(datas),
+        'causes': _observed(cancelled_events, 'cause'),
+        'elapsed_hours': sum(elapsed) / 3_600_000.0,
+        'fraction_p50': _percentile(fractions, 50),
+    }
+
+
+def _killer_site(data: dict[str, Any]) -> str:
+    killer = data.get('killer')
+    site = killer.get('site') if isinstance(killer, dict) else None
+    return str(site or UNKNOWN)
+
+
+def _void_provenance(voided_events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    datas = [e.get('data', {}) for e in voided_events]
+    return {
+        'n': len(datas),
+        'n_with_item_commit': sum(1 for d in datas if d.get('item_commit')),
+        'killer_sites': _tally(_killer_site(d) for d in datas),
+    }
+
+
+def _queue_to_land(finalized_events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    done = [
+        e.get('data', {}) for e in finalized_events
+        if e.get('data', {}).get('state') == 'done'
+    ]
+    secs = [s for d in done if (s := _usable_number(d.get('queue_to_land_secs'))) is not None]
+    return {**_series(secs), 'n_missing': len(done) - len(secs)}
+
+
+def compute_policy_signals(
+    verify_events: Sequence[dict[str, Any]],
+    cancelled_events: Sequence[dict[str, Any]],
+    voided_events: Sequence[dict[str, Any]],
+    finalized_events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """The merge-lane-policy PRD D10 signals the lane has emitted since task 8523.
+
+    Values are read AS OBSERVED, like :func:`compute_mixes`: no vocabulary is
+    imported from the orchestrator.  A row written before the instrumentation
+    landed lacks the key and buckets under :data:`UNKNOWN`, as does a null.
+
+    ``cancelled.elapsed_hours`` sums the verify time each cancel threw away;
+    ``fraction_p50`` is over the rows whose host had a median to divide by.
+    ``queue_to_land`` covers ``state == 'done'`` rows only, with
+    ``n_missing`` counting landings that predate the key.
+
+    Returns ``{'runner_reason', 'base_relation', 'cancelled', 'voided',
+    'queue_to_land'}``.
+    """
+    return {
+        'runner_reason': _observed(verify_events, 'runner_reason'),
+        'base_relation': _observed(verify_events, 'base_relation'),
+        'cancelled': _cancelled_verifies(cancelled_events),
+        'voided': _void_provenance(voided_events),
+        'queue_to_land': _queue_to_land(finalized_events),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Multi-project rim: one runs.db per project root, one labelled bundle each.
 # ---------------------------------------------------------------------------
 
-# The always-on sections, in report order. `chains` and `speculation` are
-# behind flags and appended after these.
+# The always-on sections, in report order. `speculation`, `chains` and
+# `policy_signals` are behind flags and appended after these.
 _ALWAYS_ON_SECTIONS = (
     'landings_per_day', 'lead_time', 'verify_by_runner',
     'occupancy', 'queue_depth', 'mixes',
@@ -1279,6 +1365,7 @@ def collect_project(
     *,
     chains: bool = False,
     speculation: bool = False,
+    policy: bool = False,
 ) -> dict[str, Any]:
     """Read one project's runs.db and return one LABELLED result bundle.
 
@@ -1329,7 +1416,7 @@ def collect_project(
             for event_type in (
                 'merge_queued', 'merge_dequeued', 'merge_verify',
                 'merge_finalized', 'merge_heartbeat', 'merge_attempt',
-                'speculative_merge', 'verdict_voided',
+                'speculative_merge', 'verdict_voided', 'merge_verify_cancelled',
             )
         }
     except sqlite3.Error as exc:
@@ -1366,6 +1453,11 @@ def collect_project(
         sections['chains'] = compute_chains(
             loaded['merge_finalized'], loaded['merge_verify']
         )
+    if policy:
+        sections['policy_signals'] = compute_policy_signals(
+            loaded['merge_verify'], loaded['merge_verify_cancelled'],
+            loaded['verdict_voided'], loaded['merge_finalized'],
+        )
     bundle['sections'] = sections
     return bundle
 
@@ -1377,6 +1469,7 @@ def collect_projects(
     *,
     chains: bool = False,
     speculation: bool = False,
+    policy: bool = False,
 ) -> list[dict[str, Any]]:
     """One :func:`collect_project` bundle per root, in the order given.
 
@@ -1385,7 +1478,9 @@ def collect_projects(
     the operator the other project's rows.
     """
     return [
-        collect_project(root, lo, hi, chains=chains, speculation=speculation)
+        collect_project(
+            root, lo, hi, chains=chains, speculation=speculation, policy=policy,
+        )
         for root in roots
     ]
 
@@ -1476,6 +1571,14 @@ def build_parser() -> argparse.ArgumentParser:
         '--speculation', action='store_true',
         help='Add the speculation section, incl. void rate by project (off by default).',
     )
+    parser.add_argument(
+        '--policy', action='store_true',
+        help=(
+            'Add the merge-lane-policy PRD D10 section: runner_reason, '
+            'base_relation, cancelled verifies, void provenance, queue-to-land '
+            '(off by default).'
+        ),
+    )
     return parser
 
 
@@ -1499,6 +1602,7 @@ SECTION_TITLES = {
     'mixes': 'outcome mixes',
     'speculation': 'speculation',
     'chains': 'merge-ahead chains',
+    'policy_signals': 'lane policy signals',
 }
 
 VOID_RATE_BY_PROJECT_TITLE = 'void rate by project'
@@ -1557,8 +1661,9 @@ def _format_lead_time(
         '    segment           p50      p90      min      max      n  (minutes)'
     )
     for label, key in (
-        ('lead', 'lead'), ('queue wait', 'wait'),
+        ('lead', 'lead'), ('queue wait', 'wait'), ('re-queued', 'requeued'),
         ('verify', 'verify'), ('finalize+CAS', 'residual'),
+        ('verify->land', 'last_verify_to_land'),
     ):
         series = section[key]
         lines.append(
@@ -1569,7 +1674,7 @@ def _format_lead_time(
     if section['n_negative_residual']:
         lines.append(
             f"  WARNING {section['n_negative_residual']} landing(s) have a "
-            'NEGATIVE finalize+CAS residual — the three segments did not '
+            'NEGATIVE finalize+CAS residual — the segments did not '
             'decompose the lead for those, so the residual row is not '
             'finalize+CAS time'
         )
@@ -1756,6 +1861,35 @@ def _format_chains(
     return lines
 
 
+def _format_policy_signals(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    cancelled = section['cancelled']
+    voided = section['voided']
+    queue_to_land = section['queue_to_land']
+    lines = [_section(SECTION_TITLES['policy_signals'], window)]
+    for key in ('runner_reason', 'base_relation'):
+        lines.append(f"    merge_verify {key} (n={section[key]['total']}):")
+        lines += _format_tally(section[key])
+    lines.append(
+        f"    merge_verify_cancelled {cancelled['n']}: "
+        f"{_num(cancelled['elapsed_hours'], 2)} verify-hour(s) thrown away, "
+        f"fraction p50 {_num(cancelled['fraction_p50'], 2)}"
+    )
+    lines += _format_tally(cancelled['causes'])
+    lines.append(
+        f"    verdict_voided {voided['n']}, {voided['n_with_item_commit']} with "
+        f"item_commit; killer sites:"
+    )
+    lines += _format_tally(voided['killer_sites'])
+    lines.append(
+        f"    queue-to-land (done): p50 {_num(queue_to_land['p50'])}s"
+        f"  p90 {_num(queue_to_land['p90'])}s over {queue_to_land['n']} "
+        f"landing(s), {queue_to_land['n_missing']} without the key"
+    )
+    return lines
+
+
 _SECTION_FORMATTERS = {
     'landings_per_day': _format_landings,
     'lead_time': _format_lead_time,
@@ -1765,11 +1899,12 @@ _SECTION_FORMATTERS = {
     'mixes': _format_mixes,
     'speculation': _format_speculation,
     'chains': _format_chains,
+    'policy_signals': _format_policy_signals,
 }
 
 # Report order. A bundle only renders the sections it actually carries, so the
 # flagged ones simply do not appear unless they were requested.
-_SECTION_ORDER = (*_ALWAYS_ON_SECTIONS, 'speculation', 'chains')
+_SECTION_ORDER = (*_ALWAYS_ON_SECTIONS, 'speculation', 'chains', 'policy_signals')
 
 
 def format_report(bundles: Sequence[dict[str, Any]]) -> str:
@@ -1858,7 +1993,8 @@ def main(argv: Sequence[str], now: datetime | None = None) -> int:
 
     roots = resolve_project_roots(args.project_root)
     bundles = collect_projects(
-        roots, lo, hi, chains=args.chains, speculation=args.speculation
+        roots, lo, hi,
+        chains=args.chains, speculation=args.speculation, policy=args.policy,
     )
     for bundle in bundles:
         if bundle['error'] is not None:

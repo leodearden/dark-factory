@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import random
 import sqlite3
 from collections import Counter
@@ -31,16 +30,11 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from orchestrator.evals.paths import main_checkout
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.mining import assign_split
 
 logger = logging.getLogger(__name__)
-
-# The repo checkout `propose_curator_label_frontier`'s invoke_agent harness
-# runs in. Overridable via CURATOR_REPO_ROOT for portability across
-# checkouts/CI (same reasoning as __main__.py's CURATOR_TICKETS_DB) -- see
-# curator_replay_corpus/README.md's "Building the corpus" section.
-_DEFAULT_REPO_ROOT = Path(os.environ.get('CURATOR_REPO_ROOT', '/home/leo/src/dark-factory'))
 
 __all__ = [
     'AuditReport',
@@ -646,23 +640,16 @@ async def propose_curator_label_frontier(
 ) -> FrontierLabel:
     """Propose a GOLD curator label for *candidate* via a frontier model.
 
-    Build-time only -- never called from a hermetic test (those inject a
-    fake ``FrontierProposerFn``). Mirrors
-    ``reviewer_trial.mining.propose_labels_frontier``'s ``invoke_agent``
-    pattern: no tools, structured JSON output, cost always reported --
-    unlike the reviewer_trial version (which returns a ``(issues, cost_usd)``
-    tuple), ``FrontierProposerFn`` is a plain ``Callable[[dict],
-    Awaitable[FrontierLabel]]``, so the cost is instead stamped onto the
-    returned label's ``FrontierLabel.cost_usd`` field. ``__main__.py``'s
+    Its production callers are build-time only; corpus-building tests inject a
+    fake ``FrontierProposerFn`` instead. Calls ``invoke_agent`` with no tools and
+    structured JSON output, and always reports cost: ``FrontierProposerFn``
+    is a plain ``Callable[[dict], Awaitable[FrontierLabel]]``, so the cost
+    is stamped onto the returned label's ``FrontierLabel.cost_usd`` field. ``__main__.py``'s
     ``build-curator-corpus`` command wraps this proposer to accumulate
     ``cost_usd`` across every sampled candidate and prints the total.
 
     *cwd* is the repo checkout ``invoke_agent`` runs its harness in; it
-    defaults to ``_DEFAULT_REPO_ROOT`` (the ``CURATOR_REPO_ROOT`` env var,
-    falling back to ``/home/leo/src/dark-factory``) so a different
-    checkout/CI environment can point this at the right working directory
-    without a code change -- see curator_replay_corpus/README.md's "Building
-    the corpus" section.
+    defaults to the main checkout (``orchestrator.evals.paths.main_checkout``).
 
     Never raises: an unparseable/malformed response degrades to
     ``action='create'`` -- the live curator's own best-effort fallback
@@ -700,7 +687,7 @@ justification. Output your decision as JSON.
     result = await invoke_agent(
         prompt=prompt,
         system_prompt=system_prompt,
-        cwd=cwd if cwd is not None else _DEFAULT_REPO_ROOT,
+        cwd=cwd if cwd is not None else main_checkout(),
         model=model,
         max_turns=max_turns,
         max_budget_usd=1.0,

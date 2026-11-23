@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from typing import TypedDict
@@ -169,6 +171,29 @@ class TestEventStore:
         assert rows[0][0] == 'implementer'
         assert rows[0][1] == 0.50
 
+
+
+class TestEmitReturnsTheRowId:
+    def test_emit_returns_the_id_the_row_is_read_back_with(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'test.db', 'run-id')
+
+        first = store.emit(EventType.merge_verify, task_id='1', data={'n': 1})
+        second = store.emit(EventType.merge_verify, task_id='1', data={'n': 2})
+
+        rows = store.fetch_events_by_type(EventType.merge_verify)
+        assert [first, second] == [row['id'] for row in rows]
+        assert isinstance(first, int)
+        assert isinstance(second, int)
+        assert second > first
+
+    def test_a_failed_emit_returns_none_and_does_not_raise(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'test.db'
+        store = EventStore(db_path, 'run-id')
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.execute('DROP TABLE events')
+            conn.commit()
+
+        assert store.emit(EventType.merge_verify, task_id='1', data={'n': 1}) is None
 
 class TestMergeFinalizedEventType:
     """EventType.merge_finalized must exist and round-trip through the event store."""
@@ -1069,6 +1094,113 @@ class TestMergeFinalizedAbsorbing:
         assert store.merge_finalized_absorbing('', cross_run=True) is None
 
 
+def _unreadable(store: EventStore) -> EventStore:
+    """Overwrite *store*'s file with non-database bytes, so every later read fails to open it."""
+    store.db_path.write_bytes(b'not a database' * 64)
+    for sidecar in ('-wal', '-shm'):
+        Path(f'{store.db_path}{sidecar}').unlink(missing_ok=True)
+    return store
+
+
+_Read = Callable[..., object]
+
+_READS = pytest.mark.parametrize(
+    ('reader', 'read', 'miss'),
+    [
+        (
+            'latest_merge_finalized',
+            lambda store, **kw: store.latest_merge_finalized(task_id='T1', **kw),
+            None,
+        ),
+        (
+            'merge_finalized_absorbing',
+            lambda store, **kw: store.merge_finalized_absorbing('mr-x', **kw),
+            None,
+        ),
+        (
+            'merge_finalized_superseded_by',
+            lambda store, **kw: store.merge_finalized_superseded_by('coalesce-x', **kw),
+            [],
+        ),
+    ],
+    ids=['latest', 'absorbing', 'superseded_by'],
+)
+_CROSS_RUN = pytest.mark.parametrize('cross_run', [False, True], ids=['run_scoped', 'cross_run'])
+
+
+class TestMergeFinalizedReadFailure:
+    """The merge_finalized readers' two read-failure policies: fire-safe by default, strict on request."""
+
+    @_READS
+    @_CROSS_RUN
+    def test_an_unreadable_store_raises_when_not_fire_safe(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        reader: str,
+        read: _Read,
+        miss: object,
+        cross_run: bool,
+    ) -> None:
+        store = _unreadable(EventStore(tmp_path / 'runs.db', 'run-A'))
+        caplog.set_level(logging.WARNING, logger='orchestrator.event_store')
+
+        with pytest.raises(sqlite3.DatabaseError):
+            read(store, cross_run=cross_run, fire_safe=False)
+
+        assert f'event_store.{reader} failed' not in caplog.messages
+
+    @_READS
+    @_CROSS_RUN
+    def test_an_unreadable_store_reads_as_a_miss_by_default(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        reader: str,
+        read: _Read,
+        miss: object,
+        cross_run: bool,
+    ) -> None:
+        store = _unreadable(EventStore(tmp_path / 'runs.db', 'run-A'))
+        caplog.set_level(logging.WARNING, logger='orchestrator.event_store')
+
+        assert read(store, cross_run=cross_run) == miss
+        assert any(
+            record.levelno == logging.WARNING
+            and record.getMessage() == f'event_store.{reader} failed'
+            for record in caplog.records
+        )
+
+    @_READS
+    @_CROSS_RUN
+    def test_a_clean_miss_is_not_a_failure(
+        self, tmp_path: Path, reader: str, read: _Read, miss: object, cross_run: bool,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+
+        assert read(store, cross_run=cross_run, fire_safe=False) == miss
+
+    @_READS
+    @_CROSS_RUN
+    def test_a_hit_reads_the_same_either_way(
+        self, tmp_path: Path, reader: str, read: _Read, miss: object, cross_run: bool,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-p', task_id='T1', branch='b1', state='done',
+            absorbed_request_ids=['mr-x'],
+        )
+        _emit_finalized(
+            store, request_id='mr-m', task_id='T2', branch='b2', state='superseded',
+            superseded_by='coalesce-x',
+        )
+
+        strict = read(store, cross_run=cross_run, fire_safe=False)
+
+        assert strict != miss
+        assert strict == read(store, cross_run=cross_run)
+
+
 _MF_INDEXES = {
     MergeFinalizedKey.request_id: 'idx_mf_request_id',
     MergeFinalizedKey.branch: 'idx_mf_branch',
@@ -1245,6 +1377,32 @@ class TestFetchEventsByTypeAllRuns:
         ) == []
 
 
+class TestFetchRecentEventsByType:
+    """``fetch_recent_events_by_type`` reads the newest rows of one type across runs (task 8528)."""
+
+    def test_returns_the_newest_limit_rows_across_runs_oldest_first(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, run_id='run-A')
+        for n in range(3):
+            store_a.emit(EventType.merge_verify, task_id=f'a{n}', data={'n': n})
+        store_a.emit(EventType.workflow_verify, task_id='other', data={'n': 99})
+        store_b = EventStore(db_path, run_id='run-B')
+        for n in range(3, 5):
+            store_b.emit(EventType.merge_verify, task_id=f'b{n}', data={'n': n})
+
+        rows = store_b.fetch_recent_events_by_type(EventType.merge_verify, limit=4)
+
+        assert [row['data']['n'] for row in rows] == [1, 2, 3, 4]
+        assert [row['run_id'] for row in rows] == ['run-A', 'run-A', 'run-B', 'run-B']
+
+    def test_an_empty_store_returns_an_empty_list(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', run_id='run-A')
+
+        assert store.fetch_recent_events_by_type(EventType.merge_verify, limit=10) == []
+
+
 class TestMergeSerialLaneBreachedEventType:
     """EventType.merge_serial_lane_breached must exist and round-trip (task 2930/η).
 
@@ -1344,3 +1502,35 @@ class TestPinBlockedEventType:
         conn.close()
 
         assert rows == [('P', 'H')]
+
+
+class TestParkRefusedEventType:
+    """``park_refused`` names the parks a candidate waits on, none outranking it (task 6328)."""
+
+    def test_park_refused_round_trips(self, tmp_path: Path) -> None:
+        assert EventType.park_refused.value == EventType.park_refused.name == 'park_refused'
+
+        data = {
+            'task_id': 'B',
+            'priority': 'critical',
+            'episode_secs': 1800.0,
+            'blockers': [{'module': 'x.py', 'owner': 'A', 'kind': 'parked'}],
+            'park_owners': [{
+                'owner': 'A',
+                'source': 'fairness',
+                'tier': 'critical',
+                'park_age_secs': 7200.0,
+                'waiting_on': [{'module': 'z.py', 'owner': 'H', 'kind': 'held'}],
+            }],
+        }
+        db_path = tmp_path / 'e.db'
+        store = EventStore(db_path, 'run-1')
+        store.emit(EventType.park_refused, task_id='B', data=data)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT task_id, data FROM events WHERE event_type = 'park_refused'"
+        ).fetchall()
+        conn.close()
+
+        assert [(task_id, json.loads(raw)) for task_id, raw in rows] == [('B', data)]

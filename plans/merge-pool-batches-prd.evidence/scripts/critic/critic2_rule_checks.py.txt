@@ -1,0 +1,47 @@
+"""Checks of draft 2's rule (6.5) against the simulated policy's own functions (read-only import)."""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import lane as L
+
+
+def depth_U(p, e, A, follow_one, kmax=12):
+    a = lambda x: A[min(len(A) - 1, int(round(x * (len(A) - 1))))]
+    def C(k):
+        R = 1 - (1 - p) ** k * (1 - e)
+        if k == 1:
+            return 1.0
+        return 1 + R * k * (1.0 if follow_one else a(min(1.0, p / R)))
+    k = 1
+    while k < kmax and C(k + 1) - C(k) < a(p):
+        k += 1
+    return k
+
+
+print('== B1 at other false-failure values: table depth vs rule depth (a forced to 1)')
+ests = [0.75, 0.80, 0.876, 0.90, 0.934, 0.95, 0.959, 0.965, 0.972, 0.975, 0.979, 0.982, 0.984, 0.986, 0.988, 0.989, 0.990, 0.991, 0.992, 0.995]
+for e in (0.0, 0.009, 0.018, 0.026, 0.05):
+    A, _ = L.going_cost(e, 0.9, 12, False, True)
+    row = [(L.table_row(est, L.TABLE_NEW), depth_U(1 - est, e, A, True)) for est in ests]
+    bad = [(est, t, u) for est, (t, u) in zip(ests, row) if t != u]
+    print('e=%.3f mismatches %d of %d: %s' % (e, len(bad), len(ests), bad))
+
+print('\n== depth the rule itself picks for fresh requests on main (nested going cost), by defect rate and false-failure')
+for e in (0.009, 0.018, 0.026, 0.05):
+    A, _ = L.going_cost(e, 0.9, 12, False, False)
+    print('e=%.3f: ' % e + ' '.join('q=%.2f:%d' % (q, depth_U(q, e, A, False)) for q in (0.03, 0.05, 0.08, 0.10, 0.12, 0.14, 0.17, 0.19, 0.20, 0.25)))
+
+print('\n== sensitivity of depth to the fitted defect rate (e=0.026): q -> depth')
+A, _ = L.going_cost(0.026, 0.9, 12, False, False)
+print(' '.join('%.3f:%d' % (q / 1000, depth_U(q / 1000, 0.026, A, False)) for q in range(20, 260, 10)))
+
+print('\n== an unproved root (main_red 0.06) folded into each member\'s p: depth at defect rate q')
+for q in (0.05, 0.08, 0.14):
+    p = 1 - (1 - 0.06) * (1 - q)
+    print('q=%.2f -> p=%.3f depth %d (proved root: %d)' % (q, p, depth_U(p, 0.026, A, False), depth_U(q, 0.026, A, False)))
+
+print('\n== cleared rider joining a single fresh front: C({front,rider}) - C({front}) vs a(0)')
+for q in (0.05, 0.14):
+    e = 0.026
+    Pred = 1 - (1 - e) * (1 - q)
+    a = lambda x: A[min(len(A) - 1, int(round(x * (len(A) - 1))))]
+    print('q=%.2f: increase %.3f, a(0)=%.3f -> %s by the formula' % (q, Pred * (a(min(1, q / Pred)) + A[0]), A[0], 'joins' if Pred * (a(min(1, q / Pred)) + A[0]) < A[0] else 'does NOT join'))

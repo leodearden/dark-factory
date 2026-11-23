@@ -1,0 +1,105 @@
+"""Item 6: red chains and what followed each (membership era: chain_task_ids from 2026-11-15T11:19Z)."""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/measure')
+from collections import Counter, defaultdict
+from common import verifies, by_type, fmt, pct, T10617, T8528
+
+V = sorted(verifies('2026-11-01'), key=lambda r: r['id'])
+V = [v for v in V if v['ts'] >= '2026-11-05']
+MEMB_LO = '2026-11-15T11:19:00+00:00'
+FIN = [e for e in by_type('merge_finalized', '2026-11-05')]
+done_at = defaultdict(list)
+for f in FIN:
+    if f['d'].get('state') == 'done':
+        done_at[f['d'].get('branch') or f['task']].append(f['id'])
+CANC = by_type('merge_verify_cancelled', '2026-11-05')
+
+red_all = [v for v in V if v['k'] >= 2 and not v['passed']]
+print('red chains whole window by sub-era and size:')
+def era(t):
+    if t < MEMB_LO: return 'a1 11-05..11-15T11:19 (no membership)'
+    if t < T10617: return 'a2 11-15T11:19..10617 deploy 11-17T20:51'
+    if t < T8528: return 'a3 10617..8528 deploy'
+    return 'b after 8528'
+c = Counter((era(v['ts']), v['k']) for v in red_all)
+tot = Counter((era(v['ts']), v['k']) for v in V if v['k'] >= 2)
+for k in sorted(tot):
+    print(' ', k, 'red', c.get(k, 0), 'of', tot[k])
+
+red = [v for v in red_all if v['members']]
+rows = []
+for rc in red:
+    later = [v for v in V if v['id'] > rc['id']]
+    mem_out = []
+    for m in rc['members']:
+        outcome = None
+        for v in later:
+            if v['k'] == 1 and v['task'] == m:
+                outcome = ('solo_pass' if v['passed'] else 'solo_fail', v)
+                break
+            if v['k'] >= 2 and v['members'] and m in v['members']:
+                outcome = ('rechained_before_solo', v)
+                break
+        if outcome is None:
+            landed = any(i > rc['id'] for i in done_at.get(m, []))
+            outcome = ('landed_without_later_verify' if landed else 'no_later_verify', None)
+        mem_out.append((m, outcome[0], outcome[1]))
+    rows.append((rc, mem_out))
+
+print('\nper red chain (membership era):')
+summary = defaultdict(lambda: Counter())
+iso_minutes = defaultdict(list)
+bad_per = defaultdict(list)
+for rc, mo in rows:
+    e = era(rc['ts'])
+    kinds = Counter(x[1] for x in mo)
+    n_solo = kinds['solo_pass'] + kinds['solo_fail']
+    s = summary[e]
+    s['red_chains'] += 1
+    s['members'] += len(mo)
+    for kk, n in kinds.items():
+        s[kk] += n
+    complete = n_solo == len(mo)
+    if complete:
+        s['chains_all_members_solo'] += 1
+        if kinds['solo_fail'] == 0:
+            s['chains_all_solo_zero_fail'] += 1
+        bad_per[e].append(kinds['solo_fail'])
+    if n_solo and kinds['solo_fail'] == 0:
+        s['chains_with_some_solo_zero_fail'] += 1
+    if n_solo == 0:
+        s['chains_with_no_solo'] += 1
+    mins = sum(x[2]['dur_s'] for x in mo if x[1].startswith('solo')) / 60
+    iso_minutes[e].append(mins)
+    print(f"  {rc['ts'][:16]} k={rc['k']} head={rc['task']} {rc['runner']} red_units={rc['red_units']} -> " +
+          ', '.join(f"{m}:{o}" for m, o, _ in mo) + f" | iso_min={mins:.0f}")
+
+print('\nsummary by era')
+for e in sorted(summary):
+    print(e, dict(summary[e]))
+    print('   isolation verify-minutes per red chain: n', len(iso_minutes[e]), 'sum', round(sum(iso_minutes[e])), 'p50', fmt(pct(iso_minutes[e], 50), 0), 'p90', fmt(pct(iso_minutes[e], 90), 0), 'mean', round(sum(iso_minutes[e]) / len(iso_minutes[e])) if iso_minutes[e] else '-')
+    print('   bad members (failed alone) per fully-isolated red chain:', Counter(bad_per[e]))
+
+from common import RUN_STARTS, ts as _ts
+print('\nre-chained-before-solo members: was there an orchestrator restart between the red chain and the re-chain verify start?')
+rr = Counter()
+for rc, mo in rows:
+    for m, kind, v in mo:
+        if kind != 'rechained_before_solo':
+            continue
+        restart = any(rc['end_ts'] < _ts(r + '+00:00') < v['start_ts'] for r in RUN_STARTS)
+        rr[(era(rc['ts']), restart)] += 1
+for k in sorted(rr):
+    print(' ', k, rr[k])
+print('\ncancelled verifies of red-chain members before their next completed verify (time thrown away):')
+cc = Counter(); cm = Counter()
+for rc, mo in rows:
+    for m, kind, v in mo:
+        hi = v['end_ts'] if v else 9e18
+        for c in CANC:
+            if c['task'] == m and rc['end_ts'] < _ts(c['ts']) < hi:
+                cc[era(rc['ts'])] += 1
+                cm[era(rc['ts'])] += (c['d'].get('elapsed_ms') or 0) / 60000
+for k in sorted(cc):
+    print(' ', k, 'n', cc[k], 'minutes', round(cm[k]))
+print('\ncancelled merge verifies by cause and window', Counter((('b' if c['ts'] >= T8528 else 'a'), c['d'].get('cause')) for c in CANC))

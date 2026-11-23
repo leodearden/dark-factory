@@ -11,8 +11,13 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+from legibility import census, census_verify, synthesis
+from orchestrator.agents import code_quality
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.review_suggestions.prior_round import build_resettled_adjudicator_prompt
 
 
 def user_record(content, **flags) -> dict:
@@ -65,6 +70,77 @@ def with_origin(record: dict, kind: str) -> dict:
     out.pop('isMeta', None)
     out['origin'] = {'kind': kind}
     return out
+
+
+def sdk_prompt(text: str, *, entrypoint: str | None = 'sdk-cli') -> dict:
+    """A user prompt record stamped as Claude Code stamps an SDK-delivered
+    prompt -- promptSource, turnOrigin and userType, with 'isMeta' REMOVED --
+    in the shape sighted 2026-11-18.
+
+    The default *entrypoint* 'sdk-cli' is headless ``claude --print``
+    (shared/src/shared/cli_invoke.py::build_claude_argv), which the
+    provenance rule excludes WHATEVER the text says. A test pinning a text
+    marker passes ``entrypoint=None``, which leaves the key out so only the
+    text rules can decide. T3 Code's human-typed turns carry 'sdk-ts' or
+    't3-code' (session 790c2455)."""
+    out = user_record(text)
+    out.pop('isMeta', None)
+    out.update(promptSource='sdk', turnOrigin='sdk', userType='external')
+    if entrypoint is not None:
+        out['entrypoint'] = entrypoint
+    return out
+
+
+UNMARKED_HEADLESS_SDK_PROMPT_TEXTS: dict[str, str] = {
+    'dry_run_unblock': (
+        'Task ID: 4384\n'
+        'Worktree: /home/leo/src/dark-factory/.worktrees/4384\n'
+        'Block reason: verify failed three times on the same gate\n'
+        'Detail: (none)\n\n'
+        'Investigate and emit your structured proposal.'
+    ),
+    'link_adjudicator': (
+        'ITEM p1\n'
+        'CHILD: The merge worker releases the lease before verify returns.\n'
+        'PARENT: Merge-lane leases outlive the verify they guard.'
+    ),
+    'path_scope_adjudicator': (
+        "Task filed in project: 'reify'\n"
+        'Flagged matched path prefixes: orchestrator/src/orchestrator/\n'
+        "Suggested correct project: 'dark_factory'\n\n"
+        'Task title:\n'
+        'Merge worker holds the lease across verify\n'
+    ),
+    'task_curator_candidate': (
+        '# Candidate task (not yet created)\n'
+        '  title: Merge worker holds the lease across verify\n'
+        '  priority: low\n'
+        '  spawn_context: agent_followup'
+    ),
+}
+"""Machine prompts delivered to headless ``claude --print`` that NO text rule
+recognises, restated and abridged from their builders:
+``orchestrator/src/orchestrator/dry_run_unblock.py::run_dry_run_unblock``
+(session 2bf64b62),
+``fused-memory/src/fused_memory/maintenance/link_adjudicator.py::render_user_prompt``
+(session 169b8d4b),
+``fused-memory/src/fused_memory/middleware/path_scope_adjudicator.py::PathScopeAdjudicator._build_user_prompt``
+and ``fused-memory/src/fused_memory/middleware/task_curator.py::_render_candidate_section``.
+Only the record's provenance can exclude them."""
+
+UNMARKED_HEADLESS_SDK_PROMPTS = tuple(
+    pytest.param(text, id=name) for name, text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.items()
+)
+""":data:`UNMARKED_HEADLESS_SDK_PROMPT_TEXTS` as ``pytest.param`` entries
+carrying their own ids, ready to parametrize a single ``text`` argument."""
+
+SDK_GUI_CLIENT_HUMAN_TURNS = (
+    pytest.param("what's the status of the PR?", 'sdk-ts', id='sdk_ts'),
+    pytest.param('do watch it', 't3-code', id='t3_code'),
+)
+"""(text, entrypoint) human turns typed into T3 Code, a GUI client over the
+Agent SDK, verbatim from session 790c2455: promptSource 'sdk' as on a
+headless prompt, told apart only by the entrypoint."""
 
 
 def coder_judgment(note: str = "that's wrong: the watcher re-armed on a stale lease") -> str:
@@ -202,6 +278,50 @@ NON_HUMAN_ORIGIN_IDS: tuple[str, ...] = (
 )
 
 
+SLASH_COMMAND_ARGLESS_TURN = (
+    '<command-message>reflect</command-message>\n<command-name>/reflect</command-name>'
+)
+"""Claude Code's expansion of a slash command typed with no arguments, as
+stored 2026-11-21: message-first, and no ``<command-args>`` tag at all."""
+
+SLASH_COMMAND_EMPTY_ARGS_TURN = (
+    '<command-name>/login</command-name>\n'
+    '            <command-message>login</command-message>\n'
+    '            <command-args></command-args>'
+)
+"""The name-first, indented expansion shape, with an empty args tag."""
+
+SLASH_COMMAND_WITH_ARGS_TURN = (
+    '<command-message>team</command-message>\n'
+    '<command-name>/team</command-name>\n'
+    '<command-args>Should dark-factory split its very large test files?</command-args>'
+)
+"""An expansion whose args a human typed, so it is dialogue."""
+
+LOCAL_COMMAND_STDOUT_TURN = '<local-command-stdout>Compacted </local-command-stdout>'
+"""The client's echo of a local command's output (here ``/compact``)."""
+
+INTERRUPT_MARKER_TURNS: tuple[str, ...] = (
+    '[Request interrupted by user]',
+    '[Request interrupted by user for tool use]',
+)
+"""The two bare interrupt markers Claude Code writes as a whole user turn."""
+
+CLIENT_RENDERED_TURNS: tuple[str, ...] = (
+    SLASH_COMMAND_ARGLESS_TURN,
+    SLASH_COMMAND_EMPTY_ARGS_TURN,
+    LOCAL_COMMAND_STDOUT_TURN,
+    *INTERRUPT_MARKER_TURNS,
+)
+"""Every whole-turn shape the client composes from a UI action, so it holds
+no prose a human typed; parametrize with :data:`CLIENT_RENDERED_IDS`."""
+
+CLIENT_RENDERED_IDS: tuple[str, ...] = (
+    'argless_slash_command', 'empty_args_slash_command', 'local_command_stdout',
+    'interrupt_marker', 'interrupt_marker_for_tool_use',
+)
+
+
 def recon_run_review_text() -> str:
     """Build the text of an injected reconciliation-run-review user turn --
     the literal shape ``ReconciliationJudge._build_review_prompt`` emits
@@ -304,3 +424,160 @@ CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD = (
 """A human turn quoting the census §1.9 sighting of the steward continuation
 prompt. The quote stops before 'with a summary', exactly as the census does,
 so it is dialogue and stays gold."""
+
+
+def prior_round_adjudicator_prompt(
+    *,
+    description: str = 'The retry loop never backs off between attempts.',
+) -> str:
+    """The real text
+    ``orchestrator/src/orchestrator/review_suggestions/prior_round.py::build_resettled_adjudicator_prompt``
+    sends the prior-round adjudicator, built by calling that builder so a
+    rewording of its opening sentence turns the lockstep tests red. Shaped
+    after census sightings 16e1a37b / 22669850 / f1f8ce95 record 3;
+    *description* is review free text, where a real one may carry signal
+    literals."""
+    current = [{
+        'location': 'orchestrator/src/orchestrator/merge_lane/gates.py',
+        'category': 'correctness',
+        'description': description,
+        'suggested_fix': 'Sleep with exponential backoff between attempts.',
+    }]
+    prior = [{
+        'location': 'orchestrator/src/orchestrator/merge_lane/gates.py',
+        'category': 'correctness',
+        'description': 'Retries hide the gate latency.',
+        'suggested_fix': 'Move the retries into the caller.',
+    }]
+    return build_resettled_adjudicator_prompt(current, prior)
+
+
+def census_verifier_prompt(*evidence: str) -> str:
+    """The real text ``scripts/legibility/census_verify.py::verify_prompt``
+    sends the periodic-census verifier, built by calling that builder so a
+    rewording of its opening sentence turns the lockstep tests red. *evidence*
+    is the cluster's quoted evidence, lines from OTHER sessions that may carry
+    signal literals or foreign agent-class markers."""
+    return census_verify.verify_prompt(
+        {'title': 'Merge gate refuses rebased branches', 'evidence': list(evidence)},
+        project_root='/home/leo/src/dark-factory',
+        quality_block=code_quality.guidance(),
+    )
+
+
+def census_synthesis_prompt(title: str = 'Merge gate refuses rebased branches') -> str:
+    """The real text ``scripts/legibility/census.py::synthesis_prompt`` sends
+    the periodic-census synthesis writer, built by calling that builder so a
+    rewording of its opening sentence turns the lockstep tests red. *title* is
+    the one new finding's title, free text that may carry signal literals or
+    foreign agent-class markers."""
+    brief = synthesis.Brief(
+        run_id='census-dark_factory-20261003',
+        new=(synthesis.NewFinding(
+            key='fk-0123456789ab',
+            entry_id='entry-cand-20261003-1',
+            title=title,
+            cause=None,
+            area='orchestrator',
+            anchor='orchestrator/x.py::f',
+            tags=('h2',),
+            origin_phase='implement',
+            manifested_phase='verify',
+            sessions=('s-1',),
+            verdict=None,
+        ),),
+        re_observed=(),
+        unkeyed_re_observed=0,
+        invariant_counts=(),
+        counts=(),
+    )
+    return census.synthesis_prompt(brief, quality_block=code_quality.guidance())
+
+
+def pre_5356_replan_prompt(
+    issue: str = 'The lease is released before the verify finishes.',
+) -> str:
+    """The RETIRED replan prompt as archived transcripts hold it, restated
+    and abridged from session 2880c011 record 3 rather than built: task 5356
+    (commit 8321b68278) removed its builder, and today's
+    ``BriefingAssembler.build_replan_prompt`` opens with the task preamble.
+    *issue* is review free text."""
+    return (
+        'The implementation was reviewed and blocking issues were found.\n\n'
+        '# Review Feedback — Blocking Issues\n\n'
+        '## [reviewer_comprehensive] correctness\n'
+        '**Location:** orchestrator/src/orchestrator/merge_lane/worker.py\n'
+        f'**Issue:** {issue}\n'
+        '**Suggested fix:** Hold the lease until the verify returns.\n\n\n'
+        '# Current Plan\n\n'
+        '```json\n{"task_id": "3490", "steps": []}\n```\n\n'
+        '# Action\n\n'
+        'Update the plan to address the blocking issues. You may add new steps '
+        'to the `steps` array, but do NOT remove or reorder existing steps. Set '
+        'new steps to status "pending". Write the updated plan to '
+        '`.task/plan.json`.\n'
+    )
+
+
+WATCHER_ROTATION_PROMPT = (
+    'You are running as an autonomous escalation watcher.\n'
+    'Rotation limits (injected by supervisor):\n'
+    '  ROTATION_ESCALATIONS=50\n'
+    '  ROTATION_HOURS=4.0\n'
+    '\n'
+    'When you have handled ROTATION_ESCALATIONS escalations or 4.0 hours have '
+    'elapsed since startup, emit your digest as the final message and exit cleanly.\n'
+    '\n'
+    'Project root: /home/leo/src/reify\n'
+    'Escalation queue: /home/leo/src/reify/data/escalations\n'
+    f'\n{WATCHER_REARM_OUTCOME_GUIDANCE}'
+)
+"""The rotation prompt
+``orchestrator/src/orchestrator/harness.py::Harness._run_watcher_rotation``
+composes, restated and abridged with the values sighted in reify 4aaf48b0
+record 2: it omits the ``tooling_root_block`` the harness inserts after the
+'Escalation queue:' line. The opener is restated because the harness builds it
+inline; follow-up agent-followup-7441 (tkt_0RW5QBHZMRJ9JGM2BW1DHGM1KN) gives it
+a pure builder to call instead. The outcome guidance is the real constant,
+spliced as the harness does."""
+
+
+HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT = (
+    pytest.param(
+        'the adjudicator keeps suppressing my fix — why does it think the concern '
+        'was resolved in a prior round?',
+        id='adjudicator',
+    ),
+    pytest.param(
+        'the implementation was reviewed twice and the blocking issues it found '
+        'were stale, please re-check',
+        id='replan',
+    ),
+    pytest.param(
+        'why is the autonomous escalation watcher re-arming twice per rotation?',
+        id='watcher',
+    ),
+    pytest.param(
+        'why does the periodic-census verifier keep hunting for transcripts with find?',
+        id='census_verifier',
+    ),
+    pytest.param(
+        'the census synthesis writer dropped my correction again',
+        id='census_synthesis',
+    ),
+    pytest.param(
+        'why does "You are the periodic-census verifier for the dark-factory '
+        'agent-confusion …" run find over the whole disk?',
+        id='census_verifier_opener_quote',
+    ),
+    pytest.param(
+        'the PRD quotes "You are the periodic-census synthesis writer for the '
+        'dark-factory agent-confusion …" — why does it drop my corrections?',
+        id='census_synthesis_opener_quote',
+    ),
+)
+"""Human turns that name or quote the harness prose prompts without carrying
+a whole marker, so they stay dialogue. The opener quotes stop one word short
+of their marker, as ``CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD`` does, so a
+shortened marker turns them red. Each is a ``pytest.param`` carrying its own
+id, ready to parametrize a single ``text`` argument."""

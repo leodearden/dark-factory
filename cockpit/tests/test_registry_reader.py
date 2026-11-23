@@ -1,7 +1,7 @@
 """Tests for cockpit.registry_reader — scan_sessions + in-memory tick diff.
 
 scan_sessions is the cockpit's sole read path over the C1 session registry
-(orchestrator.session_registry, PRD §6 G5: consumers import the frozen
+(orchestrator.session_records, PRD §6 G5: consumers import the frozen
 contract, never re-derive it). Fail-soft is a hard constraint (PRD §2): a
 corrupt record must never abort the whole scan.
 
@@ -19,18 +19,19 @@ from __future__ import annotations
 
 import os
 
-from orchestrator import session_registry as sr
+from orchestrator import decision_registry as dr
+from orchestrator import session_records
 
 
 def _make_record(**overrides):
     """Build a SessionRecord with sane defaults; overrides tweak individual fields.
 
-    Mirrors orchestrator/tests/test_session_registry.py's _make_record
+    Mirrors orchestrator/tests/_session_record_fixtures.py::make_record's
     helper convention (a fields dict + .update(overrides)).
     """
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': 'unblock:df#2085 slug',
         'role': 'unblock',
         'project': 'df',
@@ -38,7 +39,7 @@ def _make_record(**overrides):
         'start_ts': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 def _make_decision(**overrides):
@@ -53,31 +54,31 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 class TestScanSessions:
     def test_returns_all_seeded_records(self, tmp_path):
         from cockpit.registry_reader import scan_sessions
 
-        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
-        r3 = _make_record(session_slug='c-3', status=sr.Status.IDLE)
+        r1 = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=session_records.Status.AWAITING_INPUT)
+        r3 = _make_record(session_slug='c-3', status=session_records.Status.IDLE)
         for r in (r1, r2, r3):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         result = scan_sessions(tmp_path)
 
         assert {r.session_slug for r in result} == {'a-1', 'b-2', 'c-3'}
-        assert all(isinstance(r, sr.SessionRecord) for r in result)
+        assert all(isinstance(r, session_records.SessionRecord) for r in result)
 
     def test_skips_corrupt_record_without_aborting_scan(self, tmp_path):
         from cockpit.registry_reader import scan_sessions
 
-        good = _make_record(session_slug='good-1', status=sr.Status.RUNNING)
-        sr.write_record(good, root=tmp_path)
+        good = _make_record(session_slug='good-1', status=session_records.Status.RUNNING)
+        session_records.write_record(good, root=tmp_path)
 
-        corrupt_dir = sr.sessions_dir(tmp_path) / 'corrupt-2'
+        corrupt_dir = session_records.sessions_dir(tmp_path) / 'corrupt-2'
         corrupt_dir.mkdir(parents=True)
         (corrupt_dir / 'record.json').write_text('{not valid json')
 
@@ -89,10 +90,10 @@ class TestScanSessions:
         """A slug dir with no record.json at all (FileNotFoundError) is skipped too."""
         from cockpit.registry_reader import scan_sessions
 
-        good = _make_record(session_slug='good-1', status=sr.Status.RUNNING)
-        sr.write_record(good, root=tmp_path)
+        good = _make_record(session_slug='good-1', status=session_records.Status.RUNNING)
+        session_records.write_record(good, root=tmp_path)
 
-        empty_dir = sr.sessions_dir(tmp_path) / 'empty-2'
+        empty_dir = session_records.sessions_dir(tmp_path) / 'empty-2'
         empty_dir.mkdir(parents=True)
 
         result = scan_sessions(tmp_path)
@@ -117,11 +118,11 @@ class TestSessionScanner:
     def test_scan_matches_scan_sessions_for_seeded_dir(self, tmp_path):
         from cockpit.registry_reader import SessionScanner, scan_sessions
 
-        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
-        r3 = _make_record(session_slug='c-3', status=sr.Status.IDLE)
+        r1 = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=session_records.Status.AWAITING_INPUT)
+        r3 = _make_record(session_slug='c-3', status=session_records.Status.IDLE)
         for r in (r1, r2, r3):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         scanner = SessionScanner(root=tmp_path)
         result = scanner.scan()
@@ -137,15 +138,15 @@ class TestSessionScanner:
     def test_scan_reflects_slug_added_since_last_scan(self, tmp_path):
         from cockpit.registry_reader import SessionScanner
 
-        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        sr.write_record(r1, root=tmp_path)
+        r1 = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        session_records.write_record(r1, root=tmp_path)
 
         scanner = SessionScanner(root=tmp_path)
         first = scanner.scan()
         assert {r.session_slug for r in first} == {'a-1'}
 
-        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
-        sr.write_record(r2, root=tmp_path)
+        r2 = _make_record(session_slug='b-2', status=session_records.Status.AWAITING_INPUT)
+        session_records.write_record(r2, root=tmp_path)
 
         second = scanner.scan()
         assert {r.session_slug for r in second} == {'a-1', 'b-2'}
@@ -157,16 +158,16 @@ class TestSessionScanner:
 
         from cockpit.registry_reader import SessionScanner
 
-        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
+        r1 = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=session_records.Status.AWAITING_INPUT)
         for r in (r1, r2):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         scanner = SessionScanner(root=tmp_path)
         first = scanner.scan()
         assert {r.session_slug for r in first} == {'a-1', 'b-2'}
 
-        shutil.rmtree(sr.sessions_dir(tmp_path) / 'a-1')
+        shutil.rmtree(session_records.sessions_dir(tmp_path) / 'a-1')
 
         second = scanner.scan()
         assert {r.session_slug for r in second} == {'b-2'}
@@ -174,7 +175,7 @@ class TestSessionScanner:
 
 class TestScanChangeShortCircuit:
     """Proves SessionScanner's mtime cache: a scan() call must not re-parse
-    (call session_registry.read_record for) a slug whose record.json mtime
+    (call session_records.read_record for) a slug whose record.json mtime
     is unchanged since the previous scan() -- this is the ~4.5s-at-10k-
     sessions cost this task exists to eliminate (see the module docstring).
     """
@@ -185,20 +186,20 @@ class TestScanChangeShortCircuit:
         from cockpit import registry_reader
         from cockpit.registry_reader import SessionScanner
 
-        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        sr.write_record(record, root=tmp_path)
-        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        record = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        session_records.write_record(record, root=tmp_path)
+        path = session_records.record_path_for_slug('a-1', root=tmp_path)
         os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
 
         call_count = 0
-        original_read_record = registry_reader.session_registry.read_record
+        original_read_record = registry_reader.session_records.read_record
 
         def counting_read_record(slug, root=None):
             nonlocal call_count
             call_count += 1
             return original_read_record(slug, root=root)
 
-        monkeypatch.setattr(registry_reader.session_registry, 'read_record', counting_read_record)
+        monkeypatch.setattr(registry_reader.session_records, 'read_record', counting_read_record)
 
         scanner = SessionScanner(root=tmp_path)
         first = scanner.scan()
@@ -218,19 +219,19 @@ class TestScanChangeShortCircuit:
         change."""
         from cockpit.registry_reader import SessionScanner
 
-        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        sr.write_record(record, root=tmp_path)
+        record = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        session_records.write_record(record, root=tmp_path)
 
         scanner = SessionScanner(root=tmp_path)
         first = scanner.scan()
         assert len(first) == 1
-        assert first[0].status == sr.Status.RUNNING
+        assert first[0].status == session_records.Status.RUNNING
 
-        sr.update_status('a-1', root=tmp_path, status=sr.Status.IDLE)
+        session_records.update_status('a-1', root=tmp_path, status=session_records.Status.IDLE)
 
         second = scanner.scan()
         assert len(second) == 1
-        assert second[0].status == sr.Status.IDLE
+        assert second[0].status == session_records.Status.IDLE
 
     def test_same_mtime_different_size_rewrite_is_not_masked_by_cache(self, tmp_path):
         """The cache is keyed on (st_mtime_ns, st_size), not st_mtime_ns
@@ -242,23 +243,23 @@ class TestScanChangeShortCircuit:
         """
         from cockpit.registry_reader import SessionScanner
 
-        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        sr.write_record(record, root=tmp_path)
-        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        record = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        session_records.write_record(record, root=tmp_path)
+        path = session_records.record_path_for_slug('a-1', root=tmp_path)
         os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
 
         scanner = SessionScanner(root=tmp_path)
         first = scanner.scan()
-        assert first[0].status == sr.Status.RUNNING
+        assert first[0].status == session_records.Status.RUNNING
 
         # 'running' (7 chars) -> 'awaiting-input' (14 chars) changes
         # record.json's byte length; re-pin the mtime back to the exact
         # value the cache already holds to force the adversarial collision.
-        sr.update_status('a-1', root=tmp_path, status=sr.Status.AWAITING_INPUT)
+        session_records.update_status('a-1', root=tmp_path, status=session_records.Status.AWAITING_INPUT)
         os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
 
         second = scanner.scan()
-        assert second[0].status == sr.Status.AWAITING_INPUT
+        assert second[0].status == session_records.Status.AWAITING_INPUT
 
     def test_removed_slug_leaves_no_stale_entry_for_a_different_record_at_same_slug(
         self, tmp_path
@@ -275,25 +276,25 @@ class TestScanChangeShortCircuit:
 
         from cockpit.registry_reader import SessionScanner
 
-        first_record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        sr.write_record(first_record, root=tmp_path)
-        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        first_record = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        session_records.write_record(first_record, root=tmp_path)
+        path = session_records.record_path_for_slug('a-1', root=tmp_path)
         os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
 
         scanner = SessionScanner(root=tmp_path)
         first = scanner.scan()
         assert {r.session_slug for r in first} == {'a-1'}
 
-        shutil.rmtree(sr.sessions_dir(tmp_path) / 'a-1')
+        shutil.rmtree(session_records.sessions_dir(tmp_path) / 'a-1')
         assert scanner.scan() == []
 
-        second_record = _make_record(session_slug='a-1', status=sr.Status.AWAITING_INPUT)
-        sr.write_record(second_record, root=tmp_path)
+        second_record = _make_record(session_slug='a-1', status=session_records.Status.AWAITING_INPUT)
+        session_records.write_record(second_record, root=tmp_path)
         os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))  # coincidentally the same mtime
 
         second = scanner.scan()
         assert len(second) == 1
-        assert second[0].status == sr.Status.AWAITING_INPUT
+        assert second[0].status == session_records.Status.AWAITING_INPUT
 
     def test_slug_unreadable_after_caching_is_skipped_not_stale_or_crashing(self, tmp_path):
         """Once a slug has been cached, its record.json can later become
@@ -305,23 +306,23 @@ class TestScanChangeShortCircuit:
         """
         from cockpit.registry_reader import SessionScanner
 
-        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        r2 = _make_record(session_slug='b-2', status=sr.Status.RUNNING)
+        r1 = _make_record(session_slug='a-1', status=session_records.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=session_records.Status.RUNNING)
         for r in (r1, r2):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         scanner = SessionScanner(root=tmp_path)
         first = scanner.scan()
         assert {r.session_slug for r in first} == {'a-1', 'b-2'}
 
         # a-1: record.json vanishes but the slug directory remains.
-        path_a = sr.record_path_for_slug('a-1', root=tmp_path)
+        path_a = session_records.record_path_for_slug('a-1', root=tmp_path)
         path_a.unlink()
         assert path_a.parent.is_dir()
 
         # b-2: record.json is overwritten with invalid JSON (a genuine
         # rewrite, so its mtime naturally advances).
-        path_b = sr.record_path_for_slug('b-2', root=tmp_path)
+        path_b = session_records.record_path_for_slug('b-2', root=tmp_path)
         path_b.write_text('{not valid json')
 
         second = scanner.scan()
@@ -339,7 +340,7 @@ class TestProjectTokenCanonicalization:
     once, in registry_reader's module docstring.
 
     What these tests pin is the MECHANISM: every scanned record's .project
-    goes through session_registry.normalize_project_token (task 3807's one
+    goes through shared.project_id.fold_project_token (task 3807's one
     canonical fold) inside _read_record_soft -- the single parse step shared
     by scan_sessions and SessionScanner.scan -- so both scan paths, and the
     mtime cache behind SessionScanner, yield one bucket by construction.
@@ -349,7 +350,7 @@ class TestProjectTokenCanonicalization:
 
     def _seed_spellings(self, tmp_path):
         for i, project in enumerate(self._SPELLINGS):
-            sr.write_record(
+            session_records.write_record(
                 _make_record(session_slug=f'spelling-{i}', project=project), root=tmp_path
             )
 
@@ -390,14 +391,14 @@ class TestProjectTokenCanonicalization:
         self._seed_spellings(tmp_path)
 
         call_count = 0
-        original_read_record = registry_reader.session_registry.read_record
+        original_read_record = registry_reader.session_records.read_record
 
         def counting_read_record(slug, root=None):
             nonlocal call_count
             call_count += 1
             return original_read_record(slug, root=root)
 
-        monkeypatch.setattr(registry_reader.session_registry, 'read_record', counting_read_record)
+        monkeypatch.setattr(registry_reader.session_records, 'read_record', counting_read_record)
 
         scanner = SessionScanner(root=tmp_path)
         first = scanner.scan()
@@ -411,7 +412,7 @@ class TestProjectTokenCanonicalization:
 
     def test_synthetic_and_basename_tail_tokens_stay_distinct(self, tmp_path):
         """Collapse guard, mirroring
-        test_normalize_project_token_does_not_merge_solar_challenge_platform:
+        shared/tests/test_project_id.py::TestFoldProjectToken::test_never_merges_two_projects_sharing_a_prefix:
         the fold merges SPELLINGS, never distinct projects. The registry's
         long tail of synthetic tokens (fm-neutral-classifier-cwd-*,
         _lane-<n>, run-<hex>, bare task ids) and cwd-basename tokens ('tmp',
@@ -429,8 +430,8 @@ class TestProjectTokenCanonicalization:
             'shared': 'shared',
         }
         for i, raw in enumerate(tail):
-            sr.write_record(_make_record(session_slug=f'tail-{i}', project=raw), root=tmp_path)
-        sr.write_record(_make_record(session_slug='real', project='dark-factory'), root=tmp_path)
+            session_records.write_record(_make_record(session_slug=f'tail-{i}', project=raw), root=tmp_path)
+        session_records.write_record(_make_record(session_slug='real', project='dark-factory'), root=tmp_path)
 
         result = scan_sessions(tmp_path)
 
@@ -444,7 +445,7 @@ class TestProjectTokenCanonicalization:
         than joining any real project's bucket."""
         from cockpit.registry_reader import scan_sessions
 
-        sr.write_record(_make_record(session_slug='unset', project=''), root=tmp_path)
+        session_records.write_record(_make_record(session_slug='unset', project=''), root=tmp_path)
 
         (record,) = scan_sessions(tmp_path)
 
@@ -466,7 +467,7 @@ class TestProjectTokenCanonicalization:
             start_ts='2026-07-07T00:00:00+00:00',
             cwd='/home/leo/src/dark-factory',
         )
-        sr.write_record(written, root=tmp_path)
+        session_records.write_record(written, root=tmp_path)
 
         (scanned,) = scan_sessions(tmp_path)
 
@@ -503,7 +504,7 @@ class TestScanDecisions:
         from cockpit.registry_reader import scan_decisions
 
         for i, project in enumerate(('dark-factory', 'df', 'dark_factory')):
-            assert sr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
+            assert dr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
 
         result = scan_decisions(tmp_path)
 
@@ -520,13 +521,13 @@ class TestScanDecisions:
             project='DARK-Factory',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             manual_boost=3,
             task_id='2085',
             escalation_id='esc-2085-1',
             severity='blocking',
         )
-        assert sr.write_decision(written, root=tmp_path)
+        assert dr.write_decision(written, root=tmp_path)
 
         (scanned,) = scan_decisions(tmp_path)
 
@@ -557,10 +558,10 @@ class TestScanDecisions:
         from cockpit.registry_reader import scan_decisions
 
         for i, project in enumerate(('dark-factory', 'df', 'dark_factory', 'other-project')):
-            assert sr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
+            assert dr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
 
         result = scan_decisions(tmp_path)
-        expected = sr.list_decisions(tmp_path)
+        expected = dr.list_decisions(tmp_path)
 
         assert [d.id for d in result] == [d.id for d in expected]
 
@@ -570,8 +571,8 @@ class TestBuildSnapshot:
         from cockpit.registry_reader import build_snapshot
 
         records = [
-            _make_record(session_slug='a-1', status=sr.Status.RUNNING),
-            _make_record(session_slug='b-2', status=sr.Status.IDLE),
+            _make_record(session_slug='a-1', status=session_records.Status.RUNNING),
+            _make_record(session_slug='b-2', status=session_records.Status.IDLE),
         ]
 
         snapshot = build_snapshot(records)
@@ -604,13 +605,13 @@ class TestBuildSnapshot:
 
         first = _make_record(
             session_slug='a-1',
-            status=sr.Status.AWAITING_INPUT,
-            question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
+            status=session_records.Status.AWAITING_INPUT,
+            question=session_records.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
         )
         second = _make_record(
             session_slug='a-1',
-            status=sr.Status.AWAITING_INPUT,
-            question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
+            status=session_records.Status.AWAITING_INPUT,
+            question=session_records.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
         )
 
         assert build_snapshot([first]) != build_snapshot([second])
@@ -621,8 +622,8 @@ class TestSnapshotChanged:
         from cockpit.registry_reader import build_snapshot, snapshot_changed
 
         records = [
-            _make_record(session_slug='a-1', status=sr.Status.RUNNING),
-            _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT),
+            _make_record(session_slug='a-1', status=session_records.Status.RUNNING),
+            _make_record(session_slug='b-2', status=session_records.Status.AWAITING_INPUT),
         ]
 
         old = build_snapshot(records)
@@ -656,8 +657,8 @@ class TestSnapshotChanged:
             [
                 _make_record(
                     session_slug='a-1',
-                    status=sr.Status.AWAITING_INPUT,
-                    question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
+                    status=session_records.Status.AWAITING_INPUT,
+                    question=session_records.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
                 )
             ]
         )
@@ -665,8 +666,8 @@ class TestSnapshotChanged:
             [
                 _make_record(
                     session_slug='a-1',
-                    status=sr.Status.AWAITING_INPUT,
-                    question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
+                    status=session_records.Status.AWAITING_INPUT,
+                    question=session_records.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
                 )
             ]
         )
@@ -697,9 +698,9 @@ class TestSnapshotChanged:
         """status running -> awaiting-input on the same slug must diff as changed."""
         from cockpit.registry_reader import build_snapshot, snapshot_changed
 
-        old = build_snapshot([_make_record(session_slug='a-1', status=sr.Status.RUNNING)])
+        old = build_snapshot([_make_record(session_slug='a-1', status=session_records.Status.RUNNING)])
         new = build_snapshot(
-            [_make_record(session_slug='a-1', status=sr.Status.AWAITING_INPUT)]
+            [_make_record(session_slug='a-1', status=session_records.Status.AWAITING_INPUT)]
         )
 
         assert snapshot_changed(old, new) is True

@@ -13,7 +13,8 @@ import codecs
 import json
 import locale
 import logging
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -72,6 +73,11 @@ class TestStaticContract:
 
     def test_legal_transitions_excludes_illegal_edge(self):
         assert (LaneState.RELEASED, LaneState.IN_USE) not in LEGAL_TRANSITIONS
+
+    def test_in_use_returns_to_assigned_when_last_child_exits(self):
+        # Leaf δ (task 3076): IN_USE is a liveness marker over an ASSIGNED
+        # lane, so the last live child exiting must be able to step it back.
+        assert (LaneState.IN_USE, LaneState.ASSIGNED) in LEGAL_TRANSITIONS
 
     def test_quarantined_has_exactly_one_sanctioned_recycle_edge(self):
         # The ONE sanctioned exit from QUARANTINED: recycle a quarantined slot
@@ -140,6 +146,31 @@ class TestLegalRoundtrip:
         assert record.title is None
         assert record.branch == 'task/foo'  # branch is NOT cleared
         assert lifecycle.read(lane) == record
+
+    def test_in_use_round_trips_back_to_assigned_keeping_the_assignment(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/2254')
+        lifecycle.transition(lane, LaneState.ASSIGNED, task_id='2254', title='demo')
+        in_use = lifecycle.transition(lane, LaneState.IN_USE)
+
+        record = lifecycle.transition(lane, LaneState.ASSIGNED)
+
+        assert record.state == LaneState.ASSIGNED
+        assert lifecycle.read(lane) == record
+        assert (record.task_id, record.title, record.branch) == (
+            in_use.task_id, in_use.title, in_use.branch,
+        ) == ('2254', 'demo', 'task/2254')
+        assert datetime.fromisoformat(record.updated_at) > datetime.fromisoformat(
+            in_use.updated_at,
+        )
+
+        released = lifecycle.transition(lane, LaneState.RELEASED)
+        assert released.state == LaneState.RELEASED
+        assert released.task_id is None
 
     def test_record_file_path_and_json_shape(self, tmp_path: Path):
         lifecycle = _lifecycle(tmp_path)
@@ -237,6 +268,52 @@ class TestIllegalEscalate:
 
         with pytest.raises(IllegalLaneTransition):
             lifecycle.transition(lane, LaneState.IN_USE)
+
+
+def _in_use_lane(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    """Drive a lane to IN_USE for task 42 and return its path."""
+    lane = tmp_path / '_lane-0'
+    lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+    lifecycle.transition(lane, LaneState.REGISTERED, branch='task/42')
+    lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42', title='demo')
+    lifecycle.transition(lane, LaneState.IN_USE)
+    return lane
+
+
+class TestInUseReturnEdgeKeepsTheAssignment:
+    """Leaf δ (task 3076) legalised IN_USE -> ASSIGNED for the last live child
+    exiting. transition() is the one mutator, so it is where that edge is
+    refused when it would hand the lane to another task."""
+
+    @pytest.mark.parametrize('other_task_id', ['99', None])
+    def test_a_task_id_change_raises_escalates_and_writes_nothing(
+        self, tmp_path: Path, other_task_id: str | None,
+    ):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        lifecycle = _lifecycle(tmp_path, escalation_queue=queue)
+        lane = _in_use_lane(tmp_path, lifecycle)
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        with pytest.raises(IllegalLaneTransition, match='IN_USE for task'):
+            lifecycle.transition(lane, LaneState.ASSIGNED, task_id=other_task_id)
+
+        assert record_path.read_bytes() == before_bytes
+        escalations = queue.get_by_task(f'lane-lifecycle-{lane.name}')
+        assert len(escalations) == 1
+        assert (escalations[0].agent_role, escalations[0].level) == (
+            ESCALATION_SENTINEL_ROLE, 2,
+        )
+
+    def test_naming_the_task_it_already_holds_is_legal(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _in_use_lane(tmp_path, lifecycle)
+
+        record = lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42')
+
+        assert (record.state, record.task_id, record.title) == (
+            LaneState.ASSIGNED, '42', 'demo',
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +588,132 @@ class TestNoteAssigned:
 
         # Never silent-steal: the record is untouched on conflict.
         assert record_path.read_bytes() == before_bytes
+
+    def test_in_use_different_task_raises_escalates_and_leaves_record_unchanged(
+        self, tmp_path: Path,
+    ):
+        # Leaf δ made IN_USE -> ASSIGNED legal, so without transition()'s
+        # re-key guard task 99 could silently take a lane task 42 has a live
+        # child in.
+        queue = EscalationQueue(tmp_path / 'escalations')
+        lifecycle = _lifecycle(tmp_path, escalation_queue=queue)
+        lane = _in_use_lane(tmp_path, lifecycle)
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        with pytest.raises(IllegalLaneTransition):
+            lifecycle.note_assigned(lane, task_id='99', branch='task/99')
+
+        assert record_path.read_bytes() == before_bytes
+        escalations = queue.get_by_task(f'lane-lifecycle-{lane.name}')
+        assert len(escalations) == 1
+        assert escalations[0].agent_role == ESCALATION_SENTINEL_ROLE
+        assert escalations[0].level == 2
+
+    def test_in_use_same_task_is_idempotent_noop_and_stays_in_use(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _in_use_lane(tmp_path, lifecycle)
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        record = lifecycle.note_assigned(lane, task_id='42')
+
+        assert record.state == LaneState.IN_USE
+        assert record.task_id == '42'
+        assert record_path.read_bytes() == before_bytes
+
+
+# ---------------------------------------------------------------------------
+# refresh_assigned — the REUSE-dispatch activity stamp (task 7863): rewrites
+# only updated_at, the age clock warm-lane-gc.sh's record gate reads, on a
+# record the caller already holds; refuses anything else without writing.
+# ---------------------------------------------------------------------------
+
+
+def _backdate(lifecycle: LaneLifecycle, lane: Path, *, days: int) -> str:
+    """Rewrite *lane*'s on-disk updated_at to *days* ago; return that stamp."""
+    path = lifecycle.state_dir / f'{lane.name}.json'
+    record = LaneRecord.from_json(path.read_text(encoding='utf-8'))
+    stamp = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    path.write_text(replace(record, updated_at=stamp).to_json(), encoding='utf-8')
+    return stamp
+
+
+def _assigned_lane(tmp_path: Path, lifecycle: LaneLifecycle, task_id: str) -> Path:
+    lane = tmp_path / '_lane-0'
+    lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+    lifecycle.transition(lane, LaneState.REGISTERED, branch=f'task/{task_id}')
+    lifecycle.transition(lane, LaneState.ASSIGNED, task_id=task_id, title='demo')
+    return lane
+
+
+def _assert_recent(stamp: str, *, newer_than: str) -> None:
+    moment = datetime.fromisoformat(stamp)
+    assert moment > datetime.fromisoformat(newer_than)
+    assert abs(datetime.now(UTC) - moment) < timedelta(minutes=5)
+
+
+def _no_record(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    return tmp_path / '_lane-0'
+
+
+def _held_by_other_task(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    return _assigned_lane(tmp_path, lifecycle, '99')
+
+
+def _quarantined_holding_task(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    lane = _assigned_lane(tmp_path, lifecycle, '42')
+    lifecycle.transition(lane, LaneState.QUARANTINED)
+    return lane
+
+
+class TestRefreshAssigned:
+    def test_assigned_same_task_restamps_updated_at_and_keeps_every_other_field(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _assigned_lane(tmp_path, lifecycle, '42')
+        old = _backdate(lifecycle, lane, days=30)
+        before = lifecycle.read(lane)
+
+        returned = lifecycle.refresh_assigned(lane, task_id='42')
+
+        _assert_recent(returned.updated_at, newer_than=old)
+        assert replace(returned, updated_at=old) == before
+        assert lifecycle.read(lane) == returned
+
+    def test_in_use_same_task_restamps_and_stays_in_use(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _assigned_lane(tmp_path, lifecycle, '42')
+        lifecycle.transition(lane, LaneState.IN_USE)
+        old = _backdate(lifecycle, lane, days=30)
+        before = lifecycle.read(lane)
+
+        returned = lifecycle.refresh_assigned(lane, task_id='42')
+
+        assert returned.state == LaneState.IN_USE
+        _assert_recent(returned.updated_at, newer_than=old)
+        assert replace(returned, updated_at=old) == before
+        assert lifecycle.read(lane) == returned
+
+    @pytest.mark.parametrize(
+        'make_lane',
+        [_no_record, _released_lane, _held_by_other_task, _quarantined_holding_task],
+        ids=['absent', 'released', 'assigned-to-99', 'quarantined'],
+    )
+    def test_refuses_a_record_task_does_not_hold(self, tmp_path: Path, make_lane):
+        lifecycle = _lifecycle(tmp_path)
+        lane = make_lane(tmp_path, lifecycle)
+        record_path = lifecycle.state_dir / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes() if record_path.exists() else None
+
+        with pytest.raises(IllegalLaneTransition, match="'42'"):
+            lifecycle.refresh_assigned(lane, task_id='42')
+
+        after_bytes = record_path.read_bytes() if record_path.exists() else None
+        assert after_bytes == before_bytes
 
 
 # ---------------------------------------------------------------------------

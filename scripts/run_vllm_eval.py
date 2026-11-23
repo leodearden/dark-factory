@@ -33,7 +33,7 @@ from typing import Any
 from uuid import uuid4
 
 sys.path.insert(0, "/home/leo/src/runpod-toolkit")
-sys.path.insert(0, "/home/leo/src/dark-factory/orchestrator/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator" / "src"))
 from orchestrator.evals.configs import (
     FINAL_RUN_CONFIGS,
     VLLM_EVAL_CONFIGS,
@@ -253,9 +253,10 @@ def build_eval_env() -> dict[str, str]:
 
     THE ROSTER. Evals have NO dedicated account. They draw on the same
     shared fleet pool as every other invocation and tolerate cap/429
-    events via ``invoke_with_cap_retry``'s 48h patience plus session
-    ``--resume`` (see ``orchestrator.evals.runner``), rather than via a
-    private reserve. Account A is reserved for INTERACTIVE use only —
+    events via ``invoke_with_cap_retry``'s shared default cap-wait patience
+    (``shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS``)
+    plus session ``--resume`` (see ``orchestrator.evals.runner``), rather
+    than via a private reserve. Account A is reserved for INTERACTIVE use only —
     Leo's own sessions exhaust its weekly cap most weeks, so it never
     could serve as that reserve (ruling 2026-08-30, tasks 4741/4945).
 

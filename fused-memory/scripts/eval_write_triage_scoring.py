@@ -48,9 +48,6 @@ contradiction detector was validated in both directions.
 """
 from __future__ import annotations
 
-import importlib.util
-import sys
-import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,29 +61,12 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
 )
+from fused_memory.utils.script_loader import load_script
 
 _CALIBRATE_PATH = Path(__file__).resolve().parent / 'calibrate_write_triage.py'
 
 
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_calibrate = _load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
+_calibrate = load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
 
 
 # Alpha's vocabulary, re-exported rather than re-spelled.
@@ -180,7 +160,7 @@ PROVENANCE_KEYS: tuple[str, ...] = (
     'self_retrieved',
 )
 
-#: The bands :func:`decide_band` routes to, in report order. NOT
+#: The bands :func:`decide_band` labels and ``route_band`` routes to, in report order. NOT
 #: :data:`EVAL_OUTCOMES`: ``judge`` is a routing decision rather than a triage
 #: outcome and is absent from ``TRIAGE_OUTCOMES``, while ``amended`` and
 #: ``contested`` are outcomes no band can reach on its own.
@@ -492,8 +472,8 @@ def score_attachments(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _band_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
-    """How many of *rows* each band answered, in :data:`EVAL_BANDS` order.
+def _band_counts(rows: Sequence[Mapping[str, Any]], field: str = 'band') -> dict[str, int]:
+    """How many of *rows* carry each band in *field*, in :data:`EVAL_BANDS` order.
 
     A band outside the vocabulary RAISES rather than widening the row, for the
     same reason :func:`score_cases` refuses an absorbed verdict: the markdown
@@ -502,14 +482,51 @@ def _band_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     """
     counts = dict.fromkeys(EVAL_BANDS, 0)
     for row in rows:
-        band = str(row['band'])
+        band = str(row[field])
         if band not in counts:
             raise ValueError(
-                f'band {band!r} is outside {list(EVAL_BANDS)}: an absorbed band '
-                f'grows a row that render_markdown never emits',
+                f'{field} {band!r} is outside {list(EVAL_BANDS)}: an absorbed '
+                f'{field} grows a row that render_markdown never emits',
             )
         counts[band] += 1
     return counts
+
+
+def score_routing(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Count what ``route_band`` sent the judge, beside the cosine band that labelled it.
+
+    :func:`score_attachments` reads each row's ``band``, the ``decide_band``
+    label; this reads its ``routed``. ``restate_band`` splits the writes at or
+    above ``t_high`` into those the judge was asked about and those kept
+    ``restated`` as near-verbatim repeats, and ``judged`` is the judge's
+    accuracy over every case it saw. Pure counting over the per-case dump.
+    """
+    route_split = {
+        name: _band_counts([r for r in rows if r['expected_class'] == name], 'routed')
+        for name in EVAL_CLASSES
+    }
+    route_split_all = _band_counts(rows, 'routed')
+    judged = [r for r in rows if r['routed'] == OUTCOME_JUDGE]
+    restate = [r for r in rows if r['band'] == OUTCOME_RESTATED]
+    restate_judged = [r for r in restate if r['routed'] == OUTCOME_JUDGE]
+    restate_correct = [r for r in restate_judged if r['correct']]
+    judged_correct = [r for r in judged if r['correct']]
+    return {
+        'route_split': route_split,
+        'route_split_all': route_split_all,
+        'restate_band': {
+            'n': len(restate),
+            'judged': len(restate_judged),
+            'verbatim': sum(1 for r in restate if r['routed'] == OUTCOME_RESTATED),
+            'correct': len(restate_correct),
+            'accuracy': _rate(len(restate_correct), len(restate_judged)),
+        },
+        'judged': {
+            'n': len(judged),
+            'correct': len(judged_correct),
+            'accuracy': _rate(len(judged_correct), len(judged)),
+        },
+    }
 
 
 def _spend(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -626,6 +643,7 @@ def case_row(
         ),
         'canonical_present': case['canonical_present'],
         'band': case['band'],
+        'routed': case['routed'],
         'similarity': case['similarity'],
         'verdict': answer.verdict,
         'outcome': answer.outcome,
@@ -717,21 +735,26 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
         'the corpus. Those are KEPT in the population, because production '
         'meets them.',
         'Every figure here is measured over the population production would '
-        'actually route: the slate, the band winner and the band all come '
-        'from a live retrieval through `retrieve_candidates` / `decide_band` / '
-        '`select_judge_candidates` at this config\'s `candidate_k`, `t_high` '
-        'and `t_low`, and the judge was asked ONLY for the middle band. So '
-        '`per_class` MIXES bands — a deterministic `restated` and a below-floor '
-        '`stored` are counted there without an LLM having seen the case — and '
-        '`production_shape.middle_band` is the judge\'s own accuracy. '
+        'actually route: the slate, the band winner, the cosine band and the '
+        'route all come from a live retrieval through `retrieve_candidates` / '
+        '`decide_band` / `route_band` / `select_judge_candidates` at this '
+        'config\'s `candidate_k`, `t_high` and `t_low`, and the judge was asked '
+        'for every case `route_band` sends it: the [t_low, t_high) middle band, '
+        'plus each restate-band write that does not repeat its band winner, or '
+        'the winner\'s canonical, near-verbatim. So `per_class` MIXES routes — '
+        'a near-verbatim `restated` and a below-floor `stored` are counted there '
+        'without an LLM having seen the case. `routing.judged` is the judge\'s '
+        'own accuracy; `production_shape.middle_band` is its accuracy on the '
+        'cosine middle band, and `routing.restate_band` its accuracy on judged '
+        'high-cosine writes. '
         'A verdict that is correct for its curator label can still attach to '
         'ANOTHER RECORD, which `per_class` cannot show. '
         '`production_shape.duplicate_attach.strict` and '
         '`production_shape.wrong_record_attach` score `attach_target_id`, the '
-        'record production files the write against. For a middle-band attach '
+        'record production files the write against. For a judged attach '
         'that is the candidate the judge NAMED, hoisted to its canonical '
         '(`judged_candidate_id`); otherwise it is the band winner '
-        '(`band_winner_id`). So for the middle band `strict` is recall at '
+        '(`band_winner_id`). So for a judged write `strict` is recall at '
         '`judge_candidate_count`, not at 1. An artifact from a judge that named '
         'no candidate (before task 5794) attached every judged write to the '
         'band winner, and its rows carry no `judged_candidate_id`.',
@@ -744,20 +767,20 @@ def caveats_for(slate_mode: Any) -> list[str]:
     return [*CAVEATS, *MODE_CAVEATS.get(str(slate_mode), MODE_CAVEATS[SLATE_SEEDED])]
 
 
-def _judged_share(label: str, production_shape: Mapping[str, Any] | None) -> str:
-    """How many *label* cases reached the judge, where the run measured a band split."""
-    band_split = (production_shape or {}).get('band_split') or {}
-    if label not in band_split:
+def _judged_share(label: str, routing: Mapping[str, Any] | None) -> str:
+    """How many *label* cases reached the judge, where the run measured a route split."""
+    route_split = (routing or {}).get('route_split') or {}
+    if label not in route_split:
         return ''
-    return f' (of the {band_split[label][OUTCOME_JUDGE]} the judge saw)'
+    return f' (of the {route_split[label][OUTCOME_JUDGE]} the judge saw)'
 
 
 def pseudo_contradiction_caveat(
-    scored: Mapping[str, Any], production_shape: Mapping[str, Any] | None,
+    scored: Mapping[str, Any], routing: Mapping[str, Any] | None,
 ) -> str:
     """How the pseudo_contradiction class read under the shipped `contests` definition.
 
-    Derived from the scored confusion row, and from the band split where the
+    Derived from the scored confusion row, and from the route split where the
     run measured one, so the counts have one source. It reports the reading
     and asserts nothing about whether it is right: the records keep the labels
     they were adjudicated under and are still scored against them.
@@ -771,7 +794,7 @@ def pseudo_contradiction_caveat(
         "is wrong, outdated or different (Leo's ruling 2026-09-30, "
         "plans/write-triage-flip-readiness-prd.md §11.3 C1'') — the judge "
         f'answered `contested` on {row[OUTCOME_CONTESTED]} of {n} {label} '
-        f'cases{_judged_share(label, production_shape)}; all outcomes: '
+        f'cases{_judged_share(label, routing)}; all outcomes: '
         f'{breakdown}. These records were '
         'adjudicated NOT contradictions under the EARLIER definition ("cannot '
         'be true at the same time"), and this report still scores `contested` '
@@ -783,7 +806,7 @@ def pseudo_contradiction_caveat(
 
 def duplicate_contested_caveat(
     scored: Mapping[str, Any],
-    production_shape: Mapping[str, Any] | None,
+    routing: Mapping[str, Any] | None,
     judge_model: Any,
 ) -> str:
     """How often a duplicate read as `contested`, and on which judge.
@@ -799,7 +822,7 @@ def duplicate_contested_caveat(
     n = scored['per_class'][label]['n']
     return (
         f'The judge, `{judge_model}`, answered `contested` on {contested} of '
-        f'{n} {label} cases{_judged_share(label, production_shape)}. The '
+        f'{n} {label} cases{_judged_share(label, routing)}. The '
         'curator labelled each duplicate the same claim as its canonical, so '
         'this report scores `contested` on one as wrong; with triage enabled, '
         'each is a write this judge would flag `contested` for a human to '
@@ -819,6 +842,7 @@ def build_report(
     scored: Mapping[str, Any],
     provenance: Mapping[str, Any],
     production_shape: Mapping[str, Any] | None = None,
+    routing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON-serializable accuracy report.
 
@@ -867,15 +891,18 @@ def build_report(
         # be right for its label while the attach lands on another record.
         # `None` means the run did not measure it, never that it measured zero.
         'production_shape': dict(production_shape) if production_shape else None,
+        # What `route_band` sent the judge (`score_routing`); `None` when the
+        # run did not measure it.
+        'routing': dict(routing) if routing is not None else None,
         'contested_ground_truth': {
             'available': False,
             'reason': CONTESTED_GROUND_TRUTH_REASON,
         },
         'caveats': [
             *caveats_for(run_provenance.get('slate_mode')),
-            pseudo_contradiction_caveat(scored, production_shape),
+            pseudo_contradiction_caveat(scored, routing),
             duplicate_contested_caveat(
-                scored, production_shape, run_provenance['judge_model'],
+                scored, routing, run_provenance['judge_model'],
             ),
         ],
         'provenance': run_provenance,
@@ -913,22 +940,50 @@ def _render_production_shape(report: Mapping[str, Any]) -> list[str]:
         f'{in_slate["n"]} = `{in_slate["rate"]}`',
         f'- cases whose canonical is no longer in the corpus: '
         f'`{shape["canonical_absent"]}`',
-        f'- judge accuracy restricted to the MIDDLE band: {middle["correct"]}/'
-        f'{middle["n"]} = `{middle["accuracy"]}`',
+        f'- judge accuracy restricted to the cosine MIDDLE band [t_low, t_high): '
+        f'{middle["correct"]}/{middle["n"]} = `{middle["accuracy"]}`',
         f'- LLM calls made: `{shape["judge_calls"]}`, tokens: '
         f'`{shape["judge_spend"]["total_tokens"]}`',
-        '', '### Band split — expected class by the band that answered', '',
+        '', '### Band split — expected class by the cosine band (`decide_band`) it fell in', '',
+        *_split_table(shape['band_split']),
+    ]
+    return lines
+
+
+def _split_table(split: Mapping[str, Mapping[str, int]]) -> list[str]:
+    """One row per class of *split*'s counts, one column per :data:`EVAL_BANDS` entry."""
+    lines = [
         '| class | ' + ' | '.join(EVAL_BANDS) + ' |',
         '|---' * (len(EVAL_BANDS) + 1) + '|',
     ]
     for name in EVAL_CLASSES:
-        row = shape['band_split'][name]
+        row = split[name]
         lines.append(
-            f'| {name} | ' + ' | '.join(
-                str(row.get(band, 0)) for band in EVAL_BANDS
-            ) + ' |',
+            f'| {name} | ' + ' | '.join(str(row.get(band, 0)) for band in EVAL_BANDS) + ' |',
         )
     return lines
+
+
+def _render_routing(report: Mapping[str, Any]) -> list[str]:
+    """What ``route_band`` sent the judge, or a statement that the run did not measure it."""
+    heading = ['', '## Routing — what `route_band` sent the judge', '']
+    routing = report.get('routing')
+    if not routing:
+        return [*heading, '- not measured by this run.']
+    restate = routing['restate_band']
+    judged = routing['judged']
+    return [
+        *heading,
+        f'- restate-band (cosine >= t_high) writes sent to the judge: '
+        f'{restate["judged"]}/{restate["n"]}; kept `restated` as near-verbatim '
+        f'repeats of their band winner: {restate["verbatim"]}/{restate["n"]}',
+        f'- judge accuracy on the restate-band writes it was sent: '
+        f'{restate["correct"]}/{restate["judged"]} = `{restate["accuracy"]}`',
+        f'- judge accuracy on every case it saw: '
+        f'{judged["correct"]}/{judged["n"]} = `{judged["accuracy"]}`',
+        '', '### Route split — expected class by the route `route_band` took', '',
+        *_split_table(routing['route_split']),
+    ]
 
 
 def render_markdown(report: Mapping[str, Any]) -> str:
@@ -960,6 +1015,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         )
 
     lines += _render_production_shape(report)
+    lines += _render_routing(report)
 
     split = report['duplicate_outcome_split']
     lines += [

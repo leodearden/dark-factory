@@ -382,7 +382,7 @@ _needs_escalation = pytest.mark.skipif(
 
 
 def _pending(tmp_path: Path) -> list:
-    from escalation.queue import EscalationQueue  # noqa: PLC0415
+    from escalation.queue import EscalationQueue
 
     return EscalationQueue(tmp_path / 'data' / 'escalations').get_pending()
 
@@ -464,7 +464,7 @@ class TestEscalation:
 
 class TestEscalationFailSoft:
     @pytest.mark.asyncio
-    async def test_without_the_escalation_package_the_warning_still_fires(
+    async def test_without_the_escalation_package_both_the_breach_and_the_lost_escalation_warn(
         self, journal, tmp_path, caplog, monkeypatch
     ):
         monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
@@ -478,7 +478,10 @@ class TestEscalationFailSoft:
         breaches = await alarm.check()
 
         assert [b.ceiling for b in breaches] == [JournalCeiling.FILE_SIZE]
-        assert len(_warnings(caplog)) == 1
+        messages = _warnings(caplog)
+        assert len(messages) == 2
+        assert sum('file-size ceiling' in m for m in messages) == 1
+        assert sum('escalation package unavailable' in m for m in messages) == 1
 
 
 class _FakeClock:

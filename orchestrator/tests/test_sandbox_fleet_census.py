@@ -9,9 +9,9 @@ portable, and each sibling's flip is held by that project's own registry (D6),
 so it is re-measured by hand; ``docs/sandbox-fleet-status.md`` carries the
 dated census and the recipe.
 
-The eval runner's exception (D12) is pinned by
-``orchestrator/tests/test_eval_profile.py::test_build_eval_orch_config_applies_profile_and_inherits_base``
-and is not re-asserted here (INV-5).
+Eval cells inherit the base config's sandbox (D12 retired, task 9849). That
+inheritance is pinned by ``orchestrator/tests/test_eval_corpus_sandbox.py``
+(boundary row 28) and is not re-asserted here (INV-5).
 
 The forward check compares the raw committed mapping, never a ``SandboxConfig``
 built from it, because the model defaults ``enabled`` to True and ignores

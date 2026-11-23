@@ -363,7 +363,7 @@ def _stale_evidence_mark_done(
     callable so each test assigns it directly onto its own fake scheduler's
     ``mark_done``.
     """
-    async def _reject(task_id, *, kind, sha, note=None):  # noqa: ARG001
+    async def _reject(task_id, *, kind, sha, note=None):
         raise StaleEvidenceRejection(
             task_id=task_id,
             evidence_commit=evidence_commit,

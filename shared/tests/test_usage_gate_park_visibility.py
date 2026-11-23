@@ -1,11 +1,11 @@
 """A fully-capped park must be VISIBLE, not silent (task 4945).
 
-THE GAP THIS CLOSES, named by the code itself. ``orchestrator/evals/
-runner.py`` documents that ``cap_wait_sanity_secs`` is consulted at exactly
-one place — ``_check_cap_wait``, in the cap-hit branch AFTER an invocation
-returned — so "the unbounded ``_open.wait()`` above is out of its reach",
-and filed making a fully-capped park visible as a follow-up. This is that
-follow-up.
+THE GAP THIS CLOSES. ``orchestrator/evals/runner.py`` documented that
+``cap_wait_sanity_secs`` was consulted only in the cap-hit branch AFTER an
+invocation returned, so the gate's fully-capped park was out of its reach,
+and filed making that park visible as a follow-up. This is that follow-up.
+Task 4002 has since bounded the park too; ``test_park_free_invocation.py``
+pins that.
 
 MEASURED BEFORE THE FIX: ``UsageGate.before_invoke`` logged
 ``'All accounts capped — waiting for any to reopen'`` exactly ONCE at INFO
@@ -32,6 +32,10 @@ event schema rather than a second bespoke one, and the sibling defect that
 shape already survived — ``test_cap_retry.py::
 test_cap_wait_log_survives_non_serializable_soonest_resets_at`` — tells
 this suite what it has to pin too.
+
+THE SCOPED PARK (task 7243). The file also pins the ``scoped_park``
+heartbeat of the scoped (model-scoped cap) park, where a caller waits on one
+scope while the fleet stays open and the all-capped park never runs.
 """
 
 from __future__ import annotations
@@ -47,13 +51,16 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
-from _usage_gate_test_helpers import make_gate
+from _usage_gate_test_helpers import SCOPE, make_gate
 
 from shared import usage_gate as usage_gate_mod
+from shared.invocation_outcome import AuthFailed, CapHit
 
 LOGGER_NAME = 'shared.usage_gate'
 
 PARK_EVENT = 'all_capped_park'
+
+SCOPE_PARK_EVENT = 'scoped_park'
 
 # The one-shot INFO line that predates this heartbeat. It fires once per
 # pass through the selection loop, which makes it a direct COUNT of loop
@@ -67,8 +74,10 @@ _LOOP_STALL_MARGIN_SECS = 0.1
 _PARK_VALVE_SECS = 10.0
 
 
-def _park_records(caplog) -> list[tuple[logging.LogRecord, dict]]:
-    """Every structured ``all_capped_park`` record, with its decoded payload."""
+def _park_records(
+    caplog, event: str = PARK_EVENT
+) -> list[tuple[logging.LogRecord, dict]]:
+    """Every structured *event* record, with its decoded payload."""
     found = []
     for rec in caplog.records:
         if rec.name != LOGGER_NAME:
@@ -77,7 +86,7 @@ def _park_records(caplog) -> list[tuple[logging.LogRecord, dict]]:
             payload = json.loads(rec.getMessage())
         except (ValueError, TypeError):
             continue  # the co-occurring plain-string logs are expected
-        if isinstance(payload, dict) and payload.get('event') == PARK_EVENT:
+        if isinstance(payload, dict) and payload.get('event') == event:
             found.append((rec, payload))
     return found
 
@@ -99,6 +108,27 @@ def _all_capped_gate(names: tuple[str, ...] = ('a', 'b')):
         acct.resets_at = datetime.now(UTC) + timedelta(hours=5)
     assert gate.is_paused, 'fixture must actually be parked, or every assertion is vacuous'
     return gate
+
+
+async def _scope_exhausted_gate(
+    resets_in: tuple[timedelta, ...] = (timedelta(hours=5), timedelta(hours=3)),
+):
+    """A gate whose every account is capped for SCOPE alone, one reset per account.
+
+    Capped through the public slot API: each scoped slot lands on the next
+    account with headroom, so the first delta goes to a and the next to b.
+    Returns the gate and the soonest reset it reported.
+    """
+    gate = make_gate(['a', 'b'], wait_for_reset=False)
+    now = datetime.now(UTC)
+    resets = [now + delta for delta in resets_in]
+    for resets_at in resets:
+        async with gate.invoke_slot(scope=SCOPE) as slot:
+            slot.report(CapHit(resets_at=resets_at, reason='test cap'))
+    assert not gate.is_paused, (
+        'fixture must leave the fleet open, or this is the all-capped park'
+    )
+    return gate, min(resets)
 
 
 async def _until(
@@ -123,17 +153,18 @@ async def _park_for(
     gate,
     seconds: float,
     *,
+    scope: str | None = None,
     until: Callable[[], bool] | None = None,
     valve_secs: float = _PARK_VALVE_SECS,
 ) -> None:
-    """Drive ``before_invoke`` into the park, hold it, then abandon it.
+    """Drive ``before_invoke`` for *scope* into the park, hold it, then abandon it.
 
     The park is held for at least *seconds*. When *until* is given it is held
     further, until the caller's precondition has actually been observed rather
     than for a fixed span, bounded by *valve_secs*. A park that returns early
     fails. The park is abandoned by cancellation, the routine production path.
     """
-    park = asyncio.create_task(gate.before_invoke())
+    park = asyncio.create_task(gate.before_invoke(scope=scope))
     try:
         await _until(
             lambda: park.done() or until is None or until(),
@@ -143,8 +174,8 @@ async def _park_for(
         if park.done():
             lease = park.result()
             raise AssertionError(
-                f'before_invoke returned early ({lease!r}) while every account '
-                'was capped: the park must block until an account reopens'
+                f'before_invoke returned early ({lease!r}) while no account was '
+                'admissible: the park must block until an account reopens'
             )
     finally:
         park.cancel()
@@ -195,6 +226,20 @@ def fast_heartbeat(monkeypatch):
     def _set(interval: float) -> float:
         monkeypatch.setattr(
             usage_gate_mod, '_ALL_CAPPED_PARK_LOG_INTERVAL_SECS', interval
+        )
+        return interval
+
+    return _set
+
+
+@pytest.fixture
+def fast_scope_heartbeat(monkeypatch):
+    """Shrink the scoped park's heartbeat interval, as ``fast_heartbeat`` does
+    the fleet park's."""
+
+    def _set(interval: float) -> float:
+        monkeypatch.setattr(
+            usage_gate_mod, '_SCOPE_PARK_LOG_INTERVAL_SECS', interval
         )
         return interval
 
@@ -423,6 +468,32 @@ class TestAllCappedParkIsVisible:
             f'{[p for _, p in _park_records(caplog)]!r}'
         )
 
+    async def test_the_heartbeat_names_which_accounts_are_capped_and_which_auth_failed(
+        self, caplog, fast_heartbeat
+    ) -> None:
+        """A capped account waits on a reset; an auth-failed one never reopens
+        without an operator. Counted together they read the same."""
+        gate = make_gate(['a', 'b'], auth_reprobe_enabled=False)
+        try:
+            async with gate.invoke_slot() as slot:
+                slot.report(CapHit(
+                    resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap',
+                ))
+            async with gate.invoke_slot() as slot:
+                slot.report(AuthFailed(status=401))
+            assert gate.is_paused, 'fixture must actually be parked'
+            fast_heartbeat(0.02)
+
+            await _park_for(gate, 0.1)
+        finally:
+            await gate.shutdown()
+
+        records = _park_records(caplog)
+        assert records, 'no heartbeat emitted — cannot assert what it names'
+        _, payload = records[0]
+        assert payload.get('capped_accounts') == ['a'], payload
+        assert payload.get('auth_failed_accounts') == ['b'], payload
+
     async def test_the_heartbeat_survives_a_non_serialisable_reset_time(
         self, caplog, fast_heartbeat, monkeypatch
     ) -> None:
@@ -451,6 +522,230 @@ class TestAllCappedParkIsVisible:
             'json.dumps must be called with default=str so a bad value is '
             'stringified rather than raised out of before_invoke'
         )
+
+
+class TestScopedParkIsVisible:
+    """A caller parked on an exhausted model scope must be visible too (task 7243).
+
+    The fleet is open here, so the all-capped park never runs: the caller waits
+    on the per-scope waiter instead, toward a scope reset that can be hours
+    away. Its record mirrors ``all_capped_park``'s shape, so fleet log
+    consumers parse one schema, under a name that says the caller is parked
+    on a scope, not on a frozen pool.
+    """
+
+    async def test_the_scoped_park_emits_a_structured_warning_heartbeat(
+        self, caplog, fast_scope_heartbeat
+    ) -> None:
+        fast_scope_heartbeat(0.02)
+        gate, soonest_reset = await _scope_exhausted_gate()
+
+        await _park_for(gate, 0.2, scope=SCOPE)
+
+        records = _park_records(caplog, SCOPE_PARK_EVENT)
+        assert records, (
+            'a caller parked on an exhausted scope emitted no scoped_park '
+            'record, so it is still indistinguishable from a hung run. Captured '
+            f'from {LOGGER_NAME}: {[r.getMessage() for r in caplog.records]!r}'
+        )
+        assert all(rec.levelno == logging.WARNING for rec, _ in records), (
+            'the scoped heartbeat must be WARNING so it survives default fleet '
+            f'log levels: {[logging.getLevelName(rec.levelno) for rec, _ in records]!r}'
+        )
+        _, payload = records[0]
+        assert payload['scope'] == SCOPE, payload
+        assert isinstance(payload['elapsed_s'], (int, float)), payload
+        assert payload['soonest_scope_reset_at'] == soonest_reset.isoformat(), (
+            "the heartbeat must name the scope's soonest reset (b's, the earlier "
+            f'of the two), which is when the caller can next be served: {payload!r}'
+        )
+        base_keys = {
+            'elapsed_s',
+            'account_count',
+            'capped_accounts',
+            'auth_failed_accounts',
+            'probe_in_flight_accounts',
+            'soonest_open_at',
+        }
+        assert base_keys <= payload.keys(), (
+            'the scoped record must carry the all_capped_park base fields, so '
+            f'fleet log consumers parse one schema: missing {base_keys - payload.keys()}'
+        )
+        assert payload['account_count'] == 2, payload
+        assert not _park_records(caplog), (
+            'a scope exhaustion emitted all_capped_park records while the fleet '
+            'was open, misreporting an exhausted scope as a frozen pool: '
+            f'{[p for _, p in _park_records(caplog)]!r}'
+        )
+
+    async def test_a_scoped_caller_with_headroom_emits_no_scope_park_record(
+        self, caplog
+    ) -> None:
+        gate = make_gate(['a', 'b'])
+
+        lease = await asyncio.wait_for(gate.before_invoke(scope=SCOPE), 1.0)
+
+        assert lease is not None
+        assert not _park_records(caplog, SCOPE_PARK_EVENT), (
+            'a scoped caller served at once emitted a scoped_park '
+            'record; a heartbeat that fires when nothing is wrong trains '
+            f'readers to ignore it: {[p for _, p in _park_records(caplog, SCOPE_PARK_EVENT)]!r}'
+        )
+
+    async def test_the_scoped_heartbeat_is_throttled_under_fast_repolls(
+        self, caplog, fast_scope_heartbeat, monkeypatch
+    ) -> None:
+        """A scoped park that re-polls fast must not turn the log into a flood.
+
+        NOT a hypothetical: while any account is probe_in_flight the scoped
+        park re-polls every ``_SCOPE_WAIT_REPOLL_CEIL_SECS``, one loop pass per
+        re-poll for as long as the probe is outstanding. Here b stays mid-probe
+        (the legacy setter arms no probe-hold timer) and a is scope-capped, so
+        the park re-polls every 2ms with the fleet open.
+        """
+        interval = fast_scope_heartbeat(0.5)
+        repoll_secs = 0.002
+        monkeypatch.setattr(usage_gate_mod, '_SCOPE_WAIT_REPOLL_CEIL_SECS', repoll_secs)
+        gate = make_gate(['a', 'b'], wait_for_reset=False)
+        async with gate.invoke_slot(scope=SCOPE) as slot:
+            slot.report(CapHit(
+                resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap',
+            ))
+        gate._accounts[1].probe_in_flight = True
+        assert not gate.is_paused, (
+            'fixture must leave the fleet open, or this is the all-capped park'
+        )
+
+        # A correct throttle's heartbeat count is bounded by elapsed time, so a
+        # run is evidence only when the re-poll chances exceed the budget below.
+        target_chances = 200
+        started = time.monotonic()
+        async with _interval_ticks(repoll_secs) as ticks:
+            await _park_for(
+                gate,
+                0.0,
+                scope=SCOPE,
+                until=lambda: ticks() >= target_chances,
+                valve_secs=30.0,
+            )
+        duration = time.monotonic() - started
+
+        heartbeats = len(_park_records(caplog, SCOPE_PARK_EVENT))
+        chances = ticks()
+        heartbeat_budget = math.ceil(duration / interval) + 2
+
+        if chances <= heartbeat_budget:
+            pytest.skip(
+                f'only {chances} re-poll chances in {duration:.1f}s, no more than '
+                f'the {heartbeat_budget} heartbeats a {interval}s throttle may emit '
+                'in that time: the host never re-polled faster than the throttle, '
+                'so there was no flood to bound'
+            )
+        assert heartbeats <= heartbeat_budget, (
+            f'{heartbeats} scoped_park heartbeats across {duration:.2f}s '
+            f'at a {interval}s interval: the log rate must be bounded by the '
+            f'interval, not by how often the park re-polls ({chances} chances)'
+        )
+
+    async def test_the_scoped_heartbeat_repeats_and_its_clock_advances(
+        self, caplog, fast_scope_heartbeat, stall_the_loop
+    ) -> None:
+        """One record at the start of a park hours from its scope reset is not
+        visibility: that is the silent park this task replaces.
+
+        ``elapsed_s`` is asserted NON-DECREASING rather than strictly
+        increasing because the payload is rounded to 0.1s, so consecutive
+        fast-interval heartbeats legitimately tie.
+        """
+        interval = fast_scope_heartbeat(0.02)
+        heartbeat_chances = 25
+        gate, _ = await _scope_exhausted_gate()
+
+        async with _interval_ticks(interval) as ticks:
+            stall_the_loop(outlasting=interval * heartbeat_chances)
+            await _park_for(
+                gate, 0.0, scope=SCOPE, until=lambda: ticks() >= heartbeat_chances
+            )
+
+        records = _park_records(caplog, SCOPE_PARK_EVENT)
+        assert len(records) >= 2, (
+            f'the scoped park emitted {len(records)} heartbeat(s) across the whole '
+            'park: a park that announces itself once and then sleeps toward a '
+            'scope reset hours away is indistinguishable from a hung run'
+        )
+        elapsed = [payload['elapsed_s'] for _, payload in records]
+        assert elapsed == sorted(elapsed), (
+            f'elapsed_s went backwards across one scoped park: {elapsed!r}'
+        )
+        assert elapsed[-1] > elapsed[0], (
+            f'elapsed_s never advanced across the whole scoped park: {elapsed!r}. '
+            'A heartbeat that repeats a frozen number cannot tell a ten-minute '
+            'park from a two-day one'
+        )
+
+    async def test_an_abandoned_scoped_park_does_not_poison_the_next_one(
+        self, caplog, fast_scope_heartbeat
+    ) -> None:
+        """The scoped clock is per waiter, so a cancelled park takes it along.
+
+        Pins that against a refactor to shared instance state, which would
+        need the fleet park's release machinery to stay correct.
+        """
+        interval = fast_scope_heartbeat(0.05)
+        gate, _ = await _scope_exhausted_gate()
+
+        await _park_for(gate, interval * 2.4, scope=SCOPE)
+        assert _park_records(caplog, SCOPE_PARK_EVENT), (
+            'the first scoped park logged nothing, so this test cannot show that '
+            'its clock was or was not inherited'
+        )
+
+        caplog.clear()
+        await _park_for(gate, interval * 1.5, scope=SCOPE)
+
+        records = _park_records(caplog, SCOPE_PARK_EVENT)
+        assert records, (
+            'the second scoped park emitted no heartbeat: its first line was '
+            'throttled against a park that had already been abandoned'
+        )
+        first_elapsed = records[0][1]['elapsed_s']
+        assert first_elapsed < interval, (
+            f'the second scoped park opened at elapsed_s={first_elapsed!r}, '
+            "inheriting the abandoned park's start time"
+        )
+
+    async def test_an_account_reset_is_served_within_one_interval_not_at_the_scope_deadline(
+        self, fast_scope_heartbeat
+    ) -> None:
+        """The wait cap's one effect on what a caller receives.
+
+        c is account-capped, resetting a few intervals out, and a and b are
+        capped for SCOPE for hours. c's reset sets no scope waiter, so only
+        the capped wait re-runs the sweep that serves c: an uncapped wait
+        sleeps toward the scope deadline hours away.
+        """
+        interval = fast_scope_heartbeat(0.05)
+        gate = make_gate(['c', 'a', 'b'], wait_for_reset=False)
+        async with gate.invoke_slot() as slot:
+            slot.report(CapHit(
+                resets_at=datetime.now(UTC) + timedelta(seconds=interval * 4),
+                reason='test cap',
+            ))
+        for _ in range(2):
+            async with gate.invoke_slot(scope=SCOPE) as slot:
+                slot.report(CapHit(
+                    resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap',
+                ))
+        assert gate.capped_account_names == ('c',) and not gate.is_paused, (
+            'fixture must account-cap c alone and leave the fleet open'
+        )
+
+        try:
+            lease = await asyncio.wait_for(gate.before_invoke(scope=SCOPE), 5.0)
+        finally:
+            await gate.shutdown()
+
+        assert lease is not None and lease.name == 'c', lease
 
 
 class TestAnAbandonedParkIsNotInherited:
@@ -495,6 +790,36 @@ class TestAnAbandonedParkIsNotInherited:
             'inherited the abandoned park\'s start time. A pool frozen for '
             'zero seconds would be reported as frozen for as long as some '
             'earlier, unrelated park happened to last'
+        )
+
+    async def test_a_park_that_ends_at_its_deadline_does_not_poison_the_next_one(
+        self, caplog, fast_heartbeat
+    ) -> None:
+        """A bounded park ends by raising, which no lease-serving clear reaches."""
+        interval = fast_heartbeat(0.05)
+        gate = _all_capped_gate()
+
+        with pytest.raises(usage_gate_mod.PoolFrozen):
+            await asyncio.wait_for(
+                gate.before_invoke(max_wait_secs=interval * 2.4), _PARK_VALVE_SECS,
+            )
+        assert _park_records(caplog), (
+            'the bounded park logged nothing, so this test cannot show that its '
+            'clock was or was not inherited'
+        )
+
+        caplog.clear()
+        await _park_for(gate, interval * 1.5)
+
+        records = _park_records(caplog)
+        assert records, (
+            'the next park emitted no heartbeat: the park that ended at its '
+            "deadline left `_park_last_logged_at` set and throttled it"
+        )
+        first_elapsed = records[0][1]['elapsed_s']
+        assert first_elapsed < interval, (
+            f'the next park opened at elapsed_s={first_elapsed!r}, inherited from '
+            'a park that had already ended at its deadline'
         )
 
     async def test_a_cancelled_sibling_does_not_reset_a_live_park(

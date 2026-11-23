@@ -7,11 +7,12 @@ The detector cross-checks fleet session-registry records
 spawn-launched interactive session produced no plausibly-matching
 transcript (the "session ran, no transcript" regression).
 
-Every test injects a tmp ``fleet_root`` (so ``session_registry`` never
+Every test injects a tmp ``fleet_root`` (so ``session_records`` never
 touches the real ``~/.claude`` tree), a tmp ``projects_root``, a FIXED
 ``now``, a written fixture ``legibility.yaml``, and a fake ``poster`` — no
-real ``~/.claude``, no live escalation server, and no dependency on the
-separately-landing ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` preventer.
+real ``~/.claude`` and no live escalation server. Every preventer-guard test
+reads a fixture spawn script except the one that pins the guard against the
+committed ``skills/spawn/spawn-claude.sh``.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ import pytest
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
 
-from orchestrator import session_registry
+from orchestrator import session_reaper, session_records
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_transcript_persistence.py"
 
@@ -58,22 +59,26 @@ def _write_session_record(
     fleet_root: Path,
     slug: str,
     *,
-    status: session_registry.Status,
+    status: session_records.Status,
     prompt: str,
     cwd: str = "/home/leo/src/dark-factory",
     start_ts: datetime | None = None,
     exit_code: int | None = 0,
-) -> session_registry.SessionRecord:
+    claude_session_id: str | None = None,
+    claude_launch_session_id: str | None = None,
+) -> session_records.SessionRecord:
     """Write a SessionRecord under *fleet_root* via the canonical writer."""
-    rec = session_registry.SessionRecord(
+    rec = session_records.SessionRecord(
         session_slug=slug,
         status=status,
         prompt=prompt,
         cwd=cwd,
         start_ts=_iso(start_ts) if start_ts is not None else _iso(FIXED_NOW),
         exit_code=exit_code,
+        claude_session_id=claude_session_id,
+        claude_launch_session_id=claude_launch_session_id,
     )
-    session_registry.write_record(rec, root=fleet_root)
+    session_records.write_record(rec, root=fleet_root)
     return rec
 
 
@@ -127,30 +132,30 @@ def test_find_completed_spawn_records_filters(tmp_path):
 
     # (KEEP) a completed EXITED spawn with a usable prompt, in window.
     _write_session_record(
-        fleet, "good-exited", status=session_registry.Status.EXITED,
+        fleet, "good-exited", status=session_records.Status.EXITED,
         prompt="Investigate the flaky merge on task 2500 and report back.",
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (KEEP) FAILED_TO_START is also terminal.
     _write_session_record(
-        fleet, "good-failed", status=session_registry.Status.FAILED_TO_START,
+        fleet, "good-failed", status=session_records.Status.FAILED_TO_START,
         prompt="Run the unblock skill for df#2085.",
         start_ts=FIXED_NOW - timedelta(hours=5),
     )
     # (EXCLUDE) empty prompt.
     _write_session_record(
-        fleet, "empty-prompt", status=session_registry.Status.EXITED,
+        fleet, "empty-prompt", status=session_records.Status.EXITED,
         prompt="", start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (EXCLUDE) non-terminal (RUNNING) — transcript may still be flushing.
     _write_session_record(
-        fleet, "still-running", status=session_registry.Status.RUNNING,
+        fleet, "still-running", status=session_records.Status.RUNNING,
         prompt="A long-running interactive session.",
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (EXCLUDE) terminal but older than the 48h lookback window.
     _write_session_record(
-        fleet, "too-old", status=session_registry.Status.EXITED,
+        fleet, "too-old", status=session_records.Status.EXITED,
         prompt="An old completed session outside the window.",
         start_ts=FIXED_NOW - timedelta(hours=72),
     )
@@ -171,6 +176,125 @@ def test_find_completed_spawn_records_filters(tmp_path):
     assert {r.session_slug for r in kept} == {"good-exited", "good-failed"}
 
 
+def test_find_completed_spawn_records_skips_unbound_orphan(tmp_path):
+    fleet = tmp_path / "fleet"
+    orphan = session_reaper.ORPHAN_EXIT_CODE
+    in_window = FIXED_NOW - timedelta(hours=1)
+    prompt = "Investigate the flaky merge on task 2500 and report back."
+
+    # (EXCLUDE) reaper-stamped orphan no hook ever bound: nothing shows it started.
+    _write_session_record(
+        fleet, "unbound-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, start_ts=in_window, exit_code=orphan,
+    )
+    # (KEEP) a bound current id proves claude ran.
+    _write_session_record(
+        fleet, "bound-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, start_ts=in_window, exit_code=orphan,
+        claude_session_id="11111111-1111-1111-1111-111111111111",
+    )
+    # (KEEP) a bound launch id alone also proves claude ran.
+    _write_session_record(
+        fleet, "launch-bound-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, start_ts=in_window, exit_code=orphan,
+        claude_launch_session_id="22222222-2222-2222-2222-222222222222",
+    )
+    # (KEEP) unbound, but finish() recorded claude's own exit code.
+    _write_session_record(
+        fleet, "unbound-real-exit", status=session_records.Status.EXITED,
+        prompt=prompt, start_ts=in_window, exit_code=0,
+    )
+
+    kept = mod.find_completed_spawn_records(
+        mod.iter_registry_records(fleet_root=fleet),
+        now=FIXED_NOW,
+        lookback=timedelta(hours=48),
+    )
+
+    assert {r.session_slug for r in kept} == {
+        "bound-orphan", "launch-bound-orphan", "unbound-real-exit",
+    }
+
+
+def test_run_check_does_not_alarm_on_unbound_orphan(tmp_path):
+    fleet = tmp_path / "fleet"
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    _write_session_record(
+        fleet, "team-dark_factory-90994", status=session_records.Status.EXITED,
+        prompt=(
+            "/team Read the brief at /home/leo/.claude/spawn-briefs/"
+            "review-all-dark_factory-20261008-cleanup.md and carry it out "
+            "end-to-end; it is the contract."
+        ),
+        cwd="/home/leo/src/dark-factory",
+        start_ts=FIXED_NOW - timedelta(hours=1),
+        exit_code=session_reaper.ORPHAN_EXIT_CODE,
+    )
+    config_path = _write_config(tmp_path, cwd_prefixes=["/home/leo/src/dark-factory"])
+    poster = _RecordingPoster()
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=poster,
+    )
+
+    assert result.exit_code == 0
+    assert result.missing == []
+    assert result.escalated is False
+    assert poster.calls == []
+
+
+def test_run_check_reports_count_of_skipped_unbound_orphans(tmp_path):
+    fleet = tmp_path / "fleet"
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    orphan = session_reaper.ORPHAN_EXIT_CODE
+    in_window = FIXED_NOW - timedelta(hours=1)
+    prompt = "Investigate the flaky merge on task 2500 and report back."
+    member_cwd = "/home/leo/src/dark-factory"
+
+    # (COUNT) two in-window unbound orphans in this project.
+    for slug in ("member-orphan-1", "member-orphan-2"):
+        _write_session_record(
+            fleet, slug, status=session_records.Status.EXITED,
+            prompt=prompt, cwd=member_cwd, start_ts=in_window, exit_code=orphan,
+        )
+    # (NOT COUNTED) another project's unbound orphan.
+    _write_session_record(
+        fleet, "foreign-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, cwd="/home/leo/src/reify", start_ts=in_window, exit_code=orphan,
+    )
+    # (NOT COUNTED) an unbound orphan outside the lookback window.
+    _write_session_record(
+        fleet, "old-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, cwd=member_cwd, start_ts=FIXED_NOW - timedelta(hours=72),
+        exit_code=orphan,
+    )
+    config_path = _write_config(tmp_path, cwd_prefixes=[member_cwd])
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=_RecordingPoster(),
+    )
+
+    assert result.exit_code == 0
+    assert result.skipped_unbound_orphans == 2
+    assert "2 unbound orphan record(s) not checked" in result.reason
+
+
+def test_run_check_reason_omits_orphan_clause_when_none_skipped(tmp_path):
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=_RecordingPoster(),
+    )
+
+    assert result.skipped_unbound_orphans == 0
+    assert "unbound orphan" not in result.reason
+
+
 # ---------------------------------------------------------------------------
 # step-3/4: STRONG prompt-prefix matching (find_matching_transcript)
 # ---------------------------------------------------------------------------
@@ -188,15 +312,17 @@ def _spawn_record(
     *,
     start_offset_hours: int = 1,
     claude_session_id: str | None = None,
+    claude_launch_session_id: str | None = None,
 ):
-    return session_registry.SessionRecord(
+    return session_records.SessionRecord(
         session_slug=slug,
-        status=session_registry.Status.EXITED,
+        status=session_records.Status.EXITED,
         prompt=prompt,
         cwd=cwd,
         start_ts=_iso(FIXED_NOW - timedelta(hours=start_offset_hours)),
         exit_code=0,
         claude_session_id=claude_session_id,
+        claude_launch_session_id=claude_launch_session_id,
     )
 
 
@@ -345,9 +471,9 @@ def test_find_missing_transcripts_end_to_end(tmp_path):
     missing = _spawn_record("sess-missing", member_missing, missing_prompt)
 
     # (c) in-flight (non-terminal) spawn with no transcript -> tolerated.
-    inflight = session_registry.SessionRecord(
+    inflight = session_records.SessionRecord(
         session_slug="sess-inflight",
-        status=session_registry.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         prompt="An in-flight interactive session still running.",
         cwd=member_present,
         start_ts=_iso(FIXED_NOW - timedelta(hours=1)),
@@ -548,22 +674,80 @@ def test_find_matching_transcript_bound_session_id_absent_is_missing_even_with_p
     assert got is None
 
 
-def test_find_matching_transcript_rebound_id_without_file_is_missing_despite_launch_transcript(
-    tmp_path,
-):
-    """Pins the accepted re-mint false-positive class: a ``/clear`` re-binds the
-    record to a new id, and a session that exits before writing under it has no
-    ``<new_id>.jsonl`` even though its launch transcript survives."""
+_REBOUND_SESSION_ID = "64e5c3cd-2457-4f92-8532-574617f54233"
+_LAUNCH_SESSION_ID = "5029efa9-cb15-43d2-bba8-985e34de0b7a"
+
+
+def test_find_matching_transcript_rebound_id_without_file_resolves_launch_transcript(tmp_path):
+    """A ``/clear`` re-mint moves claude_session_id; the launch id still names the launch transcript."""
     projects = tmp_path / "projects"
     rec = _spawn_record(
         "sess-rebound", _DF_CWD, _USABLE_PROMPT,
-        claude_session_id="64e5c3cd-2457-4f92-8532-574617f54233",
+        claude_session_id=_REBOUND_SESSION_ID,
+        claude_launch_session_id=_LAUNCH_SESSION_ID,
     )
     launch = _write_transcript(
-        projects, _DF_CWD, "5029efa9-cb15-43d2-bba8-985e34de0b7a.jsonl",
+        projects, _DF_CWD, f"{_LAUNCH_SESSION_ID}.jsonl",
         _USABLE_PROMPT + _SPAWN_TRAILER,
     )
     _set_mtime(launch, FIXED_NOW - timedelta(hours=1))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == launch
+
+
+def test_find_matching_transcript_rebound_id_resolves_current_file_when_launch_file_absent(
+    tmp_path,
+):
+    projects = tmp_path / "projects"
+    rec = _spawn_record(
+        "sess-rebound", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id=_REBOUND_SESSION_ID,
+        claude_launch_session_id=_LAUNCH_SESSION_ID,
+    )
+    current = _write_transcript(
+        projects, _DF_CWD, f"{_REBOUND_SESSION_ID}.jsonl",
+        "An opening turn unrelated to the recorded prompt.",
+    )
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == current
+
+
+def test_find_matching_transcript_neither_bound_file_is_missing_even_with_prompt_match(tmp_path):
+    projects = tmp_path / "projects"
+    rec = _spawn_record(
+        "sess-rebound-lost", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id=_REBOUND_SESSION_ID,
+        claude_launch_session_id=_LAUNCH_SESSION_ID,
+    )
+    respawn = _write_transcript(projects, _DF_CWD, "respawn.jsonl", _USABLE_PROMPT)
+    _set_mtime(respawn, FIXED_NOW - timedelta(hours=1))
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+def test_find_matching_transcript_path_like_launch_id_never_resolves_outside_expected_dir(
+    tmp_path,
+):
+    projects = tmp_path / "projects"
+    bad_id = "../elsewhere/decoy"
+    rec = _spawn_record(
+        "sess-bad-launch-id", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id=_REBOUND_SESSION_ID,
+        claude_launch_session_id=bad_id,
+    )
+    expected_dir = projects / mod.inventory.encode_cwd(_DF_CWD)
+    decoy_name = f"{bad_id}.jsonl"
+    (expected_dir / decoy_name).parent.mkdir(parents=True, exist_ok=True)
+    _write_transcript(projects, _DF_CWD, decoy_name, "An unrelated session elsewhere.")
 
     got = mod.find_matching_transcript(
         rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
@@ -604,6 +788,42 @@ def test_find_matching_transcript_path_like_bound_id_falls_back_to_prompt_match(
         rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
     )
     assert got == present
+
+
+@pytest.mark.parametrize("launch_file_present", [True, False], ids=["launch-file", "no-launch-file"])
+def test_find_matching_transcript_path_like_current_id_matches_exactly_on_launch_id(
+    tmp_path, caplog, launch_file_present,
+):
+    """A rejected current id leaves the record bound by its launch id: exact match, no prompt fallback."""
+    projects = tmp_path / "projects"
+    bad_id = "../elsewhere/decoy"
+    rec = _spawn_record(
+        "sess-bad-current-id", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id=bad_id,
+        claude_launch_session_id=_LAUNCH_SESSION_ID,
+    )
+    expected_dir = projects / mod.inventory.encode_cwd(_DF_CWD)
+    decoy_name = f"{bad_id}.jsonl"
+    (expected_dir / decoy_name).parent.mkdir(parents=True, exist_ok=True)
+    _write_transcript(projects, _DF_CWD, decoy_name, "An unrelated session elsewhere.")
+    respawn = _write_transcript(projects, _DF_CWD, "respawn.jsonl", _USABLE_PROMPT)
+    _set_mtime(respawn, FIXED_NOW - timedelta(hours=1))
+    launch = None
+    if launch_file_present:
+        launch = _write_transcript(
+            projects, _DF_CWD, f"{_LAUNCH_SESSION_ID}.jsonl",
+            "An opening turn unrelated to the recorded prompt.",
+        )
+
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        got = mod.find_matching_transcript(
+            rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+        )
+
+    assert got == launch
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("claude_session_id" in m and bad_id in m for m in warned), warned
+    assert not any("claude_launch_session_id" in m for m in warned), warned
 
 
 # ---------------------------------------------------------------------------
@@ -690,12 +910,15 @@ def test_find_matching_transcript_unbound_slash_command_ignores_non_expansion_tu
 # ---------------------------------------------------------------------------
 
 _LOST_SESSION_ID = "fbc45451-7894-4330-961f-ba377c9ce8a3"
+_LOST_LAUNCH_SESSION_ID = "a2c0e7b1-0000-4000-8000-000000006069"
 
 
 def test_find_missing_transcripts_finding_carries_bound_claude_session_id(tmp_path):
     projects = tmp_path / "projects"
     bound = _spawn_record(
-        "sess-lost-bound", _DF_CWD, _USABLE_PROMPT, claude_session_id=_LOST_SESSION_ID,
+        "sess-lost-bound", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id=_LOST_SESSION_ID,
+        claude_launch_session_id=_LOST_LAUNCH_SESSION_ID,
     )
     unbound = _spawn_record(
         "sess-lost-unbound", _DF_CWD,
@@ -710,16 +933,25 @@ def test_find_missing_transcripts_finding_carries_bound_claude_session_id(tmp_pa
     assert len(findings) == 2
     by_slug = {f.session_slug: f for f in findings}
     assert by_slug["sess-lost-bound"].claude_session_id == _LOST_SESSION_ID
+    assert by_slug["sess-lost-bound"].claude_launch_session_id == _LOST_LAUNCH_SESSION_ID
     assert by_slug["sess-lost-unbound"].claude_session_id is None
+    assert by_slug["sess-lost-unbound"].claude_launch_session_id is None
 
 
-def test_build_escalation_arguments_names_bound_claude_session_id(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+def test_the_posted_detail_names_the_bound_claude_session_id(tmp_path):
     finding = _missing_finding(claude_session_id=_LOST_SESSION_ID)
 
-    args = mod._build_escalation_arguments([finding], cfg, force_persistence_ok=None)
+    args = _posted_arguments(tmp_path, [finding])
 
     assert _LOST_SESSION_ID in args["detail"]
+
+
+def test_the_posted_detail_names_the_bound_launch_session_id(tmp_path):
+    finding = _missing_finding(claude_launch_session_id=_LOST_LAUNCH_SESSION_ID)
+
+    args = _posted_arguments(tmp_path, [finding])
+
+    assert _LOST_LAUNCH_SESSION_ID in args["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -850,7 +1082,7 @@ def test_payload_exports_force_persistence_false_for_quoted_echo():
 
 
 # ---------------------------------------------------------------------------
-# step-11/12: escalation envelope + best-effort poster
+# step-11/12: the transcript-loss alarm, best-effort
 # ---------------------------------------------------------------------------
 
 def _missing_finding(
@@ -858,6 +1090,7 @@ def _missing_finding(
     cwd: str = "/home/leo/src/dark-factory/.worktrees/2701",
     *,
     claude_session_id: str | None = None,
+    claude_launch_session_id: str | None = None,
 ) -> mod.MissingTranscript:
     return mod.MissingTranscript(
         session_slug=slug,
@@ -867,84 +1100,37 @@ def _missing_finding(
         exit_code=0,
         expected_dir=Path("/tmp/projects") / mod.inventory.encode_cwd(cwd),
         claude_session_id=claude_session_id,
+        claude_launch_session_id=claude_launch_session_id,
     )
 
 
 class _RecordingPoster:
-    """A fake poster capturing (url, envelope) calls (never posts anything)."""
+    """A fake poster capturing (url, arguments) calls (never posts anything)."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
 
-    def __call__(self, url: str, envelope: dict) -> None:
-        self.calls.append((url, envelope))
+    def __call__(self, url: str, arguments) -> None:
+        self.calls.append((url, dict(arguments)))
 
 
-class _FakeHttpxResponse:
-    """A 200 `application/json` reply with an empty JSON-RPC body.
-
-    `status_code`, `headers` and `json()` were added for task 3644:
-    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
-    which reads `status_code` (to detect the stateful escalation server's 400
-    "Missing session ID") and `content-type` (to detect an SSE-framed body)
-    before decoding. Without them this fake would die on an AttributeError
-    and stop exercising the real code path -- so the task-2953 header
-    contract below keeps being asserted against the transport that actually
-    ships, not against a fake the implementation has outgrown."""
-
-    status_code = 200
-    headers = {"content-type": "application/json"}
-
-    def raise_for_status(self):
-        pass
-
-    def json(self):
-        return {}
-
-
-def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
-    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
-    lacking an Accept header covering both application/json and
-    text/event-stream (verified live against a local MCP /mcp endpoint).
-    `_default_poster`'s httpx import is lazy, but httpx IS importable here --
-    a direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
-    task 2965) -- so an un-faked call would really hit the network. The
-    shared `install_fake_httpx` fixture substitutes a stub so the outbound
-    request shape is assertable independent of any live listener.
-    Mirrors nightly.py's identical test for its own `_default_poster`."""
-    captured_kwargs = {}
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse()
-
-    install_fake_httpx(_fake_post)
-
-    mod._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
-
-    headers = captured_kwargs.get('headers') or {}
-    assert 'application/json' in headers.get('Accept', '')
-    assert 'text/event-stream' in headers.get('Accept', '')
-    # Content-Type is part of the same transport contract -- pin it too so a
-    # future edit dropping it can't pass on the Accept assertions alone.
-    assert headers.get('Content-Type') == 'application/json'
-    # The envelope must still ride along unchanged on the same POST.
-    assert captured_kwargs.get('json') == {'jsonrpc': '2.0'}
-
-
-def test_build_escalation_arguments_shape(tmp_path):
+def _posted_arguments(tmp_path, findings, **kwargs) -> dict:
+    """The escalate_info arguments post_findings posts for *findings* (project proj_a)."""
     cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+    poster = _RecordingPoster()
+    assert mod.post_findings(cfg, findings, poster=poster, **kwargs) is True
+    [(_url, arguments)] = poster.calls
+    return arguments
+
+
+def test_the_posted_alarm_names_every_lost_session(tmp_path):
     findings = [
         _missing_finding("sess-lost-1", "/home/leo/src/dark-factory/.worktrees/2701"),
         _missing_finding("sess-lost-2", "/home/leo/src/dark-factory/.worktrees/2702"),
     ]
 
-    args = mod._build_escalation_arguments(findings, cfg, force_persistence_ok=None)
+    args = _posted_arguments(tmp_path, findings)
 
-    assert args["task_id"] == "legibility-transcript-check-proj_a"
-    assert args["agent_role"] == "legibility-transcript-check"
-    assert args["category"] == "infra_issue"
-    assert args["severity"] == "info"
     # summary names the count of missing transcripts.
     assert "2" in args["summary"]
     # detail names each finding's slug AND cwd.
@@ -954,7 +1140,19 @@ def test_build_escalation_arguments_shape(tmp_path):
     assert "/home/leo/src/dark-factory/.worktrees/2702" in args["detail"]
 
 
-def test_post_findings_posts_envelope_and_returns_true(tmp_path):
+@pytest.mark.parametrize(("force_persistence_ok", "verdict"), [(True, "present"), (False, "MISSING")])
+def test_the_posted_detail_carries_the_preventer_verdict(tmp_path, force_persistence_ok, verdict):
+    args = _posted_arguments(
+        tmp_path, [_missing_finding()], force_persistence_ok=force_persistence_ok,
+    )
+
+    assert (
+        "preventer guard (CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 in spawn-claude.sh): "
+        f"{verdict}"
+    ) in args["detail"]
+
+
+def test_post_findings_posts_the_arguments_and_returns_true(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id="proj_a", escalation_port=8271))
     findings = [_missing_finding()]
     poster = _RecordingPoster()
@@ -963,21 +1161,19 @@ def test_post_findings_posts_envelope_and_returns_true(tmp_path):
 
     assert ok is True
     assert len(poster.calls) == 1
-    url, envelope = poster.calls[0]
-    assert url == "http://localhost:8271/mcp"
-    # A JSON-RPC tools/call envelope for the escalate_info tool.
-    assert envelope["jsonrpc"] == "2.0"
-    assert envelope["method"] == "tools/call"
-    assert envelope["params"]["name"] == "escalate_info"
-    assert envelope["params"]["arguments"]["agent_role"] == "legibility-transcript-check"
-    assert envelope["params"]["arguments"]["task_id"] == "legibility-transcript-check-proj_a"
+    url, arguments = poster.calls[0]
+    assert url == "http://localhost:8271"
+    assert arguments["task_id"] == "legibility-transcript-check-proj_a"
+    assert arguments["agent_role"] == "legibility-transcript-check"
+    assert arguments["category"] == "infra_issue"
+    assert arguments["severity"] == "info"
 
 
 def test_post_findings_best_effort_swallows_poster_exception(tmp_path):
     cfg = load_config(_write_config(tmp_path))
     findings = [_missing_finding()]
 
-    def _raising(url: str, envelope: dict) -> None:
+    def _raising(url: str, arguments) -> None:
         raise RuntimeError("escalation server down")
 
     # Best-effort contract: a raising poster -> False, never propagates.
@@ -1007,7 +1203,7 @@ def _build_fleet_and_projects(tmp_path, *, include_lost: bool):
 
     # completed + transcript present (strong match) -> no finding.
     _write_session_record(
-        fleet, "sess-present", status=session_registry.Status.EXITED,
+        fleet, "sess-present", status=session_records.Status.EXITED,
         prompt=_USABLE_PROMPT, cwd=member_present,
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
@@ -1015,21 +1211,21 @@ def _build_fleet_and_projects(tmp_path, *, include_lost: bool):
 
     # in-flight (non-terminal) -> tolerated, no finding.
     _write_session_record(
-        fleet, "sess-inflight", status=session_registry.Status.RUNNING,
+        fleet, "sess-inflight", status=session_records.Status.RUNNING,
         prompt="An in-flight interactive session still running right now.",
         cwd=member_present, start_ts=FIXED_NOW - timedelta(hours=1),
     )
 
     # foreign-project completed spawn -> excluded (not is_member).
     _write_session_record(
-        fleet, "sess-foreign", status=session_registry.Status.EXITED,
+        fleet, "sess-foreign", status=session_records.Status.EXITED,
         prompt="A completed spawn in a different project entirely, not a member here.",
         cwd=foreign_cwd, start_ts=FIXED_NOW - timedelta(hours=1),
     )
 
     if include_lost:
         _write_session_record(
-            fleet, "sess-lost", status=session_registry.Status.EXITED,
+            fleet, "sess-lost", status=session_records.Status.EXITED,
             prompt=(
                 "Diagnose the stuck reconciliation on task 2701 and summarise "
                 "the root cause."
@@ -1076,8 +1272,8 @@ def test_run_check_healthy_no_escalation(tmp_path):
 
 def test_run_check_preventer_guard_toggles_force_persistence_ok(tmp_path):
     # A tmp spawn-script fixture MISSING the token -> force_persistence_ok False;
-    # a fixture WITH the token -> True. Fixtures only — never the real
-    # committed spawn-claude.sh (which does not carry the token on this branch).
+    # a fixture WITH the token -> True. Fixtures only, so the test controls
+    # the verdict in both directions.
     fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
 
     missing_token = tmp_path / "spawn-no-token.sh"
@@ -1123,6 +1319,31 @@ def test_main_healthy_returns_zero(tmp_path):
     assert rc == 0
 
 
+def test_main_check_preventer_passes_on_committed_spawn_script(tmp_path, capsys):
+    assert mod.DEFAULT_SPAWN_SCRIPT.is_file(), (
+        f"--check-preventer's default spawn script {mod.DEFAULT_SPAWN_SCRIPT} "
+        "does not exist; the guard would read '' and fail safe on every run"
+    )
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+
+    rc = mod.main([
+        "--config", str(config_path),
+        "--fleet-root", str(fleet),
+        "--projects-root", str(projects),
+        "--lookback-hours", "48",
+        "--check-preventer",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 0 and "preventer guard present" in captured.out, (
+        "the --check-preventer guard no longer recognises the "
+        "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 export in the committed "
+        "skills/spawn/spawn-claude.sh, so an operator's --check-preventer run "
+        f"would false-alarm (rc={rc}, stdout={captured.out!r}, "
+        f"stderr={captured.err!r})"
+    )
+
+
 def test_run_check_enriches_escalation_detail_with_preventer_verdict(tmp_path):
     # run_check with BOTH lost findings AND --check-preventer: the escalation
     # detail is enriched with the preventer verdict via force_persistence_ok,
@@ -1145,8 +1366,8 @@ def test_run_check_enriches_escalation_detail_with_preventer_verdict(tmp_path):
     assert result.exit_code == 1
     assert result.force_persistence_ok is False
     assert len(poster.calls) == 1
-    _url, envelope = poster.calls[0]
-    detail = envelope["params"]["arguments"]["detail"]
+    _url, arguments = poster.calls[0]
+    detail = arguments["detail"]
     assert "preventer guard" in detail
     # The verdict for a missing token is the loud 'MISSING' marker.
     assert "MISSING" in detail
@@ -1190,142 +1411,3 @@ def test_read_spawn_script_unreadable_returns_empty(tmp_path):
     a_dir = tmp_path / "a_dir"
     a_dir.mkdir()
     assert mod._read_spawn_script(a_dir) == ""
-
-
-# ---------------------------------------------------------------------------
-# task 3644: the transcript-loss alarm must survive a STATEFUL server
-# ---------------------------------------------------------------------------
-#
-# Same defect as nightly.py's and census.py's posters: `_default_poster`
-# bare-POSTed `tools/call`, the escalation server rejects it at the transport
-# layer with `400 Bad Request` / "Missing session ID" (captured live
-# 2026-08-05), and `post_findings` swallows that best-effort and returns
-# False -- so the transcript-loss alarm never reached anyone. Fixed by the
-# same single-sourced transport in census_trigger.
-
-
-class _FakeStatefulResponse:
-    """An `httpx.Response` stand-in for the stateful-server handshake."""
-
-    def __init__(self, *, status_code=200, headers=None, payload=None, text=""):
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.text = text
-        self._payload = payload
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
-            # install_fake_httpx stub exposes only `post` and pytest.fails on
-            # any other attribute (task 3376).
-            raise RuntimeError(f"HTTP {self.status_code}")
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError("response has no JSON body")
-        return self._payload
-
-
-def _stateful_escalation_post(recorded, *, session_id="sid-transcript"):
-    """A fake `httpx.post` behaving like the STATEFUL escalation server:
-    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
-    as a response header; `notifications/initialized` -> 202; `tools/call`
-    WITH that header -> 200."""
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get("json") or {}
-        method = envelope.get("method")
-        if method == "initialize":
-            return _FakeStatefulResponse(
-                headers={"mcp-session-id": session_id,
-                         "content-type": "application/json"},
-                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
-            )
-        if method == "notifications/initialized":
-            return _FakeStatefulResponse(status_code=202)
-        if (kwargs.get("headers") or {}).get("mcp-session-id") != session_id:
-            return _FakeStatefulResponse(
-                status_code=400,
-                headers={"content-type": "application/json"},
-                payload={"jsonrpc": "2.0", "id": "server-error",
-                         "error": {"code": -32600,
-                                   "message": "Bad Request: Missing session ID"}},
-            )
-        return _FakeStatefulResponse(
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": 1,
-                     "result": {"structuredContent": {"id": "esc-11", "status": "queued"}}},
-        )
-
-    return _post
-
-
-def _recording_delete(deleted):
-    """A fake `httpx.delete` recording the MCP session-termination call the
-    transport makes after a handshake, so the long-lived escalation server does
-    not leak a session per transcript-loss alarm."""
-    def _delete(url, **kwargs):
-        deleted.append((url, kwargs))
-        return _FakeStatefulResponse(status_code=200)
-
-    return _delete
-
-
-def test_post_findings_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
-    """The DEFAULT poster (no `poster=` injection) must handshake and land.
-
-    `post_findings` -- NOT `post_escalation`; this module's escalation
-    entrypoint takes a `Sequence[MissingTranscript]` -- so a minimal non-empty
-    findings list is what reaches the POST."""
-    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
-    recorded = []
-    deleted = []
-    install_fake_httpx(
-        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
-    )
-
-    assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is True
-
-    methods = [(kwargs.get("json") or {}).get("method") for _url, kwargs in recorded]
-    assert methods == [
-        "tools/call", "initialize", "notifications/initialized", "tools/call",
-    ]
-    # The retried call carries the server-assigned session id...
-    assert (recorded[-1][1].get("headers") or {}).get("mcp-session-id") == "sid-transcript"
-    # ...and is still the escalate_info the alarm meant to file.
-    params = (recorded[-1][1].get("json") or {})["params"]
-    assert params["name"] == "escalate_info"
-    assert "sess-lost-1" in params["arguments"]["detail"]
-    # ...and the session opened to file it is released again.
-    assert [(kw.get("headers") or {}).get("mcp-session-id") for _u, kw in deleted] == [
-        "sid-transcript"
-    ]
-
-
-def test_post_findings_reports_false_on_a_tool_error_envelope(
-    tmp_path, install_fake_httpx, caplog
-):
-    """HTTP 200 is not success. `post_findings` discards the response body and
-    reports True on "no exception", so a tool-level failure
-    (`result.isError: true`) would otherwise read as a landed alarm -- the same
-    green-on-paper/nothing-filed failure task 3644 exists to close, one layer
-    up from the transport."""
-    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
-
-    def _post(url, **kwargs):
-        return _FakeStatefulResponse(
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": 1, "result": {
-                "isError": True,
-                "content": [{"type": "text", "text": "unknown category 'nope'"}],
-            }},
-        )
-
-    install_fake_httpx(_post)
-
-    with caplog.at_level(logging.WARNING):
-        assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is False
-
-    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("escalation post failed" in m for m in warned), warned
-    assert any("isError" in m or "reported an error" in m for m in warned), warned

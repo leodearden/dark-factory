@@ -45,12 +45,16 @@ def keeps_read_row(*, operation: str | None, success: bool) -> bool:
     return operation in READ_OPERATIONS_KEPT_PER_ROW or not success
 
 
-_KEPT_OPERATIONS_SQL = ', '.join(f"'{op}'" for op in sorted(READ_OPERATIONS_KEPT_PER_ROW))
+_PER_ROW_OPERATIONS_SQL = ', '.join(f"'{op}'" for op in sorted(READ_OPERATIONS_KEPT_PER_ROW))
 
-COUNT_ONLY_READ_PREDICATE = (
-    "kind = 'read' AND success = 1 "
-    f'AND (operation IS NULL OR operation NOT IN ({_KEPT_OPERATIONS_SQL}))'
+# The write_ops search and read retention horizons: reads whose operation is, or is
+# not, in READ_OPERATIONS_KEPT_PER_ROW. Together they partition kind = 'read' rows.
+PER_ROW_OPERATION_READ_PREDICATE = f"kind = 'read' AND operation IN ({_PER_ROW_OPERATIONS_SQL})"
+NON_PER_ROW_OPERATION_READ_PREDICATE = (
+    f"kind = 'read' AND (operation IS NULL OR operation NOT IN ({_PER_ROW_OPERATIONS_SQL}))"
 )
+
+COUNT_ONLY_READ_PREDICATE = f'{NON_PER_ROW_OPERATION_READ_PREDICATE} AND success = 1'
 
 # History migration (fused-memory/scripts/roll_up_journal_reads.py). Parameters
 # for both: a rowid window (lo, hi), half-open. NOT INDEXED pins the plan to the
@@ -68,6 +72,15 @@ RAW_READS_BY_ROLLUP_KEY_SQL = (
 DELETE_COUNT_ONLY_READS_SQL = (
     'DELETE FROM write_ops NOT INDEXED '
     f'WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE}'
+)
+
+# Run just before the chunk's write transaction: the DELETE must drop each row's
+# random-UUID entry from the primary-key autoindex, and those cold leaf reads, not
+# the deletes, are what hold the write lock past fused-memory's busy_timeout.
+PREWARM_PRIMARY_KEY_SQL = (
+    'SELECT count(*) FROM write_ops INDEXED BY sqlite_autoindex_write_ops_1 '
+    'WHERE id IN (SELECT id FROM write_ops NOT INDEXED '
+    f'WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE})'
 )
 
 # The migration's work queue starts at the first count-only rowid; NOT INDEXED

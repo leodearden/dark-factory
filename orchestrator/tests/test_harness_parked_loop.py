@@ -1,14 +1,14 @@
 """Harness.run() with its dispatch loop PARKED (task 5344, INV-10).
 
-Under saturation the loop sits in ``await sem.acquire()`` (a slot is busy and
-``acquire_next`` keeps handing out work) rather than in a rest branch.  These
+Under saturation the loop waits for a live slot to end without picking a task,
+so no picked task holds its module locks while it waits (task 8480).  These
 tests drive the real ``run()`` in that shape and assert what must still happen
 there: a finishing slot's report is collected, an owed service restart
 force-fires, and the fleet merge heartbeat keeps advancing.
 
-``max_concurrent_tasks=1`` is what parks the loop: once slot ``'1'`` holds the
-semaphore, the next assignment blocks in ``sem.acquire()`` until that slot
-ends.  Startup collaborators are stubbed the way
+``max_concurrent_tasks=1`` with no main-health-fix reserve is what parks the
+loop: once slot ``'1'`` holds the only run slot, the loop makes no further
+``acquire_next`` call until that slot ends.  Startup collaborators are stubbed the way
 ``test_harness_scheduler_seam.py::TestFinishStartupCalledBeforeFirstAcquireNext``
 does; the slot body is stubbed at its one seam, ``_run_slot``.
 """
@@ -27,6 +27,7 @@ from _orch_helpers import wait_responsive
 
 from orchestrator.config import OrchestratorConfig, ReviewConfig
 from orchestrator.harness import Harness, HarnessReport, TaskReport
+from orchestrator.run_slots import DispatchScope
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.service_restart import StaleServiceRestartCoordinator
 from orchestrator.workflow import WorkflowOutcome
@@ -70,22 +71,25 @@ class _Slots:
 class _Dispatch:
     """``acquire_next`` stand-in handing out ``task_ids`` in order, then None.
 
+    Its tasks are not main-health fixes, so a restricted tick hands out none.
     Call number N blocks until ``held_ticks[N]`` is set, like a long tick.
     """
 
     def __init__(self, task_ids: list[str]) -> None:
         self._pending = list(task_ids)
         self.calls = 0
+        self.scopes: list[DispatchScope] = []
         self.stop_when: Callable[[], bool] = lambda: False
         self.held_ticks: dict[int, asyncio.Event] = {}
 
-    async def acquire_next(self) -> TaskAssignment | None:
+    async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         self.calls += 1
+        self.scopes.append(scope)
         if self.calls in self.held_ticks:
             await self.held_ticks[self.calls].wait()
         if self.stop_when():
             raise _Stop
-        if not self._pending:
+        if scope is not DispatchScope.ANY or not self._pending:
             return None
         tid = self._pending.pop(0)
         return TaskAssignment(task_id=tid, task={'title': tid}, modules=[])
@@ -115,10 +119,13 @@ async def _until(predicate: Callable[[], bool], label: str) -> None:
     await wait_responsive(poll(), label=label)
 
 
-def _harness(tmp_path: Path, dispatch: _Dispatch, slots: _Slots) -> Harness:
+def _harness(
+    tmp_path: Path, dispatch: _Dispatch, slots: _Slots, *, main_health_fix_reserved_slots: int = 0,
+) -> Harness:
     config = OrchestratorConfig(
         project_root=tmp_path,
         max_concurrent_tasks=1,
+        main_health_fix_reserved_slots=main_health_fix_reserved_slots,
         idle_poll_secs=_TICK,
         merge_heartbeat_interval_secs=_TICK,
         stale_service_restart_interval_secs=_TICK,
@@ -236,7 +243,7 @@ class TestParkedLoop:
         h.review_checkpoint = review
 
         async def drive() -> None:
-            for tid, calls in (('1', 2), ('2', 3), ('3', 4)):
+            for tid, calls in (('1', 1), ('2', 2), ('3', 3)):
                 await _until(lambda n=calls: dispatch.calls >= n, f'dispatch call {calls}')
                 slots.gates[tid].set()
 
@@ -252,7 +259,7 @@ class TestParkedLoop:
         dispatch, slots = _Dispatch(['1']), _Slots()
         tick = asyncio.Event()
         dispatch.held_ticks[2] = tick
-        h = _harness(tmp_path, dispatch, slots)
+        h = _harness(tmp_path, dispatch, slots, main_health_fix_reserved_slots=1)
 
         async def drive() -> None:
             try:
@@ -265,6 +272,9 @@ class TestParkedLoop:
         report = await _run_driven(h, slots, drive)
 
         assert [r.task_id for r in report.task_reports] == ['1']
+        assert dispatch.scopes[:2] == [DispatchScope.ANY, DispatchScope.MAIN_HEALTH_FIX], (
+            'tick 2 is the reserve tick, run while slot 1 holds the only general slot'
+        )
 
     async def test_owed_restart_force_fires_while_parked(
         self, tmp_path: Path, fleet_dir: Path,
@@ -275,14 +285,14 @@ class TestParkedLoop:
         coord = _fused_memory_restart(h, clock, fired)
 
         async def drive() -> None:
-            await _until(lambda: dispatch.calls >= 2, 'loop parked on slot 1')
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
             await _arm(coord)
             reads_when_armed = clock.reads
             await _until(lambda: clock.reads >= reads_when_armed + 3, 'restart polled while parked')
             assert not fired.is_set(), 'a polite restart must wait while a slot is live'
             clock.now += _FORCE_FIRE_AFTER_SECS
             await _until(fired.is_set, 'owed restart force-fired while parked')
-            assert dispatch.calls == 2, 'the loop must still be parked when it fires'
+            assert dispatch.calls == 1, 'the loop must still be parked when it fires'
 
         await _run_driven(h, slots, drive)
 
@@ -293,11 +303,11 @@ class TestParkedLoop:
         h = _harness(tmp_path, dispatch, slots)
 
         async def drive() -> None:
-            await _until(lambda: dispatch.calls >= 2, 'loop parked on slot 1')
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
             await _until(lambda: _heartbeat_ts(fleet_dir) is not None, 'first heartbeat')
             first = _heartbeat_ts(fleet_dir) or 0.0
             await _until(lambda: (_heartbeat_ts(fleet_dir) or 0.0) > first, 'heartbeat advanced')
-            assert dispatch.calls == 2, 'the loop must still be parked'
+            assert dispatch.calls == 1, 'the loop must still be parked'
 
         await _run_driven(h, slots, drive)
 
@@ -310,7 +320,7 @@ class TestParkedLoop:
         assert main is not None
 
         async def sigterm_while_parked() -> None:
-            await _until(lambda: dispatch.calls >= 2, 'loop parked on slot 1')
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
             main.cancel()
 
         with pytest.raises(asyncio.CancelledError):

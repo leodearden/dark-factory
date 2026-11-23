@@ -207,7 +207,7 @@ the mis-closed tag in general.
   the tag that was mis-closed".
 
 **One accepted residual survives the 2026-08-25 widening, at the GENERIC boundary
-only.** `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._first_markup_argument`
+only.** `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._markup_arguments`
 documents it in place: a CROSS-FIELD misclose — a closer naming a *different*
 parameter of the *same* tool — still passes, because that scan calls
 `detect_for(value, param)` with the argument's own name and **no schema**, so
@@ -348,7 +348,7 @@ failure class this whole task exists to kill.
 | Change | What it does |
 |---|---|
 | `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens; its envelope literals are now `shared.toolcall_markup` re-exports (task 3688, §1). |
-| `fused_memory/server/markup_guard.py::install_markup_guard` (task 4458, which replaced task 3141's `markup_tripwire.py` gate, see §1 — NOT this task) | Live rejection at the MCP write boundary, for every tool on the fused-memory server. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
+| `fused_memory/server/markup_guard.py::build_markup_guard`, installed by `fused_memory/server/boundary_guards.py::install_boundary_guards` (task 4458, which replaced task 3141's `markup_tripwire.py` gate, see §1 — NOT this task) | Live rejection at the MCP write boundary, for every tool on the fused-memory server. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
 | `fused_memory/backends/task_text_markup_gate.py` (task 4419 — NOT this task) | Storage-layer refusal inside `SqliteTaskBackend.add_task` / `.update_task`, covering the task writers that never cross MCP dispatch. See "The storage-layer refusal" below. |
 | `Mem0Backend.scan_payload_text` → `MemoryService.scan_memory_content` → `scan_memory_content` MCP tool | The missing read capability (§3). |
 | `fused-memory/scripts/sweep_toolcall_xml_leak.py` | The corpus sweep (§5). |
@@ -358,8 +358,10 @@ failure class this whole task exists to kill.
 
 Every tool on the fused-memory server **rejects** a call whose arguments carry
 envelope markup, before anything is persisted. The live guard is
-`fused-memory/src/fused_memory/server/markup_guard.py::install_markup_guard`
-(task 4458). It wraps the server's `call_tool` with
+`fused-memory/src/fused_memory/server/markup_guard.py::build_markup_guard`
+(task 4458), installed by
+`fused-memory/src/fused_memory/server/boundary_guards.py::install_boundary_guards`.
+It wraps the server's `call_tool` with
 `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware` and answers
 with one of two `error_type` values. `mcp_markup_detected` carries a
 `repaired_call`: the complete argument map with the swallowed parameters
@@ -433,7 +435,7 @@ writer passes through them. Five writers of task text run in-process below
 | `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._dispatch_ticket_decision` | the curator worker's deferred replay of a ticket, hours after the guarded submit |
 | `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._submit_task_planning_mode` | a `deferred` insert under planning mode |
 | `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor.update_task` | description and details, for any in-process caller |
-| `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_queue_briefing_refresh_tasks` | a briefing-refresh task composed from stage output, bypassing the curator |
+| `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::queue_briefing_refresh_tasks` | a briefing-refresh task composed from stage output, bypassing the curator |
 
 Both sinks call
 `fused-memory/src/fused_memory/backends/task_text_markup_gate.py::refuse_leaked_task_text`

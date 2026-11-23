@@ -22,15 +22,8 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
-from _workflow_helpers import (
-    AgentStub,
-    _build_workflow_with_escalation,
-    _make_resolving_steward,
-)
-from escalation.models import Escalation
-from escalation.pins import classify_pins
-from escalation.queue import EscalationQueue
-from test_workflow_merge_gating_strand import (
+from _info_l0_router_fixtures import handing_off_steward
+from _merge_phase_fixtures import (
     _build_workflow,
     _make_advanced_worktree,
     _make_silent_steward,
@@ -39,12 +32,22 @@ from test_workflow_merge_gating_strand import (
     _time_the_wait,
     _wire_resolve_callback,
 )
-from test_workflow_merge_gating_strand import config as config
-from test_workflow_merge_gating_strand import git_ops as git_ops
-from test_workflow_merge_gating_strand import git_repo as git_repo
-from test_workflow_merge_gating_strand import task_assignment as task_assignment
+from _merge_phase_fixtures import config as config
+from _merge_phase_fixtures import git_ops as git_ops
+from _merge_phase_fixtures import git_repo as git_repo
+from _merge_phase_fixtures import task_assignment as task_assignment
+from _open_l1_fixtures import submit_l1
+from _workflow_helpers import (
+    AgentStub,
+    _build_workflow_with_escalation,
+    _make_resolving_steward,
+)
+from escalation.models import Escalation
+from escalation.pins import classify_pins
+from escalation.queue import EscalationQueue
 
 from orchestrator.agents.roles import STEWARD
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import _is_gating_escalation
 from orchestrator.workflow_types import WorkflowOutcome
@@ -76,71 +79,6 @@ def _submit_l2(queue: EscalationQueue, task_id: str, severity: str) -> Escalatio
     )
     queue.submit(esc)
     return esc
-
-
-def _submit_l1(
-    queue: EscalationQueue, task_id: str, severity: str,
-    agent_role: str = 'harness-orphan-reaper',
-) -> Escalation:
-    """Submit a pending level-1 record at *severity*, as an earlier incarnation left it."""
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=agent_role,
-        severity=severity,
-        category='design_concern',
-        summary=f'a {severity!r} L1 left by an earlier incarnation',
-        level=1,
-    )
-    queue.submit(esc)
-    return esc
-
-
-def _make_handing_off_steward(
-    queue: EscalationQueue, task_id: str, filer_role: str = STEWARD.name,
-) -> type:
-    """A steward that hands the gating L0 to a human: files a level-1 under
-    *filer_role* and dismisses the L0.  With the steward's role, both producers
-    look like this in the queue — ``TaskSteward``'s own give-up path and its
-    agent's ``escalate_blocker(level=1)``.  It acts after a short delay, as the
-    real steward's background loop does, so the wait has begun before it hands
-    off."""
-
-    class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):
-            self.give_up_task: asyncio.Task | None = None
-
-        def set_outcome_channel(self, channel) -> None:
-            pass
-
-        def set_wip_probe(self, probe) -> None:
-            pass
-
-        async def _give_up(self) -> None:
-            await asyncio.sleep(0.05)
-            for esc in queue.get_by_task(task_id, status='pending', level=0):
-                queue.submit(Escalation(
-                    id=queue.make_id(task_id),
-                    task_id=task_id,
-                    agent_role=filer_role,
-                    severity=esc.severity,
-                    category=esc.category,
-                    summary=f'Steward re-escalation: {esc.summary}',
-                    level=1,
-                ))
-                queue.resolve(
-                    esc.id, 'Auto-dismissed: re-escalated to level 1',
-                    dismiss=True, resolved_by='steward',
-                )
-
-        async def start(self) -> None:
-            self.give_up_task = asyncio.create_task(self._give_up())
-
-        async def stop(self) -> None:
-            if self.give_up_task is not None:
-                await self.give_up_task
-
-    return _FakeSteward
 
 
 class TestGatingAgreesWithThePinClassifier:
@@ -260,7 +198,7 @@ class TestInfoL1DoesNotHandOffAtTheWaitTail:
         )
         _wire_resolve_callback(queue, wf)
         submit = _stub_merge_internals(wf, monkeypatch)
-        info_l1 = _submit_l1(queue, task_id, 'info')
+        info_l1 = submit_l1(queue, task_id, 'info', agent_role='harness-orphan-reaper')
         _submit_gating_l0(queue, task_id)
         wf._steward_factory = _make_resolving_steward(queue, task_id)
 
@@ -271,6 +209,56 @@ class TestInfoL1DoesNotHandOffAtTheWaitTail:
         assert 'blocked' not in scheduler.statuses.get(task_id, [])
         still_pending = queue.get_by_task(task_id, status='pending', level=1)
         assert [e.id for e in still_pending] == [info_l1.id]
+
+
+@pytest.mark.asyncio
+class TestInfoL1DoesNotDivertTheStewardRequeue:
+    """``_mark_blocked``'s steward wait: an info L1 left on the task never
+    turns the steward's resolution into a ``blocked`` park; a blocking one
+    still does (PRD D3)."""
+
+    async def _mark_blocked_with_l1_open(
+        self, config, git_ops, task_assignment, tmp_path, severity: str,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        l1 = submit_l1(queue, task_id, severity, agent_role='harness-info-l0-router')
+        workflow, scheduler, _ = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, AgentStub(), tmp_path,
+            spawn_merge_worker=False,
+            steward_factory=_make_resolving_steward(queue, task_id),
+            queue=queue,
+        )
+        wt = (await git_ops.create_worktree(task_id)).path
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        outcome = await asyncio.wait_for(
+            workflow._mark_blocked('architect produced no plan.json'), 20,
+        )
+        open_l1 = queue.get_by_task(task_id, status='pending', level=1)
+        return outcome, scheduler.statuses.get(task_id, []), open_l1, l1
+
+    async def test_an_info_l1_left_open_requeues_once_the_steward_resolves(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        outcome, statuses, open_l1, info_l1 = await self._mark_blocked_with_l1_open(
+            config, git_ops, task_assignment, tmp_path, 'info',
+        )
+
+        assert outcome == WorkflowOutcome.REQUEUED, f'an info L1 must not hand off; got {outcome}'
+        assert statuses[-1] == 'pending', statuses
+        assert [e.id for e in open_l1] == [info_l1.id]
+
+    async def test_a_blocking_l1_left_open_still_parks_the_task(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        outcome, statuses, _, _ = await self._mark_blocked_with_l1_open(
+            config, git_ops, task_assignment, tmp_path, 'blocking',
+        )
+
+        assert outcome == WorkflowOutcome.ESCALATED
+        assert statuses[-1] == 'blocked', statuses
 
 
 @pytest.mark.asyncio
@@ -299,7 +287,7 @@ class TestTheWaitTailNamesWhoActed:
 
         async def _escalate_once():
             if not stale and stale_l1_role is not None:
-                stale.append(_submit_l1(queue, task_id, 'blocking', stale_l1_role))
+                stale.append(submit_l1(queue, task_id, 'blocking', agent_role=stale_l1_role))
             _submit_gating_l0(queue, task_id)
             return WorkflowOutcome.ESCALATED
 
@@ -315,7 +303,7 @@ class TestTheWaitTailNamesWhoActed:
     ):
         report, open_l1, _ = await self._run_escalated(
             config, git_ops, task_assignment, monkeypatch, tmp_path,
-            make_steward=_make_handing_off_steward,
+            make_steward=handing_off_steward,
         )
 
         assert report.outcome == WorkflowOutcome.BLOCKED
@@ -327,7 +315,7 @@ class TestTheWaitTailNamesWhoActed:
     ):
         report, open_l1, _ = await self._run_escalated(
             config, git_ops, task_assignment, monkeypatch, tmp_path,
-            make_steward=lambda queue, task_id: _make_handing_off_steward(
+            make_steward=lambda queue, task_id: handing_off_steward(
                 queue, task_id, filer_role='orchestrator',
             ),
         )

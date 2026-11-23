@@ -10,9 +10,7 @@ imports only ``eval_write_triage_scoring.py``.
 """
 from __future__ import annotations
 
-import importlib.util
 import logging
-import sys
 import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -20,28 +18,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.server.write_triage import OUTCOME_JUDGE
+from fused_memory.utils.script_loader import load_script
 
 logger = logging.getLogger(__name__)
 
 _SCRIPTS = Path(__file__).resolve().parent
-
-
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
 
 
 # Pyright cannot follow the by-path loader, so it alone resolves `_scoring` through
@@ -49,7 +30,7 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 if TYPE_CHECKING:
     import eval_write_triage_scoring as _scoring
 else:
-    _scoring = _load_script(
+    _scoring = load_script(
         _SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring',
     )
 
@@ -109,6 +90,7 @@ def _case(
     acceptable: frozenset[str],
     band_winner_id: str | None,
     band: str,
+    routed: str,
     similarity: float | None,
     canonical_present: bool | None,
     canonical_alias_id: str | None,
@@ -129,6 +111,7 @@ def _case(
         'acceptable_outcomes': acceptable,
         'band_winner_id': band_winner_id,
         'band': band,
+        'routed': routed,
         'similarity': similarity,
         'canonical_present': canonical_present,
         'canonical_alias_id': canonical_alias_id,
@@ -157,6 +140,7 @@ def _seeded_case(
         acceptable=acceptable,
         band_winner_id=slate[0] if slate else None,
         band=OUTCOME_JUDGE,
+        routed=OUTCOME_JUDGE,
         similarity=None,
         canonical_present=None,
         canonical_alias_id=canonical_alias_id,
@@ -275,11 +259,11 @@ class EvalPlan:
         unseen = [
             f"{case['memory_id']} ({case['expected_class']})"
             for case in self.cases
-            if case['band'] == OUTCOME_JUDGE and not case['candidates']
+            if case['routed'] == OUTCOME_JUDGE and not case['candidates']
         ]
         if unseen:
             raise ValueError(
-                f'{len(unseen)} judge-band case(s) have an EMPTY slate: '
+                f'{len(unseen)} case(s) routed to the judge have an EMPTY slate: '
                 f'{", ".join(unseen)}. judge_write answers those `stored` with no '
                 'provider call, so the eval would count a verdict nobody gave. A '
                 'single-cluster run leaves the distractor control nothing to draw '
@@ -333,8 +317,8 @@ def plan_from_slates(
     (default: *records*), so a ``--limit`` run describes a target exactly as
     the full run does.
 
-    The expected class stays the fixture's label. The slate, the band winner
-    and the band come from the retrieval — including for a record whose
+    The expected class stays the fixture's label. The slate, the band winner,
+    the band and the route come from the retrieval — including for a record whose
     canonical is no longer in the corpus, which is kept in the population and
     flagged rather than dropped.
     """
@@ -354,6 +338,7 @@ def plan_from_slates(
             acceptable=_scoring.acceptable_outcomes_for(str(record['label'])),
             band_winner_id=slate.attach_target_id,
             band=slate.band,
+            routed=slate.routed,
             similarity=slate.similarity,
             canonical_present=slate.canonical_present,
             canonical_alias_id=aliases.get(str(record['cluster_id'])),

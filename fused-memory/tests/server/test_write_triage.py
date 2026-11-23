@@ -22,15 +22,16 @@ import types
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from _fm_helpers import make_insufficient_quota_error
 
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
-from fused_memory.models.memory import MemoryResult
+from fused_memory.models.memory import AddMemoryResponse, MemoryResult
 from fused_memory.server import write_triage
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
-    _parent_id_in_meta,
+    SIGHTING_KIND,
 )
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
@@ -46,11 +47,12 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     ROUTED_KEY,
     TRIAGE_OUTCOMES,
+    FailOpenStage,
     TriageFailOpenCounter,
     TriageJudgeVerdict,
     _stub_judge,
+    attach_write_durable,
     attach_write_landed,
-    canonical_id_of,
     decide_band,
     declares_attach_keys,
     emit_triage_fail_open_storm_escalation,
@@ -67,6 +69,10 @@ from fused_memory.utils.clip_disclosure import TruncationFact
 # than restated as the literal 60 — see test_near_duplicate_guard.py.
 _RRF_RANK1 = 1.0 / (RRF_K + 1)
 
+#: Every record's text unless a test says otherwise; a write of this text
+#: repeats it verbatim, which is what keeps a restate-band write `restated`.
+_RECORD_TEXT = 'some procedural content'
+
 
 def _result(
     id_: str,
@@ -74,7 +80,7 @@ def _result(
     *,
     category: MemoryCategory | None = MemoryCategory.procedural_knowledge,
     source_store: SourceStore = SourceStore.mem0,
-    content: str = 'some procedural content',
+    content: str = _RECORD_TEXT,
     relevance_score: float = _RRF_RANK1,
     store_rank: int = 1,
     omit_store_score: bool = False,
@@ -632,6 +638,7 @@ class TestDecideBand:
         ('label', 'extra'),
         [
             ('no kind at all', None),
+            ('parent_id without kind', {PARENT_ID_KEY: 'm1'}),
             ('kind outside CHILD_KINDS', {'kind': 'note', PARENT_ID_KEY: 'm1'}),
             ('kind is None', {'kind': None, PARENT_ID_KEY: 'm1'}),
         ],
@@ -661,7 +668,7 @@ class TestDecideBand:
     def test_a_child_with_a_malformed_parent_id_does_not_hoist(
         self, label, extra,
     ) -> None:
-        """Matches `_parent_id_in_meta`'s exact rule, so the two cannot disagree.
+        """The rule is grouped_read's `child_parent_id`: a malformed link is no child.
 
         A child kind whose parent link is unusable is treated as an ordinary
         candidate rather than hoisted to a nonsense target: `parent_id` must
@@ -672,37 +679,6 @@ class TestDecideBand:
             [_result('c1', 0.97, extra_metadata=extra)], t_high=T_HIGH, t_low=T_LOW,
         )
         assert d.canonical_id == 'c1', label
-
-    @pytest.mark.parametrize(
-        'extra',
-        [
-            None,
-            {},
-            {'kind': 'sighting', PARENT_ID_KEY: 'm1'},
-            {'kind': 'amendment', PARENT_ID_KEY: 'm1'},
-            {'kind': 'sighting'},
-            {'kind': 'sighting', PARENT_ID_KEY: None},
-            {'kind': 'sighting', PARENT_ID_KEY: ''},
-            {'kind': 'sighting', PARENT_ID_KEY: 7},
-            {'kind': 'note', PARENT_ID_KEY: 'm1'},
-            {'kind': None, PARENT_ID_KEY: 'm1'},
-            {PARENT_ID_KEY: 'm1'},
-        ],
-    )
-    def test_the_child_rule_cannot_drift_from_grouped_reads(self, extra) -> None:
-        """DRIFT GUARD: one rule, asserted against the READ side's own function.
-
-        `write_triage` decides where a child's write attaches; `grouped_read`
-        decides where a child is displayed. If those two disagree about what
-        counts as a child, the write lands somewhere the read cannot fold it
-        from — a child that exists but never groups. Asserting equivalence
-        against the landed `_parent_id_in_meta` means a future tightening of
-        the rule in either module cannot silently re-open this hole in the
-        other.
-        """
-        result = _result('own-id', 0.97, extra_metadata=extra)
-        expected = _parent_id_in_meta(result.metadata) or 'own-id'
-        assert canonical_id_of(result) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -891,7 +867,7 @@ class TestTriageFailOpenCounter:
             assert counter.record(project='dark_factory') is None
 
     def test_the_crossing_call_returns_a_json_serializable_summary(self) -> None:
-        import json  # noqa: PLC0415
+        import json
 
         counter = TriageFailOpenCounter(time_provider=_Clock())
         summary = None
@@ -1326,7 +1302,7 @@ class TestTriageWriteFailsOpen:
             return verdict
 
         decision = await triage_write(
-            service, content='c', project_id='p', counter=counter, judge=_judge,
+            service, content=_RECORD_TEXT, project_id='p', counter=counter, judge=_judge,
         )
 
         assert decision.outcome == verdict
@@ -1364,7 +1340,7 @@ class TestTriageWriteFailsOpen:
         service = self._service(search=AsyncMock(return_value=[_result('m1', 0.97)]))
 
         decision = await triage_write(
-            service, content='c', project_id='p', counter=counter,
+            service, content=_RECORD_TEXT, project_id='p', counter=counter,
         )
 
         assert decision.outcome == OUTCOME_RESTATED
@@ -1432,6 +1408,143 @@ class TestTriageWriteFailsOpen:
             memory_service=None, content='c', project_id='p', decision=None,
             candidates=[_result('m1', 0.80)],
         ) == OUTCOME_STORED
+
+
+class TestAFailOpenNamesTheStageThatGaveUp:
+    """INV-11: an untriaged ``stored`` must be distinguishable from a triaged one.
+
+    The ack outcome stays ``stored`` either way (C1), so the decision itself
+    carries where triage gave up; every genuine ``stored`` carries ``None``.
+    """
+
+    _service = staticmethod(TestTriageWriteFailsOpen._service)
+
+    @staticmethod
+    async def _triage(service, **kwargs):
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        return await triage_write(
+            service, content=_RECORD_TEXT, project_id='p', counter=counter, **kwargs,
+        )
+
+    def _hoisting_service(self, cosine_to_memories: AsyncMock) -> types.SimpleNamespace:
+        """A restated child whose parent is not in the slate, so the guard looks it up."""
+        service = self._service(
+            search=AsyncMock(return_value=SearchResults([
+                _result('child', 0.97, extra_metadata={
+                    'kind': SIGHTING_KIND, PARENT_ID_KEY: 'parent',
+                }),
+            ])),
+            min_parent_cosine=0.60, hoist_max_cosine_gap=0.05,
+        )
+        service.cosine_to_memories = cosine_to_memories
+        return service
+
+    def test_the_stage_values_are_the_logged_strings(self) -> None:
+        assert FailOpenStage.RETRIEVE == 'retrieve'
+        assert FailOpenStage.JUDGE == 'judge'
+        assert FailOpenStage.ATTACH_GUARD == 'attach_guard'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('label', 'search'),
+        [
+            ('search raises', AsyncMock(side_effect=RuntimeError('mem0 down'))),
+            ('search degraded', AsyncMock(return_value=SearchResults(
+                [], degraded=True, failed_stores=['mem0'],
+            ))),
+            ('search degraded with a candidate', AsyncMock(return_value=SearchResults(
+                [_result('m1', 0.97)], degraded=True, failed_stores=['mem0'],
+            ))),
+        ],
+    )
+    async def test_a_retrieval_failure_names_retrieve(self, label, search) -> None:
+        decision = await self._triage(self._service(search=search))
+
+        assert decision.outcome == OUTCOME_STORED, label
+        assert decision.fail_open_stage is FailOpenStage.RETRIEVE, label
+
+    @pytest.mark.asyncio
+    async def test_a_raising_judge_names_judge(self) -> None:
+        async def _boom(**_kwargs):
+            raise RuntimeError('judge down')
+
+        decision = await self._triage(
+            self._service(search=AsyncMock(return_value=[_result('m1', 0.75)])),
+            judge=_boom,
+        )
+
+        assert decision.fail_open_stage is FailOpenStage.JUDGE
+
+    @pytest.mark.asyncio
+    async def test_an_out_of_vocabulary_verdict_names_judge(self) -> None:
+        async def _nonsense(**_kwargs):
+            return 'nonsense'
+
+        decision = await self._triage(
+            self._service(search=AsyncMock(return_value=[_result('m1', 0.75)])),
+            judge=_nonsense,
+        )
+
+        assert decision.fail_open_stage is FailOpenStage.JUDGE
+
+    @pytest.mark.asyncio
+    async def test_a_raising_parent_lookup_names_attach_guard(self) -> None:
+        service = self._hoisting_service(
+            AsyncMock(side_effect=TimeoutError('cosine lookup timed out')),
+        )
+
+        decision = await self._triage(service)
+
+        service.cosine_to_memories.assert_awaited_once()
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_STORED, None)
+        assert decision.fail_open_stage is FailOpenStage.ATTACH_GUARD
+
+    @pytest.mark.asyncio
+    async def test_an_attach_guard_refusal_is_not_a_fail_open(self) -> None:
+        decision = await self._triage(
+            self._hoisting_service(AsyncMock(return_value={'parent': 0.30})),
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.attach_refusals, 'the guard must have refused this attach'
+        assert decision.fail_open_stage is None
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_empty_search_is_not_a_fail_open(self) -> None:
+        decision = await self._triage(
+            self._service(search=AsyncMock(return_value=SearchResults([]))),
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.fail_open_stage is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag',
+        [
+            'allow_near_duplicate',
+            'caller_owns_attach_keys',
+            'caller_declares_supersession',
+            'caller_is_completion_record',
+        ],
+    )
+    async def test_a_force_store_is_not_a_fail_open(self, flag) -> None:
+        decision = await self._triage(
+            self._service(search=AsyncMock(return_value=[_result('m1', 0.97)])),
+            **{flag: True},
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.fail_open_stage is None
+
+    @pytest.mark.asyncio
+    async def test_the_stub_judges_stored_is_not_a_fail_open(self) -> None:
+        decision = await self._triage(
+            self._service(search=AsyncMock(return_value=[_result('m1', 0.75)])),
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.fail_open_stage is None
 
 
 # ---------------------------------------------------------------------------
@@ -1525,7 +1638,7 @@ class TestTheRetrievedCandidatesReachTheJudge:
 
         await triage_write(
             self._service(SearchResults([_result('m1', score)])),
-            content='c', project_id='p', counter=counter, judge=_judge,
+            content=_RECORD_TEXT, project_id='p', counter=counter, judge=_judge,
         )
 
         assert called == [], label
@@ -1592,13 +1705,13 @@ class TestTheDecisionDisclosesClippedCandidates:
         judge_fact = TruncationFact(field='judge_candidates', cap=2, elided=1)
 
         async def _judge(**_kwargs):
-            return TriageJudgeVerdict(OUTCOME_RESTATED, 'm0', truncation_facts=(judge_fact,))
+            return TriageJudgeVerdict(OUTCOME_AMENDED, 'm0', truncation_facts=(judge_fact,))
 
         results = [_result(f'm{i}', 0.75 - i / 1000) for i in range(3)]
 
         decision = await self._triage(self._service(results), judge=_judge)
 
-        assert decision.outcome == OUTCOME_RESTATED
+        assert decision.outcome == OUTCOME_AMENDED
         assert decision.truncation_facts == (self._RETRIEVAL_FACT, judge_fact)
 
 
@@ -1743,6 +1856,31 @@ class TestEmitTriageFailOpenStormEscalation:
             f'must route the burst at the owning PRD leaf: {payload!r}'
         )
 
+    def test_states_the_mem0_intent_counts_for_the_window(self, tmp_path) -> None:
+        """The journal, not triage, knows whether each write's Mem0 leg landed."""
+        pytest.importorskip('escalation')
+        storm = {
+            **_STORM,
+            'mem0_intents_in_window': {'completed': 7, 'failed': 2, 'retrying': 3},
+        }
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), storm)
+
+        detail = _only_escalation(tmp_path)['detail']
+        assert (
+            "mem0_intents_in_window={'completed': 7, 'failed': 2, 'retrying': 3}"
+            in detail
+        ), detail
+
+    def test_without_counts_it_records_none(self, tmp_path) -> None:
+        """A fail-open storm is often the same outage that fails the Mem0 write itself."""
+        pytest.importorskip('escalation')
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+
+        payload = _only_escalation(tmp_path)
+        assert 'mem0_intents_in_window=None' in payload['detail']
+
     def test_the_escalation_id_is_greppable_via_the_stable_anchor(
         self, tmp_path,
     ) -> None:
@@ -1780,7 +1918,7 @@ class TestEmitTriageFailOpenStormEscalation:
     def test_files_afresh_once_the_prior_escalation_is_resolved(self, tmp_path) -> None:
         """Dedup must not silence a NEW outage after the old one was cleared."""
         pytest.importorskip('escalation')
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         first = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
         assert first is not None
@@ -1809,6 +1947,118 @@ class TestEmitTriageFailOpenStormEscalation:
         assert payload['category'] == 'write_triage_fail_open_storm'
         assert payload['task_id'] == write_triage._ANCHOR_TASK_ID
         assert payload['level'] == 1
+
+
+class TestAFailOpenOnExhaustedCreditsSaysSo:
+    """A fail-open storm behind an empty OpenAI balance names the credits (task 10922).
+
+    On 2026-11-19 the triage fail-open alarm read like a transient outage while
+    the real cause was exhausted credits, which only a human paying clears.
+    """
+
+    _service = staticmethod(TestTriageWriteFailsOpen._service)
+    _fail_open_logs = staticmethod(TestTriageWriteFailsOpen._fail_open_logs)
+
+    @pytest.mark.asyncio
+    async def test_the_fail_open_line_names_the_billing_cause(self, caplog) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(
+            search=AsyncMock(side_effect=make_insufficient_quota_error()),
+        )
+
+        with caplog.at_level(logging.DEBUG, logger=write_triage.logger.name):
+            decision = await triage_write(
+                service, content='c', project_id='p', counter=counter,
+            )
+
+        assert decision.outcome == OUTCOME_STORED, 'the write is never blocked'
+        assert decision.fail_open_stage is not None
+        (logged,) = self._fail_open_logs(caplog)
+        assert logged.levelno == logging.WARNING
+        assert 'cause=billing_exhausted:api_key_credits' in logged.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_fail_open_names_its_exception_type(self, caplog) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(side_effect=RuntimeError('mem0 down')))
+
+        with caplog.at_level(logging.DEBUG, logger=write_triage.logger.name):
+            await triage_write(service, content='c', project_id='p', counter=counter)
+
+        (logged,) = self._fail_open_logs(caplog)
+        assert 'cause=RuntimeError' in logged.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_the_storm_counts_the_billing_fail_opens_in_its_window(self) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        outage = self._service(search=AsyncMock(side_effect=RuntimeError('mem0 down')))
+        empty_balance = self._service(
+            search=AsyncMock(side_effect=make_insufficient_quota_error()),
+        )
+        plain = 2
+        billing = _FAIL_OPEN_STORM_THRESHOLD - plain
+
+        for _ in range(plain):
+            await triage_write(outage, content='c', project_id='p', counter=counter)
+        for _ in range(billing):
+            await triage_write(empty_balance, content='c', project_id='p', counter=counter)
+
+        storm = counter.drain_storm()
+        assert storm is not None, 'crossing the threshold must fire'
+        assert storm['count'] == _FAIL_OPEN_STORM_THRESHOLD
+        assert storm['billing_exhausted_in_window'] == billing
+
+    def test_a_billing_storm_leads_with_the_credits(self, tmp_path) -> None:
+        pytest.importorskip('escalation')
+
+        emit_triage_fail_open_storm_escalation(
+            str(tmp_path), {**_STORM, 'billing_exhausted_in_window': 9},
+        )
+
+        payload = _only_escalation(tmp_path)
+        assert 'credits exhausted' in payload['summary'].lower()
+        assert 'provider_billing_exhausted' in f"{payload['summary']}\n{payload['detail']}"
+        assert 'billing_exhausted_in_window=9' in payload['detail']
+
+    @pytest.mark.parametrize(
+        'storm',
+        [_STORM, {**_STORM, 'billing_exhausted_in_window': 0}],
+        ids=['key-absent', 'zero'],
+    )
+    def test_without_billing_fail_opens_the_summary_is_unchanged(
+        self, tmp_path, storm,
+    ) -> None:
+        pytest.importorskip('escalation')
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), storm)
+
+        assert _only_escalation(tmp_path)['summary'] == (
+            f'12 add_memory write(s) triaged WITHOUT triage in '
+            f'{_FAIL_OPEN_STORM_WINDOW_SECONDS}s — write triage is failing open '
+            '(see docs/prds/memory-write-path-convergence.md)'
+        )
+
+
+def _only_escalation(project_root) -> dict:
+    (path,) = (project_root / 'data' / 'escalations').glob('esc-*.json')
+    return json.loads(path.read_text())
+
+
+class TestAttachWriteDurable:
+    """An attach whose Mem0 leg is queued for server-side retry still stands."""
+
+    def test_a_response_with_ids_is_durable(self) -> None:
+        assert attach_write_durable(AddMemoryResponse(memory_ids=['m1'])) is True
+
+    def test_a_mem0_leg_pending_retry_is_durable(self) -> None:
+        result = AddMemoryResponse(memory_ids=[], stores_pending_retry=[SourceStore.mem0])
+        assert attach_write_durable(result) is True
+
+    def test_nothing_landed_and_nothing_pending_is_not_durable(self) -> None:
+        assert attach_write_durable(AddMemoryResponse(memory_ids=[])) is False
+
+    def test_an_unspecced_test_double_reads_as_durable(self) -> None:
+        assert attach_write_durable(Mock()) is True
 
 
 class TestAttachWriteLanded:

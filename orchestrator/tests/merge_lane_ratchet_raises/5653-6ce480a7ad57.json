@@ -1,0 +1,12 @@
+{
+  "task_id": "5653",
+  "reason": "test_verify_cache_decision.py joins the lane-importing tests: it now drives VerifyRunnerPool's merge gate with a merge_lane PostMergePyrightResult double, and brings its one existing private read (verify_plan._derive_full_suite_runs, the full-breadth merge plan its fan-out fixtures compare against). Net-additive test coverage, not a refactor.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6117,
+      "current": 6118
+    }
+  ]
+}

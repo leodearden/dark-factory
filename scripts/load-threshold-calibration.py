@@ -702,9 +702,8 @@ def compare_to_code_defaults(block: dict | None, defaults: dict | None) -> dict 
     the model changed.
 
     A leaf the defaults mapping does not know is ``unknown_to_schema``, not a
-    silent drop: measured today, PsiAdmissionConfig has no ``runqueue_ratio``
-    field (β unlanded), and "this arm is not in the model yet" is a distinct
-    fact from both "restates the default" and "differs from it".
+    silent drop: "this arm is not in the model" (a leaf the schema lacks) is a
+    distinct fact from both "restates the default" and "differs from it".
     """
     if block is None or defaults is None:
         return None

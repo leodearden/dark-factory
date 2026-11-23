@@ -1,0 +1,654 @@
+{
+  "sample": {
+    "cap": 20,
+    "hash_rule": "sha256(graph:edge_uuid)",
+    "strata": [
+      "retired",
+      "kept"
+    ],
+    "window_end": "2026-11-10T00:00:00+00:00",
+    "window_start": "2026-10-24T00:00:00+00:00"
+  },
+  "verdicts": [
+    {
+      "edge_uuid": "806908fe-5512-43fb-9e7c-30934d4139cc",
+      "episode_uuid": "03d78b57-a82f-404c-8c14-725d5a372550",
+      "fact": "Filer-first credit applies only to entries that pass the same source-dir predicate as prefix discovery, which excludes tests/.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "\"Filer-first credit applies only to entries that pass the same source-dir predicate as prefix discovery ... Generic dirs (docs/, src/, tests/) ... stay NEUTRAL\"."
+    },
+    {
+      "edge_uuid": "e196f0cb-ba65-4298-8e97-5773c4f34a81",
+      "episode_uuid": "0430f902-a57e-4d83-bc33-bede9d04ec8c",
+      "fact": "The make_id docstring and submit() comment in escalation/src/escalation/queue.py are not edited, which also applies to ticket_janitor.py.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) ticket_janitor.py is only named inside the unedited submit() comment; the record says nothing of it being left unedited."
+    },
+    {
+      "edge_uuid": "8ba96598-2a8b-4692-bbb4-3502e3c902b6",
+      "episode_uuid": "05ef9170-6cdc-48d3-a4fa-73733e3fd6af",
+      "fact": "The task reads the flat shape from the amendment advisory.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The guard reads the flat get_task shape as amendment_advisory also does; it does not read anything from the amendment advisory."
+    },
+    {
+      "edge_uuid": "4f07681d-ce22-4304-87e2-75099493e5a4",
+      "episode_uuid": "11702c7a-8451-4f41-9d18-f61b895bca95",
+      "fact": "The decision rejects the alternative of building the tool description at runtime by interpolating recon_self_model text through delete_memory.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The rejected alternative interpolates recon_self_model text \"through `mcp.tool(description=...)`\", not through delete_memory."
+    },
+    {
+      "edge_uuid": "e659fa78-124a-4a8a-86c8-95a5d7b2bccd",
+      "episode_uuid": "11702c7a-8451-4f41-9d18-f61b895bca95",
+      "fact": "Task 4422 wires a tombstone into delete_memory.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iii) A future possibility stated as fact: the copy \"would go stale silently once task 4422 wires a tombstone into delete_memory\"."
+    },
+    {
+      "edge_uuid": "4a4482d9-ed94-4c16-bdeb-de4562eec4a7",
+      "episode_uuid": "1198a0b1-3080-4c95-8c4e-9f50a150ecb9",
+      "fact": "The test timeout is caused by pytest-timeout during the import chain.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Inverted cause: the slow cold import inside the 10s timeout caused the failure, which \"end[ed] in pytest-timeout\"."
+    },
+    {
+      "edge_uuid": "4199d608-1ff3-405e-8441-ca773f2430c5",
+      "episode_uuid": "1419fad0-1e62-4ce6-9456-c15368ab34fb",
+      "fact": "curator_pool imports from maintenance/backfill_curator_corpus.py.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Inverted direction: maintenance/backfill_curator_corpus.py imports flatten_task_tree, which a move would repoint; curator_pool imports nothing from it."
+    },
+    {
+      "edge_uuid": "51f2f494-79cf-4782-b3a6-ecece6215143",
+      "episode_uuid": "1419fad0-1e62-4ce6-9456-c15368ab34fb",
+      "fact": "TaskCurator uses curator_pool functions.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iii) Partition (A) is filed as a follow-up and task_curator.py \"stays whole\"; no curator_pool exists for TaskCurator to use."
+    },
+    {
+      "edge_uuid": "e49c9eda-4334-45e4-b88e-94c7d46c50b1",
+      "episode_uuid": "1d20847a-9efe-406f-b8e5-1a200eb2050a",
+      "fact": "The exclusivity of _spec- verifies is parity with today's speculative _spec- verifies, whose exclusivity is the pool assignment.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "\"today's speculative _spec- verifies, whose exclusivity is the pool assignment\"."
+    },
+    {
+      "edge_uuid": "1e2414e0-d5ad-4324-a8b3-21b3dbd1927d",
+      "episode_uuid": "1f6d5b4b-7848-4506-a05e-cad602f84849",
+      "fact": "The raw failure code is related to vacuous_effect_absent, indicating that nothing was measured.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) For vacuous_effect_absent \"the numbers and vacuous_paths show the measurement\"; \"nothing was measured\" is said of diff_failed and similar codes."
+    },
+    {
+      "edge_uuid": "01f1ef75-58f5-4f1c-b073-d6dba03fdfc2",
+      "episode_uuid": "23fb459f-9cbe-4186-b813-3b8243ab0055",
+      "fact": "The re-measurement should be recorded in the task record as well as in the implementer's commit message.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The decision is \"Record the re-measurement in the implementer's commit message\"; it does not also require the task record."
+    },
+    {
+      "edge_uuid": "f269cc2e-3533-471f-ba02-dd229a73ce03",
+      "episode_uuid": "2fd9d676-cb25-467d-b55d-bf2ffee7be3b",
+      "fact": "Task 3473 and task 5135's recipe both involve a verbatim test_command.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "\"re-running the verbatim test_command as task 3473 and task 5135's recipe do\"."
+    },
+    {
+      "edge_uuid": "459df832-91c6-4895-b6f2-c963faa08d5e",
+      "episode_uuid": "34904d12-3ba0-4cf2-8109-addddb344acc",
+      "fact": "spawn_t3_lane.bind_session copies the Owner pid together with the owner identity.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "\"spawn_t3_lane.bind_session ... copies the identity together with the pid\"."
+    },
+    {
+      "edge_uuid": "688f215a-3c2d-4115-9d57-4f8e82184440",
+      "episode_uuid": "35a7e015-73b9-4e72-9eb9-6f9a8648e804",
+      "fact": "Gating the ack on agent_outcome would change the meaning of the flags in the context of a completed recon cycle.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Gating \"would change what a completed recon cycle means for every Stage 1 input, not only these flags\"; it does not change the flags' meaning."
+    },
+    {
+      "edge_uuid": "e88cf8d3-cb7b-4b54-8698-ab01abe63f12",
+      "episode_uuid": "3f0ec279-bb18-4822-86ec-f76b7d3ca4f0",
+      "fact": "live_leases() can only see flock-held leases related to the probe under test.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) \"live_leases() cannot do it, because it sees only flock-held leases\": it cannot attribute leases to the probe, which the fact says it does."
+    },
+    {
+      "edge_uuid": "1111fd8e-046f-4ed0-a5a6-b5d85ea6aaa4",
+      "episode_uuid": "510fbfed-f307-4206-bd49-aab5d0cf1a7c",
+      "fact": "t3_mcp_client.py includes a credential store module called Credential/state/path/write/read.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iii) The rejected partition stated as fact: \"t3_mcp_client.py stays one file ... with no split into transport, credential and OAuth modules\"."
+    },
+    {
+      "edge_uuid": "0c79c6d7-8704-4393-abb5-3cfc312939f9",
+      "episode_uuid": "59099088-f6e7-4e16-b703-0247453edc47",
+      "fact": "clip_disclosure imports from memory_consolidator.py.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Inverted direction: the formatters import clip_disclosure, whose imports \"never import reconciliation.stages\"."
+    },
+    {
+      "edge_uuid": "ff0c8ec0-72ed-4e83-bf20-31bd6b0bdb53",
+      "episode_uuid": "59099088-f6e7-4e16-b703-0247453edc47",
+      "fact": "dangling_citation imports from memory_consolidator.py.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Inverted direction: the formatters import dangling_citation, whose imports \"never import reconciliation.stages\"."
+    },
+    {
+      "edge_uuid": "27684bca-e8e3-4c6d-b2e7-5d385a54a541",
+      "episode_uuid": "5a148567-4f96-4630-8e08-6935b7a67900",
+      "fact": "Expired spend has candidate quality causes.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Inverted: such spend \"has infra or production causes, not candidate quality\"."
+    },
+    {
+      "edge_uuid": "e57110f1-b993-47db-afa7-b2633a75f5fd",
+      "episode_uuid": "687dcebb-500a-4cc1-84f4-674e980d03ef",
+      "fact": "OrchestratorConfig() does not receive new detector code or tests, which includes the MUST NOT twins.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The MUST NOT twins already exist on main, added by task 4481 with test_flags_inline_bare_construction; they are not among what is withheld."
+    },
+    {
+      "edge_uuid": "37f17d30-8419-42dc-a73b-ee4a16ed6e21",
+      "episode_uuid": "6e313910-d3ec-4b5e-80b8-a5fb0ebfd61f",
+      "fact": "The get_statuses_fresh function's per-call connection is wrapped in AtomicConnection.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iii) The rejected alternative as fact: the helper takes the read callable \"rather than wrapping get_statuses_fresh's per-call connection in AtomicConnection\"."
+    },
+    {
+      "edge_uuid": "a62dae2a-a729-4ffd-b1df-d7d63bfd15fb",
+      "episode_uuid": "81b98404-06f1-4576-b0a6-44950cbffd4c",
+      "fact": "The task involves a SPOT consolidation of test doubles in tests/server/test_write_triage_judge.py.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "The change is \"a SPOT consolidation of test doubles\" and it \"only shrinks the file slightly\"."
+    },
+    {
+      "edge_uuid": "eaf8df19-21cc-400c-a332-cb63f6be80e3",
+      "episode_uuid": "82469bbb-b997-4146-84fa-299727198113",
+      "fact": "An unselected 'Foo_Bar' contests a selected 'foo_bar'.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) A hypothetical stated as fact: filtering \"would hide an unselected 'Foo_Bar' contesting a selected 'foo_bar'\"."
+    },
+    {
+      "edge_uuid": "6fae9691-a3e1-4768-984a-015eaa80b45c",
+      "episode_uuid": "8361cf38-cff9-450e-88fb-9bebbdc44363",
+      "fact": "Widening the interceptor's write-authority catch list would affect the gate docstring.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Rejected alternative: \"Widening the interceptor's write-authority catch list and its gate docstring would touch a second module\"."
+    },
+    {
+      "edge_uuid": "243fa2cf-a3c0-4c2b-ae22-f1b5f15f7df7",
+      "episode_uuid": "8511771a-6628-43f9-b318-a5e59d4cdff0",
+      "fact": "The SessionRunner was held open across a SYNCHRONOUS census launch.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "\"The runner was held open across merge, commit, ledger and a SYNCHRONOUS census launch\"."
+    },
+    {
+      "edge_uuid": "4df12dbf-7081-4343-b845-280b3a9ec457",
+      "episode_uuid": "8618f60c-447b-41bd-85d2-c2e1bea6d803",
+      "fact": "Scheduler uses the private harness config for task retrieval.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) project_root is \"Scheduler._project_root (private)\", and reaching for it \"or for harness config\" is what git_authority must not do; the Scheduler does not use harness config."
+    },
+    {
+      "edge_uuid": "c1b63ac5-ef8c-4532-a478-5e2589493aef",
+      "episode_uuid": "8b5507fc-c5ee-4b2c-a303-9343cf3974d2",
+      "fact": "The literal check indicates that load_registry_topics() is unchanged despite a curator_gate canonical edit.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Inverted: \"a curator_gate canonical edit makes load_registry_topics() unequal (measured: ... full equality False)\"."
+    },
+    {
+      "edge_uuid": "c82f03fe-c01d-48aa-bdc4-4d3f87b1ba95",
+      "episode_uuid": "8f54b134-4dd7-4000-86a4-2ccfa00985ad",
+      "fact": "TruthReport is the single ground-truth snapshot for one task, which includes fields _shape keys.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "\"TruthReport is \"the single ground-truth snapshot for one task\"\", carrying \"the fields _shape keys the veto on\"."
+    },
+    {
+      "edge_uuid": "01812520-845c-4d0e-8521-5f38451d34c8",
+      "episode_uuid": "a1844c2b-4693-46ad-aa12-3c6c9d95e784",
+      "fact": "The mark_done guard would have withheld the flip and _revert_withheld_member would have set task 4023 back to the shape of task-3669 after it landed.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "\"_revert_withheld_member would have set the task back to `pending` after it landed — the task-3669 shape\"."
+    },
+    {
+      "edge_uuid": "909e1d72-d9ce-419f-a1ed-8cb7d0319d2f",
+      "episode_uuid": "a1da7f7c-cf8c-4279-ab0f-d3673dae5809",
+      "fact": "Step-5 covers every parsing reader in one parametrized table.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "\"Step-5 covers every parsing reader in one parametrized table\"."
+    },
+    {
+      "edge_uuid": "ae90a195-9afc-4018-a2fe-c5a043f9da73",
+      "episode_uuid": "b1ae3e87-48ec-4357-b2a7-79161594862d",
+      "fact": "Rule 4 takes effect unconditionally in this task, with reify #8919 being a precondition for it.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "\"Rule 4 takes effect unconditionally in this task\", reify #8919 being the precondition the Details set and that is now met."
+    },
+    {
+      "edge_uuid": "552de9dc-b65e-459e-986c-6044ddf387a5",
+      "episode_uuid": "b59ab723-17ec-4ab3-832e-40dfbdab66f9",
+      "fact": "If pending task 6289 later edits this module, the HungSeams yield is the shape it should build on.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "\"If 6289 later edits this module, the HungSeams yield and the per-request reach recording are the shape it should build on\"."
+    },
+    {
+      "edge_uuid": "2bb2eb23-c746-4d6b-bbe8-02c8c1841061",
+      "episode_uuid": "b6fb4a85-c4b0-4fe9-b49f-383f9e749e02",
+      "fact": "The tracked at base refusal is dropped globally rather than behind a per-call flag, making it a single-file refusal.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The 'tracked at base' refusal \"is dropped globally\"; it does not become a single-file refusal, which is what a rejected flag would have kept."
+    },
+    {
+      "edge_uuid": "dc7e8f28-1259-491f-8ad9-6cd6a9fb8fbb",
+      "episode_uuid": "bf8a25f6-6643-42f1-b259-97cb7a719a36",
+      "fact": "Task 7792 has been raised to high priority due to its impact on FalkorDB.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "\"task 7792, giving integration tests and evals their own FalkorDB, was raised to high priority\"."
+    },
+    {
+      "edge_uuid": "5924e85e-861d-4536-8a3c-3e1eee205a07",
+      "episode_uuid": "c99e077a-b596-46d0-92c4-d17253124c96",
+      "fact": "Task 7709 suppresses 100 sentinels, including stream-touch 191, due to its same-task rule.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) stream-touch 191 is one of the \"8 [that] need a cross-task holder\", not among the 100 that 7709's same-task rule suppresses."
+    },
+    {
+      "edge_uuid": "43093092-d366-40c4-8ac5-657c13694d81",
+      "episode_uuid": "cb987a41-c6f8-40a6-8720-a4c8a87818f2",
+      "fact": "orchestrator/src/orchestrator/harness.py is modified, affecting the 8100/8102 servers.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "\"orchestrator/src/orchestrator/harness.py is touched ... That is where the 8100/8102 servers are built\"."
+    },
+    {
+      "edge_uuid": "b1009b08-9420-472c-a461-8b98b5306813",
+      "episode_uuid": "d1520c3b-b10d-42a4-8dc1-8751a9587d74",
+      "fact": "write_triage_judge.py documents per-call clients as a trade for hot reload related to openai.APIConnectionError.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) \"related to openai.APIConnectionError\" links two things the record keeps apart; per-call clients are documented \"as a deliberate trade for hot reload\", nothing more."
+    },
+    {
+      "edge_uuid": "fe00508c-ef08-43d7-a12c-92944943a32b",
+      "episode_uuid": "d69bfa1f-872e-4768-a1b0-0e6fbef417f9",
+      "fact": "The dead-letter mutators are excluded from DISALLOW_MEMORY_WRITES.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The record says the every-stage assertion \"catches an entry left only in DISALLOW_MEMORY_WRITES\"; it never says the mutators are excluded from it."
+    },
+    {
+      "edge_uuid": "bbeeebbf-9af8-4851-92e8-0bb508e9b447",
+      "episode_uuid": "e20c97e4-e2cd-45dd-88ed-f31c4c4c49c2",
+      "fact": "The t3 instance is disabled for the project when using spawn_t3_provider.py.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) \"is disabled for project\" is t3 stderr the record refuses to parse; it never says the instance is disabled when using spawn_t3_provider.py."
+    },
+    {
+      "edge_uuid": "418faf41-f323-46d4-99cc-8cb4a282f278",
+      "episode_uuid": "f74791b2-4d03-4056-b6ad-c192cbeb0943",
+      "fact": "The cold reattach is a live dark-factory exposure that is held behind task 4752.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iii) The rejected option as fact: blocking \"would hold a live dark-factory exposure (the cold reattach) behind a 17-step task\"; the record does not block."
+    },
+    {
+      "edge_uuid": "87bf9071-b02c-45de-a620-b7b7f5e3a696",
+      "episode_uuid": "04f0b519-adac-4d29-8c4d-22cd62acaffc",
+      "fact": "The verify.sh list is affected by the docs/prds/v0_6/fixtures/indexed_sub_instantiation_surface.ri file's declaration.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) \"affected by\" links the verify.sh list to the declaration; the record names the list only as part of #6431's single-commit move."
+    },
+    {
+      "edge_uuid": "2831632c-dbdd-4856-86b4-db8a9347bfe8",
+      "episode_uuid": "053e3538-48b9-40cc-9c66-7fa5bdf00121",
+      "fact": "A whole-binary priority would start all shards ahead of other occt-group work, affecting the makespan.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) The record says a whole-binary priority \"buys no makespan\"; the fact says it affects the makespan."
+    },
+    {
+      "edge_uuid": "f1ee369e-935f-4ec7-a85f-7b1282910b0a",
+      "episode_uuid": "053e3538-48b9-40cc-9c66-7fa5bdf00121",
+      "fact": "A whole-binary priority would be anti-LPT for most of what it moves, including shard_20, and it buys no makespan.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) shard_20 was the earlier straggler, not one of the \"trivial (≤16s)\" shards the anti-LPT claim is about."
+    },
+    {
+      "edge_uuid": "e3c2a3c8-98c8-4dfc-9b84-147f0281bfe5",
+      "episode_uuid": "16ed0f57-434e-4c87-b73b-4a484656bfbc",
+      "fact": "Task 7562 is adopted by main's rows_bound_by.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Inverted: the branch adopts \"main's rows_bound_by\", which task 7562 landed; nothing adopts task 7562."
+    },
+    {
+      "edge_uuid": "217609a9-9379-4051-893f-d7fbb45d0714",
+      "episode_uuid": "2213a4c1-8d8f-44d1-9666-03a17b8ece5a",
+      "fact": "Task 5998 directly falsifies the MECHANISM claims.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) It is per-worker pinning that \"directly falsifies\" the MECHANISM claims; task 5998 landed the hatch."
+    },
+    {
+      "edge_uuid": "cd4e0765-3509-46c1-988e-07f51b0bd7bf",
+      "episode_uuid": "223a38e9-6588-4dd0-9de3-58eae62202ff",
+      "fact": "The partition of form_find.rs and form_find_free.rs is owned by later S14 leaves.",
+      "graph": "reify",
+      "label": "misbound",
+      "rationale": "Faithful to \"Their partition is owned by later S14 leaves\", but bound to node RowSet, a type moved into fd_criteria."
+    },
+    {
+      "edge_uuid": "cc8af0fd-d2a1-4bbb-abd5-576a072404cc",
+      "episode_uuid": "2877cc60-6b89-4590-9cc1-a5e3d8952447",
+      "fact": "The file profile_split.rs would duplicate STUB_CARGO if a second test binary were created.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Rejected option with its rejection: \"a second test binary, which would duplicate STUB_CARGO and run real_check twice\"."
+    },
+    {
+      "edge_uuid": "0616ad1d-3562-412d-9252-41791dd3e40b",
+      "episode_uuid": "2d5a247a-4275-490e-a5b4-e4a41e854c50",
+      "fact": "A NaN Length Scalar is a Scalar, so reporting 'expected Value::Scalar' would be an error that lies.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "\"a NaN Length Scalar IS a Scalar, so reporting \"expected Value::Scalar\" would be an error that lies\" — the reason against reusing ExpectedScalar."
+    },
+    {
+      "edge_uuid": "b5844ce4-037c-45c8-8626-44ab801b70ff",
+      "episode_uuid": "2d5a247a-4275-490e-a5b4-e4a41e854c50",
+      "fact": "A NaN Length Scalar is a Scalar, so reporting 'expected Value::Scalar' would be an error that lies.",
+      "graph": "reify",
+      "label": "misbound",
+      "rationale": "Faithful to \"a NaN Length Scalar IS a Scalar, so reporting \"expected Value::Scalar\" would be an error that lies\", but bound to ExpectedReal; the reason concerns ExpectedScalar."
+    },
+    {
+      "edge_uuid": "170c71e0-6ee2-44e7-ae8a-59db09403c5e",
+      "episode_uuid": "37664d6b-8060-43fb-a16c-86fddb43329e",
+      "fact": "#9571's scope includes wiring nine cross-PRD edges, including #8256.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) The nine cross-PRD edges were wired as separate dependencies, not added to #9571's scope (let annotations, the Add/Sub guard and the dir() hint)."
+    },
+    {
+      "edge_uuid": "80eb0d28-f213-4fd8-842b-c183043ae25b",
+      "episode_uuid": "55c1c256-aae0-4f12-8bdb-d819ca4b0556",
+      "fact": "κ's NS-V2 fix-it provides necessary information for the leave-one-out oracle.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Inverted: the leave-one-out oracle \"gives κ's NS-V2 fix-it nothing to reuse\"; the fix-it supplies the oracle nothing."
+    },
+    {
+      "edge_uuid": "a9e3dd91-651c-4de4-a81a-405fa843b442",
+      "episode_uuid": "55c1c256-aae0-4f12-8bdb-d819ca4b0556",
+      "fact": "Syntactic references cover the oracle's needs for all stdlib modules, ensuring they are included in the name_env.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) \"Syntactic references cover the oracle's needs for 48 of 48 stdlib modules\" is stated; that this ensures inclusion \"in the name_env\" is not."
+    },
+    {
+      "edge_uuid": "db593c72-474a-4c5e-b7f2-6ff1662ce92e",
+      "episode_uuid": "55e641c6-783b-4c01-a4c9-35485b05585b",
+      "fact": "Task 5405 was blocked by the checks that would fail on delivery due to changes in main 3e8f753316.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) It was \"task 5405's check\" that failed on delivery and blocked dependents, not 5405 that was blocked; main 3e8f753316 carries the widened manifests, not the cause."
+    },
+    {
+      "edge_uuid": "a4526b00-6806-4514-8e4b-58e638035203",
+      "episode_uuid": "5ded563e-72eb-4301-bbd4-a1f89fdabe38",
+      "fact": "The maximum von Mises stress from the elastic static solution is less than the yield limit.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(iii) States the migrated predicate `max(von_mises(...)) < yield_limit` as a measured result; the record only adopts it as the example's check."
+    },
+    {
+      "edge_uuid": "7fea6b2d-91d9-4585-86f7-2b1bd8801c63",
+      "episode_uuid": "5f85196a-d0ef-4213-b730-bc0be5dd14b1",
+      "fact": "The module diagnostics/document_compile.rs uses the public compute_diagnostics_with_state function.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) It is multi_file_tests.rs that \"uses only the public `compute_diagnostics_with_state`\"; \"document_compile.rs imports nothing from diagnostics.rs\"."
+    },
+    {
+      "edge_uuid": "c8be9aec-d5dd-4cf0-8f0e-45a4e3e49c58",
+      "episode_uuid": "5f85196a-d0ef-4213-b730-bc0be5dd14b1",
+      "fact": "The FEA-hint cluster is extracted as a child module diagnostics/fea_hint.rs from diagnostics.rs.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(iii) The weighed partition (b) as fact: extracting diagnostics/fea_hint.rs \"is out of ζ's scope; filed as a follow-up\"."
+    },
+    {
+      "edge_uuid": "8f92e0ba-8448-46c9-b24c-985fe561cff6",
+      "episode_uuid": "67a1bdd0-a68a-47c0-83c2-395c0131adca",
+      "fact": "For non-empty selections of finite von Mises values, the result differs from the old fold when all values are NaN.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) For finite selections the record says the result \"is bit-identical to the old fold\"; only an all-NaN ring differs, which a finite selection cannot be."
+    },
+    {
+      "edge_uuid": "84fe1532-3d9c-4a70-9d2e-11ba2a9d49d8",
+      "episode_uuid": "6eafc68b-856e-407e-881d-f13ecf3e9212",
+      "fact": "NoProgress is an example of a non-finite evaluation, which includes NaN/∞ evaluation.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Inverted: a NaN/∞ evaluation \"lands in NoProgress\"; NoProgress is not an example of a non-finite evaluation."
+    },
+    {
+      "edge_uuid": "4e6e1680-b06c-4770-b31c-9b38a9bcf114",
+      "episode_uuid": "73f0810f-3f84-497c-a6ba-e8f969636813",
+      "fact": "member_finish's times describe the attempt reported by the record, which includes member_finish, rc, and fail_detail.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "\"member_finish's times describe the attempt the record reports, the same attempt as its rc, duration_ms and fail_detail\"."
+    },
+    {
+      "edge_uuid": "c459905d-fd3d-4c0e-a4ad-d83baffab17d",
+      "episode_uuid": "85f3b76d-50e6-47d3-a3a7-24b310134ddb",
+      "fact": "A `Self { … }` constructor would leave a count of 0 under a ceiling of 1, which is considered slack, linking ceiling to slack.",
+      "graph": "reify",
+      "label": "misbound",
+      "rationale": "Faithful to \"A `Self { … }` constructor would leave a count of 0 under a ceiling of 1, which is slack\", but bound to node \"$15 ceiling\", which the episode never names."
+    },
+    {
+      "edge_uuid": "7e1ae0d6-fd01-41d8-a675-44a3ff555efc",
+      "episode_uuid": "8c89b5b7-a0e6-4ca0-a230-f06dc3992653",
+      "fact": "The ruling #6431 affects the handling of entries in docs/ by emptying it.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) #6431 is a task, not a ruling, and \"#6431 emptying docs/\" is a future possibility the record guards against, not something it affects now."
+    },
+    {
+      "edge_uuid": "cbcca21e-d923-4f3f-ac26-bfdfc076446b",
+      "episode_uuid": "95c35240-5aed-4028-8538-99b3f988d164",
+      "fact": "A count above baseline reds indicates STALE.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) \"a count below baseline is STALE\"; a count above baseline simply reds."
+    },
+    {
+      "edge_uuid": "c8973cbd-9141-4bbf-af4e-6dd422b6a40a",
+      "episode_uuid": "9ba6cd22-64ab-48e1-9af1-fe623f2a70aa",
+      "fact": "Bare unit literals resolve through the hard-coded table for compound units.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) \"Compound units resolve through the registry only\"; it is bare unit literals that \"fall back to the hard-coded table\"."
+    },
+    {
+      "edge_uuid": "019a7be8-2815-44bc-b9c4-b22d7ff034ff",
+      "episode_uuid": "9d5bfc0a-a0d5-4cb8-b36d-145e3cb9db25",
+      "fact": "#8883's metadata.files dropped eval.rs for closed_chain.rs, tree.rs, and closed_2prismatic_idyn.ri.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Inverted: \"#8883's metadata.files dropped closed_chain.rs ... for tree.rs, eval.rs and closed_2prismatic_idyn.ri\"."
+    },
+    {
+      "edge_uuid": "3f808a93-78a9-4818-9b9a-8b1a09e86a76",
+      "episode_uuid": "9d5bfc0a-a0d5-4cb8-b36d-145e3cb9db25",
+      "fact": "#8883's metadata.files dropped tree.rs for closed_chain.rs, eval.rs, and closed_2prismatic_idyn.ri.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Inverted: closed_chain.rs was dropped \"for tree.rs, eval.rs and closed_2prismatic_idyn.ri\"; tree.rs was added, not dropped."
+    },
+    {
+      "edge_uuid": "718f7116-fd12-4b10-9604-7afb2faca61a",
+      "episode_uuid": "a2907bcf-c56b-47e2-9136-64c6b300c67e",
+      "fact": "The baseline value is affected by the changes in glob_imports.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Siblings \"each lower the same `glob_imports` row\", so the baseline is \"live census minus 8\", re-measured."
+    },
+    {
+      "edge_uuid": "3f887d19-0016-4675-a678-ff87c75b9068",
+      "episode_uuid": "a841d436-2158-467a-870c-d6f6ab31c110",
+      "fact": "Test 37 is moved into a new tests/infra/test_build_sidecar_preflight.py file.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(iii) The rejected partition stated as fact: moving Test 37 into tests/infra/test_build_sidecar_preflight.py \"was rejected for three reasons\"."
+    },
+    {
+      "edge_uuid": "60bd122b-bc7c-43cf-98cf-7cc513da8c70",
+      "episode_uuid": "b00dbe3e-ec88-4c1b-b94d-70ef5ebe9ea8",
+      "fact": "The gap found in the variant-vs-variant assert_ne relates to the implementation mutations.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Naming the mutation that must red each step closes \"the gap the review found in the variant-vs-variant assert_ne\"."
+    },
+    {
+      "edge_uuid": "6e47ada9-b867-414c-b9e1-3b0e031d40c9",
+      "episode_uuid": "b0edf4d8-ee88-44bd-988e-bc520a5df731",
+      "fact": "The interior-voxel count is calculated from densify_grid_to_sampled.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "\"measure volume as the interior-voxel count from densify_grid_to_sampled\"."
+    },
+    {
+      "edge_uuid": "cdad5161-b24d-4105-b4c1-683ca1b694ee",
+      "episode_uuid": "b8937c1c-7123-437a-b402-4f4dee55b223",
+      "fact": "The hand-delete + npm install path has crashed arborist with the edgesOut error.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "The note describes the path \"as one that \"has crashed\" arborist with the edgesOut error\"; the sighting is accepted as real."
+    },
+    {
+      "edge_uuid": "977bc4d2-6980-48b7-9fe0-d857220577b1",
+      "episode_uuid": "baf63384-b023-41e1-b188-466cfa44fbc5",
+      "fact": "harness-subdir modules include the full leaf literal from workspace_root().",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Harness-subdir modules use `include_str!(\"../../../../tests/prd-gate/fixtures/<name>.ri\")`; `workspace_root().join(...)` is the CLI test's form."
+    },
+    {
+      "edge_uuid": "691acd49-c3cc-4a54-a772-2e523582edcf",
+      "episode_uuid": "bc8e20ff-e9fd-450f-9ce9-1b3b42f3964c",
+      "fact": "The deleted divergence prose includes moved helpers.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) \"the file shrinks by the moved helpers and the deleted divergence prose\": two separate things; the prose does not include the helpers."
+    },
+    {
+      "edge_uuid": "873aa961-9945-4d51-b944-fc980de76e23",
+      "episode_uuid": "bf5f0a70-8594-4960-8d48-4ee601c70b32",
+      "fact": "Heuristic 10 requires redundant enforcement to prevent breaches of invariants in mpc after construction.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) The record says heuristic 10's redundant enforcement does NOT apply to mpc: \"Here it cannot [be breached]\", so no use-site re-check is added."
+    },
+    {
+      "edge_uuid": "856a975f-027f-4a6b-a1bd-3578ba92adff",
+      "episode_uuid": "c6784342-15de-4401-9c57-3dc672a0b96b",
+      "fact": "The regression test asserts the rendered output using the public renderMarkdown seam and does not assert the parser itself.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "\"The regression test asserts the rendered output ... It does not assert the regex itself\", through \"the public renderMarkdown seam only\"."
+    },
+    {
+      "edge_uuid": "4e41bb94-0b30-458d-b2f2-08364ed12444",
+      "episode_uuid": "d8f27170-3813-42e1-bd1c-68c300127e24",
+      "fact": "EntityAliased may lead to a redundant import of std.x if the original name remains visible.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "\"if ν later decides the original name stays visible too, the cost is a redundant `import std.x` line\"."
+    },
+    {
+      "edge_uuid": "cdfdb6f0-6a05-4f84-a4da-57fcbfc60469",
+      "episode_uuid": "e71ef6ba-d36e-4fe4-822e-a99af14694d6",
+      "fact": "UnitExpr::Pow sites are constructed or destructured in parser.c.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) The sites are in \"compiler units.rs ..., ts_parser and the lowering tests\"; parser.c is gitignored generated code with no diff."
+    },
+    {
+      "edge_uuid": "e93ec5dd-db29-45a9-a845-652ddaa0fa83",
+      "episode_uuid": "ec22ab71-6d48-4acb-90c8-100c09a991e9",
+      "fact": "D9′ Fixed{dir} traction = magnitude*dir is proposed in the direction-typing PRD decomposition.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "A proposal stated as one: \"D9′ Fixed{dir} traction = magnitude*dir is PROPOSED, not Leo's ruling\"."
+    },
+    {
+      "edge_uuid": "e7864c35-0a48-4d69-ad5e-46fdc2356673",
+      "episode_uuid": "ee4e439c-fb9e-42a6-b1a5-e0943a253d05",
+      "fact": "printenv is named as the BashCall function.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(iii) The rejected naming as fact: \"Naming `printenv` as the BashCall \"function\" would be a lying name\"; a typed BashExport is used."
+    },
+    {
+      "edge_uuid": "8a471448-45e7-4cd2-b608-71d1c08fb42b",
+      "episode_uuid": "f3b073f0-aae6-4bcd-91dc-762b428f2ece",
+      "fact": "The tauri node resolves the feature set for embedded-frontend under the --features value passed by the launcher.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "\"the feature set cargo actually resolves for tauri under the --features value the launcher passed\", the value whose name embedded-frontend the test avoids pinning."
+    },
+    {
+      "edge_uuid": "74e5dc4f-a015-414c-8365-b4f78ca581e6",
+      "episode_uuid": "fa7735f1-b661-44fa-a7e9-f044046be43d",
+      "fact": "The budget-exhaustion arm of solve_result_adapter_codes_infeasible_and_reports_budget_as_no_progress is routed through Heuristic 11 (SPOT).",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) The arm is \"routed through the helper\"; heuristic 11 (SPOT) is the reason, not something it is routed through."
+    }
+  ]
+}

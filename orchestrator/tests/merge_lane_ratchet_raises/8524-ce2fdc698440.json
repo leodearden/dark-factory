@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "step-13: merger re-anchor tests put the bare worker's SpeculationController in state A and record a dead base through the worker",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_chain_intact.py",
+      "baseline": 80,
+      "current": 86
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6436,
+      "current": 6442
+    }
+  ]
+}

@@ -14,8 +14,11 @@ exception is the make_commit_probe suite, which builds a throwaway repo).
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from _distinct_git_repo import init_distinct_git_repo
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
@@ -28,7 +31,10 @@ from fused_memory.services.completion_claim_gate import (
     verify_claims,
 )
 
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _KNOWN = frozenset({'reify', 'dark_factory'})
+_GATE_LOGGER = 'fused_memory.services.completion_claim_gate'
 
 
 def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionClaim]:
@@ -281,6 +287,26 @@ class TestProximityBinding:
             ('task', '4213', 'dark_factory'),
         ]
 
+    def test_forward_binding_through_a_hyphenated_project_qualifier(self):
+        claims = _extract('prevention filed as dark-factory task 4213', default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '4213', 'dark_factory'),
+        ]
+
+    def test_specimen_esc_unverified_claim_6141_1_binds_to_the_named_project(self):
+        claims = _extract(
+            "The prompt's \"Files Changed on Main\" list is then the fork-point diff "
+            '(merge-base..main), not the diff since the last confirm_plan, because '
+            "confirm_plan never advances metadata.json's base_commit, so the Lever B "
+            'revalidation skip never fires (filed as dark-factory task 6141).',
+            default_project_id='solar_challenge',
+        )
+
+        assert [(c.kind, c.subject, c.ref, c.project_id) for c in claims] == [
+            ('filing_dispatch', 'task', '6141', 'dark_factory'),
+        ], claims
+
     @pytest.mark.parametrize(
         'text', ['task 1985 and task 1986 landed', 'task 1985, task 1986 landed'],
     )
@@ -419,6 +445,60 @@ class TestCrossProjectRefResolution:
         assert claims[0].subject == 'task'
         assert claims[0].ref == '3142'
         assert claims[0].project_id == 'dark_factory'
+
+    @pytest.mark.parametrize(
+        ('text', 'writer', 'project'),
+        [
+            ('dark-factory task 3142 has landed', 'reify', 'dark_factory'),
+            ('Dark-Factory task 3142 has landed', 'reify', 'dark_factory'),
+            ("dark-factory's task 3142 has landed", 'reify', 'dark_factory'),
+            ('DF task 3142 has landed', 'reify', 'dark_factory'),
+            ('dark-factory:3142 was merged', 'reify', 'dark_factory'),
+            ('dark-factory#3142 was merged', 'reify', 'dark_factory'),
+            ('Reify task 3142 has landed', 'dark_factory', 'reify'),
+        ],
+    )
+    def test_qualifier_spelling_folds_to_the_registered_project(self, text, writer, project):
+        claims = _extract(text, default_project_id=writer)
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '3142', project),
+        ], f'{text!r} -> {claims!r}'
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param('df 3142 has landed', 'dark_factory', id='df-anchor'),
+            pytest.param('the fix was merged as DF#3142', 'dark_factory', id='df-hash-forward'),
+            pytest.param('task 3142 has landed', 'reify', id='task-anchor-is-not-a-project'),
+        ],
+    )
+    def test_task_ref_anchor_word_names_its_project(self, text, project):
+        claims = _extract(text, default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '3142', project),
+        ], f'{text!r} -> {claims!r}'
+
+    def test_word_folding_to_an_unregistered_id_is_not_a_qualifier(self):
+        claims = _extract('dark-factory-side task 3142 has landed', default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '3142', 'reify'),
+        ]
+
+    def test_registered_ids_sharing_a_fold_resolve_to_one_and_warn_naming_both(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=_GATE_LOGGER):
+            claims = extract_completion_claims(
+                'dark-factory task 3142 has landed',
+                default_project_id='solar_challenge',
+                known_project_ids={'df', 'dark_factory', 'solar_challenge'},
+            )
+
+        assert [(c.ref, c.project_id) for c in claims] == [('3142', 'dark_factory')]
+        collisions = [r.getMessage() for r in caplog.records if r.name == _GATE_LOGGER]
+        assert len(collisions) == 1, collisions
+        assert "'df'" in collisions[0] and "'dark_factory'" in collisions[0], collisions
 
     def test_unqualified_ref_inherits_the_writers_project(self):
         claims = _extract('task 3142 has landed', default_project_id='reify')
@@ -901,6 +981,9 @@ class TestEmitUnverifiedClaimEscalation:
         payload = json.loads(files[0].read_text())
         assert payload['id'] == esc_id
         assert payload['category'] == 'unverified_completion_claim'
+        assert payload['level'] == 0, (
+            'the filed record, not just the forwarded kwarg, must be born at L0'
+        )
 
         # The record must be actionable without opening the code or the corpus:
         # it names WHAT was claimed and WHAT was observed. Asserted as labelled
@@ -911,6 +994,45 @@ class TestEmitUnverifiedClaimEscalation:
         assert "observed='in-progress'" in detail, f'must state what was seen: {detail!r}'
         assert "subject='task'" in detail, f'must name the authority: {detail!r}'
         assert 'has been applied' in detail, f'must quote the claim: {detail!r}'
+
+    def test_the_filed_record_is_one_the_info_l0_router_converts_into_a_curator_task(
+        self, tmp_path,
+    ):
+        from fused_memory.services import completion_claim_gate as gate_mod
+
+        pytest.importorskip('escalation')
+        from escalation.classify import INFO_L0_MECHANICAL_ROLES
+        from escalation.disposition import ConvertViaCurator, ExitKind, route_info_l0
+        from escalation.queue import EscalationQueue
+        from shared.project_layout import escalation_queue_dir
+
+        esc_id = gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag())
+        assert esc_id is not None
+        record = EscalationQueue(escalation_queue_dir(tmp_path)).get(esc_id)
+        assert record is not None, f'{esc_id!r} must be readable from the project queue'
+        assert record.level == 0, (
+            'only an info L0 is routed by the info-L0 router, whose curator task '
+            f'is what checks the claim; filed at level={record.level!r}'
+        )
+
+        # The orchestrator's orphan reaper hands every info L0 to this router;
+        # no task row backs the synthetic anchor, so its status is unknown.
+        decided = route_info_l0(
+            record,
+            task_status=None,
+            exit_kind=ExitKind.ORPHAN,
+            mechanical_roles=INFO_L0_MECHANICAL_ROLES,
+        )
+
+        assert isinstance(decided, ConvertViaCurator), (
+            'the info-L0 router must turn each unverified claim into a curator '
+            'task, so a tracked task checks the claim, rather than close it as '
+            f'status info or a consumed observation; got {decided!r}'
+        )
+        assert decided.payload.spawned_from == 'unverified-claim-5422', (
+            'escalation-watcher self-execute item 11 keys on this provenance'
+        )
+        assert decided.payload.escalation_id == esc_id
 
     def test_dedupes_per_project_and_ref(self, tmp_path):
         """A repeated claim about the SAME ref collapses onto the open record;
@@ -997,7 +1119,10 @@ class TestDelegatesToTheSharedHelper:
             'write-path noise in front of work that cannot proceed'
         )
         assert seen['project_root'] == str(tmp_path)
-        assert seen['level'] == 0
+        assert seen['level'] == 0, (
+            'see TestEmitUnverifiedClaimEscalation::'
+            'test_the_filed_record_is_one_the_info_l0_router_converts_into_a_curator_task'
+        )
 
     def test_two_different_refs_get_two_different_anchors(
         self, tmp_path, monkeypatch,

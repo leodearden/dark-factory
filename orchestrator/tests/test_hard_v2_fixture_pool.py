@@ -310,7 +310,7 @@ class TestCurationMdIsGenerated:
 
 @pytest.fixture(scope='module')
 def pool() -> list[dict]:
-    from orchestrator.cli import _load_fixture_dir
+    from orchestrator.evals.cli import _load_fixture_dir
     return _load_fixture_dir(POOL_DIR)
 
 
@@ -578,7 +578,7 @@ class TestStandingCorpusIsolation:
         # test named for the v2 hard pool. What β1 actually guarantees — no
         # collision with the standing corpus — is asserted by
         # `test_the_only_id_overlap_is_the_declared_continuity_set` below.
-        from orchestrator.cli import _load_fixture_dir
+        from orchestrator.evals.cli import _load_fixture_dir
         standing = _load_fixture_dir(STANDING_TASKS_DIR)
         assert len(standing) >= 22
         assert len({f['id'] for f in standing}) == len(standing)
@@ -591,14 +591,14 @@ class TestStandingCorpusIsolation:
         # design — they are the same three tasks re-banded into the v2
         # cohort — so the overlap is pinned to exactly that declared set
         # rather than left as an open-ended allowance.
-        from orchestrator.cli import _load_fixture_dir
+        from orchestrator.evals.cli import _load_fixture_dir
         standing_ids = {f['id'] for f in _load_fixture_dir(STANDING_TASKS_DIR)}
         declared = {e['id'] for e in manifest['continuity']['fixtures']}
         overlap = standing_ids & {f['id'] for f in pool}
         assert overlap == declared
 
     def test_standing_corpus_carries_no_v2_cohort_fixture(self) -> None:
-        from orchestrator.cli import _load_fixture_dir
+        from orchestrator.evals.cli import _load_fixture_dir
         for f in _load_fixture_dir(STANDING_TASKS_DIR):
             assert f.get('cohort') != 'fable-trial-v2-hard', f['id']
 
@@ -719,6 +719,7 @@ class TestContinuityFixtures:
             assert got['provenance']['baseline_source'] == CONTINUITY_RUNG, \
                 entry['id']
 
+    @pytest.mark.reads_git_history
     def test_source_fixtures_are_byte_unchanged_since_before_beta1(
         self, continuity: list[dict],
     ) -> None:
@@ -778,7 +779,7 @@ class TestMetaLayout:
         # inside _meta/ it is unreachable.
         assert META_DIR.is_dir()
         assert not (POOL_DIR / 'curation.json').exists()
-        from orchestrator.cli import _load_fixture_dir
+        from orchestrator.evals.cli import _load_fixture_dir
         loaded_from_meta = _load_fixture_dir(META_DIR)
         # The glob does reach _meta/*.json if pointed AT _meta — the guarantee
         # is that nothing points at it. What matters is that pointing at the

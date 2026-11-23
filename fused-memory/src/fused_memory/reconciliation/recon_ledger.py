@@ -43,6 +43,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
@@ -54,6 +55,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STREAK_PAYLOAD_KEY,
     STREAK_WINDOW_PAYLOAD_KEY,
 )
+from fused_memory.utils.sqlite_connector import Connector
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,12 @@ MARKER_KINDS = ('stage1_flag_marker', 'stage2_persistence_marker', 'flag_for_sta
 # standing_decision_constants' INV-5 forbids. mem0_tombstone re-exports it, so
 # `from ...mem0_tombstone import RECORD_KIND_MEM0_TOMBSTONE` still resolves.
 RECORD_KIND_MEM0_TOMBSTONE = 'mem0_tombstone'
+
+# The project_id of a row that belongs to no project. It is outside
+# utils/validation.py::validate_project_id's grammar, so no real project can
+# collide with it; every query and gc() filters on project_id, so no project's
+# reads or gc see it.
+SERVICE_SCOPE_PROJECT_ID = '(service)'
 
 # Single-sourced INSERT ... ON CONFLICT used by BOTH upsert() and
 # upsert_many(). Hoisted to module scope so the two write paths cannot drift
@@ -290,8 +298,13 @@ def _streak_row_from_record(record: ReconLedgerRecord) -> SuppressionStreakRow:
 class ReconLedgerStore:
     """SQLite-backed control-plane ledger for recon markers/suppressions/summaries."""
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, *, connect: Connector = connect_daemon) -> None:
+        """*connect* is how ``initialize`` opens the ledger's one connection.
+
+        It is given the database path and defaults to ``connect_daemon``.
+        """
         self._db_path = Path(db_path)
+        self._connect = connect
         self._access: AtomicConnection | None = None
 
     async def initialize(self) -> None:
@@ -322,7 +335,7 @@ class ReconLedgerStore:
         if self._access is not None:
             await self.close()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = await connect_daemon(str(self._db_path))
+        conn = await self._connect(str(self._db_path))
         conn.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
         self._access = AtomicConnection(conn)
@@ -330,24 +343,10 @@ class ReconLedgerStore:
             await db.executescript(TABLE_SQL)
 
         # Safe migration: add the nullable entity_uuid column to pre-existing
-        # recon_ledger tables (task 2894 α, journal.py:214-249 ALTER-TABLE
-        # house pattern). On a fresh DB the column is already created by
-        # TABLE_SQL, so this ALTER fails ("duplicate column name") and is a
-        # harmless rollback; on an old DB it adds the column. Runs BEFORE
-        # INDEX_SQL so ix_recon_ledger_project_kind_entity can reference it.
-        #
-        # The catch is NARROWED to the expected "duplicate column name" case
-        # (loud-over-silent): a genuine migration failure — a locked/corrupt DB,
-        # a disk error — is re-raised here with its own message rather than
-        # swallowed and left to re-surface one statement later as a confusing
-        # "no such column: entity_uuid" from the INDEX_SQL that references it.
-        try:
-            async with self._access.write() as db:
-                await db.execute('ALTER TABLE recon_ledger ADD COLUMN entity_uuid TEXT')
-        except Exception as exc:
-            # The write unit has already rolled itself back.
-            if 'duplicate column name' not in str(exc).lower():
-                raise  # Not the benign "column already exists" case — surface it.
+        # recon_ledger tables (task 2894 α). Runs BEFORE INDEX_SQL so
+        # ix_recon_ledger_project_kind_entity can reference it.
+        async with self._access.write() as db:
+            await add_column_if_missing(db, 'recon_ledger', 'entity_uuid', 'TEXT')
 
         async with self._access.write() as db:
             await db.executescript(INDEX_SQL)
@@ -651,7 +650,10 @@ class ReconLedgerStore:
         early-collection path is narrowed to single-task markers, the
         dominant/incident-driving shape, by this collapse). Fail-safe
         direction is preserved either way: uncertain/unmatched => keep, never
-        delete on partial information.
+        delete on partial information.  A project-qualified component (e.g.
+        ``'reify:650'``, from ``flag_dedup.compute_marker_signature``) never
+        equals a terminal id either, so foreign-cited markers are reaped by
+        TTL only — the same fail-safe direction.
 
         When ``terminal_task_ids`` is empty, the terminal-referenced clause is
         omitted entirely and an expiry-only DELETE runs instead — an explicit

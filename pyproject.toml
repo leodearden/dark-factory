@@ -6,6 +6,7 @@ requires-python = ">=3.11,<4"
 
 [tool.uv.workspace]
 members = [
+    "client-feed",
     "cockpit",
     "dashboard",
     "escalation",
@@ -19,18 +20,21 @@ members = [
 include = ["conftest.py", "df_pytest_isolation.py"]
 extraPaths = [
     # scripts/ is a flat script directory rather than a package src root, so
-    # both it and scripts/legibility/ are listed explicitly. scripts/tests/
-    # conftest.py performs the same two sys.path insertions at runtime, and the
-    # `scripts` module's declared type gate
+    # it is listed explicitly. scripts/tests/conftest.py performs the same
+    # sys.path insertion at runtime, and the `scripts` module's declared type gate
     # (`uv run --project shared pyright scripts/`, task 4358; `npx pyright
     # scripts/` before that) runs from this directory — it carries no
     # --directory, and --project selects only the environment pyright resolves
     # from — so it resolves against this table. Pinned by
     # tests/scripts/test_scripts_module_config.py::
     # test_root_pyright_extrapaths_resolves_scripts_imports (task 3456).
+    # scripts/legibility/ is deliberately absent (task 6645): its modules are
+    # reached only as `legibility.<mod>`, so a bare sibling import is
+    # reportMissingImports. Guarded by
+    # scripts/tests/test_legibility_import_spelling.py.
     "scripts",
-    "scripts/legibility",
     "scripts/local-model-serving",
+    "client-feed/src",
     "cockpit/src",
     "dashboard/src",
     "escalation/src",
@@ -38,6 +42,14 @@ extraPaths = [
     "orchestrator/src",
     "sampler/src",
     "shared/src",
+    # Only the orchestrator test helpers this table's targets import by bare
+    # name (task 8507), never a whole test directory: an entry here claims its
+    # names over same-directory siblings. Why, and the guards that enforce it:
+    # tests/scripts/test_no_vestigial_import_pragmas.py.
+    "orchestrator/tests/cross_suite_helpers",
+    # The same rule for shared's helpers that tests/repo_guards imports
+    # (task 5654).
+    "shared/tests/cross_suite_helpers",
 ]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
@@ -49,6 +61,7 @@ markers = [
     "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
     "integration: live tests requiring real external services/credentials (live Claude CLI + OAuth accounts, real Qdrant/OpenAI); deselect: -m 'not integration'",
     "warm_lane_bash: the ported warm-lane bash bucket in orchestrator/tests/test_warm_lane_bash_suite.py, which shells out to tests/warm-lane/ (task 3073). Deselected from the default suite by orchestrator/pyproject.toml and re-selected post-merge by the `warm-lane-bash` LaneCommand, whose explicit CLI `-m warm_lane_bash` overrides addopts (last wins) and is therefore unaffected by this mirror; deselect: -m 'not warm_lane_bash'",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
 ]
 # pytest reads exactly ONE [tool.pytest.ini_options] — the rootdir's inifile —
 # and never merges addopts/markers across pyproject.toml files. So any marker a

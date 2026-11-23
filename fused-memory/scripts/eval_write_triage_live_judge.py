@@ -7,7 +7,8 @@ PRD ``docs/prds/memory-write-path-convergence.md`` §9 leaf γ, decision D10.
 (retrieved slates) each return a ``judge_fn`` that drives
 ``server/write_triage_judge.py::judge_write`` with a duck-typed service
 exposing only ``config``, so the eval measures the production prompt, the
-production provider fan-out and the production parser. The answer is an
+production provider fan-out and the production parser. Both refuse, through :func:`require_plan_judge_route`, a
+config that would judge anywhere but the ChatGPT-plan proxy. The answer is an
 ``eval_write_triage_scoring.py::JudgeAnswer``, the one thing imported from
 there. ``eval_write_triage_judge.py`` owns everything done with the answers;
 this module owns only how they are obtained, imports nothing from it, and is
@@ -16,8 +17,6 @@ the only eval module that reaches an LLM.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
 import types
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -29,28 +28,14 @@ from fused_memory.server.write_triage import OUTCOME_JUDGE, BandDecision, JudgeU
 from fused_memory.server.write_triage_judge import (
     judge_prompt_elisions,
     judge_write,
+    resolve_judge_api_key,
+    resolve_judge_api_url,
     resolve_judge_field_chars,
+    resolve_judge_provider,
 )
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
-
-
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
 
 
 # Pyright cannot follow the by-path loader, so it alone resolves `_scoring` through
@@ -58,7 +43,7 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 if TYPE_CHECKING:
     import eval_write_triage_scoring as _scoring
 else:
-    _scoring = _load_script(
+    _scoring = load_script(
         _SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring',
     )
 
@@ -110,11 +95,14 @@ def _ask_judge(
     band_winner_id: str | None,
     similarity: float | None,
 ) -> _scoring.JudgeAnswer:
-    """Drive the SHIPPED judge for one case, or restate a band that decided itself.
+    """Drive the SHIPPED judge for one case, or restate a route that decided itself.
 
-    Only the middle band reaches an LLM, exactly as ``triage_write`` routes it:
-    a deterministic ``restated`` and a below-floor ``stored`` are returned with
-    no call, no rendered prompt and no spend, so none of the three is reported.
+    Only a case routed to the judge reaches an LLM, exactly as ``triage_write``
+    routes it through ``route_band``: the middle band, plus a restate-band
+    write that does not repeat its band winner, or the winner's canonical,
+    near-verbatim. A near-verbatim ``restated`` and a below-floor ``stored``
+    are returned with no call, no rendered prompt and no spend, so none of the
+    three is reported.
 
     ``asyncio.run`` per case, which is why the runner is synchronous:
     ``judge_write`` is the only awaitable in the pipeline and it needs no
@@ -159,6 +147,34 @@ def _as_memory_result(record: Mapping[str, Any], metadata: Mapping[str, Any]) ->
     )
 
 
+def require_plan_judge_route(config: Any) -> None:
+    """Refuse *config* unless its judge has its own endpoint and key.
+
+    An unset ``write_triage.judge_api_url`` or ``judge_api_key`` makes the
+    shipped judge inherit ``llm.providers.<provider>``, which bills the API
+    credit, while this eval judges only through the ChatGPT-plan proxy (task
+    9946; Leo's billing ruling on task 9045). Unset is read through the
+    shipped resolvers, so a blank leaf counts as unset exactly as it does in
+    production.
+    """
+    service = types.SimpleNamespace(config=config)
+    unset = [
+        leaf for leaf, resolved in (
+            ('judge_api_url', resolve_judge_api_url(service)),
+            ('judge_api_key', resolve_judge_api_key(service)),
+        )
+        if resolved is None
+    ]
+    if unset:
+        raise ValueError(
+            f'write_triage.{" and write_triage.".join(unset)} unset: the judge would '
+            f'inherit llm.providers.{resolve_judge_provider(service)} and bill the API '
+            'credit (OPENAI_API_KEY), but this eval judges only through the '
+            'ChatGPT-plan proxy (task 9946). Set the plan-proxy environment '
+            'config.yaml reads both leaves from.',
+        )
+
+
 def build_judge_fn(config: Any) -> Any:
     """The SEEDED live edge: drive the SHIPPED judge, not a re-implementation.
 
@@ -174,6 +190,7 @@ def build_judge_fn(config: Any) -> Any:
     would have found, and marks the middle band — the only band that reaches a
     judge at all.
     """
+    require_plan_judge_route(config)
     service = types.SimpleNamespace(config=config)
 
     def judge_fn(
@@ -200,12 +217,15 @@ def build_judge_fn(config: Any) -> Any:
 def build_retrieved_judge_fn(config: Any) -> Any:
     """The RETRIEVED live edge: the case already carries production's routing.
 
-    The slate, the band winner, the band and the similarity all came from
-    ``decide_band``/``select_judge_candidates`` over a real retrieval, so this
-    only rebuilds the records and defers to the same judge edge. The candidate
-    metadata is passed through whole because it carries the cosine the shipped
-    selector re-reads.
+    The slate, the band winner, the route and the similarity all came from
+    ``route_band``/``select_judge_candidates`` over a real retrieval, so this
+    only rebuilds the records and defers to the same judge edge. A case
+    reaches the LLM when ``route_band`` routed it to the judge: the middle
+    band, plus a restate-band write that does not repeat its band winner, or
+    the winner's canonical, near-verbatim. The candidate metadata is passed
+    through whole because it carries the cosine the shipped selector re-reads.
     """
+    require_plan_judge_route(config)
     service = types.SimpleNamespace(config=config)
 
     def judge_fn(
@@ -219,7 +239,7 @@ def build_retrieved_judge_fn(config: Any) -> Any:
             service,
             str(case['content']),
             slate,
-            outcome=str(case['band']),
+            outcome=str(case['routed']),
             band_winner_id=case['band_winner_id'],
             similarity=case['similarity'],
         )

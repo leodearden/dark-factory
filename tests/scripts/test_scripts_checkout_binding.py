@@ -17,6 +17,9 @@ from pathlib import Path
 from types import MappingProxyType
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -79,10 +82,10 @@ def _python(
     )
 
 
-def _run_probe(checkout: Path, source: str) -> subprocess.CompletedProcess[str]:
+def _run_probe(checkout: Path, source: str, *argv: str) -> subprocess.CompletedProcess[str]:
     probe = checkout / 'scripts' / 'probe.py'
     probe.write_text(source, encoding='utf-8')
-    return _python([str(probe)], decoy=checkout.parent / _DECOY)
+    return _python([str(probe), *argv], decoy=checkout.parent / _DECOY)
 
 
 def _lies_under(path: str, directory: Path) -> bool:
@@ -181,8 +184,67 @@ def test_an_unbindable_checkout_refuses_to_import(tmp_path: Path, pyproject: str
     assert pyproject_path in reported['message']
 
 
+_REPORT_WORKSPACE_MEMBERS = (
+    'import json, sys\n'
+    'from pathlib import Path\n'
+    + _BIND
+    + 'try:\n'
+    '    members = _checkout.workspace_members(Path(sys.argv[1]))\n'
+    'except _checkout.CheckoutBindingError as exc:\n'
+    "    print(json.dumps({'refused': type(exc).__name__, 'path': exc.path,"
+    " 'message': str(exc)}))\n"
+    'else:\n'
+    "    print(json.dumps({'members': list(members), 'is_tuple': type(members) is tuple}))\n"
+)
+
+
+def _read_members(tmp_path: Path, pyproject: str | None) -> tuple[Path, dict[str, object]]:
+    checkout = _layout(tmp_path)
+    other = tmp_path / 'other'
+    other.mkdir()
+    if pyproject is not None:
+        (other / 'pyproject.toml').write_text(pyproject, encoding='utf-8')
+    proc = _run_probe(checkout, _REPORT_WORKSPACE_MEMBERS, str(other))
+
+    assert proc.returncode == 0, proc.stderr
+    return other, json.loads(proc.stdout)
+
+
+def test_workspace_members_reads_any_roots_declared_members_in_declared_order(
+    tmp_path: Path,
+) -> None:
+    _, reported = _read_members(
+        tmp_path, '[tool.uv.workspace]\nmembers = ["sampler", "no-src", "shared"]\n'
+    )
+
+    assert reported == {'members': ['sampler', 'no-src', 'shared'], 'is_tuple': True}
+
+
+@pytest.mark.parametrize(
+    'pyproject', _UNBINDABLE_PYPROJECTS.values(), ids=_UNBINDABLE_PYPROJECTS.keys()
+)
+def test_workspace_members_refuses_each_unbindable_member_list_naming_its_pyproject(
+    tmp_path: Path, pyproject: str | None
+) -> None:
+    other, reported = _read_members(tmp_path, pyproject)
+
+    pyproject_path = str(other / 'pyproject.toml')
+    assert reported['refused'] == 'CheckoutBindingError'
+    assert reported['path'] == pyproject_path
+    assert pyproject_path in str(reported['message'])
+
+
+def test_a_glob_refusal_names_only_the_glob_entries(tmp_path: Path) -> None:
+    _, reported = _read_members(
+        tmp_path, '[tool.uv.workspace]\nmembers = ["pkgs/*", "shared", "a?b"]\n'
+    )
+
+    assert "['pkgs/*', 'a?b']" in str(reported['message'])
+
+
 _BOUND_SCRIPTS = (
     'merge_lane_metrics',
+    'merge_lane_ratchet',
     'quality_metrics_snapshot',
     'inline_suppression_classify',
     'inline_suppressions',
@@ -216,7 +278,14 @@ _SAFE_IO_REPORTS_ITS_FILE = "import sys\nprint('safe_io:' + __file__, file=sys.s
 
 def test_merge_lane_metrics_run_from_a_copy_uses_the_copys_shared(tmp_path: Path) -> None:
     checkout = _layout(
-        tmp_path, scripts=('_checkout.py', 'merge_lane_metrics.py', 'source_measures.py')
+        tmp_path,
+        scripts=(
+            '_checkout.py',
+            'merge_lane_metrics.py',
+            'merge_lane_ratchet.py',
+            'merge_lane_cluster.py',
+            'source_measures.py',
+        ),
     )
     for shared_package in (checkout / 'shared' / 'src' / 'shared', tmp_path / _DECOY / 'shared'):
         (shared_package / 'safe_io.py').write_text(_SAFE_IO_REPORTS_ITS_FILE, encoding='utf-8')
@@ -235,19 +304,28 @@ def test_merge_lane_metrics_run_from_a_copy_uses_the_copys_shared(tmp_path: Path
     assert _lies_under(loaded[0], checkout / 'shared' / 'src'), loaded[0]
 
 
-def test_the_ratchet_commit_gate_reports_an_unbindable_checkout_as_an_instrument_failure(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ('gate', 'revisions'),
+    [
+        pytest.param('check_staged_ratchet_raise.py', (), id='commit-gate'),
+        pytest.param('check_ratchet_advance.py', ('HEAD', 'HEAD'), id='advance-gate'),
+    ],
+)
+def test_each_ratchet_gate_reports_an_unbindable_checkout_as_an_instrument_failure(
+    tmp_path: Path, gate: str, revisions: tuple[str, ...]
 ) -> None:
     gate_scripts = (
         '_checkout.py',
-        'merge_lane_metrics.py',
+        'merge_lane_ratchet.py',
+        'merge_lane_cluster.py',
         'source_measures.py',
-        'check_staged_ratchet_raise.py',
+        'ratchet_revisions.py',
+        gate,
     )
     checkout = _layout(tmp_path, pyproject=None, scripts=gate_scripts)
 
     proc = _python(
-        [str(checkout / 'scripts' / 'check_staged_ratchet_raise.py'), '--root', str(checkout)],
+        [str(checkout / 'scripts' / gate), '--root', str(checkout), *revisions],
         decoy=tmp_path / _DECOY,
     )
 

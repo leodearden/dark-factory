@@ -336,7 +336,7 @@ def run(
     Returns a report dict.  When ``apply`` is False (dry-run, the default),
     no writes are performed.
 
-    Refuses with ``TargetStoreMissing`` when *queue_dir* is missing or empty — see
+    Refuses with ``TargetStoreUnpopulated`` when *queue_dir* is missing or empty — see
     the module docstring.  The check lives here rather than in ``main()`` so
     programmatic callers inherit it too.
     """

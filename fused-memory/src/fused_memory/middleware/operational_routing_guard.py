@@ -22,9 +22,10 @@ submit path (normal, planning_mode, direct interceptor).
 "pure gate" = ``task_kind='deterministic'``, ``always_escalates=True``,
 ``before_done`` dropped — the shape enforced by
 ``deterministic_task_guard.deterministic_task_error`` (a deterministic task
-with no action must always escalate, never be an ill-formed no-op). The
-stamp itself is delegated verbatim to
-:meth:`TaskInterceptor._inject_deterministic_pure_gate` (INV-5 — the
+with no action must always escalate, never be an ill-formed no-op) — plus
+``pure_gate_from`` naming the triggering execution_class when the
+submission was not already in that shape. The stamp itself is delegated verbatim to
+``shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`` (INV-5 — the
 pure-gate stamp is reused, never re-implemented).
 
 Only exact ``operational_mode == 'llm'`` takes the llm sub-branch;
@@ -54,24 +55,27 @@ boundary (task ζ integration matrix), not β.
   branch (the reused stamp shallow-copies), and the *original* object is
   returned verbatim on the non-coercion branch (a byte-identical no-op for
   every ``code_tdd``/absent/``None``/``str`` submission).
-
-## Import-cycle note
-
-:func:`inject_operational_routing` lazily imports ``TaskInterceptor`` *inside*
-the function. ``task_interceptor.py`` imports this module at top level (for
-its direct-path twin), so a top-level import of ``TaskInterceptor`` here would
-be circular; the lazy import breaks the cycle (by call time ``task_interceptor``
-is fully loaded). Lazy imports are an established pattern in this codebase.
 """
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
+
+from shared.pure_gate_provenance import (
+    PURE_GATE_FROM_KEY,
+    PureGateTrigger,
+    is_pure_gate_shape,
+    pure_gate_stamped,
+)
+
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
     'OPERATIONAL_LLM_GATE_MARKER_KEY',
     'inject_operational_routing',
+    'pure_gate_routing_notice',
 ]
 
 #: Dedicated, machine-checkable marker key stamped True only for
@@ -81,30 +85,12 @@ __all__ = [
 #: needed. Task γ/2803 consumes it (or the preserved operational_mode='llm').
 OPERATIONAL_LLM_GATE_MARKER_KEY = 'x_operational_llm_gate'
 
-_COERCED_EXECUTION_CLASSES: frozenset[str] = frozenset({'operational', 'decision'})
-
-
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes → empty dict).
-
-    Mirrors ``execution_class_guard._parse_metadata``. None → {}; empty string
-    → {}; dict → returned as-is (used only to READ declared fields, never
-    mutated here); JSON string → parsed dict, or {} if the parse fails or
-    yields a non-dict; anything else → {}.
-    """
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        if not metadata:
-            return {}
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
+_TRIGGER_BY_EXECUTION_CLASS: Mapping[str, PureGateTrigger] = MappingProxyType(
+    {
+        'operational': PureGateTrigger.EXECUTION_CLASS_OPERATIONAL,
+        'decision': PureGateTrigger.EXECUTION_CLASS_DECISION,
+    }
+)
 
 
 def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
@@ -122,19 +108,51 @@ def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
     Args:
         metadata: Incoming task metadata (dict, JSON string, or None).
     """
-    parsed = _parse_metadata(metadata)
+    parsed = raw_metadata_dict(metadata, source='operational_routing_guard')
     execution_class = parsed.get('execution_class')
-    if execution_class not in _COERCED_EXECUTION_CLASSES:
+    if not isinstance(execution_class, str):
+        return metadata
+    trigger = _TRIGGER_BY_EXECUTION_CLASS.get(execution_class)
+    if trigger is None:
         # code_tdd / absent / anything not operational|decision → untouched.
         return metadata
 
-    # INV-5: reuse the pure-gate stamp verbatim (never re-implement). Lazy
-    # import breaks the task_interceptor↔guard cycle — see module docstring.
-    from fused_memory.middleware.task_interceptor import TaskInterceptor
-
-    coerced = TaskInterceptor._inject_deterministic_pure_gate(metadata)
+    coerced = pure_gate_stamped(parsed, trigger)
     if execution_class == 'operational' and parsed.get('operational_mode') == 'llm':
         # Dedicated llm-gate marker (task γ/2803 consumes it). operational_mode
         # itself is ALSO preserved by the pure-gate stamp, so γ may read either.
         coerced[OPERATIONAL_LLM_GATE_MARKER_KEY] = True
     return coerced
+
+
+def pure_gate_routing_notice(metadata: object) -> dict[str, Any]:
+    """The submit-response notice for a submission converted into a pure gate, else ``{}``.
+
+    Derived from the stored stamp, so the notice and the task record cannot
+    disagree. A stamp on metadata that is not in the pure-gate shape gets no
+    notice: it would claim a human gate that does not exist.
+    """
+    if not isinstance(metadata, Mapping):
+        return {}
+    if not is_pure_gate_shape(metadata):
+        return {}
+    try:
+        trigger = PureGateTrigger(metadata.get(PURE_GATE_FROM_KEY))
+    except ValueError:
+        return {}
+    return {
+        'routing_notice': {
+            'pure_gate_from': trigger.value,
+            'detail': (
+                f'This submission was converted into a deterministic always-escalates '
+                f'pure gate because of {trigger.value}: a task created from it escalates '
+                f'to a HUMAN at dispatch, and no agent executes it.'
+            ),
+            'hint': (
+                "If an agent can execute this work (including a docs, comment or rename "
+                "edit), file it with task_kind='normal' and metadata.complexity='simple' "
+                'instead, without an operational/decision execution_class '
+                '(docs/task-authoring.md §4).'
+            ),
+        },
+    }

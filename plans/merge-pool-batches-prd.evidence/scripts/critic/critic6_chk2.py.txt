@@ -1,0 +1,31 @@
+import sys
+sys.path.insert(0,'/tmp/gate-10069/critic6')
+from rule7 import fallback_cost, batch_cost, going_costs, plan_batch
+rows=[]
+for q in (0.01,0.03,0.05,0.08,0.14,0.2,0.3,0.5):
+  for r in (0.001,0.005,0.01,0.02,0.05):
+    if r>q: continue
+    for u in (0.0,0.05,0.15,0.3,0.6,1.0):
+      for sc in (True,False):
+        a_new,a_cl,_=going_costs(q,r,u,sc)
+        C=lambda f,c: batch_cost(f,c,q,r,u,sc,a_new,a_cl)
+        for front,nn,nc_ in (('new',30,30),('cleared',30,30),('new',1,30),('cleared',30,1),('new',3,30),('cleared',30,3),('cleared',30,6),('new',6,30),('cleared',30,12)):
+            cands=(['new']*(nn-(front=='new')))+(['cleared']*(nc_-(front=='cleared')))
+            f,c=plan_batch(front,cands,q,r,u,sc)
+            # best joint extension by going-cost valuation: maximise saving = (j)*a - (C(new)-C(cur))
+            best=0.0; arg=None
+            if front=='new':
+                for j in range(c+1, min(24-f, nc_)+1):
+                    s=(j-c)*a_cl-(C(f,j)-C(f,c))
+                    if s>best: best,arg=s,(f,j)
+            else:
+                for j in range(f+1, min(12, 24-c, nn)+1):
+                    s=(j-f)*a_new-(C(j,c)-C(f,c))
+                    if s>best: best,arg=s,(j,c)
+            if best>1e-9: rows.append((round(best,4),round(best/C(f,c),3),q,r,u,sc,front,nn,nc_,(f,c),arg))
+rows.sort(reverse=True)
+print(len(rows),'cells where a joint extension would save verifies (valued at going costs)')
+print('largest absolute savings (verifies, share of batch cost):')
+for x in rows[:10]: print('  ',x)
+print('scanning on, u<=0.3:')
+for x in [y for y in rows if y[5] and y[4]<=0.3][:10]: print('  ',x)

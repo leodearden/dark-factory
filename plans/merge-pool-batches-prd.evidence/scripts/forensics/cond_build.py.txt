@@ -1,0 +1,177 @@
+"""Parse every resolved tree into requests (own / base), classify the base at verdict time and by fate,
+assign content ids (tip, or own-diff hash when a task has several tips), and label each content's truth.
+Output: cond.json"""
+import os,sys
+from common import *
+import chain_detail as CD
+WIN='2026-11-15T11:19'
+MS={v['merge_sha']:v for v in V}
+def own_len(v):
+    L=v['layers']; n=min(v['k'],len(L))
+    if n>0 and L[n-1].get('task') is None and not L[n-1].get('missing'):
+        while n<len(L) and L[n].get('task') is None and not L[n].get('missing') and L[n]['sha'] not in MS: n+=1
+    return n
+def seg_reqs(L,lo,hi,owner,below):
+    """requests in layers[lo:hi]; a run of non-merge layers is one fast-forwarded request of *owner*"""
+    out=[]; i=lo
+    while i<hi:
+        l=L[i]
+        if l.get('missing'): out.append(dict(task=None,tip=l['sha'],p1=None,layer=l['sha'],on_main=False,landed_ts=None,ff=False,missing=True)); i+=1; continue
+        if l.get('task') is not None:
+            p1=L[i+1]['sha'] if i+1<len(L) else below
+            out.append(dict(task=l['task'],tip=l['tip'],p1=p1,layer=l['sha'],on_main=bool(l.get('on_main_now')),landed_ts=l.get('landed_ts'),ff=False)); i+=1
+        else:
+            j=i
+            while j<hi and L[j].get('task') is None and not L[j].get('missing'): j+=1
+            p1=L[j]['sha'] if j<len(L) else below
+            out.append(dict(task=owner,tip=l['sha'],p1=p1,layer=l['sha'],on_main=bool(l.get('on_main_now')),landed_ts=l.get('landed_ts'),ff=True)); i=j
+    return out
+_memo={}
+def parse(v):
+    if v['vid'] in _memo: return _memo[v['vid']]
+    L=v['layers']; n=own_len(v)
+    own=seg_reqs(L,0,n,v['task'],v['base'])
+    base=[]; entries=[]
+    j=n
+    while j<len(L):
+        s=L[j]['sha']
+        E=MS.get(s)
+        if E is not None and E is not v:
+            eo,eb,ee=parse(E)
+            have={l['sha'] for l in L[j:]}
+            lay={l['sha']:l for l in L[j:]}
+            def fix(r):
+                r=dict(r); l=lay.get(r['layer'])
+                if l: r['on_main']=bool(l.get('on_main_now')); r['landed_ts']=l.get('landed_ts')
+                return r
+            base+= [fix(r) for r in eo+eb if r['layer'] in have]
+            entries.append(dict(top=s,vid=E['vid'],owner=E['task'],k=E['k'],passed=E['passed'],end=E['end'],on_main=bool(L[j].get('on_main_now')),landed_ts=L[j].get('landed_ts')))
+            entries+= [dict(e,on_main=bool(lay[e['top']].get('on_main_now')),landed_ts=lay[e['top']].get('landed_ts')) for e in ee if e['top'] in have]
+            break
+        # no verify row for this layer's commit: a no-row entry top (or an unattributable layer)
+        k2=j+1
+        if L[j].get('task') is None and not L[j].get('missing'):
+            while k2<len(L) and L[k2].get('task') is None and L[k2]['sha'] not in MS: k2+=1
+        base+=seg_reqs(L,j,k2,'?ff',v['base'])
+        if not entries or entries[-1].get('vid') is not None or True:
+            entries.append(dict(top=s,vid=None,owner=L[j].get('task'),k=None,passed=None,end=None,on_main=bool(L[j].get('on_main_now')),landed_ts=L[j].get('landed_ts')))
+        j=k2
+    _memo[v['vid']]=(own,base,entries); return _memo[v['vid']]
+# no-row layers: consecutive no-row layers belong to ONE unknown entry stack; collapse them
+def collapse(entries):
+    out=[]
+    for e in entries:
+        if e['vid'] is None and out and out[-1]['vid'] is None: out[-1]['n']=out[-1].get('n',1)+1; continue
+        out.append(dict(e))
+    return out
+P={}
+for v in V:
+    own,base,entries=parse(v); P[v['vid']]=(own,base,collapse(entries))
+# ---- content ids
+tips=collections.defaultdict(dict)   # task -> tip -> p1
+for vid,(own,base,_) in P.items():
+    for r in own+base:
+        if r['task'] and r.get('p1'): tips[r['task']].setdefault(r['tip'],r['p1'])
+for t,ls in CD.LAND.items():
+    for c,h,ltip,lp1 in ls: tips[t].setdefault(ltip,lp1)
+CACHE='/tmp/gate-10069/forensics/pid_cache.json'
+pc=json.load(open(CACHE)) if os.path.exists(CACHE) else {}
+CID={}
+n=0
+for t,d in tips.items():
+    if len(d)==1:
+        for tip in d: CID[(t,tip)]=tip[:10]
+        continue
+    for tip,p1 in d.items():
+        k=p1+':'+tip
+        if k not in pc: pc[k]=CD.own_pid(p1,tip); n+=1
+        CID[(t,tip)]=('pid'+pc[k]) if pc[k] else tip[:10]
+json.dump(pc,open(CACHE,'w'))
+print('own-diff hashes computed',n,'tasks with >1 tip',sum(1 for d in tips.values() if len(d)>1),file=sys.stderr)
+def cid(r): return '%s@%s'%(r['task'],CID.get((r['task'],r['tip']),(r['tip'] or '?')[:10]))
+# ---- main red by ancestry
+@functools.lru_cache(None)
+def anc(a,b):
+    if not b or b in('NONE','TRUNC'): return None
+    rc,_=git('merge-base','--is-ancestor',a,b); return rc==0
+EP={'LOOP':('e8b3ab52aa','946947de73'),'RETIRED':('7b31131e51','729259fb78'),'link_heal_config':('6d1efef4da','04ef3477a9')}
+def main_red(v):
+    out=set()
+    for g,(bad,heal) in EP.items():
+        if anc(bad,v['base']) and not anc(heal,v['base']): out.add(g)
+    return out
+# ---- evidence per content
+EVD=collections.defaultdict(lambda: dict(passes=[],landed=[],solofail=[],solofail_mr=[],solofail_unsound=[],solofail_infra=[],solofail_nolog=[],tips=set(),task=None))
+for t,ls in CD.LAND.items():
+    for c,h,ltip,lp1 in ls:
+        k='%s@%s'%(t,CID.get((t,ltip),ltip[:10])); EVD[k]['landed'].append((c,h[:10])); EVD[k]['tips'].add(ltip[:8]); EVD[k]['task']=t
+rows=[]
+for v in V:
+    own,base,entries=P[v['vid']]
+    mr=main_red(v); fs=fset(v)
+    heal_in_tree=any(r['task']=='10239' for r in own+base)
+    if heal_in_tree: mr=mr-{'LOOP'}
+    for r in own+base:
+        if not r['task']: continue
+        k=cid(r); EVD[k]['tips'].add((r['tip'] or '')[:8]); EVD[k]['task']=r['task']
+        if v['passed']: EVD[k]['passes'].append(v['vid'])
+        if r['on_main']: EVD[k]['landed'].append((r['landed_ts'],r['layer'][:10]))
+    if (not v['passed']) and v['k']==1 and len(own)==1 and own[0]['task']:
+        k=cid(own[0]); sound=all(r['on_main'] for r in base)
+        if fs is None: EVD[k]['solofail_nolog'].append(v['vid'])
+        elif any(x.startswith('<') and 'timeout' in x for x in fs): EVD[k]['solofail_infra'].append(v['vid'])
+        elif not sound: EVD[k]['solofail_unsound'].append(v['vid'])
+        elif fs<=mr: EVD[k]['solofail_mr'].append(v['vid'])
+        else: EVD[k]['solofail'].append((v['vid'],sorted(fs-mr)))
+    rows.append(v)
+INFER={'7736':'1b28101f','10137':'1e140efe'}
+DOUBT={'5285'}   # its only failing non-main-red test passed in a superset tree run on another host the same minute
+def truth(k):
+    e=EVD[k]
+    if e['task'] in DOUBT and not (e['passes'] or e['landed']): return 'U'
+    good=bool(e['passes'] or e['landed']); bad=bool(e['solofail'])
+    if good and bad: return 'X'
+    if bad: return 'D'
+    if good: return 'S'
+    t=e['task']
+    if t in INFER and INFER[t] in e['tips']: return 'Di'
+    if e['solofail_mr']: return 'Sm'
+    return 'U'
+out={'verifies':[],'contents':{}}
+for k,e in EVD.items():
+    out['contents'][k]=dict(task=e['task'],tips=sorted(e['tips']),truth=truth(k),passes=e['passes'],landed=e['landed'][:3],solofail=e['solofail'],solofail_mr=e['solofail_mr'],solofail_unsound=e['solofail_unsound'],solofail_infra=e['solofail_infra'],solofail_nolog=e['solofail_nolog'])
+for v in V:
+    own,base,entries=P[v['vid']]
+    mr=main_red(v)
+    if any(r['task']=='10239' for r in own+base): mr=mr-{'LOOP'}
+    ent=[]
+    state='MAIN' if not entries else None
+    for e in entries:
+        if e['on_main'] and e['landed_ts'] and T(e['landed_ts'])<=v['end']: st='green_landed'
+        elif e['vid'] is not None and e['end']<=v['end']: st='green_pass' if e['passed'] else 'red_before'
+        elif e['vid'] is not None: st='later_pass' if e['passed'] else 'later_red'
+        else: st='norow'
+        d=dict(e); d['st']=st; d['delay']=(e['end']-v['end']) if (e['vid'] is not None and e['end']>v['end']) else None
+        ent.append(d)
+    if entries:
+        sts=[e['st'] for e in ent]
+        if 'red_before' in sts: state='RED_BEFORE'
+        elif any(s in('later_pass','later_red','norow') for s in sts): state='UNVERIFIED'
+        else: state='GREEN_SPEC'
+    fate=None
+    if entries:
+        if ent[0]['on_main']: fate='landed_as_built'
+        elif any(e['st'] in('later_red','red_before') for e in ent): fate='red'
+        else: fate='never_landed_no_red_row'
+    fs=fset(v)
+    out['verifies'].append(dict(vid=v['vid'],ts=v['ts'],start=v['start'],end=v['end'],task=v['task'],k=v['k'],passed=v['passed'],runner=v['runner'],base_relation=v['base_relation'],speculative=v['speculative'],depth=v['depth'],
+        merge_sha=v['merge_sha'],base=v['base'],n_units=sum(v['unit_outcomes'].values()),red_units=v['red_units'],fails=sorted(fs) if fs is not None else None,main_red=sorted(mr),
+        own=[dict(task=r['task'],cid=cid(r) if r['task'] else None,tip=(r['tip'] or '')[:8],ff=r.get('ff'),on_main=r['on_main'],layer=r['layer'][:10]) for r in own],
+        base_reqs=[dict(task=r['task'],cid=cid(r) if r['task'] else None,tip=(r['tip'] or '')[:8],on_main=r['on_main'],layer=r['layer'][:10]) for r in base],
+        entries=ent,state=state,fate=fate,in_window=v['ts']>=WIN))
+json.dump(out,open('/tmp/gate-10069/forensics/cond.json','w'))
+W=[x for x in out['verifies'] if x['in_window']]
+print('window verifies',len(W),collections.Counter((x['state'],'P' if x['passed'] else 'F') for x in W))
+print('truth labels (distinct contents):',collections.Counter(c['truth'] for c in out['contents'].values()))
+print('own-len != k:',[(x['vid'],x['k'],len(x['own'])) for x in W if len(x['own'])!=x['k']])
+print('X contents:',[(k,c['passes'][:3],c['solofail']) for k,c in out['contents'].items() if c['truth']=='X'])

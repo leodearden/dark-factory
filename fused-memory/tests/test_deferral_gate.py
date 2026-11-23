@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 from shared import task_deferral
 from shared.project_layout import tasks_db
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import DeferralWriteAuthorityError
@@ -35,6 +36,8 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.targeted import TargetedReconciler
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.write_journal import WriteJournal
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _EVENT_PEEK_LIMIT = 1000
 
@@ -1032,6 +1035,27 @@ async def test_update_task_echo_of_stored_record_is_accepted(stack: Stack, mode:
         metadata['deferral'], sort_keys=True,
     )
     assert after[f'x_echo_{mode}'] == 'written'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', _MODES)
+async def test_update_task_cannot_retype_a_carried_by_deferral(stack: Stack, mode: str) -> None:
+    carrier = await stack.seed('pending', f'row 8 retype carrier {mode}')
+    task_id = await stack.seed('pending', f'row 8 retype {mode}')
+    await _enter(stack, task_id, {'kind': 'carried_by', 'carrier_task_id': int(carrier)})
+    metadata = (await stack.read(task_id))['metadata']
+    deferral = metadata['deferral']
+    retyped = {**deferral, 'carrier_task_id': float(deferral['carrier_task_id'])}
+    payload = {**metadata, 'deferral': retyped} if mode == 'replace' else {'deferral': retyped}
+
+    with pytest.raises(DeferralWriteAuthorityError):
+        await stack.backend.update_task(
+            task_id, project_root=stack.root,
+            metadata=json.dumps(payload), metadata_mode=mode,
+        )
+
+    stored = (await stack.read(task_id))['metadata']['deferral']
+    assert type(stored['carrier_task_id']) is int
 
 
 @pytest.mark.asyncio

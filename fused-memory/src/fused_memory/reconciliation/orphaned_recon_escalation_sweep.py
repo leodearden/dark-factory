@@ -389,16 +389,15 @@ def build_orphaned_escalation_flag(
     escalation id instead would make every re-file of the same subject look
     like a brand-new finding.
 
-    That key carries no project: ``flag_dedup.dedup_flags`` keys the ledger
-    row on ``(project_id=the RUNNING project, task_id, flag_type)``.  For this
-    flag_type it is project-correct by construction, because
+    ``flag_dedup.dedup_flags`` keys the ledger row on ``(project_id=the
+    RUNNING project, task_id, flag_type)``, and
+    ``flag_dedup.compute_marker_signature`` project-qualifies only foreign
+    CITED ids; a top-level ``task_id`` stays bare.  This flag's bare subject
+    id is project-correct by construction, because
     ``sweep_orphaned_recon_escalations`` emits a flag only when the subject's
-    project IS the running project.  A generic project-qualified marker
-    (task 5614, which also records why ``cited_tasks`` and a composite
-    ``task_id`` were rejected) remains ``flag_dedup``'s change to make, for
-    other producers.  The flag's DESCRIPTION always names the subject's
-    project regardless, so a closer reading the finding never has to infer
-    which store to check.
+    project IS the running project.  The flag's DESCRIPTION always names the
+    subject's project regardless, so a closer reading the finding never has
+    to infer which store to check.
 
     Args:
         esc: The pending ``Escalation`` being reported.

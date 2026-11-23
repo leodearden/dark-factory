@@ -72,6 +72,7 @@ from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR
 
 from fused_memory.memory_metadata import (
     EXPERIMENTAL_KEY_PREFIX,
+    is_canonical,
     is_valid_topic_slug,
     normalize_supersedes,
 )
@@ -92,6 +93,7 @@ __all__ = [
     'declared_gate_topic',
     'evaluate_closure',
     'handrolled_member_enumeration',
+    'observed_members',
     'render_consolidation_gate_section',
     'render_end_state_brief',
     'resolve_unstamped_live_ids',
@@ -270,7 +272,7 @@ def _scroll_ids(members: Sequence[Any]) -> set[str]:
     return {_payload_id(p).lower() for p in members if _payload_id(p)}
 
 
-def _observed_members(gate_block: Any) -> Sequence[Any]:
+def observed_members(gate_block: Any) -> Sequence[Any]:
     """The gate block's inert ``provenance.observed_members``, defensively.
 
     A non-Mapping block, a missing/non-Mapping ``provenance``, and an
@@ -296,7 +298,7 @@ def _sole_canonical_claim(members: Sequence[Any]) -> list[Any]:
     because there is no single claim to trust.  Normalized through the shared
     :func:`normalize_supersedes` (INV-5), never a second parser.
     """
-    canonicals = [p for p in members if _payload_meta(p).get('canonical') is True]
+    canonicals = [p for p in members if is_canonical(_payload_meta(p))]
     if len(canonicals) != 1:
         return []
     return normalize_supersedes(_payload_meta(canonicals[0]).get('supersedes'))
@@ -428,7 +430,7 @@ def unstamped_candidates(
     closure claim in favour of inert provenance.
 
     Defensive on every shape: an unusable block or provenance contributes no
-    observed members (see :func:`_observed_members`) rather than raising —
+    observed members (see :func:`observed_members`) rather than raising —
     this predicate's job is to REPORT malformedness, and one that dies on bad
     input blocks the very gates it exists to adjudicate (the same reasoning
     as :func:`_payload_meta`).  The claim is read regardless.
@@ -442,7 +444,7 @@ def unstamped_candidates(
     live_ids = _scroll_ids(members)
     candidates: list[str] = []
     seen: set[str] = set()
-    for raw in (*_sole_canonical_claim(members), *_observed_members(gate_block)):
+    for raw in (*_sole_canonical_claim(members), *observed_members(gate_block)):
         if not is_full_uuid(raw):
             continue
         folded = str(raw).lower()
@@ -624,11 +626,8 @@ def evaluate_closure(
     It therefore refuses ONLY on cluster malformedness:
 
     * ``no_canonical`` / ``multiple_canonicals`` — the canonical count is not
-      exactly one.  Canonical is ``meta.get('canonical') is True``, a strict
-      IDENTITY check, single-sourcing the meaning with
-      ``services/topic_anchor.py::select_canonical_payload``; truthiness would
-      admit an int ``1`` (``1 == True`` in Python) and let the read path and
-      this predicate disagree about what canonical means.
+      exactly one.  Canonical is ``fused_memory/canonical_marker.py::is_canonical``,
+      the strict predicate every reader shares.
 
     Every offender is collected rather than short-circuited on the first,
     matching ``server/consolidation.py::validate_consolidate_args``' convention,
@@ -682,9 +681,7 @@ def evaluate_closure(
         )
 
     # --- canonical invariant: exactly one strictly-canonical member -------- #
-    canonical_ids = [
-        _payload_id(p) for p in members if _payload_meta(p).get('canonical') is True
-    ]
+    canonical_ids = [_payload_id(p) for p in members if is_canonical(_payload_meta(p))]
     if not canonical_ids and not scroll_truncated:
         # ABSENCE-based, so it is only sound on a COMPLETE view: a canonical
         # sitting past the scroll cap is indistinguishable from no canonical at
@@ -1090,7 +1087,7 @@ def build_consolidation_gate_task(
     deterministic task that neither runs an action nor escalates, and invariant
     3b rejects ``always_escalates`` on a normal task, so it is the only legal
     shape for a pure human gate.  It is also exactly what
-    ``TaskInterceptor._inject_deterministic_pure_gate`` produces, so the
+    ``shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`` produces, so the
     declared submission and the post-coercion task agree either way.  No
     ``before_done`` is referenced: that coercion unconditionally pops one, and
     ``docs/task-authoring.md`` records that ``before_done.kind='predicate'``

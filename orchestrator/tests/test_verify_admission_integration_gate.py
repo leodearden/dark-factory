@@ -263,6 +263,7 @@ class TestMergeNeverBlocks:
         config = OrchestratorConfig(
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
+            merge_verify_breadth='scoped',
         )
         holder_worktree = tmp_path / 'wt-holder'
         holder_worktree.mkdir()

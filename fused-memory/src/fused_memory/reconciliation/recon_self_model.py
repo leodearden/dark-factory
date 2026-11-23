@@ -126,6 +126,11 @@ MEM0_TOMBSTONE_DELETERS = (
 )
 
 
+def format_mem0_tombstone_deleters() -> str:
+    """MEM0_TOMBSTONE_DELETERS as the backtick-wrapped, comma-separated list the recon prompts render."""
+    return ', '.join(f'`{deleter}`' for deleter in MEM0_TOMBSTONE_DELETERS)
+
+
 @dataclass(frozen=True)
 class MarkerLifecycle:
     """Who writes a record_kind, and what deletes it.
@@ -312,11 +317,16 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'resolve_ticket': (
         'resolve_ticket(ticket, project_root) -> '
-        "{'status': 'created'|'combined'|'failed'|'refused', 'task_id'?: ..., "
-        "'reason'?: ...}  "
+        "{'status': 'created'|'combined'|'failed'|'refused'|'cancelled'"
+        "|'pending'|'awaiting_curation', "
+        "'task_id'?: ..., 'ticket'?: ..., 'reason'?: ...}  "
         '# refused = a deterministic guard rejected the candidate: NO task was '
         'created and NO task_id key is present. Terminal and intended; never '
-        'retry it and never record a task id for it.'
+        'retry it and never record a task id for it. '
+        '# cancelled = terminal, NO task_id. '
+        '# pending / awaiting_curation = OPEN: not decided yet; carries the '
+        'ticket, never a task_id. Do not count it or flag it as a discrepancy; '
+        're-poll the same ticket, never re-submit.'
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
@@ -566,7 +576,6 @@ def render_cycle_summary_section() -> str:
         f"  - stage='{stage}' -> recon_pool='{pool}'"
         for stage, pool in CYCLE_SUMMARY_STAGE_TO_RECON_POOL.items()
     )
-    deleters_str = ', '.join(f'`{deleter}`' for deleter in MEM0_TOMBSTONE_DELETERS)
     return (
         '## Per-Cycle Summary\n'
         'Python writes exactly one per-cycle summary memory per stage, '
@@ -597,7 +606,7 @@ def render_cycle_summary_section() -> str:
         'The Mem0 record is a best-effort searchable copy; the AUTHORITATIVE '
         'record is the ReconLedgerStore cycle_summary row — check it with '
         '`get_cycle_summary_presence`, never by looking for the mirror.\n\n'
-        f'Deletes performed by these named sweeps — {deleters_str} — leave a '
+        f'Deletes performed by these named sweeps — {format_mem0_tombstone_deleters()} — leave a '
         "TOMBSTONE, returned by `get_memory_by_id` on its not-found branch as "
         "a `'tombstone'` key naming the sweep that deleted the record "
         '(`deleter`), the run that performed the deletion (`deleting_run_id`), '
@@ -612,7 +621,7 @@ def render_cycle_summary_section() -> str:
         'reasons: (1) several Mem0 delete paths write no tombstone at all — '
         'most notably the MCP `delete_memory` tool itself (the path the '
         "recon stages' own flag-reaping instructions call), plus cascade "
-        'child deletes, the task_count_snapshot prune, the targeted-recon '
+        'child deletes, the targeted-recon '
         'completion-echo delete, the harness status-correction delete, and '
         'the scope-freshness snapshot pool cap; and (2) even a written '
         'tombstone expires after `mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS` '
@@ -805,8 +814,9 @@ def render_task_creation_accounting_section() -> str:
         'no new task id: count it under `tasks_combined`, never under '
         '`tasks_created`.\n\n'
         'Confirmation rule: see `## Verifying Task Operations` above for the '
-        'full rule, including its `get_task`-verified fallback for a status '
-        'other than `created`/`combined`/`failed`. Only the '
+        'full rule, including its `get_task`-verified fallback for an '
+        'unrecognised status, and its rule that an open status (`pending`, '
+        '`awaiting_curation`) counts toward neither tally. Only the '
         '`resolve_ticket`-confirmed subset of that rule — `status` `created` '
         'or `combined` WITH a `task_id` — is machine-countable via the '
         'action record below; never record on the `submit_task` call '

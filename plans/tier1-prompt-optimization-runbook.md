@@ -115,9 +115,9 @@ Notes:
 > **Root gotcha (different from Step 1):** `data/orchestrator/runs.db` is a
 > **gitignored runtime artifact** the live orchestrator writes to — it only
 > exists, and is only current, in the checkout that's actually running
-> production traffic. Point `--runs-db` at
-> `/home/leo/src/dark-factory/data/orchestrator/runs.db` explicitly (the
-> CLI's default) or set `PROMPT_OPT_RUNS_DB`; a task worktree's copy (if one
+> production traffic. The CLI's default is the main checkout's
+> `data/orchestrator/runs.db` (derived even from a linked worktree); pass
+> `--runs-db` to read another file. A task worktree's copy (if one
 > exists at all) is stale/empty. The canary opens `runs.db` **read-only**
 > (a `mode=ro` SQLite URI), so it's safe to run against the live file while
 > the orchestrator is actively writing to it — no lock contention, and a

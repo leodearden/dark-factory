@@ -124,7 +124,7 @@ def _render_batch(records: Sequence[sampling.ScoredRecord]) -> list[str]:
     for record in records:
         try:
             digests.append(digest.build_digest(record.path, agent_class_override=record.stratum))
-        except Exception as exc:  # noqa: BLE001 - isolate one bad transcript, keep mining
+        except Exception as exc:  # isolate one bad transcript, keep mining
             logger.warning('census: failed to build digest for %s: %s', record.path, exc)
     return digests
 
@@ -137,9 +137,8 @@ class WindowBatchSource:
     Lazy: nothing is opened, enumerated or rendered until the first
     iteration, so a run deferred before mining touches nothing. The first
     iteration opens (creating or pruning) the ledger and publishes
-    :attr:`selection`. A ledgered session is recognised from its first
-    ``sessionId`` (:func:`sampling.peek_session_id`), so it costs no full
-    transcript scan.
+    :attr:`selection`. A ledgered session is dropped by
+    :func:`sampling.drop_coded`, so it costs no full transcript scan.
     """
 
     def __init__(
@@ -184,12 +183,7 @@ class WindowBatchSource:
             full if snapshot.has_census_rows
             else transition_window(full, last_census_at=self._last_census_at)
         )
-        if snapshot.state is session_ledger.LedgerState.UNREADABLE:
-            logger.warning(
-                'census: session ledger unreadable, so no already-coded session is '
-                'skipped this run: %s',
-                snapshot.error,
-            )
+        coded = session_ledger.already_coded(snapshot, log=logger)
         sessions = [] if window.is_empty else inventory.enumerate_sessions_in_range(
             self._projects_root, self._cfg.cwd_prefixes,
             window.first_day, window.last_day,
@@ -197,10 +191,7 @@ class WindowBatchSource:
                 self._cfg.project_root, self._cfg.agent_transcript_roots,
             ),
         )
-        uncoded = [
-            session for session in sessions
-            if sampling.peek_session_id(session.path) not in snapshot.sessions
-        ]
+        uncoded = sampling.drop_coded(sessions, coded)
         scored = [sampling.score_session(session) for session in uncoded]
         eligible = [record for record in scored if record.score > 0]
         self._selection = SessionSelection(

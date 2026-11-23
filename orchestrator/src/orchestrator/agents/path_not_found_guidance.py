@@ -1,10 +1,10 @@
 """Role-prompt guidance: a not-found error on an expected path falsifies the path.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 and `orchestrator/src/orchestrator/agents/roles.py::JUDGE` splice
 `PATH_NOT_FOUND_GUIDANCE` into every role with a literal system prompt. It is a
-leaf module, imported downward by roles.py, only so that already oversized file
-does not grow further.
+leaf module, imported downward by harness_guidance.py, and by roles.py for
+JUDGE's chain.
 
 `orchestrator/src/orchestrator/agents/partial_failure_guidance.py::MULTI_PATH_PARTIAL_FAILURE_GUIDANCE`
 covers SPOTTING a missing path in multi-path output; this block covers

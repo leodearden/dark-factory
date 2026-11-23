@@ -1,0 +1,12 @@
+import sqlite3,re,collections,sys,json
+lines=open('/tmp/gate-10069/conflicts/bc_all.txt').read().splitlines()
+tips=collections.defaultdict(set)
+for l in lines:
+    pid=re.search(r'uv\[(\d+)\]',l).group(1); tip=re.search(r'tip=(\w+)',l).group(1); tips[pid].add(tip)
+res={}
+for proj,db in [('df','/home/leo/src/dark-factory/data/orchestrator/runs.db'),('reify','/home/leo/src/reify/data/orchestrator/runs.db')]:
+    c=sqlite3.connect(f'file:{db}?mode=ro',uri=True)
+    shas=set(r[0][:8] for r in c.execute("select json_extract(data,'$.merge_sha') from events where event_type='merge_verify' and timestamp>='2026-11-07' and json_extract(data,'$.merge_sha') is not null"))
+    for pid,t in tips.items():
+        res.setdefault(pid,{})[proj]=len(t&shas)
+for pid,t in tips.items(): print(pid,len(t),res[pid])

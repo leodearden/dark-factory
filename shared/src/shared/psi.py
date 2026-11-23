@@ -40,13 +40,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+from shared.cgroup_slice import project_slice_name
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'ARM_FIELDS',
     'parse_pressure_file',
+    'parse_pressure_totals',
     'read_pressure',
     'PsiSample',
     'read_psi_sample',
+    'cpu_some10_or_none',
     'RunqueueReading',
     'read_runqueue_ratio',
     'OwnCgroup',
@@ -56,10 +61,25 @@ __all__ = [
 ]
 
 _AVG_RE = re.compile(r'avg(10|60)=([0-9]+(?:\.[0-9]+)?)')
+_TOTAL_RE = re.compile(r'(?:^|\s)total=([0-9]+)')
 
 _PROC_STAT = '/proc/stat'
 _PROC_SELF_CGROUP = '/proc/self/cgroup'
 _CGROUP_ROOT = '/sys/fs/cgroup'
+
+
+def _pressure_lines(text: str) -> Iterator[tuple[str, str]]:
+    """Yield ``(prefix, line)`` for each ``some``/``full`` line of a pressure text.
+
+    The one line scanner of the pressure-file format: ``parse_pressure_file``
+    and ``parse_pressure_totals`` are two projections of it.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        for prefix in ('some', 'full'):
+            if line.startswith(prefix):
+                yield prefix, line
+                break
 
 
 def parse_pressure_file(text: str) -> dict[str, float] | None:
@@ -107,14 +127,7 @@ def parse_pressure_file(text: str) -> dict[str, float] | None:
         'full_avg60': 0.0,
     }
     found = False
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith('some'):
-            prefix = 'some'
-        elif line.startswith('full'):
-            prefix = 'full'
-        else:
-            continue
+    for prefix, line in _pressure_lines(text):
         # finditer, not search: one line carries BOTH windows, so a scan that
         # stops at the first match would silently drop avg60.
         for match in _AVG_RE.finditer(line):
@@ -124,6 +137,26 @@ def parse_pressure_file(text: str) -> dict[str, float] | None:
     if not found:
         return None
     return result
+
+
+def parse_pressure_totals(text: str) -> dict[str, int] | None:
+    """Parse the cumulative ``total=`` stall (µs) of each pressure line.
+
+    Keyed ``some_total`` and ``full_total``; an absent ``full`` line gives
+    ``full_total`` 0, the same partial-miss rule as ``parse_pressure_file``.
+    Returns ``None`` when no line carries a total, so a caller can tell an
+    unparseable file from zero stall. PRD
+    ``plans/per-consumer-resource-recording-prd.md`` D7 reads cgroup pressure
+    files for these totals.
+    """
+    result = {'some_total': 0, 'full_total': 0}
+    found = False
+    for prefix, line in _pressure_lines(text):
+        match = _TOTAL_RE.search(line)
+        if match is not None:
+            result[f'{prefix}_total'] = int(match.group(1))
+            found = True
+    return result if found else None
 
 
 def read_pressure(name: str) -> str:
@@ -190,8 +223,9 @@ def resolve_own_cgroup(
     """Resolve the reading process's own cgroup and its cpu.pressure file.
 
     Read the ``0::`` (unified-hierarchy) path from ``proc_cgroup_path`` and
-    walk it leaf-upward: the first segment equal to ``df-<project_id>.slice``
-    wins, else the leaf itself. Shapes are owned by PRD
+    walk it leaf-upward: the first segment equal to the project's slice name
+    (``shared/src/shared/cgroup_slice.py::project_slice_name``) wins, else the
+    leaf itself. Shapes are owned by PRD
     ``plans/load-throttle-harmonisation-prd.md`` §6.3, which is also the home
     of the parity fixtures this is tested against.
 
@@ -221,8 +255,8 @@ def resolve_own_cgroup(
         if not path:
             raise ValueError('0:: line carries no cgroup path')
         segments = path.split('/')
-        if project_id is not None:
-            slice_name = f'df-{project_id}.slice'
+        if project_id:
+            slice_name = project_slice_name(project_id)
             for depth in range(len(segments), 0, -1):
                 if segments[depth - 1] == slice_name:
                     path = '/'.join(segments[:depth])
@@ -315,14 +349,10 @@ Single home (heuristic 11): ``saturated`` reads it order-insensitively
 (``any``) and ``tripping_metric`` reads the SAME generator order-sensitively
 (first element), so the OR set and the rank cannot drift apart. The rank
 itself is owned by PRD ``plans/load-throttle-harmonisation-prd.md`` D10.
-
-That single home is still ahead of the tree (2026-09-09): until β (task 3590,
-PRD §8) switches ``scheduler.py::_note_heavy_deferral`` from its own if/elif
-chain to ``tripping_metric()``, that site ranks in the older DA-D1 order
-(cpu > mem_some > mem_full > io). Two live rankings, on purpose and for that
-window only — they already agree on the reported DOMAIN (the cfg field
-names), so β changes the order and nothing else.
 """
+
+ARM_FIELDS: frozenset[str] = frozenset(arm.field for arm in _ARMS)
+"""The arm field names of ``_ARMS``: the public, immutable vocabulary projection."""
 
 
 @dataclass(frozen=True)
@@ -373,11 +403,11 @@ class PsiSample:
     def _tripping_arms(self, cfg) -> Iterator[_Arm]:
         """Yield the arms of ``_ARMS`` this sample trips, in D10 rank order."""
         for arm in _ARMS:
-            # β (task 3590) must retire the ABSENCE half of this default with
-            # `{a.field for a in _ARMS} <= set(PsiAdmissionConfig.model_fields)`
-            # — `shared` cannot import that model, and without the guard a
-            # later rename there silently disables an arm forever. `saturated`
-            # documents why absence is tolerated until then.
+            # Absence reads as "arm off" (see `saturated`), so a rename in
+            # orchestrator's PsiAdmissionConfig would silently disable an arm.
+            # `shared` cannot import that model; the parity of its threshold
+            # fields with ARM_FIELDS is pinned on the orchestrator side by
+            # orchestrator/tests/test_config_psi_admission_reload.py::TestPsiAdmissionArmVocabulary
             threshold = getattr(cfg, arm.field, None)
             if threshold is None:
                 continue
@@ -393,8 +423,8 @@ class PsiSample:
         each is read with ``getattr(cfg, field, None)``, so an ABSENT attribute
         and an explicit ``None`` both mean "this arm is off". That keeps a
         v1 cfg (four thresholds, no ``runqueue_ratio`` / ``own_cpu_some_avg10``)
-        working in the live dispatch gate while the config-side v2 lands
-        separately, and it is the same reading the code defaults ask for.
+        working in the live dispatch gate, and it is the same reading the code
+        defaults ask for.
 
         An arm also never trips when its own component read failed. The host
         ``read_ok`` gate stays OUTSIDE the loop, so an unreadable host PSI
@@ -534,3 +564,8 @@ def read_psi_sample(
         own_read_ok=own.read_ok,
         cpu_some60=host.cpu_some60,
     )
+
+
+def cpu_some10_or_none(sample: PsiSample) -> float | None:
+    """Host CPU pressure as a ledger records it: ``None`` means the host read failed; ``0.0`` is a real reading."""
+    return sample.cpu_some10 if sample.read_ok else None

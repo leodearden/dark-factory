@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
+from fused_memory.middleware import ticket_store as fused_memory_ticket_store
 from legibility import task_store
 
 _URL = "http://fused-memory.test/mcp"
@@ -233,7 +234,40 @@ def test_a_timed_out_wait_is_undecided_and_any_other_failure_is_not() -> None:
 @pytest.mark.parametrize(
     "reply",
     [
-        {"status": "pending"},
+        {"status": "pending", "ticket": "tkt_1", "reason": "wait_timeout"},
+        {"status": "awaiting_curation", "ticket": "tkt_1", "reason": "curation-deferred: llm-failed"},
+    ],
+    ids=["pending", "awaiting-curation"],
+)
+def test_an_open_ticket_is_undecided_and_names_no_task(reply) -> None:
+    outcome = _resolve(reply)
+
+    assert outcome.undecided is True
+    assert outcome.task_id is None
+
+
+def test_a_cancelled_ticket_is_decided_and_names_no_task() -> None:
+    outcome = _resolve({"status": "cancelled", "reason": "user_cancelled"})
+
+    assert outcome == task_store.TicketOutcome(task_store.TicketStatus.CANCELLED, None, "user_cancelled")
+    assert outcome.undecided is False
+    assert outcome.task_id is None
+    assert _resolve({"status": "cancelled", "reason": "user_cancelled", "task_id": 7}).task_id is None
+
+
+def test_the_census_parses_exactly_fused_memorys_ticket_statuses() -> None:
+    census = {status.value for status in task_store.TicketStatus}
+    canonical = {status.value for status in fused_memory_ticket_store.TicketStatus}
+
+    assert census == canonical, (
+        f"census-only statuses {sorted(census - canonical)}; "
+        f"fused-memory-only statuses {sorted(canonical - census)}"
+    )
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"status": "exploded"},
         {"status": "created"},
         {"status": "combined", "task_id": "not-a-number"},
         {"status": "created", "task_id": True},

@@ -23,13 +23,17 @@ from typing import Any
 import pytest
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.reconciliation.consolidation_auto import (
     CORRECTION_METADATA_KEYS,
+    REASON_CODE_CLASSES,
     UNREADABLE,
     AutoOutcome,
     AutoProposal,
     AutoReasonCode,
     AutoVerdict,
+    FlowReasonCode,
+    ReasonCodeClass,
     build_auto_canonical,
     evaluate_auto_predicate,
 )
@@ -126,6 +130,7 @@ def _judge(
     open_gate_id: str | None = None,
     existing_canonical_slugs: Sequence[str] = (),
     config: Any = None,
+    waived: frozenset = frozenset(),
 ) -> AutoVerdict:
     """Run the predicate over *members*, every unmentioned fact at its benign value.
 
@@ -147,6 +152,7 @@ def _judge(
         open_gate_id=open_gate_id,
         existing_canonical_slugs=existing_canonical_slugs,
         config=config or _auto_config(),
+        waived=waived,
     )
 
 
@@ -799,6 +805,20 @@ class TestMemberHazards:
         assert [r.ids for r in reasons] == [('m2',)]
         assert key in reasons[0].detail
 
+    def test_a_member_marked_superseded_fails(self):
+        """Folding a marked record would delete the mark and re-promote its claim."""
+        marked: dict[str, Any] = {
+            SUPERSEDED_BY_METADATA_KEY: 'ce8590f1-cc05-48da-9428-1cf1f54f3fff',
+        }
+        members = _members(_member('m1'), _member('m2', **marked))
+
+        verdict = _judge(members)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_carries_correction_metadata)
+        assert [r.ids for r in reasons] == [('m2',)]
+        assert SUPERSEDED_BY_METADATA_KEY in reasons[0].detail
+
     @pytest.mark.parametrize(
         'body',
         CORRECTION_BANNER_SPECIMENS.values(),
@@ -1279,6 +1299,42 @@ class TestCountAndMemberSetContradictions:
         assert verdict.retain_ids == ('m1',)
 
 
+_NON_BOOL_CANONICALS = [1, 1.0, 'true']
+
+
+class TestOnlyTheBoolTrueIsCanonical:
+    """A ``canonical`` value that is not the bool ``True`` claims nothing.
+
+    Contrast ``test_a_named_incumbent_contradicting_a_zero_count_fails``,
+    where ``canonical=True`` makes C this topic's incumbent.
+    """
+
+    @pytest.mark.parametrize('value', _NON_BOOL_CANONICALS)
+    def test_a_non_bool_canonical_of_this_topic_is_not_the_incumbent(self, value):
+        m1 = _member('m1', topic=TOPIC)
+        c = _member('C', topic=TOPIC)
+        c['metadata']['canonical'] = value
+
+        verdict = _judge(_members(m1, c), canonical_count=0)
+
+        assert AutoReasonCode.canonical_count_contradicted not in _codes(verdict)
+        assert AutoReasonCode.member_already_canonical not in _codes(verdict)
+        assert 'C' in verdict.retain_ids
+        assert 'C' not in verdict.stripped_ids
+
+    @pytest.mark.parametrize('value', _NON_BOOL_CANONICALS)
+    def test_a_non_bool_canonical_of_another_topic_is_not_member_already_canonical(
+        self, value
+    ):
+        x1 = _member('x1', topic='some-other-topic')
+        x1['metadata']['canonical'] = value
+
+        verdict = _judge(_members(_member('m1'), x1), canonical_count=0)
+
+        assert AutoReasonCode.member_different_topic in _codes(verdict)
+        assert AutoReasonCode.member_already_canonical not in _codes(verdict)
+
+
 class TestCallerContractViolationsReturnAVerdict:
     """Inputs the parameter annotations FORBID, answered rather than obeyed.
 
@@ -1597,3 +1653,173 @@ class TestEveryReasonCodeIsExercised:
         verdict = REASON_CODE_FIXTURES[code]()
 
         assert code in _codes(verdict), verdict
+
+
+class TestReasonCodeClasses:
+    """Who decides each reason code: PRD ``plans/consolidation-adjudicator-prd.md`` K1.
+
+    ``REASON_CODE_CLASSES`` is the one home of the partition, and these tests pin
+    it to K1's table. The flow codes are the reasons the rules AROUND the
+    predicate give, so they are a separate vocabulary that shares the ledger
+    row's flat ``reason_codes`` tuple with the predicate's codes.
+    """
+
+    def test_every_reason_code_is_classified(self):
+        assert set(REASON_CODE_CLASSES) == set(AutoReasonCode)
+
+    def test_the_partition_is_k1s_table(self):
+        k1 = {
+            ReasonCodeClass.NO_OP: (
+                AutoReasonCode.already_gated,
+                AutoReasonCode.already_consolidated,
+                AutoReasonCode.incumbent_canonical_stripped,
+            ),
+            ReasonCodeClass.REPAIR: (
+                AutoReasonCode.member_not_found,
+                AutoReasonCode.member_different_topic,
+                AutoReasonCode.member_already_canonical,
+                AutoReasonCode.proposal_category_mismatch,
+            ),
+            ReasonCodeClass.RETRY: (
+                AutoReasonCode.member_unreadable,
+                AutoReasonCode.canonical_count_unavailable,
+            ),
+            ReasonCodeClass.REFUSE: (
+                AutoReasonCode.member_id_repeated,
+                AutoReasonCode.no_retained_members,
+                AutoReasonCode.mixed_category,
+                AutoReasonCode.canonical_category_mismatch,
+                AutoReasonCode.multiple_canonicals,
+                AutoReasonCode.canonical_count_contradicted,
+                AutoReasonCode.member_carries_correction_metadata,
+                AutoReasonCode.canonical_carries_correction,
+                AutoReasonCode.slug_near_collision,
+            ),
+            ReasonCodeClass.ADJUDICATOR: (
+                AutoReasonCode.member_carries_correction_banner,
+            ),
+        }
+        expected = {code: cls for cls, codes in k1.items() for code in codes}
+
+        assert dict(REASON_CODE_CLASSES) == expected
+
+    def test_the_classes_are_k1s_five(self):
+        assert {cls.value for cls in ReasonCodeClass} == {
+            'no_op', 'repair', 'retry', 'refuse', 'adjudicator',
+        }
+
+    def test_flow_codes_are_k1_and_k4s(self):
+        """The report and check scripts read these values back off ledger rows."""
+        assert {code.value for code in FlowReasonCode} == {
+            'too_few_members_after_repair',
+            'too_many_members_to_adjudicate',
+            'too_few_kept',
+            'closure_failed_previously',
+            'unreadable',
+            'adjudicator_failed',
+        }
+
+    def test_flow_codes_never_collide_with_a_predicate_code(self):
+        """Both land in ``ProposalOutcome.reason_codes``, one flat string tuple."""
+        flow = {code.value for code in FlowReasonCode}
+        predicate = {code.value for code in AutoReasonCode}
+
+        assert flow.isdisjoint(predicate)
+
+
+#: A body the banner arm matches, for the waiver tests.
+BANNER_BODY = CORRECTION_BANNER_SPECIMENS['bracketed_bare_stamp']
+
+#: Every code a caller may NOT waive, derived from the one table.
+_UNWAIVABLE_CODES = [
+    code
+    for code, cls in REASON_CODE_CLASSES.items()
+    if cls is not ReasonCodeClass.ADJUDICATOR
+]
+
+
+class TestPredicateWaivers:
+    """``waived``: hazards the caller's adjudicator already judged (K2).
+
+    A waiver is ``(code, subject member id)``. A waived hazard is skipped, and
+    only adjudicator-class codes may be waived; anything else raises.
+    """
+
+    def test_a_waived_banner_hazard_is_skipped(self):
+        members = _members(_member('m1'), _member('m2', content=BANNER_BODY))
+        waiver = (AutoReasonCode.member_carries_correction_banner, 'm2')
+
+        unwaived = _judge(members)
+        waived = _judge(members, waived=frozenset({waiver}))
+
+        assert unwaived.outcome is AutoOutcome.FAIL
+        assert waived.outcome is AutoOutcome.PASS
+        assert waived.retain_ids == ('m1', 'm2')
+
+    def test_a_waiver_covers_only_its_subject(self):
+        members = _members(
+            _member('m1'),
+            _member('m2', content=BANNER_BODY),
+            _member('m3', content=BANNER_BODY),
+        )
+
+        verdict = _judge(
+            members,
+            waived=frozenset({(AutoReasonCode.member_carries_correction_banner, 'm2')}),
+        )
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        banner = _reasons_for(verdict, AutoReasonCode.member_carries_correction_banner)
+        assert [reason.ids for reason in banner] == [('m3',)]
+
+    def test_a_waiver_leaves_another_hazard_on_the_same_member(self):
+        members = _members(
+            _member('m1'),
+            _member('m2', content=BANNER_BODY, superseded_by='0090d639'),
+        )
+
+        verdict = _judge(
+            members,
+            waived=frozenset({(AutoReasonCode.member_carries_correction_banner, 'm2')}),
+        )
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.member_carries_correction_metadata in _codes(verdict)
+        assert AutoReasonCode.member_carries_correction_banner not in _codes(verdict)
+
+    def test_a_waiver_for_a_hazard_that_did_not_fire_changes_nothing(self):
+        members = _members(_member('m1'), _member('m2'))
+
+        waived = _judge(
+            members,
+            waived=frozenset({(AutoReasonCode.member_carries_correction_banner, 'm1')}),
+        )
+
+        assert waived == _judge(members)
+
+    @pytest.mark.parametrize('code', _UNWAIVABLE_CODES, ids=lambda code: code.value)
+    def test_a_waiver_outside_the_adjudicator_class_raises(self, code):
+        members = _members(_member('m1'), _member('m2'))
+
+        with pytest.raises(ValueError) as excinfo:
+            _judge(members, waived=frozenset({(code, 'm1')}))
+
+        assert code.value in str(excinfo.value)
+        assert REASON_CODE_CLASSES[code].value in str(excinfo.value)
+
+    def test_the_waiver_check_precedes_the_gate_rung(self):
+        """A mis-wired caller fails on every path, not only past rung 1."""
+        members = _members(_member('m1'), _member('m2'))
+
+        with pytest.raises(ValueError):
+            _judge(
+                members,
+                open_gate_id='5183',
+                waived=frozenset({(AutoReasonCode.mixed_category, 'm1')}),
+            )
+
+    def test_a_waiver_naming_no_reason_code_raises(self):
+        members = _members(_member('m1'), _member('m2'))
+
+        with pytest.raises(ValueError, match='not_a_code'):
+            _judge(members, waived=frozenset({('not_a_code', 'm1')}))

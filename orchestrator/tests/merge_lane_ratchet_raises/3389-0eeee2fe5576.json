@@ -1,0 +1,42 @@
+{
+  "task_id": "3389",
+  "reason": "Net-additive defect fix: GitOps.commit now unstages any gitlink the staged change set newly introduces (an embedded git repo would otherwise ride a WIP commit to the merge lane) and stages with --ignore-errors so one commit-less embedded repo can no longer abort staging and silently drop the real WIP; the diff parser lives in staged_gitlinks.py, git_ops.py gains only the unstage-and-warn seam and its docstring",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1444,
+      "current": 1447
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 16003,
+      "current": 16035
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9322,
+      "current": 9331
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4866,
+      "current": 4869
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57857,
+      "current": 57889
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32113,
+      "current": 32122
+    }
+  ]
+}

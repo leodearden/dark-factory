@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# reference-transaction: audit every move of main against the merge-lane ratchet.
+#
+# WHY HERE. Every route to main ends in a move of refs/heads/main -- the merge
+# worker's `git update-ref`, a merge or commit on main, a rebase finishing
+# there -- while pre-commit cannot see a rebase replay, a clean merge or a
+# --no-verify commit. In the `prepared` state git has checked the CAS and not
+# yet moved the ref, and a non-zero exit aborts the move.
+#
+# Project-specific, and inert where the ratchet artifacts do not change: only a
+# move whose diff touches the baseline or the ledger spawns python. Policy --
+# rewinds, sideways moves, the restore carve-out -- lives in the auditor; this
+# script only filters.
+#
+# In the merge lane a refusal surfaces as cas_failed retries, then "CAS retry
+# limit exhausted", with this text in the orchestrator log (task 6892 tracks
+# classifying it). Deliberate bypass for a human:
+#   git -c core.hooksPath=/dev/null update-ref ...
+
+state="$1"
+
+# ALWAYS drain stdin, whatever the state: git writes every queued update to it.
+# The HEAD line that accompanies a commit on main is ignored, so each move is
+# audited once.
+old="" new="" seen=""
+while read -r line_old line_new line_ref; do
+    if [ "$line_ref" = "refs/heads/main" ]; then
+        old="$line_old" new="$line_new" seen=1
+    fi
+done
+if [ "$state" != "prepared" ] || [ -z "$seen" ]; then
+    exit 0
+fi
+
+# A deletion passes. A zero old oid (a non-CAS update-ref, or pack-refs and gc
+# re-writing main as it is) means main's current value, which `prepared` still
+# reports; no current value means main is being created, which passes too.
+[[ $new =~ ^0+$ ]] && exit 0
+if [[ $old =~ ^0+$ ]]; then
+    old="$(git rev-parse -q --verify refs/heads/main)" || exit 0
+fi
+[ "$old" = "$new" ] && exit 0
+
+git diff-tree -r --quiet "$old" "$new" -- \
+    orchestrator/tests/merge_lane_ratchet_baseline.json \
+    orchestrator/tests/merge_lane_ratchet_raises \
+    orchestrator/tests/merge_lane_ratchet_authorized_raises.json
+diff_rc=$?
+if [ "$diff_rc" -eq 0 ]; then
+    exit 0
+elif [ "$diff_rc" -ne 1 ]; then
+    echo "reference-transaction: could not compare the ratchet artifacts across this move of main (git rc=$diff_rc);" >&2
+    echo "  refusing the move rather than skipping the audit." >&2
+    exit 1
+fi
+
+ROOT="$(git rev-parse --show-toplevel)" || {
+    echo "reference-transaction: cannot find the working tree to run scripts/check_ratchet_advance.py from;" >&2
+    echo "  refusing the move rather than skipping the audit." >&2
+    exit 1
+}
+python3 "$ROOT/scripts/check_ratchet_advance.py" --root "$ROOT" "$old" "$new"
+audit_rc=$?
+if [ "$audit_rc" -eq 1 ]; then
+    echo "reference-transaction: merge-lane ratchet audit REFUSED this move of main (${old:0:10}..${new:0:10}); see above." >&2
+    exit 1
+elif [ "$audit_rc" -ne 0 ]; then
+    echo "reference-transaction: merge-lane ratchet audit could NOT RUN (rc=$audit_rc); its named cause is above." >&2
+    exit 1
+fi
+exit 0

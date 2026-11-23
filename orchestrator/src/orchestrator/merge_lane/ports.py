@@ -30,6 +30,7 @@ from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord, MergeRequest
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cache.replay import CacheAccess
 
 _T = TypeVar('_T')
 
@@ -46,6 +47,11 @@ class VerifyPort(Protocol):
     ``run_dry_run_unblock``), so the wiring is a rename, not a translation.
     """
 
+    @property
+    def verify_cache(self) -> CacheAccess | None:
+        """The dispatcher's verify-result cache that a LOCAL merge gate through this port joins; None keeps every verify outside it."""
+        ...
+
     async def run_scoped(
         self,
         worktree: Path,
@@ -61,6 +67,7 @@ class VerifyPort(Protocol):
         force_workspace: bool = False,
         role: Literal['merge', 'task'] = 'task',
         event_store: EventStore | None = None,
+        verify_cache: CacheAccess | None = None,
     ) -> VerifyResult: ...
 
     async def run_unscoped_typechecks(
@@ -71,6 +78,7 @@ class VerifyPort(Protocol):
         *,
         block_on_timeout: bool,
         task_id: str | None = None,
+        executed: VerifyResult | None = None,
     ) -> PostMergePyrightResult: ...
 
     async def check_post_merge_pyright(
@@ -132,7 +140,7 @@ class VerifyPort(Protocol):
 
 
 class ClockPort(Protocol):
-    """The worker's clocks, its sleep and bounded wait, and its merge-worktree progress probe."""
+    """The worker's clocks, its sleep and bounded wait, and its merge-worktree progress probes."""
 
     def now(self) -> float: ...
 
@@ -140,9 +148,13 @@ class ClockPort(Protocol):
 
     def newest_content_mtime(self, root: Path) -> float | None: ...
 
+    def verify_cpu_ticks(self, root: Path) -> int | None: ...
+
     async def sleep(self, secs: float) -> None: ...
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         """Wait up to *timeout* for any of *aws* to finish; the DONE set, never a raise.
 
         A lane wait belongs on this port iff it sits in a REPEATING loop
@@ -183,7 +195,11 @@ class ProductionVerifier:
 
     Every method resolves its function and forwards the call exactly as
     received -- positional arguments positionally, keywords by keyword -- so
-    the function sees the same call it saw before the port existed.
+    the function sees the same call it saw before the port existed. The one
+    addition is ``cold_shadow``'s ``verifier=self``: the cold leg verifies
+    through the port it was asked through, whichever instance that is.
+    ``verify_cache`` is held for the callers that opt into it and is never
+    injected into a forwarded call.
     """
 
     scoped: Resolver[Callable[..., Awaitable[VerifyResult]]]
@@ -193,6 +209,10 @@ class ProductionVerifier:
     disk_guard: Resolver[Callable[..., Awaitable[str | None]]]
     cold_shadow_verify: Resolver[Callable[..., Awaitable[dict[str, str]]]]
     dry_run: Resolver[Callable[..., Coroutine[Any, Any, None]]]
+    verify_cache: CacheAccess | None = None
+
+    def joined_to(self, access: CacheAccess | None) -> ProductionVerifier:
+        return dataclasses.replace(self, verify_cache=access)
 
     async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
         return await self.scoped()(*args, **options)
@@ -210,7 +230,7 @@ class ProductionVerifier:
         return DiskGuardOutcome(reason=await self.disk_guard()(*args, **options))
 
     async def cold_shadow(self, *args: Any, **options: Any) -> dict[str, str]:
-        return await self.cold_shadow_verify()(*args, **options)
+        return await self.cold_shadow_verify()(*args, verifier=self, **options)
 
     def dry_run_unblock(self, **investigation: Any) -> Coroutine[Any, Any, None]:
         return self.dry_run()(**investigation)
@@ -220,11 +240,13 @@ class ProductionVerifier:
 class ProductionClock:
     """``ClockPort`` on the real clocks.
 
-    ``content_mtime`` resolves ``merge_liveness.newest_content_mtime`` the
-    way the verify resolvers do, for the same reason.
+    ``content_mtime`` and ``cpu_ticks`` resolve ``liveness.newest_content_mtime``
+    and ``liveness.verify_tree_cpu_ticks`` the way the verify resolvers do,
+    for the same reason.
     """
 
     content_mtime: Resolver[Callable[[Path], float | None]]
+    cpu_ticks: Resolver[Callable[[Path], int | None]]
 
     def now(self) -> float:
         return time.time()
@@ -235,10 +257,15 @@ class ProductionClock:
     def newest_content_mtime(self, root: Path) -> float | None:
         return self.content_mtime()(root)
 
+    def verify_cpu_ticks(self, root: Path) -> int | None:
+        return self.cpu_ticks()(root)
+
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(secs)
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         done, _ = await asyncio.wait(aws, timeout=timeout)
         return done
 

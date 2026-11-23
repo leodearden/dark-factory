@@ -13,6 +13,10 @@ gate without any other test failing.
 
 from __future__ import annotations
 
+from fused_memory.reconciliation.dangling_citation import (
+    DanglingCitation,
+    build_dangling_citation_finding,
+)
 from fused_memory.reconciliation.harness import _derive_affected_ids
 
 
@@ -213,3 +217,19 @@ class TestDeriveAffectedIds:
         }
         result = _derive_affected_ids(finding)
         assert result == ['3839'], f'top-level task_id must not merge into cited identity; got {result!r}'
+
+    # ------------------------------------------------------------------ #
+    # The dangling-citation handoff record is an identity source (task 5749)
+    # ------------------------------------------------------------------ #
+
+    def test_dangling_citation_record_contributes_its_ids(self):
+        """A Stage-3 dangling-citation finding cites nothing, so its record is its identity."""
+        record = DanglingCitation(
+            target_run_id='06a4466d-cdc0-49ac-8e99-e6723be39392',
+            finding_id='a1a1a1a1-0000-4000-8000-000000000001',
+            memory_id='beacf7fc-b76a-4c0b-876d-f4cf6d906d42',
+            store='mem0',
+        )
+        result = _derive_affected_ids(build_dangling_citation_finding(record))
+        for value in (record.target_run_id, record.finding_id, record.memory_id):
+            assert value in result, f'{value} missing from derived identity {result!r}'

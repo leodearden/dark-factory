@@ -1,5 +1,5 @@
 /* Overview tab — command-center grid */
-const { Sparkline, LineChart, StatTile, PALETTE: P, niceCountMax } = window.DF_CHARTS;
+const { Sparkline, LineChart, StatTile, PALETTE: P } = window.DF_CHARTS;
 const { Glyph, LiveFeed, DatumReading } = window.DF_SHELL;
 const D = window.DF_DATA;
 // The census readers and the Datum wrappers. Module scope, no fallback — see
@@ -35,14 +35,14 @@ const METRICS = [
   { key: 'psi_io_some_avg10',   label: 'IO pressure · some',   type: 'psi' },
   { key: 'psi_io_full_avg10',   label: 'IO pressure · full',   type: 'psi' },
   { key: 'occt_queue_depth',    label: 'OCCT queue depth',     type: 'int' },
-  { key: 'verify_concurrency',  label: 'Verify concurrency',   type: 'int' },
-  { key: 'verify_rss_total_bytes', label: 'Verify RSS total',  type: 'bytes' },
+  { key: 'verify_scopes_live',  label: 'Verify scopes live',   type: 'int' },
+  { key: 'verify_scope_memory_bytes', label: 'Verify scope memory', type: 'bytes' },
 ];
 
 /* Format a host-load metric value for display.
  *  type 'psi'   → "X.XX%"  (avg10 stall %; some = tasks stalling, full = all stalling)
- *  type 'bytes' → "X.X GiB" (verify_rss_total_bytes via 1024**3 = 1073741824)
- *  type 'int'   → integer (occt_queue_depth, verify_concurrency)
+ *  type 'bytes' → "X.X GiB" (verify_scope_memory_bytes via 1024**3 = 1073741824)
+ *  type 'int'   → integer (occt_queue_depth, verify_scopes_live)
  */
 function formatLoadValue(type, v) {
   if (type === 'psi')   return `${v.toFixed(2)}%`;
@@ -57,7 +57,7 @@ function formatLoadValue(type, v) {
  * unit's `--timeout-keep-alive` must stay strictly ABOVE the slowest such
  * poller, or the server closes this socket in the gap between polls and exposes
  * the server-closes-while-client-writes race. The value is parsed from this
- * declaration by tests/scripts/test_dashboard_service_template.py
+ * declaration by tests/scripts/dashboard_client_pollers.py
  * (CLIENT_POLLERS), so RAISING IT REQUIRES raising --timeout-keep-alive in BOTH
  * scripts/dashboard.service.template and
  * dashboard/dark-factory-dashboard.service.
@@ -265,7 +265,7 @@ function OverviewTab({ paused }) {
               ]}
               height={210}
               formatY={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : Math.round(v)}
-              snapMax={niceCountMax}
+              countAxis
               formatX={window.DF_SHELL.fmtDateTime}
             />
           </div>

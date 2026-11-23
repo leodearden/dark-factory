@@ -8,11 +8,12 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _curator_helpers import curator_double
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.middleware.curator_types import DEFAULT_PRIORITY
 from fused_memory.middleware.task_curator import (
     _PRIORITY_RANK,
-    DEFAULT_PRIORITY,
     BackfillResult,
     TaskCurator,
 )
@@ -232,7 +233,7 @@ class TestBackfillPointIdConsistency:
     @pytest.mark.asyncio
     async def test_backfill_uses_same_point_id_as_record_task(self):
         """backfill_corpus() and record_task() produce identical UUID5 point IDs."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         project_id = 'myproject'
         task_id = '42'
@@ -296,7 +297,7 @@ class TestBackfillPointIdConsistency:
     @pytest.mark.asyncio
     async def test_record_task_normalizes_none_fields(self):
         """record_task() with files_to_modify=None and priority=None stores [] and 'medium' in payload."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         project_id = 'proj'
         task_id = '99'
@@ -353,7 +354,7 @@ class TestBackfillPointIdConsistency:
     @pytest.mark.asyncio
     async def test_record_task_and_backfill_payload_shapes_match(self):
         """record_task() and backfill_corpus() produce payloads with identical types."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         project_id = 'proj'
         task_id = '77'
@@ -453,7 +454,7 @@ class TestBackfillPointIdConsistency:
     @pytest.mark.asyncio
     async def test_default_priority_alignment(self):
         """record_task() with default CandidateTask and backfill_corpus() with no priority key both produce 'medium'."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         project_id = 'proj'
         task_id = '50'
@@ -1040,7 +1041,8 @@ class TestAutoBackfill:
 
         This integration test exercises the full _get_curator → _maybe_backfill_corpus
         path, confirming that the wiring is live (not just that _maybe_backfill_corpus
-        works in isolation).
+        works in isolation). It calls the private ``_get_curator`` directly because
+        its lazy build is the subject.
         """
         import asyncio
 
@@ -1089,7 +1091,7 @@ class TestAutoBackfill:
 class TestTaskInterceptorClose:
     """Tests for TaskInterceptor.close() resource release and re-use prevention."""
 
-    def _make_interceptor(self, mock_taskmaster=None) -> TaskInterceptor:
+    def _make_interceptor(self, mock_taskmaster=None, curator=None) -> TaskInterceptor:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         config = _make_interceptor_config()
         return TaskInterceptor(
@@ -1097,19 +1099,19 @@ class TestTaskInterceptorClose:
             targeted_reconciler=None,
             event_buffer=MagicMock(),
             config=config,
+            curator=curator,
         )
 
     @pytest.mark.asyncio
     async def test_close_awaits_curator_close_and_clears(self):
-        """close() awaits curator.close() and sets _curator to None."""
-        interceptor = self._make_interceptor()
-        mock_curator = AsyncMock()
-        interceptor._curator = mock_curator
+        """close() awaits curator.close() and releases the curator."""
+        curator = curator_double()
+        interceptor = self._make_interceptor(curator=curator)
 
         await interceptor.close()
 
-        mock_curator.close.assert_awaited_once()
-        assert interceptor._curator is None
+        curator.close.assert_awaited_once()
+        assert interceptor.curator_registry_health() == ()
 
     @pytest.mark.asyncio
     async def test_close_sets_closed_flag(self):
@@ -1121,7 +1123,11 @@ class TestTaskInterceptorClose:
 
     @pytest.mark.asyncio
     async def test_get_curator_returns_none_after_close(self):
-        """_get_curator() returns None after close(), preventing resource re-creation."""
+        """_get_curator() returns None after close(), preventing resource re-creation.
+
+        Calls the private ``_get_curator`` directly because its close guard is
+        the subject.
+        """
         interceptor = self._make_interceptor()
         await interceptor.close()
 
@@ -1131,9 +1137,8 @@ class TestTaskInterceptorClose:
     @pytest.mark.asyncio
     async def test_close_drains_before_releasing_curator(self):
         """close() calls drain() before closing the curator."""
-        interceptor = self._make_interceptor()
-        mock_curator = AsyncMock()
-        interceptor._curator = mock_curator
+        mock_curator = curator_double()
+        interceptor = self._make_interceptor(curator=mock_curator)
 
         call_order: list[str] = []
         original_drain = interceptor.drain

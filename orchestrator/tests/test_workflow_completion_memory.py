@@ -6,7 +6,10 @@ Finding 2: the orchestrator's deterministic post-merge completion writer POSTed
 deterministic ``count_memories_by_metadata`` / ``get_memories_by_metadata``
 audits match on ``metadata.task_id``, so those organic completion notes were
 audit-invisible.  These tests pin that the write now stamps
-``metadata={'task_id': str(self.task_id), 'source': 'orchestrator_completion'}``.
+``metadata={'task_id': str(self.task_id), 'source': 'orchestrator_completion',
+'kind': 'task_completion'}``.  The declared ``kind`` force-stores the record
+past write triage (fused-memory/src/fused_memory/server/write_triage.py::declares_attach_keys,
+task 6956), so it never attaches as a child of another task's record.
 """
 
 from __future__ import annotations
@@ -116,3 +119,18 @@ async def test_completion_write_task_id_is_string_not_int(tmp_path):
     metadata = captured[0]['json']['params']['arguments']['metadata']
     assert metadata['task_id'] == '2610'
     assert isinstance(metadata['task_id'], str), 'metadata.task_id must be a str'
+
+
+@pytest.mark.asyncio
+async def test_completion_write_declares_task_completion_kind(tmp_path):
+    """The completion metadata declares kind='task_completion' beside task_id and source."""
+    wf = _make_workflow(tmp_path=tmp_path, task_id='2610')
+
+    captured: list[dict] = []
+    with patch('httpx.AsyncClient', lambda *a, **k: _CaptureClient(captured)):
+        await wf._write_completion_to_memory()
+
+    metadata = captured[0]['json']['params']['arguments']['metadata']
+    assert metadata['kind'] == 'task_completion'
+    assert metadata['task_id'] == '2610'
+    assert metadata['source'] == 'orchestrator_completion'

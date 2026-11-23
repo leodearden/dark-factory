@@ -30,6 +30,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 from shared.task_transitions import outcome_allows_status
 
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
@@ -128,6 +129,7 @@ def _make(
     config.project_root = tmp_path / 'proj'
     config.git.branch_prefix = 'task/'
     config.module_configs_or_empty = {}
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock(side_effect=set_task_status_side_effect)
@@ -993,7 +995,7 @@ class TestReadyToMergeDispatch:
 
     async def _drive(
         self, tmp_path: Path, *, site: str, with_already_done: bool,
-    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome]:
+    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome | None]:
         """Drive the REAL dispatch site with exit artifacts a stub agent wrote.
 
         Both handlers are stubbed, so what is observed is purely which branch
