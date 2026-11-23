@@ -41,7 +41,6 @@ from shared.cli_invoke import (
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.declared_checks import declared_checks
-from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
@@ -101,6 +100,7 @@ from orchestrator.already_landed_tick_view import (
     read_already_landed_tick_view,
 )
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.auto_eval_redo import redo_submit_text
 from orchestrator.background_service import (
     DEFAULT_BACKOFF_SECS,
     BackgroundService,
@@ -516,8 +516,6 @@ _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES: frozenset[str] = frozenset({'pending'})
 _AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES: frozenset[str] = frozenset(
     {'wip_conflict', 'infra_issue', 'branch_reset'},
 )
-
-_REDO_TITLE_MAX = 200
 
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
@@ -11227,20 +11225,17 @@ class Harness:
             'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
-        original_title = str(assignment.task.get('title') or '')
-        title = elide_at_word(f'[auto-eval redo] {original_title}', _REDO_TITLE_MAX)
-        description = (
-            f'Automated full-architect redo of task {original_id} '
-            f'(blocked at phase={report.block_phase} via optimistic path '
-            f'{optimistic_path!r}). Original branch+worktree are renamed to '
-            f'{new_branch} for forensic comparison once this redo is released.'
-            f'\n\nOriginal title: {original_title}'
+        submit_text = redo_submit_text(
+            assignment.task,
+            original_id=original_id,
+            block_phase=report.block_phase,
+            optimistic_path=optimistic_path,
+            new_branch=new_branch,
         )
 
         outcome = await self.scheduler.submit_task({
             'project_root': str(self.config.project_root),
-            'title': title,
-            'description': description,
+            **submit_text,
             'priority': str(assignment.task.get('priority') or 'medium'),
             'metadata': redo_metadata,
             'planning_mode': True,
