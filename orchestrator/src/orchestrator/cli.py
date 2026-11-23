@@ -452,17 +452,25 @@ def verify_cache_audit_run_cmd(config: OrchestratorConfig, log_dir: Path | None)
 @click.option('--reason', required=True, help='Why the cache is safe to re-enable; recorded on the policy row.')
 @pass_config(help=f'{CONFIG_OPTION_HELP_PREFIX} Selects the target project.')
 def verify_cache_enable_cmd(reason: str, config: OrchestratorConfig):
-    """Clear the verify cache's kill switch (an operator write, plans/verify-result-cache-prd.md § Audit)."""
+    """Clear the verify cache's kill switch (an operator write, plans/verify-result-cache-prd.md § Audit).
+
+    Also resolves the pending kill-switch L2 blockers, whose disable this ends.
+    """
     from datetime import UTC, datetime
 
+    from escalation.queue import EscalationQueue
+    from shared.project_layout import escalation_queue_dir
+
     from orchestrator.verify_cache.audit import enable
+    from orchestrator.verify_cache.audit_hook import resolve_ended_blockers
     from orchestrator.verify_cache.registry import Registry, RegistryError, registry_db_path
     from orchestrator.verify_cache.status import render_status
 
-    registry = Registry(registry_db_path(Path(config.project_root)))
+    project_root = Path(config.project_root)
+    registry = Registry(registry_db_path(project_root))
     now = datetime.now(UTC)
     try:
-        asyncio.run(enable(registry, reason, now))
+        policy = asyncio.run(enable(registry, reason, now))
         summary = asyncio.run(registry.summary())
     except RegistryError as e:
         click.echo(f'Error: {e}', err=True)
@@ -471,6 +479,23 @@ def verify_cache_enable_cmd(reason: str, config: OrchestratorConfig):
         raise click.BadParameter(str(e), param_hint='--reason') from e
     for line in render_status(config.verify_cache, summary, now):
         click.echo(line)
+    queue_dir = escalation_queue_dir(project_root)
+    if not queue_dir.is_dir():
+        return
+    try:
+        resolved = resolve_ended_blockers(
+            EscalationQueue(queue_dir), policy, now,
+            resolved_by='interactive', resolution=f'Verify cache re-enabled by the operator: {policy.reason}',
+        )
+    except OSError as e:
+        click.echo(
+            f'Error: the cache is re-enabled, but resolving its kill-switch blocker in {queue_dir} failed: {e}; '
+            'resolve it with resolve_issue',
+            err=True,
+        )
+        sys.exit(1)
+    for escalation_id in resolved:
+        click.echo(f'resolved kill-switch blocker {escalation_id}')
 
 
 @main.command('probe-models')

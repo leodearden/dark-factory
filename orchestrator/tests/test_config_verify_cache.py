@@ -28,8 +28,6 @@ from orchestrator.verify_cache import keys, policy, registry
 from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV, CacheMode
 from orchestrator.verify_evidence import Leg, UnitTier
 
-_FORCE_OFF = VERIFY_CACHE_ENV
-
 
 def _project(tmp_path: Path, top_level: dict) -> Path:
     config_path = tmp_path / 'dark-factory-orchestrator.yaml'
@@ -74,7 +72,7 @@ _BOTH_ON = VerifyCacheConfig(task_mode=CacheMode.ON, merge_mode=CacheMode.ON)
 class TestEnvForcesOff:
     @pytest.mark.parametrize('value', ['off', 'OFF', ' off '])
     def test_off_forces_both_roles_off(self, monkeypatch, value):
-        monkeypatch.setenv(_FORCE_OFF, value)
+        monkeypatch.setenv(VERIFY_CACHE_ENV, value)
 
         assert _BOTH_ON.mode_for('task') is CacheMode.OFF
         assert _BOTH_ON.mode_for('merge') is CacheMode.OFF
@@ -85,7 +83,7 @@ class TestEnvForcesOff:
 
     @pytest.mark.parametrize('value', ['', 'on', 'log', 'bogus'])
     def test_any_other_value_can_never_turn_the_cache_on(self, monkeypatch, value):
-        monkeypatch.setenv(_FORCE_OFF, value)
+        monkeypatch.setenv(VERIFY_CACHE_ENV, value)
 
         assert _BOTH_ON.mode_for('task') is CacheMode.ON
         assert _BOTH_ON.mode_for('merge') is CacheMode.ON
@@ -105,7 +103,7 @@ class TestEnvForcesOff:
         )
         assert policy.decide(_BOTH_ON, 'merge', key, view, never_cache=False, now=now).decision is policy.Decision.HIT
 
-        monkeypatch.setenv(_FORCE_OFF, 'off')
+        monkeypatch.setenv(VERIFY_CACHE_ENV, 'off')
 
         decision = policy.decide(_BOTH_ON, 'merge', key, view, never_cache=False, now=now)
         assert decision.decision is policy.Decision.MISS

@@ -17,6 +17,7 @@ import yaml
 from click.testing import CliRunner
 from escalation.categories import EscalationCategory
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
 from orchestrator.cli import main
 from orchestrator.config import VerifyCacheConfig
@@ -233,6 +234,7 @@ class TestApply:
 
         state = seeded.policy()
         assert state.disabled_until is None
+        assert state.reason == f'kill switch expired at {until.isoformat()}'
         assert state.streak == 1
         assert (after.newly_disabled, after.l2_required) == (False, False)
 
@@ -303,6 +305,24 @@ class TestEnableCli:
         status = CliRunner().invoke(main, ['verify-cache', 'status', '--config', str(cfg)])
         assert 'policy: enabled' in status.output, status.output
         assert 'fixed X' in (seeded.policy().reason or '')
+
+    def test_enable_resolves_the_pending_kill_switch_blocker(self, tmp_path):
+        seeded = _Seeded(registry.registry_db_path(tmp_path), t0=datetime.now(UTC))
+        queue_dir = escalation_queue_dir(tmp_path)
+        hook = audit_hook.VerifyCacheAuditHook(seeded.registry, EscalationQueue(queue_dir), now=lambda: seeded.now)
+        asyncio.run(hook(AUDIT_COMMAND, HEAD, _reproduced(ALPHA_NODE, BETA_NODE), ()))
+        [blocker] = EscalationQueue(queue_dir).get_by_task(audit_hook.AUDIT_ESCALATION_SENTINEL, status='pending')
+
+        result = CliRunner().invoke(
+            main, ['verify-cache', 'enable', '--reason', 'fixed X', '--config', str(_config(tmp_path))],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert f'resolved kill-switch blocker {blocker.id}' in result.output, result.output
+        resolved = EscalationQueue(queue_dir).get(blocker.id)
+        assert resolved is not None
+        assert (resolved.status, resolved.resolved_by) == ('resolved', 'interactive')
+        assert 'fixed X' in (resolved.resolution or '')
 
     def test_a_missing_reason_is_a_usage_error(self, tmp_path):
         result = CliRunner().invoke(main, ['verify-cache', 'enable', '--config', str(_config(tmp_path))])
@@ -424,9 +444,30 @@ class TestAuditHook:
 
         until = hooked.seeded.policy().disabled_until
         assert until is not None
-        [second] = [esc for esc in hooked.pending() if esc.id != first.id]
+        [second] = hooked.pending()
+        assert second.id != first.id
         assert until.isoformat() in second.summary, second.summary
         assert retrip_head in second.detail, second.detail
+        assert hooked.queue is not None
+        superseded = hooked.queue.get(first.id)
+        assert superseded is not None
+        assert (superseded.status, superseded.resolved_by) == ('resolved', audit_hook.AUDIT_ESCALATION_ROLE)
+
+    def test_an_expired_disables_blocker_is_resolved_by_the_next_attributable_pass(self, hooked):
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+        [blocker] = hooked.pending()
+        until = hooked.seeded.policy().disabled_until
+        assert until is not None
+        hooked.seeded.now = until + timedelta(days=1)
+        hooked.seeded.fresh_leak_source(KA, LATER_HEAD)
+
+        hooked.call(_reproduced(ALPHA_NODE), head=LATER_HEAD)
+
+        assert hooked.pending() == []
+        assert hooked.queue is not None
+        resolved = hooked.queue.get(blocker.id)
+        assert resolved is not None and resolved.status == 'resolved'
+        assert f'kill switch expired at {until.isoformat()}' in (resolved.resolution or ''), resolved.resolution
 
     def test_row_14_a_red_on_a_unit_that_ran_takes_the_ordinary_path(self, hooked):
         assert hooked.call(_reproduced(GAMMA_NODE)) == ()
@@ -475,6 +516,39 @@ class TestAuditHook:
         with pytest.raises(registry.RegistryError):
             asyncio.run(hook(AUDIT_COMMAND, HEAD, _reproduced(ALPHA_NODE), ()))
         assert not seeded.present(KA)
+
+    def test_a_failing_queue_costs_the_blocker_never_the_notes(self, hooked, monkeypatch, caplog):
+        def refuse(escalation):
+            raise OSError('escalation queue is read-only')
+
+        assert hooked.queue is not None
+        monkeypatch.setattr(hooked.queue, 'submit', refuse)
+
+        with caplog.at_level(logging.ERROR, logger=audit_hook.__name__):
+            notes = hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+
+        assert len(notes) == 2
+        assert hooked.seeded.policy().is_disabled(hooked.seeded.now)
+        assert hooked.pending() == []
+        [logged] = [record for record in caplog.records if 'kill-switch blocker' in record.getMessage()]
+        assert logged.exc_info is not None
+
+    def test_an_unattributable_red_with_no_consumption_on_record_is_logged_once(self, tmp_path, caplog):
+        unconsumed = registry.Registry(tmp_path / 'verify_cache.db')
+        asyncio.run(unconsumed.record_green(KA, evidence_event_id=7, run_id='r1', sha='abc'))
+        hook = audit_hook.VerifyCacheAuditHook(unconsumed, None)
+
+        with caplog.at_level(logging.WARNING, logger=audit_hook.__name__):
+            for _ in range(2):
+                assert asyncio.run(hook(AUDIT_COMMAND, HEAD, _reproduced(ALPHA_NODE), ())) == ()
+
+        assert len([record for record in caplog.records if 'records no consumption' in record.getMessage()]) == 1
+
+    def test_an_unattributable_red_beside_recorded_consumptions_logs_nothing(self, hooked, caplog):
+        with caplog.at_level(logging.WARNING, logger=audit_hook.__name__):
+            assert hooked.call(_reproduced(GAMMA_NODE)) == ()
+
+        assert not [record for record in caplog.records if 'records no consumption' in record.getMessage()]
 
     def test_without_a_queue_the_disable_still_lands_and_the_loss_is_logged(self, tmp_path, caplog):
         hooked = _Hooked(tmp_path, with_queue=False)

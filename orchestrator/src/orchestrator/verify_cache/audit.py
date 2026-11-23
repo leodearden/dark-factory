@@ -198,7 +198,7 @@ def _next_state(
     trips = not disabled and bool(new) and len(streak_leaks) >= MIN_DISABLING_LEAKS
     state = PolicyState(
         disabled_until=_disabled_until(current, now, trips=trips),
-        reason=_disable_reason(streak_leaks) if trips else current.reason,
+        reason=_disable_reason(streak_leaks) if trips else _held_reason(current, now),
         streak=len(streak_leaks),
         leaks=tuple(record.to_text() for record in records),
         updated_at=current.updated_at,
@@ -211,6 +211,13 @@ def _disabled_until(current: PolicyState, now: datetime, *, trips: bool) -> date
     if current.is_disabled(now):
         return current.disabled_until
     return now + DISABLE_FOR if trips else None
+
+
+def _held_reason(current: PolicyState, now: datetime) -> str | None:
+    """*current*'s reason, unless the disable it explains has just expired."""
+    if current.disabled_until is None or current.is_disabled(now):
+        return current.reason
+    return f'kill switch expired at {current.disabled_until.isoformat()}'
 
 
 def _records(state: PolicyState) -> tuple[LeakRecord, ...]:

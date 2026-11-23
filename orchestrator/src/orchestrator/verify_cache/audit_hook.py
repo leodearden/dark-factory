@@ -14,7 +14,14 @@ from escalation.models import Escalation
 from orchestrator.offline_lane_confirm import Confirmed, PassOutcome
 from orchestrator.offline_lane_filing import EvidenceNote
 from orchestrator.offline_lane_records import RunRecord
-from orchestrator.verify_cache.audit import LeakIdentity, LeakRecord, LeakResponse, apply, attribute
+from orchestrator.verify_cache.audit import (
+    AuditVerdict,
+    LeakIdentity,
+    LeakRecord,
+    LeakResponse,
+    apply,
+    attribute,
+)
 from orchestrator.verify_cache.audit_run import AUDIT_COMMAND
 from orchestrator.verify_cache.registry import PolicyState, Registry
 
@@ -43,6 +50,7 @@ class VerifyCacheAuditHook:
     """The lane's section 5.7 hook for the verify-cache-audit command (plans/verify-result-cache-prd.md § Audit).
 
     Only a confirmed red's reproduced nodes are evidence; registry errors propagate, so the lane drops only these notes.
+    An escalation-queue error costs only the blocker sync, which the next attributable pass retries.
     """
 
     def __init__(
@@ -55,6 +63,7 @@ class VerifyCacheAuditHook:
         self._registry = registry
         self._queue = escalation_queue
         self._now = now
+        self._reported_unrecorded_consumption = False
 
     async def __call__(
         self, command: str, head: str, outcome: PassOutcome, run_records: Sequence[RunRecord],
@@ -63,26 +72,78 @@ class VerifyCacheAuditHook:
             return ()
         verdict = await attribute(head, outcome.reproduced, self._registry)
         if not verdict.attributions:
+            await self._note_unattributable(verdict)
             return ()
         now = self._now()
         response = await apply(verdict, self._registry, now)
-        if response.l2_required:
-            await asyncio.to_thread(self._file_blocker, response)
-        return _notes(response, now)
-
-    def _file_blocker(self, response: LeakResponse) -> None:
-        if self._queue is None:
-            logger.error(
-                'verify-cache audit: the cache is DISABLED until %s but there is no escalation queue '
-                'to file its L2 blocker on',
+        notes = _notes(response, now)
+        try:
+            await asyncio.to_thread(self._sync_blockers, response, now)
+        except Exception:
+            logger.exception(
+                'verify-cache audit: syncing the kill-switch blocker with the escalation queue failed '
+                '(policy disabled_until=%s); the next attributable pass retries it',
                 response.policy.disabled_until,
             )
+        return notes
+
+    async def _note_unattributable(self, verdict: AuditVerdict) -> None:
+        """Tell 'nothing records a consumption' apart from 'no leak', once per process (INV-13)."""
+        if self._reported_unrecorded_consumption:
+            return
+        summary = await self._registry.summary()
+        if summary.consumed:
+            return
+        self._reported_unrecorded_consumption = True
+        logger.warning(
+            'verify-cache audit: %d reproduced red(s) are unattributable and %s records no consumption at all, '
+            'so the audit cannot tell a leak from a landing that replayed nothing: either no landing has '
+            'replayed a green, or nothing records the greens it replays. Reported once per process.',
+            len(verdict.unattributed), summary.path,
+        )
+
+    def _sync_blockers(self, response: LeakResponse, now: datetime) -> None:
+        """Resolve the blockers of ended disables, then file the live disable's blocker if it has none."""
+        if self._queue is None:
+            if response.l2_required:
+                logger.error(
+                    'verify-cache audit: the cache is DISABLED until %s but there is no escalation queue '
+                    'to file its L2 blocker on',
+                    response.policy.disabled_until,
+                )
+            return
+        resolve_ended_blockers(
+            self._queue, response.policy, now,
+            resolved_by=AUDIT_ESCALATION_ROLE,
+            resolution=f'The kill-switch disable this blocker describes has ended: {_policy_now(response.policy, now)}.',
+        )
+        if not response.l2_required:
             return
         episode = _disable_episode(response.policy)
-        pending = self._queue.get_by_task(AUDIT_ESCALATION_SENTINEL, status='pending', level=2)
-        if any(blocker.root_cause == episode for blocker in pending):
+        if any(blocker.root_cause == episode for blocker in _pending_blockers(self._queue)):
             return
         self._queue.submit(_blocker(self._queue.make_id(AUDIT_ESCALATION_SENTINEL), response))
+
+
+def resolve_ended_blockers(
+    queue: EscalationQueue, policy: PolicyState, now: datetime, *, resolved_by: str, resolution: str,
+) -> tuple[str, ...]:
+    """Resolve every pending kill-switch blocker except the one for *policy*'s live disable; the ids resolved."""
+    live = _disable_episode(policy) if policy.is_disabled(now) else None
+    ended = [blocker for blocker in _pending_blockers(queue) if blocker.root_cause != live]
+    for blocker in ended:
+        queue.resolve(blocker.id, resolution, resolved_by=resolved_by)
+    return tuple(blocker.id for blocker in ended)
+
+
+def _pending_blockers(queue: EscalationQueue) -> list[Escalation]:
+    return queue.get_by_task(AUDIT_ESCALATION_SENTINEL, status='pending', level=2)
+
+
+def _policy_now(policy: PolicyState, now: datetime) -> str:
+    if policy.is_disabled(now):
+        return f'the cache is now DISABLED until {_until(policy)} under a later disable'
+    return f'the cache is enabled ({policy.reason})'
 
 
 def _disable_episode(policy: PolicyState) -> str:
@@ -106,8 +167,8 @@ def _blocker(escalation_id: str, response: LeakResponse) -> Escalation:
         detail=_blocker_detail(records, response),
         suggested_action=(
             "Find the input the leaked units' cache keys missed, using the leak records in the detail. "
-            f'Once it is understood, re-enable with `{ENABLE_COMMAND}` and resolve this escalation with '
-            'resolve_issue; the cache stays disabled until then, or until disabled_until passes.'
+            f'Once it is understood, re-enable with `{ENABLE_COMMAND}`, which also resolves this escalation; '
+            'the cache stays disabled until then, or until disabled_until passes.'
         ),
     )
 
