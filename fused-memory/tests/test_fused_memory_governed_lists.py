@@ -50,7 +50,7 @@ WALL_CLOCK_DEADLINE_BASELINE = governed_exceptions(
     'Per-file budgets of wall-clock-deadline (Rule C) violations grandfathered when the '
     'rule was adopted; each budget may only fall.',
     ['fused-memory/scripts/check_bare_magicmock_config.py::_WALL_CLOCK_DEADLINE_DEBT'],
-    default=Debt(TaskRef(6201)),
+    default=Debt(TaskRef(11471)),
     default_covers=1,
 )
 
