@@ -68,6 +68,15 @@ from orchestrator.verify_runner import HostAllocator
 _LEVER_C_OFF: list = []
 
 
+def _no_pool_git_ops(throwaway: Path) -> MagicMock:
+    """A GitOps double on a host with no warm-lane pool, minting *throwaway* cold."""
+    git_ops = MagicMock()
+    git_ops.pool_in_use = MagicMock(return_value=False)
+    git_ops.create_ephemeral_verify_worktree = AsyncMock(return_value=throwaway)
+    git_ops.cleanup_merge_worktree = AsyncMock()
+    return git_ops
+
+
 def test_merge_drift_exports_moved_public_symbols() -> None:
     from orchestrator.merge_lane.drift import _maybe_run_drift_check, _run_drift_check
 
@@ -369,11 +378,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-drift-fullgate'
@@ -579,11 +584,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-env-drift'
@@ -702,11 +703,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
         req = MagicMock()
         req.task_id = 'task-env-drift-noquarantine'
         req.task_files = None
@@ -809,11 +806,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-env-drift-no-local-spawn'
@@ -890,11 +883,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import DriftDetector, HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-env-check-blast-radius'
@@ -948,11 +937,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import DriftDetector, HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-env-check-logged'
@@ -1207,9 +1192,7 @@ class _DriftScene:
     def build(
         cls, tmp_path: Path, *, remote_verify: AsyncMock | None = None, **config: Any,
     ) -> _DriftScene:
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(return_value=tmp_path / '_throwaway')
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(tmp_path / '_throwaway')
         req = MagicMock()
         req.task_id = 'task-6648-drift'
         req.module_configs = []
