@@ -268,9 +268,9 @@ def reap_script_text() -> str:
     """The text of ``remote_gate/reap-gates.sh``, shipped as package data.
 
     Its contract: env ``GATE_ROOT`` (absolute).  Under a root carrying
-    :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days and trash
-    older than a day; elsewhere it does nothing.  Run detached: it prints
-    nothing and its outcome is not awaited.
+    :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days, each with
+    its build lock, and trash older than a day; elsewhere it does nothing.
+    Run detached: it prints nothing and its outcome is not awaited.
     """
     return _packaged_script('reap-gates.sh')
 
