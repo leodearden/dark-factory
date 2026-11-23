@@ -18,7 +18,9 @@ drain, await or gauge their registry independently.
 :func:`cancel_bounded` is the bounded counterpart for a caller that must see
 the task end, or learn that it would not, within a known time (task 6660). A
 single ``cancel()`` followed by an unbounded ``await`` hangs forever on a task
-that survives one cancel.
+that survives one cancel. :func:`cancel_all_within` bounds the wait for many
+tasks at once, returning the ones still running for the caller to dispose of
+(task 7247).
 
 :func:`gather_unwound` is ``asyncio.gather`` for children that own
 subprocesses: an exception, an outer cancel included, propagates only once
@@ -34,10 +36,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from typing import TypeVar
 
-__all__ = ['abandon_task', 'cancel_bounded', 'gather_unwound', 'track_task']
+__all__ = ['abandon_task', 'cancel_all_within', 'cancel_bounded', 'gather_unwound', 'track_task']
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +134,29 @@ async def cancel_bounded(
             return True
     track_task(task, *registries)
     return False
+
+
+async def cancel_all_within(
+    tasks: Collection[asyncio.Task],
+    *,
+    timeout_secs: float,
+) -> set[asyncio.Task]:
+    """Cancel every task once and wait at most *timeout_secs*; return those still running.
+
+    The returned tasks are neither cancelled again nor awaited. Unlike
+    ``wait_for(gather(...))``, a task that survives its cancel cannot extend
+    the wait. The caller decides what becomes of the survivors, for example
+    :func:`track_task`. The exceptions of the tasks that ended are consumed.
+    """
+    if not tasks:
+        return set()
+    for task in tasks:
+        task.cancel()
+    done, pending = await asyncio.wait(tasks, timeout=timeout_secs)
+    for task in done:
+        if not task.cancelled():
+            task.exception()
+    return pending
 
 
 _Gathered = TypeVar('_Gathered')
