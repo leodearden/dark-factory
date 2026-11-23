@@ -4501,8 +4501,8 @@ section is the operator surface only.
 
 **Rulings.** R-cache-1 (Leo, 2026-09-19): a per-unit green replay is evidence,
 not a skipped gate. R-cache-2 (Leo, 2026-11-14): greens serve across hosts. The
-ruling text has one home, the PRD's § "Pre-conditions for activating"; read it
-there, it is not restated here.
+ruling text has one home, the PRD's § "Pre-conditions for activating"; read the
+conditions there.
 
 ### Modes
 
@@ -4531,9 +4531,10 @@ Each mode rolls out `off` → `log` for three days → `on`, per role and (once
 γ2 lands) per remote mode, each with its own three-day `log` window.
 
 **Task and merge are independent values.** The task role may go `on` before the
-audit (task 5655) lands: the merge gate runs `merge_verify_breadth: "full"`, so
-it still runs every unit a task-role replay skipped, and a task-role false hit
-cannot land a red on main. The merge role (and `remote_merge_mode`) stays
+audit (task 5655) lands while the project's merge gate runs
+`merge_verify_breadth: "full"` (the default): that gate still runs every unit a
+task-role replay skipped, so a task-role false hit cannot land a red on main. A
+project set to `scoped` keeps `task_mode` behind the audit too. The merge role (and `remote_merge_mode`) stays
 behind the audit: `merge_mode: on` waits for task 5655. Before flipping a role
 to `on`, check its `log` window for a `ran_red` unit carrying an
 `evidence_event_id` for a cause the branch's own diff explains; spurious reds (infra kill, worker crash,
@@ -4555,7 +4556,8 @@ read-only and never creates a registry.
 ### Reading a verify event
 
 `merge_verify` and `workflow_verify` events carry `plan_hash`, `cache_mode` and
-`units: [{unit, tier, key, outcome, evidence_event_id?}]`. The pre-merge
+`units: [{unit, tier, key, outcome, evidence_event_id, reason}]`, the last two
+nullable (shape: `orchestrator/src/orchestrator/verify_evidence.py::VerifyUnit.to_dict`). The pre-merge
 re-verify emits its own `workflow_verify` row, distinguished by its site.
 
 | Unit outcome | Meaning |
@@ -4572,7 +4574,8 @@ not hold. The dispatcher refuses the whole result as a no-verdict
 (`orchestrator/src/orchestrator/verify_runner.py::RunnerUnavailable`) and the
 existing re-dispatch path runs it again with a fresh view, so the same unbacked
 hit cannot recur. It needs no action; repeated no-verdicts on one runner are the
-signal to look at that runner's toolchain or registry sync.
+signal to look at that runner's toolchain or registry sync. Arrives with task
+9123 (γ2); until then no green crosses hosts.
 
 ### Cross-host replay
 
@@ -4583,7 +4586,9 @@ toolchain, so a host whose interpreter, lockfile, pyright, ruff or `verify_env`
 overlay differs has a different toolchain fingerprint and misses. Whether the
 two hosts' fingerprints are equal today has not been measured; the remote `log`
 window shows it, as a remote `would_hit` unit whose evidence event ran on another
-host.
+host. Arrives with task 9123 (γ2); until then no green crosses hosts: a runner
+reaches no registry, so its units report `unavailable` and nothing it runs is
+recorded.
 
 ### Audit and recording lanes
 
@@ -4608,8 +4613,9 @@ is under "Kill switch and re-enabling".
 
 Two attributable leaks within seven days set `policy_state.disabled_until` (14
 days from the second leak, with a reason and the leak evidence) and file an L2
-blocker naming both. While it is in the future **both roles miss on every unit**
-(and remote dispatches carry it), whatever the modes say. The switch lives in the
+blocker naming both. While it is in the future **both roles run every unit**,
+shown as `unavailable` (or `ran_red`; see the `disabled` row above), and remote
+dispatches carry it, whatever the modes say. The switch lives in the
 registry, not in config, so a reload does not clear it.
 
 To re-enable once the leaks are fixed, an operator runs `orchestrator
@@ -4626,7 +4632,8 @@ meanwhile (`policy: DISABLED until …` with the reason and leaks).
   repo-wide guard module, which runs at every gate.
 - Tests marked `repo_state` (per-test tier).
 - A red: the registry stores and serves greens only.
-- A remote dispatch that carries no view misses.
+- A remote dispatch that carries no view decides nothing; its units report
+  `unavailable`.
 - An entry recorded under a different spec hash never serves another spec's unit.
 - A test whose file or conftest chain differs in object id from the one it was
   recorded against has no recording and runs.
@@ -4639,7 +4646,7 @@ start, not a data loss.
 | Item | Disposition |
 |---|---|
 | R-cache-1 (2026-09-19), R-cache-2 (2026-11-14) | Rulings; text in the PRD § "Pre-conditions for activating" |
-| Task 5294 (duplicate pyright leg) | Closed as superseded by γ (task 5653) by the operator at γ's landing; γ's unscoped-typecheck consult is its dedupe |
+| Task 5294 (duplicate pyright leg) | Superseded by γ (task 5653): γ's unscoped-typecheck consult, `orchestrator/src/orchestrator/merge_lane/gates.py::_type_covered_modules`, is its dedupe. Closing 5294 as superseded is an operator action; its status lives in the task store |
 | Task 5410 (task-leg disjoint-rebase skip) | Cancelled 2026-10-09 (Leo) as superseded: task 6580 removed the merge-phase verify it targeted, and its predicate never fired (0/40 DF, 0/20 reify). The per-test tier (task 5657, ζ2) remains the long-run owner of green reuse. No retirement action remains; the reasoning is in task 5410's `details` |
 
 ---
