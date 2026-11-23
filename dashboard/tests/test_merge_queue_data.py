@@ -134,9 +134,12 @@ from dashboard.data import merge_queue  # noqa: E402
 from dashboard.data.datum import Datum, DatumState, validate_datum  # noqa: E402
 from dashboard.data.merge_queue import (  # noqa: E402
     RECENT_MERGES_CAP,
+    TRAILING_WINDOW_LADDER,
+    LandingRateSeries,
     _align_bucket,
     _bucket_minutes_for_window,
     _cutoff_iso,
+    _trailing_minutes_for_window,
     _ts_sort_key,
     enrich_merges_with_titles,
     merge_attempts,
@@ -145,6 +148,7 @@ from dashboard.data.merge_queue import (  # noqa: E402
     recent_merges,
     resolve_active,
     speculative_stats,
+    trailing_landing_rates,
 )
 from dashboard.data.stats_utils import percentile  # noqa: E402
 from dashboard.data.task_lookup import TaskRef  # noqa: E402
@@ -637,6 +641,85 @@ class TestQueueDepthTimeseries:
             f"Last bucket should have count=1 for the event at exact effective_now "
             f"({event_ts.isoformat()}), got {series['values'][idx]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestTrailingLandingRates — landings/day over the trailing window ending at each point
+# ---------------------------------------------------------------------------
+
+RATE_NOW = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+"""Deliberately off every bucket boundary: the points are anchored at the request instant."""
+
+
+def _rate_at(series: LandingRateSeries, instant: datetime) -> float:
+    return series['values'][series['labels'].index(instant.isoformat())]
+
+
+class TestTrailingLandingRates:
+    @pytest.mark.parametrize('hours,expected', [
+        (24, 1440),
+        (168, 1440),
+        (336, 1440),
+        (337, 10080),
+        (720, 10080),
+        (87600, 10080),
+    ])
+    def test_trailing_window_ladder_tiers(self, hours, expected):
+        assert _trailing_minutes_for_window(hours) == expected
+
+    def test_the_trailing_ladder_ends_in_a_catch_all(self):
+        assert TRAILING_WINDOW_LADDER[-1][0] is None
+
+    @pytest.mark.parametrize('hours', [24, 168, 720, 87600])
+    def test_points_are_one_bucket_apart_from_the_window_start_to_now(self, hours):
+        series = trailing_landing_rates((), now=RATE_NOW, hours=hours)
+
+        step = _bucket_minutes_for_window(hours)
+        assert len(series['labels']) == hours * 60 // step + 1
+        instants = [datetime.fromisoformat(label) for label in series['labels']]
+        assert {later - earlier for earlier, later in zip(instants, instants[1:])} == {
+            timedelta(minutes=step),
+        }
+        assert series['labels'][-1] == RATE_NOW.isoformat()
+        assert instants[0] == RATE_NOW - timedelta(hours=hours)
+        assert series['trailing_minutes'] == _trailing_minutes_for_window(hours)
+        assert series['values'] == [0] * len(series['labels'])
+
+    def test_the_rate_does_not_drop_to_zero_between_landings(self):
+        landed = [RATE_NOW - timedelta(hours=10), RATE_NOW - timedelta(hours=3)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['values'][-1] == 2.0
+        assert _rate_at(series, RATE_NOW - timedelta(hours=5)) == 1.0
+        since_first = [
+            value for label, value in zip(series['labels'], series['values'])
+            if datetime.fromisoformat(label) >= landed[0]
+        ]
+        assert since_first
+        assert 0 not in since_first
+
+    def test_the_first_point_counts_its_whole_trailing_window(self):
+        landed = [RATE_NOW - timedelta(hours=24 + 12)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['values'][0] == 1.0
+
+    def test_a_seven_day_trailing_window_divides_by_seven(self):
+        week = [RATE_NOW - timedelta(days=day, hours=1) for day in range(6, -1, -1)]
+
+        assert trailing_landing_rates(week, now=RATE_NOW, hours=720)['values'][-1] == 1.0
+        assert trailing_landing_rates(week[-1:], now=RATE_NOW, hours=720)['values'][-1] == 0.14
+
+    def test_each_point_counts_the_half_open_trailing_window_ending_there(self):
+        trailing = timedelta(minutes=_trailing_minutes_for_window(24))
+        landed = [RATE_NOW - trailing, RATE_NOW]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['values'][-1] == 1.0
+        assert _rate_at(series, RATE_NOW - trailing) == 1.0
 
 
 # ---------------------------------------------------------------------------
