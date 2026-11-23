@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 from _merge_lane_fakes import healthy_verify_clock, make_lane
+from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_deep_reservation import (
     _deep,
     _requests,
@@ -58,7 +59,7 @@ async def _killed(lane: MergeLane, run: asyncio.Task[None]) -> None:
 async def _stopped(lane: MergeLane, run: asyncio.Task[None]) -> None:
     """The process restarts gracefully: stop() resolves every live request."""
     await lane.stop()
-    await asyncio.wait_for(run, 60)
+    await asyncio.wait_for(run, MERGE_RESULT_TIMEOUT)
 
 
 class _SoloVerifiesHang(_TreeKeyedVerifier):
