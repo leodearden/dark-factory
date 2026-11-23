@@ -3,18 +3,23 @@
 A recurrence-minted predicate link is born low-tier, youngest and with the
 highest id, so in score order it loses every tick to the older low backlog.
 A timed gate needs no module lock, so the scheduler dispatches it first once
-its milestone opens; a deploy, or a gate whose milestone has not opened, keeps
-its scored place, and an operator pin still goes ahead of it.
+its milestone opens, the oldest id first and through a PSI hold; a deploy, or
+a gate whose milestone has not opened, keeps its scored place, and an operator
+pin still goes ahead of it.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from _park_test_helpers import ParkWorld, event_payloads, make_task, park_world
+from shared.psi import PsiSample
+
+from orchestrator.config import PsiAdmissionConfig
 
 
 def _at(delta: timedelta) -> str:
@@ -68,10 +73,18 @@ def _pure_gate(tid: str, *, at: str) -> dict:
     }
 
 
-def _world(tmp_path: Path, tasks: list[dict], *, pinned: tuple[str, ...] = ()) -> ParkWorld:
-    w = park_world(tmp_path, pinned=pinned)
+def _world(
+    tmp_path: Path, tasks: list[dict], *, pinned: tuple[str, ...] = (), **config_overrides: Any,
+) -> ParkWorld:
+    w = park_world(tmp_path, pinned=pinned, **config_overrides)
     w.scheduler.get_tasks = AsyncMock(return_value=tasks)
     return w
+
+
+def _cpu_sample(cpu_some10: float) -> PsiSample:
+    return PsiSample(
+        cpu_some10=cpu_some10, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True,
+    )
 
 
 def _last_terminal_phase(w: ParkWorld) -> str:
@@ -127,3 +140,30 @@ async def test_a_pin_still_dispatches_before_an_open_link(tmp_path):
     assert await _dispatched_id(w) == 'P'
     assert _last_terminal_phase(w) == 'select_pins'
     assert await _dispatched_id(w) == '501'
+
+
+@pytest.mark.asyncio
+async def test_two_open_links_dispatch_oldest_id_first(tmp_path):
+    w = _world(
+        tmp_path,
+        [*_backlog(3), _link('600', at=_at(-timedelta(hours=1))), _link('501', at=_at(-timedelta(hours=2)))],
+    )
+
+    assert await _dispatched_id(w) == '501'
+    assert await _dispatched_id(w) == '600'
+
+
+@pytest.mark.asyncio
+async def test_an_open_link_dispatches_through_a_psi_hold_that_defers_the_backlog(tmp_path):
+    w = _world(tmp_path, _backlog(3), psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0))
+    assert await _dispatched_id(w) == '1', 'premise: one task in flight meets the hold floor'
+
+    w.scheduler.get_tasks = AsyncMock(
+        return_value=[*_backlog(3), _link('501', at=_at(-timedelta(hours=1)))],
+    )
+    w.scheduler._read_psi_sample = lambda: _cpu_sample(99.0)
+
+    assert await _dispatched_id(w) == '501'
+    assert _last_terminal_phase(w) == 'select_timed_gates'
+    assert await _dispatched_id(w) is None
+    assert [e['task_id'] for e in event_payloads(w.store, 'dispatch_deferred')] == ['2']
