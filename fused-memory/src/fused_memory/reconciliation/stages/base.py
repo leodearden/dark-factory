@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -519,35 +520,15 @@ class BaseStage:
     def _build_mcp_config(self) -> dict:
         """Assemble MCP server config for Claude CLI.
 
-        Always includes the fused-memory server (HTTP or stdio), the
-        jcodemunch stdio server, and the in-process recon-report HTTP server
-        on ``self._recon_report_port``.  The escalation HTTP server is added
+        Always includes recon's core servers (:func:`recon_core_mcp_servers`)
+        and the in-process recon-report HTTP server on
+        ``self._recon_report_port``.  The escalation HTTP server is added
         only if an escalation URL is configured; its entry carries the stage's
         project as the ``X-Escalation-Project`` header, which scopes the
         reconciliation escalation server's uuid-prefix guard.
         """
-        fm_config = _find_fused_memory_server()
-
-        if fm_config.get('type') == 'http':
-            # HTTP: just a URL, no env needed (server has its own env)
-            fm_entry: dict = {
-                'type': 'http',
-                'url': fm_config['url'],
-            }
-        else:
-            # Stdio: command + args + env
-            fm_env = dict(fm_config.get('env', {}))
-            if 'OPENAI_API_KEY' not in fm_env:
-                fm_env['OPENAI_API_KEY'] = os.environ.get('OPENAI_API_KEY', '')
-            fm_entry = {
-                'command': fm_config['command'],
-                'args': fm_config['args'],
-                'env': fm_env,
-            }
-
         servers: dict = {
-            'fused-memory': fm_entry,
-            'jcodemunch': jcodemunch_server_config(),
+            **recon_core_mcp_servers(),
             # PRD γ: recon_report MCP server — in-process only, not in any
             # disallow list because mcp__recon-report__* tools only mutate
             # in-process state (not Graphiti / Mem0 / Taskmaster).
@@ -567,6 +548,24 @@ class BaseStage:
             }
 
         return {'mcpServers': servers}
+
+
+def recon_core_mcp_servers(candidates: list[Path] | None = None) -> dict[str, Mapping[str, object]]:
+    """Recon's core MCP servers: fused-memory (HTTP, or stdio) and jcodemunch.
+
+    A stdio fused-memory entry carries ``OPENAI_API_KEY`` from the process env
+    unless its own env sets it; an HTTP entry needs no env, since the server
+    has its own. *candidates* is passed to :func:`_find_fused_memory_server`.
+    """
+    fm_config = _find_fused_memory_server(candidates)
+    if fm_config.get('type') == 'http':
+        fm_entry: dict = {'type': 'http', 'url': fm_config['url']}
+    else:
+        fm_env = dict(fm_config.get('env', {}))
+        if 'OPENAI_API_KEY' not in fm_env:
+            fm_env['OPENAI_API_KEY'] = os.environ.get('OPENAI_API_KEY', '')
+        fm_entry = {'command': fm_config['command'], 'args': fm_config['args'], 'env': fm_env}
+    return {'fused-memory': fm_entry, 'jcodemunch': jcodemunch_server_config()}
 
 
 def _find_fused_memory_server(candidates: list[Path] | None = None) -> dict:
