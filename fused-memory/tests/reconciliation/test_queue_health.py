@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 
 import pytest
+from _parked_queue_fixtures import queue_holding_parked_rows
+from shared.write_queue_statuses import CLAIMABLE
 
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 
@@ -78,8 +80,8 @@ class TestSummarizeGraphitiQueueHealth:
         assert result['dead_count'] == 0
         assert result['healthy'] is True
 
-    def test_only_dead_unhealthy_not_retry_or_pending(self):
-        """healthy=False only when dead > 0; pending or retry alone do not trigger."""
+    def test_only_rows_awaiting_an_operator_mark_unhealthy(self):
+        """A backlog the workers will drain is healthy; a parked row is not."""
         stats_pending = {
             'counts': {'pending': 5, 'retry': 2},
             'oldest_pending_age_seconds': 30.0,
@@ -88,6 +90,23 @@ class TestSummarizeGraphitiQueueHealth:
         assert result['healthy'] is True, (
             'pending+retry without dead must still be healthy'
         )
+        assert summarize_graphiti_queue_health({'counts': {'parked': 1}})['healthy'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_queue_holding_only_parked_rows_is_unhealthy(self, tmp_path):
+        async with queue_holding_parked_rows(tmp_path, rows=3) as q:
+            result = summarize_graphiti_queue_health(await q.get_stats(group_id='proj1'))
+
+        assert result['parked_count'] == 3
+        assert (result['pending_count'], result['retry_count'], result['dead_count']) == (0, 0, 0)
+        assert result['oldest_pending_age_seconds'] is not None
+        assert result['healthy'] is False
+
+    def test_every_claimable_status_is_counted(self):
+        fed = {status.value: n for n, status in enumerate(CLAIMABLE, start=1)}
+        result = summarize_graphiti_queue_health({'counts': fed})
+
+        assert {status: result[f'{status}_count'] for status in CLAIMABLE} == fed
 
     # --- Step-1 (task 1810): malformed-stats WARNING tests ---
 
