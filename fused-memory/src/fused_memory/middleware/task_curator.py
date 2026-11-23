@@ -54,6 +54,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, Required, TypeAlias, TypedDict, TypeVar
 
+import openai
 from shared.cancel_dispositions import sibling_lookup_values
 from shared.cli_invoke import (
     AgentResult,
@@ -2284,8 +2285,10 @@ class TaskCurator:
         where much of what the pool loses is lost (see the pool-cap block in
         ``config/schema.py::CuratorConfig``). A stream whose read fails is
         logged at WARNING and named in ``withheld.unavailable_streams``; when
-        every stream it attempted failed, it raises ``_CorpusUnavailableError``
-        instead, since an empty pool would then only look like no overlap.
+        every stream it attempted failed and some failure was not a refusal of
+        this candidate's input, it raises ``_CorpusUnavailableError`` instead,
+        since an empty pool would then only look like no overlap, and a retry
+        could change it.
         """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
@@ -2381,7 +2384,7 @@ class TaskCurator:
             )
             admit(dep_entries)
 
-        if reads.every_attempt_failed():
+        if reads.is_outage():
             raise _CorpusUnavailableError(tuple(reads.unavailable))
 
         # Every stream has run, so seen_ids is now the complete admitted set
@@ -3200,16 +3203,28 @@ _T = TypeVar('_T')
 
 @dataclass
 class _StreamReads:
-    """The corpus streams one ``_build_corpus`` call attempted, and those whose read failed."""
+    """The corpus streams one ``_build_corpus`` call attempted, those whose read failed, and which of those refused."""
 
     attempted: list[str] = field(default_factory=list)
     unavailable: list[str] = field(default_factory=list)
+    # The subset of ``unavailable`` whose read raised openai.BadRequestError:
+    # a refusal of this candidate's input, which a retry will not change.
+    refused: list[str] = field(default_factory=list)
 
     async def read(self, stream: str, read: Awaitable[_T], fallback: _T) -> _T:
         """Await *stream*'s *read*; a failure is logged, recorded, and answered with *fallback*."""
         self.attempted.append(stream)
         try:
             return await read
+        except openai.BadRequestError as exc:
+            logger.warning(
+                "task_curator: corpus stream %s refused this candidate's input, "
+                'which a retry will not change: %s',
+                stream, exception_summary(exc),
+            )
+            self.unavailable.append(stream)
+            self.refused.append(stream)
+            return fallback
         except Exception as exc:
             logger.warning(
                 'task_curator: corpus stream %s unavailable: %s', stream, exception_summary(exc),
@@ -3217,13 +3232,20 @@ class _StreamReads:
             self.unavailable.append(stream)
             return fallback
 
-    def every_attempt_failed(self) -> bool:
-        """Whether some stream was attempted and every attempted stream failed."""
-        return bool(self.attempted) and len(self.unavailable) == len(self.attempted)
+    def is_outage(self) -> bool:
+        """Whether some stream was attempted, every attempted stream failed, and a retry could change that.
+
+        A retry could change it when at least one failure was not a refusal.
+        """
+        return (
+            bool(self.attempted)
+            and len(self.unavailable) == len(self.attempted)
+            and len(self.refused) < len(self.unavailable)
+        )
 
 
 class _CorpusUnavailableError(RuntimeError):
-    """Every corpus stream ``_build_corpus`` attempted failed, so no pool can be trusted."""
+    """No attempted corpus stream answered and at least one failed in a way a retry could clear."""
 
     def __init__(self, streams: tuple[str, ...]) -> None:
         super().__init__(f'every corpus stream failed: {", ".join(streams)}')
