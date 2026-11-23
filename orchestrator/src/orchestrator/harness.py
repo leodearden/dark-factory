@@ -32,7 +32,7 @@ from escalation.grant_delivery import (
 from escalation.models import DeliveredCheckOwner, Escalation, cascade_parent_id
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
-from shared.asyncio_tasks import abandon_task
+from shared.asyncio_tasks import abandon_task, cancel_all_within
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -2700,8 +2700,6 @@ class Harness:
 
     # How long shutdown waits for cancelled workflow slots to unwind (run()'s step 4a).
     _SHUTDOWN_WORKFLOW_DRAIN_SECS: float = 15.0
-    # How long shutdown waits for cancelled straggler tasks to unwind (run()'s step 4b).
-    _SHUTDOWN_STRAGGLER_DRAIN_SECS: float = 5.0
 
     async def run(
         self,
@@ -3238,29 +3236,7 @@ class Harness:
             # 4b. Last-resort straggler sweep — catches any task the named
             # cleanup above missed (orphan probe tasks, cost-event
             # fire-and-forgets, sub-tasks spawned by merge/escalation stop).
-            current = asyncio.current_task()
-            stragglers = [
-                t for t in asyncio.all_tasks()
-                if t is not current and not t.done()
-            ]
-            if stragglers:
-                names = [t.get_name() for t in stragglers]
-                logger.warning(
-                    f'Cancelling {len(stragglers)} straggler task(s): {names}'
-                )
-                for t in stragglers:
-                    t.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*stragglers, return_exceptions=True),
-                        timeout=self._SHUTDOWN_STRAGGLER_DRAIN_SECS,
-                    )
-                except TimeoutError:
-                    still = [t.get_name() for t in stragglers if not t.done()]
-                    logger.error(
-                        'Stragglers did not die within %.0fs: %s',
-                        self._SHUTDOWN_STRAGGLER_DRAIN_SECS, still,
-                    )
+            await self._sweep_straggler_tasks()
 
             # Release singleton lock
             if self._lock_file is not None:
@@ -3269,6 +3245,26 @@ class Harness:
 
         logger.info(self.report.summary())
         return self.report
+
+    # How long shutdown waits for cancelled straggler tasks to unwind (run()'s step 4b).
+    _SHUTDOWN_STRAGGLER_DRAIN_SECS: float = 5.0
+
+    async def _sweep_straggler_tasks(self) -> None:
+        """Cancel every other live task once; never wait past ``_SHUTDOWN_STRAGGLER_DRAIN_SECS``."""
+        current = asyncio.current_task()
+        stragglers = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        if not stragglers:
+            return
+        logger.warning(
+            'Cancelling %d straggler task(s): %s',
+            len(stragglers), [t.get_name() for t in stragglers],
+        )
+        still = await cancel_all_within(stragglers, timeout_secs=self._SHUTDOWN_STRAGGLER_DRAIN_SECS)
+        if still:
+            logger.error(
+                'Stragglers did not die within %.0fs: %s',
+                self._SHUTDOWN_STRAGGLER_DRAIN_SECS, sorted(t.get_name() for t in still),
+            )
 
     async def _tag_prd_metadata(self, prd_path: Path, pre_parse_ids: set[str]) -> None:
         """Tag tasks with the PRD they were created from."""
