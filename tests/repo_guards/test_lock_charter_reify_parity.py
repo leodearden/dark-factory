@@ -933,7 +933,7 @@ class TestExtensionlessFilenames:
     def test_every_tracked_extensionless_file_is_allowlisted(
         self, repo: str, repo_root: Path | None
     ):
-        """Corpus->allowlist self-audit: the 9th extensionless file must go RED.
+        """Corpus->allowlist self-audit: a newly tracked extensionless file must go RED.
 
         Turns "add 8 names" into a self-auditing invariant.  When someone adds a
         new extension-less tracked file to either repo, this test names it here
