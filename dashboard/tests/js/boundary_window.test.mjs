@@ -90,6 +90,9 @@ test('sketch #9: the donut centre, attemptCount over the served attempts Datum, 
   }
 });
 
+// The done merges land 2h, 20h, 30h and 70h before T0: two in the day, four in the week.
+const THROUGHPUT_READING = { '24h': 'now 2/day · mean 2/day', '7d': 'now 2/day · mean 0.57/day' };
+
 test('the throughput panel names the trailing window its served rate was computed over', async () => {
   for (const win of ['24h', '7d']) {
     const { client } = await mergeBlock(win);
@@ -98,6 +101,6 @@ test('the throughput panel names the trailing window its served rate was compute
 
     assert.equal(landingRateCaption(rate), 'landings/day · 1-day trailing', win);
     const reading = landingRateReading(rate);
-    assert.ok(reading.startsWith('now 2/day'), `${win}: ${reading}`);
+    assert.ok(reading.startsWith(THROUGHPUT_READING[win]), `${win}: ${reading}`);
   }
 });

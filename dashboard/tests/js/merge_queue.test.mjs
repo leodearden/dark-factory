@@ -120,9 +120,10 @@ function depthSeries(labels, values) {
 }
 
 // A served landing-rate value: landings per day at each point over the trailing
-// window the server names, its leading zero points trimmed by the shaper.
-function landingRate(labels, values, trailingMinutes = 1440) {
-  return { labels, values, trailing_minutes: trailingMinutes };
+// window the server names, its leading zero points trimmed by the shaper, and
+// the window mean the server counted over the whole window.
+function landingRate(labels, values, trailingMinutes = 1440, windowMean = 0) {
+  return { labels, values, trailing_minutes: trailingMinutes, window_mean_per_day: windowMean };
 }
 
 const UNTIMED = Object.freeze({ p50: null, p95: null, p99: null, mean_ms: null });
@@ -388,12 +389,35 @@ test('landingRateReading: a window with no landings reads a measured zero, sayin
   assert.equal(landingRateReading(landingRate([], [])), '0/day · no landings in this window');
 });
 
-test('landingRateReading: the newest point and the mean over the served points', () => {
-  assert.equal(landingRateReading(landingRate([T1, T2], [2, 3])), 'now 3/day · mean 2.5/day');
+test('landingRateReading: the mean is the served window mean, not an average of the points', () => {
+  assert.equal(landingRateReading(landingRate([T1, T2], [2, 3], 1440, 2 / 7)), 'now 3/day · mean 0.29/day');
 });
 
-test('landingRateReading: rates show at most one decimal, a trailing .0 dropped', () => {
-  assert.equal(landingRateReading(landingRate([T1, T2], [27.43, 31])), 'now 31/day · mean 29.2/day');
+test('landingRateReading: rates of 1 or more show at most one decimal, a trailing .0 dropped', () => {
+  assert.equal(
+    landingRateReading(landingRate([T1, T2], [27.43, 31], 1440, 29.24)), 'now 31/day · mean 29.2/day',
+  );
+  assert.equal(landingRateReading(landingRate([T1, T2], [2, 3], 1440, 4)), 'now 3/day · mean 4/day');
+});
+
+test('landingRateReading: rates below 1 keep two significant figures, never a false 0/day', () => {
+  for (const [mean, text] of [[0.14, '0.14'], [1 / 30, '0.033'], [1 / 3650, '0.00027']]) {
+    const reading = landingRateReading(landingRate([T1, T2], [2, 3], 1440, mean));
+    assert.equal(reading, `now 3/day · mean ${text}/day`);
+    assert.doesNotMatch(reading, /mean 0\/day/);
+  }
+  assert.equal(landingRateReading(landingRate([T1, T2], [0.5, 0.14], 1440, 1)), 'now 0.14/day · mean 1/day');
+});
+
+test('landingRateReading: a rate serving no usable window mean states none', () => {
+  for (const mean of [undefined, null, NaN, '0.5']) {
+    assert.equal(
+      landingRateReading(landingRate([T1, T2], [2, 3], 1440, mean)), `now 3/day · mean ${EM_DASH}`,
+      String(mean),
+    );
+  }
+  const { window_mean_per_day: _dropped, ...unmeaned } = landingRate([T1, T2], [2, 3]);
+  assert.equal(landingRateReading(unmeaned), `now 3/day · mean ${EM_DASH}`);
 });
 
 // ── queuedSince: when a queued row joined, from the probe instant and its age ─

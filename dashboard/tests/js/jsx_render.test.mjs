@@ -569,11 +569,11 @@ test('tabs.jsx::MergeTab reads a window with no landings as a measured zero and 
   assert.equal(panelTitled(container, 'Throughput').querySelector('svg'), null);
 });
 
-test('tabs.jsx::MergeTab reads the throughput panel as the newest rate and the mean over the served points', t => {
-  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, rates: [2, 3] }));
+test('tabs.jsx::MergeTab reads the throughput panel as the newest rate and the served window mean', t => {
+  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, rates: [2, 3], meanPerDay: 2 / 7 }));
 
   const meta = panelMeta(container, 'Throughput');
-  assert.ok(meta.startsWith('now 3/day · mean 2.5/day'), meta);
+  assert.ok(meta.startsWith('now 3/day · mean 0.29/day'), meta);
 });
 
 test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth series sums to', t => {
