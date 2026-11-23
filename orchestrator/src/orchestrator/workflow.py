@@ -7932,10 +7932,12 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation, in three parts. **Reachability**: ``commit`` must be
-        non-empty and reachable from main — ``git merge-base --is-ancestor``
-        returns false for both unknown SHAs and SHAs not on main, so that
-        single check covers both. **Attribution** (task 4704): reachability
+        Validation, in three parts. **Reachability**: ``commit`` must be a
+        full 40-character lowercase hex sha (``is_valid_sha_40``; anything
+        else is a malformed report and never reaches git) and reachable from
+        main, read through ``GitOps.is_ancestor_checked``. A git error there
+        is reported as reachability left unanswered, never as not-reachable.
+        **Attribution** (task 4704): reachability
         proves only that the commit EXISTS on main, so the report is
         corroborated against the task's own declared ``metadata.files`` /
         ``delivered_checks`` and the commit's effect must survive at main
@@ -7993,7 +7995,19 @@ class TaskWorkflow:
             )
 
         main_sha = await self.git_ops.get_main_sha()
-        on_main = await self.git_ops.is_ancestor(commit, main_sha)
+        on_main = await self.git_ops.is_ancestor_checked(commit, main_sha)
+        if on_main is None:
+            return await self._mark_blocked(
+                f'Architect reported task already done at {commit[:12]} '
+                f'but git could not answer whether that commit is reachable '
+                f'from main (merge-base --is-ancestor errored), so '
+                f'reachability was never established',
+                detail=(
+                    f'commit: {commit}\nmain_sha: {main_sha}\n'
+                    f'evidence: {evidence}'
+                )[:2000],
+                merge_phase=merge_phase,
+            )
         if not on_main:
             return await self._mark_blocked(
                 f'Architect reported task already done at {commit[:12]} '
