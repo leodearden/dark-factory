@@ -46,12 +46,17 @@ class _Slots:
     """Stand-in slot runner: each slot ends when the test opens its gate.
 
     Mirrors ``Harness._run_slot``'s contract: it releases the semaphore on
-    exit and turns a cancel into a synthetic CANCELLED report.
+    exit and turns a cancel into a synthetic CANCELLED report.  A slot whose
+    id is in ``immune`` ignores every cancel and every gate, ``open_all``'s
+    included, until ``immune_release`` is set.
     """
 
     def __init__(self) -> None:
         self.gates: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
+        self.started: set[str] = set()
         self.finished: set[str] = set()
+        self.immune: set[str] = set()
+        self.immune_release = asyncio.Event()
         self._all_open = False
 
     def open_all(self) -> None:
@@ -61,9 +66,13 @@ class _Slots:
 
     async def run(self, assignment: TaskAssignment, sem: asyncio.Semaphore) -> TaskReport:
         tid = assignment.task_id
+        self.started.add(tid)
         if self._all_open:
             self.gates[tid].set()
         try:
+            if tid in self.immune:
+                await _ignore_cancels_until(self.immune_release)
+                return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.CANCELLED)
             await self.gates[tid].wait()
             return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.DONE)
         except asyncio.CancelledError:
@@ -133,11 +142,12 @@ async def _until(predicate: Callable[[], bool], label: str) -> None:
 
 
 def _harness(
-    tmp_path: Path, dispatch: _Dispatch, slots: _Slots, *, main_health_fix_reserved_slots: int = 0,
+    tmp_path: Path, dispatch: _Dispatch, slots: _Slots, *,
+    max_concurrent_tasks: int = 1, main_health_fix_reserved_slots: int = 0,
 ) -> Harness:
     config = OrchestratorConfig(
         project_root=tmp_path,
-        max_concurrent_tasks=1,
+        max_concurrent_tasks=max_concurrent_tasks,
         main_health_fix_reserved_slots=main_health_fix_reserved_slots,
         idle_poll_secs=_TICK,
         merge_heartbeat_interval_secs=_TICK,
@@ -388,6 +398,41 @@ class TestParkedLoop:
             release.set()
             if bystanders:
                 await asyncio.wait(bystanders, timeout=5.0)
+
+    async def test_cancel_immune_slot_is_detached_and_its_sibling_still_collected(
+        self, tmp_path: Path, fleet_dir: Path,
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.ERROR, logger='orchestrator.harness')
+        dispatch, slots = _Dispatch(['1', '2', '3']), _Slots()
+        slots.immune = {'1'}
+        h = _harness(tmp_path, dispatch, slots, max_concurrent_tasks=2)
+        _shrink_shutdown_drains(h, monkeypatch)
+        guard = asyncio.get_running_loop().call_later(_HANG_GUARD_SECS, slots.immune_release.set)
+        main = asyncio.current_task()
+        assert main is not None
+        immune_slots: list[asyncio.Task] = []
+
+        async def sigterm_with_both_slots_running() -> None:
+            await _until(lambda: {'1', '2'} <= slots.started, 'slots 1 and 2 running')
+            immune_slots.append(next(t for t in asyncio.all_tasks() if t.get_name() == 'workflow-1'))
+            main.cancel()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _run_driven(h, slots, sigterm_with_both_slots_running)
+
+            [immune_slot] = immune_slots
+            assert not immune_slot.done(), 'shutdown must not wait for a slot that ignores its cancel'
+            assert immune_slot not in h._live_tasks
+            assert _harness_errors_naming(caplog, 'workflow-1')
+            outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
+            assert outcomes == {'2': WorkflowOutcome.CANCELLED}
+        finally:
+            guard.cancel()
+            slots.immune_release.set()
+            if immune_slots:
+                await asyncio.wait(immune_slots, timeout=5.0)
 
     async def test_polite_restart_waits_for_the_dispatch_loop(
         self, tmp_path: Path, fleet_dir: Path,
