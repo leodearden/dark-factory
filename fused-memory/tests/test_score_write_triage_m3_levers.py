@@ -160,7 +160,7 @@ class TestScoreArm:
     def test_reports_the_scorers_own_blocks(self) -> None:
         items, verdicts = _corpus()
         scored = _mod().score_arm(items, verdicts, _STRATA)
-        report = _scorer().score_reader(items, verdicts, rubric='v2.1', strata=_STRATA)
+        report = _scorer().score_reader(items, verdicts, brief=_mod().BRIEF, strata=_STRATA)
         metrics = report['metrics']
         assert scored['m1'] == metrics['m1']
         assert scored['m3'] == metrics['m3']
@@ -184,7 +184,7 @@ class TestTheHomeTieClosure:
         before = copy.deepcopy(verdicts)
         arm = _arm_items(_soak_rows(C3='amended'))
         with pytest.raises(_scorer().IncompleteJudgementError):
-            _scorer().score_reader(arm, verdicts, rubric='v2.1', strata=_STRATA)
+            _scorer().score_reader(arm, verdicts, brief=_mod().BRIEF, strata=_STRATA)
         scored = _mod().score_arm(arm, verdicts, _STRATA)
         assert verdicts == before
         assert scored['closure'] == {

@@ -58,15 +58,17 @@ CALIBRATION = _SCRIPTS.parent / 'calibration'
 if TYPE_CHECKING:
     import score_write_triage_reader as _scorer
     import write_triage_m3_replay_cases as _cases
+    import write_triage_rating_rounds as _rounds
     import write_triage_reader_rubric as _rubric
     import write_triage_stats as _stats
 else:
     _scorer = load_script(_SCRIPTS / 'score_write_triage_reader.py', 'score_write_triage_reader')
     _cases = load_script(_SCRIPTS / 'write_triage_m3_replay_cases.py', 'write_triage_m3_replay_cases')
+    _rounds = load_script(_SCRIPTS / 'write_triage_rating_rounds.py', 'write_triage_rating_rounds')
     _rubric = load_script(_SCRIPTS / 'write_triage_reader_rubric.py', 'write_triage_reader_rubric')
     _stats = load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
 
-RUBRIC = 'v2.1'
+BRIEF = _rounds.BRIEF_V2_1
 """The rater brief the soak verdicts, and so the 0.35 and 0.10 M3 bounds, were rated under."""
 
 BOUND_RATERS = ('replay-bound-home-yes', 'replay-bound-home-no')
@@ -205,7 +207,7 @@ def _score(
     items: Sequence[Mapping[str, Any]], verdicts: Sequence[Mapping[str, Any]],
     strata: Mapping[str, int],
 ) -> dict[str, Any]:
-    return _scorer.score_reader(items, verdicts, rubric=RUBRIC, strata=strata)
+    return _scorer.score_reader(items, verdicts, brief=BRIEF, strata=strata)
 
 
 def _blocks(report: Mapping[str, Any]) -> dict[str, Any]:
@@ -582,7 +584,7 @@ def build_report(
         for name in arms
     }
     return {
-        'rubric': RUBRIC,
+        'rubric': BRIEF.version,
         'baseline': baseline,
         'arm_order': list(arms),
         'provenance': {**provenance, 'shipped_prompt_sha256': baseline_prompt},
