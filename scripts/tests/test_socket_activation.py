@@ -33,20 +33,24 @@ def test_the_port_is_held_before_the_child_ever_listens() -> None:
         env=dict(os.environ),
         output=subprocess.DEVNULL,
     ) as (proc, port):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
-            with pytest.raises(OSError) as refused:
-                squatter.bind(("127.0.0.1", port))
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter,
+            pytest.raises(OSError) as refused,
+        ):
+            squatter.bind(("127.0.0.1", port))
         assert refused.value.errno == errno.EADDRINUSE
     assert proc.poll() is not None
 
 
 def test_the_child_serves_on_fd_3_addressed_to_its_own_pid(tmp_path: Path) -> None:
     stale = {**os.environ, "LISTEN_PID": "1", "LISTEN_FDNAMES": "stale"}
-    with (tmp_path / "child.log").open("wb") as log:
-        with socket_activated(
+    with (
+        (tmp_path / "child.log").open("wb") as log,
+        socket_activated(
             lambda port: [sys.executable, "-I", "-c", _SERVE_ONE_GREETING_ON_FD_3, str(port)],
             env=stale,
             output=log,
-        ) as (_proc, port):
-            with socket.create_connection(("127.0.0.1", port)) as client:
-                assert client.recv(64) == b"served-on-fd-3"
+        ) as (_proc, port),
+        socket.create_connection(("127.0.0.1", port)) as client,
+    ):
+        assert client.recv(64) == b"served-on-fd-3"
