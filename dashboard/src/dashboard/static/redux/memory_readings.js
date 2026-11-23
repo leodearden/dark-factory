@@ -21,6 +21,7 @@
 const {
   servedDatum: servedMemoryDatum,
   datumView: viewOfMemoryDatum,
+  EM_DASH: MEMORY_EM_DASH,
 } = window.DF_DATUM;
 
 const MEMORY_ENDPOINT = '/api/v2/dashboard/memory';
@@ -42,24 +43,39 @@ function writeQueue(data) {
   );
 }
 
+// null when the value was served by a dashboard process predating parked rows.
+function parkedCount(counts) {
+  return typeof counts.parked === 'number' ? counts.parked : null;
+}
+
 function queueCountsText(counts) {
-  return counts.pending + ' pending · ' + counts.retry + ' retry · ' + counts.dead + ' dead';
+  const parked = parkedCount(counts);
+  return (
+    counts.pending + ' pending · ' +
+    counts.retry + ' retry · ' +
+    (parked === null ? MEMORY_EM_DASH : parked) + ' parked · ' +
+    counts.dead + ' dead'
+  );
 }
 
 function queueHint(queue) {
   if (viewOfMemoryDatum(queue).isHole) return null;
+  const parked = parkedCount(queue.value);
   const oldest = queue.value.oldest_pending_age_seconds;
-  return oldest === null || oldest === undefined ? 'idle' : oldest + 's oldest';
+  const age = oldest === null || oldest === undefined ? 'idle' : oldest + 's oldest';
+  return parked > 0 ? parked + ' parked · ' + age : age;
 }
 
-// Red is a MEASURED fault (dead letters); amber is anything short of a fresh,
-// clean reading — an unmeasured queue included, which is never painted green.
+// Red is a MEASURED fault: a dead letter, or a parked write waiting on a human.
+// Amber is anything short of a fresh, clean reading — an unmeasured queue or
+// parked count included, which is never painted green.
 function queueHealth(queue) {
   if (viewOfMemoryDatum(queue).isHole) return { ok: true, warn: true };
   const { pending, retry, dead } = queue.value;
+  const parked = parkedCount(queue.value);
   return {
-    ok: dead === 0,
-    warn: queue.state !== 'fresh' || pending > 5 || retry > 0,
+    ok: dead === 0 && !(parked > 0),
+    warn: queue.state !== 'fresh' || parked === null || pending > 5 || retry > 0,
   };
 }
 
