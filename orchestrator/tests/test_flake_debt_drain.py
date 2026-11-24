@@ -1186,3 +1186,83 @@ class TestResolutionSweep:
             examined=1, resolved=0, owner_unreadable=0, stop=None,
         )
         assert client.task_calls[reads:] == [owner_b]
+
+
+def _numbered(n: int) -> str:
+    return f'orchestrator/tests/test_x.py::test_{n:03d}'
+
+
+@pytest.mark.asyncio
+class TestResolutionPassBounds:
+    async def test_an_unreadable_owner_stops_the_pass_and_is_counted(
+        self, tmp_path: Path,
+    ) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        for test_id in (A, B, C):
+            client.finish(await _open_owned(db, client, test_id), commit=FIX)
+        client.unreachable = True
+        reads = len(client.task_calls)
+
+        report = await _resolution_pass(db, client, clock)
+
+        assert report == flake_debt_drain.ResolutionPassReport(
+            examined=1, resolved=0, owner_unreadable=1, stop=DrainStop.TASK_CLIENT_FAILED,
+        )
+        assert not any(_resolved(db, test_id) for test_id in (A, B, C))
+        assert len(client.task_calls[reads:]) == 1
+
+    async def test_a_pass_stops_at_its_time_budget(self, tmp_path: Path) -> None:
+        db, clock, seeding = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owners = [await _open_owned(db, seeding, test_id) for test_id in (A, B, C)]
+        client = _FakeLedgerTaskClient(
+            statuses={owner: 'done' for owner in owners},
+            on_call=lambda: clock.advance(timedelta(minutes=3)),
+        )
+
+        report = await _resolution_pass(db, client, clock)
+
+        assert report == flake_debt_drain.ResolutionPassReport(
+            examined=2, resolved=2, owner_unreadable=0, stop=DrainStop.BUDGET,
+        )
+        assert (_resolved(db, A), _resolved(db, B), _resolved(db, C)) == (True, True, False)
+
+    async def test_a_pass_examines_at_most_fifty_rows(self, tmp_path: Path) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owners = [await _open_owned(db, client, _numbered(n)) for n in range(51)]
+        reads = len(client.task_calls)
+
+        report = await _resolution_pass(db, client, clock)
+
+        assert report.examined == 50
+        assert owners[50] not in client.task_calls[reads:]
+
+    async def test_a_resolution_pass_never_raises(self, tmp_path: Path) -> None:
+        clock = _Clock()
+        unopenable = tmp_path / 'not-a-db'
+        unopenable.mkdir()
+        assert await _resolution_pass(
+            unopenable, _FakeLedgerTaskClient(), clock,
+        ) == flake_debt_drain.ResolutionPassReport(0, 0, 0, None)
+
+        db = _db(tmp_path)
+        await _open_owned(db, _FakeLedgerTaskClient(), A)
+        broken: FlakeLedgerTaskClient = _RaisingTaskClient()
+        assert await _resolution_pass(db, broken, clock) == flake_debt_drain.ResolutionPassReport(
+            examined=1, resolved=0, owner_unreadable=1, stop=DrainStop.TASK_CLIENT_FAILED,
+        )
+
+    async def test_a_cancellation_inside_a_resolution_pass_propagates(
+        self, tmp_path: Path,
+    ) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        await _open_owned(db, client, A)
+        client.get_task_hangs = True
+
+        sweep = asyncio.create_task(_resolution_pass(db, client, clock))
+        async with asyncio.timeout(5):
+            while 'get_task' not in client.order:
+                await asyncio.sleep(0.01)
+        sweep.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await sweep
