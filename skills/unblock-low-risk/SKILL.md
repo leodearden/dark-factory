@@ -100,6 +100,29 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
    must always be routed to a human. This skill will therefore never reach this class's proposals;
    the gate aborts them upstream.
 
+## Defect fixes
+
+When step 3's fix is for a defect (wrong runtime behaviour), it is made test-first.
+The rule's one home is `orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE`,
+the text the factory's fixing agents are given. The excerpt below is rendered
+from it and kept equal to it by `tests/scripts/test_defect_rule_mirror.py`.
+
+<!-- defect-test-rule-mirror:begin  rendered from orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE; pinned by tests/scripts/test_defect_rule_mirror.py -->
+```text
+## Fixing a defect
+
+A defect is wrong runtime behaviour. A defect fix starts from a test that fails
+without the fix and passes with it: write that test first and watch it fail.
+When the defect is declared, mark that test `@pytest.mark.defect("<ref>")` with
+the defect's ref. A test carrying `@pytest.mark.defect` is a defect's
+reproducing test.
+
+Never weaken a failing test (loosen or delete an assertion, skip it, mark it
+xfail, or delete the test) without stating in the commit message why the test,
+not the code, was wrong.
+```
+<!-- defect-test-rule-mirror:end -->
+
 ## Procedure
 
 Run these strictly in order. Stop and ABORT at the first step that is not cleanly satisfied.
@@ -130,6 +153,8 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    direct test files). The moment the correct fix demands touching a file outside that set — or any
    of `main`-only paths, CI config, infra, or `dark-factory-orchestrator.yaml`/`.mcp.json`/systemd units —
    the change is no longer low-risk: **ABORT**. Do not commit `.task/`.
+   A defect fix follows [Defect fixes](#defect-fixes): a failing test first, and no failing
+   test weakened without saying why in the commit message.
 
 4. **Rebase onto main.** `git -C <worktree> rebase main` (main may have moved). On **any conflict** →
    run [Rebase recovery preflight](#rebase-recovery-preflight) to leave the worktree clean, then

@@ -233,6 +233,8 @@ SKILLS_CONSUMING_TESTS = (
     # EXECUTES every merge-marker search in skills/**/*.md against a shadowed
     # fixture history (task 5774).
     "tests/scripts/test_merge_marker_search_snippets.py",
+    # Reads skills/unblock/SKILL.md and skills/unblock-low-risk/SKILL.md to mirror DEFECT_TEST_RULE (task 7047).
+    "tests/scripts/test_defect_rule_mirror.py",
 )
 
 

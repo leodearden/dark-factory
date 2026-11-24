@@ -380,6 +380,27 @@ Enter plan mode. The plan covers two parts:
 
 **Part 1: Fix all blocking issues** in the worktree, on the task branch.
 
+When a blocking issue is a defect (wrong runtime behaviour), fix it test-first.
+The rule's one home is `orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE`,
+the text the factory's fixing agents are given. The excerpt below is rendered
+from it and kept equal to it by `tests/scripts/test_defect_rule_mirror.py`.
+
+<!-- defect-test-rule-mirror:begin  rendered from orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE; pinned by tests/scripts/test_defect_rule_mirror.py -->
+```text
+## Fixing a defect
+
+A defect is wrong runtime behaviour. A defect fix starts from a test that fails
+without the fix and passes with it: write that test first and watch it fail.
+When the defect is declared, mark that test `@pytest.mark.defect("<ref>")` with
+the defect's ref. A test carrying `@pytest.mark.defect` is a defect's
+reproducing test.
+
+Never weaken a failing test (loosen or delete an assertion, skip it, mark it
+xfail, or delete the test) without stating in the commit message why the test,
+not the code, was wrong.
+```
+<!-- defect-test-rule-mirror:end -->
+
 **Part 2: Merge or resolve.** The procedure depends on the entry path:
 
 *If this is a blocked task (task status is `blocked`, fixing in worktree):*
