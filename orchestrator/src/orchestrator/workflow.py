@@ -112,6 +112,7 @@ from orchestrator.branch_stack import (
 from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
+from orchestrator.decision_note import decision_note_fields
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
@@ -18696,7 +18697,11 @@ class TaskWorkflow:
             logger.warning(f'Failed to write completion to memory: {e}')
 
     async def _write_decisions_to_memory(self) -> None:
-        """Write plan design decisions to fused-memory."""
+        """Write plan design decisions to fused-memory, each declaring this task.
+
+        The content and declaration come from
+        orchestrator/src/orchestrator/decision_note.py::decision_note_fields.
+        """
         decisions = self.plan.get('design_decisions', [])
         if not decisions:
             return
@@ -18710,7 +18715,7 @@ class TaskWorkflow:
                         self.mcp.url,
                         'add_memory',
                         {
-                            'content': f"Decision: {decision['decision']}\nRationale: {decision['rationale']}",
+                            **decision_note_fields(self.task_id, decision),
                             'category': 'decisions_and_rationale',
                             'project_id': self.config.fused_memory.project_id,
                             'agent_id': f'orchestrator-task-{self.task_id}',
