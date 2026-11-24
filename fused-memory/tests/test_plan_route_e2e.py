@@ -10,17 +10,24 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import types
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import openai
 import pytest
 from _fm_helpers import mock_memory_backends
 from _fm_polling import poll_until
-from _mock_openai_server import MockOpenAIServer, chat_completion_body, mock_openai_server
+from _mock_openai_server import (
+    MockOpenAIServer,
+    chat_completion_body,
+    mock_openai_server,
+    responses_body,
+)
 from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitError
 from graphiti_core.prompts.models import Message
 from pydantic import BaseModel
@@ -40,8 +47,11 @@ from fused_memory.config.schema import (
     PlanRouteConfig,
 )
 from fused_memory.middleware import _folded_escalation
-from fused_memory.models.enums import SourceStore
+from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.models.scope import configured_primary_root
+from fused_memory.server.write_triage import OUTCOME_JUDGE, OUTCOME_RESTATED, BandDecision
+from fused_memory.server.write_triage_judge import judge_write
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.plan_route import PlanRoute, PlanRouteSite
 from fused_memory.services.provider_billing import BillingSource, classify_billing_exhaustion
@@ -305,3 +315,94 @@ class TestACappedPlanThroughMemoryService:
             assert (await svc.get_status())['plan_route']['state'] == 'ok'
             assert [r['status'] for r in _capped_records(root)] == ['pending']
             assert endpoints.api_llm_requests() == []
+
+
+_RESPONSES = '/responses'
+_RESTATES = '{"verdict": "restates", "candidate_id": "m1"}'
+
+
+def _judge_config(endpoints: _Endpoints) -> FusedMemoryConfig:
+    """The judge on the plan proxy, the main LLM arm on the API-key endpoint.
+
+    Built as tests/server/test_write_triage_judge.py::_real_config builds its
+    config: the write_triage leaves are assigned after construction.
+    """
+    cfg = FusedMemoryConfig(
+        llm=LLMConfig(
+            provider='openai', model='gpt-4o-mini',
+            providers=LLMProvidersConfig(
+                openai=OpenAIProviderConfig(api_key='sk-main', api_url=endpoints.api.base_url),
+            ),
+        ),
+    )
+    object.__setattr__(cfg.write_triage, 'judge_provider', 'openai')
+    object.__setattr__(cfg.write_triage, 'judge_api_url', endpoints.proxy.base_url)
+    object.__setattr__(cfg.write_triage, 'judge_api_key', 'sk-plan-proxy')
+    return cfg
+
+
+async def _judge(memory_service: object) -> Any:
+    candidate = MemoryResult(
+        id='m1', content='some procedural content',
+        category=MemoryCategory.procedural_knowledge, source_store=SourceStore.mem0,
+        relevance_score=0.5, metadata={'store_rank': 1, 'store_score': 0.80},
+    )
+    return await judge_write(
+        memory_service=memory_service, content='c', project_id='p',
+        decision=BandDecision(OUTCOME_JUDGE, 'm1', 0.80, 0.95, 0.70), candidates=[candidate],
+    )
+
+
+class TestTheWriteTriageJudgeRidesThePlanRoute:
+    @pytest.mark.asyncio
+    async def test_a_gated_judge_lands_on_the_proxy(self, endpoints: _Endpoints) -> None:
+        endpoints.proxy.set_response(_RESPONSES, responses_body(_RESTATES))
+        service = types.SimpleNamespace(config=_judge_config(endpoints), plan_route=endpoints.route())
+
+        verdict = await _judge(service)
+
+        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_RESTATED, 'm1')
+        assert len(endpoints.proxy.requests_to(_RESPONSES)) == 1
+        assert endpoints.api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_capped_plan_fails_the_judge_once_and_never_falls_back(
+        self, endpoints: _Endpoints,
+    ) -> None:
+        endpoints.proxy.set_response_sequence(_RESPONSES, [(429, _USAGE_LIMIT)])
+        route = endpoints.route()
+        service = types.SimpleNamespace(config=_judge_config(endpoints), plan_route=route)
+
+        with pytest.raises(openai.RateLimitError) as first:
+            await _judge(service)
+        with pytest.raises(openai.RateLimitError) as second:
+            await _judge(service)
+
+        for failure in (first.value, second.value):
+            exhaustion = classify_billing_exhaustion(failure)
+            assert exhaustion is not None
+            assert exhaustion.source is BillingSource.PLAN_CAP
+        assert len(endpoints.proxy.requests_to(_RESPONSES)) == 1
+        assert endpoints.api.requests == []
+        status = route.state().to_status(parked_items=0, escalation_id=None)
+        assert status['judge_fail_opens_since_latch'] == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('plan_route', ['absent', 'not_a_plan_route'])
+    async def test_a_service_without_a_plan_route_judges_ungated(
+        self, endpoints: _Endpoints, plan_route: str,
+    ) -> None:
+        endpoints.proxy.set_response_sequence(_RESPONSES, [(429, _USAGE_LIMIT)])
+        cfg = _judge_config(endpoints)
+        service = (
+            types.SimpleNamespace(config=cfg) if plan_route == 'absent'
+            else types.SimpleNamespace(config=cfg, plan_route=MagicMock())
+        )
+
+        for _ in range(2):
+            with pytest.raises(openai.RateLimitError):
+                await _judge(service)
+
+        assert len(endpoints.proxy.requests_to(_RESPONSES)) == 2
+        endpoints.proxy.set_response(_RESPONSES, responses_body(_RESTATES))
+        assert (await _judge(service)).outcome == OUTCOME_RESTATED
