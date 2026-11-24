@@ -473,7 +473,8 @@ class TestAuditHook:
         hooked.call(_reproduced(ALPHA_NODE), head=LATER_HEAD)
 
         assert [esc.id for esc in hooked.pending()] == [blocker.id]
-        hooked.queue.resolve(blocker.id, 'root cause fixed')
+        assert hooked.queue is not None
+        hooked.queue.resolve(blocker.id, 'root cause fixed', resolution_class='actionable')
         asyncio.run(audit.enable(hooked.seeded.registry, 'root cause fixed', hooked.seeded.now))
         hooked.seeded.fresh_leak_source(KA, 'c3' * 20)
         hooked.seeded.fresh_leak_source(KB, 'c3' * 20)
@@ -560,7 +561,7 @@ class TestAuditHook:
     def test_a_hand_resolved_blocker_is_re_filed_while_the_cache_stays_disabled(self, hooked):
         hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
         [resolved_by_hand] = hooked.pending()
-        hooked.queue.resolve(resolved_by_hand.id, 'resolved by hand, without verify-cache enable')
+        hooked.queue.resolve(resolved_by_hand.id, 'resolved by hand, without verify-cache enable', resolution_class='actionable')
 
         hooked.call(_reproduced(GAMMA_NODE), head=LATER_HEAD)
 
