@@ -16,11 +16,8 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from _briefing_helpers import (
-    _mcp_search_envelope,
-    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
-    memory_transport,
-)
+from _briefing_helpers import _mcp_search_envelope, memory_transport
+from _briefing_helpers import briefing as briefing
 from shared.defects import (
     DEFECTS_METADATA_KEY,
     DefectDeclaration,
