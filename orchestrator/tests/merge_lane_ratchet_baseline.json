@@ -87,7 +87,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1579, "function_local_imports": 4, "lines": 17387, "prose_lines": 9759, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1579, "function_local_imports": 4, "lines": 17412, "prose_lines": 9771, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 359, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 228, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_policy.py": {"cognitive": 24, "function_local_imports": 0, "lines": 125, "prose_lines": 18, "reexport_names": 0},
@@ -99,7 +99,7 @@
     "orchestrator/src/orchestrator/merge_lane/dispatch_ports.py": {"cognitive": 0, "function_local_imports": 0, "lines": 218, "prose_lines": 35, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/disposition.py": {"cognitive": 56, "function_local_imports": 0, "lines": 726, "prose_lines": 442, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/drift.py": {"cognitive": 34, "function_local_imports": 0, "lines": 591, "prose_lines": 214, "reexport_names": 0},
-    "orchestrator/src/orchestrator/merge_lane/gates.py": {"cognitive": 388, "function_local_imports": 0, "lines": 3845, "prose_lines": 1662, "reexport_names": 0},
+    "orchestrator/src/orchestrator/merge_lane/gates.py": {"cognitive": 388, "function_local_imports": 0, "lines": 3846, "prose_lines": 1663, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/git_read.py": {"cognitive": 2, "function_local_imports": 0, "lines": 58, "prose_lines": 17, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/halt.py": {"cognitive": 32, "function_local_imports": 0, "lines": 205, "prose_lines": 72, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/history_leg.py": {"cognitive": 0, "function_local_imports": 0, "lines": 67, "prose_lines": 16, "reexport_names": 0},
@@ -1671,7 +1671,7 @@
     "orchestrator/tests/test_ephemeral_worktree.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_escalation_scan_off_loop.py": {"patch_targets": [], "private_reads": 20},
     "orchestrator/tests/test_eval_mcp_isolation.py": {"patch_targets": [], "private_reads": 1},
-    "orchestrator/tests/test_git_ops.py": {"patch_targets": [], "private_reads": 104},
+    "orchestrator/tests/test_git_ops.py": {"patch_targets": [], "private_reads": 111},
     "orchestrator/tests/test_git_ops_checked_lookups.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_git_ops_citation_pattern.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_git_ops_commit_staging.py": {"patch_targets": [], "private_reads": 0},
