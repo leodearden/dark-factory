@@ -107,6 +107,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Annotated, Any, NamedTuple, NoReturn
 
 from fastmcp.exceptions import ToolError
@@ -189,7 +190,7 @@ _REJECT_HINT = (
 #: offer a mechanical retry — there is no repaired call to resend — so it points
 #: at the two things the caller can actually do.
 #:
-#: Spelled ONCE, with the two variants below differing ONLY in the preservation
+#: Spelled ONCE, with the three variants below differing ONLY in the preservation
 #: clause. Composed rather than duplicated for the usual reason (INV-5): a
 #: reworded refusal must not require two edits kept in lock step.
 _UNREPAIRABLE_PREFIX = (
@@ -210,13 +211,22 @@ _UNREPAIRABLE_SUFFIX = (
 #: escalation carrying the FULL raw payload so nothing is discarded. When that
 #: filing did NOT happen, saying it did breaks the contract twice over.
 #:
-#: Selecting between the two keeps the payload's PROSE consistent with its own
-#: ``escalation_id`` field rather than letting the two disagree.
+#: Selecting among the three keeps the payload's PROSE consistent with its own
+#: ``escalation_id`` and ``residue_spool_path`` fields rather than letting them
+#: disagree (:func:`_unrepairable_hint`).
 _UNREPAIRABLE_HINT_PRESERVED = (
     _UNREPAIRABLE_PREFIX
     + 'Your full payload is preserved verbatim in the escalation named above '
     '— resend it from your own copy once your tool-call envelope stops '
     'leaking, rather than reconstructing it from this error.'
+    + _UNREPAIRABLE_SUFFIX
+)
+_UNREPAIRABLE_HINT_SPOOLED = (
+    _UNREPAIRABLE_PREFIX
+    + 'Your full payload is preserved verbatim in the server-side spool file '
+    'named by residue_spool_path, which is a file on disk and not an '
+    'escalation — resend it from your own copy once your tool-call envelope '
+    'stops leaking, rather than reconstructing it from this error.'
     + _UNREPAIRABLE_SUFFIX
 )
 _UNREPAIRABLE_HINT_UNPRESERVED = (
@@ -484,6 +494,64 @@ MARKUP_RESIDUE_ERROR_TYPES = frozenset({
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
 
+def residue_payload_length(record: Mapping[str, Any]) -> int:
+    """How many characters of caller payload a residue record's ``raw_value`` holds."""
+    raw_value = record.get('raw_value')
+    return len(raw_value) if isinstance(raw_value, str) else 0
+
+
+@dataclass(frozen=True)
+class SpooledResidue:
+    """A sink's answer to a residue record that a spool FILE now holds.
+
+    A sink answers with a bare ``str`` when it filed an escalation, which is
+    the contract every queue-backed sink keeps. A host whose last tier is a
+    file on disk answers with this instead, so the caller is pointed at a
+    ``residue_spool_path`` rather than handed a path posing as an escalation id
+    that ``get_escalation`` cannot find (task 4809).
+    """
+
+    #: Absolute, so the file is found without asking the host where it spools.
+    path: str
+
+
+#: Where a residue sink preserved the record: an escalation id, a spool file,
+#: or nowhere.
+ResiduePreservation = str | SpooledResidue | None
+
+
+def _preservation_fields(
+    preserved: ResiduePreservation, *, id_key: str, path_key: str
+) -> dict[str, str | None]:
+    """*preserved* as payload fields, each holding one kind of locator.
+
+    The escalation id under *id_key* is present-and-null, as it always was.
+    The spool file under *path_key* is omitted unless a spool holds the record,
+    the convention ``storm`` follows, because most hosts never spool.
+    """
+    fields: dict[str, str | None] = {
+        id_key: preserved if isinstance(preserved, str) else None,
+    }
+    if isinstance(preserved, SpooledResidue):
+        fields[path_key] = preserved.path
+    return fields
+
+
+def _unrepairable_hint(preserved: ResiduePreservation) -> str:
+    """The refusal hint that matches where the payload actually went."""
+    if isinstance(preserved, SpooledResidue):
+        return _UNREPAIRABLE_HINT_SPOOLED
+    if isinstance(preserved, str):
+        return _UNREPAIRABLE_HINT_PRESERVED
+    return _UNREPAIRABLE_HINT_UNPRESERVED
+
+
+def _holder_label(preserved: str | SpooledResidue) -> str:
+    if isinstance(preserved, SpooledResidue):
+        return f'spool file {preserved.path}'
+    return f'escalation {preserved}'
+
+
 #: The most of ONE attribution axis that reaches a record, a log line or a
 #: caller-facing payload. The marker below is appended PAST it, so a bounded
 #: axis is at most this plus three characters.
@@ -621,8 +689,10 @@ _UNRECOVERED_HINT = (
     'NOT be typed against its declared schema (see unrecovered_params) and was '
     'DROPPED — forwarding it verbatim would have failed validation and lost '
     'the whole call. The call went through WITHOUT those parameters; their raw '
-    'values are preserved in the escalation named by unrecovered_residue_id '
-    '(null if preserving them failed too). Resend them yourself if you still '
+    'values are preserved in the escalation named by unrecovered_residue_id, '
+    'or in the server-side file named by unrecovered_residue_spool_path when '
+    'that key is present (the id is null and the key absent if preserving '
+    'them failed too). Resend them yourself if you still '
     'hold them, and fix the envelope leak at its emission.'
 )
 
@@ -682,7 +752,9 @@ class MarkupGuardMiddleware(Middleware):
     machinery a registration site will wire them to is largely async in this
     repo — and both are invoked DEFENSIVELY: the call's outcome is already
     decided by the time either runs, so a sink that raises is logged and never
-    changes what the caller sees. See :meth:`_call_sink`.
+    changes what the caller sees. See :meth:`_call_sink`. *escalation_sink*
+    answers a residue record with where it preserved it, a
+    :data:`ResiduePreservation`.
 
     Bursts are counted by a per-instance
     :class:`~shared.boundary_storm_escape.BoundaryStormEscape`
@@ -1199,15 +1271,15 @@ class MarkupGuardMiddleware(Middleware):
         )
         subject = self._subject({**arguments, **fix.recovered})
         storm = await self._record_storm(_OUTCOME_REPAIRED, identity, subject)
-        residue_id = None
+        preserved: ResiduePreservation = None
         if unrecovered:
-            residue_id = await self._preserve_unrecovered(
+            preserved = await self._preserve_unrecovered(
                 name, identity, subject,
                 param, pattern, unrecovered,
             )
         return await self._forward(
             context, call_next, arguments, param, fix, storm,
-            unrecovered=tuple(sorted(unrecovered)), residue_id=residue_id,
+            unrecovered=tuple(sorted(unrecovered)), preserved=preserved,
             quoting=quoting,
         )
 
@@ -1406,7 +1478,7 @@ class MarkupGuardMiddleware(Middleware):
         # otherwise be chasing two different callers.
         agent_id, project = identity
         subject_task_id, subject_agent_role = subject
-        escalation_id = await self._file_residue_escalation({
+        preserved = await self._preserve_residue({
             'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
             'category': _ESCALATION_CATEGORY,
             # INV-7: a machine-readable owner plus a bound. This hold is a
@@ -1431,9 +1503,12 @@ class MarkupGuardMiddleware(Middleware):
             # beside a payload the caller still holds; this is the only
             # surviving copy of data that may never be resent.
             'raw_value': value,
+            # What the record CARRIES, never where it went: it is built before
+            # any sink runs, and a host that preserves it nowhere dumps it to a
+            # log line, where a preservation claim would be false.
             'summary': (
                 f'Unrepairable MCP envelope markup in {name}.{param} — the '
-                'call was refused and its payload preserved here'
+                'call was refused; this record carries its full raw payload'
             ),
             'suggested_action': (
                 'Recover the raw_value for the caller if it is still needed, '
@@ -1455,37 +1530,37 @@ class MarkupGuardMiddleware(Middleware):
             'tool': name,
             'field': param,
             'matched_pattern': pattern,
-            'escalation_id': escalation_id,
+            **_preservation_fields(
+                preserved, id_key='escalation_id', path_key='residue_spool_path'
+            ),
             # NO 'repaired_call'. There is no repair, and offering one would
             # invite a retry that re-sends a guess.
             #
-            # Keyed off the SAME value that populates 'escalation_id' above,
-            # never off ``self._escalation_sink is not None``: a wired sink that
+            # Keyed off the SAME value that populates the fields above, never
+            # off ``self._escalation_sink is not None``: a wired sink that
             # RAISED (a queue I/O failure on the escalation server) or returned
-            # a non-str preserved exactly nothing, and must select the
-            # unpreserved variant too. See the constants for why the claim is
-            # conditional at all.
-            'hint': (
-                _UNREPAIRABLE_HINT_PRESERVED
-                if isinstance(escalation_id, str)
-                else _UNREPAIRABLE_HINT_UNPRESERVED
-            ),
+            # neither a str nor a SpooledResidue preserved exactly nothing, and
+            # must select the unpreserved variant too. See the constants for
+            # why the claim is conditional at all.
+            'hint': _unrepairable_hint(preserved),
         }, storm)))
 
-    async def _file_residue_escalation(self, record: dict[str, Any]) -> str | None:
-        """Hand the residue to the injected sink; never change the outcome.
+    async def _preserve_residue(
+        self, record: dict[str, Any]
+    ) -> ResiduePreservation:
+        """Hand the residue to the injected sink, and return where it was preserved.
 
-        The refusal is already decided by the time this runs, so escalation is
+        The refusal is already decided by the time this runs, so preserving is
         purely ADDITIVE — see :meth:`_call_sink` for the never-raises contract
         and for why an ``async def`` emitter is awaited rather than left as an
         unawaited coroutine, which on THIS path would destroy the only surviving
         copy of the caller's payload.
 
-        Returns the id the sink reports, so the refusal payload can name the
-        record holding the caller's data. A sink that reports something other
-        than a string reports no id — the caller is better told nothing than
-        pointed at a value it cannot look up. A sink that FAILED reports ``None``
-        for the same reason.
+        The sink answers where it preserved the record, so the refusal payload
+        can name what holds the caller's data: an escalation id (``str``) or a
+        :class:`SpooledResidue`. Anything else reports ``None`` — the caller is
+        better told nothing than pointed at a value it cannot look up. A sink
+        that FAILED reports ``None`` for the same reason.
         """
         if self._escalation_sink is None:
             logger.warning(
@@ -1493,23 +1568,22 @@ class MarkupGuardMiddleware(Middleware):
                 '%r will not be preserved anywhere', record.get('tool'),
             )
             return None
-        escalation_id = await self._call_sink(self._escalation_sink, record, 'escalation')
-        if not isinstance(escalation_id, str):
+        preserved = await self._call_sink(self._escalation_sink, record, 'escalation')
+        if not isinstance(preserved, (str, SpooledResidue)):
             return None
-        # Naming the queued record, exactly as emit_markup_storm_escalation
+        # Naming the holding record, exactly as emit_markup_storm_escalation
         # signs off — the operator's entry point to the preserved payload.
         logger.warning(
-            'markup guard: queued %s holding the unrepairable payload of '
-            '%s.%s (%d chars)',
-            escalation_id, record.get('tool'), record.get('field'),
-            len(record.get('raw_value') or ''),
+            'markup guard: %s holds the unrepairable payload of %s.%s (%d chars)',
+            _holder_label(preserved), record.get('tool'), record.get('field'),
+            residue_payload_length(record),
         )
-        return escalation_id
+        return preserved
 
     async def _preserve_unrecovered(
         self, name, identity, subject, param, pattern,
         unrecovered: Mapping[str, str],
-    ) -> str | None:
+    ) -> ResiduePreservation:
         """Queue the slices FORWARD_REPAIR dropped, so nothing is destroyed.
 
         The other half of the drop above. C2 L187 binds every path this guard
@@ -1522,17 +1596,17 @@ class MarkupGuardMiddleware(Middleware):
 
         One record per dropped NAME rather than one per call: each carries a
         different parameter's payload, and the residue channel deliberately does
-        not dedup for exactly that reason. Returns the LAST id filed, which is
-        the one the forwarded call's warning names.
+        not dedup for exactly that reason. Returns where the LAST one went,
+        which is the one the forwarded call's warning names.
 
-        Never raises — ``_file_residue_escalation`` owns that contract, and this
+        Never raises — ``_preserve_residue`` owns that contract, and this
         runs on a path whose outcome (forward) is already decided.
         """
         agent_id, project = identity
         subject_task_id, subject_agent_role = subject
-        residue_id = None
+        preserved: ResiduePreservation = None
         for field, raw in sorted(unrecovered.items()):
-            residue_id = await self._file_residue_escalation({
+            preserved = await self._preserve_residue({
                 # A DISTINCT error_type from the refusal's, because the two
                 # differ in the one way that matters to whoever reads the queue:
                 # this call is FORWARDED, lossily, and no caller is bounced — so
@@ -1554,8 +1628,8 @@ class MarkupGuardMiddleware(Middleware):
                 'raw_value': raw,
                 'summary': (
                     f'Recovered {name}.{field} could not be typed against its '
-                    f'declared schema — the call was forwarded WITHOUT it and '
-                    f'the value preserved here'
+                    f'declared schema — the call was forwarded WITHOUT it; '
+                    f'this record carries its full raw payload'
                 ),
                 'suggested_action': (
                     f'Recover the raw_value into {name}.{field} if it is still '
@@ -1563,7 +1637,7 @@ class MarkupGuardMiddleware(Middleware):
                     'chase the harness serialization leak that produced it.'
                 ),
             })
-        return residue_id
+        return preserved
 
     def _reject(
         self, name, arguments, param, fix, storm, quoting: tuple[str, ...]
@@ -1622,7 +1696,7 @@ class MarkupGuardMiddleware(Middleware):
 
     async def _forward(
         self, context, call_next, arguments, param, fix, storm,
-        *, unrecovered: tuple[str, ...] = (), residue_id: str | None = None,
+        *, unrecovered: tuple[str, ...] = (), preserved: ResiduePreservation = None,
         quoting: tuple[str, ...],
     ):
         """Repair in place, let the call through, and say so.
@@ -1685,7 +1759,11 @@ class MarkupGuardMiddleware(Middleware):
         if unrecovered:
             # NAMES only here too. The values went to the residue channel.
             meta['markup_repair']['unrecovered_params'] = list(unrecovered)
-            meta['markup_repair']['unrecovered_residue_id'] = residue_id
+            meta['markup_repair'].update(_preservation_fields(
+                preserved,
+                id_key='unrecovered_residue_id',
+                path_key='unrecovered_residue_spool_path',
+            ))
             meta['markup_repair']['hint'] = _UNRECOVERED_HINT
         return ToolResult(
             content=result.content,

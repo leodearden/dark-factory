@@ -1083,7 +1083,7 @@ class TestHarnessIdleWhilePaused:
         harness._lifecycle.stop_all = AsyncMock()
 
         harness._dismiss_stale_escalations = AsyncMock()
-        harness._rehydrate_merge_halt = MagicMock()
+        harness._rehydrate_merge_halt = AsyncMock()
         harness._file_restored_pause_escalation = MagicMock()
         harness._tag_task_modules = AsyncMock()
         harness._recover_crashed_tasks = AsyncMock()
@@ -1173,7 +1173,7 @@ class TestHarnessRunForever:
         harness._lifecycle.stop_all = AsyncMock()
 
         harness._dismiss_stale_escalations = AsyncMock()
-        harness._rehydrate_merge_halt = MagicMock()
+        harness._rehydrate_merge_halt = AsyncMock()
         harness._file_restored_pause_escalation = MagicMock()
         harness._tag_task_modules = AsyncMock()
         harness._recover_crashed_tasks = AsyncMock()
@@ -1274,7 +1274,7 @@ class TestHarnessRunForever:
         harness.scheduler.acquire_next = AsyncMock(side_effect=[assignment, None, None])
         harness.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
 
-        async def fake_slot(_assignment, _sem):
+        async def fake_slot(_assignment, _lease):
             return TaskReport(task_id='T1', title='t', outcome=WorkflowOutcome.DONE)
 
         harness._run_slot = fake_slot  # type: ignore[method-assign]
@@ -1319,18 +1319,16 @@ class TestHarnessCostCeiling:
     @pytest.mark.usefixtures("code_default_config")
     def test_config_defaults(self, tmp_path: Path) -> None:
         """OrchestratorConfig exposes the two ceiling fields with correct defaults."""
-        # code_default_config pins ORCH_CONFIG_PATH at a guaranteed-absent file so
-        # OrchestratorConfig loads ONLY defaults.yaml. Without it the autouse
-        # _isolate_orch_config fixture pins the operational
-        # dark-factory-orchestrator.yaml (watcher ceiling 150.0), which would
-        # override these code defaults (task 2719: the orchestrator/config.yaml
-        # symlink whose cwd-relative fallback this test used to rely on was retired).
+        # code_default_config makes OrchestratorConfig load ONLY defaults.yaml,
+        # whatever dark-factory-orchestrator.yaml declares. That the hatch
+        # really isolates is pinned by
+        # orchestrator/tests/test_code_default_hatch_guard.py::TestHatchEfficacy.
         config = OrchestratorConfig(project_root=tmp_path)
-        assert config.watcher_daily_cost_ceiling_usd == 50.0, (
-            f'Expected 50.0; got {config.watcher_daily_cost_ceiling_usd!r}'
+        assert config.watcher_daily_cost_ceiling_usd == 150.0, (
+            f'Expected 150.0; got {config.watcher_daily_cost_ceiling_usd!r}'
         )
-        assert config.orch_daily_cost_ceiling_usd == 200.0, (
-            f'Expected 200.0; got {config.orch_daily_cost_ceiling_usd!r}'
+        assert config.orch_daily_cost_ceiling_usd == 10000.0, (
+            f'Expected 10000.0; got {config.orch_daily_cost_ceiling_usd!r}'
         )
 
     def test_config_overridable(self, monkeypatch, tmp_path: Path) -> None:

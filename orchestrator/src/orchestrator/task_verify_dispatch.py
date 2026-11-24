@@ -43,9 +43,14 @@ from orchestrator.task_verify_spec import (
 )
 from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_admission_gate import AdmissionPlan
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
-from orchestrator.verify_plan import derive_verify_plan, executed_module_prefixes
+from orchestrator.verify_plan import (
+    derive_verify_plan,
+    executed_module_prefixes,
+    with_artifact_consumer_modules,
+)
 from orchestrator.verify_runner import RunnerUnavailable
 
 if TYPE_CHECKING:
@@ -79,7 +84,8 @@ class TaskVerifyPort(Protocol):
 
 
 class LocalVerifyPort(TaskVerifyPort, Protocol):
-    """``run_scoped_verification``'s shape with the plan a verify moved between hosts keeps."""
+    """``run_scoped_verification``'s shape with the plan a verify moved between hosts keeps,
+    and the verify-result cache a local verdict joins."""
 
     async def __call__(
         self,
@@ -95,6 +101,7 @@ class LocalVerifyPort(TaskVerifyPort, Protocol):
         role: Literal['task'] = 'task',
         event_store: EventStore | None = None,
         admission_plan: AdmissionPlan | None = None,
+        verify_cache: CacheAccess | None = None,
     ) -> VerifyResult: ...
 
 
@@ -282,11 +289,22 @@ class _VerifyCall:
     force_workspace: bool
     role: Literal['task']
     event_store: EventStore | None
+    verify_cache: CacheAccess | None
 
     async def run(
         self, port: LocalVerifyPort, *, admission_plan: AdmissionPlan | None = None,
     ) -> VerifyResult:
-        """Call *port*; the plan keyword is passed only when a plan is carried."""
+        """Call *port* joined to the dispatcher's task-role verify cache (A3); the plan
+        keyword is passed only when a plan is carried."""
+        return await self._call(port, admission_plan, self.verify_cache)
+
+    async def run_outside_cache(self, port: LocalVerifyPort) -> VerifyResult:
+        """Call *port* with no verify cache, so its verdict is one it ran."""
+        return await self._call(port, None, None)
+
+    async def _call(
+        self, port: LocalVerifyPort, admission_plan: AdmissionPlan | None, verify_cache: CacheAccess | None,
+    ) -> VerifyResult:
         plan = {} if admission_plan is None else {'admission_plan': admission_plan}
         return await port(
             self.worktree, self.config, self.module_configs,
@@ -297,15 +315,20 @@ class _VerifyCall:
             force_workspace=self.force_workspace,
             role=self.role,
             event_store=self.event_store,
+            verify_cache=verify_cache,
             **plan,
         )
 
 
 @dataclass(frozen=True)
 class _TaskScope:
+    """*module_configs* is the task's set widened by its behavioural-artifact
+    consumers: the one set eligibility and the remote spec both use."""
+
     tip_sha: str
     base_sha: str | None
     task_files: tuple[str, ...]
+    module_configs: tuple[ModuleConfig, ...]
     executed_prefixes: frozenset[str]
 
 
@@ -462,11 +485,13 @@ class TaskVerifyDispatcher(DispatchRecords):
         *,
         policy_of: Callable[[OrchestratorConfig], TaskVerifyPolicy],
         run_local: LocalVerifyPort = run_scoped_verification,
+        verify_cache: CacheAccess | None = None,
     ) -> None:
         self._pool = pool
         self._git_ops = git_ops
         self._policy_of = policy_of
         self._run_local = run_local
+        self._verify_cache = verify_cache
         self._decisions: dict[tuple[str, int], DispatchDecision] = {}
         self._warned_overrides: set[CollapsedOverride] = set()
         self._remote_verdicts = 0
@@ -487,7 +512,7 @@ class TaskVerifyDispatcher(DispatchRecords):
     ) -> VerifyResult:
         call = _VerifyCall(
             worktree, config, module_configs, task_files, attempt_id, task_id,
-            archive_root, force_workspace, role, event_store,
+            archive_root, force_workspace, role, event_store, self._verify_cache,
         )
         policy = self._policy_of(config)
         if policy.host_policy == 'local':
@@ -622,7 +647,10 @@ class TaskVerifyDispatcher(DispatchRecords):
         if not (cross or confirm):
             return remote
         draft.runner = self._pool.local_name
-        local = await self._run_local_because(call, draft, 'cross_check' if cross else 'red_confirm')
+        draft.reason = 'cross_check' if cross else 'red_confirm'
+        # Outside the cache: a parity re-run checks the remote verdict by running
+        # it, and a replayed green would check nothing.
+        local = await call.run_outside_cache(self._run_local)
         if cross:
             draft.cross_check = CrossCheck(remote_passed=remote.passed, local_passed=local.passed)
         if confirm:
@@ -632,7 +660,7 @@ class TaskVerifyDispatcher(DispatchRecords):
     async def _run_local_because(
         self, call: _VerifyCall, draft: _DecisionDraft, reason: DispatchReason,
     ) -> VerifyResult:
-        """Run local under a fresh plan: before any remote queueing, and for parity re-runs (row 39)."""
+        """Run local under a fresh plan, before any remote queueing."""
         draft.reason = reason
         return await call.run(self._run_local)
 
@@ -648,7 +676,7 @@ class TaskVerifyDispatcher(DispatchRecords):
             if await self._git_ops.has_uncommitted_work(call.worktree):
                 return 'dirty_tree'
             spec = build_task_verify_spec(
-                call.config, call.module_configs, scope.task_files,
+                call.config, scope.module_configs, scope.task_files,
                 force_workspace=False, attempt_id=call.attempt_id,
                 task_id=call.task_id, tip_sha=scope.tip_sha,
             )
@@ -702,11 +730,14 @@ class TaskVerifyDispatcher(DispatchRecords):
         base_sha = await self._git_ops.merge_base_with_main(tip_sha)
         files = await self._task_files(call, tip_sha, base_sha)
         existing = [f for f in files if (call.worktree / f).is_file()]
+        modules = tuple(with_artifact_consumer_modules(
+            call.config, call.module_configs, existing, 'task',
+        ))
         plan = derive_verify_plan(
-            existing, list(call.module_configs), call.config,
+            existing, list(modules), call.config,
             _worktree_reader(call.worktree), role='task',
         )
-        return _TaskScope(tip_sha, base_sha, files, executed_module_prefixes(plan))
+        return _TaskScope(tip_sha, base_sha, files, modules, executed_module_prefixes(plan))
 
     async def _task_files(
         self, call: _VerifyCall, tip_sha: str, base_sha: str | None,
@@ -718,7 +749,7 @@ class TaskVerifyDispatcher(DispatchRecords):
         return tuple(await self._git_ops.get_changed_files(base_sha, tip_sha))
 
     def _eligible(self, call: _VerifyCall, policy: TaskVerifyPolicy, scope: _TaskScope) -> bool:
-        collapsed = collapsed_module_overrides(call.module_configs)
+        collapsed = collapsed_module_overrides(scope.module_configs)
         for override in collapsed:
             self._warn_once(override)
         files_derivable = call.task_files is not None or scope.base_sha is not None

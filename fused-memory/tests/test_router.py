@@ -1,10 +1,12 @@
 """Tests for ReadRouter: heuristic routing and LLM routing over an injected client."""
 
 import pytest
+from _mock_openai_server import mock_openai_server
 from _sdk_client_stubs import completion_client
 
 from fused_memory.models.enums import QueryType, SourceStore
-from fused_memory.routing.router import ReadRouter
+from fused_memory.routing.openai_client import routing_chat_params
+from fused_memory.routing.router import ROUTING_SYSTEM_PROMPT, ReadRouter
 
 
 @pytest.fixture
@@ -136,3 +138,48 @@ class TestLLMRouting:
 
         client.chat.completions.create.assert_awaited_once()
         assert result.query_type == QueryType.broad
+
+
+_LUNA_REQUEST = {'model': 'gpt-6-luna', 'reasoning_effort': 'low', 'max_completion_tokens': 256}
+_TODAYS_REQUEST = {'model': 'gpt-4o-mini', 'temperature': 0.0, 'max_tokens': 256}
+
+
+class TestTheRoutingRequest:
+    """route() sends routing_chat_params(config) and its messages, nothing else (task 9945)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('pin', 'expected'),
+        [pytest.param({}, _TODAYS_REQUEST, id='today'),
+         pytest.param({'model': 'gpt-6-luna', 'reasoning_effort': 'low'}, _LUNA_REQUEST, id='luna-low')],
+    )
+    async def test_the_request_is_the_routing_call_and_the_messages(self, llm_config, pin, expected):
+        for leaf, value in pin.items():
+            setattr(llm_config.routing, leaf, value)
+        client = completion_client('{"query_type": "temporal", "stores": ["graphiti"]}')
+        router = ReadRouter(llm_config, openai_client=client)
+
+        await router.route('q' * 1500)
+
+        messages = [
+            {'role': 'system', 'content': ROUTING_SYSTEM_PROMPT},
+            {'role': 'user', 'content': 'q' * 1000},
+        ]
+        sent = client.chat.completions.create.call_args.kwargs
+        assert sent == expected | {'messages': messages}
+        assert sent == routing_chat_params(llm_config) | {'messages': messages}
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_model_without_its_endpoint_degrades_to_broad_and_sends_nothing(self, llm_config):
+        """The leaves unset (a missing ${OPENAI_PLAN_PROXY_*}) never fall back onto the llm provider."""
+        with mock_openai_server() as server:
+            llm_config.llm.providers.openai.api_url = server.base_url
+            llm_config.routing.model = 'gpt-6-luna'
+            router = ReadRouter(llm_config)
+
+            result = await router.route('some query')
+            await router.close()
+
+            assert server.requests_to('/chat/completions') == []
+        assert result.query_type == QueryType.broad
+        assert result.stores == [SourceStore.graphiti, SourceStore.mem0]

@@ -27,7 +27,13 @@ from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 @pytest.fixture
 def harness(tmp_path: Path, mock_orch_config) -> Harness:
-    """Real Harness with a real EscalationQueue; other internals mocked."""
+    """Real Harness with a real EscalationQueue; other internals mocked.
+
+    Its project_root (tmp_path) is not a git repository, so the task-3876
+    predicate re-test reads as unmeasurable and keeps the halt (fail-safe); the
+    clean and dirty directions are covered in test_merge_halt_rehydration.py and
+    test_harness_merge_halt_rehydration.py.
+    """
     mock_orch_config.orphan_l0_reaper_enabled = False
 
     with (
@@ -48,6 +54,7 @@ def _make_wip_esc(
     *,
     category: str = 'wip_conflict',
     timestamp: str | None = None,
+    worktree: str | None = None,
 ) -> Escalation:
     kwargs: dict = dict(
         id=queue.make_id(task_id),
@@ -59,6 +66,7 @@ def _make_wip_esc(
         detail='detail',
         suggested_action='manual_intervention',
         level=1,
+        worktree=worktree,
     )
     if timestamp is not None:
         kwargs['timestamp'] = timestamp
@@ -187,7 +195,8 @@ class TestHaltOwnerUnhaltPredicate:
 class TestRehydrateMergeHalt:
     """Harness._rehydrate_merge_halt restores halt+owner from preserved L1s on restart."""
 
-    def test_rehydrate_restores_halt_and_owner_from_preserved_wip_conflict(
+    @pytest.mark.asyncio
+    async def test_rehydrate_restores_halt_and_owner_from_preserved_wip_conflict(
         self, harness: Harness
     ):
         """Core regression: after restart with a preserved wip_conflict L1,
@@ -202,13 +211,14 @@ class TestRehydrateMergeHalt:
 
         esc = _make_wip_esc(queue, '1111')  # level-1, wip_conflict (preserved L1)
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert worker.is_wip_halted is True
         assert worker.halt_owner_esc_id == esc.id
         assert result == esc.id
 
-    def test_rehydrate_restores_from_unmerged_state(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_rehydrate_restores_from_unmerged_state(self, harness: Harness):
         """Single preserved level-1 unmerged_state L1 restores halt+owner."""
         worker = _FakeMergeWorker()
         harness._merge_worker = worker  # type: ignore[assignment]
@@ -217,13 +227,14 @@ class TestRehydrateMergeHalt:
 
         esc = _make_wip_esc(queue, '2222', category='unmerged_state')
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert worker.is_wip_halted is True
         assert worker.halt_owner_esc_id == esc.id
         assert result == esc.id
 
-    def test_rehydrate_restores_from_stash_failed(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_rehydrate_restores_from_stash_failed(self, harness: Harness):
         """Single preserved level-1 stash_failed L1 restores halt+owner.
 
         stash_failed is a main-checkout-hygiene halt category (task 2758),
@@ -239,18 +250,19 @@ class TestRehydrateMergeHalt:
 
         esc = _make_wip_esc(queue, '2758', category='stash_failed')
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert worker.is_wip_halted is True
         assert worker.halt_owner_esc_id == esc.id
         assert result == esc.id
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('setup', [
         'empty_queue',
         'wrong_category',
         'wrong_level',
     ])
-    def test_rehydrate_noop_when_no_relevant_l1(
+    async def test_rehydrate_noop_when_no_relevant_l1(
         self, harness: Harness, setup: str
     ):
         """No qualifying L1 means no-op: worker stays un-halted, result is None."""
@@ -279,13 +291,14 @@ class TestRehydrateMergeHalt:
             )
             queue.submit(esc)
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert worker.is_wip_halted is False
         assert worker.halt_owner_esc_id is None
         assert result is None
 
-    def test_rehydrate_picks_most_recent_l1(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_rehydrate_picks_most_recent_l1(self, harness: Harness):
         """When two preserved L1s qualify, the most recent by timestamp wins."""
         worker = _FakeMergeWorker()
         harness._merge_worker = worker  # type: ignore[assignment]
@@ -299,14 +312,15 @@ class TestRehydrateMergeHalt:
             queue, '6666', timestamp='2026-05-27T11:00:00+00:00'
         )
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         # The most recent escalation must own the halt
         assert worker.halt_owner_esc_id == esc_newer.id
         assert result == esc_newer.id
         _ = esc_older  # referenced for clarity
 
-    def test_rehydrate_logs_warning_for_multiple_l1s(
+    @pytest.mark.asyncio
+    async def test_rehydrate_logs_warning_for_multiple_l1s(
         self, harness: Harness, caplog: pytest.LogCaptureFixture
     ):
         """When multiple qualifying L1s exist, a warning pinning the premature-
@@ -322,7 +336,7 @@ class TestRehydrateMergeHalt:
         _make_wip_esc(queue, '7003', timestamp='2026-05-27T11:00:00+00:00')
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            harness._rehydrate_merge_halt()
+            await harness._rehydrate_merge_halt()
 
         # The multi-L1 advisory warning must appear in the log output
         advisory_msgs = [
@@ -339,7 +353,8 @@ class TestRehydrateMergeHalt:
         assert worker.is_wip_halted
         assert worker.halt_owner_esc_id is not None
 
-    def test_rehydrate_against_real_speculative_merge_worker(
+    @pytest.mark.asyncio
+    async def test_rehydrate_against_real_speculative_merge_worker(
         self, harness: Harness
     ):
         """Integration guard: _rehydrate_merge_halt works with the real
@@ -360,7 +375,7 @@ class TestRehydrateMergeHalt:
 
         esc = _make_wip_esc(queue, '8888')
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert real_worker.is_wip_halted is True, (
             'Real SpeculativeMergeWorker must be halted after rehydration'
@@ -383,10 +398,11 @@ class TestRehydrateMergeHalt:
     # bringing the merge queue back UN-halted over a dirty project_root.
     # -----------------------------------------------------------------
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'category', ['wip_conflict', 'unmerged_state', 'stash_failed'],
     )
-    def test_rehydrate_restores_from_parked_l2(
+    async def test_rehydrate_restores_from_parked_l2(
         self, harness: Harness, category: str,
     ):
         """A halt owner promoted L1 -> L2 by ``park()`` still re-asserts the
@@ -420,7 +436,7 @@ class TestRehydrateMergeHalt:
         assert worker.is_wip_halted is False
         assert worker.halt_owner_esc_id is None
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert worker.is_wip_halted is True, (
             f'a parked (L2) {category} halt owner must still re-assert the '
@@ -430,10 +446,11 @@ class TestRehydrateMergeHalt:
         assert worker.halt_owner_esc_id == parked.id
         assert result == parked.id
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'category', ['wip_conflict', 'unmerged_state', 'stash_failed'],
     )
-    def test_parking_halt_owner_keeps_halt_live_and_after_restart(
+    async def test_parking_halt_owner_keeps_halt_live_and_after_restart(
         self, harness: Harness, category: str,
     ):
         """One record, one meaning: a PARKED halt owner still blocks — live AND
@@ -487,18 +504,19 @@ class TestRehydrateMergeHalt:
         harness._merge_worker = restarted  # type: ignore[assignment]
         assert restarted.is_wip_halted is False
 
-        assert harness._rehydrate_merge_halt() == parked.id
+        assert await harness._rehydrate_merge_halt() == parked.id
         assert restarted.is_wip_halted is True
         assert restarted.halt_owner_esc_id == parked.id
 
         # ── and resolution — the ONE unhalt edge — still releases it ──────
-        queue.resolve(parked.id, 'operator cleaned project_root', resolved_by='test')
+        queue.resolve(parked.id, 'operator cleaned project_root', resolved_by='test', resolution_class='actionable')
         assert restarted.is_wip_halted is False, (
             'resolving the parked record is the sole unhalt edge and must '
             'still work after the promotion'
         )
 
-    def test_rehydrate_mixed_levels_picks_most_recent(
+    @pytest.mark.asyncio
+    async def test_rehydrate_mixed_levels_picks_most_recent(
         self, harness: Harness, caplog: pytest.LogCaptureFixture,
     ):
         """With a pending L1 and a NEWER parked L2 both qualifying, the L2 wins.
@@ -524,7 +542,7 @@ class TestRehydrateMergeHalt:
         harness._merge_worker = worker  # type: ignore[assignment]
 
         with caplog.at_level(logging.WARNING):
-            result = harness._rehydrate_merge_halt()
+            result = await harness._rehydrate_merge_halt()
 
         assert result == esc_newer.id, (
             'the newer PARKED record must win over the older pending L1'
@@ -540,7 +558,8 @@ class TestRehydrateMergeHalt:
         )
         _ = esc_older  # referenced for clarity
 
-    def test_rehydrate_parked_l2_against_real_speculative_merge_worker(
+    @pytest.mark.asyncio
+    async def test_rehydrate_parked_l2_against_real_speculative_merge_worker(
         self, harness: Harness,
     ):
         """Anti-drift for the promoted-record path.
@@ -564,7 +583,7 @@ class TestRehydrateMergeHalt:
         assert real_worker.is_wip_halted is False
         assert real_worker.halt_owner_esc_id is None
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert real_worker.is_wip_halted is True, (
             'Real SpeculativeMergeWorker must be halted after rehydrating a '

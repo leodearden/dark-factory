@@ -1,0 +1,40 @@
+# context 2026-11-19T07:11:22Z
+main 14d11c7ca6f7eac532a9e60f000036b916ef9c8e
+nproc 32
+loadavg(not a demand signal; recorded for context) 442.24 403.39 379.59 196/12417 1392125
+app.slice cpu.weight=100
+df.slice cpu.weight=100
+reify.slice cpu.weight=100
+session.slice cpu.weight=100
+background.slice cpu.weight=30
+df.slice/df-dark_factory.slice cpu.weight=100
+  df-verify-dark-factory-c889f090-021894909503.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-0f55c570cc4f.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-187c7f0843be.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-2083ddf9f3d9.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-314aef80a0aa.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-3ba12c073d7b.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-903b5bc7faa6.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-a33da70ceb6b.scope cpu.weight=100
+  df-verify-dark-factory-c889f090-ca54e25d861f.scope cpu.weight=100
+  df-verify-dark-factory-c889f090-d177752adb1f.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-d7f96e15f4be.scope cpu.weight=33
+  df-verify-dark-factory-c889f090-dfe35a96e930.scope cpu.weight=33
+df.slice/df-reify.slice cpu.weight=100
+  df-verify-reify-4ae45bbd-546a9a79fa6c.scope cpu.weight=33
+df.slice/df-solar_challenge_platform.slice cpu.weight=100
+  df-verify-solar-challenge-platform-74bd33ed-72de1a501fa0.scope cpu.weight=33
+  df-verify-solar-challenge-platform-74bd33ed-b678fa7a7028.scope cpu.weight=100
+df.slice/df-solar_challenge.slice cpu.weight=100
+  df-verify-solar-challenge-e0fb1248-6a48fa7243cd.scope cpu.weight=33
+app.slice subtree_control: cpu memory pids
+df.slice subtree_control: cpu memory pids
+app.slice/orchestrator-autopilot-video.service cpu.weight=100
+app.slice/orchestrator-dark-factory.service cpu.weight=100
+app.slice/orchestrator-know-live.service cpu.weight=100
+app.slice/orchestrator-my-solar-challenge.service cpu.weight=100
+app.slice/orchestrator-pump-web-ui.service cpu.weight=100
+app.slice/orchestrator-reify.service cpu.weight=100
+app.slice/orchestrator-scoping-intake.service cpu.weight=100
+app.slice/orchestrator-solar-challenge-platform.service cpu.weight=100
+app.slice/orchestrator-stream-touch.service cpu.weight=100

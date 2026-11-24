@@ -165,7 +165,7 @@ class TestProvenanceConflictSinkShouldSkip:
 
         escalation_id = _record(sink)
         assert escalation_id is not None
-        queue.resolve(escalation_id, 'operator resolved the provenance conflict')
+        queue.resolve(escalation_id, 'operator resolved the provenance conflict', resolution_class='actionable')
 
         assert sink.should_skip('42') is False
 
@@ -184,7 +184,7 @@ class TestProvenanceConflictSinkShouldSkip:
 
         escalation_id = _record(sink)
         assert escalation_id is not None
-        queue.resolve(escalation_id, 'operator resolved the provenance conflict')
+        queue.resolve(escalation_id, 'operator resolved the provenance conflict', resolution_class='actionable')
 
         assert sink.should_skip('42') is False
         assert '42' not in sink._memo, (
@@ -420,7 +420,7 @@ class TestArbitrationPendingReopenAtArm:
         sink = ProvenanceConflictSink(escalation_queue=queue)
         escalation_id = _record(sink)
         assert escalation_id is not None
-        assert queue.resolve(escalation_id, 'operator arbitrated') is not None
+        assert queue.resolve(escalation_id, 'operator arbitrated', resolution_class='actionable') is not None
 
         # The unfiltered read: the resolved row now lives in the archive tier.
         unfiltered = queue.get_by_task('42')

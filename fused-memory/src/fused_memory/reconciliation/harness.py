@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -83,9 +84,9 @@ from fused_memory.reconciliation.overreach_flags import (
     acknowledge_overreach_flags,
     fetch_overreach_flags,
 )
-from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.predecessor_drain_recovery import recover_predecessor_drains
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
+from fused_memory.reconciliation.reserve_step_aside import ReserveStepAside, StepAsideSite
 from fused_memory.reconciliation.scope_freshness import (
     ScopeFreshnessResult,
     compute_scope_signature,
@@ -106,17 +107,10 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     write_stage2_cycle_summary,
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    ESCALATION_CATEGORY as TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
-)
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    TASK_COUNT_SNAPSHOT_MISS_THRESHOLD,
-    build_stale_snapshot_finding,
-    evaluate_snapshot_cadence,
-    extract_snapshot_written,
-)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    TaskTreeUnavailableReason,
+    available_tree,
     cross_verify_task_counts,
     diff_status_correction,
     filter_task_tree,
@@ -224,10 +218,6 @@ _RECON_DEDUP_CONFIG = (
             # _record_phantom_citation_finding_drop).  Same fold rationale as
             # the two storm categories above it.
             'recon_remediation_phantom_citation_storm',
-            # Task 2278: stable per-project finding identity (build_stale_snapshot_finding)
-            # so a sustained task_count_snapshot cadence gap folds into a single pending
-            # escalation per project instead of firing once per cycle.
-            TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
         ),
     )
     if HAS_ESCALATION else None
@@ -246,6 +236,17 @@ logger = logging.getLogger(__name__)
 # commits). Exceeding the cap is WARN-logged so a wedged judge is visible rather
 # than silently re-run each restart.
 _JUDGE_RECOVERY_MAX_SPAWN = 20
+
+
+class _JudgeRecoveryOccasion(StrEnum):
+    """Why a judge-recovery pass runs; the value completes its log lines."""
+
+    STARTUP = 'after restart'
+    RESERVE_REFUSAL_ENDED = 'after the reserve refusal ended'
+
+
+def _judge_task_name(run_id: str) -> str:
+    return f'judge-{run_id}'
 
 # Task 1755 / PRD β: stable finding identity for the dead_owner_shielded storm alarm.
 # The fingerprint is keyed on finding['category'] / affected_ids / description
@@ -769,12 +770,9 @@ def _run_failure_record(
     failed_stage: str | None,
     error_message: str | None = None,
 ) -> dict[str, object]:
-    """The ``_error`` record both S1→S2→S3 drivers' ``except Exception``
-    handlers, and the remediation pass's cancellation handler, write for a
-    run ended by an exception, so the failure can be classified from the row
-    alone. The other ``_error`` records (run_full_cycle's cancellation, both
-    drivers' AllAccountsCapped, the stale-run reaper) are built by hand and
-    carry neither the traceback nor the sqlite keys.
+    """The ``_error`` record for a run ended by ``exc``: its type, message,
+    failed stage, traceback and SQLite classification, so the failure can be
+    classified from the row alone.
     """
     return {
         'error_type': type(exc).__name__,
@@ -783,6 +781,14 @@ def _run_failure_record(
         'traceback': ''.join(traceback.format_exception(exc)),
         **sqlite_classification(exc),
     }
+
+
+def _run_deferral_record(
+    exc: AllAccountsCappedException, *, failed_stage: str | None,
+) -> dict[str, object]:
+    """The ``_error`` record for a run deferred because every account is
+    capped: the failure record, marked ``deferred``."""
+    return {**_run_failure_record(exc, failed_stage=failed_stage), 'deferred': True}
 
 
 def _log_dropped_escalation(category: str, run_id: str, summary: str, *, reason: str) -> None:
@@ -822,6 +828,7 @@ class ReconciliationHarness:
         escalation_listener: socket.socket | None = None,
         full_cycle_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
         escalation_queue: EscalationQueue | None = None,
+        usage_gate: UsageGate | None = None,
     ):
         self.memory = memory_service
         # systemd-held listening socket for the escalation port, so it stays
@@ -927,10 +934,12 @@ class ReconciliationHarness:
         # SOONER than the bound would have — the fail-safe direction.
         self._remediation_deferrals: dict[str, int] = {}
 
-        # Usage gate (multi-account cap failover)
-        self.usage_gate: UsageGate | None = None
-        if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
+        # Usage gate (multi-account cap failover): the injected one, else one from config.
+        # Either way the harness owns it and shuts it down with itself.
+        self.usage_gate: UsageGate | None = usage_gate
+        if self.usage_gate is None and hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
+        self._reserve_step_aside = ReserveStepAside(self.usage_gate)
 
         # Judge — receives a callback that clears _halt_escalated so a
         # subsequent halt in the same process re-fires the escalation.
@@ -1380,16 +1389,20 @@ class ReconciliationHarness:
     async def _fetch_filtered_task_tree(self, project_root: ProjectRoot) -> FilteredTaskTree:
         """Fetch the task tree once and return a filtered subset of active tasks.
 
-        Degrades gracefully on failure — returns an empty FilteredTaskTree so
-        stages can still do useful memory work without task data. (ref: task 455)
+        Never raises: a failed fetch returns a tree whose unavailable_reason names
+        the failing branch, so stages still do useful memory work and every
+        renderer shows the tree as unavailable rather than as zero tasks.
+        (ref: task 455, task 9487)
 
         Args:
             project_root: Absolute path to the project root for taskmaster.
 
         Returns:
             FilteredTaskTree with active tasks sorted by priority and aggregate
-            counts. Returns empty FilteredTaskTree if taskmaster is unavailable,
-            project_root is empty, non-absolute, or the fetch fails.
+            counts. When taskmaster is unavailable, project_root is empty or
+            non-absolute, or the fetch fails, returns a tree with no tasks whose
+            unavailable_reason is taskmaster_disabled, empty_project_root,
+            non_absolute_project_root or fetch_error respectively.
             Non-absolute paths are rejected before calling taskmaster to avoid
             silent failures from the backend's absolute-path validator.
 
@@ -1408,20 +1421,20 @@ class ReconciliationHarness:
                 'reconciliation.task_tree_taskmaster_disabled',
                 extra={'project_root': project_root},
             )
-            return FilteredTaskTree()
+            return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.taskmaster_disabled)
         if not project_root:
             logger.info(
                 'reconciliation.task_tree_empty_project_root',
                 extra={'project_root_repr': repr(project_root)},
             )
-            return FilteredTaskTree()
+            return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.empty_project_root)
         if not os.path.isabs(project_root):
             logger.warning(
                 '_fetch_filtered_task_tree rejected non-absolute project_root %r'
-                ' — cannot fetch tasks; Stage 2 will see empty tree',
+                ' — cannot fetch tasks; Stage 2 will see the tree as unavailable',
                 project_root,
             )
-            return FilteredTaskTree()
+            return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.non_absolute_project_root)
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             raw_count = len(tasks_data.get('tasks', []))
@@ -1452,7 +1465,7 @@ class ReconciliationHarness:
             logger.warning(
                 f'_fetch_filtered_task_tree failed for {project_root!r}: {exc}'
             )
-            return FilteredTaskTree()
+            return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.fetch_error)
 
     async def _fetch_task_count_census(self, project_root: ProjectRoot) -> dict[str, str]:
         """Fetch the authoritative {id: status} map from taskmaster.get_statuses_fresh().
@@ -1870,10 +1883,9 @@ class ReconciliationHarness:
                 'source': 'stage1_status_correction',
             }
             content = (
-                f'Stage 1 status-correction reconciliation: the cached '
-                f'project_status_correction memory diverged from the authoritative '
-                f"get_statuses census: done={live['done']} total={live['total']} "
-                f"active={len(live['active_tasks'])}."
+                'Stage 1 status-correction reconciliation: the cached '
+                'project_status_correction record disagreed with the live task '
+                'census and was superseded.'
             )
             # Add-then-delete: guarantees at least one correct memory always exists
             # even if a delete below fails — the fresh memory (supersedes=[<old_id>])
@@ -2529,11 +2541,12 @@ class ReconciliationHarness:
                 project_id=None,
                 project_root=None,
             ),
-            # This store serves every project, so create_server leaves the guard
-            # unscoped (resolver='no_project') until task 6910 scopes it per call.
             prefix_resolver=lambda project_id, prefix: IdResolver.for_memory_service(
                 self.memory
             ).resolve_prefix(project_id, prefix),
+            # This store serves every project, so each call is scoped by its
+            # stage's X-Escalation-Project header, honoured only for a known project.
+            per_call_projects=frozenset(self._known_projects),
         )
         host = self.config.escalation_host
         port = self.config.escalation_port
@@ -2572,7 +2585,7 @@ class ReconciliationHarness:
             logger.info('Reconciliation escalation server stopped')
 
     async def _shutdown_usage_gate(self) -> None:
-        """Tear down the usage gate built in ``__init__``, best-effort."""
+        """Tear down the usage gate, best-effort: the one built from config or the one injected."""
         if self.usage_gate is None:
             return
         try:
@@ -2663,7 +2676,7 @@ class ReconciliationHarness:
                 task_id=f'recon-{run_id[:8]}',
                 agent_role='reconciliation-harness',
                 severity='info' if category in (
-                    'recon_stale_run', _RECON_INTEGRITY_ISSUE_CATEGORY, TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
+                    'recon_stale_run', _RECON_INTEGRITY_ISSUE_CATEGORY,
                 ) else 'blocking',
                 category=category,
                 summary=summary,
@@ -2992,7 +3005,7 @@ class ReconciliationHarness:
         # guarded (self.judge is not None) inside the method. Fail-safe wrapped like
         # the sibling one-shot passes so a recovery hiccup never crashes the loop.
         try:
-            await self._recover_pending_judge_reviews()
+            await self._recover_pending_judge_reviews(why=_JudgeRecoveryOccasion.STARTUP)
         except Exception as e:
             logger.warning(f'_recover_pending_judge_reviews at startup failed: {e}')
 
@@ -3122,6 +3135,10 @@ class ReconciliationHarness:
                 logger.info('reconciliation.drain_ack', extra={'project_id': project_id})
                 return
             try:
+                # Asked before should_trigger, which consumes a manual trigger.
+                if await self.reserve_steps_aside(project_id, site=StepAsideSite.PROJECT_LOOP):
+                    await _sleep(5)
+                    continue
                 should, reason = await self.buffer.should_trigger(project_id)
                 if not should:
                     idle_ticks += 1
@@ -3310,8 +3327,24 @@ class ReconciliationHarness:
             except Exception as e:
                 logger.warning(f'Heartbeat failed for {project_id}: {e}')
 
-    async def _spawn_judge(self, run_id: str, project_id: str) -> None:
-        """Durably mark a judge review pending, then fire a tracked judge task.
+    async def reserve_steps_aside(self, project_id: str, *, site: StepAsideSite) -> bool:
+        """Whether *site* defers now because the allowance reserve refuses reconciliation.
+
+        The policy is fused_memory/reconciliation/reserve_step_aside.py's. On the
+        first check after a refusal ends, the judges it left pending are recovered.
+        """
+        check = self._reserve_step_aside.check(project_id, site=site)
+        if check.refusal_ended:
+            try:
+                await self._recover_pending_judge_reviews(
+                    why=_JudgeRecoveryOccasion.RESERVE_REFUSAL_ENDED,
+                )
+            except Exception as e:
+                logger.warning(f'_recover_pending_judge_reviews after a reserve refusal failed: {e}')
+        return check.refused
+
+    async def _spawn_judge(self, run_id: str, project_id: str) -> bool:
+        """Durably mark a judge review pending, then fire a tracked judge task; whether one started.
 
         The single seam for both fresh cycle-end launches (run_full_cycle,
         _run_remediation_pass) and startup recovery (task 2708). Awaiting the
@@ -3320,11 +3353,24 @@ class ReconciliationHarness:
         marker is cleared atomically inside ``add_verdict``. The task is tracked
         in ``_judge_tasks`` (with a done-callback that discards it) so shutdown
         can drain it deterministically.
+
+        While the allowance reserve refuses reconciliation, no task starts and the
+        marker waits for the recovery pass the refusal's end runs. That check comes
+        before the in-flight one because the pass it runs may start this run's judge.
         """
         await self.journal.mark_judge_pending(run_id, project_id)
-        task = asyncio.create_task(self._run_judge(run_id), name=f'judge-{run_id}')
+        if await self.reserve_steps_aside(project_id, site=StepAsideSite.JUDGE):
+            return False
+        if self._judge_in_flight(run_id):
+            return False
+        task = asyncio.create_task(self._run_judge(run_id), name=_judge_task_name(run_id))
         self._judge_tasks.add(task)
         task.add_done_callback(self._judge_tasks.discard)
+        return True
+
+    def _judge_in_flight(self, run_id: str) -> bool:
+        name = _judge_task_name(run_id)
+        return any(task.get_name() == name and not task.done() for task in self._judge_tasks)
 
     async def _drain_judge_tasks(self) -> None:
         """Cancel and await every in-flight judge task on shutdown (task 2708).
@@ -3342,12 +3388,17 @@ class ReconciliationHarness:
             await asyncio.gather(*pending, return_exceptions=True)
         self._judge_tasks.clear()
 
-    async def _recover_pending_judge_reviews(self) -> None:
+    async def _recover_pending_judge_reviews(
+        self, *, why: _JudgeRecoveryOccasion = _JudgeRecoveryOccasion.STARTUP,
+    ) -> None:
         """Re-fire the judge for every run left with a judge_pending marker (task 2708).
 
-        One-shot startup pass: a restart landing in the cycle-end→verdict-commit
+        It runs at startup: a restart landing in the cycle-end→verdict-commit
         window cancels the fire-and-forget judge before add_verdict's atomic
-        marker-clear, so the marker survives. Re-running the judge is safe — the
+        marker-clear, so the marker survives. It runs again when an allowance
+        reserve refusal ends, for the judges _spawn_judge left pending meanwhile.
+        Runs whose judge is still in flight are skipped: their markers clear only
+        when their verdicts commit. Re-running the judge is safe — the
         review is read-only over the run record, and the invariant 'marker present
         ⟹ no committed verdict' (add_verdict clears atomically) means the re-run's
         judge_verdicts INSERT never collides on the run_id PK. Routes through the
@@ -3355,7 +3406,11 @@ class ReconciliationHarness:
         """
         if self.judge is None:
             return
-        pending = await self.journal.get_pending_judge_runs()
+        pending = [
+            (run_id, project_id)
+            for run_id, project_id in await self.journal.get_pending_judge_runs()
+            if not self._judge_in_flight(run_id)
+        ]
         if not pending:
             return
         # Account-availability gate (task 2947 ask c): if a usage gate is wired
@@ -3382,19 +3437,21 @@ class ReconciliationHarness:
         to_spawn = pending[:_JUDGE_RECOVERY_MAX_SPAWN]
         if total > _JUDGE_RECOVERY_MAX_SPAWN:
             logger.warning(
-                f'{total} pending judge review(s) at startup exceeds the '
-                f'{_JUDGE_RECOVERY_MAX_SPAWN}-per-restart recovery cap — a judge may '
+                f'{total} pending judge review(s) {why} exceed the '
+                f'{_JUDGE_RECOVERY_MAX_SPAWN}-per-pass recovery cap — a judge may '
                 'be persistently failing (a judge_pending marker clears only on a '
                 f'committed verdict). Re-firing the {len(to_spawn)} oldest; the '
                 f'remaining {total - len(to_spawn)} will be recovered on '
-                'subsequent restarts.'
+                'later passes.'
             )
-        else:
-            logger.info(
-                f'Recovering {total} pending judge review(s) after restart'
-            )
-        for run_id, project_id in to_spawn:
-            await self._spawn_judge(run_id, project_id)
+        started = [
+            run_id for run_id, project_id in to_spawn if await self._spawn_judge(run_id, project_id)
+        ]
+        held = len(to_spawn) - len(started)
+        logger.info(
+            f'Recovering {len(started)} pending judge review(s) {why}'
+            + (f'; {held} stay pending while the allowance reserve refuses reconciliation' if held else '')
+        )
 
     async def _run_judge(self, run_id: str) -> None:
         """Fire-and-forget judge wrapper with error logging."""
@@ -3708,8 +3765,8 @@ class ReconciliationHarness:
                 run.completed_at = datetime.now(UTC)
                 run.status = RunStatus.completed
                 await self.journal.complete_run(run_id, 'completed')
-            except asyncio.CancelledError:
-                await self._record_cancelled_run(run, project_id, current_stage_name)
+            except asyncio.CancelledError as e:
+                await self._record_cancelled_run(run, project_id, current_stage_name, e)
                 raise
             except AllAccountsCappedException as e:
                 await self._record_deferred_run(run, project_id, current_stage_name, e)
@@ -3758,7 +3815,11 @@ class ReconciliationHarness:
                 await self._persist_stage_reports_then_gc_config_dir(run)
 
     async def _record_cancelled_run(
-        self, run: ReconciliationRun, project_id: str, current_stage_name: str | None,
+        self,
+        run: ReconciliationRun,
+        project_id: str,
+        current_stage_name: str | None,
+        exc: asyncio.CancelledError,
     ) -> None:
         """Journal a ``run_full_cycle`` cancelled before durable completion:
         failed, with its drained events restored for a later cycle. The caller
@@ -3778,12 +3839,10 @@ class ReconciliationHarness:
         """
         run_id = run.id
         run.status = RunStatus.failed
-        run.stage_reports['_error'] = {
-            'error_type': 'CancelledError',
-            'error_message': 'Run cancelled (timeout or external cancellation)',
-            'failed_stage': current_stage_name,
-            'traceback': '',
-        }
+        run.stage_reports['_error'] = _run_failure_record(
+            exc, failed_stage=current_stage_name,
+            error_message='Run cancelled (timeout or external cancellation)',
+        )
         if await self._end_run_unless_completed(
             run, project_id, current_stage_name,
             lambda: self._journal_failed_and_restore_drained(run_id, project_id),
@@ -3860,12 +3919,7 @@ class ReconciliationHarness:
         failed, with its drained events restored for a later cycle. The caller
         returns the run rather than raising."""
         run.status = RunStatus.failed
-        run.stage_reports['_error'] = {
-            'error_type': 'AllAccountsCappedException',
-            'error_message': str(exc),
-            'failed_stage': current_stage_name,
-            'deferred': True,
-        }
+        run.stage_reports['_error'] = _run_deferral_record(exc, failed_stage=current_stage_name)
         run_id = run.id
         if await self._end_run_unless_completed(
             run, project_id, current_stage_name,
@@ -3952,13 +4006,6 @@ class ReconciliationHarness:
             # Persist stage reports before judge — the judge reads from the DB,
             # so reports must be committed before firing the async task.
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
-
-            # Task 2278: structural cadence guard for the Stage-2 task_count_snapshot
-            # write — escalates once a confirmed miss has recurred for
-            # TASK_COUNT_SNAPSHOT_MISS_THRESHOLD consecutive full cycles.  Full-cycle
-            # path only (not evaluated from _maybe_remediate); reads the just-persisted
-            # stage report, so this runs after update_run_stage_reports above.
-            await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
 
             # Async judge review. Fire-and-forget: it outlives this cycle and
             # is intentionally NOT tracked by _active_runs / recon_busy (whose
@@ -4667,106 +4714,6 @@ class ReconciliationHarness:
             )
             return max(lookback, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)
 
-    async def _maybe_escalate_stale_task_count_snapshot(
-        self,
-        project_id: str,
-        run_id: str,
-        run: ReconciliationRun,
-    ) -> None:
-        """Escalate a sustained task_count_snapshot write-cadence gap.
-
-        Reads *run*'s Stage-2 freshness stat
-        (``task_count_snapshot_mem0_written``, already computed by
-        ``TaskKnowledgeSync.run()``'s post-flight check); only a CONFIRMED
-        current miss (``False`` — not a fresh write and not an
-        inconclusive/unknown check) is eligible to escalate.  A read-only
-        alias for the pre-task-3045 stat spelling was retired in task 3488,
-        once measurement confirmed no journal row inside the lookback window
-        below could still change the computed streak; a pre-rename row now
-        reads as unknown, which stops the streak rather than extending it.
-        The prior consecutive-miss streak is recomputed each call from
-        ``journal.get_recent_runs`` — mirroring ``_finding_persistence_count``'s
-        journal-recompute pattern — rather than a stored counter, so it
-        naturally resets on any successful write and survives a harness
-        restart with no new schema.
-
-        Prior runs are filtered to full-cycle COMPLETED runs only (mirrors the
-        completed filter in ``_get_prior_s3_findings``): a remediation/targeted
-        run neither counts toward nor resets the streak (the snapshot is a
-        full-cycle Stage-2 final action, so those runs' own stat reflects their
-        own window, not a genuine gap), and a failed full run is skipped so the
-        streak bridges across it to the next completed one.
-
-        Escalates category 'recon_stale_task_count_snapshot' (info severity,
-        deduped via ``_RECON_DEDUP_CONFIG.infra_dedupe_categories`` on the
-        stable per-project ``build_stale_snapshot_finding`` identity) once the
-        streak reaches ``TASK_COUNT_SNAPSHOT_MISS_THRESHOLD``.  Skipped
-        entirely for projects where ``is_snapshot_write_blocked`` — a missing
-        snapshot there is correct-by-design, not a gap. That check runs
-        FIRST, before the current-stat read or the ``journal.get_recent_runs``
-        call, so a blocked project incurs no per-cycle journal query or
-        streak recompute (amendment round: reviewer finding, efficiency).
-
-        Fails open — never raises — mirroring ``_get_prior_s3_findings`` /
-        ``_check_graphiti_queue_health``, so a journal hiccup never aborts a
-        reconciliation cycle.  Wired into ``run_full_cycle`` only, after the
-        Stage-2 report is persisted — NOT evaluated during remediation passes.
-
-        Task 2278.
-        """
-        if not HAS_ESCALATION:
-            return
-        try:
-            if is_snapshot_write_blocked(project_id):
-                return
-            current = extract_snapshot_written(run.stage_reports.get('task_knowledge_sync'))
-            if current is not False:
-                return
-            recent = await self.journal.get_recent_runs(
-                project_id, limit=max(20, TASK_COUNT_SNAPSHOT_MISS_THRESHOLD * 4),
-            )
-            prior_runs = [
-                r for r in recent
-                if getattr(r, 'id', None) != run_id
-                and str(getattr(r, 'run_type', '')) == RunType.full
-                and str(getattr(r, 'status', '')) == 'completed'
-            ]
-            # Defensive re-sort: get_recent_runs already orders by started_at DESC,
-            # but the filtered subset's ordering is re-asserted here rather than
-            # assumed, since compute_snapshot_miss_streak depends on most-recent-first.
-            prior_runs.sort(
-                key=lambda r: getattr(r, 'started_at', None) or datetime.min.replace(tzinfo=UTC),
-                reverse=True,
-            )
-            prior_flags = [
-                extract_snapshot_written(r.stage_reports.get('task_knowledge_sync'))
-                for r in prior_runs
-            ]
-            result = evaluate_snapshot_cadence(
-                current, prior_flags, blocked=is_snapshot_write_blocked(project_id),
-            )
-            if result['escalate']:
-                self._escalate(
-                    TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
-                    run_id,
-                    summary=(
-                        f'task_count_snapshot stale for {result["streak"]} consecutive '
-                        f'full cycles (project {project_id})'
-                    ),
-                    detail=(
-                        'Reconciliation Stage 2 has not confirmed a fresh '
-                        'task_count_snapshot Mem0 write within the run window for '
-                        f'{result["streak"]} consecutive completed full reconciliation '
-                        f'cycles for project {project_id!r}.'
-                    ),
-                    finding=build_stale_snapshot_finding(project_id),
-                )
-        except Exception as e:
-            logger.warning(
-                'reconciliation.stale_task_count_snapshot_check_failed',
-                extra={'project_id': project_id, 'run_id': run_id, 'error': str(e)},
-            )
-
     def _log_non_actionable_finding(
         self,
         project_id: str,
@@ -5386,8 +5333,9 @@ class ReconciliationHarness:
             # worktree/branch of their own — routed to DeterministicRunner) do too —
             # which status alone cannot express since 'blocked' is deliberately not in
             # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
-            # auto-unblock mid-pipeline). remediation_tree is always a valid
-            # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+            # auto-unblock mid-pipeline). A failed fetch yields a tree carrying an
+            # unavailable_reason and no tasks; available_tree maps it to None, and
+            # the map is then empty.
             #
             # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
             # scalar maps into this one: the gate now also needs `metadata` (for
@@ -5405,12 +5353,18 @@ class ReconciliationHarness:
             # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
             # status-blind, fail-safe-toward-live values for that one id, not a new
             # failure mode.
+            fetched_remediation_tree = available_tree(remediation_tree)
+            remediation_tasks: list[dict] = (
+                []
+                if fetched_remediation_tree is None
+                else [
+                    *fetched_remediation_tree.active_tasks,
+                    *fetched_remediation_tree.done_tasks,
+                    *fetched_remediation_tree.cancelled_tasks,
+                ]
+            )
             task_by_id: dict[str, dict] = {}
-            for t in (
-                list(remediation_tree.active_tasks)
-                + list(remediation_tree.done_tasks)
-                + list(remediation_tree.cancelled_tasks)
-            ):
+            for t in remediation_tasks:
                 if not isinstance(t, dict) or t.get('id') is None:
                     continue
                 task_by_id[str(t.get('id'))] = t
@@ -5978,9 +5932,10 @@ class ReconciliationHarness:
                                 #
                                 # `task_by_id and ...` is load-bearing, and is
                                 # the ONE place this gate deliberately fails
-                                # OPEN.  `_fetch_filtered_task_tree` degrades to
-                                # an EMPTY tree whenever taskmaster is disabled
-                                # or the fetch fails, and an empty map is not
+                                # OPEN.  `_fetch_filtered_task_tree` returns a
+                                # tree carrying an unavailable_reason and no
+                                # tasks whenever taskmaster is disabled or the
+                                # fetch fails, so the map is empty, and that is not
                                 # evidence that a task is absent — it is evidence
                                 # that we do not know.  Treating "no tree" as
                                 # "no such task" would silently switch this whole
@@ -6088,12 +6043,7 @@ class ReconciliationHarness:
             raise
         except AllAccountsCappedException as e:
             run.status = RunStatus.failed
-            run.stage_reports['_error'] = {
-                'error_type': 'AllAccountsCappedException',
-                'error_message': str(e),
-                'failed_stage': current_stage_name,
-                'deferred': True,
-            }
+            run.stage_reports['_error'] = _run_deferral_record(e, failed_stage=current_stage_name)
             await self.journal.complete_run(run_id, 'failed')
             # Do NOT re-raise — parent run already completed
             # Do NOT restore events — there are none (remediation has no drained events)
@@ -6245,6 +6195,11 @@ class BacklogIterator:
                     )
                     yielded = True
                     break
+                if await self.harness.reserve_steps_aside(
+                    project_id, site=StepAsideSite.BACKLOG_CHUNK,
+                ):
+                    yielded = True
+                    break
 
                 # Peek at up to 1000 events (far more than a single budget can hold)
                 peeked = await self.buffer.peek_buffered(
@@ -6263,9 +6218,9 @@ class BacklogIterator:
                     return  # Stop iteration on failure
 
             # Final consolidation pass — skipped when the loop yielded on the
-            # cumulative budget (task 2040): the remaining backlog stays
-            # buffered for the next cycle instead of forcing an extra
-            # consolidation cycle past the budget.
+            # cumulative budget (task 2040) or on a reserve refusal (task 10432):
+            # the remaining backlog stays buffered for the next cycle instead of
+            # forcing an extra consolidation cycle.
             if chunk_num > 0 and not yielded:
                 await self._run_final_consolidation(project_id, opus_tier)
 

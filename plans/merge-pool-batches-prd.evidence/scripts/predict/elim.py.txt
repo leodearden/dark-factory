@@ -1,0 +1,57 @@
+"""C: elimination conviction on red chains. For each red chain with recorded members: follow each member's
+next attributable verdict; an elimination opportunity = all-but-one members cleared (P) before the remaining member's own verdict."""
+import json,collections,datetime as dt
+P='/tmp/gate-10069/predict/'
+R={r['rid']:r for r in json.load(open(P+'requests.json'))}; TR=json.load(open(P+'trials.json')); tv={t['vid']:t for t in TR}
+def T(s): return dt.datetime.fromisoformat(s).timestamp()
+MARK=T('2026-11-17T20:49:02+00:00'); D8528=T('2026-11-19T04:25:50+00:00')
+chains=sorted([t for t in TR if t['k']>1 and t['members']],key=lambda t:t['t'])
+def follow(rid,t):
+    r=R.get(rid); seq=[]
+    if not r: return 'U',None,'?',seq
+    for v,pos in r['trials']:
+        x=tv[v]
+        if x['t']<=t['t']: continue
+        kind=('solo' if x['k']==1 else 'k%d'%x['k'])+('P' if x['passed'] else ('F' if (x['k']>1 or x['applied']) else 'f(void)'))
+        seq.append(kind)
+        if x['k']==1 and x['passed']: return 'P',x,'solo',seq
+        if x['k']==1 and x['applied']: return 'F',x,'solo',seq
+        if x['k']>1 and x['passed']: return 'P',x,'chain',seq
+    return 'U',None,r['final_state'],seq
+tot=collections.Counter(); nextkind=collections.Counter()
+for era,lo,hi in(('pre-mark 11-15T11:19..11-17T20:49',0,MARK),('post-mark pre-8528',MARK,D8528),('post-8528',D8528,9e18)):
+    print('=====',era)
+    for t in chains:
+        if t['passed'] or not(lo<=t['t']<hi): continue
+        mem=[(R[m]['task'] if m in R else m,)+follow(m,t) for m in t['members']]
+        for m in mem:
+            first=m[4][0] if m[4] else 'none'
+            nextkind[(era,first if first.startswith('solo') else ('chain' if first.startswith('k') else 'none'))]+=1
+        nF=sum(m[1]=='F' for m in mem); nU=sum(m[1]=='U' for m in mem); k=len(mem)
+        known=[m for m in mem if m[2] is not None]
+        known.sort(key=lambda m:m[2]['t'])
+        status='-'
+        if nU==0:
+            last=known[-1]; others=known[:-1]
+            if all(o[1]=='P' for o in others):
+                status='ELIM-OPPORTUNITY: last suspect %s actual=%s via %s -> %s'%(last[0],last[1],last[3],'correct, saves 1 verify' if last[1]=='F' else 'WRONG conviction')
+                tot[(era,'elim_correct' if last[1]=='F' else 'elim_wrong')]+=1
+            else: status='no opportunity (a culprit was found before the last member)'; tot[(era,'no_opportunity')]+=1
+        elif nU==1 and all(m[1]=='P' for m in mem if m[1]!='U'):
+            u=[m for m in mem if m[1]=='U'][0]
+            status='ELIM would convict %s (its own verdict never recorded: %s)'%(u[0],u[3]); tot[(era,'elim_unknown_truth')]+=1
+        else: tot[(era,'unresolved (>=2 unknown or culprit+unknown)')]+=1
+        tot[(era,'red chains')]+=1
+        if lo>=MARK: print(' ',t['ts'][5:16],'k=%d'%k,str(t['base_relation']),'F=%d U=%d'%(nF,nU),'|',' '.join('%s:%s[%s]'%(m[0],m[1],'>'.join(m[4]) or m[3]) for m in mem),'|',status)
+for k,v in sorted(tot.items()): print(v,k)
+print('first follow-up trial kind per red-chain member:',dict(nextkind))
+# external-red rate among chains with all members' outcomes known
+for era,lo,hi in(('whole recorded window',0,9e18),('post-mark',MARK,9e18)):
+    g=sum(1 for t in chains if t['passed'] and lo<=t['t']<hi); ext=0; cul=0; unk=0
+    for t in chains:
+        if t['passed'] or not(lo<=t['t']<hi): continue
+        o=[follow(m,t)[0] for m in t['members']]
+        if 'F' in o: cul+=1
+        elif 'U' in o: unk+=1
+        else: ext+=1
+    print(f'{era}: green={g} red_with_known_culprit={cul} red_all_members_later_pass(external)={ext} red_unresolved={unk}  e=P(red|no culprit) between {ext}/{g+ext}={ext/(g+ext):.3f} and {ext+unk}/{g+ext+unk}={(ext+unk)/(g+ext+unk):.3f}')

@@ -41,6 +41,7 @@ from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 from shared.capability_manifest import CHECK_SUBJECT_FIELD, DeliveredCheckMeta
+from shared.declared_checks import declared_checks
 from shared.delivered_check_polarity import (
     GATE_REF,
     CheckOutcome,
@@ -503,8 +504,8 @@ async def gate_mark_done_on_delivered_checks(
       function documents "Never raises", but a guard must never be ABLE to crash
       a mark-done path, so a broken contract degrades to an ``errored`` block.
     """
-    checks = (metadata or {}).get('delivered_checks')
-    if not checks or not enabled:
+    declared = declared_checks(metadata)
+    if declared.is_empty or not enabled:
         # Inert, with ZERO I/O: check-less tasks keep their exact pre-guard
         # behavior, and the `enabled` kill switch is single-sourced on ONE
         # config leaf (delivered_checks.enabled) so a single hot reload
@@ -555,7 +556,7 @@ async def gate_mark_done_on_delivered_checks(
 
     try:
         verdict = await verify_delivered_checks_on_main(
-            checks,
+            list(declared.checks),
             project_root=project_root,
             main_sha=sha,
             check_timeout_secs=check_timeout_secs,
@@ -588,13 +589,17 @@ async def gate_mark_done_on_delivered_checks(
         )
         return DeliveredChecksBlock('failed', sha, verdict.failed_check)
 
-    if verdict.outcome == 'errored':
+    if verdict.outcome == 'errored' or declared.unreadable:
         # Some check could not be evaluated and none FAILED — make no claim
         # either way.
+        unreadable_note = (
+            f'; entries that are not check descriptors: {declared.unreadable!r}'
+            if declared.unreadable else ''
+        )
         log.warning(
             'Delivered-checks guard [%s]: task %s delivered-checks could not be '
-            'evaluated at main@%s (errored) — NOT marking done (fail-safe)',
-            site, task_id, sha,
+            'evaluated at main@%s (errored%s) — NOT marking done (fail-safe)',
+            site, task_id, sha, unreadable_note,
         )
         return DeliveredChecksBlock('errored', sha)
 

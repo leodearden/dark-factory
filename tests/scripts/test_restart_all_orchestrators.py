@@ -27,27 +27,20 @@ import json
 import os
 import re
 import subprocess
-import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-REPO_ROOT = Path(__file__).parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories resolve as namespace packages shadowing their own
-# src/<pkg>/ — the failure the root conftest.py docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (  # noqa: E402
+from df_pytest_isolation import (
     CLOCK_PROVENANCE_SESSION_KEY,
     CLOCK_PROVENANCE_SOURCE_KEY,
     PYTEST_SESSION_TOKEN_ENV,
     assert_synthetic_units,
 )
 
+REPO_ROOT = Path(__file__).parents[2]
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"

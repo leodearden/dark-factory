@@ -28,6 +28,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from shared.config_models import UsageCapConfig
 from test_harness_park_stop import _cost_store_factory  # noqa: F401 -- reused cross-module fixture
 
 from orchestrator.agents.invoke import AgentResult
@@ -76,7 +77,7 @@ def _fetch_invocations(db_path: Path, role: str) -> list[dict]:
 
 @pytest.fixture
 def config(tmp_path: Path) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=tmp_path)
+    return OrchestratorConfig(project_root=tmp_path, usage_cap=UsageCapConfig(enabled=False))
 
 
 @pytest.fixture

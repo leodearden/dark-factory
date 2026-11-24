@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _census_helpers import census_lines
+from _code_writer_links import assert_writes_c5, subject_task
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
@@ -18,6 +20,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.memory_metadata import is_completion_record
+from fused_memory.middleware.recall_annotation import Binding, bind_tasks
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
@@ -4188,7 +4191,7 @@ async def test_on_task_done_completion_journal_has_echo_used_provenance(
             {'id': '361', 'metadata': {}},
             {
                 'content_startswith': (
-                    "Task 'Autopilot task' transitioned to done; "
+                    "Task 'Autopilot task' was marked finished; "
                     "completion not yet verified."
                 ),
                 'content_contains': [
@@ -4243,7 +4246,7 @@ async def test_on_task_done_unverified_completion_reframe(
     (targeted.py:409-500) after the task 2622 reframe: (1) no usable
     done_provenance and no authoritative memory -- the branch-3 fallback must
     no longer assert "completed" from the unverified description, instead
-    reframing to "transitioned to done; completion not yet verified" plus an
+    reframing to "was marked finished; completion not yet verified" plus an
     `echo_unverified_completion` flag; (2) verified done_provenance (branch 2,
     task 2049) is UNCHANGED -- still asserts "completed" with the landed
     outcome; (3) an authoritative resolution memory (branch 1, task 1984) is
@@ -5615,18 +5618,12 @@ async def test_unblock_dependent_guards(
         mock_taskmaster.set_task_status.assert_not_awaited()
 
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_VETO_READER_SOURCE = 'source=targeted._unblock_veto_reason'
-
-
-def _veto_reader_discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _VETO_READER_SOURCE in m]
+_VETO_READER_SOURCE = 'targeted._unblock_veto_reason'
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'metadata, expected_type, census_lines',
+    'metadata, expected_type, expected_census_count',
     [
         pytest.param('{not json', 'dependent_unblock_applied', 1, id='unparseable_string'),
         pytest.param(42, 'dependent_unblock_applied', 1, id='non_str_value'),
@@ -5638,7 +5635,7 @@ def _veto_reader_discard_lines(caplog) -> list[str]:
 )
 async def test_unblock_veto_reader_logs_unreadable_dependent_metadata_once(
     wired_reconciler, mock_taskmaster, tmp_path, caplog,
-    metadata, expected_type, census_lines,
+    metadata, expected_type, expected_census_count,
 ):
     """Unreadable dependent metadata still reads as empty, so it raises no
     veto (the ``blocked_unparseable_metadata_treated_as_empty`` pin above),
@@ -5658,7 +5655,7 @@ async def test_unblock_veto_reader_logs_unreadable_dependent_metadata_once(
         )
 
     assert [a['type'] for a in _dep_actions_for(result, '2')] == [expected_type]
-    assert len(_veto_reader_discard_lines(caplog)) == census_lines
+    assert len(census_lines(caplog, _VETO_READER_SOURCE)) == expected_census_count
 
 
 # ── task-4903: durability of the write + per-dependent isolation ───────────
@@ -5826,8 +5823,10 @@ async def test_unblock_dependent_failure_does_not_strand_siblings(
 # ── task-4903: escalation-pin veto ──────────────────────────────────────────
 
 
-def _seed_open_escalation_pinning_task_2(project_root: str) -> str:
-    """Submit a real pending escalation pinning task '2' into the layout queue."""
+def _seed_open_escalation_on_task_2(
+    project_root: str, *, severity: str = 'blocking', level: int = 1,
+) -> str:
+    """Submit a real pending escalation on task '2' into the layout queue."""
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
@@ -5836,12 +5835,12 @@ def _seed_open_escalation_pinning_task_2(project_root: str) -> str:
         id=queue.make_id('2'),
         task_id='2',
         agent_role='harness',
-        severity='blocking',
+        severity=severity,
         category='dependency_discovered',
         summary='Task 2 blocked pending external dependency',
         detail='blocked pending review',
         suggested_action='wait',
-        level=1,
+        level=level,
     ))
 
 
@@ -5879,7 +5878,7 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
     than a hand-rolled JSON blob.
     """
     project_root = str(tmp_path)
-    esc_id = _seed_open_escalation_pinning_task_2(project_root)
+    esc_id = _seed_open_escalation_on_task_2(project_root)
 
     result = await _unblock_sweep_over_blocked_task_2(
         wired_reconciler, mock_taskmaster, project_root,
@@ -5903,7 +5902,7 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
 async def test_unblock_dependent_vetoed_by_open_escalation_in_relocated_layout_queue(
     wired_reconciler, mock_taskmaster, tmp_path, escalation_queue_relocation,
 ):
-    esc_id = _seed_open_escalation_pinning_task_2(str(tmp_path))
+    esc_id = _seed_open_escalation_on_task_2(str(tmp_path))
 
     result = await _unblock_sweep_over_blocked_task_2(
         wired_reconciler, mock_taskmaster, str(tmp_path),
@@ -5913,6 +5912,45 @@ async def test_unblock_dependent_vetoed_by_open_escalation_in_relocated_layout_q
     assert action.get('reason') == 'escalation_pinned', action
     assert action.get('escalation_ids') == [esc_id], action
     assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('level', [0, 1, 2])
+async def test_unblock_dependent_not_vetoed_by_info_only_escalation(
+    wired_reconciler, mock_taskmaster, tmp_path, level,
+):
+    """An info record is an annotation, not a handoff: it pins nothing at any
+    level (escalation/src/escalation/pins.py::classify_pins, link 1)."""
+    _seed_open_escalation_on_task_2(str(tmp_path), severity='info', level=level)
+
+    result = await _unblock_sweep_over_blocked_task_2(
+        wired_reconciler, mock_taskmaster, str(tmp_path),
+    )
+
+    [action] = _dep_actions_for(result, '2')
+    assert action['type'] == 'dependent_unblock_applied', action
+    set_task_status = wired_reconciler.task_interceptor.set_task_status
+    set_task_status.assert_awaited_once()
+    assert set_task_status.await_args.kwargs.get('task_id') == '2'
+    assert set_task_status.await_args.kwargs.get('status') == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_veto_names_only_the_pinning_escalation(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    _seed_open_escalation_on_task_2(str(tmp_path), severity='info', level=2)
+    blocking_id = _seed_open_escalation_on_task_2(str(tmp_path))
+
+    result = await _unblock_sweep_over_blocked_task_2(
+        wired_reconciler, mock_taskmaster, str(tmp_path),
+    )
+
+    [action] = _dep_actions_for(result, '2')
+    assert action['type'] == 'dependent_unblock_vetoed', action
+    assert action.get('reason') == 'escalation_pinned', action
+    assert action.get('escalation_ids') == [blocking_id], action
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -7919,3 +7957,137 @@ class TestStaleStatusSnapshotTransitionTrigger:
         assert rows[0]['detail']['task_id'] == '1'
         assert rows[0]['detail']['invalidated'] == 1
         assert rows[0]['detail']['candidate_edges'] == 1
+
+
+# ---------------------------------------------------------------------------
+# C5 (plans/live-task-facts-at-recall-prd.md): the two notes _on_task_done
+# writes link their task structurally and name no task status. Fixture text is
+# status-neutral, so any status word found came from a template.
+# ---------------------------------------------------------------------------
+
+
+class TestDoneNotesLinkTheirTask:
+    PROJECT = 'test-project'
+    TASK_ID = '4102'
+    TASK_BEFORE = {
+        'id': '4102', 'title': 'Wire the census',
+        'description': 'Adds a census of memory writers', 'details': 'One row per write site',
+    }
+    SUBJECT = subject_task(PROJECT, TASK_ID)
+
+    async def _reconcile_done(self, reconciler) -> dict:
+        return await reconciler.reconcile_task(
+            task_id=self.TASK_ID, transition='done', project_id=self.PROJECT,
+            project_root='/tmp/test', task_before=self.TASK_BEFORE,
+        )
+
+    @staticmethod
+    def _writes(mock_memory_service, marker_key: str) -> list[dict]:
+        return [
+            call.kwargs for call in mock_memory_service.add_memory.call_args_list
+            if marker_key in (call.kwargs.get('metadata') or {})
+        ]
+
+    @staticmethod
+    def _verifier_says(reconciler, verdict: VerificationVerdict) -> None:
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=verdict, confidence=0.9,
+            evidence=[{'file_path': 'census.py', 'snippet': 'CENSUS = {}'}],
+            summary='The census table lives in census.py',
+        ))
+
+    @pytest.mark.asyncio
+    async def test_the_echo_with_provenance_links_its_task(
+        self, reconciler, mock_memory_service, mock_taskmaster,
+    ):
+        mock_taskmaster.get_task = AsyncMock(return_value={
+            'id': self.TASK_ID,
+            'metadata': {'done_provenance': {'note': 'Added the census module', 'commit': 'abc1234'}},
+        })
+
+        await self._reconcile_done(reconciler)
+
+        (echo,) = self._writes(mock_memory_service, 'transition')
+        assert echo['metadata']['echo_used_provenance'] is True
+        assert_writes_c5(echo, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    async def test_the_unverified_fallback_echo_links_its_task(self, reconciler, mock_memory_service):
+        await self._reconcile_done(reconciler)
+
+        (echo,) = self._writes(mock_memory_service, 'transition')
+        assert echo['metadata']['echo_unverified_completion'] is True
+        assert 'not yet verified' in echo['content']
+        assert_writes_c5(echo, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    async def test_the_echo_beside_authoritative_memory_links_its_task(
+        self, reconciler, mock_memory_service,
+    ):
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            {'id': '959b8497', 'metadata': {'task_id': self.TASK_ID, 'supersedes': ['cd09e261']}},
+        ])
+
+        await self._reconcile_done(reconciler)
+
+        (echo,) = self._writes(mock_memory_service, 'transition')
+        assert echo['metadata']['echo_suppressed_stale_description'] is True
+        assert_writes_c5(echo, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_echo_keeps_its_link(
+        self, reconciler, mock_memory_service, mock_taskmaster, mock_event_buffer,
+    ):
+        mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+        mock_taskmaster.get_task = AsyncMock(return_value={
+            'id': self.TASK_ID, 'metadata': {'done_provenance': {'note': 'Added the census module'}},
+        })
+
+        await self._reconcile_done(reconciler)
+
+        mock_memory_service.add_memory.assert_not_called()
+        deferred = [
+            call.kwargs for call in mock_event_buffer.defer_write.call_args_list
+            if 'transition' in (call.kwargs.get('metadata') or {})
+        ]
+        (echo,) = deferred
+        assert echo['metadata']['_deferred'] is True
+        assert_writes_c5(echo, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'verdict', [VerificationVerdict.confirmed, VerificationVerdict.contradicted],
+    )
+    async def test_the_verdict_note_links_its_task(
+        self, reconciler, mock_memory_service, mock_taskmaster, verdict, tmp_path,
+    ):
+        self._verifier_says(reconciler, verdict)
+        mock_taskmaster.get_task = AsyncMock(return_value={
+            'id': self.TASK_ID, 'metadata': {'done_provenance': {'note': 'Added the census module'}},
+        })
+
+        await reconciler.reconcile_task(
+            task_id=self.TASK_ID, transition='done', project_id=self.PROJECT,
+            project_root=str(tmp_path), task_before=self.TASK_BEFORE,
+        )
+
+        (note,) = self._writes(mock_memory_service, 'verification_verdict')
+        assert note['metadata']['verification_verdict'] == verdict
+        assert_writes_c5(note, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    async def test_a_real_done_transition_echo_binds_its_task_structurally(
+        self, reconciler, mock_memory_service,
+    ):
+        """B3: what reconcile_task(..., 'done') writes, recalled, binds the task STRUCTURAL."""
+        await self._reconcile_done(reconciler)
+
+        (echo,) = self._writes(mock_memory_service, 'transition')
+        recalled = MemoryResult(
+            id='echo-1', content=echo['content'], source_store=SourceStore.mem0,
+            metadata=echo['metadata'],
+        )
+        bindings = bind_tasks([recalled], project_id=self.PROJECT, known_projects={})
+        assert [(bound.ref, bound.binding) for bound in bindings.tasks] == [
+            (self.SUBJECT, Binding.STRUCTURAL),
+        ]

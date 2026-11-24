@@ -30,9 +30,10 @@ const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProje
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
-  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, projectDepth,
+  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, totalHint,
+  projectLandingRate, landingRateCaption, landingRateReading,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
 // PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
@@ -140,6 +141,31 @@ const pathTotal = cards => sumOf(cards.paths.map(x => x.count));
 // carries the same age badge and reason as the pips. A hole draws no chart.
 function DatumPanelHead({ title, datum, reading }) {
   return <div className="panel-head"><span className="title">{title}</span><span className="meta"><DatumReading datum={datum} format={reading} /></span></div>;
+}
+
+// A compact number: its reading over its label, and an optional hint line.
+function NumberCell({ label, hint, datum, format, color }) {
+  return (
+    <div>
+      <div className="mono" style={{ fontSize: 18, color }}><DatumReading datum={datum} format={format} /></div>
+      <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{label}</div>
+      {hint && <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{hint}</div>}
+    </div>
+  );
+}
+
+// The count of numbers sets both the card's columns and its flex weight in a .number-cards row.
+const NUMBER_BASIS_PX = 88;
+
+function NumberCard({ title, meta, numbers }) {
+  return (
+    <div className="panel" style={{ flexGrow: numbers.length, flexBasis: numbers.length * NUMBER_BASIS_PX }}>
+      <div className="panel-head"><span className="title">{title}</span>{meta && <span className="meta">{meta}</span>}</div>
+      <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: `repeat(${numbers.length}, 1fr)`, gap: 12 }}>
+        {numbers.map(n => <NumberCell key={n.label} {...n} />)}
+      </div>
+    </div>
+  );
 }
 
 // ── Deps + locks chip lists ──
@@ -867,6 +893,23 @@ function HaltPill({ halt }) {
 }
 
 // ── Merge Queue ──
+// ι=1894: live retries-per-landing + drift-at-detection metrics
+function liveMergeNumbers(metrics) {
+  const m = metrics || {};
+  const dd = m.drift_at_detection || {};
+  const driftVal = dd.last != null ? dd.last : (dd.mean != null ? Number(dd.mean).toFixed(1) : null);
+  return [
+    {
+      label: 'Retries / landing', datum: plainDatum(m.retries_per_landing, EP.mergeQueue), format: n => Number(n).toFixed(2),
+      hint: m.landings_total != null ? `${m.landings_total} landings` : 'offline',
+    },
+    {
+      label: 'Drift @ detect', datum: derivedDatum(driftVal, EP.mergeQueue, 'no drift detections'),
+      hint: dd.count ? `${dd.count} detections` : 'no conflicts',
+    },
+  ];
+}
+
 function MergeTab({ projectFilter }) {
   const projects = Object.entries(DF.MERGE_QUEUE).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid));
   const projIds = projects.map(([pid]) => pid);
@@ -875,13 +918,15 @@ function MergeTab({ projectFilter }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
+        const merges = attemptsOver(DF, projIds);
+        const inQueue = inQueueOver(DF, projIds);
         const speculative = speculativeOver(DF, projIds);
         const worst = worstP95Over(DF, projIds);
         return (
           <div className="col-span-12 grid cols-4">
-            <ST label="Merges (window)" datum={attemptsOver(DF, projIds)}
+            <ST label="Merges (window)" datum={merges} hint={totalHint(merges)}
                 history={attemptsHistory(DF, projIds)} sparkColor={CP.accent} />
-            <ST label="In queue now" datum={inQueueOver(DF, projIds)}
+            <ST label="In queue now" datum={inQueue} hint={totalHint(inQueue)}
                 history={inQueueHistory(DF, projIds).slice(-30)} sparkColor={CP.warn} />
             <ST label="Speculative hit rate"
                 datum={speculative} format={hitRateText}
@@ -889,7 +934,7 @@ function MergeTab({ projectFilter }) {
                 history={[]} sparkColor={CP.ok} />
             <ST label="p95 latency · worst project"
                 datum={worst} format={w => fmtMs(w.p95_ms)}
-                hint={datumView(worst).isHole ? undefined : `${worst.value.timed_projects} projects`}
+                hint={totalHint(worst, datumView(worst).isHole ? undefined : `${worst.value.timed_projects} projects`)}
                 history={[]} sparkColor={CP.warn} />
           </div>
         );
@@ -901,8 +946,8 @@ function MergeTab({ projectFilter }) {
         const speculative = projectSpeculative(DF, pid);
         const windowTotal = recentTotal(DF, pid);
         const attempts = projectAttempts(DF, pid);
-        const depth = projectDepth(DF, pid);
-        const depthSeries = depth.value;
+        const landingRate = projectLandingRate(DF, pid);
+        const rates = landingRate.value;
         const tried = attempts.value;
         const summary = (
           <>
@@ -914,13 +959,12 @@ function MergeTab({ projectFilter }) {
           </>
         );
         return (
-          <div key={pid} className="col-span-12">
+          <div key={pid} className="col-span-12 stack-host">
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
-              <div className="grid cols-12" style={{ gap: 12 }}>
+              <div className="grid cols-12 stack-narrow" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
-                  <DatumPanelHead title={`Merge attempts · ${depthBucketCaption(depthSeries)}`} datum={depth}
-                      reading={series => `peak ${Math.max(0, ...series.values)}/bucket`} />
-                  {depthSeries && <div className="panel-body"><LC labels={depthSeries.labels.map(String)} series={[{ values: depthSeries.values, color: CP.accent }]} height={180} countAxis formatX={window.DF_SHELL.fmtDateTime} /></div>}
+                  <DatumPanelHead title={`Throughput · ${landingRateCaption(rates)}`} datum={landingRate} reading={landingRateReading} />
+                  {rates && rates.values.length > 0 && <div className="panel-body"><LC labels={rates.labels.map(String)} series={[{ values: rates.values, color: CP.accent }]} height={180} formatX={window.DF_SHELL.fmtDateTime} /></div>}
                 </div>
 
                 <div className="col-span-5 panel">
@@ -941,52 +985,19 @@ function MergeTab({ projectFilter }) {
                   )}
                 </div>
 
-                <div className="col-span-6 panel">
-                  <div className="panel-head"><span className="title">Latency centiles</span><span className="meta">{tried ? latencyCaption(tried.latency) : ''}</span></div>
-                  <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
-                    {[['p50', 'p50'], ['p95', 'p95'], ['p99', 'p99'], ['mean', 'mean_ms']].map(([l, key]) => (
-                      <div key={l}><div className="mono" style={{ fontSize: 18 }}><DatumReading datum={attempts} format={a => fmtMs(a.latency[key])} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{l}</div></div>
-                    ))}
-                  </div>
-                </div>
-                <div className="col-span-6 panel">
-                  <div className="panel-head"><span className="title">Speculative merge</span></div>
-                  <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
-                    <div><div className="mono" style={{ fontSize: 18, color: CP.ok }}><DatumReading datum={speculative} format={c => c.hit_count} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>hits</div></div>
-                    <div><div className="mono" style={{ fontSize: 18, color: CP.warn }}><DatumReading datum={speculative} format={c => c.discard_count} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>discards</div></div>
-                    <div><div className="mono" style={{ fontSize: 18 }}><DatumReading datum={speculative} format={hitRateText} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>hit rate</div></div>
-                  </div>
-                </div>
-
-                {/* ι=1894: live retries-per-landing + drift-at-detection metrics */}
-                <div className="col-span-6 panel">
-                  <div className="panel-head"><span className="title">Live merge metrics</span></div>
-                  <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 12 }}>
-                    {(() => {
-                      const m = d.metrics || {};
-                      const rpl = m.retries_per_landing;
-                      const dd = m.drift_at_detection || {};
-                      const driftVal = dd.last != null ? dd.last : (dd.mean != null ? Number(dd.mean).toFixed(1) : null);
-                      return (
-                        <>
-                          <ST label="Retries / landing"
-                              datum={plainDatum(rpl, EP.mergeQueue)} format={n => Number(n).toFixed(2)}
-                              unit=""
-                              hint={m.landings_total != null ? `${m.landings_total} landings` : 'offline'}
-                              history={[]} sparkColor={CP.warn} />
-                          <ST label="Drift @ detect"
-                              datum={derivedDatum(driftVal, EP.mergeQueue, 'no drift detections')}
-                              unit=""
-                              hint={dd.count ? `${dd.count} detections` : 'no conflicts'}
-                              history={[]} sparkColor={CP.bad} />
-                        </>
-                      );
-                    })()}
-                  </div>
+                <div className="col-span-12 number-cards">
+                  <NumberCard title="Latency centiles" meta={tried ? latencyCaption(tried.latency) : ''}
+                      numbers={[['p50', 'p50'], ['p95', 'p95'], ['p99', 'p99'], ['mean', 'mean_ms']].map(([label, key]) => ({ label, datum: attempts, format: a => fmtMs(a.latency[key]) }))} />
+                  <NumberCard title="Speculative merge" numbers={[
+                    { label: 'hits', datum: speculative, format: c => c.hit_count, color: CP.ok },
+                    { label: 'discards', datum: speculative, format: c => c.discard_count, color: CP.warn },
+                    { label: 'hit rate', datum: speculative, format: hitRateText },
+                  ]} />
+                  <NumberCard title="Live merge metrics" numbers={liveMergeNumbers(d.metrics)} />
                 </div>
 
                 {d.active.length > 0 && (
-                  <div className="col-span-6 panel">
+                  <div className="col-span-12 panel">
                     <div className="panel-head"><span className="title">Currently queued</span></div>
                     <div className="panel-body flush">
                       <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>State</th><th>Branch</th><th className="num">Age</th><th className="num">Pos</th><th>Waiter</th><th className="num">When</th></tr></thead>
@@ -1012,7 +1023,7 @@ function MergeTab({ projectFilter }) {
                   </div>
                 )}
 
-                <div className={d.active.length > 0 ? 'col-span-6 panel' : 'col-span-12 panel'}>
+                <div className="col-span-12 panel">
                   <div className="panel-head"><span className="title">Recent merges</span><span className="meta" title={windowTotal.reason || undefined}>{recentMergesCaption(d.recent.length, windowTotal.value, windowEcho(DF.__receipt, EP.mergeQueue))}</span></div>
                   <div className="panel-body flush">
                     <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>Outcome</th><th className="num">Duration</th><th className="num">When</th></tr></thead>

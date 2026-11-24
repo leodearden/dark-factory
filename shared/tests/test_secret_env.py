@@ -13,7 +13,6 @@ from shared.secret_env import (
     is_secret_env_name,
     secret_env_values,
     without_account_pool,
-    without_agent_endpoint_vars,
 )
 
 SECRET_NAMES = (
@@ -30,6 +29,8 @@ SECRET_NAMES = (
     'RUNPOD_API_KEY',
     'TYPESAFE_API_KEY',
     'HF_DOWNLOAD_TOKEN',
+    'OPENAI_PLAN_PROXY_KEY',
+    'AWS_SECRET_ACCESS_KEY',
 )
 
 ORDINARY_NAMES = (
@@ -43,6 +44,8 @@ ORDINARY_NAMES = (
     'MEM0_TELEMETRY',
     'SSH_AUTH_SOCK',
     'DF_AGENT_CPU_NICE',
+    'MONKEY',
+    'PYTHON_KEYRING_BACKEND',
 )
 
 POOL = {f'CLAUDE_OAUTH_TOKEN_{letter}': f'pool-{letter}-' + 'p' * 40 for letter in 'ABCDEFGH'}
@@ -62,6 +65,7 @@ def _environ_with_secrets() -> dict[str, str]:
         'ANTHROPIC_API_KEY': 'anthropic-' + 'a' * 40,
         'GEMINI_API_KEY': 'gemini-' + 'g' * 40,
         'CLAUDE_CODE_OAUTH_TOKEN': 'session-' + 's' * 40,
+        'OPENAI_PLAN_PROXY_KEY': 'plan-proxy-' + 'k' * 40,
         **ORDINARY_ENV,
     }
 
@@ -86,7 +90,7 @@ class TestAgentSubprocessEnv:
     def test_drops_the_pool_and_every_api_key(self):
         child = agent_subprocess_env(_environ_with_secrets())
         assert [k for k in child if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
-        for name in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY'):
+        for name in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_PLAN_PROXY_KEY'):
             assert name not in child
 
     def test_keeps_the_session_credential_and_ordinary_vars_unchanged(self):
@@ -132,26 +136,46 @@ class TestAgentSubprocessEnv:
         assert child['CLAUDE_CODE_OAUTH_TOKEN'] == environ['CLAUDE_CODE_OAUTH_TOKEN']
         assert 'CLAUDE_OAUTH_TOKEN_A' not in child
 
+    def test_named_credentials_replace_the_session_credential(self):
+        environ = _environ_with_secrets()
+        child = agent_subprocess_env(environ, credentials={'OPENAI_API_KEY', 'GEMINI_API_KEY'})
+        assert {k for k in child if is_secret_env_name(k)} == {'OPENAI_API_KEY', 'GEMINI_API_KEY'}
+        assert child['OPENAI_API_KEY'] == environ['OPENAI_API_KEY']
+        assert child['GEMINI_API_KEY'] == environ['GEMINI_API_KEY']
+        assert 'CLAUDE_CODE_OAUTH_TOKEN' not in child
+        assert 'ANTHROPIC_API_KEY' not in child
+        assert [k for k in child if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
+        for name, value in ORDINARY_ENV.items():
+            assert child[name] == value
 
-class TestWithoutAgentEndpointVars:
-    def test_drops_the_endpoint_and_its_client_key(self):
+    def test_empty_credentials_keep_no_secret(self):
+        child = agent_subprocess_env(_environ_with_secrets(), credentials=frozenset())
+        assert {k for k in child if is_secret_env_name(k)} == set()
+
+    def test_naming_a_credential_that_is_absent_adds_nothing(self):
+        child = agent_subprocess_env(_environ_with_secrets(), credentials={'GOOGLE_API_KEY'})
+        assert 'GOOGLE_API_KEY' not in child
+
+    @pytest.mark.parametrize('name', ('CLAUDE_OAUTH_TOKEN_A', 'CLAUDE_OAUTH_TOKEN_MAX_B'))
+    def test_a_pool_name_cannot_be_a_credential(self, name):
+        with pytest.raises(ValueError) as exc:
+            agent_subprocess_env(_environ_with_secrets(), credentials={'OPENAI_API_KEY', name})
+        assert name in str(exc.value)
+
+    def test_endpoint_selection_is_dropped_even_when_named(self):
         environ = {
             **_environ_with_secrets(),
             'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8317',
             'ANTHROPIC_AUTH_TOKEN': 'proxy-' + 'x' * 40,
         }
-        child = without_agent_endpoint_vars(environ)
+        child = agent_subprocess_env(environ, credentials={'ANTHROPIC_AUTH_TOKEN'})
         assert 'ANTHROPIC_BASE_URL' not in child
         assert 'ANTHROPIC_AUTH_TOKEN' not in child
 
-    def test_drops_python_env_selection(self):
-        child = without_agent_endpoint_vars({**ORDINARY_ENV, 'VIRTUAL_ENV': '/srv/orch/.venv'})
-        assert 'VIRTUAL_ENV' not in child
-
-    def test_keeps_every_other_credential(self):
-        environ = {**_environ_with_secrets(), 'HF_DOWNLOAD_TOKEN': 'hf-' + 'h' * 40}
-        assert without_agent_endpoint_vars(environ) == environ
-
+    def test_keeps_the_plan_proxy_url(self):
+        environ = {**_environ_with_secrets(), 'OPENAI_PLAN_PROXY_URL': 'http://127.0.0.1:8317/v1'}
+        child = agent_subprocess_env(environ)
+        assert child['OPENAI_PLAN_PROXY_URL'] == environ['OPENAI_PLAN_PROXY_URL']
 
 
 class TestWithoutAccountPool:

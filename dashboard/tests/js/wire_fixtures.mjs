@@ -87,22 +87,14 @@ function sampleLabels(count, stepMinutes = 60) {
 // it. It holds:
 //   - `sampleCount` labels;
 //   - a non-empty series per census member, so every band draws;
-//   - the rows' in-progress split;
 //   - the `latest` and `forecast` Datums;
 //   - the parity verdict's fields. Only the aggregate block names the
 //     breaching `projects`; leave them out for a per-project block.
 export function burndownBlock(vocab, sampleCount, { alarm, cap, peak, breachCount, projects }) {
   const labels = sampleLabels(sampleCount);
-  const series = Object.fromEntries(
+  const columns = Object.fromEntries(
     Object.values(vocab.SERIES_KEYS).map((key, i) => [key, labels.map(() => i + 1)]),
   );
-  const inProgress = series[vocab.SERIES_KEYS['in-progress']];
-  const split = {
-    in_progress_live: inProgress.map(n => n - 1),
-    in_progress_stranded: inProgress.map(() => 1),
-    in_progress_rows: inProgress,
-  };
-  const columns = { ...series, ...split };
   const counts = Object.fromEntries(Object.entries(columns).map(([key, values]) => [key, values.at(-1)]));
   return {
     labels,
@@ -234,39 +226,68 @@ function unreadWireDatum(reason) {
 
 // One MERGE_QUEUE[project] block, as data/redux_api.py::shape_merge_queue
 // serves it: a measured, empty queue whose depth series holds `buckets` labels
-// ending at WIRE_AS_OF, `bucketMinutes` apart, every count zero but the newest.
-// A null `bucketMinutes` is a series that names no width; its labels are then
-// hourly. `outcomes` counts the window's untimed attempts by outcome. With
-// `unread`, the project's runs.db could not be read, so its depth and attempts
-// are unknown.
-export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = {}, unread = false } = {}) {
+// ending at WIRE_AS_OF, `bucketMinutes` apart (hourly when null), every count
+// zero but the newest. Its landing rate counts each point over `trailingMinutes` (null names
+// no trailing window): `rates` per point at labels spaced like the depth's, or,
+// when null, 1/day at each depth label, and serves `meanPerDay` as the window mean
+// the server counted over the whole window. `outcomes` counts the window's untimed
+// attempts by outcome. With `unread`, the project's runs.db could not be read,
+// so its depth, landing rate and attempts are unknown. With `noRunsDb`, the
+// project has no runs.db file at all: it is served runs_db_present false, its
+// depth, landing rate and attempts unknown saying so. `active`, `recent` and
+// `metrics` are served as given.
+export function mergeQueueBlock({
+  bucketMinutes = null, buckets = 3, trailingMinutes = 1440, rates = null, meanPerDay = 1, outcomes = {},
+  unread = false, noRunsDb = false, active = [], recent = [], metrics = {},
+} = {}) {
   const labels = sampleLabels(buckets, bucketMinutes ?? 60);
+  const rateLabels = rates ? sampleLabels(rates.length, bucketMinutes ?? 60) : labels;
   const outcomeLabels = Object.keys(outcomes);
   const outcomeValues = outcomeLabels.map(label => outcomes[label]);
   const attempts = outcomeValues.reduce((sum, n) => sum + n, 0);
-  const unreadReason = 'the merge_attempt events could not be read from runs.db';
+  const unreadReason = noRunsDb
+    ? 'no runs.db file exists for this project'
+    : 'the merge_attempt events could not be read from runs.db';
+  unread = unread || noRunsDb;
   return {
     depth: unread
       ? unreadWireDatum(unreadReason)
-      : wireDatum({ labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)), bucket_minutes: bucketMinutes }),
+      : wireDatum({ labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)) }),
+    landing_rate: unread
+      ? unreadWireDatum(unreadReason)
+      : wireDatum({
+        labels: rateLabels, values: rates ?? labels.map(() => 1),
+        trailing_minutes: trailingMinutes, window_mean_per_day: meanPerDay,
+      }),
     attempts: unread
       ? unreadWireDatum(unreadReason)
       : wireDatum({
         outcomes: { labels: outcomeLabels, values: outcomeValues, colors: outcomeLabels.map(() => '#888888') },
         latency: { p50: null, p95: null, p99: null, mean_ms: null, with_duration: 0, without_duration: attempts },
       }),
-    recent: [],
-    active: [],
+    recent,
+    active,
     recent_total: wireDatum(0),
     speculative: wireDatum({ hit_count: 0, discard_count: 0, total: 0, hit_rate: null }),
     in_queue: wireDatum(0),
     live_probe_configured: true,
+    runs_db_present: !noRunsDb,
     active_spark: { labels: [], values: [] },
     halt: { offline: true },
     train_events: [],
     train_throughput: wireDatum({}),
-    metrics: {},
+    metrics,
   };
+}
+
+// One MERGE_QUEUE[project].active row: data/merge_queue.py::_normalize_entry plus redux_api.py::shape_merge_queue's title Datum.
+export function mergeActiveRow({ taskId = '1', state = 'queued' } = {}) {
+  return { task_id: taskId, branch: `task/${taskId}`, state, age_secs: 60, position: 1, waiter_alive: true, title: wireDatum(`task ${taskId}`) };
+}
+
+// One MERGE_QUEUE[project].recent row: data/merge_queue.py::recent_merges plus redux_api.py::shape_merge_queue's title Datum.
+export function mergeRecentRow({ taskId = '1', outcome = 'done' } = {}) {
+  return { task_id: taskId, run_id: `run-${taskId}`, outcome, duration_ms: 1200, timestamp: WIRE_AS_OF, title: wireDatum(`task ${taskId}`) };
 }
 
 // The SCHEDULER payload, as /scheduler serves it: the keys data.js seeds it
@@ -316,7 +337,7 @@ export function projectRow(id) {
 // boundary_wire_fixtures.test.mjs: no boundary payload serves MEMORY_EVALS.
 
 // One open escalation, as data/memory_evals.py::_escalation_projection projects
-// it onto a metric row, the storm banner or unmatched_escalations.
+// it onto a verdict entry, the storm banner or unmatched_escalations.
 export function memoryEvalEscalation(id, overrides = {}) {
   return {
     id,
@@ -329,9 +350,9 @@ export function memoryEvalEscalation(id, overrides = {}) {
   };
 }
 
-// One metric row, as data/memory_evals.py::_build_eval emits it: unjudged and
-// unlinked unless overridden.
-export function memoryEvalRow(overrides = {}) {
+// One metric row, as data/memory_evals.py::_build_metric_row emits it: one
+// unjudged, unlinked verdict entry unless overridden.
+export function memoryEvalMetric(overrides = {}) {
   return {
     metric_id: 'canonical-in-top-5',
     kind: 'proportion',
@@ -341,13 +362,23 @@ export function memoryEvalRow(overrides = {}) {
     denominator: 30,
     direction: 'lower_is_worse',
     trend: { labels: ['20260704T031500Z', '20260705T031500Z'], values: [0.9, 0.9] },
+    value: null,
+    limit_ref: null,
+    run_stamp: null,
+    verdicts: [memoryEvalVerdict()],
+    ...overrides,
+  };
+}
+
+// One entry of a metric row's `verdicts`, as data/memory_evals.py::_verdict_fields
+// emits it: item-less, unjudged and unlinked unless overridden. A quiet item
+// entry omits verdict_detail and fingerprint; delete them to build one.
+export function memoryEvalVerdict(overrides = {}) {
+  return {
+    item: null,
     verdict: null,
     verdict_detail: null,
-    value: null,
-    item: null,
-    limit_ref: null,
     fingerprint: null,
-    run_stamp: null,
     escalation: null,
     parity: 'unjudged',
     ...overrides,

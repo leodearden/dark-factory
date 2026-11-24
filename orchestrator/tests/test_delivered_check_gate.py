@@ -1530,6 +1530,33 @@ class TestPhaseBackfillTerminalDepRecords:
         assert ctx.terminal_dep_records['20'] == corrected_record
         assert scheduler._terminal_dep_record_cache['20'] == corrected_record
 
+    @pytest.mark.asyncio
+    async def test_warmed_record_carrying_only_an_unreadable_entry_is_refetched(
+        self, scheduler: Scheduler
+    ):
+        """An unreadable declaration is still a declaration: the record can be
+        repaired in place, so it is never served from the cross-tick cache."""
+        stale_record = {'id': '20', 'status': 'done', 'metadata': {'delivered_checks': ['garbage']}}
+        scheduler._terminal_dep_record_cache['20'] = stale_record
+        repaired_record = {
+            'id': '20',
+            'status': 'done',
+            'metadata': {'delivered_checks': [{'kind': 'grep', 'name': 'c', 'pattern': 'FIXED'}]},
+        }
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},
+        )
+        scheduler.get_task = AsyncMock(return_value=repaired_record)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records['20'] == repaired_record
+
     # --- (i) warmed CHECKLESS record -> still served from cache, no re-fetch --
 
     @pytest.mark.asyncio
@@ -1580,7 +1607,7 @@ class TestPhaseBackfillTerminalDepRecords:
         tick after tick. Dep ids are chosen so plain alphabetical sort
         ('21' < '29') would pick the WRONG (re-validation) dep first
         without the fix, proving this isn't an accident of sort order."""
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
         stale_record = {
             'id': '21',
             'status': 'done',
@@ -1651,32 +1678,87 @@ class TestPhaseBackfillTerminalDepRecords:
         assert ctx.terminal_dep_records['20'] == verified
         assert scheduler._terminal_dep_record_cache['20'] == verified
 
-    @pytest.mark.asyncio
-    async def test_budget_prioritizes_held_revalidation_over_new_dep(
-        self, scheduler: Scheduler
-    ):
-        """A deferred held record would fail open, so it outranks a new dep_id
-        (which only waits a tick).  '21' < '29' so plain sort would pick the new
-        dep first."""
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
-        scheduler._terminal_dep_record_cache['29'] = self._scheduled_deploy_record(
-            '29', 'scheduled'
+    async def _warm_record_cache(self, scheduler: Scheduler, *records: dict) -> None:
+        """Cache *records* the way production does: one tick fetching each as never-cached."""
+        by_id = {record['id']: record for record in records}
+        dependents = [self._dependent(task_id=f'9{dep_id}', dep_id=dep_id) for dep_id in by_id]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map=dict.fromkeys(by_id, 'done'),
+            tasks_by_id={str(t['id']): t for t in dependents},
         )
-        task_a = self._dependent(task_id='10', dep_id='29')  # held re-validation
-        task_b = self._dependent(task_id='11', dep_id='21')  # never cached
+        scheduler.get_task = AsyncMock(side_effect=by_id.__getitem__)
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+    @pytest.mark.asyncio
+    async def test_budget_reserves_a_slot_for_a_never_cached_dep_over_held_revalidation(
+        self, scheduler: Scheduler, caplog
+    ):
+        """Held re-validations recur every tick until the settler releases them,
+        so held-first would starve a never-cached dep forever once they fill the
+        budget.  A deferred held record keeps serving from cache, hold in place,
+        and is counted in the deferral WARNING.  '21' < '29', so held-first or a
+        plain sort would pick the held dep."""
+        held = self._scheduled_deploy_record('21', 'scheduled')
+        await self._warm_record_cache(scheduler, held)
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
+        task_a = self._dependent(task_id='10', dep_id='21')  # held re-validation
+        task_b = self._dependent(task_id='11', dep_id='29')  # never cached
         ctx = TickContext(
             tasks=[task_a, task_b],
             status_map={'21': 'done', '29': 'done'},
             tasks_by_id={'10': task_a, '11': task_b},
         )
-        still_held = self._scheduled_deploy_record('29', 'scheduled')
-        scheduler.get_task = AsyncMock(return_value=still_held)
+        new_record = {'id': '29', 'status': 'done', 'metadata': {}}
+        scheduler.get_task = AsyncMock(return_value=new_record)
 
-        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_backfill_terminal_dep_records(ctx)
 
         assert result is _CONTINUE
         scheduler.get_task.assert_awaited_once_with('29')
-        assert ctx.terminal_dep_records == {'29': still_held}
+        assert ctx.terminal_dep_records == {'21': held, '29': new_record}
+        assert ctx.deferred_terminal_deps == frozenset()
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.scheduler' and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert isinstance(warnings[0].args, tuple)
+        *_, deferred, deferred_held, deferred_new, deferred_revalidation = warnings[0].args
+        assert (deferred, deferred_held, deferred_new, deferred_revalidation) == (1, 1, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_held_revalidations_keep_all_but_one_slot_while_a_never_cached_dep_waits(
+        self, scheduler: Scheduler
+    ):
+        held_22 = self._scheduled_deploy_record('22', 'scheduled')
+        await self._warm_record_cache(
+            scheduler, self._scheduled_deploy_record('20', 'scheduled'), held_22
+        )
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 2
+        dependents = [
+            self._dependent(task_id=task_id, dep_id=dep_id)
+            for task_id, dep_id in (('10', '20'), ('11', '22'), ('12', '29'))
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '22': 'done', '29': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+
+        async def _fake_get_task(task_id):
+            if task_id == '29':
+                return {'id': '29', 'status': 'done', 'metadata': {}}
+            return self._scheduled_deploy_record(task_id, 'scheduled')
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert {c.args[0] for c in scheduler.get_task.await_args_list} == {'20', '29'}
+        assert ctx.terminal_dep_records['22'] is held_22
+        assert ctx.deferred_terminal_deps == frozenset()
 
     # --- (l) a held record survives a failed or deferred re-fetch ----------
 
@@ -1723,7 +1805,7 @@ class TestPhaseBackfillTerminalDepRecords:
     async def test_held_record_deferred_by_the_budget_is_still_served(
         self, scheduler: Scheduler
     ):
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
         held_21 = self._scheduled_deploy_record('21', 'scheduled')
         scheduler._terminal_dep_record_cache['20'] = self._scheduled_deploy_record('20', 'scheduled')
         scheduler._terminal_dep_record_cache['21'] = held_21
@@ -1752,7 +1834,7 @@ class TestPhaseBackfillTerminalDepRecords:
         """A deferred dep with no record would fail open; the scheduled-deploy
         arm waits on it instead.  A deferred re-validation keeps its cached,
         known-unheld record, so it is not named."""
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
         scheduler._terminal_dep_record_cache['22'] = {
             'id': '22',
             'status': 'done',
@@ -1773,6 +1855,62 @@ class TestPhaseBackfillTerminalDepRecords:
 
         scheduler.get_task.assert_awaited_once_with('20')
         assert ctx.deferred_terminal_deps == frozenset({'21'})
+
+    # --- (n) the record-fetch budget is its own knob -----------------------
+
+    def _two_never_cached_deps_ctx(self) -> tuple[TickContext, dict]:
+        dependents = [
+            self._dependent(task_id='10', dep_id='20'),
+            self._dependent(task_id='11', dep_id='21'),
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '21': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+        records = {
+            dep_id: {'id': dep_id, 'status': 'done', 'metadata': {}}
+            for dep_id in ('20', '21')
+        }
+        return ctx, records
+
+    @pytest.mark.asyncio
+    async def test_check_budget_does_not_throttle_record_fetches(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        ctx, records = self._two_never_cached_deps_ctx()
+
+        async def _fake_get_task(task_id):
+            return records[task_id]
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert scheduler.get_task.await_count == 2
+        assert ctx.terminal_dep_records == records
+        assert ctx.deferred_terminal_deps == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_deferral_warning_names_the_record_fetch_budget(
+        self, scheduler: Scheduler, caplog
+    ):
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
+        ctx, records = self._two_never_cached_deps_ctx()
+
+        async def _fake_get_task(task_id):
+            return records[task_id]
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert any(
+            'delivered_checks.max_record_fetches_per_tick' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1827,6 +1965,18 @@ class TestDeliveredChecksConfig:
         """The scheduler-tuning green tier: an operator may retune the sweep
         budget via mcp__escalation__reload_config without a restart."""
         assert 'delivered_checks.max_checks_per_tick' in RELOADABLE_FIELDS
+
+    @pytest.mark.usefixtures("code_default_config")
+    def test_default_max_record_fetches_per_tick_is_50(self):
+        config = OrchestratorConfig()
+        assert config.delivered_checks.max_record_fetches_per_tick == 50
+
+    def test_max_record_fetches_per_tick_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(max_record_fetches_per_tick=0)
+
+    def test_max_record_fetches_per_tick_is_hot_reloadable(self):
+        assert 'delivered_checks.max_record_fetches_per_tick' in RELOADABLE_FIELDS
 
     # --- task 2583 (epsilon) knobs: enabled / grace_cycles / check_timeout_secs -
 
@@ -2414,6 +2564,107 @@ class TestComputeDeliveredCheckCache:
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert self._held_events(scheduler) == []
 
+    # --- (d2) an entry that is not a check descriptor folds into ERRORED ---
+
+    @pytest.mark.parametrize(
+        'declaration',
+        [
+            pytest.param(['garbage'], id='non-dict-entry'),
+            pytest.param(
+                {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+                id='bare-dict-value',
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unreadable_declaration_is_errored_never_run_never_cached(
+        self, scheduler: Scheduler, monkeypatch, declaration
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        dep['metadata'] = {'delivered_checks': declaration}
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert calls == []
+        assert result == {}
+        assert not any(k[0] == '20' for k in scheduler._delivered_check_cache)
+        assert self._held_events(scheduler) == []
+        assert scheduler._delivered_check_error_streak.get('20') == 1
+
+    @pytest.mark.asyncio
+    async def test_unreadable_entry_beside_a_delivered_check_is_errored(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[*self._ONE_CHECK, 'garbage'])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert calls == ['cap-one']
+        assert result == {}
+        assert not any(k[0] == '20' for k in scheduler._delivered_check_cache)
+
+    @pytest.mark.asyncio
+    async def test_failed_check_outranks_an_unreadable_sibling(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[*self._ONE_CHECK, 'garbage'])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {'20': False}
+        assert len(self._held_events(scheduler)) == 1
+
+    @pytest.mark.parametrize(
+        'corrupted',
+        [
+            pytest.param(
+                [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}, 'garbage'],
+                id='garbage-entry-added',
+            ),
+            pytest.param(
+                {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+                id='list-unwrapped-to-bare-dict',
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_cached_delivered_is_not_served_once_the_declaration_turns_unreadable(
+        self, scheduler: Scheduler, monkeypatch, corrupted
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=list(self._ONE_CHECK))
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+
+        dep['metadata'] = {'delivered_checks': corrupted}
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second.get('20') is not True
+
     # --- (e) budget: the first dep this sweep is guaranteed to resolve -----
 
     @pytest.mark.asyncio
@@ -2495,6 +2746,37 @@ class TestComputeDeliveredCheckCache:
         assert not any(
             k[0] == '21' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
         ), 'the deferred dep must not leave ANY digest-variant cache entry'
+
+    # --- (e3) a dep that runs no check leaves the guarantee to the next ----
+
+    @pytest.mark.asyncio
+    async def test_unreadable_only_first_dep_leaves_the_guarantee_to_the_next(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """A wholly unreadable declaration runs no check, so it must not use
+        up the sweep's forward-progress guarantee. Otherwise a later dep with
+        more checks than the budget is deferred on every sweep for as long as
+        the malformed record stays unrepaired."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({
+            'cap-a': DeliveredCheckResult.DELIVERED,
+            'cap-b': DeliveredCheckResult.DELIVERED,
+        })
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task_a = self._dependent(task_id='10', dep_id='20')
+        dep_a = self._dep(dep_id='20', checks=['garbage'])
+        task_b = self._dependent(task_id='11', dep_id='21')
+        dep_b = self._dep(dep_id='21', checks=self._TWO_CHECKS)
+        status_map = {'20': 'done', '21': 'done'}
+        tasks_by_id = {'20': dep_a, '21': dep_b, '10': task_a, '11': task_b}
+
+        result = await scheduler._compute_delivered_check_cache(
+            [task_a, task_b], status_map, tasks_by_id
+        )
+
+        assert result == {'21': True}
+        assert calls == ['cap-a', 'cap-b']
 
     # --- (f) cache hit: same-sha re-sweep does NOT re-invoke the runner ----
 
@@ -3187,6 +3469,29 @@ class TestDeliveredCheckGraceEscalation:
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
         # No held event on the escalation (3rd) tick — only ticks 1 and 2.
         assert len(self._held_events(scheduler)) == 2
+
+    @pytest.mark.asyncio
+    async def test_escalation_names_the_failed_check_past_an_unreadable_entry(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.FAILED}),
+        )
+        task = self._dependent()
+        failing = self._ONE_CHECK[0]
+        dep = self._dep(checks=['garbage', failing])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+        callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
+
+        for _ in range(scheduler.config.delivered_checks.grace_cycles):
+            await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        callback.assert_called_once()
+        assert callback.call_args.kwargs['check'] == failing
 
     @pytest.mark.asyncio
     async def test_escalation_survives_sha_advances_and_transient_absence(
@@ -4082,6 +4387,8 @@ class TestGateMarkDoneOnDeliveredChecks:
             pytest.param({}, id='empty-metadata'),
             pytest.param(None, id='none-metadata'),
             pytest.param({'delivered_checks': []}, id='empty-checks-list'),
+            pytest.param({'delivered_checks': {}}, id='empty-dict-value'),
+            pytest.param({'delivered_checks': ''}, id='empty-str-value'),
         ],
     )
     @pytest.mark.asyncio
@@ -4125,6 +4432,76 @@ class TestGateMarkDoneOnDeliveredChecks:
         assert 't-1' in text
         assert self._SHA in text
         assert self._SITE in text
+
+    # -- Row 5b: an entry that is not a check descriptor -------------------
+
+    @pytest.mark.parametrize(
+        ('metadata', 'unreadable'),
+        [
+            pytest.param({'delivered_checks': ['garbage']}, 'garbage', id='non-dict-entry'),
+            pytest.param(
+                {'delivered_checks': {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'}},
+                {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+                id='bare-dict-value',
+            ),
+            pytest.param({'delivered_checks': 'cap-one'}, 'cap-one', id='str-value'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_an_unreadable_declaration_is_never_inert_and_blocks_errored(
+        self, caplog, metadata, unreadable
+    ):
+        """A declaration that is not a list of check descriptors can never be
+        evaluated, so it blocks as ``errored`` even when everything that WAS
+        readable delivered. It is never iterated key- or character-wise."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(metadata, verify_mock=verify, git_ops=self._git_ops())
+
+        assert isinstance(block, DeliveredChecksBlock)
+        assert block.reason == 'errored'
+        for awaited in verify.await_args_list:
+            assert awaited.args[0] == []
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
+        text = warnings[0].getMessage()
+        assert 't-1' in text
+        assert self._SITE in text
+        assert repr(unreadable) in text
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_entry_beside_a_delivered_check_still_blocks_errored(self):
+        valid = self._grep_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        block = await self._call(
+            {'delivered_checks': [valid, 'garbage']}, verify_mock=verify, git_ops=self._git_ops(),
+        )
+
+        assert block is not None and block.reason == 'errored'
+        verify.assert_awaited_once()
+        assert verify.await_args is not None
+        assert verify.await_args.args[0] == [valid]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_check_outranks_an_unreadable_sibling(self):
+        valid = self._grep_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=valid,
+        ))
+
+        block = await self._call(
+            {'delivered_checks': [valid, 'garbage']}, verify_mock=verify, git_ops=self._git_ops(),
+        )
+
+        assert block is not None
+        assert block.reason == 'failed'
+        assert block.failed_check == valid
 
     # -- Row 6: kill switch ------------------------------------------------
 

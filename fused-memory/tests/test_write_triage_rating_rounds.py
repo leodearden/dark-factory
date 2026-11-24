@@ -5,14 +5,14 @@ Synthetic rows and a tmp scratch only. The module is loaded by path
 """
 from __future__ import annotations
 
+import copy
+import dataclasses
 import functools
 import hashlib
 import json
 import re
-import sqlite3
 import types
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,13 @@ def _rubric() -> types.ModuleType:
     )
 
 
+@functools.cache
+def _backfill() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'backfill_rating_shard_kinds.py', mod_name='backfill_rating_shard_kinds',
+    )
+
+
 def _rated(entry: str, *, role: str = 'primary', basis: str = 'current', **answers: str) -> dict[str, Any]:
     row: dict[str, Any] = {
         'entry_id': entry, 'target_id': 'p1', 'basis': basis, 'rater': f'opus-{role}',
@@ -50,93 +57,6 @@ def _rated(entry: str, *, role: str = 'primary', basis: str = 'current', **answe
     if 'UNCLEAR' in answers.values():
         row['unclear_reason'] = 'cannot tell'
     return row
-
-
-def _history_db(path: Path, rows: list[tuple[str, str | None, str, str, str]]) -> Path:
-    connection = sqlite3.connect(path)
-    connection.execute(
-        'CREATE TABLE history (id TEXT PRIMARY KEY, memory_id TEXT, old_memory TEXT,'
-        ' new_memory TEXT, event TEXT, created_at DATETIME, updated_at DATETIME,'
-        ' is_deleted INTEGER, actor_id TEXT, role TEXT)'
-    )
-    for index, (memory_id, old, new, event, updated_at) in enumerate(rows):
-        connection.execute(
-            'INSERT INTO history VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)',
-            (f'h{index}', memory_id, old, new, event, '2026-10-01T00:00:00+00:00', updated_at),
-        )
-    connection.commit()
-    connection.close()
-    return path
-
-
-@pytest.fixture
-def history(tmp_path: Path) -> Path:
-    """p1 edited twice, p2 once, and p3 once by an UPDATE that kept no old text."""
-    return _history_db(tmp_path / 'history.db', [
-        ('p1', None, 'first', 'ADD', '2026-10-01T00:00:00+00:00'),
-        ('p1', 'first', 'second', 'UPDATE', '2026-10-05T00:00:00+00:00'),
-        ('p1', 'second', 'third', 'UPDATE', '2026-10-09T00:00:00+00:00'),
-        ('p2', 'other', 'other v2', 'UPDATE', '2026-10-03T00:00:00+00:00'),
-        ('p3', None, 'lost', 'UPDATE', '2026-10-03T00:00:00+00:00'),
-    ])
-
-
-class TestTextAt:
-
-    @pytest.mark.parametrize(('instant', 'expected'), [
-        ('2026-10-02T12:00:00.000001+00:00', 'first'),
-        ('2026-10-07T00:00:00+00:00', 'second'),
-        ('2026-10-10T00:00:00+00:00', 'third, current'),
-    ])
-    def test_is_the_text_before_the_first_edit_after_the_instant(
-        self, history: Path, instant: str, expected: str,
-    ) -> None:
-        at = datetime.fromisoformat(instant)
-        assert _mod().text_at(history, 'p1', at, 'third, current') == expected
-
-    def test_an_edit_without_its_old_text_is_unrecoverable(self, history: Path) -> None:
-        at = datetime.fromisoformat('2026-10-02T00:00:00+00:00')
-        assert _mod().text_at(history, 'p3', at, 'lost') is None
-
-
-class TestMemoryHistory:
-    """MemoryHistory reads the UPDATE events once and answers as text_at does."""
-
-    @pytest.mark.parametrize(('instant', 'expected'), [
-        ('2026-10-02T12:00:00.000001+00:00', 'first'),
-        ('2026-10-07T00:00:00+00:00', 'second'),
-        ('2026-10-10T00:00:00+00:00', 'third, current'),
-    ])
-    def test_answers_as_text_at_does(self, history: Path, instant: str, expected: str) -> None:
-        at = datetime.fromisoformat(instant)
-        rounds = _mod()
-        assert rounds.MemoryHistory.read(history).text_at('p1', at, 'third, current') == expected
-        assert rounds.text_at(history, 'p1', at, 'third, current') == expected
-
-    def test_an_edit_without_its_old_text_is_unrecoverable(self, history: Path) -> None:
-        at = datetime.fromisoformat('2026-10-02T00:00:00+00:00')
-        assert _mod().MemoryHistory.read(history).text_at('p3', at, 'lost') is None
-
-    @pytest.mark.parametrize(('memory_id', 'instant', 'edited'), [
-        ('p1', '2026-10-07T00:00:00+00:00', True),
-        ('p1', '2026-10-10T00:00:00+00:00', False),
-        ('p3', '2026-10-02T00:00:00+00:00', True),
-        ('never-edited', '2026-10-01T00:00:00+00:00', False),
-    ])
-    def test_edited_after_is_whether_an_update_follows_the_instant(
-        self, history: Path, memory_id: str, instant: str, edited: bool,
-    ) -> None:
-        at = datetime.fromisoformat(instant)
-        assert _mod().MemoryHistory.read(history).edited_after(memory_id, at) is edited
-
-    def test_a_history_read_for_some_memories_refuses_any_other(self, history: Path) -> None:
-        partial = _mod().MemoryHistory.read(history, memory_ids=['p2'])
-        at = datetime.fromisoformat('2026-10-02T00:00:00+00:00')
-        assert partial.text_at('p2', at, 'other v2') == 'other'
-        with pytest.raises(ValueError, match='p1'):
-            partial.text_at('p1', at, 'third, current')
-        with pytest.raises(ValueError, match='p1'):
-            partial.edited_after('p1', at)
 
 
 class TestCapped:
@@ -665,8 +585,11 @@ class TestRatingScratch:
             attach = [name.startswith('attach_') for name in rounds.holding(triple)]
             assert attach == [triple[2] == 'attach_time'] * 2, triple
         for name, spec in key['shards'].items():
+            basis = 'attach_time' if name.startswith('attach_') else 'current'
             assert spec == {'role': spec['role'], 'rater': f'opus-{spec["role"]}', 'round': 0,
+                            'kind': 'initial', 'basis': basis,
                             'items': spec['items'], 'brief_sha256': _sha(_mod().BRIEF_PATH)}
+            assert {key['items'][item]['basis'] for item in spec['items']} == {basis}
             assert (rounds.root / 'shards' / f'{name}.txt').exists()
         assert sorted(rounds.added) == sorted(key['shards'])
 
@@ -804,7 +727,7 @@ class TestRatingScratch:
         key = rounds.key()
         assert {**key['shards']['third_00'], 'items': len(key['shards']['third_00']['items'])} == {
             'role': 'third', 'rater': 'opus-third-00', 'round': 0, 'items': 1,
-            'brief_sha256': _sha(_mod().BRIEF_PATH),
+            'kind': 'third', 'basis': 'current', 'brief_sha256': _sha(_mod().BRIEF_PATH),
         }
         assert rounds.holding(('e0', 'p1', 'current'))[-1] == 'third_00'
         assert 'third_00' not in rounds.holding(('e0', 'p1', 'attach_time'))
@@ -819,6 +742,70 @@ class TestRatingScratch:
             'pairs': 0, 'shards': [],
         }
         assert (rounds.root / 'key.json').read_bytes() == key_bytes
+
+    def test_every_reask_shard_records_its_kind(self, rounds: _Rounds) -> None:
+        rounds.rate({('primary', ('e1', 'p1', 'current')): _lacks_loss,
+                     ('second', ('e2', 'p1', 'current')): _unfound_quote})
+        _mod().reask_round(rounds.scratch, rounds.key(), rounds.entries())
+        reasks = {name: spec for name, spec in rounds.key()['shards'].items() if 'reask_' in name}
+        assert {name: (spec['kind'], spec['basis']) for name, spec in reasks.items()} == {
+            'reask_01_primary': ('reask', 'current'), 'reask_02_second': ('reask', 'current'),
+        }
+
+    def test_a_reask_round_deals_each_basis_of_a_rater_into_its_own_shard(
+        self, rounds: _Rounds,
+    ) -> None:
+        rounds.rate({('primary', ('e0', 'p1', 'current')): _lacks_loss,
+                     ('primary', ('e0', 'p1', 'attach_time')): _lacks_loss})
+        assert _mod().reask_round(rounds.scratch, rounds.key(), rounds.entries()) == {
+            'lines': 2, 'shards': {'reask_01_primary': 1, 'attach_reask_01_primary': 1},
+        }
+        key = rounds.key()
+        assert {name: (spec['round'], spec['rater'], spec['kind'], spec['basis'])
+                for name, spec in key['shards'].items() if 'reask_' in name} == {
+            'reask_01_primary': (1, 'opus-primary', 'reask', 'current'),
+            'attach_reask_01_primary': (1, 'opus-primary', 'reask', 'attach_time'),
+        }
+
+    def test_add_shards_refuses_a_key_with_a_spec_lacking_its_kind_or_basis(
+        self, rounds: _Rounds,
+    ) -> None:
+        key = rounds.key()
+        del key['shards']['primary_00']['kind']
+        extra = _mod().ShardEntry('e9', 'p1', 'current', 'df', 'child of e9', 'parent of e9')
+        with pytest.raises(ValueError, match=r"primary_00.*backfill_rating_shard_kinds\.py"):
+            rounds.scratch.add_shards(key, [*_scratch_entries(), extra], seed=7)
+
+    def test_add_shards_numbers_new_shards_past_the_initial_ones_alone(self, rounds: _Rounds) -> None:
+        rounds.rate({('primary', ('e1', 'p1', 'current')): _lacks_loss})
+        _mod().reask_round(rounds.scratch, rounds.key(), rounds.entries())
+        rounds.rate()
+        _mod().third_round(rounds.scratch, rounds.key(), rounds.entries(), {('e0', 'p1')})
+        rounds.rate()
+        _mod().rerate_round(rounds.scratch, rounds.key(), rounds.entries(), [('e2', 'p1')],
+                            version='v2.2')
+        key = rounds.key()
+        extra = _mod().ShardEntry('e9', 'p1', 'current', 'df', 'child of e9', 'parent of e9')
+        assert rounds.scratch.add_shards(key, [*_scratch_entries(), extra], seed=7) == [
+            'primary_01', 'second_01',
+        ]
+
+    def test_every_shard_the_rounds_key_records_the_kind_and_basis_the_backfill_derives(
+        self, rounds: _Rounds,
+    ) -> None:
+        rounds.rate({('primary', ('e0', 'p1', 'current')): _lacks_loss,
+                     ('primary', ('e0', 'p1', 'attach_time')): _lacks_loss})
+        _mod().reask_round(rounds.scratch, rounds.key(), rounds.entries())
+        rounds.rate()
+        _mod().third_round(rounds.scratch, rounds.key(), rounds.entries(), {('e1', 'p1')})
+        rounds.rate()
+        _mod().rerate_round(rounds.scratch, rounds.key(), rounds.entries(), [('e2', 'p1')],
+                            version='v2.2')
+        key = rounds.key()
+        assert {(spec['kind'], spec['basis']) for spec in key['shards'].values()} == {
+            (kind, basis) for kind in ('initial', 'reask') for basis in ('current', 'attach_time')
+        } | {('third', 'current'), ('rerate', 'current')}
+        assert _backfill().backfilled(key) == key
 
 
 def _sha(path: Path) -> str:
@@ -1045,6 +1032,54 @@ class TestBriefVersion:
             _mod().brief_version(label)
 
 
+class TestRaterBrief:
+    def test_keeps_its_version_and_sha256_and_is_frozen(self) -> None:
+        brief = _mod().RaterBrief('v2.2', 'a' * 64)
+        assert (brief.version, brief.sha256) == ('v2.2', 'a' * 64)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            brief.version = 'v2.3'
+
+    def test_refuses_a_version_that_is_not_a_brief_version_label(self) -> None:
+        with pytest.raises(ValueError, match='brief version label'):
+            _mod().RaterBrief('2.2', 'a' * 64)
+
+    @pytest.mark.parametrize('sha', ['xyz', 'A' * 64])
+    def test_refuses_a_sha256_that_is_not_64_lowercase_hex_naming_it(self, sha: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(repr(sha))):
+            _mod().RaterBrief('v2.2', sha)
+
+    def test_brief_v2_1_is_the_v2_1_label_and_its_sha256(self) -> None:
+        rounds = _mod()
+        expected = rounds.RaterBrief('v2.1', rounds.BRIEF_V2_1_SHA256)
+        assert expected == rounds.BRIEF_V2_1
+
+    def test_the_latest_rerate_brief_of_a_summary_is_its_last_rerates(self) -> None:
+        record = {'rerates': [
+            {'version': 'v2.2', 'round': 1, 'pairs': 3, 'brief_sha256': 'b' * 64},
+            {'version': 'v2.3', 'round': 2, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}
+        assert _mod().latest_rerate_brief(record) == _mod().RaterBrief('v2.3', 'c' * 64)
+
+    def test_the_latest_rerate_brief_of_a_scratch_key_is_the_brief_it_was_keyed_under(
+        self, tmp_path: Path, old_brief: Path, new_brief: Path,
+    ) -> None:
+        rounds, entries = _mod(), _two_writes()
+        first = rounds.RatingScratch(tmp_path / 'scratch', brief=old_brief)
+        key = first.load_key()
+        first.add_shards(key, list(entries.values()), seed=7)
+        first.save_key(key)
+        revised = rounds.RatingScratch(first.root, brief=new_brief)
+        rounds.rerate_round(revised, revised.load_key(), entries, [('w', 'p1')], version='v2.2')
+        key = revised.load_key()
+        assert key['rerates'][-1]['pairs'] == [['w', 'p1']]
+        assert rounds.latest_rerate_brief(key) == rounds.RaterBrief('v2.2', _sha(new_brief))
+
+    @pytest.mark.parametrize('record', [{'rerates': []}, {'shards': {}, 'items': {}}])
+    def test_a_record_without_a_rerate_is_refused(self, record: dict[str, Any]) -> None:
+        with pytest.raises(ValueError, match='no re-rate'):
+            _mod().latest_rerate_brief(record)
+
+
 def _never_called() -> dict[tuple[str, str], Any]:
     raise AssertionError('the derivations were read though the re-rate is already keyed')
 
@@ -1078,6 +1113,9 @@ class TestEnsureRerate:
         }
         [rerate] = scratch.load_key()['rerates']
         assert rerate == key['rerates'][0]
+        assert {name: (key['shards'][name]['kind'], key['shards'][name]['basis'])
+                for name in rerate['shards']} == {
+            name: ('rerate', 'current') for name in rerate['shards']}
         assert (rerate['version'], rerate['round'], rerate['pairs']) == ('v2.2', 1, [['w', 'p1']])
         assert rerate['brief_sha256'] == _sha(new_brief)
         assert rerate['retires_third_raters'] == ['opus-third-00']
@@ -1119,6 +1157,93 @@ class TestEnsureRerate:
         assert summary['rendered_again'] == ['rerate_01_primary_00']
         assert scratch.key_path.read_bytes() == key_bytes
         assert deleted.read_bytes() == shard_bytes
+
+
+def _planned(name: str, *entries: Any, kind: str = 'initial', role: str = 'primary',
+             round_: int = 0) -> Any:
+    rounds = _mod()
+    return rounds.PlannedShard(name=name, entries=entries, kind=rounds.ShardKind(kind), role=role,
+                               rater=f'opus-{role}', round=round_)
+
+
+def _e9(basis: str = 'current') -> Any:
+    return _mod().ShardEntry('e9', 'p1', basis, 'df', 'child of e9', f'parent of e9 {basis}')
+
+
+class TestARoundChecksEveryShardBeforeWritingAny:
+    """A round's shards are checked together before any is written, and never keyed over stale ratings."""
+
+    COUNT = 45
+
+    def test_a_later_barred_shard_leaves_no_earlier_shard_written(
+        self, tmp_path: Path, old_brief: Path,
+    ) -> None:
+        rounds = _mod()
+        entries = {(f'e{index:02d}', 'p1', 'current'): rounds.ShardEntry(
+            f'e{index:02d}', 'p1', 'current', 'df', f'child {index}', f'parent {index}')
+            for index in range(self.COUNT)}
+        first = rounds.RatingScratch(tmp_path / 'scratch', brief=old_brief)
+        key = first.load_key()
+        first.add_shards(key, list(entries.values()), seed=7)
+        first.save_key(key)
+        revised = rounds.RatingScratch(first.root)
+        rounds.rerate_round(revised, revised.load_key(), entries,
+                            [(f'e{index:02d}', 'p1') for index in range(0, self.COUNT, 2)],
+                            version='v2.2')
+        key_bytes = revised.key_path.read_bytes()
+        key = revised.load_key()
+        before = copy.deepcopy(key)
+        with pytest.raises(ValueError, match='third_00_01'):
+            rounds.third_round(revised, key, entries, {pair[:2] for pair in entries})
+        assert sorted((revised.root / 'shards').glob('third_00*.txt')) == []
+        assert revised.key_path.read_bytes() == key_bytes
+        assert key == before
+
+    def test_keying_a_name_whose_ratings_file_exists_is_refused_naming_it(
+        self, tmp_path: Path,
+    ) -> None:
+        rounds = _Rounds(tmp_path)
+        ratings = rounds.root / 'ratings'
+        ratings.mkdir()
+        (ratings / 'third_00.jsonl').write_text('{"id": "third_00-000", "home": "YES"}\n')
+        key_bytes = (rounds.root / 'key.json').read_bytes()
+        with pytest.raises(ValueError, match=r'third_00\.jsonl'):
+            _mod().third_round(rounds.scratch, rounds.key(), rounds.entries(), {('e0', 'p1')})
+        assert not (rounds.root / 'shards' / 'third_00.txt').exists()
+        assert (rounds.root / 'key.json').read_bytes() == key_bytes
+
+    def test_a_name_already_keyed_is_refused(self, tmp_path: Path) -> None:
+        rounds = _Rounds(tmp_path)
+        key, shard_files = rounds.key(), rounds.shard_files()
+        before = copy.deepcopy(key)
+        with pytest.raises(ValueError, match='primary_00.*already keyed'):
+            rounds.scratch.write_shards(key, [_planned('primary_00', _e9())])
+        assert key == before
+        assert rounds.shard_files() == shard_files
+
+    def test_a_plan_naming_one_shard_twice_is_refused(self, tmp_path: Path) -> None:
+        rounds = _Rounds(tmp_path)
+        key, shard_files = rounds.key(), rounds.shard_files()
+        before = copy.deepcopy(key)
+        with pytest.raises(ValueError, match='primary_09.*twice'):
+            rounds.scratch.write_shards(key, [_planned('primary_09', _e9()),
+                                              _planned('primary_09', _e9())])
+        assert key == before
+        assert rounds.shard_files() == shard_files
+
+    def test_a_planned_shard_of_mixed_bases_is_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match=r"reask_01_primary.*\['attach_time', 'current'\]"):
+            _planned('reask_01_primary', _e9('current'), _e9('attach_time'), kind='reask', round_=1)
+        with pytest.raises(ValueError, match='reask_01_primary'):
+            _planned('reask_01_primary', kind='reask', round_=1)
+
+    def test_a_planned_shard_has_the_one_basis_of_its_entries(self) -> None:
+        assert _planned('attach_primary_09', _e9('attach_time')).basis == 'attach_time'
+
+
+class TestShardKind:
+    def test_names_the_four_ways_a_shard_is_keyed(self) -> None:
+        assert {str(kind) for kind in _mod().ShardKind} == {'initial', 'reask', 'third', 'rerate'}
 
 
 class TestTheRaterContract:

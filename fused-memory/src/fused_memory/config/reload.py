@@ -23,6 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from fused_memory.config.overlay import EMBEDDER_SPACE_UNITS, PROVENANCE_FIELD
 from fused_memory.config.schema import FusedMemoryConfig
 
 # Code-owned allowlist of dotted leaf paths safe to hot-apply in place. Seeded
@@ -111,6 +112,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # and restart_required would be a false alarm. Yielded whole by
     # _iter_leaves, so it reloads all-or-nothing like the map above.
     'write_triage_project_calibrations',
+    # Config overlay provenance (task 6798). Read live off
+    # memory_service.config by get_status (embedder/status.py), and it travels
+    # with the overlay values it vouches for, so it reloads exactly when they do.
+    'config_overlay',
     # The two write-triage OPERATOR KNOBS (task 3127), green-tier for a
     # different reason than the calibrated thresholds above: they are hand-set,
     # not derived, and both are read LIVE off the shared
@@ -156,6 +161,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'write_triage.judge_provider',
     'write_triage.judge_model',
     'write_triage.judge_api_url',
+    'write_triage.judge_api_key',
     'write_triage.judge_timeout_seconds',
     'write_triage.judge_candidate_count',
     'write_triage.judge_reasoning_effort',
@@ -279,6 +285,18 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # write_triage.t_high_by_category. Each therefore reloads all-or-nothing,
     # which is why a partially-applied ranking map can never gate a cycle.
     'consolidation_auto.category_weights',
+    # Adjudicator leaves (plans/consolidation-adjudicator-prd.md K7), read by
+    # reconciliation/consolidation_adjudicator.py,
+    # reconciliation/consolidation_adjudicator_calibration.py and the executor
+    # (task gamma of that PRD).
+    'consolidation_auto.max_adjudications_per_cycle',
+    'consolidation_auto.adjudicator_model',
+    'consolidation_auto.adjudicator_reasoning_effort',
+    'consolidation_auto.adjudicator_timeout_seconds',
+    'consolidation_auto.adjudicator_field_chars',
+    'consolidation_auto.adjudicator_member_max',
+    'consolidation_auto.outcome_retention_days',
+    'consolidation_auto.memo_days',
     # ---- Link-heal executor caps and adjudicator knobs (tasks 6181, 6184;
     # plans/write-triage-link-healing-prd.md H1, H2) ----
     # The consumers are fused-memory/scripts/link_heal.py and
@@ -294,11 +312,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'link_heal.misfile_share_ceiling',
     'link_heal.corrects_share_ceiling',
     'link_heal.shard_failure_streak',
-    # The scheduled sweep and its calibration gate (task 7159): same consumers.
+    # The scheduled sweep, its calibration gate and its adjudication cap
+    # (tasks 7159, 6188): same consumers.
     'link_heal.projects',
     'link_heal.writes',
     'link_heal.sweep_actions',
     'link_heal.sweep_window_hours',
+    'link_heal.max_adjudications_per_run',
     'link_heal.calibration_kappa_margin',
     'link_heal.calibration_min_project_items',
 })
@@ -315,6 +335,50 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
 # so the report stays machine-checkable — rather than raising the KeyError of
 # task 2718 review esc-2718-1.
 _ABSENT = '<absent>'
+
+
+# Any embedder leaf, not only model and dimensions: the overlay provenance
+# vouches for every key the overlay merged, endpoint included, so it must
+# never report a merge the live embedder is still waiting on a restart for.
+_EMBEDDER_SECTION_PREFIX = 'embedder.'
+
+# The leaves that wait with the embedder section: the overlay's embedder-space
+# units and the provenance that vouches for them.
+_EMBEDDER_SPACE_LEAVES: frozenset[str] = frozenset(
+    {PROVENANCE_FIELD}
+    | {
+        f'{unit.section}.{key}'
+        for unit in EMBEDDER_SPACE_UNITS if unit.keys is not None
+        for key in unit.keys
+    }
+)
+_EMBEDDER_SPACE_SECTIONS: frozenset[str] = frozenset(
+    unit.section for unit in EMBEDDER_SPACE_UNITS if unit.keys is None
+)
+
+
+def _waits_with_the_embedder(path: str) -> bool:
+    return (
+        path in _EMBEDDER_SPACE_LEAVES
+        or path.split('.', 1)[0] in _EMBEDDER_SPACE_SECTIONS
+    )
+
+
+def _hold_embedder_space_while_the_embedder_waits(
+    applied_candidates: dict[str, dict[str, Any]],
+    restart_required: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Move every embedder-space candidate to restart_required when an embedder leaf is there."""
+    if not any(path.startswith(_EMBEDDER_SECTION_PREFIX) for path in restart_required):
+        return applied_candidates, restart_required
+    held = {
+        path: entry for path, entry in applied_candidates.items()
+        if _waits_with_the_embedder(path)
+    }
+    still_applied = {
+        path: entry for path, entry in applied_candidates.items() if path not in held
+    }
+    return still_applied, restart_required | held
 
 
 @dataclass
@@ -387,6 +451,11 @@ def diff_config(
     allowlisted). The union + ``_ABSENT`` fallback merely guarantees any residual
     one-sided leaf is still bucketed (never a ``KeyError``) if that symmetry were
     ever broken — see task 2718 review esc-2718-1.
+
+    Embedder-space values (bands, calibrations) mean nothing outside the
+    embedder's space, and the overlay provenance vouches for the embedder
+    keys it merged, so when an ``embedder.*`` leaf waits for a restart, so
+    do they.
     """
     live_leaves = dict(_iter_leaves(live))
     fresh_leaves = dict(_iter_leaves(fresh))
@@ -404,6 +473,9 @@ def diff_config(
                 restart_required[path] = entry
         else:
             unchanged += 1
+    applied_candidates, restart_required = _hold_embedder_space_while_the_embedder_waits(
+        applied_candidates, restart_required,
+    )
     return ConfigDiff(
         applied_candidates=applied_candidates,
         restart_required=restart_required,

@@ -486,6 +486,7 @@ class TestTheConnectionHasASocketTimeout:
             socket_timeout=12.5,
         )
 
+    @pytest.mark.integration
     @falkor_skipif()
     @pytest.mark.asyncio
     async def test_a_live_connection_carries_the_socket_timeout(self):

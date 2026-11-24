@@ -56,6 +56,7 @@ class TestLinkHealConfigDefaults:
         assert cfg.writes is False
         assert cfg.sweep_actions == ['detach', 'relabel']
         assert cfg.sweep_window_hours == 24
+        assert cfg.max_adjudications_per_run == 200
         assert cfg.calibration_kappa_margin == 0.10
         assert cfg.calibration_min_project_items == 60
 
@@ -74,6 +75,7 @@ class TestLinkHealConfigDefaults:
             ('corrects_share_ceiling', 1.01),
             ('adjudicator_model', ''),
             ('sweep_window_hours', 0),
+            ('max_adjudications_per_run', 0),
             ('calibration_kappa_margin', -0.01),
             ('calibration_kappa_margin', 1.01),
             ('calibration_min_project_items', 0),
@@ -112,12 +114,13 @@ class TestLinkHealLeavesAreGreenTier:
         'writes': True,
         'sweep_actions': ['detach'],
         'sweep_window_hours': 48,
+        'max_adjudications_per_run': 50,
         'calibration_kappa_margin': 0.05,
         'calibration_min_project_items': 30,
     }
 
-    def test_the_schema_declares_fifteen_leaves(self):
-        assert len(LEAVES) == 15, LEAVES
+    def test_the_schema_declares_sixteen_leaves(self):
+        assert len(LEAVES) == 16, LEAVES
 
     def test_every_leaf_is_allowlisted(self):
         missing = {f'link_heal.{name}' for name in LEAVES} - RELOADABLE_FIELDS
@@ -152,6 +155,9 @@ def tracked_config(monkeypatch) -> FusedMemoryConfig:
 class TestTrackedConfigShipsTheSweepWithWritesOff:
     def test_the_sweep_ships_with_writes_off(self, tracked_config):
         assert tracked_config.link_heal.writes is False
+
+    def test_the_sweep_ships_with_the_default_adjudication_cap(self, tracked_config):
+        assert tracked_config.link_heal.max_adjudications_per_run == 200
 
     def test_the_sweep_covers_the_projects_with_triage_children_in_the_soak(self, tracked_config):
         projects = tracked_config.link_heal.projects

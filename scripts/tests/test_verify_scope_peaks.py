@@ -8,6 +8,7 @@ so per-gate max-leg = [10, 20] -> p50 = 15, p90 = 19, max = 20; sum-of-legs max 
 from __future__ import annotations
 
 import dataclasses
+import glob
 import json
 import math
 import os
@@ -16,6 +17,9 @@ import time
 
 import pytest
 import verify_scope_peaks as mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 GIB = mod.GIB
 MEMORY = mod.HostMemory(total_gib=125.0, available_gib=90.0)
@@ -86,6 +90,21 @@ def test_tick_ignores_names_outside_the_verify_scope_shape():
 def test_scope_root_is_the_process_whose_parent_is_outside_the_scope():
     assert mod.scope_root({50: 900, 900: 1}) == 900
     assert mod.scope_root({}) is None
+
+
+def test_default_scope_glob_matches_a_verify_scope_under_its_project_slice(tmp_path):
+    uid = os.getuid()
+    scope = (
+        tmp_path / f'user.slice/user-{uid}.slice/user@{uid}.service'
+        / 'df.slice/df-reify.slice/df-verify-reify-0123abcd-0123456789ab.scope'
+    )
+    scope.mkdir(parents=True)
+    default = mod.SCOPE_GLOB.format(uid=uid)
+    assert default.startswith('/sys/fs/cgroup/')
+
+    rooted = str(tmp_path / default.removeprefix('/sys/fs/cgroup/'))
+
+    assert glob.glob(rooted) == [str(scope)]
 
 
 def test_poll_flushes_an_ended_scope_and_truncates_live_ones_on_exit(tmp_path, monkeypatch):

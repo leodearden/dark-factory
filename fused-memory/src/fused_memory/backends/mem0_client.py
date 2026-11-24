@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import aclosing
 from typing import Any, TypeVar
 
@@ -13,30 +13,45 @@ from fused_memory.backends.timeout_budget import await_within, socket_timeout_ou
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
+from fused_memory.utils.mem0_content_keys import MEM0_TEXT_KEY, mem0_payload_text
+from fused_memory.utils.toolcall_xml_leak import PREFILTER_NEEDLES, find_toolcall_xml_leak
 
 logger = logging.getLogger(__name__)
 
 #: Return type of whatever a timed call is awaiting — see Mem0Backend._timed_read.
 _T = TypeVar('_T')
 
-# The canonical Qdrant payload key for a memory's text, with the historical
-# fallbacks. Mirrors memory_service._MEM0_CONTENT_KEYS and
-# scripts/clear_malformed_empty_memory._CONTENT_KEYS so "what counts as a
-# memory's content" is judged identically everywhere.
-_MEM0_TEXT_KEY = 'data'
-_MEM0_TEXT_KEYS = (_MEM0_TEXT_KEY, 'memory', 'content')
-
 # How much of a matching record's text to echo back in a scan hit.
 _EXCERPT_LEN = 240
 
 
-def extract_payload_text(payload: dict[str, Any]) -> str | None:
-    """Return a Qdrant payload's memory text, in canonical key order."""
-    for key in _MEM0_TEXT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
+#: A scan verdict: the fragments of *text* that make it a match (empty: no match).
+_ScanVerdict = Callable[[str], list[str]]
+
+
+def _leak_verdict(text: str) -> list[str]:
+    return [hit.fragment for hit in find_toolcall_xml_leak(text)]
+
+
+def _needle_verdict_for(needles: Sequence[str]) -> _ScanVerdict:
+    """The distinct *needles* that occur in a text, case-sensitively, in caller order."""
+    distinct = tuple(dict.fromkeys(needles))
+
+    def present(text: str) -> list[str]:
+        return [needle for needle in distinct if needle in text]
+
+    return present
+
+
+def _excerpt_around(text: str, fragments: Sequence[str]) -> str:
+    """At most ``_EXCERPT_LEN`` chars of *text*, centred where its earliest *fragments* hit begins.
+
+    A ``…`` marks each side the window elides, so a window never reads as the whole text.
+    """
+    anchor = min(text.find(fragment) for fragment in fragments)
+    begin = max(0, min(anchor - _EXCERPT_LEN // 2, len(text) - _EXCERPT_LEN))
+    end = begin + _EXCERPT_LEN
+    return ('…' if begin else '') + text[begin:end] + ('…' if end < len(text) else '')
 
 
 #: Default cap on how many pages a single full-enumeration scroll may walk.
@@ -206,15 +221,14 @@ def split_managed_metadata(
     return managed, custom
 
 
-# mem0's own default embedding dimensionality, shared by its Qdrant vector
-# store (mem0/configs/vector_stores/qdrant.py) and its OpenAI embedder
-# (mem0/embeddings/openai.py). Emitting the embedder key at this value would
-# be a behaviour CHANGE, not a no-op — see _build_config_dict.
-_MEM0_DEFAULT_EMBEDDING_DIMS = 1536
-
 # mem0's MemoryConfig.history_db_path value for a private, per-instance SQLite
 # history DB (SQLiteManager's own default).
 _MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
+
+
+def build_vector_store_client(qdrant_url: str, *, read_budget_s: float, write_budget_s: float) -> QdrantClient:
+    """The sync Qdrant client mem0's vector stores run on, its socket timeout outlasting both the read and the write budget."""
+    return QdrantClient(url=qdrant_url, timeout=socket_timeout_outlasting(read_budget_s, write_budget_s))
 
 
 class Mem0Backend:
@@ -242,8 +256,9 @@ class Mem0Backend:
     message format.  mem0's instance construction (its collection listing and
     payload-index creates) runs off the event loop under the write budget as
     ``create_instance``, and the Qdrant client mem0's vector store uses is this
-    backend's own, its socket timeout from ``socket_timeout_outlasting`` over
-    both budgets, so a slow mem0 leg fails on its named budget
+    backend's own, built by :func:`build_vector_store_client` from the very
+    budgets :meth:`_timed_read` / :meth:`_timed_write` apply, so a
+    slow mem0 leg fails on its named budget
     (tests/test_mem0_vector_store_client.py).  The one exception left: the
     direct async client's socket timeout is still the read budget, so its
     calls can still fail unattributed: its writes, and :meth:`list_projects`'
@@ -275,28 +290,20 @@ class Mem0Backend:
                 'config': {
                     'url': cfg.mem0.qdrant_url,
                     'collection_name': collection_name,
-                    # Note the deliberate asymmetry with the embedder's
-                    # 'embedding_dims' below: DIFFERENT key name, different
-                    # upstream semantics, different emission rule. mem0 would
-                    # CREATE the collection at this width, but never does:
-                    # _ensure_collection has already created it from the same
-                    # cfg.embedder.dimensions, so mem0's create_col always
-                    # finds it present and skips. mem0's own default is 1536
-                    # (mem0/configs/vector_stores/qdrant.py), so emitting it
-                    # unconditionally is a no-op at the shipped config.
+                    # The width the collection is created at. The embedder
+                    # below deliberately gets no width key, so mem0 never
+                    # sends `dimensions` (plans/local-embedder-cutover-prd.md
+                    # §6 C3). mem0 would CREATE the collection at this width,
+                    # but never does: _ensure_collection has already created
+                    # it from the same cfg.embedder.dimensions.
                     #
-                    # OPERATOR HAZARD at a NON-1536 embedder.dimensions on an
-                    # EXISTING deployment: neither key was plumbed before, so
-                    # such a config was inert — mem0 created the collection at
-                    # its own 1536 default and requested 1536-wide vectors.
-                    # Both now follow the config, but an existing collection
-                    # keeps its old width: _ensure_collection's exists-check
-                    # skips it, and so does mem0's QdrantDB.create_col
-                    # ('Collection ... already exists. Skipping creation.'),
-                    # leaving a 1536-wide collection that every N-wide upsert
-                    # then fails against at runtime. Changing
-                    # embedder.dimensions requires recreating and re-embedding
-                    # the Qdrant collection; it is not a live-migratable knob.
+                    # OPERATOR HAZARD on an EXISTING deployment: a collection
+                    # keeps the width it was created at. _ensure_collection's
+                    # exists-check skips it, and so does mem0's
+                    # QdrantDB.create_col, so every upsert at a new width
+                    # fails at runtime. Changing embedder.dimensions requires
+                    # recreating and re-embedding the Qdrant collection; it is
+                    # not a live-migratable knob.
                     'embedding_model_dims': cfg.embedder.dimensions,
                 },
             },
@@ -352,16 +359,6 @@ class Mem0Backend:
                 # the two endpoints stay independent.
                 'openai_base_url': cfg.embedder.providers.openai.api_url,
             }
-            # Emitted ONLY at a non-default dimensionality. This guard is
-            # mandatory, not stylistic: mem0/embeddings/openai.py does
-            #     self._pass_dimensions_to_api = self.config.embedding_dims is not None
-            # so emitting the key at all — even as 1536 — would start sending a
-            # `dimensions` field on EVERY embeddings request under the shipped
-            # config, which is not byte-identical. Do not "simplify" this away.
-            # (Note the key name: the embedder takes `embedding_dims`;
-            # `embedding_model_dims` is the vector store's, set above.)
-            if cfg.embedder.dimensions != _MEM0_DEFAULT_EMBEDDING_DIMS:
-                embedder_config['embedding_dims'] = cfg.embedder.dimensions
             config_dict['embedder'] = {
                 'provider': 'openai',
                 'config': embedder_config,
@@ -780,9 +777,10 @@ class Mem0Backend:
     def _get_vector_store_client(self) -> QdrantClient:
         """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
         if self._vector_store_client is None:
-            self._vector_store_client = QdrantClient(
-                url=self.config.mem0.qdrant_url,
-                timeout=socket_timeout_outlasting(self._read_timeout, self._write_timeout),
+            self._vector_store_client = build_vector_store_client(
+                self.config.mem0.qdrant_url,
+                read_budget_s=self._read_timeout,
+                write_budget_s=self._write_timeout,
             )
         return self._vector_store_client
 
@@ -890,7 +888,7 @@ class Mem0Backend:
             for k, v in (filters or {}).items()
         ]
         should: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=_MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
+            qmodels.FieldCondition(key=MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
             for needle in (text_needles or ())
         ]
         # `or None` on BOTH arms — the omit-an-unused-arm rule, stated once.
@@ -1073,7 +1071,7 @@ class Mem0Backend:
         limit: int | None = None,
         max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
     ) -> dict[str, Any]:
-        """Literal substring scan over Qdrant payload TEXT for leaked tool-call XML.
+        """Literal substring scan over Qdrant payload TEXT (leaked tool-call XML by default).
 
         (a) THIS IS NOT SEMANTIC SEARCH AND NOT METADATA EQUALITY. It is the
         gap that made the corpus unsweepable: :meth:`search` ranks by
@@ -1082,7 +1080,7 @@ class Mem0Backend:
         live 2026-07-26 probe returned zero). :meth:`count_by_metadata` /
         :meth:`scroll_by_metadata` match payload KEYS by equality, which
         cannot see inside the memory text at all. This method walks the
-        records and applies the shared detector to their content.
+        records and judges their text.
 
         (b) PREFILTER. Unless *exhaustive*, one
         ``FieldCondition(key='data', match=MatchText(text=needle))`` per
@@ -1091,23 +1089,38 @@ class Mem0Backend:
         literal, case-sensitive, order-preserving SUBSTRING match — measured
         on qdrant 1.17.1 over 19,321 points at ~70-90 ms for an exact count.
 
-        (c) THE PREFILTER IS AN OPTIMISATION ONLY. Every returned record is
-        RE-VERIFIED with :func:`find_toolcall_xml_leak`, which is the
-        authoritative verdict. This matters because those are un-indexed-field
-        FALLBACK semantics: creating a text payload index on ``data`` would
-        SILENTLY flip ``MatchText`` to tokenized word-matching. That failure is
-        safe here rather than merely unlikely — tokenized matching is strictly
-        MORE permissive for these needles (a record containing a literal
+        (c) THE PREFILTER IS AN OPTIMISATION ONLY. Every walked record is
+        judged in Python, and that is the authoritative verdict: the caller's
+        *needles*, when given, as a literal, case-sensitive substring match;
+        otherwise :func:`find_toolcall_xml_leak`. The verdict can only discard
+        records the prefilter returned, never recover ones it skipped, so a
+        prefiltered scan is exact only while the prefilter selects a SUPERSET
+        of the verdict's matches. That rests on un-indexed-field FALLBACK
+        semantics: creating a text payload index on ``data`` would SILENTLY
+        flip ``MatchText`` to tokenized word-matching.
+
+        For the DEFAULT SENTINELS that flip is safe: tokenized matching is
+        strictly MORE permissive for them (a record containing a literal
         serialized opening tag necessarily contains its constituent word
-        tokens), so the prefilter remains a superset and the Python detector
-        still yields the exact answer. Only speed degrades, never correctness.
+        tokens), so the superset holds and only speed degrades. For CUSTOM
+        *needles* it is NOT safe: a needle that is not a whole token, such as
+        the mid-word ``'econciliatio'``, is a literal substring but no token
+        match, so an indexed prefilter would silently skip records the verdict
+        would report. A prefiltered custom-needle scan is therefore exact only
+        under un-indexed substring semantics; ``exhaustive=True`` is the
+        index-independent path. The prefilter also reads only the ``data``
+        key, so prefiltered mode finds text stored there alone; *exhaustive*
+        mode also sees the ``memory``/``content`` fallbacks.
         ``tests/test_mem0_client.py::TestMem0BackendScanPayloadTextIntegration``
-        is the tripwire that fails loudly if those semantics ever change.
+        is the tripwire that fails loudly if those semantics change, but it
+        runs against its own test collection and cannot see an index created
+        on a production one.
 
         (d) ``exhaustive=True`` skips the prefilter entirely and walks the
-        whole collection. Use it when the answer must not depend on prefilter
-        semantics at all — notably when establishing the TRUE incidence rate,
-        so that claim rests on nothing but the shared detector.
+        whole collection; it changes nothing else. Use it when the answer must
+        not depend on prefilter semantics at all — notably when establishing
+        the TRUE incidence rate, so that claim rests on nothing but the
+        Python verdict.
 
         (e) BOTH MODES PAGINATE, and the walk is DELEGATED to
         :meth:`scroll_collection_pages` rather than re-implemented here — one
@@ -1135,11 +1148,14 @@ class Mem0Backend:
 
         Args:
             scope: Project/agent/session scope (selects the collection).
-            needles: Literal substrings for the prefilter. ``None`` or empty
-                defaults to
+            needles: Literal substrings that are both the prefilter and the
+                verdict: a walked record matches when it contains one. ``None``
+                or empty defaults to
                 :data:`~fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
-                — never to "no needles", which would scan for nothing and
-                report a clean corpus. Ignored when *exhaustive*.
+                for the prefilter and the leak detector for the verdict —
+                never to "no needles", which would scan for nothing and report
+                a clean corpus. *exhaustive* skips only their prefilter use.
+                No needle may be the empty string.
             filters: Optional key→value payload equality filters, AND-ed in
                 via ``must`` exactly as :meth:`count_by_metadata` builds them,
                 to narrow the scan (e.g. ``{'category': ...}``). Applies in
@@ -1161,14 +1177,19 @@ class Mem0Backend:
                 that a caller's exit-code predicate reads as a complete,
                 successful sweep. Rejecting it is the same no-silent-wrong-value
                 rule that makes a scan timeout propagate rather than collapse
-                into an empty list.
+                into an empty list. Also if any needle is ``''``: the empty
+                string is a substring of every text, so one stray ``''`` would
+                turn a needle hunt into an echo of the whole walked population.
 
         Returns:
             ``{'matches': [...], 'scanned': int, 'truncated': bool,
             'collection': str}`` where each match is ``{'id', 'created_at',
             'matched_fragments', 'excerpt', 'metadata'}``. ``scanned`` counts
             every point walked, including non-matching ones, so it is a correct
-            denominator for an incidence rate.
+            denominator for an incidence rate. ``excerpt`` is at most
+            ``_EXCERPT_LEN`` characters of the text, centred where its earliest
+            matched fragment begins, with ``…`` on each elided side; a tail
+            leak or a needle deep in a record is therefore visible in it.
 
             ``collection`` is the Qdrant collection this call actually
             scrolled — the same name passed to every ``client.scroll`` below,
@@ -1226,11 +1247,12 @@ class Mem0Backend:
                 'non-positive limit walks zero points and would report an empty '
                 'result as a clean corpus'
             )
-
-        from fused_memory.utils.toolcall_xml_leak import (
-            PREFILTER_NEEDLES,
-            find_toolcall_xml_leak,
-        )
+        if needles and '' in needles:
+            raise ValueError(
+                f"scan_payload_text needles must not contain '', got {needles!r}; the "
+                'empty string is a substring of every text, so it would report every '
+                'walked record as a match'
+            )
 
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
 
@@ -1242,6 +1264,7 @@ class Mem0Backend:
         # this mode wants — expressed as scroll_filter=None, not as an
         # unfiltered Filter.
         needle_arm = None if exhaustive else list(needles or PREFILTER_NEEDLES)
+        verdict = _needle_verdict_for(needles) if needles else _leak_verdict
         scroll_filter = (
             self._build_payload_filter(filters, text_needles=needle_arm)
             if (filters or needle_arm)
@@ -1260,7 +1283,7 @@ class Mem0Backend:
             # `aclosing` rather than a bare `async for` because `async for`
             # closes the generator only when the ITERATION ends or raises: a
             # failure in the LOOP BODY below (a malformed payload reaching the
-            # detector) or a cancellation would otherwise leave the pager
+            # verdict) or a cancellation would otherwise leave the pager
             # suspended mid-walk for the event loop's async-generator hooks to
             # finalise at some later, unpredictable point.  This makes the
             # close deterministic on EVERY exit path.
@@ -1277,15 +1300,15 @@ class Mem0Backend:
                 async for point in pages:
                     scanned += 1
                     payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-                    hits = find_toolcall_xml_leak(extract_payload_text(payload))
-                    if not hits:
+                    text = mem0_payload_text(payload)
+                    fragments = verdict(text)
+                    if not fragments:
                         continue
-                    text = extract_payload_text(payload) or ''
                     matches.append({
                         'id': point.id,
                         'created_at': payload.get('created_at'),
-                        'matched_fragments': [hit.fragment for hit in hits],
-                        'excerpt': text[:_EXCERPT_LEN] + ('…' if len(text) > _EXCERPT_LEN else ''),
+                        'matched_fragments': fragments,
+                        'excerpt': _excerpt_around(text, fragments),
                         'metadata': payload,
                     })
         except ScrollPointBudgetExhausted:

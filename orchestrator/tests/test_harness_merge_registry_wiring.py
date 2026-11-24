@@ -19,6 +19,7 @@ from _orch_helpers import _init_harness_state_for_test
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.worker import InFlightMergeRegistry
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 
 # ---------------------------------------------------------------------------
 # Shared harness builder (mirrors test_harness_startup_get_statuses)
@@ -136,6 +137,7 @@ def harness_for_registry_run_slot() -> Harness:
     # The shared registry — this is the object we assert is forwarded.
     h._merge_inflight_registry = InFlightMergeRegistry()
     h._task_verify_dispatcher = MagicMock()
+    h._verify_cache = MagicMock()
     h.cost_store = None
     h._run_store = None
     h._run_id = None
@@ -229,7 +231,7 @@ class TestRunSlotInjectsRegistryIntoWorkflow:
             mock_wf.run = _wedge
             mock_wf_cls.return_value = mock_wf
 
-            wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+            wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
 
             # Poll until _run_slot constructs TaskWorkflow (registers in slot tasks).
             for _ in range(50):

@@ -36,17 +36,15 @@ import copy
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
-import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from orchestrator import session_records, session_registry
+from orchestrator import session_records, session_registry, session_windows
 from orchestrator.session_ownership_probes import EventProbes, ProcessTree
 from orchestrator.session_self_exit import SelfExit
 
@@ -54,6 +52,7 @@ from orchestrator.session_self_exit import SelfExit
 # isort: split
 from shared.proc_liveness import pid_alive
 from shared.process_identity import Liveness
+from shared.project_layout import CheckoutRootError, main_checkout_of
 from shared.session_liveness import capture_for_record, judge
 
 logger = logging.getLogger(__name__)
@@ -142,10 +141,11 @@ _OWNER_ONLY_SESSION_START_SOURCES = frozenset({'clear', 'compact'})
 """SessionStart ``source`` values only a process already holding a session can emit.
 
 ``/clear`` and compaction re-mint ``session_id`` in place. Membership is
-necessary but not sufficient to forgive a re-mint: ``_env_slug_ownership``
-also requires the event's owning claude pid to equal the record's
-``claude_owner_pid``. ``'resume'`` is excluded because a new nested process
-reports it too. See ``docs/session-hook-ownership.md`` §Session-id re-mints.
+necessary but not sufficient to forgive a re-mint: the event's owning claude
+pid must also match the record's ``claude_owner_pid``, as judged by
+``_owner_pid_verdict``, which never forgives under a shared ``claude agents``
+host. ``'resume'`` is excluded because a new nested process reports it too.
+See ``docs/session-hook-ownership.md`` §Session-id re-mints.
 """
 
 
@@ -241,8 +241,8 @@ def _env_slug_ownership(
       need not read again. None only when nothing was read.
 
     Fail-soft: every unresolvable probe adopts, never forks. *allow_remint*
-    (SessionStart only) forgives a mismatch from an owner-only ``source`` when
-    the owning claude pid matches the record's ``claude_owner_pid``. *probes*
+    (SessionStart only) forgives a mismatch from an owner-only ``source``
+    unless ``_owner_pid_verdict`` refutes the owner. *probes*
     is this event's ``EventProbes``. See ``docs/session-hook-ownership.md``
     §Owner or inheritor and §Fail-soft direction.
     """
@@ -272,29 +272,8 @@ def _env_slug_ownership(
         # Forked onto the hand-launched keying, whose slug embeds this very
         # session_id: binding there is tautological, never a capture.
         return False, True, snapshot
-    owner_pid = record.claude_owner_pid
-    current_pid = probes.owning_claude_pid()
-    if owner_pid is None or current_pid is None:
-        # Unprovable, not disproved: adopt.
-        return True, True, snapshot
-    return owner_pid == current_pid, True, snapshot
-
-
-def _env_slug_is_owned(
-    slug: str,
-    hook_input: Mapping[str, Any],
-    root: Path | str | None,
-    *,
-    allow_remint: bool = False,
-    probes: EventProbes,
-) -> bool:
-    """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
-
-    Kept as the narrow, boolean question for callers that only need the
-    identity decision; the binding decision travels separately, through
-    ``_resolve_hook_slug``.
-    """
-    return _env_slug_ownership(slug, hook_input, root, allow_remint=allow_remint, probes=probes)[0]
+    # An unprovable owner (None) is not disproved: adopt.
+    return _owner_pid_verdict(record, probes) is not False, True, snapshot
 
 
 @dataclass(frozen=True)
@@ -377,35 +356,31 @@ def _adopt_t3_thread_slug(
     """Adopt *slug*, the record this event's T3 thread pointer names, unless the event is not its owner.
 
     A T3 thread carries no ``CLAUDE_SPAWN_OWNER_PPID``, so the claude pids
-    decide. Unbound: the thread's first claude binds, as does the recorded
-    owner pid or any event once the recorded owner is judged DEAD; an event
-    whose pid is unresolvable adopts without binding. Bound to this event's
-    session id: adopted as ``session_id_keyed``, so a dead owner is
-    reclaimed. Bound to another
-    session id: the owner-only re-mint rule of ``_env_slug_ownership``, or,
-    on SessionStart (*allow_remint*), a recorded owner judged DEAD re-binds.
-    A nested claude always has a live owner, so it forks. See
+    decide (``_owner_pid_verdict``). Unbound: the thread's first claude binds,
+    as does a proven owner or any event once the recorded owner is judged
+    DEAD; an event whose pid is unresolvable adopts without binding.
+    Bound to this event's session id: adopted as ``session_id_keyed``, so a
+    dead owner is reclaimed. Bound to another session id: the owner-only
+    re-mint rule of ``_env_slug_ownership``, or, on SessionStart
+    (*allow_remint*), a recorded owner judged DEAD re-binds. A nested claude
+    always has a live owner, so it forks. See
     ``docs/session-hook-ownership.md`` §Owner or inheritor.
     """
     snapshot = _read_record_snapshot(slug, root)
     record = snapshot.record
     if record is None:
         return None
-    owner_pid, current_pid = record.claude_owner_pid, probes.owning_claude_pid()
+    verdict = _owner_pid_verdict(record, probes)
     bound = (record.claude_session_id or '').strip()
     if not bound:
-        if owner_pid is None or owner_pid == current_pid or _recorded_owner_is_dead(record):
+        if record.claude_owner_pid is None or verdict is True or _recorded_owner_is_dead(record):
             return _HookSlugResolution(slug, None, True, snapshot)
-        if current_pid is None:
+        if probes.owning_claude_pid() is None:
             return _HookSlugResolution(slug, None, False, snapshot)
         return None
     if bound == _hook_session_id(hook_input):
         return _HookSlugResolution(slug, None, True, snapshot, session_id_keyed=True)
-    if (
-        allow_remint
-        and _is_owner_only_session_start(hook_input)
-        and (owner_pid is None or current_pid is None or owner_pid == current_pid)
-    ):
+    if allow_remint and _is_owner_only_session_start(hook_input) and verdict is not False:
         return _HookSlugResolution(slug, None, True, snapshot)
     if allow_remint and _recorded_owner_is_dead(record):
         return _HookSlugResolution(slug, None, True, snapshot, may_rebind=True)
@@ -661,6 +636,22 @@ def _reclaim_dead_owner_pid(record: session_records.SessionRecord, probes: Event
     return True
 
 
+def _owner_pid_verdict(record: session_records.SessionRecord, probes: EventProbes) -> bool | None:
+    """Does this event's claude pid prove it is *record*'s bound owner process?
+
+    False when ``probes.owner_is_shared_host()``: every session a ``claude
+    agents`` host runs shares its pid. None when ``record.claude_owner_pid``
+    or ``probes.owning_claude_pid()`` is None: unprovable, so callers adopt.
+    Otherwise whether the two pids are equal.
+    """
+    if probes.owner_is_shared_host():
+        return False
+    owner, current = record.claude_owner_pid, probes.owning_claude_pid()
+    if owner is None or current is None:
+        return None
+    return owner == current
+
+
 def _recorded_owner_is_dead(record: session_records.SessionRecord) -> bool:
     """Whether *record*'s recorded owner claude is judged DEAD; False when it records none."""
     owner = record.claude_owner_pid
@@ -684,8 +675,10 @@ def _stamp_session_pointers(
     Each pointer asserts exactly what the written record already proves: the
     session-id pointer only when this event changed the binding, the
     pid pointer whenever ``claude_owner_pid`` is this event's owning claude
-    pid, and the thread pointer whenever the record is t3 for this event's
-    *t3_thread_id* and no other live record holds that thread
+    pid and the store accepts that pid as a pointer key
+    (``session_records.is_session_pointer_pid``), and the thread pointer
+    whenever the record is t3 for this event's *t3_thread_id* and no other
+    live record holds that thread
     (``session_records.index_t3_record_if_unheld``): a hook never moves a
     held thread pointer, only the T3 lane's bind does. The pid and thread
     rules cover every lane (adopt, fork, a withheld launch window, an
@@ -767,131 +760,12 @@ def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
     return env.get('CLAUDE_SPAWN_PARENT_ID') or None
 
 
-_WM_WINDOW_ID_ATTEMPTS = 5
-_WM_WINDOW_ID_RETRY_SLEEP_SECS = 0.2
-_WMCTRL_TIMEOUT_SECS = 2
-
-
-def _wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    """Fail-soft default runner for ``_resolve_wm_window_id``.
-
-    Wraps ``subprocess.run(['wmctrl', '-l'], ...)`` and never raises, but
-    distinguishes *why* it failed so the caller can react differently:
-
-    - A genuinely-missing ``wmctrl`` binary (``FileNotFoundError``) is a
-      permanent failure -- yields the rc=127 sentinel
-      ``_resolve_wm_window_id`` short-circuits on (no point retrying a
-      binary that will never appear).
-    - Any other ``OSError``/``SubprocessError`` -- notably
-      ``subprocess.TimeoutExpired`` from a momentarily-hung ``wmctrl`` -- is
-      transient, not permanent, so it yields a distinct rc=124 sentinel that
-      the retry loop keeps riding out exactly like a nonzero/empty probe.
-      Conflating the two would abort all remaining attempts on a single
-      slow probe instead of retrying it.
-    """
-    try:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=_WMCTRL_TIMEOUT_SECS)
-    except FileNotFoundError:
-        return subprocess.CompletedProcess(argv, returncode=127, stdout='')
-    except (OSError, subprocess.SubprocessError):
-        return subprocess.CompletedProcess(argv, returncode=124, stdout='')
-
-
-def _resolve_wm_window_id(
-    title: str,
-    *,
-    run: Callable[[list[str]], subprocess.CompletedProcess[str]] = _wmctrl_list,
-    attempts: int = _WM_WINDOW_ID_ATTEMPTS,
-    sleep: Callable[[float], None] = time.sleep,
-) -> str | None:
-    """Best-effort resolve *title*'s live X11 window id via ``wmctrl -l``.
-
-    Terminals map their X11 window asynchronously, so the window may not yet
-    appear in ``wmctrl -l`` on the first probe right after spawn -- this
-    retries up to *attempts* times, sleeping ``_WM_WINDOW_ID_RETRY_SLEEP_SECS``
-    between attempts (never after the last one). Each ``wmctrl -l`` line is
-    parsed via ``split(None, 3)`` into ``(window_id, desktop, host, title)`` --
-    identical to ``WmBackend.is_alive``'s proven parse
-    (cockpit/src/cockpit/backends/wm.py) -- and this returns the window id of
-    the line whose title field matches *title* EXACTLY, never as a substring,
-    so a short marker can't false-positive against an unrelated longer window
-    title. NOTE: this parse is intentionally duplicated (not shared/imported)
-    across the orchestrator/cockpit package boundary -- keep the two in sync
-    if either changes (see WmBackend.is_alive's matching note).
-
-    Fully fail-soft: a missing ``wmctrl``, a nonzero return code on every
-    attempt, no matching line, or any unexpected exception (from *run*,
-    parsing, or *sleep*) all return ``None`` rather than raising -- a
-    resolution miss must degrade cleanly to ``display=None``, never worse.
-
-    ``_wmctrl_list``'s two failure sentinels are handled distinctly:
-    a returncode of 127 (genuinely-missing ``wmctrl`` binary) is a permanent
-    failure, so it short-circuits on the first probe instead of paying the
-    full *attempts* x sleep cost; a returncode of 124 (transient failure,
-    e.g. a ``wmctrl`` invocation that timed out) is treated exactly like any
-    other non-matching probe and retried.
-
-    Worst-case added SessionStart latency (this runs synchronously inside
-    the hook): the common "window not mapped yet" miss costs
-    ``(attempts - 1) * _WM_WINDOW_ID_RETRY_SLEEP_SECS`` of sleeping plus
-    *attempts* fast ``wmctrl -l`` calls (~0.8s at the current defaults); the
-    pathological case of ``wmctrl`` itself repeatedly timing out costs up to
-    ``attempts * _WMCTRL_TIMEOUT_SECS`` on top of that (~10.8s at the current
-    defaults) before giving up and leaving ``display=None``.
-    """
-    try:
-        for attempt in range(attempts):
-            result = run(['wmctrl', '-l'])
-            if result.returncode == 127:
-                return None
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    columns = line.split(None, 3)
-                    if len(columns) < 4:
-                        continue
-                    window_id, _desktop, _host, line_title = columns
-                    if line_title == title:
-                        return window_id
-            if attempt < attempts - 1:
-                sleep(_WM_WINDOW_ID_RETRY_SLEEP_SECS)
-    except Exception:
-        logger.warning("wmctrl window-id resolution failed; degrading to display=None", exc_info=True)
-        return None
-    return None
-
-
-def _canonical_window_id(raw: str | None) -> str | None:
-    """Canonicalize a window id to wmctrl -l's zero-padded ``0x%08x`` form.
-
-    ``int(raw, 0)`` base-autodetects, so a bare DECIMAL ``$WINDOWID`` (what a
-    real terminal emulator exports, e.g. ``'52428807'``) and an already-hex
-    id (e.g. ``'0x3200007'``) both parse to the same integer, which is then
-    reformatted as ``0x%08x`` -- byte-identical to wmctrl -l's own
-    ``0x%08lx`` first column (e.g. ``'0x03200007'``). This makes a captured
-    id self-consistent with the marker path (``_resolve_wm_window_id``, which
-    already returns wmctrl's canonical column) and with every string-consumer
-    (the window-gone reaper, dashboards). Fail-soft: a missing (``None``) or
-    unparseable id returns ``None`` so the caller can fall back to the raw
-    value rather than crashing the hook.
-
-    NOTE: this parse/canonicalize logic is mirrored (duplicated, not
-    shared/imported, since cockpit must never import orchestrator -- see
-    ``cockpit/src/cockpit/backends/base.py``'s docstring) in
-    ``cockpit/src/cockpit/backends/wm.py::_window_id_int``, which keys on the
-    identical ``int(s, 0)`` contract (there returning the int; here the
-    canonical string). Keep the two in sync.
-    """
-    try:
-        return f'0x{int(raw, 0):08x}'  # type: ignore[arg-type]
-    except (ValueError, TypeError):
-        return None
-
-
 def _resolve_display(
     env: Mapping[str, str],
     title: str,
     *,
-    allow_spawn_marker: bool = True,
+    allow_spawn_marker: bool,
+    windows: session_windows.WindowProbe,
 ) -> session_records.Display | None:
     """Resolve this session's best-effort focus target from env (Fleet Cockpit C2).
 
@@ -907,7 +781,8 @@ def _resolve_display(
     Third and last, when neither TMUX nor WINDOWID is present (the common
     case for konsole/gnome-terminal spawns, which do not export WINDOWID --
     task 2510 / Fleet Cockpit C10 fix): if ``CLAUDE_SPAWN_WM_TITLE`` is set,
-    resolve its live X11 window id via ``_resolve_wm_window_id`` and, on a
+    resolve its live X11 window id via *windows* (live:
+    ``session_windows.py::resolve_window_id_by_title``) and, on a
     hit, stamp a 'wm' Display carrying that EXACT marker as ``wm_title``
     (never the possibly-since-churned *title* param). Gated strictly on this
     explicit env var -- no fallback to *title* itself -- so a hand-launched
@@ -934,11 +809,11 @@ def _resolve_display(
         return session_records.Display(
             kind=session_records.DisplayKind.WM.value,
             wm_title=title,
-            wm_window_id=_canonical_window_id(env.get('WINDOWID')) or env.get('WINDOWID'),
+            wm_window_id=session_windows.canonical_window_id(env.get('WINDOWID')) or env.get('WINDOWID'),
         )
     marker = env.get('CLAUDE_SPAWN_WM_TITLE') if allow_spawn_marker else None
     if marker:
-        window_id = _resolve_wm_window_id(marker)
+        window_id = windows.resolve_by_title(marker)
         if window_id is not None:
             return session_records.Display(
                 kind=session_records.DisplayKind.WM.value,
@@ -954,12 +829,15 @@ def run_session_start(
     root: Path | str | None = None,
     *,
     process_tree: ProcessTree | None = None,
+    windows: session_windows.WindowProbe | None = None,
 ) -> session_records.SessionRecord:
     """SessionStart hook handler: capture or refresh this session's record.
 
     With no record at the slug yet, this is the session's first sight: a rich
     record is built from the resolved identity with status RUNNING. An
-    existing record is refreshed to RUNNING in place, its other fields kept.
+    existing record is refreshed to RUNNING in place, its other fields kept
+    except exit_code, which RUNNING clears (see
+    ``session_records.py::set_status``).
     Both then get best-effort enrichment (``parent_session_id`` from
     ``CLAUDE_SPAWN_PARENT_ID``; a t3 display claiming ``claims_t3_thread``,
     else display from ``_resolve_display`` unless the record's is T3's), a
@@ -979,9 +857,10 @@ def run_session_start(
       inherited ``CLAUDE_SPAWN_LAUNCHER_PID``;
     * identity and title resolve from ``_own_identity_env``.
 
-    *process_tree* is the tree the probes read; None reads the live one. See
-    ``docs/session-hook-ownership.md`` §Forked-inheritor identity and
-    §One read, one decision, one write.
+    *process_tree* is the tree the probes read; None reads the live one.
+    *windows* is the window probe the display resolution reads; None reads
+    wmctrl. See ``docs/session-hook-ownership.md`` §Forked-inheritor identity
+    and §One read, one decision, one write.
     """
     probes = EventProbes(env, process_tree)
     resolution = _resolve_hook_slug(
@@ -1028,7 +907,9 @@ def run_session_start(
             transcript_path=session_records.transcript_path_for_cwd(cwd),
         )
 
-    record.status = session_records.Status.RUNNING
+    record = session_records.apply_refresh(
+        slug, record, status=session_records.Status.RUNNING
+    )
     if forked_from is not None:
         # The rejected env slug IS this nested claude's spawner.
         record.parent_session_id = forked_from
@@ -1045,7 +926,12 @@ def run_session_start(
             t3_thread_id=resolution.claims_t3_thread,
         )
     else:
-        display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
+        display = _resolve_display(
+            env,
+            title,
+            allow_spawn_marker=forked_from is None,
+            windows=windows if windows is not None else session_windows.wmctrl_window_probe(),
+        )
         if display is not None and not session_records.is_t3_record(record):
             record.display = display
     # may_bind, not forked_from, guards the bind: an adopted-but-unproven
@@ -1328,40 +1214,18 @@ def merge_hook_settings(settings: Mapping[str, Any], script_dir: str | Path) -> 
 def _hooks_script_dir() -> Path:
     """Absolute path to the in-repo skills/spawn/hooks/ dir.
 
-    Resolves to the PRIMARY checkout's ``skills/spawn/hooks/``, even when
-    this file is itself executing from inside a linked git worktree (e.g.
-    ``.worktrees/<id>/``). Otherwise the ephemeral worktree's path gets
-    baked into the absolute hook commands written into
-    ``~/.claude/settings.json``, and every hook breaks the moment that
-    worktree is reaped.
-
-    Runs ``git -C <this file's dir> rev-parse --path-format=absolute
-    --git-common-dir``: the *common* git dir always points at the primary
-    repo's ``.git``, even from a linked worktree, so its parent is the
-    primary checkout root. Falls back to the previous
-    ``Path(__file__).resolve().parents[3]`` behaviour whenever git is
-    absent, this isn't a git checkout, the command errors, or the resolved
-    directory doesn't actually contain the three hook scripts -- install
-    must stay robust and never raise.
+    Resolves to the PRIMARY checkout's ``skills/spawn/hooks/`` via
+    ``shared.project_layout.main_checkout_of``, even from a linked worktree,
+    so a reaped worktree's path is never baked into the hook commands in
+    ``~/.claude/settings.json``. Falls back to ``Path(__file__).resolve().parents[3]``
+    when no main checkout can be derived or the candidate lacks a hook
+    script: install never raises.
     """
     fallback = Path(__file__).resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
-    file_dir = Path(__file__).resolve().parent
     try:
-        result = subprocess.run(
-            ['git', '-C', str(file_dir), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-            capture_output=True,
-            text=True,
-            timeout=_HOOK_TIMEOUT_SECS,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError):
+        primary_root = main_checkout_of(Path(__file__))
+    except CheckoutRootError:
         return fallback
-
-    git_common_dir = result.stdout.strip()
-    if not git_common_dir:
-        return fallback
-
-    primary_root = Path(git_common_dir).resolve().parent
     candidate = primary_root / 'skills' / 'spawn' / 'hooks'
     if all((candidate / script_name).is_file() for script_name in _HOOK_SCRIPTS.values()):
         return candidate

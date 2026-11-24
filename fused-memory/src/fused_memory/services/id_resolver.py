@@ -39,8 +39,9 @@ from shared.uuid_prefix_guard import (
     ResolverUnavailable,
 )
 
-from fused_memory.backends.mem0_client import extract_payload_text, is_missing_collection_error
+from fused_memory.backends.mem0_client import is_missing_collection_error
 from fused_memory.models.scope import Scope
+from fused_memory.utils.mem0_content_keys import mem0_payload_text
 from fused_memory.utils.validation import is_full_uuid
 
 if TYPE_CHECKING:
@@ -113,8 +114,7 @@ def _candidate_order(candidate: Candidate) -> tuple[int, str]:
 
 
 def _mem0_preview(payload: dict[str, Any] | None) -> str:
-    text = extract_payload_text(payload) if payload else None
-    return (text or '')[:PREVIEW_CHARS]
+    return mem0_payload_text(payload)[:PREVIEW_CHARS] if payload else ''
 
 
 class IdResolver:

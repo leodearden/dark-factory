@@ -2580,14 +2580,19 @@ class TestSplitChainTail:
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
             ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory'
+            ' && uv run --project shared python tests/scripts/git_history_census.py fused-memory/tests'
         )
         assert tail == FM_LINT_COMMAND[len(prefix):]
 
     def test_accepts_scripts_lint_chain(self):
-        """scripts/orchestrator.yaml::lint_command — the envelope-literal guard is its tail."""
+        """scripts/orchestrator.yaml::lint_command — the envelope-literal guard and the census are its tail."""
         prefix, tail = split_chain_tail(SCRIPTS_LINT_COMMAND, 'ruff check')
         assert prefix == 'uv run --project shared ruff check scripts/ '
-        assert tail == '&& python3 tests/scripts/raw_envelope_literal_guard.py scripts'
+        assert tail == (
+            '&& python3 tests/scripts/raw_envelope_literal_guard.py scripts'
+            ' && uv run --project shared python tests/scripts/git_history_census.py'
+            ' tests/scripts scripts/tests'
+        )
         assert prefix + tail == SCRIPTS_LINT_COMMAND
 
     def test_accepts_root_lint_chain(self):
@@ -2811,18 +2816,12 @@ class TestTailPreservationAllowlist:
                 ' fused-memory/tests'
                 ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py'
                 ' fused-memory/tests'
-                ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory',
+                ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory'
+                ' && uv run --project shared python tests/scripts/git_history_census.py'
+                ' fused-memory/tests',
             ),
             ('npx pyright && python3 y.py', 'pyright', '&& python3 y.py'),
-            (
-                FM_LINT_COMMAND,
-                'uv run',
-                '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
-                ' fused-memory/tests'
-                ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py'
-                ' fused-memory/tests'
-                ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory',
-            ),
+            (ROOT_LINT_COMMAND, 'uv run', '&& ' + ROOT_LINT_CHECKER_CLAUSE),
         ],
         ids=['ruff-check', 'pyright', 'uv-run'],
     )
@@ -2845,7 +2844,7 @@ class TestTailPreservationAllowlist:
             (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
             (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
             (FM_LINT_COMMAND, 'ruff check'),
-            (FM_LINT_COMMAND, 'uv run'),
+            (ROOT_LINT_COMMAND, 'uv run'),
             ('npx pyright && python3 y.py', 'pyright'),
         ],
         ids=[
@@ -2906,11 +2905,11 @@ class TestTailPreservationAllowlist:
     @pytest.mark.parametrize(
         ('raw', 'keyword'),
         [
-            (FM_LINT_COMMAND, 'uv run'),
+            (ROOT_LINT_COMMAND, 'uv run'),
             ('uv run ruff check src/ && python3 scripts/check_noqa.py src', 'uv run'),
             ('uv run --project orchestrator pyright src/ && python3 x.py', 'uv run'),
         ],
-        ids=['fm-lint', 'uv-run-ruff', 'uv-run-pyright'],
+        ids=['root-lint', 'uv-run-ruff', 'uv-run-pyright'],
     )
     def test_condition_0b_leaves_the_reproject_path_untouched(self, raw, keyword):
         """Condition 0b must cost ``_reproject_str`` nothing: its real inputs

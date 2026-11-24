@@ -539,14 +539,12 @@ class _MineTally:
 
 @cli.command('mine')
 @click.option('--runs-db', default=None, type=click.Path(path_type=Path),
-              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB; '
-                   "default: the main checkout's runs.db)")
+              help="Path to the offline orchestrator runs.db (default: the main checkout's runs.db)")
 @click.option('--escalations-dir', default=None, type=click.Path(path_type=Path),
-              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR; '
-                   "default: the main checkout's escalation queue)")
+              help='Path to the offline escalations directory '
+                   "(default: the main checkout's escalation queue)")
 @click.option('--repo-path', default=None, type=click.Path(path_type=Path),
-              help='Git repo to recover mined diffs from (env: REVIEWER_TRIAL_REPO_ROOT; '
-                   'default: the main checkout)')
+              help='Git repo to recover mined diffs from (default: the main checkout)')
 @click.option('--target-total', default=100, type=int, help='Aim for this many total diffs (existing + mined)')
 @click.option('--max-parallel', default=8, type=int, help='Max concurrent frontier-labeling calls')
 @click.option('--model', default='opus', help='Frontier model for propose_labels_frontier')
@@ -570,14 +568,12 @@ def mine(
     after every successfully-labeled diff, so an interrupted run only loses
     whatever was still in flight.
     """
-    runs_db = runs_db or cli_default(
-        '--runs-db', project_layout.runs_db, env_var='REVIEWER_TRIAL_RUNS_DB',
-    )
+    runs_db = runs_db or cli_default('--runs-db', project_layout.runs_db)
     escalations_dir = escalations_dir or cli_default(
         '--escalations-dir', project_layout.escalation_queue_dir,
-        env_var='REVIEWER_TRIAL_ESCALATIONS_DIR',
     )
-    repo_path = repo_path or cli_default('--repo-path', Path, env_var='REVIEWER_TRIAL_REPO_ROOT')
+    repo_path = repo_path or cli_default('--repo-path', Path)
+    click.echo(f'Mine sources: runs_db={runs_db}  escalations_dir={escalations_dir}  repo_path={repo_path}')
 
     async def _run() -> int:
         from orchestrator.config import GitConfig
@@ -611,8 +607,8 @@ def mine(
                 f'runs.db not found at {runs_db}\n'
                 '  This is an offline generation tool that reads the gitignored '
                 'orchestrator run history, which lives in the MAIN repo checkout, not '
-                "a task worktree (see corpus/README.md). Pass --runs-db, "
-                'or set REVIEWER_TRIAL_RUNS_DB, to point at a real runs.db -- otherwise '
+                'a task worktree (see corpus/README.md). Pass --runs-db '
+                'to point at a real runs.db -- otherwise '
                 "sqlite3 silently creates an empty one and this fails later with "
                 "'no such table: task_results'.",
                 err=True,

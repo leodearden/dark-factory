@@ -161,7 +161,7 @@ def _neutralise_heavy_startup(harness: Harness) -> None:
     harness._lifecycle.stop_all = AsyncMock()
 
     harness._dismiss_stale_escalations = AsyncMock()
-    harness._rehydrate_merge_halt = MagicMock()
+    harness._rehydrate_merge_halt = AsyncMock()
     harness._file_restored_pause_escalation = MagicMock()
     harness._tag_task_modules = AsyncMock()
     harness._recover_crashed_tasks = AsyncMock()

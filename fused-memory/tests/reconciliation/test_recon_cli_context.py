@@ -2,7 +2,9 @@
 
 Every recon CLI call (the stages, the judge and the verify loop) reads no
 settings file, loads no CLAUDE.md and no auto-memory index, keeps
-auto-compaction off, and keeps its transcript. Each switch has one job:
+auto-compaction off, and keeps its transcript. Every call also declares the
+background work class to the usage gate, so the allowance reserve refuses it in
+its protected window. Each switch has one job:
 
 - Empty setting sources keep out the settings files: hooks, permission rules,
   settings env and ``.mcp.json`` approvals.
@@ -27,6 +29,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _git_root_helper import make_git_root
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
 
@@ -43,6 +46,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
 )
 from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.reserve_step_aside import RECONCILIATION_WORK_CLASS
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from reconciliation.stubbed_stage_cli import run_stage, run_stage_answered_by
 
@@ -72,6 +76,7 @@ def test_recon_cli_context_constants_name_one_rule():
         'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',
     }
     assert not hasattr(RECONCILIATION_CLI_ENV_OVERRIDES, '__setitem__')
+    assert WorkClass(kind=WorkKind.BACKGROUND, role='reconciliation') == RECONCILIATION_WORK_CLASS
 
 
 @pytest.mark.asyncio
@@ -86,6 +91,7 @@ async def test_stage_runner_loads_no_settings_claude_md_or_memory_index(tmp_path
     assert kwargs.get('available_tools') is None
     assert kwargs['cwd'] == tmp_path
     assert kwargs['permission_mode'] == 'bypassPermissions'
+    assert kwargs['work_class'] == RECONCILIATION_WORK_CLASS
 
 
 @pytest.mark.asyncio
@@ -156,6 +162,7 @@ async def test_judge_loads_no_settings_claude_md_or_memory_index(tmp_path, monke
     assert kwargs['env_overrides'] == dict(RECONCILIATION_CLI_ENV_OVERRIDES)
     assert kwargs['cwd'] == tmp_path
     assert kwargs['strict_mcp_config'] is True
+    assert kwargs['work_class'] == RECONCILIATION_WORK_CLASS
 
 
 @pytest.mark.asyncio
@@ -183,3 +190,4 @@ async def test_verify_loop_loads_no_settings_claude_md_or_memory_index(tmp_path)
     assert kwargs['cwd'] == git_root.resolve()
     assert kwargs['permission_mode'] == 'dontAsk'
     assert kwargs['available_tools'] == ['Read', 'Grep', 'Glob']
+    assert kwargs['work_class'] == RECONCILIATION_WORK_CLASS

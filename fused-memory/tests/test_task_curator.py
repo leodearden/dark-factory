@@ -30,6 +30,7 @@ from _curator_helpers import (
 from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
 from _curator_helpers import prepared as _bundle
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cli_invoke import AgentResult, no_mcp_servers_config
 from shared.declared_scope import derive_declared_scope
 from shared.followup_items import observed_item
@@ -1789,6 +1790,7 @@ class TestInjectedInvoker:
             **self._scoping_kwargs(),
             'label': 'task-curator[p]',
             'role': 'task_curator',
+            'work_class': WorkClass(kind=WorkKind.ESSENTIAL, project_id='p', role='task_curator'),
             'output_schema': CURATOR_OUTPUT_SCHEMA,
             'system_prompt': CURATOR_SINGLE_SPEC.in_code_constant,
             'model': cfg.model,
@@ -1821,6 +1823,9 @@ class TestInjectedInvoker:
             **self._scoping_kwargs(),
             'label': 'task-curator-batch[p]',
             'role': 'task_curator_batch',
+            'work_class': WorkClass(
+                kind=WorkKind.ESSENTIAL, project_id='p', role='task_curator_batch',
+            ),
             'output_schema': CURATOR_BATCH_OUTPUT_SCHEMA,
             'system_prompt': CURATOR_BATCH_SPEC.in_code_constant,
             'model': cfg.model,
@@ -3058,6 +3063,9 @@ class TestParserDegradednessTable:
         ('missing-target', {'action': 'combine', 'justification': 'dup'}, True),
         ('ambiguous-drop',
          {'action': 'drop', 'target_id': '1', 'batch_target_index': 0}, True),
+        ('ambiguous-combine',
+         {'action': 'combine', 'target_id': '1', 'target_fingerprint': 'T1',
+          'batch_target_index': 0, 'rewritten_task': REWRITE}, True),
         ('combine-missing-rewrite',
          {'action': 'combine', 'target_id': '1', 'target_fingerprint': 'T1'}, True),
         ('rewrite-parse-failed',
@@ -3102,7 +3110,7 @@ class TestParserDegradednessTable:
         the same payload would leave one branch unpinned while the table still
         looked complete. Keyed on (marker, payload) rather than marker alone:
         'missing-target' legitimately has two rows, since 'drop' and 'combine'
-        reach it by different routes through the is_within_batch_drop test."""
+        reach it by different routes through the parser's target checks."""
         keys = [(marker, repr(raw)) for marker, raw, _ in self.CASES]
         assert len(keys) == len(set(keys)), keys
 
@@ -4239,6 +4247,54 @@ class TestParseDecisionDict:
         assert result.action == 'drop'
         assert result.batch_target_index == 2
 
+    _SIBLING_REWRITE = {
+        'title': 'Unified task',
+        'description': 'both candidates as one',
+        'details': 'every detail of both',
+        'files_to_modify': ['src/a.py'],
+        'priority': 'medium',
+    }
+
+    def test_within_batch_combine_parses_as_a_combine_onto_the_sibling(self):
+        result = self._call(
+            {
+                'action': 'combine',
+                'target_id': None,
+                'batch_target_index': 1,
+                'target_fingerprint': 'Sibling title',
+                'rewritten_task': self._SIBLING_REWRITE,
+                'justification': 'fold into batch item 1',
+            },
+            pool=[],
+        )
+        assert (result.action, result.target_id, result.batch_target_index) == ('combine', None, 1)
+        assert result.target_fingerprint == 'Sibling title'
+        assert result.rewritten_task is not None
+        assert result.rewritten_task.title == 'Unified task'
+        assert result.degraded is False
+
+    def test_within_batch_combine_without_a_rewrite_degrades(self):
+        result = self._call(
+            {
+                'action': 'combine',
+                'target_id': None,
+                'batch_target_index': 1,
+                'target_fingerprint': 'Sibling title',
+                'justification': 'fold into batch item 1',
+            },
+            pool=[],
+        )
+        assert result.action == 'create'
+        assert 'combine-missing-rewrite' in result.justification
+
+    def test_a_create_does_not_keep_a_stray_batch_target_index(self):
+        result = self._call(
+            {'action': 'create', 'batch_target_index': 2, 'justification': 'novel'},
+            pool=[],
+        )
+        assert result.action == 'create'
+        assert result.batch_target_index is None
+
 
 # ----------------------------------------------------------------------
 # _parse_batch_decisions
@@ -4382,6 +4438,65 @@ class TestParseBatchDecisions:
             f'Expected exc_info[0] to be a subclass of ValueError, '
             f'got {record.exc_info[0]!r}'
         )
+
+    @staticmethod
+    def _combine_edge(index: int, target: int) -> dict:
+        return {
+            'candidate_index': index,
+            'action': 'combine',
+            'batch_target_index': target,
+            'target_fingerprint': f'Candidate {target}',
+            'rewritten_task': {'title': 'Unified', 'description': 'd', 'details': 'x'},
+            'justification': f'fold into {target}',
+        }
+
+    def _parse(self, decisions: list[dict]) -> list[CuratorDecision]:
+        n = len(decisions)
+        return _parse_batch_decisions(
+            self._make_result(decisions),
+            pools=[[] for _ in range(n)],
+            pool_sizes_list=[{} for _ in range(n)],
+            latency_ms=10,
+        )
+
+    @pytest.mark.parametrize('target', [1, 5, -1])
+    def test_a_combine_edge_outside_the_batch_or_onto_itself_degrades(self, target):
+        result = self._parse([
+            {'candidate_index': 0, 'action': 'create', 'justification': 'new'},
+            self._combine_edge(1, target),
+        ])
+        assert result[1].action == 'create'
+        assert 'batch-target-out-of-range' in result[1].justification
+        assert result[1].degraded is True
+
+    def test_a_cycle_mixing_combine_and_drop_edges_degrades_both(self):
+        result = self._parse([
+            self._combine_edge(0, 1),
+            {'candidate_index': 1, 'action': 'drop', 'batch_target_index': 0,
+             'justification': 'dup of 0'},
+        ])
+        assert [d.action for d in result] == ['create', 'create']
+        assert all('batch-cycle' in d.justification for d in result)
+
+    def test_a_combine_onto_a_dropped_sibling_is_left_for_dispatch_to_judge(self):
+        result = self._parse([
+            {'candidate_index': 0, 'action': 'create', 'justification': 'new'},
+            {'candidate_index': 1, 'action': 'drop', 'batch_target_index': 0,
+             'justification': 'dup of 0'},
+            self._combine_edge(2, 1),
+        ])
+        assert [d.action for d in result] == ['create', 'drop', 'combine']
+        assert result[2].batch_target_index == 1
+
+    def test_a_valid_batch_with_a_combine_edge_parses_as_given(self):
+        result = self._parse([
+            {'candidate_index': 0, 'action': 'create', 'justification': 'new'},
+            self._combine_edge(1, 0),
+            {'candidate_index': 2, 'action': 'create', 'justification': 'other'},
+        ])
+        assert [d.action for d in result] == ['create', 'combine', 'create']
+        assert [d.batch_target_index for d in result] == [None, 0, None]
+        assert result[1].target_id is None
 
 
 # ----------------------------------------------------------------------
@@ -9193,6 +9308,28 @@ class TestCuratorPromptLoaderWiringBatch:
         assert mock.await_args.kwargs['system_prompt'] == compose_prompt(
             CURATOR_BATCH_SPEC.contract, heuristics,
         )
+
+    @pytest.mark.asyncio
+    async def test_a_pin_under_the_pre_combine_edge_harness_does_not_reach_the_batch_call(
+        self, tmp_path,
+    ):
+        """Heuristics tuned against the contract that forbade a within-batch
+        combine (harness 'curator-v1') must not pair with the contract that
+        allows one."""
+        config = _make_config()
+        store = PromptArtifactStore(tmp_path)
+        store.pin(
+            'curator_batch', config.curator.model, 'curator-v1',
+            heuristics='PINNED: never combine two batch candidates.',
+            provenance=ArtifactProvenance(
+                **_prompt_artifact_provenance_kwargs(harness_version='curator-v1')
+            ),
+        )
+        mock = AsyncMock(return_value=batch_create_result(2))
+        curator = TaskCurator(config=config, taskmaster=None, prompt_store=store, invoke=mock)
+        await curator.curate_prepared([_bundle('T0'), _bundle('T1')], 'p', '/x')
+        assert mock.await_args is not None
+        assert mock.await_args.kwargs['system_prompt'] == CURATOR_BATCH_SPEC.in_code_constant
 
 
 

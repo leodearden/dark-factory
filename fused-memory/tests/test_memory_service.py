@@ -9,7 +9,12 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import _make_rate_limit_error
+from _fm_helpers import (
+    _make_rate_limit_error,
+    make_insufficient_quota_error,
+    make_transient_rate_limit_error,
+    wrap_like_graphiti,
+)
 from _mem0_record_shapes import mem0_record
 from _qdrant_responses import missing_collection_404
 from _queued_write_fixtures import (
@@ -4029,6 +4034,13 @@ class TestIsRateLimitOrQuotaError:
 
         exc = WrappedError('upstream said: insufficient_quota, but this is unrelated')
         assert _is_rate_limit_or_quota_error(exc) is False
+
+    def test_graphiti_wrapped_insufficient_quota_matches(self):
+        """graphiti_core re-raises the provider 429 as its own unstructured
+        RateLimitError, so the quota code is reachable only on __cause__
+        (task 10922)."""
+        exc = wrap_like_graphiti(make_insufficient_quota_error())
+        assert _is_rate_limit_or_quota_error(exc) is True
 
 
 class TestGetEntity:
@@ -11614,6 +11626,30 @@ class TestStoreFailureDiagnosticsHelper:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('make_error', 'billing_exhausted'),
+        [
+            (make_insufficient_quota_error, 'api_key_credits'),
+            (make_transient_rate_limit_error, None),
+        ],
+        ids=['credits-exhausted', 'transient-429'],
+    )
+    async def test_search_diagnostics_tell_exhausted_credits_from_a_transient_429(
+        self, service, make_error, billing_exhausted,
+    ):
+        """Both are rate_limit_or_quota, but only exhausted credits name a
+        billing source: it needs a human to pay, a 429 clears by itself
+        (task 10922)."""
+        service.graphiti.search = AsyncMock(side_effect=make_error())
+
+        res = await service.search(query='q', project_id='reify')
+
+        graphiti_diag = next(d for d in res.failure_diagnostics if d['store'] == 'graphiti')
+        assert graphiti_diag['rate_limit_or_quota'] is True
+        assert 'billing_exhausted' in graphiti_diag
+        assert graphiti_diag['billing_exhausted'] == billing_exhausted
+
+    @pytest.mark.asyncio
     async def test_search_outer_timeout_populates_failure_diagnostics(self, service):
         """A store whose task is still pending when the OUTER search_timeout_seconds
         deadline elapses (cancelled, not raised) must also get a failure_diagnostics
@@ -11951,7 +11987,7 @@ class TestGetMemoryById:
     @pytest.mark.asyncio
     async def test_content_fallback_to_content_key(self, service):
         """With neither 'data' nor 'memory', content falls back to the third and
-        last key in the canonical _MEM0_CONTENT_KEYS order ('content')."""
+        last key in the canonical ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` order ('content')."""
         payload = {'content': 'c', 'category': 'observations_and_summaries'}
         service.mem0.get_point_by_id = AsyncMock(return_value=payload)
 
@@ -11963,7 +11999,7 @@ class TestGetMemoryById:
 
     @pytest.mark.asyncio
     async def test_no_recognized_content_key_returns_found_with_empty_content(self, service):
-        """A present point whose payload carries NONE of _MEM0_CONTENT_KEYS is still
+        """A present point whose payload carries NONE of ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` is still
         a hit (found), with content=='' and the full raw payload as metadata — the
         documented ('data'→'memory'→'content'→'') precedence's fall-through arm.
 
@@ -12683,19 +12719,18 @@ class TestMemoryMetadataValidationAtSeam:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
-    async def test_kind_registry_carve_out_is_real(self, service, entry_point, caplog):
-        """`enforce=True` + `enforce_kind_registry=False`: unknown kind warns
-        and PROCEEDS, while a bad slug in the same call still raises.
+    async def test_unknown_kind_never_rejects_even_under_enforce(self, service, entry_point, caplog):
+        """With `enforce=True` an unknown kind warns and the write PROCEEDS,
+        while a bad slug under the same flag still raises.
 
-        The carve-out has to be checked in one call, not two: a validator
-        that simply downgraded everything under the kind flag would pass two
-        separate tests while silently disabling the shape checks too.
+        A census-only axis must not silently disable the shape checks: a
+        validator that downgraded every violation alongside `kind` would pass
+        a kind-only test while letting the bad slug through.
         """
         from fused_memory.memory_metadata import MemoryMetadataValidationError
 
         caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
         service.config.memory_metadata.enforce = True
-        service.config.memory_metadata.enforce_kind_registry = False
 
         await _mm_write(service, entry_point, metadata={'kind': 'invented_kind_xyz'})
         _mm_backend_mock(service, entry_point).assert_awaited_once()

@@ -1,0 +1,6 @@
+import sqlite3, json
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True,timeout=30)
+for r in c.execute("select name, sql from sqlite_master where type in ('table','index')"): print(r[0]); print('  ',(r[1] or '')[:600])
+print(c.execute("select min(id),max(id) from events").fetchone())
+# find id for timestamp bound using index if available
+r=c.execute("select min(id) from events where timestamp>='2026-11-14T00:00'").fetchone(); print('lo id',r)

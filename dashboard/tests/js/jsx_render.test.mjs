@@ -37,9 +37,12 @@ import {
   escalationsPayload,
   memoryEvalCard,
   memoryEvalEscalation,
-  memoryEvalRow,
+  memoryEvalMetric,
+  memoryEvalVerdict,
   memoryEvalsPayload,
+  mergeActiveRow,
   mergeQueueBlock,
+  mergeRecentRow,
   openEscalationItem,
   orchestratorRow,
   projectRow,
@@ -47,6 +50,7 @@ import {
   schedulerLockRow,
   schedulerModule,
   schedulerSnapshot,
+  servingEndpoint,
   taskCensus,
   taskRow,
   tasksSnapshotEntry,
@@ -429,14 +433,14 @@ for (const { pinned, pins } of PINNING_TILE_FIXTURES) {
   });
 }
 
-// ── Decision 5: the depth chart's bucket width (merge_queue.js::depthBucketCaption) ──
-// The panel names the width the server counted the series at; a series that
-// names none names no width.
+// ── The throughput panel's trailing window (merge_queue.js::landingRateCaption) ──
+// The panel names the trailing window the server counted each point over; a
+// rate that names none names no window.
 
-for (const bucketMinutes of [60, null]) {
-  test(`tabs.jsx::MergeTab titles its depth panel with depthBucketCaption for bucket_minutes ${bucketMinutes}`, t => {
+for (const trailingMinutes of [1440, 10080, null]) {
+  test(`tabs.jsx::MergeTab titles its throughput panel with landingRateCaption for trailing_minutes ${trailingMinutes}`, t => {
     const harness = openWindow(t);
-    const block = mergeQueueBlock({ bucketMinutes });
+    const block = mergeQueueBlock({ bucketMinutes: 60, trailingMinutes });
     seedDashboardData(harness.window, {
       MERGE_QUEUE: { [PROJECT]: block },
       __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
@@ -445,9 +449,9 @@ for (const bucketMinutes of [60, null]) {
 
     const titles = [...container.querySelectorAll('.panel-head > .title')]
       .map(title => title.textContent)
-      .filter(text => text.startsWith('Merge attempts'));
-    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth.value);
-    assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
+      .filter(text => text.startsWith('Throughput'));
+    const caption = harness.window.DF_MERGE_QUEUE.landingRateCaption(block.landing_rate.value);
+    assert.deepEqual(titles, [`Throughput · ${caption}`]);
   });
 }
 
@@ -487,7 +491,7 @@ test('tabs.jsx::MergeTab renders an unread runs.db as unknown, never as measured
   const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
   assert.ok(pips.includes(`${datumView(projectAttempts(DF, PROJECT)).text} attempts`), JSON.stringify(pips));
   assert.ok(!pips.some(text => text.startsWith('0 attempts')), `an unread project reads a measured 0: ${JSON.stringify(pips)}`);
-  for (const prefix of ['Outcomes', 'Merge attempts']) {
+  for (const prefix of ['Outcomes', 'Throughput']) {
     assert.equal(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws a chart over an unread window`);
   }
 });
@@ -499,9 +503,52 @@ test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount'
   const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
   assert.equal(count, 5);
   assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
-  for (const prefix of ['Outcomes', 'Merge attempts']) {
+  for (const prefix of ['Outcomes', 'Throughput']) {
     assert.notEqual(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws no chart over a measured window`);
   }
+});
+
+// ── The headline totals over several projects (merge_queue.js::totalHint) ──
+// A present-but-unread project makes a total a '≥' over the readable ones,
+// and the tile's hint names it; a project with no runs.db file is outside the
+// runs.db totals, so it is named nowhere. Its own pips still read unknown.
+
+test('tabs.jsx::MergeTab serves a lower-bound total naming the unreadable project, and leaves a project with no runs.db out', t => {
+  const harness = openWindow(t);
+  const stoppedProbe = wireDatum(null, { as_of: null, state: 'unknown', reason: 'connect refused; no sample in the history window' });
+  seedDashboardData(harness.window, {
+    MERGE_QUEUE: {
+      [PROJECT]: mergeQueueBlock({ bucketMinutes: 60, outcomes: { done: 3 } }),
+      hive: { ...mergeQueueBlock({ bucketMinutes: 60, unread: true }), in_queue: stoppedProbe, active_spark: { labels: [], values: [] } },
+      ghost: mergeQueueBlock({ bucketMinutes: 60, noRunsDb: true }),
+    },
+    __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
+  });
+  const { container } = harness.mount(harness.window.DF_TABS.MergeTab, { projectFilter: [] });
+  const DF = harness.window.DF_DATA;
+  const { attemptsOver, inQueueOver, projectAttempts, totalHint } = harness.window.DF_MERGE_QUEUE;
+  const { datumView, LOWER_BOUND_PREFIX, EM_DASH } = harness.window.DF_DATUM;
+  const hintOf = tile => tile.querySelector('.lbl > span')?.textContent ?? '';
+
+  const mergesTile = statTile(container, 'Merges (window)');
+  const merges = attemptsOver(DF, null);
+  assert.equal(mergesTile.querySelector('.val').textContent, datumView(merges).text);
+  assert.ok(datumView(merges).text.startsWith(LOWER_BOUND_PREFIX), datumView(merges).text);
+  const mergesHint = hintOf(mergesTile);
+  assert.ok(mergesHint.endsWith(totalHint(merges)), `"${mergesHint}" must end with totalHint()`);
+  assert.ok(mergesHint.includes('hive'), mergesHint);
+  assert.ok(!mergesHint.includes('ghost'), `a project with no runs.db is named: ${mergesHint}`);
+
+  const queueTile = statTile(container, 'In queue now');
+  const inQueue = inQueueOver(DF, null);
+  assert.equal(queueTile.querySelector('.val').textContent, datumView(inQueue).text);
+  assert.ok(datumView(inQueue).text.startsWith(LOWER_BOUND_PREFIX), datumView(inQueue).text);
+  assert.equal(hintOf(queueTile), ` · ${totalHint(inQueue)}`);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  const hivePip = `${datumView(projectAttempts(DF, 'hive')).text} attempts`;
+  assert.equal(hivePip, `${EM_DASH} attempts`);
+  assert.ok(pips.includes(hivePip), JSON.stringify(pips));
 });
 
 function withDepthValues(block, values) {
@@ -512,16 +559,22 @@ function panelMeta(container, prefix) {
   return panelTitled(container, prefix).querySelector('.panel-head > .meta').textContent;
 }
 
-// The depth series' first bucket is counted whole (test_merge_queue_data.py::test_first_bucket_includes_events_before_cutoff), so its sum is not the window's attempt count; attemptCount is the only one.
-for (const values of [[1], [2, 0, 3]]) {
-  test(`tabs.jsx::MergeTab reads the depth panel as the series' per-bucket peak over ${JSON.stringify(values)}`, t => {
-    const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: values.length }), values);
-    const { container } = mountMergeTab(t, block);
+// The throughput panel reads its served rate (merge_queue.js::landingRateReading):
+// a window with no landings is a measured zero, read as one and drawn as nothing.
+test('tabs.jsx::MergeTab reads a window with no landings as a measured zero and draws no chart', t => {
+  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, rates: [] }));
 
-    const meta = panelMeta(container, 'Merge attempts');
-    assert.ok(meta.startsWith(`peak ${Math.max(0, ...values)}/bucket`), meta);
-  });
-}
+  const meta = panelMeta(container, 'Throughput');
+  assert.ok(meta.startsWith('0/day · no landings in this window'), meta);
+  assert.equal(panelTitled(container, 'Throughput').querySelector('svg'), null);
+});
+
+test('tabs.jsx::MergeTab reads the throughput panel as the newest rate and the served window mean', t => {
+  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, rates: [2, 3], meanPerDay: 2 / 7 }));
+
+  const meta = panelMeta(container, 'Throughput');
+  assert.ok(meta.startsWith('now 3/day · mean 0.29/day'), meta);
+});
 
 test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth series sums to', t => {
   const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: 3, outcomes: { done: 1 } }), [1, 0, 1]);
@@ -533,10 +586,104 @@ test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth se
   const outcomes = panelMeta(container, 'Outcomes');
   assert.ok(outcomes.startsWith(`${count} merges`), outcomes);
   assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
-  const depth = panelMeta(container, 'Merge attempts');
-  assert.doesNotMatch(depth, /\battempts\b/);
-  assert.doesNotMatch(depth, /\bmerges\b/);
+  const throughput = panelMeta(container, 'Throughput');
+  assert.doesNotMatch(throughput, /\battempts\b/);
+  assert.doesNotMatch(throughput, /\bmerges\b/);
 });
+
+// ── A project's Merge-tab layout: one row of number cards, then each table on its own row ──
+// jsdom lays nothing out, so the layout is read from what the browser lays it
+// out by: the cards' shared row, each card's inline flex weight, and the
+// tables' column spans in the project's 12-column grid.
+
+const panelTitleOf = panel => panel.querySelector('.panel-head > .title')?.textContent;
+
+function numberCell(card, label) {
+  const cells = [...card.querySelector('.panel-body').children].filter(cell => [...cell.children].some(line => line.textContent === label));
+  assert.equal(cells.length, 1, `expected exactly one number labelled "${label}"`);
+  return cells[0];
+}
+
+test('tabs.jsx::MergeTab sets Latency centiles, Speculative merge and Live merge metrics in one row, each card weighted by its count of numbers', t => {
+  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60 }));
+  const titles = ['Latency centiles', 'Speculative merge', 'Live merge metrics'];
+  const cards = titles.map(title => panelTitled(container, title));
+
+  const row = cards[0].parentElement;
+  assert.ok(cards.every(card => card.parentElement === row), 'the number cards must share one row');
+  assert.ok(row.classList.contains('number-cards'), 'the shared row must be a .number-cards flex row');
+  assert.ok(row.classList.contains('col-span-12'), 'the number-card row must span the whole project row');
+  assert.ok(row.parentElement.classList.contains('cols-12'), "the number-card row must sit in the project's 12-column grid");
+  assert.deepEqual([...row.children].map(panelTitleOf), titles, 'the row must hold exactly the three number cards, in order');
+  const counts = cards.map(card => card.querySelector('.panel-body').children.length);
+  assert.deepEqual(counts, [4, 3, 2]);
+  assert.deepEqual(cards.map(card => Number(card.style.flexGrow)), counts, 'each card must be weighted by its count of numbers');
+  const basisPerNumber = cards.map((card, i) => parseFloat(card.style.flexBasis) / counts[i]);
+  assert.ok(basisPerNumber[0] > 0, `each card must carry a positive flex basis: ${cards.map(card => card.style.flexBasis)}`);
+  assert.ok(basisPerNumber.every(basis => basis === basisPerNumber[0]), `each card's flex basis must be proportional to its count of numbers: ${cards.map(card => card.style.flexBasis)}`);
+});
+
+const LIVE_METRIC_ARMS = [
+  {
+    arm: 'measured',
+    metrics: { retries_per_landing: 1.5, landings_total: 4, drift_at_detection: { count: 2, last: 3 } },
+    retries: 1.5, drift: 3, hints: ['4 landings', '2 detections'], texts: ['1.50', '3'],
+  },
+  {
+    arm: 'empty',
+    metrics: {},
+    retries: undefined, drift: null, hints: ['offline', 'no conflicts'], holeTitles: ['no value in the payload', 'no drift detections'],
+  },
+];
+
+for (const { arm, metrics, retries, drift, hints, texts, holeTitles } of LIVE_METRIC_ARMS) {
+  test(`tabs.jsx::MergeTab renders Live merge metrics as compact readings with their hints, ${arm}`, t => {
+    const { harness, container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, metrics }));
+    const { plainDatum, derivedDatum, datumView, EM_DASH } = harness.window.DF_DATUM;
+    const { stateKey } = servingEndpoint(harness.window.DF_DATA_LOADER, 'MERGE_QUEUE');
+    const panel = panelTitled(container, 'Live merge metrics');
+    assert.ok(panel.querySelector('.kpi') === null, 'Live merge metrics must render compact readings, not StatTiles');
+    assert.ok(panel.querySelector('.spark') === null, 'Live merge metrics must draw no empty spark slot');
+
+    const views = [
+      datumView(plainDatum(retries, stateKey), { format: n => Number(n).toFixed(2) }),
+      datumView(derivedDatum(drift, stateKey, 'no drift detections')),
+    ];
+    if (texts) assert.deepEqual(views.map(view => view.text), texts);
+    else assert.deepEqual(views.map(view => [view.text, view.title]), holeTitles.map(title => [EM_DASH, title]));
+
+    ['Retries / landing', 'Drift @ detect'].forEach((label, i) => {
+      const cell = numberCell(panel, label);
+      assert.ok(cell.textContent.includes(hints[i]), `"${label}" must show its hint "${hints[i]}": ${cell.textContent}`);
+      const reading = cell.querySelector('.mono > span');
+      assert.equal(reading.firstChild.textContent, views[i].text, `"${label}" reading`);
+      assert.equal(reading.title, views[i].title ?? '', `"${label}" reading's title`);
+    });
+  });
+}
+
+for (const queued of [true, false]) {
+  test(`tabs.jsx::MergeTab gives Currently queued and Recent merges each a full row${queued ? ', queued first' : ', with nothing queued'}`, t => {
+    const block = mergeQueueBlock({ bucketMinutes: 60, active: queued ? [mergeActiveRow()] : [], recent: [mergeRecentRow({ taskId: '2' })] });
+    const { harness, container } = mountMergeTab(t, block);
+    const recent = panelTitled(container, 'Recent merges');
+    const grid = recent.parentElement;
+    assert.ok(grid.classList.contains('cols-12'), "Recent merges must sit in the project's 12-column grid");
+    assert.ok(recent.classList.contains('col-span-12'), 'Recent merges must span the whole row');
+    assert.equal(recent.querySelectorAll('tbody tr').length, 1, 'Recent merges must render its one fixture row');
+
+    if (queued) {
+      const queuedPanel = panelTitled(container, 'Currently queued');
+      assert.ok(queuedPanel.parentElement === grid, "Currently queued must sit in the project's 12-column grid");
+      assert.ok(queuedPanel.classList.contains('col-span-12'), 'Currently queued must span the whole row');
+      assert.ok(queuedPanel.compareDocumentPosition(recent) & harness.window.Node.DOCUMENT_POSITION_FOLLOWING, 'Currently queued must come before Recent merges');
+      assert.equal(queuedPanel.querySelectorAll('tbody tr').length, 1, 'Currently queued must render its one fixture row');
+    } else {
+      const titles = [...container.querySelectorAll('.panel-head > .title')].map(title => title.textContent);
+      assert.ok(!titles.some(text => text.startsWith('Currently queued')), `nothing is queued, yet: ${JSON.stringify(titles)}`);
+    }
+  });
+}
 
 // ── The Completion-paths legend (charts.jsx::PALETTE.paths) ──
 // Every slice performance.py::get_completion_paths serves draws in a colour of
@@ -1536,68 +1683,125 @@ function mountMemoryEvals(t, payload) {
   return { window, container, navigations };
 }
 
-// The rendered table rows, one per metric row, in payload order.
-function metricRowElements(container, rows) {
+const STORM_NOTE = 'link suppressed — storm aggregate';
+
+const ownVerdicts = metric => metric.verdicts.filter(verdict => verdict.item == null);
+const itemVerdicts = metric => metric.verdicts.filter(verdict => verdict.item != null);
+
+// The rendered table rows in payload order: per metric, one row holding the
+// verdicts that judge the metric as a whole, then one row per item verdict.
+function metricRowElements(container, metrics) {
   const trs = [...container.querySelectorAll('tbody tr')];
-  assert.equal(trs.length, rows.length, 'each metric row must render as exactly one table row');
-  return trs;
+  const expected = metrics.flatMap(metric => [
+    { metric, item: null, verdicts: ownVerdicts(metric) },
+    ...itemVerdicts(metric).map(verdict => ({ metric, item: verdict.item, verdicts: [verdict] })),
+  ]);
+  assert.equal(trs.length, expected.length, 'each metric must render one row plus one row per item verdict');
+  return expected.map((row, i) => ({ ...row, tr: trs[i] }));
 }
 
 function escalationLinks(root) {
   return [...root.querySelectorAll('[data-testid="memory-eval-escalation-link"]')];
 }
 
-// The one span in `tr` that renders verdictBadge(row): its words, its classes,
-// and the evaluator's verdict_detail as its title.
-function renderedBadge(window, tr, row) {
-  const badge = window.DF_MEMORY_EVALS_FMT.verdictBadge(row);
-  const spans = spansDescribedBy(tr, { ...badge, title: row.verdict_detail || '' });
-  assert.equal(spans.length, 1, `${row.metric_id} ${row.item ?? ''}: expected one span reading "${badge.label}"`);
+function occurrences(text, needle) {
+  return text.split(needle).length - 1;
+}
+
+// The one span in `tr` that renders verdictBadge(verdict): its words, its
+// classes, and the evaluator's verdict_detail as its title.
+function renderedBadge(window, tr, verdict) {
+  const badge = window.DF_MEMORY_EVALS_FMT.verdictBadge(verdict);
+  const spans = spansDescribedBy(tr, { ...badge, title: verdict.verdict_detail || '' });
+  assert.equal(spans.length, 1, `${verdict.item ?? 'item-less'}: expected one span reading "${badge.label}"`);
   return spans[0];
 }
 
-function assertLinksOnly(tr, row) {
+// What every rendered row must show of its own verdicts, and nothing more: each
+// verdict's badge, a link only for a linked verdict, the storm note only on a
+// storm_collapsed one, the fingerprint only where the entry carries one, and a
+// trend chart in the metric's own row alone.
+function assertRendersItsVerdicts(window, row) {
+  const { metric, item, verdicts, tr } = row;
+  const where = `${metric.metric_id} ${item ?? '(metric row)'}`;
+  for (const verdict of verdicts) renderedBadge(window, tr, verdict);
+
+  const linked = verdicts.filter(verdict => verdict.escalation);
   const links = escalationLinks(tr);
-  if (!row.escalation) {
-    assert.equal(links.length, 0, `${row.metric_id} ${row.item ?? ''} (${row.parity}) renders an escalation link`);
-    return;
+  assert.equal(links.length, linked.length, `${where} renders ${links.length} escalation links`);
+  linked.forEach((verdict, i) => assert.ok(links[i].textContent.includes(verdict.escalation.id), links[i].textContent));
+
+  assert.equal(
+    occurrences(tr.textContent, STORM_NOTE),
+    verdicts.filter(verdict => verdict.parity === 'storm_collapsed').length,
+    `${where}: the storm-suppression note and the storm_collapsed verdicts disagree`,
+  );
+
+  for (const verdict of verdicts) {
+    if (verdict.fingerprint) assert.ok(tr.textContent.includes(`fp ${verdict.fingerprint}`), `${where}: no fp line`);
   }
-  assert.equal(links.length, 1, `${row.metric_id} ${row.item ?? ''} (${row.parity}) must render one escalation link`);
-  assert.ok(links[0].textContent.includes(row.escalation.id), links[0].textContent);
+  if (verdicts.every(verdict => !verdict.fingerprint)) {
+    assert.ok(!tr.textContent.includes('fp '), `${where} renders an fp line for no fingerprint: ${tr.textContent}`);
+  }
+
+  const charts = tr.querySelectorAll('[data-testid="memory-eval-trend-chart"]').length;
+  assert.equal(charts, item === null ? 1 : 0, `${where} renders ${charts} trend charts`);
+}
+
+// Each item row names its own item and no other; the metric's own row names none.
+function assertItemsNamed(rows) {
+  const items = rows.map(row => row.item).filter(item => item !== null);
+  for (const row of rows) {
+    const firstCell = row.tr.querySelector('td').textContent;
+    if (row.item === null) assert.ok(firstCell.includes(row.metric.metric_id), firstCell);
+    else assert.ok(firstCell.includes(`item ${row.item}`), `the item is not named in its row: ${firstCell}`);
+    for (const other of items) {
+      assert.equal(row.tr.textContent.includes(other), other === row.item, `the ${row.item ?? 'metric'} row and ${other} disagree`);
+    }
+  }
 }
 
 test("tab_memory_evals.jsx::MemoryEvalsSection renders each parity state in verdictBadge's words and links only open escalations", t => {
   const alarmed = memoryEvalEscalation('esc-alarmed');
   const recovered = memoryEvalEscalation('esc-recovered');
-  const rows = [
-    memoryEvalRow({
-      verdict: 'alarm', verdict_detail: '12/30 against a pooled baseline of 72/90 over 3 run(s).',
-      fingerprint: alarmed.dedupe_fingerprint, escalation: alarmed, parity: 'alarmed_open',
+  const metrics = [
+    memoryEvalMetric({
+      limit_ref: 'alpha=0.002777777777777778',
+      verdicts: [memoryEvalVerdict({
+        verdict: 'alarm', verdict_detail: '12/30 against a pooled baseline of 72/90 over 3 run(s).',
+        fingerprint: alarmed.dedupe_fingerprint, escalation: alarmed, parity: 'alarmed_open',
+      })],
     }),
-    memoryEvalRow({
+    memoryEvalMetric({
       metric_id: 'dangling-pointers', kind: 'count', rule_kind: 'count',
-      verdict: 'no_alarm', fingerprint: recovered.dedupe_fingerprint, escalation: recovered, parity: 'recovered_open',
+      verdicts: [memoryEvalVerdict({
+        verdict: 'no_alarm', fingerprint: recovered.dedupe_fingerprint, escalation: recovered, parity: 'recovered_open',
+      })],
     }),
-    memoryEvalRow({
+    memoryEvalMetric({
       metric_id: 'superseded-above-successor', kind: 'count', rule_kind: 'count',
-      verdict: 'insufficient_data', fingerprint: 'fp-insufficient', parity: 'insufficient_data',
+      verdicts: [memoryEvalVerdict({ verdict: 'insufficient_data', fingerprint: 'fp-insufficient', parity: 'insufficient_data' })],
     }),
-    memoryEvalRow({
-      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-recon-watcher-triage',
-      verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+    memoryEvalMetric({
+      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire',
+      verdicts: [{ item: 't-recon-watcher-triage', verdict: 'grandfathered', parity: 'grandfathered', escalation: null }],
     }),
   ];
-  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)] });
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, metrics)] });
   const { window, container, navigations } = mountMemoryEvals(t, payload);
 
-  const trs = metricRowElements(container, rows);
-  rows.forEach((row, i) => {
-    const badge = renderedBadge(window, trs[i], row);
-    assertLinksOnly(trs[i], row);
-    if (!row.escalation) assert.ok(!badge.classList.contains('bad'), `${row.parity} renders alarm-shaped: ${badge.className}`);
-  });
+  const rows = metricRowElements(container, metrics);
+  for (const row of rows) {
+    assertRendersItsVerdicts(window, row);
+    for (const verdict of row.verdicts) {
+      const badge = renderedBadge(window, row.tr, verdict);
+      if (!verdict.escalation) assert.ok(!badge.classList.contains('bad'), `${verdict.parity} renders alarm-shaped: ${badge.className}`);
+    }
+  }
+  assert.equal(occurrences(container.textContent, metrics[0].limit_ref), 1, 'limit_ref renders once, on its metric row');
+  assert.ok(rows[0].tr.textContent.includes(metrics[0].limit_ref));
 
-  click(window, escalationLinks(trs[0])[0]);
+  click(window, escalationLinks(rows[0].tr)[0]);
   assert.equal(navigations.length, 1);
   const [view, target] = navigations[0];
   assert.equal(view, 'esc');
@@ -1609,15 +1813,21 @@ test('tab_memory_evals.jsx::MemoryEvalsSection under a storm renders one aggrega
   const storm = {
     triggered: true, alarm_count: 3, aggregate_fingerprint: aggregate.dedupe_fingerprint, escalation: aggregate,
   };
-  const collapsed = ['canonical-in-top-5', 'dangling-pointers', 'superseded-above-successor'].map(metricId =>
-    memoryEvalRow({ metric_id: metricId, verdict: 'alarm', fingerprint: `fp-${metricId}`, parity: 'storm_collapsed' }),
+  const collapsed = ['canonical-in-top-5', 'dangling-pointers'].map(metricId =>
+    memoryEvalMetric({
+      metric_id: metricId,
+      verdicts: [memoryEvalVerdict({ verdict: 'alarm', fingerprint: `fp-${metricId}`, parity: 'storm_collapsed' })],
+    }),
   );
-  const grandfathered = memoryEvalRow({
-    metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-recon-watcher-triage',
-    verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+  const tripwire = memoryEvalMetric({
+    metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire',
+    verdicts: [
+      memoryEvalVerdict({ item: 't-alpha', verdict: 'alarm', fingerprint: 'fp-t-alpha', parity: 'storm_collapsed' }),
+      { item: 't-recon-watcher-triage', verdict: 'grandfathered', parity: 'grandfathered', escalation: null },
+    ],
   });
-  const rows = [...collapsed, grandfathered];
-  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)], storm_escape: storm });
+  const metrics = [...collapsed, tripwire];
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, metrics)], storm_escape: storm });
   const { window, container } = mountMemoryEvals(t, payload);
 
   const banner = oneByTestId(container, 'memory-eval-storm-banner');
@@ -1626,47 +1836,44 @@ test('tab_memory_evals.jsx::MemoryEvalsSection under a storm renders one aggrega
   assert.equal(bannerLinks.length, 1, 'the banner must link the aggregate escalation');
   assert.ok(bannerLinks[0].textContent.includes(aggregate.id), bannerLinks[0].textContent);
 
-  const trs = metricRowElements(container, rows);
-  rows.forEach((row, i) => {
-    renderedBadge(window, trs[i], row);
-    assertLinksOnly(trs[i], row);
-    assert.equal(
-      trs[i].textContent.includes('link suppressed — storm aggregate'),
-      row.parity === 'storm_collapsed',
-      `${row.metric_id} (${row.parity}) and the storm-suppression note disagree`,
-    );
-  });
+  for (const row of metricRowElements(container, metrics)) assertRendersItsVerdicts(window, row);
+  assert.equal(occurrences(container.textContent, STORM_NOTE), 3, 'one storm note per storm_collapsed verdict');
   assert.equal(escalationLinks(container).length, 1, 'only the banner may link an escalation under a storm');
 });
 
-test("tab_memory_evals.jsx::MemoryEvalsSection renders a tripwire's per-item verdicts as one row per item, each naming its item", t => {
+test("tab_memory_evals.jsx::MemoryEvalsSection renders a tripwire's item verdicts as one row per item under its metric", t => {
   const alarmed = memoryEvalEscalation('esc-item-1');
-  const rows = [
-    memoryEvalRow({ verdict: 'no_alarm', fingerprint: 'fp-window', parity: 'clear' }),
-    memoryEvalRow({
-      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-alpha',
-      verdict: 'alarm', fingerprint: alarmed.dedupe_fingerprint, escalation: alarmed, parity: 'alarmed_open',
+  const limitRef = `grandfather_set_hash=${'f8c4'.repeat(16)}`;
+  const metrics = [
+    memoryEvalMetric({
+      limit_ref: 'alpha=0.002777777777777778',
+      verdicts: [memoryEvalVerdict({
+        verdict: 'no_alarm', verdict_detail: '12/30 against a pooled baseline.', fingerprint: 'fp-window', parity: 'clear',
+      })],
     }),
-    memoryEvalRow({
-      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-beta',
-      verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+    memoryEvalMetric({
+      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', value: 1, limit_ref: limitRef,
+      trend: { labels: ['20260704T031500Z', '20260705T031500Z'], values: [1, 1] },
+      verdicts: [
+        memoryEvalVerdict({
+          item: 't-alpha', verdict: 'alarm', verdict_detail: "Item 't-alpha' newly fails and is not grandfathered.",
+          fingerprint: alarmed.dedupe_fingerprint, escalation: alarmed, parity: 'alarmed_open',
+        }),
+        { item: 't-beta', verdict: 'grandfathered', parity: 'grandfathered', escalation: null },
+      ],
     }),
   ];
-  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)] });
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, metrics)] });
   const { window, container } = mountMemoryEvals(t, payload);
 
-  const trs = metricRowElements(container, rows);
-  const items = rows.map(row => row.item).filter(Boolean);
-  rows.forEach((row, i) => {
-    const firstCell = trs[i].querySelector('td').textContent;
-    assert.ok(firstCell.includes(row.metric_id), firstCell);
-    for (const item of items) {
-      assert.equal(trs[i].textContent.includes(item), item === row.item, `the ${row.item ?? 'item-less'} row and ${item} disagree`);
-    }
-    if (row.item) assert.ok(firstCell.includes(row.item), `the item is not named beside its metric: ${firstCell}`);
-    renderedBadge(window, trs[i], row);
-    assertLinksOnly(trs[i], row);
-  });
+  const rows = metricRowElements(container, metrics);
+  assert.deepEqual(rows.map(row => [row.metric.metric_id, row.item]), [
+    ['canonical-in-top-5', null], [TRIPWIRE, null], [TRIPWIRE, 't-alpha'], [TRIPWIRE, 't-beta'],
+  ]);
+  for (const row of rows) assertRendersItsVerdicts(window, row);
+  assertItemsNamed(rows.filter(row => row.metric.metric_id === TRIPWIRE));
+  assert.equal(occurrences(container.textContent, limitRef), 1, "the tripwire's limit_ref renders once");
+  assert.ok(rows[1].tr.textContent.includes(limitRef), 'limit_ref renders on the metric row, not an item row');
 });
 
 // ── Decision 12: the filed cell (task_row_cells.js::filedCellState) ──

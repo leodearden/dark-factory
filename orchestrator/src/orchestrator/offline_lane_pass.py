@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
+
 from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmTarget,
@@ -39,10 +42,10 @@ from orchestrator.offline_lane_records import (
     classify_exit,
 )
 from orchestrator.offline_lane_runs import ConfirmRunner, ProbeSeam, confirm_runner, run_probe
+from orchestrator.verify_cache.audit_hook import VerifyCacheAuditHook
+from orchestrator.verify_cache.registry import Registry, registry_db_path
 
 if TYPE_CHECKING:
-    from escalation.queue import EscalationQueue
-
     from orchestrator.config import LaneCommand, OrchestratorConfig
 
 logger = logging.getLogger(__name__)
@@ -58,8 +61,12 @@ ConfirmSeam = Callable[[ConfirmTarget, RunRecord | None, ConfirmRunner], Awaitab
 def lane_pass_outcome_hooks(
     config: OrchestratorConfig, escalation_queue: EscalationQueue | None,
 ) -> tuple[PassOutcomeHook, ...]:
-    """The production section 5.7 hooks, each asked once per red pass that reached an outcome."""
-    return ()
+    """The production section 5.7 hooks, each asked once per red pass that reached an outcome:
+    the verify-cache audit's red handler, over the project's cache registry, filing on the
+    project's on-disk escalation queue when no queue is wired."""
+    project_root = Path(config.project_root)
+    queue = escalation_queue if escalation_queue is not None else EscalationQueue(escalation_queue_dir(project_root))
+    return (VerifyCacheAuditHook(Registry(registry_db_path(project_root)), queue),)
 
 
 class PassObserver(Protocol):

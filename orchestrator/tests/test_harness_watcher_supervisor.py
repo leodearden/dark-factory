@@ -36,6 +36,7 @@ from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
     _WATCHER_DISALLOWED_TOOLS,
@@ -2816,6 +2817,33 @@ class TestFileWatcherOutageL2:
         # Must not raise
         h._file_watcher_outage_l2('watcher_crashloop')
 
+    def test_filing_emits_escalation_created_for_the_l2(self, tmp_path: Path) -> None:
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.event_store = MagicMock(spec=EventStore)
+
+        h._file_watcher_outage_l2('watcher_crashloop')
+
+        (l2,) = [e for e in queue.get_pending() if e.level == 2]
+        h.event_store.emit.assert_called_once()
+        (event_type,) = h.event_store.emit.call_args.args
+        assert event_type is EventType.escalation_created
+        assert h.event_store.emit.call_args.kwargs['task_id'] == '__watcher_supervisor__'
+        data = h.event_store.emit.call_args.kwargs['data']
+        assert data['escalation_id'] == l2.id
+        assert (data['level'], data['severity']) == (2, 'urgent')
+        assert data['category'] == 'infra_issue'
+        assert data['reason'] == 'watcher-supervisor-outage'
+
+    def test_pending_count_failure_files_nothing_and_does_not_raise(
+        self, tmp_path: Path,
+    ) -> None:
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        with patch.object(queue, 'get_pending', side_effect=RuntimeError('boom')):
+            h._file_watcher_outage_l2('watcher_crashloop')
+
+        assert queue.get_pending() == []
+
 
 # ---------------------------------------------------------------------------
 # task 1501: _resolve_watcher_outage_l2 resolves the open outage L2
@@ -2849,6 +2877,7 @@ class TestResolveWatcherOutageL2:
             f'Expected status="resolved"; got {resolved.status!r}'
         )
         assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
+        assert resolved.resolution_class is not None, 'a level-2 close must be classified'
 
     def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
         """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
@@ -3271,6 +3300,26 @@ class TestWatcherAllowedTools:
                 f'(task 3726); current list: {_WATCHER_DISALLOWED_TOOLS}'
             )
 
+    def test_task_search_is_granted(self) -> None:
+        """search_tasks must be allowed, and not disallowed.
+
+        SKILL.md's existence checks (dependency_discovered step 1 and the
+        workflow_slot_wedged disposition) call search_tasks, and an MCP tool
+        not named in --allowed-tools is permission-denied, so a refused
+        lookup would be read as 'no matching task' (task 10426).
+        """
+        tool = 'mcp__fused-memory__search_tasks'
+        assert tool in _WATCHER_ALLOWED_TOOLS, (
+            f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the existence checks '
+            "in SKILL.md can tell 'no matching task' from a refused call "
+            f'(task 10426); current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        assert tool not in _WATCHER_DISALLOWED_TOOLS, (
+            f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
+            'turn every existence check into a false "no matching task" '
+            f'(task 10426); current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
     def test_skill_tool_is_denied(self) -> None:
         """The bare 'Skill' tool is denied, and never pre-granted.
 
@@ -3446,6 +3495,7 @@ _READ_ONLY_GRANTED_MCP_TOOLS = frozenset({
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
+    'mcp__fused-memory__search_tasks',
 })
 _TIER1_BULLET = '- **Tier-1 admin actions ONLY.**'
 
@@ -3880,7 +3930,7 @@ class TestWatcherHasActionableL1:
             return resolve(self, escalation_id, *args, **kwargs)
 
         with patch.object(EscalationQueue, 'resolve', resolve_missing_the_member):
-            queue.resolve(l2_id, 'human answered the cluster')
+            queue.resolve(l2_id, 'human answered the cluster', resolution_class='actionable')
 
         l2, l1 = queue.get(l2_id), queue.get(l1_id)
         assert l2 is not None and l2.status == 'resolved'

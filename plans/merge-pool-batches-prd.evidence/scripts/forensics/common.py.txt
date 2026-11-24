@@ -1,0 +1,31 @@
+import json,collections,re,subprocess,functools,datetime as dt
+REPO='/home/leo/src/dark-factory'
+V=json.load(open('/tmp/gate-10069/forensics/verifies.json'))
+F=json.load(open('/tmp/gate-10069/forensics/fails.json'))
+VB={v['vid']:v for v in V}
+CAN={'test_merge_gate_history_leg':'HIST','test_loop_blocking_gate':'LOOP','test_harness_escalation_filing_identity':'FILING','test_deterministic_runner_project_root_cwd':'DETRUN',
+ 'test_reify_closure_staleness_sweep_retired':'RETIRED','test_inline_suppression_ratchet':'SUPP','test_uv_run_venv_isolation':'UVRUN','test_index_html':'CACHEB'}
+def canon(t):
+    m=re.search(r'/(test_[A-Za-z0-9_]+)\.py',t)
+    b=m.group(1) if m else t
+    return CAN.get(b,b.replace('test_','')[:22])
+def fset(v):
+    o=F.get(str(v['vid']))
+    if o is None or not o['files']: return None
+    s=set(canon(t) for t in o['failed'])
+    if not s and o['cats']: s=set('<'+c+'>' for c in o['cats'])
+    if o.get('timed_out'): s.add('<timeout>')
+    return s
+def git(*a):
+    p=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True,errors='replace'); return p.returncode,p.stdout.strip()
+def T(s): return dt.datetime.fromisoformat(s).timestamp()
+def layer_of(v,task):
+    for i,l in enumerate(v['layers']):
+        if l.get('task')==task: return i,l
+    return None,None
+def role(v,i): return 'mem' if i<v['k'] else 'pred'
+E=None
+def events():
+    global E
+    if E is None: E=[json.loads(l) for l in open('/tmp/gate-10069/forensics/ev.jsonl')]
+    return E

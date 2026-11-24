@@ -663,10 +663,10 @@ class TestSessionCeilingIsLiveInThisSuite:
         assert ceiling is not None, (
             'GIT_CEILING_DIRECTORIES is unset: the session ceiling is not armed '
             'in the orchestrator suite. orchestrator/tests/conftest.py must '
-            'sys.path.append the repo root and import '
-            '_df_git_ceiling_at_basetemp from df_pytest_isolation (task 3355) — '
-            'the import IS the wiring, since pytest only collects fixtures bound '
-            "into a conftest's namespace."
+            'sys.path.append the repo root and call '
+            'arm_test_root_isolation(config) from its pytest_configure (task '
+            '3355) — that call IS the wiring, since pytest only collects '
+            'fixtures a plugin or conftest registers.'
         )
         # Entry MEMBERSHIP, not equality: an operator- or CI-set ambient ceiling
         # is preserved and appended to, never clobbered.
@@ -712,8 +712,9 @@ class TestAmbientGitDirCannotRedirectThisSuite:
         assert leaked == [], (
             f'{leaked} survived into a test body, so a git command run here '
             'targets that repository regardless of any cwd or ceiling. '
-            'orchestrator/tests/conftest.py must import _df_git_env_hermetic '
-            'from df_pytest_isolation -- the import IS the wiring.'
+            'orchestrator/tests/conftest.py must call '
+            'arm_test_root_isolation(config) from its pytest_configure -- that '
+            'call IS the wiring.'
         )
 
     def test_a_ceiling_does_not_contain_an_explicit_git_dir(

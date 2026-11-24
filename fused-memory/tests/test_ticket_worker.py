@@ -9,7 +9,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import answer_each_with, serve_existing_task, submit_as_one_batch
+from _curator_helpers import (
+    curator_always,
+    curator_double,
+    curator_judging,
+    curator_returning,
+    serve_existing_task,
+    submit_as_one_batch,
+)
 from _fm_helpers import pydantic_spec
 from _fm_polling import poll_until, poll_until_stable
 from shared.async_sqlite_base import CheckpointResult
@@ -189,6 +196,23 @@ async def interceptor_with_store(taskmaster, event_buffer, ticket_store):
             await t
 
 
+@pytest_asyncio.fixture
+async def make_interceptor(taskmaster, event_buffer, ticket_store):
+    """Build interceptors around the given curator double; close each on teardown."""
+    built: list[TaskInterceptor] = []
+
+    def make(curator) -> TaskInterceptor:
+        interceptor = TaskInterceptor(
+            taskmaster, None, event_buffer, ticket_store=ticket_store, curator=curator,
+        )
+        built.append(interceptor)
+        return interceptor
+
+    yield make
+    for interceptor in built:
+        await interceptor.close()
+
+
 # ---------------------------------------------------------------------------
 # _poll_ticket_resolved helper — task 3901
 # ---------------------------------------------------------------------------
@@ -271,38 +295,29 @@ class TestPollTicketResolvedHelper:
 
 @pytest.mark.asyncio
 async def test_worker_processes_create_decision(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """When the curator returns action='create', the worker calls tm.add_task,
     marks the ticket as status='created' with task_id from tm.add_task, and
     populates result_json with the full add_task return dict.
     """
     # Arrange: curator mock that returns a 'create' decision
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock(
-        return_value=CuratorDecision(action='create')
+    mock_curator = curator_always(CuratorDecision(action='create'))
+
+    interceptor = make_interceptor(mock_curator)
+    # Submit a ticket — this enqueues the ticket_id
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='Test Task',
+        description='A task for the worker',
     )
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
+    assert result.get('ticket', '').startswith('tkt_'), (
+        f'Expected ticket in result, got: {result}'
+    )
+    ticket_id = result['ticket']
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        # Submit a ticket — this enqueues the ticket_id
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Test Task',
-            description='A task for the worker',
-        )
-        assert result.get('ticket', '').startswith('tkt_'), (
-            f'Expected ticket in result, got: {result}'
-        )
-        ticket_id = result['ticket']
-
-        # Let the worker drain the queue
-        row = await _poll_ticket_resolved(ticket_store, ticket_id)
+    # Let the worker drain the queue
+    row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # Assert: tm.add_task was called once
     taskmaster.add_task.assert_called_once()
@@ -330,7 +345,7 @@ async def test_worker_processes_create_decision(
 
 @pytest.mark.asyncio
 async def test_worker_processes_drop_decision(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """When curator returns action='drop' with target_id, the worker:
     - marks ticket as status='combined' with task_id=target_id
@@ -338,27 +353,22 @@ async def test_worker_processes_drop_decision(
     - does NOT call tm.add_task
     - result_json matches the legacy drop shape: {id, deduplicated, action, justification, ...}
     """
-    mock_curator = MagicMock()
+    mock_curator = curator_double()
     _drop_decision = CuratorDecision(action='drop', target_id='5', justification='dup')
     mock_curator.curate_prepared = AsyncMock(return_value=[_drop_decision])
     _stub_prepare_candidate(mock_curator)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Duplicate Task',
-            description='Should be dropped',
-        )
-        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
-        ticket_id = result['ticket']
+    interceptor = make_interceptor(mock_curator)
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='Duplicate Task',
+        description='Should be dropped',
+    )
+    assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+    ticket_id = result['ticket']
 
-        # Let the worker drain
-        row = await _poll_ticket_resolved(ticket_store, ticket_id)
+    # Let the worker drain
+    row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # tm.add_task must NOT have been called
     taskmaster.add_task.assert_not_called()
@@ -388,14 +398,17 @@ async def test_worker_processes_drop_decision(
 
 @pytest.mark.asyncio
 async def test_worker_processes_combine_decision(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """When curator returns action='combine' with target_id and rewritten_task:
-    - _execute_combine is called (implying write_lock was held)
+    - The target is rewritten through tm.update_task under the write lock
     - A reembed background task is created via curator.reembed_task
     - Ticket is status='combined' with task_id='5'
     - tm.add_task is NOT called
     """
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '5', 'title': 'Combine target', 'status': 'pending'},
+    )
     rewritten = RewrittenTask(
         title='Combined Task',
         description='Merged description',
@@ -403,55 +416,31 @@ async def test_worker_processes_combine_decision(
         files_to_modify=[],
         priority='medium',
     )
-    mock_curator = MagicMock()
-    _combine_decision = CuratorDecision(
+    curator = curator_returning(CuratorDecision(
         action='combine',
         target_id='5',
+        target_fingerprint='Combine target',
         rewritten_task=rewritten,
         justification='similar scope',
+    ))
+    interceptor = make_interceptor(curator)
+
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='Combine Candidate',
+        description='Should be combined',
     )
-    mock_curator.curate_prepared = AsyncMock(return_value=[_combine_decision])
-    _stub_prepare_candidate(mock_curator)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
-    mock_curator.reembed_task = AsyncMock(return_value=None)
+    assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+    ticket_id = result['ticket']
 
-    # Sentinel: track whether _execute_combine ran (it runs under write_lock)
-    execute_combine_calls = []
+    # Let the worker drain
+    row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
-    # **_kwargs absorbs the keyword-only arguments the real _execute_combine
-    # takes (candidate_metadata, task 3446). This stub is a write-lock
-    # sentinel, not a signature pin — asserting on the call shape here would
-    # duplicate test_task_interceptor.py's combine coverage.
-    async def fake_execute_combine(project_root, decision, **_kwargs):
-        execute_combine_calls.append({'project_root': project_root, 'decision': decision})
-        return {'updated': True, 'target_id': decision.target_id}
-
-    with (
-        patch.object(
-            type(interceptor_with_store), '_get_curator',
-            new=AsyncMock(return_value=mock_curator),
-        ),
-        patch.object(
-            interceptor_with_store, '_execute_combine',
-            side_effect=fake_execute_combine,
-        ),
-    ):
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Combine Candidate',
-            description='Should be combined',
-        )
-        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
-        ticket_id = result['ticket']
-
-        # Let the worker drain
-        row = await _poll_ticket_resolved(ticket_store, ticket_id)
-
-    # _execute_combine was called (confirms write_lock path was taken)
-    assert len(execute_combine_calls) == 1, (
-        f'Expected _execute_combine to be called once, got {execute_combine_calls}'
-    )
+    # The target was rewritten in place
+    taskmaster.update_task.assert_awaited_once()
+    update_kwargs = taskmaster.update_task.await_args.kwargs
+    assert update_kwargs['task_id'] == '5'
+    assert update_kwargs['title'] == 'Combined Task'
 
     # tm.add_task must NOT have been called
     taskmaster.add_task.assert_not_called()
@@ -469,7 +458,7 @@ async def test_worker_processes_combine_decision(
     assert result_data.get('title') == 'Combined Task'
 
     # reembed background task was spawned (curator.reembed_task was called)
-    mock_curator.reembed_task.assert_called_once()
+    curator.reembed_task.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +468,7 @@ async def test_worker_processes_combine_decision(
 
 @pytest.mark.asyncio
 async def test_worker_r4_escalation_idempotency_returns_existing_task(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """When metadata contains escalation_id + suggestion_hash that match an
     existing non-cancelled task, the worker short-circuits:
@@ -498,27 +487,20 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
     }
     serve_existing_task(taskmaster, existing_task)
 
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock()  # should NOT be called
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
+    mock_curator = curator_always(CuratorDecision(action='create'))
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Escalation Task',
-            description='Should be idempotency-gated',
-            metadata={'escalation_id': 'e1', 'suggestion_hash': 'h1'},
-        )
-        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
-        ticket_id = result['ticket']
+    interceptor = make_interceptor(mock_curator)
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='Escalation Task',
+        description='Should be idempotency-gated',
+        metadata={'escalation_id': 'e1', 'suggestion_hash': 'h1'},
+    )
+    assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+    ticket_id = result['ticket']
 
-        # Let the worker drain
-        row = await _poll_ticket_resolved(ticket_store, ticket_id)
+    # Let the worker drain
+    row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # curator.curate must NOT have been called (short-circuit)
     mock_curator.curate.assert_not_called()
@@ -545,34 +527,29 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
 
 @pytest.mark.asyncio
 async def test_worker_curator_failure_parks_the_ticket(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """When the curator defers a candidate whose LLM call failed (not a
     zero-output hang), the worker parks the ticket instead of creating:
     - tm.add_task is NOT called
     - the ticket is awaiting_curation with defer_reason 'llm-failed'
     """
-    mock_curator = MagicMock()
+    mock_curator = curator_double()
     mock_curator.curate_prepared = AsyncMock(
         return_value=[CuratorDecision.deferred(DeferReason.LLM_FAILED)],
     )
     _stub_prepare_candidate(mock_curator)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Park Test',
-            description='Should be parked awaiting curation',
-        )
-        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
-        ticket_id = result['ticket']
+    interceptor = make_interceptor(mock_curator)
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='Park Test',
+        description='Should be parked awaiting curation',
+    )
+    assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+    ticket_id = result['ticket']
 
-        row = await _poll_ticket_resolved(ticket_store, ticket_id)
+    row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     taskmaster.add_task.assert_not_called()
     assert (row['status'], row['defer_reason'], row['task_id']) == (
@@ -587,7 +564,7 @@ async def test_worker_curator_failure_parks_the_ticket(
 
 @pytest.mark.asyncio
 async def test_worker_tm_add_task_failure_marks_ticket_failed(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """When tm.add_task raises, the ticket resolves as status='failed',
     reason contains the error message, result_json is NULL, and no
@@ -595,43 +572,34 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
     """
     taskmaster.add_task = AsyncMock(side_effect=RuntimeError('db locked'))
 
+    mock_curator = curator_always(CuratorDecision(action='create'))
+    interceptor = make_interceptor(mock_curator)
+
     # Capture journal calls via the event buffer
     journal_calls = []
-    original_journal = interceptor_with_store._journal
+    original_journal = interceptor._journal
 
     async def capturing_journal(event):
         journal_calls.append(event)
         return await original_journal(event)
 
-    interceptor_with_store._journal = capturing_journal
+    interceptor._journal = capturing_journal
 
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock(
-        return_value=CuratorDecision(action='create')
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='Failing Task',
+        description='Should fail on add_task',
     )
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
+    assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+    ticket_id = result['ticket']
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Failing Task',
-            description='Should fail on add_task',
-        )
-        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
-        ticket_id = result['ticket']
-
-        # Let the worker drain. The negative task_created assertion below
-        # is safe against this barrier even though _journal runs *after*
-        # the terminal write: on the failure path the emission is guarded
-        # by `status == 'created'` (task_interceptor.py:3806 / 4184), so no
-        # event is ever built for a 'failed' ticket. There is no window in
-        # which the event exists but has not yet been journalled.
-        row = await _poll_ticket_resolved(ticket_store, ticket_id, what='the failing ticket')
+    # Let the worker drain. The negative task_created assertion below
+    # is safe against this barrier even though _journal runs *after*
+    # the terminal write: on the failure path the emission is guarded
+    # by `status == 'created'` (task_interceptor.py:3806 / 4184), so no
+    # event is ever built for a 'failed' ticket. There is no window in
+    # which the event exists but has not yet been journalled.
+    row = await _poll_ticket_resolved(ticket_store, ticket_id, what='the failing ticket')
 
     # Ticket must be terminal with status='failed'
     assert row['status'] == 'failed', f'Expected failed, got {row["status"]}'
@@ -661,38 +629,30 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
 
 @pytest.mark.asyncio
 async def test_worker_created_path_emits_journal_event(
-    interceptor_with_store, ticket_store, taskmaster, event_buffer, caplog,
+    make_interceptor, ticket_store, taskmaster, event_buffer, caplog,
 ):
     """Regression-pin: on create success, exactly one EventType.task_created
     event is journalled with the task_id in its payload.
     """
     from fused_memory.models.reconciliation import EventType
 
+    mock_curator = curator_always(CuratorDecision(action='create'))
+    interceptor = make_interceptor(mock_curator)
+
     # Capture journal calls
     journal_calls = []
-    original_journal = interceptor_with_store._journal
+    original_journal = interceptor._journal
 
     async def capturing_journal(event):
         journal_calls.append(event)
         return await original_journal(event)
 
-    interceptor_with_store._journal = capturing_journal
+    interceptor._journal = capturing_journal
 
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock(
-        return_value=CuratorDecision(action='create')
-    )
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
-
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ), caplog.at_level(
+    with caplog.at_level(
         logging.ERROR, logger='fused_memory.middleware.task_interceptor',
     ):
-        result = await interceptor_with_store.submit_task(
+        result = await interceptor.submit_task(
             project_root='/project',
             title='Journal Test Task',
             description='Checking event emission',
@@ -755,7 +715,7 @@ async def test_worker_created_path_emits_journal_event(
 
 @pytest.mark.asyncio
 async def test_worker_note_created_and_record_task_run_under_write_lock(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """Verifies that curator.note_created and curator.record_task are both
     called with the correct task_id, in order, and while the write_lock is
@@ -770,38 +730,31 @@ async def test_worker_note_created_and_record_task_run_under_write_lock(
 
     def spy_note_created(pid, candidate, task_id):
         call_order.append(('note_created', task_id))
-        lock = interceptor_with_store._write_locks.get(project_id)
+        lock = interceptor._write_locks.get(project_id)
         lock_held_at_note.append(lock.locked() if lock else False)
 
     async def spy_record_task(task_id, candidate, pid):
         call_order.append(('record_task', task_id))
-        lock = interceptor_with_store._write_locks.get(project_id)
+        lock = interceptor._write_locks.get(project_id)
         lock_held_at_record.append(lock.locked() if lock else False)
 
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock(
-        return_value=CuratorDecision(action='create')
-    )
-    answer_each_with(mock_curator, mock_curator.curate)
+    mock_curator = curator_always(CuratorDecision(action='create'))
     mock_curator.note_created = spy_note_created
     mock_curator.record_task = spy_record_task
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Lock Test',
-            description='Checking write_lock',
-        )
-        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+    interceptor = make_interceptor(mock_curator)
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='Lock Test',
+        description='Checking write_lock',
+    )
+    assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
 
-        await poll_until(
-            lambda: len(call_order) >= 2,
-            timeout=10.0,
-            message='worker did not call both note_created and record_task',
-        )
+    await poll_until(
+        lambda: len(call_order) >= 2,
+        timeout=10.0,
+        message='worker did not call both note_created and record_task',
+    )
 
     # Both were called in order: note_created before record_task
     assert len(call_order) == 2, f'Expected 2 calls, got {call_order}'
@@ -858,39 +811,32 @@ async def test_resolve_ticket_returns_immediately_for_terminal_ticket(
 
 @pytest.mark.asyncio
 async def test_resolve_ticket_wakes_on_worker_completion(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """When resolve_ticket is awaiting a pending ticket, the worker completing
     that ticket wakes the caller promptly (well under the 5s timeout).
     """
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
+    mock_curator = curator_always(CuratorDecision(action='create'))
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        # Submit the ticket (enqueues ticket_id, starts worker)
-        submit_result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Wake Test',
-            description='Checks that resolve wakes on completion',
-        )
-        assert submit_result.get('ticket', '').startswith('tkt_'), f'Got: {submit_result}'
-        ticket_id = submit_result['ticket']
+    interceptor = make_interceptor(mock_curator)
+    # Submit the ticket (enqueues ticket_id, starts worker)
+    submit_result = await interceptor.submit_task(
+        project_root='/project',
+        title='Wake Test',
+        description='Checks that resolve wakes on completion',
+    )
+    assert submit_result.get('ticket', '').startswith('tkt_'), f'Got: {submit_result}'
+    ticket_id = submit_result['ticket']
 
-        # Await submit+resolve in parallel; worker should complete the ticket
-        # before the 5s timeout expires.
-        import time
-        start = time.monotonic()
-        resolve_result = await asyncio.wait_for(
-            interceptor_with_store.resolve_ticket(ticket_id, '/project', timeout_seconds=5.0),
-            timeout=6.0,  # outer safety bound
-        )
-        elapsed = time.monotonic() - start
+    # Await submit+resolve in parallel; worker should complete the ticket
+    # before the 5s timeout expires.
+    import time
+    start = time.monotonic()
+    resolve_result = await asyncio.wait_for(
+        interceptor.resolve_ticket(ticket_id, '/project', timeout_seconds=5.0),
+        timeout=6.0,  # outer safety bound
+    )
+    elapsed = time.monotonic() - start
 
     assert resolve_result['status'] == 'created', f'Expected created: {resolve_result}'
     assert resolve_result.get('task_id') == '42', f'Expected task_id=42: {resolve_result}'
@@ -910,7 +856,7 @@ async def test_resolve_ticket_wakes_on_worker_completion(
 
 @pytest.mark.asyncio
 async def test_resolve_ticket_timeout_answers_pending_without_mutating_row(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """When resolve_ticket times out, it answers the open ``pending`` status
     with the ticket and reason ``wait_timeout``, and the ticket row remains
@@ -926,28 +872,23 @@ async def test_resolve_ticket_timeout_answers_pending_without_mutating_row(
         await paused.wait()
         return [CuratorDecision(action='create')] * len(candidates)
 
-    mock_curator = MagicMock()
+    mock_curator = curator_double()
     mock_curator.curate_prepared = blocking_curate_prepared
     _stub_prepare_candidate(mock_curator)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        submit_result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='Timeout Test',
-            description='Should time out',
-        )
-        assert submit_result.get('ticket', '').startswith('tkt_'), f'Got: {submit_result}'
-        ticket_id = submit_result['ticket']
+    interceptor = make_interceptor(mock_curator)
+    submit_result = await interceptor.submit_task(
+        project_root='/project',
+        title='Timeout Test',
+        description='Should time out',
+    )
+    assert submit_result.get('ticket', '').startswith('tkt_'), f'Got: {submit_result}'
+    ticket_id = submit_result['ticket']
 
-        # Call resolve_ticket with a very short timeout
-        result = await interceptor_with_store.resolve_ticket(
-            ticket_id, '/project', timeout_seconds=0.1,
-        )
+    # Call resolve_ticket with a very short timeout
+    result = await interceptor.resolve_ticket(
+        ticket_id, '/project', timeout_seconds=0.1,
+    )
 
     assert result == {'status': 'pending', 'ticket': ticket_id, 'reason': 'wait_timeout'}
 
@@ -1001,8 +942,6 @@ async def test_close_drains_worker_and_closes_store(
     store = TicketStore(tmp_path / 'close_test_tickets.db')
     await store.initialize()
 
-    ti = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=store)
-
     # Submit a ticket so the worker is lazily started.
     # Use a paused asyncio.Event to block the worker indefinitely without
     # the 'coroutine as iterator' bug that AsyncMock(side_effect=coroutine) has.
@@ -1012,23 +951,20 @@ async def test_close_drains_worker_and_closes_store(
         await paused_event.wait()  # blocks until cancelled
         return CuratorDecision(action='create')
 
-    mock_curator = MagicMock()
-    mock_curator.curate = blocking_curate
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
-    mock_curator.reembed_task = AsyncMock()
+    mock_curator = curator_judging(blocking_curate)
 
-    with patch.object(ti, '_get_curator', AsyncMock(return_value=mock_curator)):
-        await ti.submit_task('/project', title='Test')
-        # Worker is now running (blocked on curator).
-        assert len(ti._worker_tasks) > 0, 'At least one worker should be started'
-        assert any(not t.done() for t in ti._worker_tasks.values()), (
-            'At least one worker should still be running'
-        )
+    ti = TaskInterceptor(
+        taskmaster, None, event_buffer, ticket_store=store, curator=mock_curator,
+    )
+    await ti.submit_task('/project', title='Test')
+    # Worker is now running (blocked on curator).
+    assert len(ti._worker_tasks) > 0, 'At least one worker should be started'
+    assert any(not t.done() for t in ti._worker_tasks.values()), (
+        'At least one worker should still be running'
+    )
 
-        # Close should cancel the worker and close the store.
-        await ti.close()
+    # Close should cancel the worker and close the store.
+    await ti.close()
 
     # All worker tasks should be done after close.
     assert all(t.done() for t in ti._worker_tasks.values()), (
@@ -1049,7 +985,7 @@ async def test_close_drains_worker_and_closes_store(
 
 @pytest.mark.asyncio
 async def test_worker_post_create_failure_still_resolves_as_created(
-    interceptor_with_store, ticket_store, taskmaster, event_buffer,
+    make_interceptor, ticket_store, taskmaster, event_buffer,
 ):
     """Regression: if note_created raises AFTER tm.add_task succeeds, the ticket
     must still resolve as status='created' (NOT 'failed').
@@ -1064,39 +1000,33 @@ async def test_worker_post_create_failure_still_resolves_as_created(
     """
     from fused_memory.models.reconciliation import EventType
 
+    mock_curator = curator_always(CuratorDecision(action='create'))
+    mock_curator.note_created = MagicMock(side_effect=RuntimeError('embed broke'))
+    interceptor = make_interceptor(mock_curator)
+
     # Capture journal calls
     journal_calls = []
-    original_journal = interceptor_with_store._journal
+    original_journal = interceptor._journal
 
     async def capturing_journal(event):
         journal_calls.append(event)
         return await original_journal(event)
 
-    interceptor_with_store._journal = capturing_journal
+    interceptor._journal = capturing_journal
 
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock(side_effect=RuntimeError('embed broke'))
-    mock_curator.record_task = AsyncMock()
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='PostCreateFailure Test',
+        description='note_created will fail',
+    )
+    assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+    ticket_id = result['ticket']
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='PostCreateFailure Test',
-            description='note_created will fail',
-        )
-        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
-        ticket_id = result['ticket']
+    row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
-        row = await _poll_ticket_resolved(ticket_store, ticket_id)
-
-        # SETTLE barrier: see _poll_journal_settled's docstring for why a
-        # liveness poll cannot substitute here.
-        await _poll_journal_settled(journal_calls, EventType.task_created)
+    # SETTLE barrier: see _poll_journal_settled's docstring for why a
+    # liveness poll cannot substitute here.
+    await _poll_journal_settled(journal_calls, EventType.task_created)
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
@@ -1134,7 +1064,7 @@ async def test_worker_post_create_failure_still_resolves_as_created(
 
 @pytest.mark.asyncio
 async def test_worker_record_task_failure_still_resolves_as_created(
-    interceptor_with_store, ticket_store, taskmaster, event_buffer,
+    make_interceptor, ticket_store, taskmaster, event_buffer,
 ):
     """Regression: if record_task raises AFTER tm.add_task succeeds, the ticket
     must still resolve as status='created'.
@@ -1145,38 +1075,32 @@ async def test_worker_record_task_failure_still_resolves_as_created(
     """
     from fused_memory.models.reconciliation import EventType
 
+    mock_curator = curator_always(CuratorDecision(action='create'))
+    mock_curator.record_task = AsyncMock(side_effect=RuntimeError('record broke'))
+    interceptor = make_interceptor(mock_curator)
+
     journal_calls = []
-    original_journal = interceptor_with_store._journal
+    original_journal = interceptor._journal
 
     async def capturing_journal(event):
         journal_calls.append(event)
         return await original_journal(event)
 
-    interceptor_with_store._journal = capturing_journal
+    interceptor._journal = capturing_journal
 
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock(side_effect=RuntimeError('record broke'))
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='RecordTaskFailure Test',
+        description='record_task will fail',
+    )
+    assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+    ticket_id = result['ticket']
 
-    with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ):
-        result = await interceptor_with_store.submit_task(
-            project_root='/project',
-            title='RecordTaskFailure Test',
-            description='record_task will fail',
-        )
-        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
-        ticket_id = result['ticket']
+    row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
-        row = await _poll_ticket_resolved(ticket_store, ticket_id)
-
-        # SETTLE barrier: see _poll_journal_settled's docstring for why a
-        # liveness poll cannot substitute here.
-        await _poll_journal_settled(journal_calls, EventType.task_created)
+    # SETTLE barrier: see _poll_journal_settled's docstring for why a
+    # liveness poll cannot substitute here.
+    await _poll_journal_settled(journal_calls, EventType.task_created)
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
@@ -1246,7 +1170,7 @@ async def test_per_project_ticket_queues_do_not_serialise(
             await unblock_a.wait()
         return CuratorDecision(action='create')
 
-    mock_curator = MagicMock()
+    mock_curator = curator_double()
     mock_curator.curate = AsyncMock(side_effect=curate_side_effect)
     _stub_prepare_candidate(mock_curator)
 
@@ -1257,84 +1181,80 @@ async def test_per_project_ticket_queues_do_not_serialise(
         ]
 
     mock_curator.curate_prepared = AsyncMock(side_effect=curate_prepared)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
 
     # Two separate project roots map to two project_ids
     project_root_a = '/project-a'
     project_root_b = '/project-b'
 
-    ti = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=ticket_store)
+    ti = TaskInterceptor(
+        taskmaster, None, event_buffer, ticket_store=ticket_store, curator=mock_curator,
+    )
 
     resolve_a: asyncio.Task[dict] | None = None
     try:
-        with patch.object(
-            type(ti), '_get_curator',
-            new=AsyncMock(return_value=mock_curator),
-        ):
-            # (1) Submit project-a — worker picks it up immediately and blocks
-            submit_a = await ti.submit_task(project_root=project_root_a, title='Task A')
-            assert submit_a.get('ticket', '').startswith('tkt_'), f'Got: {submit_a}'
-            ticket_a = submit_a['ticket']
+        # (1) Submit project-a — worker picks it up immediately and blocks
+        submit_a = await ti.submit_task(project_root=project_root_a, title='Task A')
+        assert submit_a.get('ticket', '').startswith('tkt_'), f'Got: {submit_a}'
+        ticket_a = submit_a['ticket']
 
-            # Exact barrier: worker-a is inside the blocking curate() call
-            # before project-b is submitted. A fixed sleep can end before
-            # worker-a is scheduled under xdist, silently weakening the test
-            # (task 3901 sweep).
-            await poll_until(
-                curate_a_entered.is_set,
-                message='worker-a never entered curate()',
-            )
+        # Exact barrier: worker-a is inside the blocking curate() call
+        # before project-b is submitted. A fixed sleep can end before
+        # worker-a is scheduled under xdist, silently weakening the test
+        # (task 3901 sweep).
+        await poll_until(
+            curate_a_entered.is_set,
+            message='worker-a never entered curate()',
+        )
 
-            # (2) Submit project-b — must get an independent worker
-            submit_b = await ti.submit_task(project_root=project_root_b, title='Task B')
-            assert submit_b.get('ticket', '').startswith('tkt_'), f'Got: {submit_b}'
-            ticket_b = submit_b['ticket']
+        # (2) Submit project-b — must get an independent worker
+        submit_b = await ti.submit_task(project_root=project_root_b, title='Task B')
+        assert submit_b.get('ticket', '').startswith('tkt_'), f'Got: {submit_b}'
+        ticket_b = submit_b['ticket']
 
-            # (3) project-b's ticket is terminal while project-a's is still pending
-            row_b = await _poll_ticket_resolved(
-                ticket_store, ticket_b, what='the project-b ticket',
-            )
-            assert row_b['status'] == 'created', (
-                f'project-b should resolve while project-a is blocked: {row_b!r}'
-            )
-            row_a = await ticket_store.get(ticket_a)
-            assert row_a['status'] == 'pending', (
-                'project-a must still be blocked in curate() when project-b '
-                f'resolves: {row_a!r}'
-            )
+        # (3) project-b's ticket is terminal while project-a's is still pending
+        row_b = await _poll_ticket_resolved(
+            ticket_store, ticket_b, what='the project-b ticket',
+        )
+        assert row_b['status'] == 'created', (
+            f'project-b should resolve while project-a is blocked: {row_b!r}'
+        )
+        row_a = await ticket_store.get(ticket_a)
+        assert row_a['status'] == 'pending', (
+            'project-a must still be blocked in curate() when project-b '
+            f'resolves: {row_a!r}'
+        )
 
-            # (4) The project-a waiter parks before the unblock, so worker-a's
-            # signal is what wakes it.
-            resolve_a = asyncio.create_task(
-                ti.resolve_ticket(ticket_a, project_root_a, timeout_seconds=None),
-            )
-            unblock_a.set()
-            await poll_until(
-                resolve_a.done,
-                message='resolve_ticket(project-a) did not return after unblock',
-            )
-            result_a = resolve_a.result()
-            assert result_a.get('status') == 'created', (
-                f'project-a should resolve after unblock: {result_a!r}'
-            )
+        # (4) The project-a waiter parks before the unblock, so worker-a's
+        # signal is what wakes it.
+        resolve_a = asyncio.create_task(
+            ti.resolve_ticket(ticket_a, project_root_a, timeout_seconds=None),
+        )
+        unblock_a.set()
+        await poll_until(
+            resolve_a.done,
+            message='resolve_ticket(project-a) did not return after unblock',
+        )
+        result_a = resolve_a.result()
+        assert result_a.get('status') == 'created', (
+            f'project-a should resolve after unblock: {result_a!r}'
+        )
 
-            # (5) Two workers with distinct names
-            assert hasattr(ti, '_worker_tasks'), (
-                'Expected _worker_tasks dict (per-project sharding not implemented)'
-            )
-            assert len(ti._worker_tasks) == 2, (
-                f'Expected 2 workers (one per project), got {len(ti._worker_tasks)}: '
-                f'{list(ti._worker_tasks.keys())}'
-            )
-            worker_names = {t.get_name() for t in ti._worker_tasks.values()}
-            # resolve_project_id converts hyphens to underscores: /project-a → project_a
-            assert any('project_a' in n for n in worker_names), (
-                f'Expected a worker named for project_a: {worker_names}'
-            )
-            assert any('project_b' in n for n in worker_names), (
-                f'Expected a worker named for project_b: {worker_names}'
-            )
+        # (5) Two workers with distinct names
+        assert hasattr(ti, '_worker_tasks'), (
+            'Expected _worker_tasks dict (per-project sharding not implemented)'
+        )
+        assert len(ti._worker_tasks) == 2, (
+            f'Expected 2 workers (one per project), got {len(ti._worker_tasks)}: '
+            f'{list(ti._worker_tasks.keys())}'
+        )
+        worker_names = {t.get_name() for t in ti._worker_tasks.values()}
+        # resolve_project_id converts hyphens to underscores: /project-a → project_a
+        assert any('project_a' in n for n in worker_names), (
+            f'Expected a worker named for project_a: {worker_names}'
+        )
+        assert any('project_b' in n for n in worker_names), (
+            f'Expected a worker named for project_b: {worker_names}'
+        )
 
     finally:
         # Clean up all per-project workers
@@ -1532,9 +1452,7 @@ class TestDispatchTicketDecision:
         candidate = CandidateTask(title='New Feature', description='Details here')
         decision = CuratorDecision(action='create', justification='novel')
 
-        mock_curator = MagicMock()
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
+        mock_curator = curator_double()
 
         taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'New Feature'})
 
@@ -1569,8 +1487,7 @@ class TestDispatchTicketDecision:
 
         add_task_result = {'id': '77', 'title': 'New Feature'}
         taskmaster.add_task = AsyncMock(return_value=add_task_result)
-        mock_curator = MagicMock()
-        mock_curator.record_task = AsyncMock()
+        mock_curator = curator_double()
 
         with patch.object(
             type(interceptor_with_store), '_ensure_taskmaster',
@@ -1625,50 +1542,50 @@ class TestDispatchTicketDecision:
         assert result_dict.get('id') == '99'
 
     @pytest.mark.asyncio
-    async def test_dispatch_combine_calls_execute_combine_and_returns_combined(
-        self, interceptor_with_store,
+    async def test_dispatch_combine_rewrites_the_target_and_returns_combined(
+        self, interceptor_with_store, taskmaster,
     ):
-        """action='combine' → calls _execute_combine, returns (combined, target_id, ...)."""
+        """action='combine' → rewrites the target through tm.update_task.
+
+        Returns (combined, target_id, ...).
+        """
         from fused_memory.middleware.curator_types import CandidateTask
 
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '88', 'title': 'Overlap target', 'status': 'pending'},
+        )
         candidate = CandidateTask(title='Overlap Task')
         rewritten = RewrittenTask(
             title='Merged', description='desc', details='det',
             files_to_modify=[], priority='medium',
         )
         decision = CuratorDecision(
-            action='combine', target_id='88', justification='overlap',
-            rewritten_task=rewritten,
+            action='combine', target_id='88', target_fingerprint='Overlap target',
+            justification='overlap', rewritten_task=rewritten,
         )
 
-        mock_executor = AsyncMock(return_value={'id': '88', 'title': 'Merged'})
-
-        mock_curator = MagicMock()
-        mock_curator.reembed_task = AsyncMock()
-
-        with patch.object(
-            interceptor_with_store, '_execute_combine',
-            new=mock_executor,
-        ):
-            status, task_id, reason, result_dict = (
-                await interceptor_with_store._dispatch_ticket_decision(
-                    ticket_id='tkt_comb',
-                    project_root='/p',
-                    project_id='p',
-                    candidate=candidate,
-                    decision=decision,
-                    kwargs={'title': 'Overlap Task'},
-                    metadata=None,
-                    curator=mock_curator,
-                )
+        status, task_id, reason, result_dict = (
+            await interceptor_with_store._dispatch_ticket_decision(
+                ticket_id='tkt_comb',
+                project_root='/p',
+                project_id='p',
+                candidate=candidate,
+                decision=decision,
+                kwargs={'title': 'Overlap Task'},
+                metadata=None,
+                curator=curator_double(),
             )
+        )
 
         assert status == 'combined'
         assert task_id == '88'
         assert reason is not None and 'combine' in reason
         assert isinstance(result_dict, dict)
         assert result_dict.get('id') == '88'
-        assert mock_executor.await_count == 1
+        taskmaster.update_task.assert_awaited_once()
+        update_kwargs = taskmaster.update_task.await_args.kwargs
+        assert update_kwargs['task_id'] == '88'
+        assert update_kwargs['title'] == 'Merged'
 
 
 # ---------------------------------------------------------------------------
@@ -1676,31 +1593,11 @@ class TestDispatchTicketDecision:
 # ---------------------------------------------------------------------------
 
 
-@pytest_asyncio.fixture
-async def make_batch_interceptor(taskmaster, event_buffer, ticket_store):
-    """Build interceptors whose curator is the given double; close each on teardown."""
-    built: list[TaskInterceptor] = []
-
-    def make(curator) -> TaskInterceptor:
-        interceptor = TaskInterceptor(
-            taskmaster, None, event_buffer, ticket_store=ticket_store, curator=curator,
-        )
-        built.append(interceptor)
-        return interceptor
-
-    yield make
-    for interceptor in built:
-        await interceptor.close()
-
-
 def _batch_curator(*decisions: CuratorDecision) -> MagicMock:
     """A curator double whose one ``curate_prepared`` call answers *decisions* positionally."""
-    curator = MagicMock()
+    curator = curator_double()
     curator.curate_prepared = AsyncMock(return_value=list(decisions))
     _stub_prepare_candidate(curator)
-    curator.note_created = MagicMock()
-    curator.record_task = AsyncMock()
-    curator.close = AsyncMock()
     return curator
 
 
@@ -1727,12 +1624,30 @@ def _curated_titles(curator: MagicMock) -> list[str]:
     return [bundle.candidate.title for bundle in bundles]
 
 
+_SIBLING_REWRITE = RewrittenTask(
+    title='Task One, unified',
+    description='Both candidates as one task.',
+    details='Every detail of both.',
+    files_to_modify=[],
+    priority='medium',
+)
+
+
+def _combine_onto(index: int, *, fingerprint: str) -> CuratorDecision:
+    """A within-batch combine of a candidate into its sibling at curated *index*."""
+    return CuratorDecision(
+        action='combine', target_id=None, batch_target_index=index,
+        target_fingerprint=fingerprint, rewritten_task=_SIBLING_REWRITE,
+        justification=f'fold into batch {index}',
+    )
+
+
 class TestWorkerBatchDispatch:
     """The worker judges a batch with one curator call and dispatches each ticket."""
 
     @pytest.mark.asyncio
     async def test_batch_dispatches_each_ticket_and_marks_terminal(
-        self, make_batch_interceptor, taskmaster,
+        self, make_interceptor, taskmaster,
     ):
         curator = _batch_curator(
             CuratorDecision(action='create', justification='new'),
@@ -1743,7 +1658,7 @@ class TestWorkerBatchDispatch:
             {'id': '42', 'title': 'Task Alpha'},
             {'id': '43', 'title': 'Task Gamma'},
         ])
-        interceptor = make_batch_interceptor(curator)
+        interceptor = make_interceptor(curator)
 
         ticket_ids = await submit_as_one_batch(interceptor, curator, [
             _titled('Task Alpha'), _titled('Task Beta'), _titled('Task Gamma'),
@@ -1757,7 +1672,7 @@ class TestWorkerBatchDispatch:
 
     @pytest.mark.asyncio
     async def test_within_batch_drop_uses_sibling_task_id(
-        self, make_batch_interceptor, taskmaster,
+        self, make_interceptor, taskmaster,
     ):
         """A drop onto batch item 0, which has no task yet, takes the id item 0 is created with."""
         curator = _batch_curator(
@@ -1768,7 +1683,7 @@ class TestWorkerBatchDispatch:
             ),
         )
         taskmaster.add_task = AsyncMock(return_value={'id': '88', 'title': 'Task One'})
-        interceptor = make_batch_interceptor(curator)
+        interceptor = make_interceptor(curator)
 
         ticket_ids = await submit_as_one_batch(interceptor, curator, [
             _titled('Task One'), _titled('Task One dup'),
@@ -1781,7 +1696,7 @@ class TestWorkerBatchDispatch:
 
     @pytest.mark.asyncio
     async def test_per_ticket_dispatch_failure_is_isolated(
-        self, make_batch_interceptor, taskmaster,
+        self, make_interceptor, taskmaster,
     ):
         curator = _batch_curator(
             CuratorDecision(action='create', justification='new a'),
@@ -1793,7 +1708,7 @@ class TestWorkerBatchDispatch:
             RuntimeError('boom'),
             {'id': '33', 'title': 'Task C'},
         ])
-        interceptor = make_batch_interceptor(curator)
+        interceptor = make_interceptor(curator)
 
         ticket_ids = await submit_as_one_batch(interceptor, curator, [
             _titled('Task A'), _titled('Task B'), _titled('Task C'),
@@ -1807,7 +1722,7 @@ class TestWorkerBatchDispatch:
 
     @pytest.mark.asyncio
     async def test_batch_target_index_counts_only_the_curated_candidates(
-        self, make_batch_interceptor, taskmaster,
+        self, make_interceptor, taskmaster,
     ):
         """A titleless ticket is not curated, so batch_target_index skips over it.
 
@@ -1827,7 +1742,7 @@ class TestWorkerBatchDispatch:
             {'id': 't2-fallback', 'title': ''},
             {'id': '101', 'title': 'Task Two'},
         ])
-        interceptor = make_batch_interceptor(curator)
+        interceptor = make_interceptor(curator)
 
         ticket_ids = await submit_as_one_batch(interceptor, curator, [
             _titled('Task One'), _TITLELESS, _titled('Task Two'), _titled('Task Two dup'),
@@ -1843,7 +1758,7 @@ class TestWorkerBatchDispatch:
 
     @pytest.mark.asyncio
     async def test_batch_mixed_lifecycle_no_cross_substitution(
-        self, make_batch_interceptor, taskmaster,
+        self, make_interceptor, taskmaster,
     ):
         """A within-batch drop, a titleless ticket and two creates each resolve to their own id."""
         curator = _batch_curator(
@@ -1859,7 +1774,7 @@ class TestWorkerBatchDispatch:
             {'id': 'T3', 'title': ''},
             {'id': 'T4', 'title': 'Task Delta'},
         ])
-        interceptor = make_batch_interceptor(curator)
+        interceptor = make_interceptor(curator)
 
         ticket_ids = await submit_as_one_batch(interceptor, curator, [
             _titled('Task Alpha'), _titled('Task Alpha dup'), _TITLELESS, _titled('Task Delta'),
@@ -1874,7 +1789,7 @@ class TestWorkerBatchDispatch:
 
     @pytest.mark.asyncio
     async def test_batch_within_batch_drop_sibling_failed_degrades_to_create(
-        self, make_batch_interceptor, taskmaster,
+        self, make_interceptor, taskmaster,
     ):
         """A drop onto a sibling that failed to dispatch is created with its own id."""
         curator = _batch_curator(
@@ -1888,7 +1803,7 @@ class TestWorkerBatchDispatch:
             RuntimeError('boom'),
             {'id': '77', 'title': 'Task One dup'},
         ])
-        interceptor = make_batch_interceptor(curator)
+        interceptor = make_interceptor(curator)
 
         ticket_ids = await submit_as_one_batch(interceptor, curator, [
             _titled('Task One'), _titled('Task One dup'),
@@ -1899,8 +1814,78 @@ class TestWorkerBatchDispatch:
         assert taskmaster.add_task.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_within_batch_combine_folds_into_the_sibling_task(
+        self, make_interceptor, taskmaster,
+    ):
+        """A combine onto batch item 0 rewrites the task item 0 is created as."""
+        curator = _batch_curator(
+            CuratorDecision(action='create', justification='new'),
+            _combine_onto(0, fingerprint='Task One'),
+        )
+        taskmaster.add_task = AsyncMock(return_value={'id': '88', 'title': 'Task One'})
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '88', 'title': 'Task One', 'status': 'pending'},
+        )
+        interceptor = make_interceptor(curator)
+
+        ticket_ids = await submit_as_one_batch(interceptor, curator, [
+            _titled('Task One'), _titled('Task One, more of it'),
+        ])
+        created, combined = await _resolve_all(interceptor, ticket_ids)
+
+        assert _outcomes([created, combined]) == [('created', '88'), ('combined', '88')]
+        assert combined['reason'].startswith('combine:')
+        taskmaster.update_task.assert_awaited_once()
+        update = taskmaster.update_task.await_args.kwargs
+        assert (update['task_id'], update['title']) == ('88', _SIBLING_REWRITE.title)
+        assert taskmaster.add_task.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_within_batch_combine_onto_a_failed_sibling_degrades_to_create(
+        self, make_interceptor, taskmaster,
+    ):
+        """A combine onto a sibling that was never created is created on its own."""
+        curator = _batch_curator(
+            CuratorDecision(action='create', justification='new'),
+            _combine_onto(0, fingerprint='Task One'),
+        )
+        taskmaster.add_task = AsyncMock(side_effect=[
+            RuntimeError('boom'),
+            {'id': '77', 'title': 'Task One, more of it'},
+        ])
+        interceptor = make_interceptor(curator)
+
+        ticket_ids = await submit_as_one_batch(interceptor, curator, [
+            _titled('Task One'), _titled('Task One, more of it'),
+        ])
+        failed, created = await _resolve_all(interceptor, ticket_ids)
+
+        assert _outcomes([failed, created]) == [('failed', None), ('created', '77')]
+        assert 'batch-target-not-create' in created['reason']
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_within_batch_combine_onto_a_parked_sibling_parks_with_it(
+        self, make_interceptor, taskmaster, ticket_store,
+    ):
+        curator = _batch_curator(
+            CuratorDecision.deferred(DeferReason.LLM_FAILED),
+            _combine_onto(0, fingerprint='Task One'),
+        )
+        interceptor = make_interceptor(curator)
+
+        ticket_ids = await submit_as_one_batch(interceptor, curator, [
+            _titled('Task One'), _titled('Task One, more of it'),
+        ])
+        rows = [await _poll_ticket_resolved(ticket_store, ticket_id) for ticket_id in ticket_ids]
+
+        assert [row['status'] for row in rows] == ['awaiting_curation', 'awaiting_curation']
+        taskmaster.add_task.assert_not_awaited()
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_idempotency_hit_resolves_combined_and_is_not_curated(
-        self, make_batch_interceptor, taskmaster,
+        self, make_interceptor, taskmaster,
     ):
         serve_existing_task(taskmaster, {
             'id': '99', 'title': 'Existing Escalation Task', 'status': 'pending',
@@ -1914,7 +1899,7 @@ class TestWorkerBatchDispatch:
             {'id': '11', 'title': 'Task A'},
             {'id': '33', 'title': 'Task C'},
         ])
-        interceptor = make_batch_interceptor(curator)
+        interceptor = make_interceptor(curator)
 
         ticket_ids = await submit_as_one_batch(interceptor, curator, [
             _titled('Task A'),
@@ -1938,31 +1923,14 @@ class TestWorkerBatchDispatch:
 _ADD_TASK_RESULT = {'id': '42', 'title': 'New Task'}
 
 
-def _curator_returning(decision: CuratorDecision) -> MagicMock:
-    """A curator mock whose ``curate_prepared`` answers every bundle with *decision*.
-
-    ``prepare_candidate`` returns a bundle over an empty pool, as the worker
-    needs; the verdict comes from the ``curate`` mock, so a test can count it.
-    """
-    mock_curator = MagicMock()
-    mock_curator.curate = AsyncMock(return_value=decision)
-    answer_each_with(mock_curator, mock_curator.curate)
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
-    return mock_curator
-
-
-async def _drive_ticket_through_worker(interceptor, ticket_store, curator) -> dict:
-    with patch.object(
-        type(interceptor), '_get_curator', new=AsyncMock(return_value=curator),
-    ):
-        result = await interceptor.submit_task(
-            project_root='/project',
-            title='Provenance Task',
-            description='Which path created me?',
-        )
-        ticket_id = result['ticket']
-        return await _poll_ticket_resolved(ticket_store, ticket_id)
+async def _drive_ticket_through_worker(interceptor, ticket_store) -> dict:
+    result = await interceptor.submit_task(
+        project_root='/project',
+        title='Provenance Task',
+        description='Which path created me?',
+    )
+    ticket_id = result['ticket']
+    return await _poll_ticket_resolved(ticket_store, ticket_id)
 
 
 class TestCreatePathReasonPersisted:
@@ -1976,17 +1944,15 @@ class TestCreatePathReasonPersisted:
 
     @pytest.mark.asyncio
     async def test_degraded_create_records_its_justification(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
-        curator = _curator_returning(CuratorDecision(
+        interceptor = make_interceptor(curator_always(CuratorDecision(
             action='create',
             justification='llm-failed: FileNotFoundError: boom',
             degraded=True,
-        ))
+        )))
 
-        row = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, curator,
-        )
+        row = await _drive_ticket_through_worker(interceptor, ticket_store)
 
         assert row['status'] == 'created'
         assert row['reason'] == 'create: llm-failed: FileNotFoundError: boom'
@@ -1994,20 +1960,18 @@ class TestCreatePathReasonPersisted:
 
     @pytest.mark.asyncio
     async def test_healthy_create_records_full_justification_verbatim(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
         prose = (
             'No existing task covers the retry semantics of the merge lane. '
             'The closest candidate, task 812, concerns the scheduler and '
             'touches disjoint files. ' + 'Further detail. ' * 40
         ).strip()
-        curator = _curator_returning(
+        interceptor = make_interceptor(curator_always(
             CuratorDecision(action='create', justification=prose, degraded=False),
-        )
+        ))
 
-        row = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, curator,
-        )
+        row = await _drive_ticket_through_worker(interceptor, ticket_store)
 
         assert row['status'] == 'created'
         assert row['reason'] == 'create: ' + prose
@@ -2015,37 +1979,31 @@ class TestCreatePathReasonPersisted:
 
     @pytest.mark.asyncio
     async def test_prepared_ticket_create_records_reason(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
-        curator = MagicMock()
+        curator = curator_double()
         curator.curate_prepared = AsyncMock(return_value=[
             CuratorDecision(action='create', justification='novel in batch'),
         ])
         _stub_prepare_candidate(curator)
-        curator.note_created = MagicMock()
-        curator.record_task = AsyncMock()
 
-        row = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, curator,
-        )
+        row = await _drive_ticket_through_worker(make_interceptor(curator), ticket_store)
 
         assert row['status'] == 'created'
         assert row['reason'] == 'create: novel in batch'
 
     @pytest.mark.asyncio
     async def test_combine_that_could_not_execute_is_labelled_combine_failed(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
         """The justification argues the candidate IS a duplicate; the reason must
         not read as though the curator judged it new."""
         taskmaster.get_task = AsyncMock(side_effect=RuntimeError('target gone'))
-        curator = _curator_returning(CuratorDecision(
+        interceptor = make_interceptor(curator_always(CuratorDecision(
             action='combine', target_id='999', justification='same work as 999',
-        ))
+        )))
 
-        row = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, curator,
-        )
+        row = await _drive_ticket_through_worker(interceptor, ticket_store)
 
         assert row['status'] == 'created'
         assert row['reason'] == 'create: combine-failed: same work as 999'
@@ -2069,10 +2027,10 @@ class TestCreatePathReasonPersisted:
         ids=['drop-without-target', 'route-deterministic'],
     )
     async def test_non_create_actions_that_create_are_labelled_by_action(
-        self, interceptor_with_store, ticket_store, taskmaster, decision, expected,
+        self, make_interceptor, ticket_store, taskmaster, decision, expected,
     ):
         row = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, _curator_returning(decision),
+            make_interceptor(curator_always(decision)), ticket_store,
         )
 
         assert row['status'] == 'created'
@@ -2080,20 +2038,15 @@ class TestCreatePathReasonPersisted:
 
     @pytest.mark.asyncio
     async def test_created_rows_with_reason_never_enter_the_failure_sweep(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
-        degraded = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, _curator_returning(
-                CuratorDecision(
-                    action='create', justification='llm-failed: x', degraded=True,
-                ),
-            ),
-        )
-        healthy = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, _curator_returning(
-                CuratorDecision(action='create', justification='novel'),
-            ),
-        )
+        interceptor = make_interceptor(curator_returning(
+            CuratorDecision(action='create', justification='llm-failed: x', degraded=True),
+            CuratorDecision(action='create', justification='novel'),
+        ))
+
+        degraded = await _drive_ticket_through_worker(interceptor, ticket_store)
+        healthy = await _drive_ticket_through_worker(interceptor, ticket_store)
 
         failures = await ticket_store.fetch_unescalated_failures(limit=100)
 
@@ -2111,7 +2064,7 @@ def _config_without_curator_startup_tasks() -> FusedMemoryConfig:
 
 @pytest_asyncio.fixture
 async def configured_interceptor(taskmaster, event_buffer, ticket_store):
-    """An interceptor whose curator is built for real by ``_get_curator``."""
+    """An interceptor with no injected curator, so ``_get_curator`` builds one lazily."""
     ti = TaskInterceptor(
         taskmaster, None, event_buffer,
         config=_config_without_curator_startup_tasks(), ticket_store=ticket_store,
@@ -2135,7 +2088,11 @@ class TestCuratorUnavailableReasonPersisted:
     """A ticket created with NO curator records why the curator was missing.
 
     This is the path a curator's own degraded-streak alarm cannot see: when
-    ``_get_curator()`` returns None there is no curator left to count.
+    ``_get_curator()`` returns None there is no curator left to count. The
+    tests built on ``configured_interceptor`` inject no curator, because
+    ``_get_curator``'s lazy construction and its recovery are their subject:
+    ``_get_curator`` runs for real, and where a build is expected it builds a
+    patched ``TaskCurator`` class.
     """
 
     @pytest.mark.asyncio
@@ -2201,8 +2158,7 @@ class TestCuratorUnavailableReasonPersisted:
         """A live curator's ticket dispatched with no decision is not called unavailable."""
         from fused_memory.middleware.curator_types import CandidateTask
 
-        curator = MagicMock()
-        curator.record_task = AsyncMock()
+        curator = curator_double()
         with patch.object(
             type(interceptor_with_store), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
@@ -2232,7 +2188,7 @@ class TestCuratorUnavailableReasonPersisted:
                 configured_interceptor, ticket_store, 'While Broken',
             )
 
-        recovered = _curator_returning(
+        recovered = curator_always(
             CuratorDecision(action='create', justification='novel'),
         )
         with patch(
@@ -2250,7 +2206,7 @@ class TestCuratorUnavailableReasonPersisted:
     async def test_a_ticket_prepared_before_the_curator_recovered_is_still_curated(
         self, configured_interceptor, ticket_store,
     ):
-        recovered = _curator_returning(
+        recovered = curator_always(
             CuratorDecision(action='create', justification='novel'),
         )
         with patch(
@@ -2283,12 +2239,12 @@ class TestCuratorWorkerBatchDrain:
 
     @pytest.mark.asyncio
     async def test_worker_drains_up_to_batch_max_then_calls_curate_prepared_once(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
         """Worker drains all queued tickets into one batch."""
         project_id = 'project'
 
-        mock_curator = MagicMock()
+        mock_curator = curator_double()
         mock_curator.curate_prepared = AsyncMock(return_value=[
             CuratorDecision(action='create', justification='a'),
             CuratorDecision(action='create', justification='b'),
@@ -2296,8 +2252,8 @@ class TestCuratorWorkerBatchDrain:
             CuratorDecision(action='create', justification='d'),
         ])
         _stub_prepare_candidate(mock_curator)
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
+
+        interceptor = make_interceptor(mock_curator)
 
         taskmaster.add_task = AsyncMock(side_effect=[
             {'id': str(i), 'title': f'Task {i}'} for i in range(4)
@@ -2310,7 +2266,7 @@ class TestCuratorWorkerBatchDrain:
         t4 = await ticket_store.submit(project_id, self._make_candidate_json('Task 4'))
 
         # Pre-fill the queue synchronously so all tickets are queued before worker starts.
-        queue = interceptor_with_store._ticket_queues.setdefault(
+        queue = interceptor._ticket_queues.setdefault(
             project_id, asyncio.Queue()
         )
         for tid in [t1, t2, t3, t4]:
@@ -2319,7 +2275,7 @@ class TestCuratorWorkerBatchDrain:
         # Track calls to _process_add_tickets_batch_prepared (the worker
         # accumulator now drives the prepared variant directly so it can
         # gate batch composition on the soft token threshold).
-        original_impl = interceptor_with_store._process_add_tickets_batch_prepared
+        original_impl = interceptor._process_add_tickets_batch_prepared
         call_args_log: list[list[str]] = []
 
         async def tracking_batch(prepared_tickets) -> None:
@@ -2329,17 +2285,14 @@ class TestCuratorWorkerBatchDrain:
             return await original_impl(prepared_tickets)
 
         with patch.object(
-            type(interceptor_with_store), '_get_curator',
-            new=AsyncMock(return_value=mock_curator),
-        ), patch.object(
-            type(interceptor_with_store), '_ensure_taskmaster',
+            type(interceptor), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
         ), patch.object(
-            interceptor_with_store, '_process_add_tickets_batch_prepared',
+            interceptor, '_process_add_tickets_batch_prepared',
             side_effect=tracking_batch,
         ):
             # Start the worker manually.
-            interceptor_with_store._start_worker_if_needed(project_id)
+            interceptor._start_worker_if_needed(project_id)
 
             # Let the worker drain.
             for tid in (t1, t2, t3, t4):
@@ -2356,7 +2309,7 @@ class TestCuratorWorkerBatchDrain:
 
     @pytest.mark.asyncio
     async def test_single_ticket_does_not_wait_for_batch_fill(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
         """A single submitted ticket resolves quickly without waiting for a batch.
 
@@ -2365,13 +2318,13 @@ class TestCuratorWorkerBatchDrain:
         """
         project_id = 'project'
 
-        mock_curator = MagicMock()
+        mock_curator = curator_double()
         mock_curator.curate_prepared = AsyncMock(return_value=[
             CuratorDecision(action='create', justification='single'),
         ])
         _stub_prepare_candidate(mock_curator)
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
+
+        interceptor = make_interceptor(mock_curator)
 
         taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'Single Task'})
 
@@ -2379,14 +2332,14 @@ class TestCuratorWorkerBatchDrain:
         t1 = await ticket_store.submit(project_id, self._make_candidate_json('Single Task'))
 
         # Pre-fill the queue synchronously.
-        queue = interceptor_with_store._ticket_queues.setdefault(
+        queue = interceptor._ticket_queues.setdefault(
             project_id, asyncio.Queue()
         )
         queue.put_nowait(t1)
 
         # Track calls to _process_add_tickets_batch_prepared (worker calls
         # the prepared variant directly).
-        original_impl = interceptor_with_store._process_add_tickets_batch_prepared
+        original_impl = interceptor._process_add_tickets_batch_prepared
         call_args_log: list[list[str]] = []
 
         async def tracking_batch(prepared_tickets) -> None:
@@ -2396,16 +2349,13 @@ class TestCuratorWorkerBatchDrain:
             return await original_impl(prepared_tickets)
 
         with patch.object(
-            type(interceptor_with_store), '_get_curator',
-            new=AsyncMock(return_value=mock_curator),
-        ), patch.object(
-            type(interceptor_with_store), '_ensure_taskmaster',
+            type(interceptor), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
         ), patch.object(
-            interceptor_with_store, '_process_add_tickets_batch_prepared',
+            interceptor, '_process_add_tickets_batch_prepared',
             side_effect=tracking_batch,
         ):
-            interceptor_with_store._start_worker_if_needed(project_id)
+            interceptor._start_worker_if_needed(project_id)
 
             # Give the worker time to process (well under 0.5s is enough).
             row = await _poll_ticket_resolved(ticket_store, t1)
@@ -2424,7 +2374,7 @@ class TestCuratorWorkerBatchDrain:
 
     @pytest.mark.asyncio
     async def test_curator_lock_held_across_entire_batch(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
         """_curator_lock is held across the ENTIRE batch, curate_prepared + dispatch.
 
@@ -2433,7 +2383,9 @@ class TestCuratorWorkerBatchDrain:
         in flight acquires only after record_task has run.
         """
         project_id = 'project'
-        lock = interceptor_with_store._curator_lock(project_id)
+        mock_curator = curator_double()
+        interceptor = make_interceptor(mock_curator)
+        lock = interceptor._curator_lock(project_id)
         held_during: dict[str, bool] = {}
 
         curate_prepared_entered = asyncio.Event()
@@ -2456,7 +2408,6 @@ class TestCuratorWorkerBatchDrain:
         async def recording_record_task(*args, **kwargs):
             held_during['record_task'] = lock.locked()
 
-        mock_curator = MagicMock()
         mock_curator.curate_prepared = AsyncMock(side_effect=blocking_curate_prepared)
         _stub_prepare_candidate(mock_curator)
         mock_curator.note_created = MagicMock(side_effect=recording_note_created)
@@ -2466,7 +2417,7 @@ class TestCuratorWorkerBatchDrain:
 
         t1 = await ticket_store.submit(project_id, self._make_candidate_json('Locked Task'))
 
-        queue = interceptor_with_store._ticket_queues.setdefault(
+        queue = interceptor._ticket_queues.setdefault(
             project_id, asyncio.Queue()
         )
         queue.put_nowait(t1)
@@ -2481,13 +2432,10 @@ class TestCuratorWorkerBatchDrain:
         competitor: asyncio.Task[int] | None = None
         try:
             with patch.object(
-                type(interceptor_with_store), '_get_curator',
-                new=AsyncMock(return_value=mock_curator),
-            ), patch.object(
-                type(interceptor_with_store), '_ensure_taskmaster',
+                type(interceptor), '_ensure_taskmaster',
                 new=AsyncMock(return_value=taskmaster),
             ):
-                interceptor_with_store._start_worker_if_needed(project_id)
+                interceptor._start_worker_if_needed(project_id)
                 await poll_until(
                     curate_prepared_entered.is_set,
                     message='worker never entered curate_prepared',
@@ -2530,7 +2478,7 @@ class TestCuratorWorkerBatchDrain:
 
     @pytest.mark.asyncio
     async def test_remove_tasks_queued_behind_a_batch_sees_only_terminal_tickets(
-        self, make_batch_interceptor, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
         """A remove_tasks queued behind an in-flight batch reaches the backend only after the persist.
 
@@ -2549,7 +2497,7 @@ class TestCuratorWorkerBatchDrain:
         curator = _batch_curator()
         curator.curate_prepared = AsyncMock(side_effect=blocking_curate_prepared)
         curator.evict_task = AsyncMock()
-        interceptor = make_batch_interceptor(curator)
+        interceptor = make_interceptor(curator)
 
         submitted = await interceptor.submit_task('/project', title='Doomed Task', description='d')
         ticket_id = submitted['ticket']
@@ -2594,7 +2542,7 @@ class TestCuratorWorkerBatchDrain:
 
     @pytest.mark.asyncio
     async def test_end_to_end_three_tickets_one_llm_call_all_resolve_correctly(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self, make_interceptor, ticket_store, taskmaster,
     ):
         """End-to-end: 3 tickets pre-queued, one curate_prepared call, all resolve.
 
@@ -2611,7 +2559,7 @@ class TestCuratorWorkerBatchDrain:
         existing_task_id = 'existing-99'
 
         # Three decisions: create, drop (to existing task), create
-        mock_curator = MagicMock()
+        mock_curator = curator_double()
         mock_curator.curate_prepared = AsyncMock(return_value=[
             CuratorDecision(action='create', justification='new task A'),
             CuratorDecision(action='drop', target_id=existing_task_id,
@@ -2619,12 +2567,12 @@ class TestCuratorWorkerBatchDrain:
             CuratorDecision(action='create', justification='new task C'),
         ])
         _stub_prepare_candidate(mock_curator)
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
 
         # add_task is called once per 'create' decision
         task_a = {'id': 'task-a', 'title': 'Task A'}
         task_c = {'id': 'task-c', 'title': 'Task C'}
+        interceptor = make_interceptor(mock_curator)
+
         taskmaster.add_task = AsyncMock(side_effect=[task_a, task_c])
 
         # Submit all 3 tickets to the store and pre-fill the queue
@@ -2633,30 +2581,27 @@ class TestCuratorWorkerBatchDrain:
         t2 = await ticket_store.submit(project_id, self._make_candidate_json('Task B'))
         t3 = await ticket_store.submit(project_id, self._make_candidate_json('Task C'))
 
-        queue = interceptor_with_store._ticket_queues.setdefault(
+        queue = interceptor._ticket_queues.setdefault(
             project_id, asyncio.Queue()
         )
         for tid in [t1, t2, t3]:
             queue.put_nowait(tid)
 
         with patch.object(
-            type(interceptor_with_store), '_get_curator',
-            new=AsyncMock(return_value=mock_curator),
-        ), patch.object(
-            type(interceptor_with_store), '_ensure_taskmaster',
+            type(interceptor), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
         ):
             # Start the worker and let it drain.
-            interceptor_with_store._start_worker_if_needed(project_id)
+            interceptor._start_worker_if_needed(project_id)
 
             # Await resolution of all 3 tickets via resolve_ticket.
-            r1 = await interceptor_with_store.resolve_ticket(
+            r1 = await interceptor.resolve_ticket(
                 t1, '/project', timeout_seconds=5.0,
             )
-            r2 = await interceptor_with_store.resolve_ticket(
+            r2 = await interceptor.resolve_ticket(
                 t2, '/project', timeout_seconds=5.0,
             )
-            r3 = await interceptor_with_store.resolve_ticket(
+            r3 = await interceptor.resolve_ticket(
                 t3, '/project', timeout_seconds=5.0,
             )
 
@@ -2704,20 +2649,19 @@ class TestCuratorWorkerBatchDrain:
         mock_config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_config.curator.batch_max = MagicMock()  # non-int
 
-        ti = TaskInterceptor(
-            taskmaster, None, event_buffer,
-            ticket_store=ticket_store, config=mock_config,
-        )
         project_id = 'project'
 
-        mock_curator = MagicMock()
+        mock_curator = curator_double()
         mock_curator.curate_prepared = AsyncMock(return_value=[
             CuratorDecision(action='create', justification=f'item {i}')
             for i in range(3)
         ])
         _stub_prepare_candidate(mock_curator)
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
+
+        ti = TaskInterceptor(
+            taskmaster, None, event_buffer,
+            ticket_store=ticket_store, config=mock_config, curator=mock_curator,
+        )
 
         taskmaster.add_task = AsyncMock(side_effect=[
             {'id': str(i), 'title': f'Task {i}'} for i in range(3)
@@ -2742,9 +2686,6 @@ class TestCuratorWorkerBatchDrain:
 
         try:
             with patch.object(
-                type(ti), '_get_curator',
-                new=AsyncMock(return_value=mock_curator),
-            ), patch.object(
                 type(ti), '_ensure_taskmaster',
                 new=AsyncMock(return_value=taskmaster),
             ), patch.object(
@@ -2807,10 +2748,6 @@ class TestCuratorWorkerTokenBudgetAccumulator:
         config.curator.batch_max = 5
         config.curator.batch_token_threshold = 1000
 
-        ti = TaskInterceptor(
-            taskmaster, None, event_buffer,
-            ticket_store=ticket_store, config=config,
-        )
         project_id = 'project'
 
         # Per-title token sizes drive the accumulator's branching.
@@ -2822,7 +2759,7 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 prompt_tokens=sizes_by_title[candidate.title],
             )
 
-        mock_curator = MagicMock()
+        mock_curator = curator_double()
         mock_curator.prepare_candidate = AsyncMock(side_effect=fake_prepare)
         async def _bp(prepared, pid, pr):
             return [
@@ -2830,8 +2767,11 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 for _ in prepared
             ]
         mock_curator.curate_prepared = AsyncMock(side_effect=_bp)
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
+
+        ti = TaskInterceptor(
+            taskmaster, None, event_buffer,
+            ticket_store=ticket_store, config=config, curator=mock_curator,
+        )
 
         taskmaster.add_task = AsyncMock(side_effect=[
             {'id': str(i), 'title': f'T{i}'} for i in range(10)
@@ -2854,9 +2794,6 @@ class TestCuratorWorkerTokenBudgetAccumulator:
 
         try:
             with patch.object(
-                type(ti), '_get_curator',
-                new=AsyncMock(return_value=mock_curator),
-            ), patch.object(
                 type(ti), '_ensure_taskmaster',
                 new=AsyncMock(return_value=taskmaster),
             ), patch.object(
@@ -2900,10 +2837,6 @@ class TestCuratorWorkerTokenBudgetAccumulator:
         config.curator.batch_max = 5
         config.curator.batch_token_threshold = 100  # tiny
 
-        ti = TaskInterceptor(
-            taskmaster, None, event_buffer,
-            ticket_store=ticket_store, config=config,
-        )
         project_id = 'project'
 
         async def fake_prepare(candidate, project_id, project_root):
@@ -2912,7 +2845,7 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 prompt_tokens=10_000,  # massively over threshold
             )
 
-        mock_curator = MagicMock()
+        mock_curator = curator_double()
         async def _bp(prepared, pid, pr):
             return [
                 CuratorDecision(action='create', justification='ok')
@@ -2920,8 +2853,11 @@ class TestCuratorWorkerTokenBudgetAccumulator:
             ]
         mock_curator.curate_prepared = AsyncMock(side_effect=_bp)
         mock_curator.prepare_candidate = AsyncMock(side_effect=fake_prepare)
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
+
+        ti = TaskInterceptor(
+            taskmaster, None, event_buffer,
+            ticket_store=ticket_store, config=config, curator=mock_curator,
+        )
 
         taskmaster.add_task = AsyncMock(return_value={'id': '1', 'title': 'Whale'})
 
@@ -2931,9 +2867,6 @@ class TestCuratorWorkerTokenBudgetAccumulator:
 
         try:
             with patch.object(
-                type(ti), '_get_curator',
-                new=AsyncMock(return_value=mock_curator),
-            ), patch.object(
                 type(ti), '_ensure_taskmaster',
                 new=AsyncMock(return_value=taskmaster),
             ):
@@ -2971,7 +2904,7 @@ class TestCuratorWorkerTokenBudgetAccumulator:
 
 @pytest.mark.asyncio
 async def test_generic_curator_exception_marks_tickets_failed_curator_failed(
-    interceptor_with_store, ticket_store, taskmaster,
+    make_interceptor, ticket_store, taskmaster,
 ):
     """A non-cap exception escaping into the worker's outer ``except Exception``
     branch must terminalise every ticket in the batch as
@@ -2986,15 +2919,15 @@ async def test_generic_curator_exception_marks_tickets_failed_curator_failed(
     batch dispatch we didn't anticipate" branch."""
     project_id = 'project'
 
-    mock_curator = MagicMock()
-    mock_curator.note_created = MagicMock()
-    mock_curator.record_task = AsyncMock()
+    mock_curator = curator_double()
     _stub_prepare_candidate(mock_curator)
     # If the inner degrade-to-create path is reached, fail loudly — we want
     # the OUTER exception branch to be exercised.
     mock_curator.curate_prepared = AsyncMock(side_effect=AssertionError(
         'inner degrade path should not be reached',
     ))
+
+    interceptor = make_interceptor(mock_curator)
 
     candidate = json.dumps({
         'project_root': '/project',
@@ -3005,7 +2938,7 @@ async def test_generic_curator_exception_marks_tickets_failed_curator_failed(
     t2 = await ticket_store.submit(project_id, candidate)
     t3 = await ticket_store.submit(project_id, candidate)
 
-    queue = interceptor_with_store._ticket_queues.setdefault(
+    queue = interceptor._ticket_queues.setdefault(
         project_id, asyncio.Queue(),
     )
     queue.put_nowait(t1)
@@ -3020,22 +2953,19 @@ async def test_generic_curator_exception_marks_tickets_failed_curator_failed(
         raise RuntimeError('synthetic')
 
     with patch.object(
-        type(interceptor_with_store), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ), patch.object(
-        type(interceptor_with_store), '_ensure_taskmaster',
+        type(interceptor), '_ensure_taskmaster',
         new=AsyncMock(return_value=taskmaster),
     ), patch.object(
-        type(interceptor_with_store), '_process_add_tickets_batch_prepared',
+        type(interceptor), '_process_add_tickets_batch_prepared',
         new=AsyncMock(side_effect=_raise_synthetic),
     ):
-        interceptor_with_store._start_worker_if_needed(project_id)
+        interceptor._start_worker_if_needed(project_id)
         # resolve_ticket should return immediately (signalled) once worker
         # marks the row terminal.
         results = await asyncio.gather(
-            interceptor_with_store.resolve_ticket(t1, '/project', timeout_seconds=2.0),
-            interceptor_with_store.resolve_ticket(t2, '/project', timeout_seconds=2.0),
-            interceptor_with_store.resolve_ticket(t3, '/project', timeout_seconds=2.0),
+            interceptor.resolve_ticket(t1, '/project', timeout_seconds=2.0),
+            interceptor.resolve_ticket(t2, '/project', timeout_seconds=2.0),
+            interceptor.resolve_ticket(t3, '/project', timeout_seconds=2.0),
         )
 
     for tid, res in zip([t1, t2, t3], results, strict=True):

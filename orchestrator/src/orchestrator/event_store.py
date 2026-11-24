@@ -112,6 +112,12 @@ class EventType(StrEnum):
     cap_hit = 'cap_hit'
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
+    # A recovered merge request's task holds less than its journalled keys after
+    # orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds.restore.
+    # data: {request_id, cause (HoldShortfall there), restored: [keys],
+    # unheld: [keys] (empty when underivable), blockers: [{module, owner, kind}],
+    # error: repr of what failed, or None}
+    recovered_merge_hold_incomplete = 'recovered_merge_hold_incomplete'
     # Durable persist of the plan-tightened lock set on the success branch of
     # handle_blast_radius_expansion. Payload: {files, released, acquired,
     # persisted: bool}. Complements lock_released (reason='plan_refinement')
@@ -230,6 +236,12 @@ class EventType(StrEnum):
     # verify covers as built, dispatching one first; absent where unknown
     # (trains, shadow and solo-attribution verifies). Built by
     # orchestrator/src/orchestrator/merge_pool_facts.py::with_chain_members.
+    # PLUS chain_depth_reason (task 8528): always present, null when the
+    # dispatch never consulted the deep policy (kill switch, not
+    # chain-eligible, a task marked to verify un-chained, or a non-dispatch
+    # emitter such as shadow, the history leg or a train re-verify);
+    # otherwise the wire shape of
+    # orchestrator/src/orchestrator/merge_verify_facts.py::ChainDepthReason.wire.
     merge_verify = 'merge_verify'
     # The merge lane cancelled a still-running merge verify (task 8523).
     # task_id-keyed, phase='merge'; emitted by
@@ -248,8 +260,8 @@ class EventType(StrEnum):
     # commit whose verify was suppressed, and when the suppression was decided.
     merge_flake_suppressed = 'merge_flake_suppressed'
     # One firing of Abort trigger 3 (no in-flight verify progress for a full
-    # budget) in orchestrator/src/orchestrator/merge_lane/worker.py::
-    # SpeculativeMergeWorker._run_inflight_verify, requeue and cap-out alike.
+    # budget) in orchestrator/src/orchestrator/merge_lane/inflight_verify.py::
+    # InflightVerifyRun._abort_no_progress, requeue and cap-out alike.
     # task_id-keyed, phase='merge'; data is defined by
     # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
     # NoProgressAbort.event_data.
@@ -293,9 +305,12 @@ class EventType(StrEnum):
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
     # A due drift check could not acquire both host slots within its settle
-    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # window, or a warm lane where a pool is configured, so it ran nothing and
+    # re-arms for the next landing.  Producer:
     # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
-    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    # consecutive_deferrals, hosts, cause, detail}, hosts being
+    # HostAllocator.host_states(), cause a DriftDeferralCause value and detail
+    # the cause's own report (why no warm lane could be seeded), else null.
     drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
@@ -739,6 +754,11 @@ class EventType(StrEnum):
     # when the pin becomes blocked, then at most once per
     # pin_blocked_emit_interval_secs while it stays blocked.
     pin_blocked = 'pin_blocked'
+    # A dispatch candidate was refused its locks by parks alone, none of which
+    # outranks it (task 6328).  Producer, and the one statement of the payload:
+    # scheduler.py::Scheduler._note_park_refusal.  Emitted once the refusal has
+    # lasted park_refused_emit_interval_secs, then at most once per that interval.
+    park_refused = 'park_refused'
     # The starvation watchdog fired on a task (task 3821).  Producer, and the
     # one statement of the payload: scheduler.py::Scheduler._deliver_starvation_finding,
     # whose pin fields come from starvation_watchdog.py::PinOutcome.as_payload;
@@ -1058,10 +1078,13 @@ class EventType(StrEnum):
     #   (landlock/bwrap) OR the explicit ``backend=none`` operator escape hatch
     #   (still emitted — data.backend lets γ1 distinguish deliberately-
     #   unsandboxed from real containment without a third event type).
-    #   role/task_id are first-class columns. Payload: {backend, digest} —
+    #   role/task_id are first-class columns. Payload:
+    #   {backend, digest[, docs_main_paths]} —
     #   ``digest`` is WriteSet.digest(), the STABLE sha256 of the resolved
     #   writable set so an operator can diff exactly what a given invocation
-    #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
+    #   could touch (INV-2 structured facts). ``docs_main_paths`` is present
+    #   only when the docs-only project_root grant fired. Consumed by γ1's
+    #   soak predicate.
     sandbox_applied = 'sandbox_applied'
 
     # Recovery-decision emission (PRD plans/task-escalation-state-graph-prd.md
@@ -1317,6 +1340,25 @@ class MergeFinalizedKey(Enum):
 _MERGE_FINALIZED_INDEXES = '\n'.join(key.index_ddl for key in MergeFinalizedKey)
 
 
+
+def _event_row_dict(row: tuple) -> dict:
+    """One ``events`` row selected as the fetch readers select it, ``data`` parsed."""
+    (row_id, timestamp, run_id, task_id, evt_type, phase,
+     role, raw_data, cost_usd, duration_ms) = row
+    return {
+        'id': row_id,
+        'timestamp': timestamp,
+        'run_id': run_id,
+        'task_id': task_id,
+        'event_type': evt_type,
+        'phase': phase,
+        'role': role,
+        'data': json.loads(raw_data) if raw_data else {},
+        'cost_usd': cost_usd,
+        'duration_ms': duration_ms,
+    }
+
+
 class EventStore:
     """Append-only SQLite event store.
 
@@ -1372,12 +1414,15 @@ class EventStore:
         data: dict | None = None,
         cost_usd: float | None = None,
         duration_ms: int | None = None,
-    ) -> None:
-        """Write a single event row.  Never raises."""
+    ) -> int | None:
+        """Write a single event row.  Never raises.
+
+        Returns the inserted row's id, or None when the write failed.
+        """
         try:
             conn = self._connect()
             try:
-                conn.execute(
+                cursor = conn.execute(
                     'INSERT INTO events '
                     '(timestamp, run_id, task_id, event_type, phase, role, '
                     ' data, cost_usd, duration_ms) '
@@ -1395,10 +1440,12 @@ class EventStore:
                     ),
                 )
                 conn.commit()
+                return cursor.lastrowid
             finally:
                 conn.close()
         except Exception:
             logger.warning('event_store.emit failed', exc_info=True)
+            return None
 
     def latest_merge_finalized(
         self,
@@ -1585,6 +1632,31 @@ class EventStore:
             logger.warning('event_store.fetch_events_by_type failed', exc_info=True)
             return []
 
+    def fetch_recent_events_by_type(self, event_type: str | EventType, *, limit: int) -> list[dict]:
+        """Return the newest *limit* events of *event_type* across ALL runs, oldest first.
+
+        Rows are shaped as :meth:`fetch_events_by_type_all_runs` returns them.
+        Errors are logged and return [] (read path is fire-safe).
+        """
+        try:
+            type_str = event_type.value if isinstance(event_type, EventType) else str(event_type)
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    'SELECT id, timestamp, run_id, task_id, event_type, phase, role, '
+                    '       data, cost_usd, duration_ms '
+                    'FROM events '
+                    'WHERE event_type = ? '
+                    'ORDER BY id DESC LIMIT ?',
+                    (type_str, limit),
+                ).fetchall()
+            finally:
+                conn.close()
+            return [_event_row_dict(row) for row in reversed(rows)]
+        except Exception:
+            logger.warning('event_store.fetch_recent_events_by_type failed', exc_info=True)
+            return []
+
     def fetch_events_by_type_all_runs(
         self, event_type: str | EventType, *, task_id: str | None = None,
     ) -> list[dict]:
@@ -1621,23 +1693,7 @@ class EventStore:
                 rows = conn.execute(sql, tuple(params)).fetchall()
             finally:
                 conn.close()
-            result = []
-            for row in rows:
-                (row_id, timestamp, run_id, row_task_id, evt_type, phase,
-                 role, raw_data, cost_usd, duration_ms) = row
-                result.append({
-                    'id': row_id,
-                    'timestamp': timestamp,
-                    'run_id': run_id,
-                    'task_id': row_task_id,
-                    'event_type': evt_type,
-                    'phase': phase,
-                    'role': role,
-                    'data': json.loads(raw_data) if raw_data else {},
-                    'cost_usd': cost_usd,
-                    'duration_ms': duration_ms,
-                })
-            return result
+            return [_event_row_dict(row) for row in rows]
         except Exception:
             logger.warning(
                 'event_store.fetch_events_by_type_all_runs failed', exc_info=True

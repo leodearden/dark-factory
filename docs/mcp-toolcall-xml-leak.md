@@ -332,10 +332,27 @@ There was simply no way to ask "which memories contain this substring."
 
 That is now `scan_memory_content` (WORK b): a **literal** substring scan over
 Qdrant payload text. It uses a server-side `MatchText` prefilter for speed and
-then re-verifies **every** returned record in Python with the shared detector,
-which is the authoritative verdict. `exhaustive=True` skips the prefilter
-entirely and paginates the whole collection — that is the mode for an
-incidence-rate claim, so the number rests on nothing but the detector.
+then judges **every** walked record in Python, which is the authoritative
+verdict. With the default sentinels that verdict is the shared detector. With
+caller-supplied `needles` it is the needles themselves: a literal,
+case-sensitive substring match over the record text (task 4857; before that,
+a record containing a custom needle was never reported). `exhaustive=True`
+skips the prefilter, and nothing else, and paginates the whole collection —
+that is the mode for an incidence-rate claim, so the number rests on nothing
+but the Python verdict. The prefilter reads only the `data` key, so a complete
+literal enumeration, one that also sees text under the `memory`/`content`
+fallbacks, passes `needles` with `exhaustive=True, limit=None`; that is also
+the mode that does not depend on `data` staying un-indexed (§7). `scanned` is
+the number of records walked: the prefilter population, or the whole
+collection when exhaustive.
+
+The MCP tool defaults to `limit=1000` and returns each match's `metadata`
+without its text keys. `excerpt` is a fixed-width window of the text centred
+where the earliest matched fragment begins, with `…` on each elided side, so a
+tail leak or a deep needle is visible in it; `get_memory_by_id` gives the full
+body. `MemoryService.scan_memory_content` and
+`Mem0Backend.scan_payload_text` keep no default limit and return the full raw
+payload, because the in-process sweep (§5) repairs from it.
 
 Pagination is mandatory in both modes. A silently-capped scan would answer
 "what is the true incidence rate" *wrongly*, which is the same silent-wrong-value
@@ -348,7 +365,7 @@ failure class this whole task exists to kill.
 | Change | What it does |
 |---|---|
 | `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens; its envelope literals are now `shared.toolcall_markup` re-exports (task 3688, §1). |
-| `fused_memory/server/markup_guard.py::install_markup_guard` (task 4458, which replaced task 3141's `markup_tripwire.py` gate, see §1 — NOT this task) | Live rejection at the MCP write boundary, for every tool on the fused-memory server. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
+| `fused_memory/server/markup_guard.py::build_markup_guard`, installed by `fused_memory/server/boundary_guards.py::install_boundary_guards` (task 4458, which replaced task 3141's `markup_tripwire.py` gate, see §1 — NOT this task) | Live rejection at the MCP write boundary, for every tool on the fused-memory server. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
 | `fused_memory/backends/task_text_markup_gate.py` (task 4419 — NOT this task) | Storage-layer refusal inside `SqliteTaskBackend.add_task` / `.update_task`, covering the task writers that never cross MCP dispatch. See "The storage-layer refusal" below. |
 | `Mem0Backend.scan_payload_text` → `MemoryService.scan_memory_content` → `scan_memory_content` MCP tool | The missing read capability (§3). |
 | `fused-memory/scripts/sweep_toolcall_xml_leak.py` | The corpus sweep (§5). |
@@ -358,8 +375,10 @@ failure class this whole task exists to kill.
 
 Every tool on the fused-memory server **rejects** a call whose arguments carry
 envelope markup, before anything is persisted. The live guard is
-`fused-memory/src/fused_memory/server/markup_guard.py::install_markup_guard`
-(task 4458). It wraps the server's `call_tool` with
+`fused-memory/src/fused_memory/server/markup_guard.py::build_markup_guard`
+(task 4458), installed by
+`fused-memory/src/fused_memory/server/boundary_guards.py::install_boundary_guards`.
+It wraps the server's `call_tool` with
 `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware` and answers
 with one of two `error_type` values. `mcp_markup_detected` carries a
 `repaired_call`: the complete argument map with the swallowed parameters
@@ -728,18 +747,31 @@ to tokenized word-matching.** A silent semantic flip is precisely the failure
 class this task exists to kill, so the design does not depend on it:
 
 - The prefilter is only ever a **speed optimisation**. Every returned record is
-  re-verified in Python by the shared detector, which is the authoritative
-  verdict.
-- The flip fails **safe**. Tokenized matching is strictly *more* permissive for
-  these needles (text containing `&#60;parameter name=` necessarily contains
-  the tokens `parameter` and `name`), so the prefilter remains a superset and
-  the answer stays exact. Only speed degrades.
-- `exhaustive=True` bypasses the prefilter entirely.
+  judged in Python, which is the authoritative verdict: the shared detector for
+  the default sentinels, and the caller's `needles` as a literal, case-sensitive
+  substring match otherwise (task 4857). The verdict can only discard what the
+  prefilter returned, never recover what it skipped, so a prefiltered answer is
+  exact only while the prefilter is a superset of the verdict's matches.
+- For the **default sentinels** the flip fails **safe**. Tokenized matching is
+  strictly *more* permissive for them (text containing `&#60;parameter name=`
+  necessarily contains the tokens `parameter` and `name`), so the prefilter
+  remains a superset and the answer stays exact. Only speed degrades.
+- For **custom `needles`** the flip is **not** safe. A needle that is not a
+  whole token is a literal substring but no token match (the tripwire's
+  mid-word `econciliatio` is the counter-example), so an indexed prefilter
+  would silently skip records the verdict would report: false absence. A
+  prefiltered custom-needle scan is exact only under un-indexed substring
+  semantics.
+- `exhaustive=True` bypasses the prefilter entirely, so it is the
+  index-independent path for either verdict.
 
 The tripwire is
 `TestMem0BackendScanPayloadTextIntegration::test_matchtext_prefilter_is_a_literal_substring_match`
 in `fused-memory/tests/test_mem0_client.py` — a `qdrant_skipif`-gated
-integration test that fails **loudly** if the semantics ever change.
+integration test that fails **loudly** if the semantics ever change. It runs
+against its own test collection, so it cannot see an index created on a
+production collection; a custom-needle hunt whose completeness matters uses
+`exhaustive=True`.
 
 ---
 

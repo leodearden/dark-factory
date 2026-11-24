@@ -1,0 +1,180 @@
+"""Shared runner/aggregator for the gate-10069 lane grids.
+
+A plan is a list of (cell_name, cfg, [(policy_name, spec), ...], n_seeds).
+Every policy of a cell runs the same seeds 0..n-1 (common random numbers:
+request attributes by request id, restart and main-red times by seed).
+One aggregated record per (cell, policy) goes to results/<plan>.json.
+"""
+import json
+import math
+import os
+import sys
+import time
+from multiprocessing import Pool
+
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import lane as L  # noqa: E402
+
+RES = '/tmp/gate-10069/sim/results'
+CHUNK = 10
+
+
+def _work(task):
+    cell, cfg, pname, spec, s0, s1 = task
+    out = []
+    for s in range(s0, s1):
+        m = L.run_one(cfg, (pname, spec), s)
+        m['seed'] = s
+        out.append(m)
+    return cell, pname, out
+
+
+def _sumd(ds):
+    out = {}
+    for d in ds:
+        for k, v in d.items():
+            out[k] = out.get(k, 0) + v
+    return out
+
+
+def _ci(v):
+    n = len(v)
+    mu = sum(v) / n
+    if n < 2:
+        return mu, 0.0
+    sd = math.sqrt(sum((x - mu) ** 2 for x in v) / (n - 1))
+    return mu, 1.96 * sd / math.sqrt(n)
+
+
+def _q(v, p):
+    """Quantile of a list that may hold inf (censored: still waiting at the horizon)."""
+    if not v:
+        return None
+    v = sorted(v)
+    x = v[min(len(v) - 1, int(p * len(v)))]
+    return None if x == float('inf') else x
+
+
+def aggregate(cell, cfg, pname, runs):
+    runs = sorted(runs, key=lambda m: m['seed'])
+    n = len(runs)
+    span = cfg.get('horizon', L.DEFAULT_CFG['horizon']) - cfg.get('warm', L.DEFAULT_CFG['warm'])
+    hosts = cfg.get('hosts', 2)
+    S = lambda k: sum(m[k] for m in runs)
+    land = S('landings')
+    busy = S('busy')
+    cat = {k: sum(m['cat'].get(k, 0.0) for m in runs) for k in L.CATS}
+    good_w = [x for m in runs for x in m['good_w']]
+    bad_w = [x for m in runs for x in m['bad_w']]
+    size = [sum(m['size_hist'][i] for m in runs) for i in range(26)]
+    calib = [[sum(m['calib'][b][j] for m in runs) for j in range(3)] for b in range(10)]
+    calib_head = [[sum(m['calib_head'][b][j] for m in runs) for j in range(3)] for b in range(10)]
+    calib_stack = [[sum(m['calib_stack'][b][j] for m in runs) for j in range(3)] for b in range(10)]
+    kinds = {}
+    kout = {}
+    for m in runs:
+        for k, v in m['kind_n'].items():
+            kinds[k] = kinds.get(k, 0) + v
+        for k, v in m['kind_out'].items():
+            a = kout.setdefault(k, [0] * 5)
+            for i in range(5):
+                a[i] += v[i]
+    thr = [m['thr'] for m in runs]
+    lvh = [m['lvh'] for m in runs]
+    vpl = [m['verifies'] / max(1, m['landings']) for m in runs]
+    n_clean = S('n_clean')
+    rec = dict(
+        cell=cell, pol=pname, n=n,
+        thr=_ci(thr), lvh=_ci(lvh), vpl=_ci(vpl),
+        thr_runs=thr, lvh_runs=lvh, vpl_runs=vpl,
+        vpl_pooled=S('verifies') / max(1, land), lvh_pooled=land / busy if busy else 0.0,
+        void_share=(cat['torn'] + cat['inh'] + cat['mr'] + cat.get('stale', 0.0)) / busy if busy else 0.0,
+        stale_share=cat.get('stale', 0.0) / busy if busy else 0.0,
+        reverify_per_run=sum(m.get('reverify', 0) for m in runs) / n,
+        stale_per_run=sum(m.get('stale', 0) for m in runs) / n,
+        dissolved_per_run=sum(m.get('dissolved', 0) for m in runs) / n,
+        on_main_per_run=sum(m.get('on_main', 0) for m in runs) / n,
+        redobs_per_run=sum(m.get('redobs', 0) for m in runs) / n,
+        redobs_stacked_share=sum(m.get('redobs_stacked', 0) for m in runs) / max(1, sum(m.get('redobs', 0) for m in runs)),
+        nb_wrong_per100=100.0 * sum(m.get('nb_good', 0) for m in runs) / max(1, land),
+        nb_right_per100=100.0 * sum(m.get('nb_bad', 0) for m in runs) / max(1, land),
+        named_acc=sum(m.get('named_right', 0) for m in runs) / max(1, sum(m.get('named', 0) for m in runs)),
+        named_per_run=sum(m.get('named', 0) for m in runs) / n,
+        pstat=_sumd([m.get('pstat', {}) for m in runs]),
+        scan_share=sum(m.get('scan_time', 0.0) for m in runs) / busy if busy else 0.0,
+        scans_per_run=sum(m.get('n_scan', 0) for m in runs) / n,
+        b2b_mean=sum(m.get('b2b_sum', 0.0) for m in runs) / max(1, sum(m.get('b2b_n', 0) for m in runs)),
+        ov_unstacked_share=sum(m.get('ov_unstacked', 0.0) for m in runs) / max(1e-9, sum(m.get('ov_time', 0.0) for m in runs)),
+        head=_sumd([m.get('head', {}) for m in runs]), om=_sumd([m.get('om', {}) for m in runs]),
+        accident_per_run=sum(m.get('accident', 0) for m in runs) / n,
+        adopt_cancel_per_run=sum(m.get('adopt_cancel', 0) for m in runs) / n,
+        adopt_override_per_run=sum(m.get('adopt_override', 0) for m in runs) / n,
+        mr_share=cat['mr'] / busy if busy else 0.0,
+        torn_share=cat['torn'] / busy if busy else 0.0,
+        inh_share=cat['inh'] / busy if busy else 0.0,
+        cat={k: (v / busy if busy else 0.0) for k, v in cat.items()},
+        idle_share=S('idle') / (hosts * span * n),
+        good_p50=_q(good_w, 0.5), good_p95=_q(good_w, 0.95),
+        good_cens=sum(1 for x in good_w if x == float('inf')) / max(1, len(good_w)),
+        bad_p50=_q(bad_w, 0.5), bad_p95=_q(bad_w, 0.95),
+        bad_cens=sum(1 for x in bad_w if x == float('inf')) / max(1, len(bad_w)),
+        solo_per_run=S('solo') / n, solo_per100=100.0 * S('solo') / max(1, land),
+        verifies_per_run=S('verifies') / n, landings_per_run=land / n,
+        conv_wrong_per100=100.0 * S('conv_good') / max(1, land),
+        conv_right_per100=100.0 * S('conv_bad') / max(1, land),
+        conv_wrong_per_run=S('conv_good') / n, conv_right_per_run=S('conv_bad') / n,
+        false_block_per100=100.0 * S('block_good') / max(1, land),
+        block_bad_per_run=S('block_bad') / n, bounce_per_run=S('bounce') / n,
+        bad_landed=S('bad_landed'),
+        clean_per_run=n_clean / n,
+        rule_excl=S('rule_excl') / max(1, n_clean),
+        below_table=S('below_table') / max(1, n_clean),
+        above_table=S('above_table') / max(1, n_clean),
+        size=size, calib=calib, calib_head=calib_head, calib_stack=calib_stack, kinds={k: v / n for k, v in kinds.items()},
+        kind_out={k: [x / n for x in v] for k, v in kout.items()},
+        max_group=max(m['max_group'] for m in runs),
+        waiting_end=S('waiting_end') / n,
+        red_inh_share=S('red_ret_inh') / max(1, S('red_ret')),
+        redchain={k: sum(m.get('redchain', {}).get(k, 0) for m in runs) / n for k in ('own', 'inh', 'ff', 'mr')},
+    )
+    return rec
+
+
+def run_plan(name, plan, workers=4):
+    os.makedirs(RES, exist_ok=True)
+    t0 = time.time()
+    tasks = []
+    cfgs = {}
+    for cell, cfg, pols, n in plan:
+        cfgs[cell] = cfg
+        for pname, spec in pols:
+            for s0 in range(0, n, CHUNK):
+                tasks.append((cell, cfg, pname, spec, s0, min(n, s0 + CHUNK)))
+    acc = {}
+    done = 0
+    with Pool(workers) as pool:
+        for cell, pname, out in pool.imap_unordered(_work, tasks, chunksize=1):
+            acc.setdefault((cell, pname), []).extend(out)
+            done += 1
+            if done % 200 == 0:
+                print('  %s: %d/%d tasks, %.0fs' % (name, done, len(tasks), time.time() - t0), flush=True)
+    recs = [aggregate(cell, cfgs[cell], pname, runs) for (cell, pname), runs in acc.items()]
+    order = {(c, p): i for i, (c, p) in enumerate((cell, pn) for cell, _, pols, _ in plan for pn, _ in pols)}
+    recs.sort(key=lambda r: order[(r['cell'], r['pol'])])
+    with open(os.path.join(RES, name + '.json'), 'w') as f:
+        json.dump(dict(plan=name, elapsed=time.time() - t0, cfgs=cfgs, recs=recs), f)
+    print('%s done: %d records, %d runs, %.0fs' % (name, len(recs), sum(r['n'] for r in recs), time.time() - t0), flush=True)
+    return recs
+
+
+def load(name):
+    with open(os.path.join(RES, name + '.json')) as f:
+        return json.load(f)
+
+
+def paired(recs, cell, a, b, key='thr_runs'):
+    """Mean and 95% CI of the per-seed difference b - a within a cell."""
+    ra = next(r for r in recs if r['cell'] == cell and r['pol'] == a)
+    rb = next(r for r in recs if r['cell'] == cell and r['pol'] == b)
+    d = [y - x for x, y in zip(ra[key], rb[key])]
+    return _ci(d)

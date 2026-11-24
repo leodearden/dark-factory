@@ -16,7 +16,7 @@ A legibility census (`scripts/legibility/census.py`) does the following:
 
 What a finding must carry (key, area, anchor, tags, severity, disposition), what a report must pin, and how a run schedules the next are all defined in `docs/quality-findings-contract.md`. This skill points there and does not restate it.
 
-Statements marked *(until Ln)* describe today's code and change when that leaf of `plans/census-incremental-prd.md` lands. The final section lists what changes.
+Design record: `plans/census-incremental-prd.md`.
 
 Normally the census runs unattended. Each nightly trickle run ends by evaluating `census_trigger.decide_for_project` and, on FIRE, launches `census.py` with the caps from `legibility.yaml` `census.trickle_caps`. The trigger fires on either of two conditions, and on neither inside the floor:
 
@@ -64,8 +64,8 @@ uv run --directory <factory checkout>/shared python <factory checkout>/scripts/l
 
 ### Cost-control flags (each optional; omitted means unbounded)
 
-- **`--max-batches N`** stops mining after N batches (N ≥ 1). The report marks coverage as partial and `stop_reason=capped`. *(until L1)* The run still advances `last_census_at`, and the next window starts there, so capped-away sessions are never mined. To sweep them, roll `last_census_at` back first.
-- **`--max-verify-clusters N`** hands the verifier at most N novel clusters, in mining order. The rest merge as `pending` candidates. *(until L7)* A pending candidate is re-adjudicated only if a later run reproduces its exact title, so in practice it stays pending until someone adjudicates it by hand.
+- **`--max-batches N`** stops mining after N batches (N ≥ 1). The report marks coverage as partial and `stop_reason=capped`. Sessions the cap left unmined are not in the session ledger, so the next run picks them up while they remain inside the `census.ledger_retention_days` window; `last_census_at` needs no rollback.
+- **`--max-verify-clusters N`** hands the verifier at most N novel clusters, in mining order. The rest merge as `pending` candidates. The report's `## Adjudication` queue takes up to `census.adjudication.max_clusters_per_run` (default 10) clusters per run, most-sighted and newest first, so a one-off may wait a long time or need adjudicating by hand.
 - **`--dry-run-filing`** writes every would-be `submit_task` payload to `plans/confusion-census-<date>-payloads.json` (or `…-payloads-2.json`, never overwritten) and files nothing. The codebook and census-state still advance, so filing that JSON by hand is the only way those tasks will ever land.
 
 For an attended first census, use all three:
@@ -83,6 +83,7 @@ Against an empty codebook, `dup_rate` only measures "the miner found nothing to 
 - **Filing is through tickets.** `submit_task` returns a `tkt_*` id. The curator decides create, combine or drop asynchronously, and `resolve_ticket(ticket, project_root)` returns the task id once it has. Each ticket carries `metadata.source=legibility_census` and `origin_project_id`.
 - **Harness routing.** When a cluster's descriptive fields name a harness component, the ticket files into the harness project's tree, with the matched markers under `metadata.x_fix_surface`. The rule is in `scripts/legibility/filing_policy.py::resolve_target`. When the verifier proposed an in-tree remediation, the ticket stays in the observed project. The report lists each cross-project ticket with the `project_root` that `resolve_ticket` needs.
 - **Singleton filing gate** (`filing_policy.is_fileable`, since 2026-09-27). A verified cluster files only when the verifier proposed an existing in-tree remediation path, or when its title has at least `MIN_UNREMEDIATED_SIGHTINGS` (2) distinct-session sightings. Anything else is promoted into the codebook, marked `filing: withheld`, and listed under **Recorded, Not Filed**. A withheld entry files automatically on a later run once its sightings reach 2.
+- **Owed filings** (`census_filing.with_owed_after_filing`, `with_owed_after_resolving`). Sometimes a fileable finding's filing does not land: the dedup store was unreachable, `submit_task` failed, or its curator ticket resolved `failed`. If no task or pending ticket already carries the finding, its entry is marked `filing: owed`. Every later run re-offers it through the contract §8 dedup protocol until work is routed, and the entry then becomes `filing: filed`. A `--dry-run-filing` run marks nothing owed, because its payloads file is the hand-filing handle.
 
 Watch for the final line:
 
@@ -91,21 +92,29 @@ Watch for the final line:
 
 ## Post-run checklist
 
-1. **Read the report** at `plans/confusion-census-<date>.md` in the censused project. *(until L1)* A second run on the same date overwrites it, and the earlier one survives only in git history (each run commits its report). Its sections:
+1. **Read the report** at `plans/confusion-census-<date>.md` in the censused project, alongside its JSON record. Each run has its own identity (`scripts/legibility/census_identity.py`): a same-day rerun writes `…-2.md`/`…-2.json` and never overwrites the first. The newest committed report (`git ls-files 'plans/confusion-census-*.md' | tail -1`) shows the current section list. Its sections:
+   - **Method:** the YAML block of the run's parameters, with its `run_id`.
    - **Saturation:** batch count, stop reason and per-batch `dup_rate`. A stop at the two-batch minimum is the common case, and it is not evidence of full coverage.
+   - **Screened:** clusters attached to existing records with no verify spend.
+   - **Adjudication:** the capped, similarity-clustered queue that works through pending candidates, with every attach listed for audit.
    - **Verification:** present on every run given `--max-verify-clusters`, and therefore on every trickle-launched run. The anomaly to look for is the bullet **"ALL N … were REJECTED and none survived"**. It signals a suspected systemic verifier failure. Check the per-cluster `verify failed` warnings in the journal before accepting the run.
-   - **Unresolved Verdicts:** verdicts paid for and dropped against a standing record.
+   - **Unresolved Verdicts** (only when present): verdicts paid for and dropped against a standing record.
    - **Origin x Manifestation Matrix:** from the verifier's phase stamps.
-   - **Synthesis:** prose. *(until L10)* It is not parsed, and nothing in it is applied. Current reports open the section with the runner's not-applied notice, and the model heads its proposals with `scripts/legibility/census.py::SYNTHESIS_PROPOSALS_HEADING`; earlier reports call the same proposals "inputs to the merger", and those were never applied either. To act on one you agree with, put an entry correction or sighting in a §7.3 coding record and run `scripts/legibility/codebook.py apply`, checking that its printed `applied:` stats show it matched or applied (a record reusing the sighting's own session is a silent no-op); promote or reject a candidate through census adjudication; never hand-edit `docs/legibility/confusion-codebook.yaml`.
-   - **Filed Tasks:** ticket ids, plus the cross-project list.
-   - **Recorded, Not Filed** and **Cost**.
+   - **Synthesis:** rendered from validated JSON as new versus re-observed findings; its phase refinements and corrections are applied to the codebook and reported (`scripts/legibility/synthesis.py`). To act on a proposal that was not applied and that you agree with, put an entry correction or sighting in a §7.3 coding record and run `scripts/legibility/codebook.py apply`, checking that its printed `applied:` stats show it matched or applied (a record reusing the sighting's own session is a silent no-op); promote or reject a candidate through census adjudication; never hand-edit `docs/legibility/confusion-codebook.yaml`.
+   - **Findings:** each finding in the contract §1 shape.
+   - **Filed Tasks:** one row per finding with its `task_id`, ticket and disposition, plus the cross-project list.
+   - **Recorded, Not Filed** (only when present): withheld entries.
+   - **Structural:** structural findings, listed and not filed.
+   - **Dispositions:** earlier tickets carried forward to their task outcomes. A done task triggers re-verification (`fixed` or re-filed), and a cancelled task with a reason makes its entry `accepted`.
+   - **Cost.**
    The report has no per-stratum coverage section.
-2. **Resolve the tickets.** Call `resolve_ticket` for each id; for cross-project tickets, use the project root the report names. *(until L4)* The report cannot name task ids, because the curator decides after the report is rendered. Triage or re-prioritise what landed, since every ticket is filed at priority `medium` *(until L3)*.
+2. **Resolve the tickets.** The `## Filed Tasks` table names the `task_id` of every finding whose task is already known. Call `resolve_ticket` for each row that has only a ticket (its disposition reads `open … pending`; it resolves on the next run); for cross-project tickets, use the project root the report names. Triage or re-prioritise what landed: a ticket's priority is set from its cluster's severity (`scripts/legibility/census_filing.py`), so check that the severity fits.
 3. **Check `docs/legibility/census-state.json` advanced:**
    - `last_census_at` is this run's **date**, `YYYY-MM-DD` (date-only, not a timestamp).
-   - `last_census_report` names the new report (written as an absolute path *(until L1)*).
+   - `last_census_report` names the new report, repo-relative (e.g. `plans/confusion-census-2026-11-07.md`).
    - `last_census_run_id` names this run. It is what the next trigger's completion arm reads.
-4. **If you ran `--dry-run-filing`,** file the payload JSON by hand. A later census will not re-file it, because those confusions now code as matches and the window has moved.
+   - `last_census_as_of_sha` is the commit the run censused, and `session_watermark` is the exclusive end of the window this run mined; the trigger's floor is measured from it. The next run mines the last `census.ledger_retention_days` days (default 30), less the sessions already in the ledger.
+4. **If you ran `--dry-run-filing`,** file the payload JSON by hand. A later census will not re-file it, because those confusions now code as matches and their sessions are ledgered as coded, so no later run re-mines them.
 
 ## Anchor seeding — when an equivalent manual survey already exists
 
@@ -124,27 +133,15 @@ Every threshold in `legibility.yaml`'s `census:` block must be an **unquoted int
 
 Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/agent-legibility-survey-2026-07-13.md`. Use this only when an equivalent survey really exists.
 
-## What changes when `plans/census-incremental-prd.md` lands
+## Session ledger and the gate
 
-- **L1:** The run writes a JSON record and renders the report from it under one basename (contract §5), with a `run_id` and a `## Method` YAML block (the seven §5 keys plus `extra`). A same-day rerun writes `…-2.json`/`…-2.md` instead of overwriting.
-  - The trickle and the census record every coded session in a host-local ledger. The census skips ledgered and zero-signal sessions, and a capped run's unmined sessions are picked up by the next run, so rolling `last_census_at` back is no longer needed.
-  - `census-state.json` gains `last_census_run_id`, `last_census_as_of_sha` and `session_watermark`, and `last_census_report` becomes repo-relative. Check the ledger with `session_ledger.py stats --project-id <id>`.
-- **L8a:** The novelty spike becomes relative to its trailing baseline, and the floor is measured from the session watermark, so the trigger stops firing every night.
-- **L2, L3:**
-  - Verdicts carry anchor, tags, severity with a reason, and route.
-  - Entries carry `finding_key`/`finding_area`/`finding_anchor`/`finding_tags`, and the report gains `## Findings` in the contract §1 shape.
-  - Tickets carry `x_finding_key`/`x_finding_run`, at a priority equal to severity.
-- **L4:** Filing follows the contract §8 dedup protocol, and the report names task ids and the step that decided each finding.
-  - Structural findings are listed, not filed.
-  - Entries carry `filed_tickets` back-links. A run that cannot reach the task store files nothing and says so.
-- **L5:** `## Dispositions` carries earlier tickets forward to their task outcomes. A done task triggers re-verification (`fixed` or re-filed), and a cancelled task with a reason makes its entry `accepted`.
-- **L6, L7:**
-  - `## Screened` counts clusters attached to existing records with no verify spend.
-  - `## Adjudication` drains the pending-candidate backlog through a capped, similarity-clustered queue and lists every attach for audit.
-  - `--max-verify-clusters` deferrals then reach adjudication without recurring.
-- **L9:** The coder is given the project's invariant slugs, and unknown slugs are dropped and counted. It is also given the `## Definition` section of `docs/code-quality.md` (never the heuristics) as the test a confusion must meet to be minted; tagging stays with the verifier.
-- **L10:** Synthesis is rendered from validated JSON as new versus re-observed findings, and its phase refinements and corrections are applied rather than left in prose.
-- **G:** A deterministic gate checks the first automatic report after the batch lands for all of the above.
+The trickle and the census record every coded session in a host-local session ledger. The census skips ledgered and zero-signal sessions. Check the ledger with:
+
+```bash
+uv run --directory <factory checkout>/shared python <factory checkout>/scripts/legibility/session_ledger.py stats --project-id <id>
+```
+
+Gate leaf G (`scripts/legibility/check_census_report.py`, task 6409) checks the first automatic report after the census-incremental batch (`plans/census-incremental-prd.md`) landed. When it reports no conforming report yet, the remedy is a forced census with this skill, then `resume` the gate's `milestone_check_failed` escalation.
 
 ## Out of scope
 

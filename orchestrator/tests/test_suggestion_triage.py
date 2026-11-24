@@ -10,10 +10,11 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _mcp_transport_harness import tool_reply_envelope
+from _mcp_client_recorder import RecordingClientFactory
 from _orch_helpers import pydantic_spec
 from _review_fixtures import review_aggregation, review_issue
 from shared.cli_invoke import AllAccountsCappedException
+from shared.testing_mcp_stub import StubMcpServer, tool_reply_body
 
 from orchestrator.agents.triage import suggestion_hash
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
@@ -29,7 +30,7 @@ from orchestrator.workflow import StewardInterrupted, WorkflowOutcome
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_workflow(*, escalation_queue=None, escalation_event=None):
+def _make_workflow(*, escalation_queue=None, escalation_event=None, mcp_url='http://mcp.invalid:8002'):
     """Build a minimal TaskWorkflow-like object with the methods under test."""
     from orchestrator.workflow import TaskWorkflow
 
@@ -47,7 +48,7 @@ def _make_workflow(*, escalation_queue=None, escalation_event=None):
     scheduler = MagicMock()
 
     mcp = MagicMock()
-    mcp.url = 'http://localhost:8002'
+    mcp.url = mcp_url
 
     briefing = MagicMock()
 
@@ -76,7 +77,7 @@ def _fake_reviews(suggestions=None, blocking_issues=None):
 
 def _ticket_response(ticket: str = 'tkt-1') -> MagicMock:
     """A delivered ``submit_task`` POST: FastMCP's envelope around a curator ticket."""
-    envelope = tool_reply_envelope({'ticket': ticket})
+    envelope = tool_reply_body({'ticket': ticket})
     return MagicMock(status_code=200, json=lambda: envelope)
 
 
@@ -1548,11 +1549,10 @@ class TestCuratorSubmitTransport:
     The payload-shape tests above stayed green through ~3 months of silently
     discarded submissions: they patch ``httpx.AsyncClient.post`` and inspect
     the body, which cannot distinguish a delivered POST from one absorbed by
-    the ``/mcp/`` -> ``/mcp`` 307.  These drive a real client through the
-    MockTransport server in ``_mcp_transport_harness`` instead — a
-    ``_``-prefixed sibling rather than the ``test_mcp_post_transport`` module
-    that also uses it, so no test module's collection depends on another's.
-    The older tests are left intact — they were never wrong, only insufficient.
+    the ``/mcp/`` -> ``/mcp`` 307.  These drive a real client over a real
+    socket to ``StubMcpServer`` instead, which records what arrived and which
+    tool calls it answered.  The older tests are left intact — they were never wrong, only
+    insufficient.
     """
 
     def _suggestions(self):
@@ -1573,36 +1573,27 @@ class TestCuratorSubmitTransport:
     @pytest.mark.asyncio
     async def test_submit_task_call_lands_at_the_mcp_path(self):
         """THE regression: the submit_task tools/call must arrive at /mcp."""
-        from _mcp_transport_harness import (
-            MCP_PATH,
-            RecordingClientFactory,
-            RecordingMcpServer,
-        )
-
-        wf = _make_workflow()
-        server = RecordingMcpServer()
-        factory = RecordingClientFactory(server)
-
-        with patch('httpx.AsyncClient', factory):
+        with StubMcpServer(stateful=False, payload={'ticket': 'tkt-1'}) as server:
+            wf = _make_workflow(mcp_url=server.url)
             await self._route(wf, self._suggestions())
 
-        calls = server.tool_calls('submit_task')
+        calls = server.tool_call_arguments('submit_task')
         assert len(calls) == 1, (
-            f'expected 1 submit_task delivered at {MCP_PATH}, got {len(calls)}. '
-            f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+            f'expected 1 submit_task answered at /mcp, got {len(calls)}. '
+            f'arrived at {[r.path for r in server.requests]!r}'
         )
-        assert server.redirected == [], 'POSTed to the redirecting /mcp/ path'
-        server.assert_every_request_accepted_json()
+        assert server.off_endpoint_paths == (), 'POSTed off /mcp, e.g. to the redirecting /mcp/'
 
     @pytest.mark.asyncio
     async def test_client_is_constructed_with_follow_redirects(self):
         """Task's explicit ask (a), first half."""
-        from _mcp_transport_harness import RecordingClientFactory, RecordingMcpServer
+        factory = RecordingClientFactory()
 
-        wf = _make_workflow()
-        factory = RecordingClientFactory(RecordingMcpServer())
-
-        with patch('httpx.AsyncClient', factory):
+        with (
+            StubMcpServer(stateful=False, payload={'ticket': 'tkt-1'}) as server,
+            patch('httpx.AsyncClient', factory),
+        ):
+            wf = _make_workflow(mcp_url=server.url)
             await self._route(wf, self._suggestions())
 
         factory.assert_follows_redirects()

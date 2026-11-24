@@ -8,16 +8,18 @@ provides no shared `git_repo` fixture, so this module owns its own fixture.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
+from _task_runtime_fixtures import make_task_artifacts, warm_config
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
 from orchestrator.task_runtime import (
     _derive_phase,
@@ -30,15 +32,6 @@ from orchestrator.task_runtime import (
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit + a resolvable warm base.
@@ -47,37 +40,9 @@ def git_repo(tmp_path: Path) -> Path:
     fixture serves both the non-pooled and pooled (TestPooled) scenarios
     below.
     """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    repo = seed_repo(tmp_path / 'repo')
+    seed_default_warm_base(repo)
     return repo
-
-
-def _make_task_artifacts(worktree_base: Path, name: str, task_id: str) -> TaskArtifacts:
-    """Create <worktree_base>/<name> plus both of its .task-meta roots, as a dispatch does."""
-    worktree = worktree_base / name
-    worktree.mkdir(parents=True, exist_ok=True)
-    ta = TaskArtifacts.for_task(worktree, task_id)
-    ta.init(task_id, f'Task {task_id}', 'desc')
-    return ta
-
-
-def _warm_config(**overrides) -> GitConfig:
-    """Build a GitConfig with the warm-lane pool enabled (mirrors
-    test_lane_lifecycle_gitops.py's _warm_config)."""
-    return GitConfig(
-        main_branch='main',
-        branch_prefix='task/',
-        remote='origin',
-        worktree_dir='.worktrees',
-        push_after_advance=False,
-        warm_lane_pool=True,
-        **overrides,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +95,7 @@ class TestNonPooled:
         assert not git_ops.pool_in_use()
         worktree_base = git_ops.worktree_base
 
-        ta = _make_task_artifacts(worktree_base, '42', '42')
+        ta = make_task_artifacts(worktree_base, '42', '42')
         ta.write_plan({'steps': [
             {'id': 's1', 'status': 'done'},
             {'id': 's2', 'status': 'pending'},
@@ -167,7 +132,7 @@ class TestNonPooled:
 
 class TestPooled:
     def test_pooled_layout(self, git_repo: Path):
-        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        git_ops = GitOps(warm_config(), git_repo, warm_lane_pool_size=1)
         assert git_ops.pool_in_use()
         worktree_base = git_ops.worktree_base
         lifecycle = git_ops._lane_lifecycle
@@ -175,7 +140,7 @@ class TestPooled:
         # _lane-3 -> task 42, ASSIGNED (B1): 3 iteration lines + 1 review
         # PASS + a plan.json.
         lifecycle.note_assigned('_lane-3', task_id='42')
-        ta42 = _make_task_artifacts(worktree_base, '_lane-3', '42')
+        ta42 = make_task_artifacts(worktree_base, '_lane-3', '42')
         ta42.write_plan({'steps': [{'id': 's1', 'status': 'done'}]})
         ta42.append_iteration_log({'note': 'iter-1'})
         ta42.append_iteration_log({'note': 'iter-2'})
@@ -189,7 +154,7 @@ class TestPooled:
         # _lane-7 -> task 44, ASSIGNED with an EMPTY iterations.jsonl (B4:
         # honest zero, not a read failure).
         lifecycle.note_assigned('_lane-7', task_id='44')
-        _make_task_artifacts(worktree_base, '_lane-7', '44')
+        make_task_artifacts(worktree_base, '_lane-7', '44')
         empty_log = TaskArtifacts.task_root_for(worktree_base, '44') / 'iterations.jsonl'
         empty_log.write_text('')
 
@@ -262,7 +227,7 @@ class TestEachArtifactFromItsOwnRoot:
         assert entry.error is None
 
     def test_pooled_lane_record_reads_its_tasks_root(self, git_repo: Path):
-        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        git_ops = GitOps(warm_config(), git_repo, warm_lane_pool_size=1)
         worktree_base = git_ops.worktree_base
         LaneLifecycle(worktree_base).note_assigned('_lane-0', task_id='7')
         _seed_lane_metadata(worktree_base, '_lane-0', '7')
@@ -289,7 +254,7 @@ class TestSnapshotIsReadOnly:
     def test_malformed_plan_is_not_rewritten_by_a_snapshot(self, git_repo: Path):
         git_ops = GitOps(GitConfig(), git_repo)
         worktree_base = git_ops.worktree_base
-        _make_task_artifacts(worktree_base, '70', '70')
+        make_task_artifacts(worktree_base, '70', '70')
         task_root = TaskArtifacts.task_root_for(worktree_base, '70')
         plan_path = task_root / 'plan.json'
         plan_path.write_text(json.dumps({'tdd_steps': [{'id': 's1', 'status': 'done'}]}))
@@ -315,7 +280,7 @@ class TestReadFailureMarked:
         git_ops = GitOps(GitConfig(), git_repo)
         worktree_base = git_ops.worktree_base
 
-        _make_task_artifacts(worktree_base, '50', '50')
+        make_task_artifacts(worktree_base, '50', '50')
         (TaskArtifacts.task_root_for(worktree_base, '50') / 'plan.json').write_text('{not valid json')
 
         result = build_task_runtime_snapshot(git_ops=git_ops)
@@ -343,7 +308,7 @@ class TestReadFailureMarked:
         git_ops = GitOps(GitConfig(), git_repo)
         worktree_base = git_ops.worktree_base
 
-        _make_task_artifacts(worktree_base, '51', '51')
+        make_task_artifacts(worktree_base, '51', '51')
         (TaskArtifacts.task_root_for(worktree_base, '51') / 'iterations.jsonl').write_text('')
 
         result = build_task_runtime_snapshot(git_ops=git_ops)
@@ -357,7 +322,7 @@ class TestReadFailureMarked:
     def test_corrupted_iteration_log_line_marks_error_not_undercount(self, git_repo: Path):
         git_ops = GitOps(GitConfig(), git_repo)
         worktree_base = git_ops.worktree_base
-        _make_task_artifacts(worktree_base, '52', '52')
+        make_task_artifacts(worktree_base, '52', '52')
         (TaskArtifacts.task_root_for(worktree_base, '52') / 'iterations.jsonl').write_text(
             '{"n": 1}\nnot json\n{"n": 2}\n',
         )
@@ -372,7 +337,7 @@ class TestReadFailureMarked:
     def test_non_list_plan_steps_marks_error(self, git_repo: Path, steps):
         git_ops = GitOps(GitConfig(), git_repo)
         worktree_base = git_ops.worktree_base
-        _make_task_artifacts(worktree_base, '53', '53')
+        make_task_artifacts(worktree_base, '53', '53')
         (TaskArtifacts.task_root_for(worktree_base, '53') / 'plan.json').write_text(
             json.dumps({'steps': steps}),
         )
@@ -394,7 +359,7 @@ class TestReadFailureMarked:
 
 def _bare_task_dir(worktree_base: Path, name: str, task_id: str) -> Path:
     """Create <worktree_base>/<name> plus a metadata.json with NO
-    'created_at' key (distinct from _make_task_artifacts, which always
+    'created_at' key (distinct from make_task_artifacts, which always
     stamps one via TaskArtifacts.init)."""
     worktree = worktree_base / name
     worktree.mkdir(parents=True, exist_ok=True)
@@ -436,7 +401,7 @@ class TestStartedEventStoreFallback:
     def test_created_at_wins_over_event_store(self, git_repo: Path, tmp_path: Path):
         git_ops = GitOps(GitConfig(), git_repo)
         worktree_base = git_ops.worktree_base
-        ta = _make_task_artifacts(worktree_base, '62', '62')
+        ta = make_task_artifacts(worktree_base, '62', '62')
         expected_created_at = ta.read_created_at()
         assert expected_created_at is not None
 

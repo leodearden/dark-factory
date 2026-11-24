@@ -50,6 +50,7 @@ from escalation.declared_pins import normalise_declarers
 from escalation.models import (
     PERSIST_CHECK_ABSENT,
     PERSIST_CHECK_UNREADABLE,
+    RESOLUTION_CLASS_REQUIRED_CODE,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
@@ -58,6 +59,7 @@ from escalation.models import (
     max_severity,
     note_to_file_class_conflict,
     recut_action_conflict,
+    resolution_class_missing,
 )
 
 logger = logging.getLogger(__name__)
@@ -373,18 +375,37 @@ def blank_resolve_outcome() -> ResolveOutcome:
     }
 
 
+class ResolutionClassRequired(ValueError):
+    """A close of a record whose level requires a resolution_class stated none.
+
+    Raised before anything is written; :attr:`code` is the wire code
+    ``escalation/src/escalation/server.py::resolve_issue`` answers with, and the
+    message names the record, its level and the resolver.
+    """
+
+    code = RESOLUTION_CLASS_REQUIRED_CODE
+
+    def __init__(self, reason: str, *, resolved_by: str | None) -> None:
+        super().__init__(f'{reason} (resolved_by={resolved_by!r})')
+
+
 def _stamped_resolution_class(
     escalation: Escalation, resolution_class: str | None, resolved_by: str | None,
 ) -> str | None:
     """The class a terminal write stamps: *resolution_class*, else the resolver default.
 
-    ``ValueError`` with ``models.note_to_file_class_conflict``'s message when
-    *escalation* cannot carry that class.
+    ``ResolutionClassRequired`` when *escalation*'s level requires a class and
+    neither supplies one (``models.resolution_class_missing``); ``ValueError``
+    with ``models.note_to_file_class_conflict``'s message when *escalation*
+    cannot carry that class.
     """
     stamped = (
         resolution_class if resolution_class is not None
         else default_resolution_class_for_resolver(resolved_by)
     )
+    missing = resolution_class_missing(escalation, stamped)
+    if missing is not None:
+        raise ResolutionClassRequired(missing, resolved_by=resolved_by)
     conflict = note_to_file_class_conflict(escalation, stamped)
     if conflict is not None:
         raise ValueError(conflict)
@@ -450,7 +471,7 @@ def _is_late_resolution_worth_capturing(
 
 def _build_late_resolution(
     *, resolution: str, resolved_by: str | None, dismiss: bool,
-    prior_resolution_class: str | None, timestamp: str,
+    prior_resolution_class: str | None, ruled_by_human: bool | None, timestamp: str,
 ) -> tuple[LateResolution, int]:
     """Build one :class:`~escalation.models.LateResolution`, size-bounded.
 
@@ -480,6 +501,7 @@ def _build_late_resolution(
         'resolved_by': resolved_by,
         'dismiss': dismiss,
         'prior_resolution_class': prior_resolution_class,
+        'ruled_by_human': ruled_by_human,
     }
     return entry, lost
 
@@ -1214,6 +1236,10 @@ class EscalationQueue:
 
         Level-1 is the handed-to-human tier: the presence of one signals that
         the workflow must not auto-requeue the task — a human will unblock.
+        This method counts EVERY pending L1 whatever its severity; the
+        workflow's hand-off gates instead admit an open L1 only when
+        ``escalation.pins.is_queue_handoff`` calls it a hand-off, so an info
+        L1 never holds a task there.
 
         ``category``, when given, restricts the check to open L1s whose
         ``.category`` matches — a signature filter (task 2757).  This lets a NEW
@@ -1416,6 +1442,7 @@ class EscalationQueue:
         resolution_action: str | None = None,
         recut: bool = False,
         outcome: ResolveOutcome | None = None,
+        ruled_by_human: bool | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
 
@@ -1450,7 +1477,19 @@ class EscalationQueue:
         the caller's ``resolved_by`` (see ``escalation.classify.
         default_resolution_class_for_resolver``). A class the record cannot
         carry (``models.note_to_file_class_conflict``) raises ``ValueError``
-        inside the critical section before anything is written.
+        inside the critical section before anything is written. A record whose
+        level requires a class (``models.CLASS_REQUIRED_LEVELS``, level 2) closed
+        with neither an explicit class nor a non-null resolver default raises
+        ``ResolutionClassRequired`` there too, so the refusal writes nothing
+        (INV-1; plans/instruments-honesty-prd.md decision 8).
+
+        ``ruled_by_human`` (plans/instruments-honesty-prd.md decision 9): the
+        caller's assertion that a human ruled on this record, stamped beside
+        ``resolution_class`` on the applied path and forwarded through the
+        member cascade. The already-terminal path never moves the record's
+        flag: a captured late resolution records the assertion on its
+        ``late_resolutions`` entry, and an uncaptured call discards it with
+        its text.
 
         ``outcome`` (task 4495): an optional :class:`ResolveOutcome` dict filled
         in place with what this call DID — whether the resolution was actually
@@ -1566,6 +1605,7 @@ class EscalationQueue:
                         resolved_by=resolved_by,
                         dismiss=dismiss,
                         resolution_class=resolution_class,
+                        ruled_by_human=ruled_by_human,
                     )
                     if captured and outcome is not None:
                         outcome['late_resolution_captured'] = True
@@ -1585,6 +1625,8 @@ class EscalationQueue:
             if resolution_turns is not None:
                 esc.resolution_turns = resolution_turns
             esc.resolution_class = stamped_class
+            if ruled_by_human is not None:
+                esc.ruled_by_human = ruled_by_human
             if granted_files is not None:
                 esc.granted_files = granted_files
             if resolution_action is not None:
@@ -1626,6 +1668,7 @@ class EscalationQueue:
                         dismiss=dismiss,
                         resolved_by=member_resolved_by,
                         resolution_class=esc.resolution_class,
+                        ruled_by_human=esc.ruled_by_human,
                     )
                 except Exception as e:
                     logger.warning(
@@ -1638,7 +1681,7 @@ class EscalationQueue:
     def _capture_late_resolution(
         self, escalation_id: str, esc: Escalation, *,
         resolution: str, resolved_by: str | None, dismiss: bool,
-        resolution_class: str | None,
+        resolution_class: str | None, ruled_by_human: bool | None,
     ) -> tuple[bool, str | None]:
         """Preserve one late resolution on an already-terminal *esc*.
 
@@ -1696,6 +1739,7 @@ class EscalationQueue:
             # Preserved so the correction destroys nothing and the
             # original derivation stays auditable.
             prior_resolution_class=prior_class if corrected else None,
+            ruled_by_human=ruled_by_human,
             timestamp=datetime.now(UTC).isoformat(),
         )
         prior_list = list(esc.late_resolutions)
@@ -2360,9 +2404,10 @@ class EscalationQueue:
         "changed since I triaged it" re-assess rule — are, exhaustively:
         ``add_members_to_l2`` (a real member append, severity promotion or
         recorded amendment; guarded, since a true no-op must not bump),
-        ``amend`` (a recorded explicit amendment; guarded the same way) and
+        ``amend`` (a recorded explicit amendment; guarded the same way),
         ``attach_dedupe_child`` (a dedupe fold; unconditional, since every
-        successful call appends a child and increments ``dedupe_count``).
+        successful call appends a child and increments ``dedupe_count``) and
+        ``release_merge_halt`` (a first release stamp; a repeat is a no-op).
 
         Returns the updated ``Escalation``, or ``None`` when *escalation_id*
         is not found in the queue root, fails to parse, or is not pending
@@ -2450,6 +2495,34 @@ class EscalationQueue:
                 'claim_policy_class: %s claimed %s as %s', claimed_by, escalation_id, policy_class,
             )
             return ClaimResult(record=esc, refusal=None)
+
+    def release_merge_halt(self, escalation_id: str, *, note: str) -> Escalation | None:
+        """Record that a pending merge-halt record stopped owning the queue halt (task 3876).
+
+        The sole writer of ``halt_released_at`` / ``halt_release_note``. It bumps
+        ``updated_at``: the record no longer halts the merge queue, a substantive
+        change the watcher's "changed since I triaged it" rule must see.
+
+        It has :meth:`stamp_triage`'s write shape: serialized per id by
+        ``escalation_id_lock``, queue root only, pending only, so a closed
+        record is refused rather than resurrected. Idempotent: a released record
+        is returned unchanged, keeping its first stamp. ``None`` when there is no
+        pending record to release.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
+                return None
+            if esc.halt_released_at is not None:
+                return esc
+
+            now = datetime.now(UTC).isoformat()
+            esc.halt_released_at = now
+            esc.updated_at = now
+            esc.halt_release_note = note
+            self._rewrite(escalation_id, esc)
+            logger.info('release_merge_halt: released the merge halt owned by %s', escalation_id)
+            return esc
 
     def amend(
         self, escalation_id: str, *, root_cause: str = '', summary: str = '',

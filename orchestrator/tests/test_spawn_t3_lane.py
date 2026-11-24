@@ -43,8 +43,7 @@ from _process_identity_variants import own_identity
 from _process_tree_fakes import claude_process_tree
 from shared.process_identity import ProcessIdentity
 
-from orchestrator import session_hooks, session_records, t3_mcp_client
-from orchestrator import session_registry as sr
+from orchestrator import session_hooks, session_reaper, session_records, t3_mcp_client
 from orchestrator import spawn_t3_lane as lane
 from orchestrator.session_ownership_probes import ProcessTree
 
@@ -294,7 +293,7 @@ def sweep_line_levels(caplog: pytest.LogCaptureFixture) -> list[int]:
     return [
         record.levelno
         for record in caplog.records
-        if record.name == 'orchestrator.session_registry'
+        if record.name == 'orchestrator.session_reaper'
         and record.getMessage().startswith('mark_t3_sessions_exited: marked')
     ]
 
@@ -627,7 +626,7 @@ class TestLaunch:
         launch_line(capsys, tmp_path, env.project)
 
         stale = session_records.read_record(Path(stale_dir).name, root=env.fleet)
-        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, session_reaper.ORPHAN_EXIT_CODE)
         assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
 
     def test_an_unlisted_thread_whose_read_archives_it_is_swept(
@@ -639,7 +638,7 @@ class TestLaunch:
         launch_line(capsys, tmp_path, env.project)
 
         stale = session_records.read_record(Path(stale_dir).name, root=env.fleet)
-        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, session_reaper.ORPHAN_EXIT_CODE)
 
     def test_an_unlisted_thread_that_still_reads_present_is_not_swept(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -687,7 +686,7 @@ class TestLaunch:
         capsys: pytest.CaptureFixture[str],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_reaper'):
             launch_line(capsys, tmp_path, env.project)
 
         assert sweep_line_levels(caplog) == [logging.INFO]
@@ -1070,8 +1069,9 @@ class TestAwaitStarted:
         )
 
     def test_started_binds_the_transcript_and_folds_the_hand_launched_record(
-        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setattr(lane, 'STARTED_POLL_SECS', 0.05)
         t3.tool_replies['t3_thread_read'] = replies_in_turn(thread_read(status='preparing'), thread_read(status='running'))
         record_dir = spawn_record(env)
         write_transcript(env, SESSION_ID, trailer(record_dir))
@@ -1087,7 +1087,7 @@ class TestAwaitStarted:
         assert session_records.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == slug
         assert session_records.resolve_session_slug_for_pid(424242, root=env.fleet) == slug
         folded = session_records.read_record(hand_slug, root=env.fleet)
-        assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, sr.FOLDED_EXIT_CODE)
+        assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, session_reaper.FOLDED_EXIT_CODE)
 
     def test_started_copies_the_hand_launched_owner_identity_with_its_pid(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
@@ -1275,7 +1275,7 @@ def assert_folded_into(env: Env, slug: str, hand: session_records.SessionRecord)
         hand.claude_owner_identity,
     )
     folded = session_records.read_record(hand.session_slug, root=env.fleet)
-    assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, sr.FOLDED_EXIT_CODE)
+    assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, session_reaper.FOLDED_EXIT_CODE)
     assert session_records.resolve_session_slug_for_t3_thread(THREAD_ID, root=env.fleet) == slug
     assert session_records.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == slug
     assert session_records.resolve_session_slug_for_pid(T3_CLAUDE_PID, root=env.fleet) == slug
@@ -1330,7 +1330,7 @@ class TestThreadPointerReconcile:
             lane.BindingSource.TRANSCRIPT,
         )
         folded = session_records.read_record(hand.session_slug, root=env.fleet)
-        assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, sr.FOLDED_EXIT_CODE)
+        assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, session_reaper.FOLDED_EXIT_CODE)
 
 
 def test_a_spilled_launch_message_is_discovered(env: Env) -> None:
@@ -1612,7 +1612,7 @@ class TestWait:
 
         assert wait_for(env, '', FakeClock()) == 'finished code=0'
         stale = session_records.read_record(Path(stale_dir).name, root=env.fleet)
-        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, session_reaper.ORPHAN_EXIT_CODE)
         assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
 
     def test_a_pass_whose_sweep_marks_nothing_logs_its_line_at_debug(
@@ -1620,7 +1620,7 @@ class TestWait:
     ) -> None:
         t3.tool_replies['t3_thread_read'] = thread_read(archived=True)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_reaper'):
             assert wait_for(env, '', FakeClock()) == 'finished code=0'
 
         assert sweep_line_levels(caplog) == [logging.DEBUG]

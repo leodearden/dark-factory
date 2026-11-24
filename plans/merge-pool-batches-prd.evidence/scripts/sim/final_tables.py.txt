@@ -1,0 +1,106 @@
+"""The tables quoted in the seat's final message, from results/*.json.
+Usage: python final_tables.py  -> results/final_tables.txt"""
+import os
+import sys
+
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import gridlib as G  # noqa: E402
+
+
+def allrecs(plans):
+    recs = {}
+    for p in plans:
+        try:
+            for r in G.load(p)['recs']:
+                recs.setdefault((r['cell'], r['pol']), r)
+        except FileNotFoundError:
+            print('missing', p)
+    return recs
+
+
+def fq(x):
+    return '>60' if x is None else '%.0f' % x
+
+
+def paired(ra, rb, key='lvh_runs'):
+    d = [y - x for x, y in zip(ra[key], rb[key])]
+    return G._ci(d)
+
+
+def main():
+    out = []
+    R = allrecs(['main_w1_on', 'main_w2', 'open_arr', 'rules', 'main_w1_off'])
+    ROWS = [('T', 'T'), ('T+', 'T+'), ('TB', 'TB'), ('TR', 'TR (unmark+seq+elim)'), ('Jc-J1', 'Jc-J1'), ('Jc-J1d', 'Jc-J1d'),
+            ('Jc-J1d th.8', 'Jc-J1d th=0.80'), ('Jc-J2', 'Jc-J2'), ('Jc1-J1d', 'Jc1-J1d'), ('Jc1-J2 th.8', 'Jc1-J2 th=0.80'),
+            ('Jf-J2', 'Jf-J2'), ('Jv-J2', 'Jv-J2'), ('Otab', 'Otab'), ('O12', 'O12')]
+    for cell in ('cap|q=0.14|e=0.010|W1|env=on', 'cap|q=0.08|e=0.010|W1|env=on', 'cap|q=0.14|e=0.010|W2|env=on',
+                 'cap|q=0.08|e=0.010|W2|env=on', 'open|q=0.14|e=0.010|W2|env=on', 'open|q=0.08|e=0.010|W2|env=on',
+                 'cap|q=0.14|e=0.010|W1|env=off', 'cap|q=0.08|e=0.010|W1|env=off',
+                 'arr|q=0.14|e=0.010|W1|env=on', 'arr|q=0.08|e=0.010|W1|env=on'):
+        base = R.get((cell, 'T'))
+        out.append('')
+        out.append('### ' + cell)
+        out.append('| policy | land/h | land per verify-h (±95%) | vs T, paired | verifies/landing | void % | good wait p50/p95 h | bad→block p50/p95 h | solo/100 land | convictions right/wrong per 100 | own-solo wrongful blocks per 100 |')
+        out.append('|---|---|---|---|---|---|---|---|---|---|---|')
+        for lab, pol in ROWS:
+            r = R.get((cell, pol))
+            if r is None:
+                continue
+            if base is not None and pol != 'T' and len(base['lvh_runs']) == len(r['lvh_runs']):
+                dm, dc = paired(base, r)
+                d = '%+.0f%% (%+.3f ±%.3f)' % (100 * dm / base['lvh'][0], dm, dc)
+            else:
+                d = '—'
+            out.append('| %s | %.2f | %.3f ±%.3f | %s | %.2f | %.0f | %s/%s | %s/%s | %.0f | %.1f/%.2f | %.2f |' % (
+                lab, r['thr'][0], r['lvh'][0], r['lvh'][1], d, r['vpl'][0], 100 * r['void_share'],
+                fq(r['good_p50']), fq(r['good_p95']), fq(r['bad_p50']), fq(r['bad_p95']), r['solo_per100'],
+                r['conv_right_per100'], r['conv_wrong_per100'], r['false_block_per100']))
+
+    # grid: landings per verify-hour
+    out.append('')
+    out.append('### grid: landings per verify-hour (capacity-bound, waiting set 75; n=100 seeds; CI half-width 0.02-0.04 at q<=0.08, 0.01-0.03 above)')
+    cols = [('T', 'T'), ('T+', 'T+'), ('TB', 'TB'), ('Jc-J1', 'Jc-J1'), ('Jc-J1d', 'Jc-J1d'), ('Jc-J2', 'Jc-J2'), ('Jc1-J1d', 'Jc1-J1d'),
+            ('Jf-J2', 'Jf-J2'), ('Jv-J2', 'Jv-J2'), ('Otab', 'Otab'), ('O12', 'O12')]
+    out.append('| q | e | dur | main-red+restarts | ' + ' | '.join(c[0] for c in cols) + ' | T→T+ | T+→Jc-J1d | T→Jc-J1d |')
+    out.append('|' + '---|' * (len(cols) + 7))
+    for dur in ('W1', 'W2'):
+        for env in ('off', 'on'):
+            for q in (0.05, 0.08, 0.14, 0.20):
+                for e in (0.0, 0.01, 0.026):
+                    cell = 'cap|q=%.2f|e=%.3f|%s|env=%s' % (q, e, dur, env)
+                    if (cell, 'T') not in R:
+                        continue
+                    g = lambda p: R[(cell, p)]['lvh'][0]
+                    out.append('| %.2f | %.3f | %s | %s | ' % (q, e, dur, env) + ' | '.join('%.2f' % g(c[1]) for c in cols) +
+                               ' | %+.0f%% | %+.0f%% | %+.0f%% |' % (100 * (g('T+') / g('T') - 1), 100 * (g('Jc-J1d') / g('T+') - 1), 100 * (g('Jc-J1d') / g('T') - 1)))
+
+    # decomposition
+    out.append('')
+    out.append('### decomposition, paired per-seed steps in landings per verify-hour, % of the step origin (±95% CI in points of that %)')
+    steps = [('T', 'T+i'), ('T', 'T+ii'), ('T', 'T+p'), ('T', 'T+'), ('T+', 'TB'), ('TB', 'TR unmark'), ('TR unmark', 'TR unmark+seq'),
+             ('TR unmark+seq', 'TR (unmark+seq+elim)'), ('TR (unmark+seq+elim)', 'Jc-J1d th=0.80'), ('TB', 'Jc-J1'), ('Jc-J1', 'Jc-J1d'),
+             ('Jc-J1d', 'Jc-J2'), ('Jc-J1d', 'Jc1-J1d'), ('Jc-J1d', 'Jc1-J2 th=0.80'), ('Jc-J1d', 'Jf-J2'), ('Jc-J1d', 'Jv-J2'), ('T', 'Jc-J1d')]
+    out.append('| cell | ' + ' | '.join('%s→%s' % s for s in steps) + ' |')
+    out.append('|' + '---|' * (len(steps) + 1))
+    for env in ('on', 'off'):
+        for dur in ('W1', 'W2'):
+            for q in (0.05, 0.08, 0.14, 0.20):
+                cell = 'cap|q=%.2f|e=0.010|%s|env=%s' % (q, dur, env)
+                row = []
+                for a, b in steps:
+                    ra, rb = R.get((cell, a)), R.get((cell, b))
+                    if ra is None or rb is None or len(ra['lvh_runs']) != len(rb['lvh_runs']):
+                        row.append('-')
+                        continue
+                    dm, dc = paired(ra, rb)
+                    row.append('%+.1f ±%.1f' % (100 * dm / ra['lvh'][0], 100 * dc / ra['lvh'][0]))
+                if any(x != '-' for x in row):
+                    out.append('| %s | ' % cell + ' | '.join(row) + ' |')
+    path = os.path.join(G.RES, 'final_tables.txt')
+    with open(path, 'w') as fh:
+        fh.write('\n'.join(out) + '\n')
+    print('wrote', path, len(out))
+
+
+if __name__ == '__main__':
+    main()

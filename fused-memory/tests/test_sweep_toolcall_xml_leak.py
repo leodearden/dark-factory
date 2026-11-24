@@ -144,7 +144,6 @@ class TestClassifyRecord:
         as fallbacks — judged identically to the existing dedup sweep."""
         for key in ('data', 'memory', 'content'):
             assert _mod.classify_record({key: _TAIL_LEAK}) == 'repairable_tail', key
-        assert _mod._CONTENT_KEYS == ('data', 'memory', 'content')
 
 
 class TestRepairContent:
@@ -454,18 +453,17 @@ def _service(
     scanned=None,
     truncated=False,
     enforce=False,
-    enforce_kind_registry=False,
     collection: str | _OmitKey = _SCANNED_COLLECTION,
 ) -> AsyncMock:
     """An AsyncMock ``MemoryService`` for the sweep.
 
-    ``config.memory_metadata`` is a REAL namespace with real bools, not a mock
-    attribute, because the sweep's metadata pre-flight reads those flags off the
-    live service (``resolve_metadata_enforcement``) and treats an unreadable
-    config as "assume enforcing" — the fail-safe direction, but one that would
-    silently turn every repair test into a skip. Both default to the SHIPPED
-    defaults (warn-mode, kind registry not enforced), so the mock matches what a
-    live sweep would actually see today.
+    ``config.memory_metadata`` is a REAL namespace with a real bool, not a mock
+    attribute, because the sweep's metadata pre-flight reads the one ``enforce``
+    flag off the live service (``resolve_metadata_enforcement``) and treats an
+    unreadable config as "assume enforcing" — the fail-safe direction, but one
+    that would silently turn every repair test into a skip. It defaults to the
+    SHIPPED default (warn-mode), so the mock matches what a live sweep would
+    actually see today.
 
     ``collection`` defaults to a realistic name so every test here exercises
     the POST-fix scan shape (task 3243 made ``scan_payload_text`` report the
@@ -474,9 +472,7 @@ def _service(
     """
     service = AsyncMock()
     service.config = SimpleNamespace(
-        memory_metadata=SimpleNamespace(
-            enforce=enforce, enforce_kind_registry=enforce_kind_registry
-        )
+        memory_metadata=SimpleNamespace(enforce=enforce)
     )
     scan_result: dict[str, object] = {
         'matches': matches,
@@ -1491,7 +1487,7 @@ class TestRunApplyPreflightCategoryGuard:
 
 
 class TestMetadataAcceptedPredicate:
-    """``metadata_accepted(metadata, *, enforce, enforce_kind_registry)`` — pure.
+    """``metadata_accepted(metadata, *, enforce)`` — pure.
 
     ``MemoryService.add_memory`` runs ``_apply_memory_metadata_validation``,
     which raises ``MemoryMetadataValidationError`` when ``enforce`` is on and
@@ -1506,17 +1502,13 @@ class TestMetadataAcceptedPredicate:
         """``enforce=False`` is the shipped default and does NOT reject the
         write, so blocking on it would refuse repairs the store would happily
         have accepted."""
-        accepted, reason = _mod.metadata_accepted(
-            {'canonical': 1}, enforce=False, enforce_kind_registry=True
-        )
+        accepted, reason = _mod.metadata_accepted({'canonical': 1}, enforce=False)
 
         assert accepted is True
         assert reason == ''
 
     def test_enforcing_a_fatal_shape_is_refused_with_the_rule_named(self):
-        accepted, reason = _mod.metadata_accepted(
-            {'canonical': 1}, enforce=True, enforce_kind_registry=False
-        )
+        accepted, reason = _mod.metadata_accepted({'canonical': 1}, enforce=True)
 
         assert accepted is False
         assert 'invalid_canonical_type' in reason
@@ -1525,25 +1517,17 @@ class TestMetadataAcceptedPredicate:
         accepted, reason = _mod.metadata_accepted(
             {'task_id': '3083', 'x_stage': 'stage1'},
             enforce=True,
-            enforce_kind_registry=True,
         )
 
         assert accepted is True
         assert reason == ''
 
-    def test_unknown_kind_is_fatal_only_when_the_registry_is_enforced(self):
-        """The carved-out flag is the whole reason ``enforce`` alone is not
-        enough: 242 of 329 live kind values are singletons, so treating an
-        unknown kind as fatal under plain ``enforce`` would skip most of the
-        corpus."""
-        meta = {'kind': 'observation'}
-
+    def test_an_unknown_kind_is_accepted_even_under_enforce(self):
+        """PRD §10 OQ1 ruled option (b): ``unknown_kind`` is never fatal, so
+        the pre-flight must never skip a repair over it."""
         assert _mod.metadata_accepted(
-            meta, enforce=True, enforce_kind_registry=False
-        )[0] is True
-        assert _mod.metadata_accepted(
-            meta, enforce=True, enforce_kind_registry=True
-        )[0] is False
+            {'kind': 'not_a_real_kind_xyz'}, enforce=True
+        ) == (True, '')
 
     def test_the_callers_metadata_is_not_mutated(self):
         """``validate_memory_metadata`` normalizes ``supersedes`` IN PLACE, so
@@ -1552,31 +1536,31 @@ class TestMetadataAcceptedPredicate:
         meta = {'supersedes': 'a' * 8}
         before = dict(meta)
 
-        _mod.metadata_accepted(meta, enforce=True, enforce_kind_registry=False)
+        _mod.metadata_accepted(meta, enforce=True)
 
         assert meta == before
 
 
 class TestResolveMetadataEnforcement:
-    """The flags are READ off the live service, never assumed."""
+    """The flag is READ off the live service, never assumed."""
 
-    def test_real_config_flags_are_read_through(self):
-        service = _service([], enforce=True, enforce_kind_registry=True)
+    def test_real_config_flag_is_read_through(self):
+        service = _service([], enforce=True)
 
-        assert _mod.resolve_metadata_enforcement(service) == (True, True)
+        assert _mod.resolve_metadata_enforcement(service) is True
 
-    def test_shipped_defaults_are_read_through(self):
-        assert _mod.resolve_metadata_enforcement(_service([])) == (False, False)
+    def test_shipped_default_is_read_through(self):
+        assert _mod.resolve_metadata_enforcement(_service([])) is False
 
     def test_an_unreadable_config_fails_safe_to_enforcing(self, caplog):
         """A stub service must not be read as "enforcement off" — that would
-        re-open the post-delete rejection this pre-flight exists to close. Both
-        ON means a questionable record is skipped rather than destroyed, and it
-        is logged rather than silent."""
+        re-open the post-delete rejection this pre-flight exists to close.
+        Enforcing means a questionable record is skipped rather than destroyed,
+        and it is logged rather than silent."""
         with caplog.at_level('WARNING'):
             result = _mod.resolve_metadata_enforcement(SimpleNamespace())
 
-        assert result == (True, True)
+        assert result is True
         assert 'could not read config.memory_metadata' in caplog.text
 
 
@@ -1610,19 +1594,15 @@ class TestRunApplyPreflightMetadataGuard:
         assert _mod.resolve_exit_code(report) != 0
 
     @pytest.mark.asyncio
-    async def test_an_unknown_kind_is_skipped_only_when_the_registry_is_enforced(self):
+    async def test_an_unknown_kind_is_repaired_under_enforce(self):
         """``_payload``'s ``kind='observation'`` is not in KIND_REGISTRY — the
-        realistic old-corpus shape this guard exists for."""
-        enforced = _service(
-            [_match('r', _TAIL_LEAK)], enforce=True, enforce_kind_registry=True
-        )
-        report = await _mod.run(_args(apply=True), enforced)
-        enforced.delete_memory.assert_not_awaited()
-        assert _record_for(report, 'r')['skipped_metadata_would_be_rejected'] is True
+        realistic old-corpus shape. ``kind`` membership never rejects (PRD §10 OQ1,
+        option (b)), so it must not stop a repair."""
+        service = _service([_match('r', _TAIL_LEAK)], enforce=True)
 
-        warn_only = _service([_match('r', _TAIL_LEAK)], enforce=True)
-        report = await _mod.run(_args(apply=True), warn_only)
-        warn_only.delete_memory.assert_awaited_once()
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_awaited_once()
         assert _record_for(report, 'r')['repaired'] is True
 
     @pytest.mark.asyncio

@@ -1,0 +1,482 @@
+[
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "dark_factory/066b7e64-769f-4682-a264-3ae57594040c",
+    "node_uuid": "10af8a54-3975-497a-97f4-adf1d6f8fd13"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "dark_factory/066b7e64-769f-4682-a264-3ae57594040c",
+    "node_uuid": "9940c909-a830-4ff0-97a9-78406af23864"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/0fea6914-f42e-492c-ba8e-93959f2c0561",
+    "node_uuid": "2f62cd08-47d2-43df-bfe2-8974fdaca1de"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/135d44f1-f93b-4ad4-8a38-f981e631fe26",
+    "node_uuid": "4f5e772f-fa55-4688-a8c7-ff9d2e182ec9"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/135d44f1-f93b-4ad4-8a38-f981e631fe26",
+    "node_uuid": "4fd51257-a18c-49b3-9d3b-c9d0839b3d2e"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/19adad1f-13ba-4b5b-8b8f-e2c0a3e3929b",
+    "node_uuid": "23fe6ad8-5c47-4200-b5b7-084a0855487a"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/1abf3795-e500-4920-a938-6c1ebdc1aee1",
+    "node_uuid": "a3b994f8-d7f0-48c5-9b5b-b1dc36aa889b"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/1abf3795-e500-4920-a938-6c1ebdc1aee1",
+    "node_uuid": "d9639d74-440b-4785-86bf-0395ad2ec7ca"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "dark_factory/522879ba-f80c-4bc3-ab5d-78a8fb36b59e",
+    "node_uuid": "8029f00e-865d-48cd-8849-b8346a5dcb47"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "dark_factory/522879ba-f80c-4bc3-ab5d-78a8fb36b59e",
+    "node_uuid": "e3dda896-112a-4d41-8f3d-195007465c94"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/73d19d05-a901-41f3-a9ae-b93645e0ee5a",
+    "node_uuid": "580102e3-d621-46c9-a9bc-a8b627bd392f"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "dark_factory/8010efd0-baa5-404c-91cf-4abb7c6968bf",
+    "node_uuid": "1d3f9423-0e32-4a51-af2f-7dfa6d565c5b"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/9f35c5ed-19b8-47e1-acc4-cd05f4655077",
+    "node_uuid": "1ad5dd1a-2798-4a04-b891-056ad5d7577e"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "dark_factory/9f35c5ed-19b8-47e1-acc4-cd05f4655077",
+    "node_uuid": "f8795f93-dff5-4b63-8b27-6050571f42c8"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "dark_factory/a4e66cb0-2f8d-428b-90b0-32da2581e8b5",
+    "node_uuid": "4466eb10-bb10-4c9f-9e81-06bff4fbc56a"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "dark_factory/a4e66cb0-2f8d-428b-90b0-32da2581e8b5",
+    "node_uuid": "b996c117-b9ed-400a-a2d6-7010483de46e"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "dark_factory/bca9e311-a171-43f5-ad1e-34f2bdbe482e",
+    "node_uuid": "d36d3248-c42d-4cd4-9676-c68ab387f948"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "reify/29c4f1a3-12ff-4dc5-84aa-e3b13d7327dd",
+    "node_uuid": "6817a451-dba0-414e-bafb-72d908648745"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "reify/29c4f1a3-12ff-4dc5-84aa-e3b13d7327dd",
+    "node_uuid": "a7695839-c545-429c-afe4-76604956bca7"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "reify/42f8a90a-bc7a-45b8-b036-29b9992c6520",
+    "node_uuid": "57e7c5f1-ad41-4c5f-950a-ce7dd12d64d8"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "reify/4e70da61-47d4-48c0-b47f-542c537e5fee",
+    "node_uuid": "35ddc3cb-2805-4b74-b812-6a239f030bf1"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "reify/ea2a4400-9469-4784-84e8-8fc16892e9b8",
+    "node_uuid": "661ececa-32ab-440f-a29f-0f832826b807"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "scoping_intake/17b586fb-0241-43db-a5d5-39d79b355416",
+    "node_uuid": "98e2a0f0-ab48-495f-99c7-d61026ab8b16"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "scoping_intake/2e47930d-2fc4-4abd-85ce-9ba87aad4624",
+    "node_uuid": "d041fb1e-e4af-409b-b174-f9d1c4061594"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "scoping_intake/75a860ad-c03c-4be9-8b75-8cbe3ff16284",
+    "node_uuid": "25f9dd3c-ec97-4914-893e-ecc279aa421f"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "scoping_intake/75a860ad-c03c-4be9-8b75-8cbe3ff16284",
+    "node_uuid": "f8624c49-4286-4d82-8d46-80c8041b287f"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "scoping_intake/c549c393-5587-4bb6-b07f-cbcd9fe3e103",
+    "node_uuid": "5e903e68-6437-4b19-bb76-e4a61371210e"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "scoping_intake/c549c393-5587-4bb6-b07f-cbcd9fe3e103",
+    "node_uuid": "6ea3f846-39ca-4aeb-981b-a9403b1b06bb"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "scoping_intake/e7f4f814-7891-43d6-8600-74072fd4253b",
+    "node_uuid": "65499792-18a1-4ee3-96fb-c7193bf5eb67"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "scoping_intake/e7f4f814-7891-43d6-8600-74072fd4253b",
+    "node_uuid": "ae83cf05-a651-40a5-9270-693f43f887ee"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/12e2b213-c085-459e-b810-71a64a6e691d",
+    "node_uuid": "22cb3ade-3a9d-4f91-b914-74ef81bd5319"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/12e2b213-c085-459e-b810-71a64a6e691d",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/24068d28-8531-4bc1-aa62-895085dfc03f",
+    "node_uuid": "02496b13-01c6-466a-8222-d9b1b790b565"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/24068d28-8531-4bc1-aa62-895085dfc03f",
+    "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/34774da0-bce7-4c08-aa93-63c3c906c683",
+    "node_uuid": "32c11f24-9b9b-41f0-a231-f0b2c3f512b2"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/34774da0-bce7-4c08-aa93-63c3c906c683",
+    "node_uuid": "7b994a94-ad0e-4cf6-9ea9-4834aba8cce9"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/39f0a92c-9dbd-42b0-98d9-0b81eaf84d4c",
+    "node_uuid": "814e6734-83e5-4a46-9ed3-03136acbc2e4"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/39f0a92c-9dbd-42b0-98d9-0b81eaf84d4c",
+    "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/3ca2029c-f4f3-4c66-ae48-80ef9121436a",
+    "node_uuid": "8d6fed17-fabf-4921-ba31-efe661ddcf0c"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/3ca2029c-f4f3-4c66-ae48-80ef9121436a",
+    "node_uuid": "e92507e1-d7da-4bc8-9db9-ec7c7d90b865"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/624a196a-f366-46da-b05a-2bc6e12eb8e9",
+    "node_uuid": "0170553c-2932-4d4c-a83e-372363f47ce7"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/624a196a-f366-46da-b05a-2bc6e12eb8e9",
+    "node_uuid": "03032bd9-ca84-4e57-b5d5-a4016d12911a"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/9175793b-0e7e-4a10-a748-cfe36c9845b2",
+    "node_uuid": "02496b13-01c6-466a-8222-d9b1b790b565"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/9175793b-0e7e-4a10-a748-cfe36c9845b2",
+    "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/94bb011d-ff7b-4828-bc1b-ee9c3c621651",
+    "node_uuid": "5032c626-089c-48d4-ba5c-bea889c73a5e"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/94bb011d-ff7b-4828-bc1b-ee9c3c621651",
+    "node_uuid": "bfb4489f-8e05-46d0-8178-2781c51d29c6"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/ad5a977a-77f8-4b5f-b7da-6e565ab7a909",
+    "node_uuid": "25c9872d-539e-4319-83a9-86f4bc7be42d"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/ad5a977a-77f8-4b5f-b7da-6e565ab7a909",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/b3d064fe-d3e5-4674-bd8b-69823acc11b8",
+    "node_uuid": "4395502d-4d1c-483d-bdab-291a1a74ac45"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/b3d064fe-d3e5-4674-bd8b-69823acc11b8",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/c5fa0c76-a3f0-4fdc-82b5-8380820dc2c3",
+    "node_uuid": "9ae19f97-b061-43ef-a512-c8d1e1d5c205"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/c5fa0c76-a3f0-4fdc-82b5-8380820dc2c3",
+    "node_uuid": "9fdae2a4-b5eb-4017-861e-f926877c7ca1"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/d44cd744-319e-41e1-992f-f12a6a8ef27e",
+    "node_uuid": "ce0815f2-178f-4fc7-b38f-f0a71914a46e"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/d44cd744-319e-41e1-992f-f12a6a8ef27e",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/e5d2ac5a-7ce4-455a-950e-b25d609b6209",
+    "node_uuid": "814e6734-83e5-4a46-9ed3-03136acbc2e4"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/e5d2ac5a-7ce4-455a-950e-b25d609b6209",
+    "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/ef305c16-c852-4cdc-b2ea-52be1bcf4d7a",
+    "node_uuid": "22cb3ade-3a9d-4f91-b914-74ef81bd5319"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/ef305c16-c852-4cdc-b2ea-52be1bcf4d7a",
+    "node_uuid": "ec6c91bf-9f9c-4593-9238-2c976a847a72"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/f96613dc-463e-4d6b-9b76-29223f5498c9",
+    "node_uuid": "25c9872d-539e-4319-83a9-86f4bc7be42d"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge/f96613dc-463e-4d6b-9b76-29223f5498c9",
+    "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/fc1b42be-137d-4ff7-a1ad-96d0ef6e21c5",
+    "node_uuid": "8da2bd38-f4bc-41fa-837b-0dc372c0cf4a"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge/fc1b42be-137d-4ff7-a1ad-96d0ef6e21c5",
+    "node_uuid": "a0034a3b-b3ac-4ecd-9cfc-52d849f5e247"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge_platform/4bb349b6-2220-459d-ac0e-e2d7e27735f8",
+    "node_uuid": "450a55db-cdf6-4034-8019-5a428536eced"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge_platform/4bb349b6-2220-459d-ac0e-e2d7e27735f8",
+    "node_uuid": "5209b2d5-7461-4f0e-9df9-948fc19abcab"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge_platform/8519a1d7-d3e0-4d79-a0c6-9b6544557f75",
+    "node_uuid": "198aed85-3e64-45aa-ab9d-5c00dce67d60"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "solar_challenge_platform/8519a1d7-d3e0-4d79-a0c6-9b6544557f75",
+    "node_uuid": "9665acf3-e81d-4643-a3b2-4259db689f60"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge_platform/87a2f26c-79e3-42e8-987e-d6126358247b",
+    "node_uuid": "1ff539c2-2f81-4242-a2ed-cceabce2686c"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge_platform/87a2f26c-79e3-42e8-987e-d6126358247b",
+    "node_uuid": "43dc911d-40ee-4e3f-93b4-2e3db8d6e71f"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge_platform/951ebb36-dd9e-4263-a5aa-5f65cee6243d",
+    "node_uuid": "6b3cb188-5234-4932-bac0-7f7bcb0d71be"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge_platform/951ebb36-dd9e-4263-a5aa-5f65cee6243d",
+    "node_uuid": "830353d1-a37c-4acd-b927-434f307f27c6"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge_platform/c2265dc1-7776-4d40-94ca-5edb73e74ba1",
+    "node_uuid": "388148dd-1cfa-41a1-826f-33b15b9cdb92"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "solar_challenge_platform/c2265dc1-7776-4d40-94ca-5edb73e74ba1",
+    "node_uuid": "bca61fd1-8256-4a21-a921-47036629e153"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "stream_touch/6b3dcbaf-ae6f-447c-b1c0-fe90f1325ef9",
+    "node_uuid": "33db6a81-99e5-4df3-8455-b1f1b9720142"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "stream_touch/6b3dcbaf-ae6f-447c-b1c0-fe90f1325ef9",
+    "node_uuid": "38e740f1-a735-4214-a10b-917990a18965"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "stream_touch/ad0907b9-772a-46e5-a591-41bb1981c74e",
+    "node_uuid": "71f7b858-c98a-4eeb-b9c0-b782b48e08c5"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "stream_touch/ad0907b9-772a-46e5-a591-41bb1981c74e",
+    "node_uuid": "d26eb564-c9b7-48bc-92d7-4dd9d5c5b90f"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "stream_touch/b8f82dfd-e3fd-4b27-a538-0bc4b8169398",
+    "node_uuid": "33db6a81-99e5-4df3-8455-b1f1b9720142"
+  },
+  {
+    "A": "control",
+    "B": "luna-low",
+    "fixture_id": "stream_touch/b8f82dfd-e3fd-4b27-a538-0bc4b8169398",
+    "node_uuid": "dfe64d65-1619-44d9-939b-ee841f2c5aa8"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "stream_touch/e6422203-8fdb-4665-a247-550bdda19c74",
+    "node_uuid": "7a6f56be-56b8-4658-81e3-7fc3644a98f1"
+  },
+  {
+    "A": "luna-low",
+    "B": "control",
+    "fixture_id": "stream_touch/e6422203-8fdb-4665-a247-550bdda19c74",
+    "node_uuid": "9c95b74a-c004-4e44-85a5-df1794f1f2fe"
+  }
+]

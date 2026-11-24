@@ -71,7 +71,12 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
+markers = [
+    "integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')",
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
+]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
 filterwarnings = [
@@ -111,9 +116,10 @@ filterwarnings = [
 #
 # 420 IS DERIVED FROM MEASUREMENT. The worst per-test wall clock of an UNMARKED
 # test, across every suite and both inifile-resolution modes under real fleet
-# load, measured 45.48s (orchestrator/tests/test_hard_v2_fixture_pool.py,
-# root-bound); times the 8x headroom factor whose rationale is
-# orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR = 363.84,
+# load, is recorded at
+# shared/src/shared/testing_ceiling_anchors.py::INI_DEFAULT_MEASURED_WORST_SECS;
+# times the 8x headroom factor whose rationale is
+# shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR,
 # rounded up to a whole minute = 420. Marked tests are excluded by design,
 # including the slower repo-wide scans in
 # fused-memory/tests/test_check_bare_magicmock_config.py, which carry their own

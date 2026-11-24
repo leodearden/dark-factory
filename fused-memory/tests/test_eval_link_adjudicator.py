@@ -49,6 +49,7 @@ GAMMA_A_REQUIRES = (
 )
 
 ev = load_script_module(SCRIPT_PATH, mod_name='eval_link_adjudicator')
+stats = load_script_module(FUSED_MEMORY / 'scripts' / 'write_triage_stats.py', mod_name='write_triage_stats')
 
 FIGURES = (
     'misfile_recall',
@@ -135,6 +136,13 @@ class TestScoreArm:
             low, high = scored[f'{name}_ci95']
             assert 0.0 <= low <= scored[name] <= high <= 1.0
 
+    def test_each_interval_is_the_unrounded_wilson_bounds_of_its_counts(self):
+        scored = self._scored()
+
+        for name in FIGURES:
+            num, den = scored[f'{name}_num'], scored[f'{name}_den']
+            assert scored[f'{name}_ci95'] == list(stats.wilson_bounds(num / den, den)), name
+
     def test_a_zero_denominator_gives_none_not_zero(self):
         scored = ev.score_arm([_item('a1', T.AGREEING)], [_said('a1', Verdict.SAME)])
 
@@ -145,15 +153,30 @@ class TestScoreArm:
         assert scored['false_detach_rate'] == 0.0
 
 
-class TestWilson95:
-    def test_nine_of_fifteen(self):
-        low, high = ev.wilson95(9, 15)
+def _intervals(node):
+    """Every ``(key, num, den, ci95)`` figure of a report, at any depth."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key.endswith('_ci95'):
+                figure = key.removesuffix('_ci95')
+                yield key, node[f'{figure}_num'], node[f'{figure}_den'], value
+            yield from _intervals(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _intervals(value)
 
-        assert low == pytest.approx(0.357, abs=1e-3)
-        assert high == pytest.approx(0.802, abs=1e-3)
 
-    def test_no_trials_is_none(self):
-        assert ev.wilson95(0, 0) is None
+class TestCommittedReports:
+    @pytest.mark.parametrize(
+        'report', ['link_adjudicator_report.json', 'link_adjudicator_report_triage.json'],
+    )
+    def test_every_interval_is_the_wilson_bounds_of_its_own_counts(self, report):
+        figures = list(_intervals(json.loads((FUSED_MEMORY / 'calibration' / report).read_text())))
+
+        assert figures
+        for key, num, den, ci95 in figures:
+            expected = None if den == 0 else list(stats.wilson_bounds(num / den, den))
+            assert ci95 == expected, (key, num, den)
 
 
 class TestKindAgreement:

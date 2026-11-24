@@ -1244,7 +1244,7 @@ class TestRunDeterministicReconSweep:
             category='milestone_gate', summary='Human gate 5330', level=2,
         )
         queue.submit(existing)
-        queue.resolve(existing.id, 'human approved the gate', resolved_by='human')
+        queue.resolve(existing.id, 'human approved the gate', resolved_by='human', resolution_class='actionable')
         # Sanity: nothing pending, but the archive holds the resolved record.
         assert queue.get_by_task(tid, status='pending') == []
         assert len(queue.get_by_task(tid, agent_role='orchestrator-deterministic')) == 1

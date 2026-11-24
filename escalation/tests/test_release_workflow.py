@@ -10,6 +10,7 @@ matching the pattern used by other MCP-tool unit tests in this repo.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -472,6 +473,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
 
     from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
     from orchestrator.scheduler import TaskAssignment  # type: ignore[reportMissingImports]
+    from orchestrator.slot_lease import SlotLease
     from orchestrator.workflow import (  # type: ignore[reportMissingImports]
         TerminalReport,
         WorkflowOutcome,
@@ -529,6 +531,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     h._merge_inflight_registry = None  # type: ignore[assignment]
     h.cost_store = None  # type: ignore[assignment]
     h._task_verify_dispatcher = MagicMock()
+    h._verify_cache = MagicMock()
 
     # _collect_slot_report / _apply_retry_cap
     h._run_store = None  # type: ignore[assignment]
@@ -575,7 +578,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
         server = create_server(queue, harness=h)
 
         # Start the slot task — it blocks inside mock run() awaiting cancel_event.
-        slot_task = asyncio.create_task(h._run_slot(assignment, sem))
+        slot_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
 
         # Wait for _run_slot to register the cancel_event in _workflow_cancel_events.
         for _ in range(100):
@@ -656,6 +659,8 @@ async def test_orphan_park_lands_inside_real_scheduler_grace_window(
     # note_workflow_cancelled writes where workflow_cancel_recent reads.  A
     # rename of either attribute fails this test loudly (AttributeError).
     sched._RECONCILE_CANCEL_GRACE_S = 30.0  # type: ignore[assignment]
+    # Mirrors Scheduler.__init__: both grace accessors read the injected clock.
+    sched._time_source = time.monotonic
     # The two MCP round-trips are the only stubs.
     sched.get_status = AsyncMock(return_value='in-progress')  # type: ignore[method-assign]
     sched.set_task_status = AsyncMock()  # type: ignore[method-assign]

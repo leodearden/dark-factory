@@ -22,6 +22,7 @@ from _orch_helpers import (
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
+from _seed_script_stubs import seed_default_warm_base
 from _worktree_registrations import lane_admin_dir, registered_worktree_paths
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
 from shared.merge_subject import format_merge_subject
@@ -54,34 +55,12 @@ from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHol
 from orchestrator.quarantine_provenance import NOT_RELOCATED
 
 
+# No warm base here: persistent-merge-worktree tests assert ``_merge-verify``
+# is absent until lazily created, so warm-lane tests seed it themselves.
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
     return seed_repo(tmp_path / 'repo')
-
-
-def _seed_default_warm_base(repo: Path) -> None:
-    """Pre-create the DEFAULT derived warm-lane base (task 2061).
-
-    <repo>/.worktrees/_merge-verify/target, non-empty — so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK for
-    warm-lane tests using the default (unoverridden) warm_lane_base_target_dir.
-    NOT folded into the shared git_repo fixture: several persistent-merge-
-    worktree tests in this file assert ``_merge-verify`` does NOT exist before
-    it is lazily created, so only warm-lane tests that need a resolvable base
-    call this explicitly.
-
-    Task 2099: also marks ``.pool-root`` present so the NEW mount-presence
-    guard on acquire_warm_lane/acquire_spec_lane's create-once discriminator
-    does not false-trip in these warm-lane tests, which simulate an
-    already-running warm-lane host (a resolvable base presupposes prior pool
-    warmup on an already-mounted host) — an orthogonal concern to whether the
-    base itself is buildable.
-    """
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
 
 
 async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
@@ -10634,7 +10613,7 @@ class TestCreateWorktreeWarmLaneRouting:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     async def test_warm_path_returns_lane_not_branch_named_dir(
         self, git_repo: Path,
@@ -10785,7 +10764,7 @@ class TestCleanupWorktreePoolAware:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     async def test_cleanup_lane_not_removed(
         self, git_repo: Path,
@@ -10956,7 +10935,7 @@ class TestCreateWorktreeRequeueAndRecycledId:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -11578,7 +11557,7 @@ class TestReleaseWarmLaneBranchRetention:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -11826,7 +11805,7 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12096,7 +12075,7 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12324,7 +12303,7 @@ class TestRebindBranchToHead:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12578,6 +12557,68 @@ class TestRebindBranchToHead:
         # Clean up the second worktree
         await _run(['git', 'worktree', 'remove', '--force', str(second_wt)], cwd=git_repo)
 
+    async def _lane_with_one_commit_on_x(
+        self, git_repo: Path,
+    ) -> tuple[GitOps, Path, str]:
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        info = await git_ops.acquire_warm_lane('X', start_ref_raw.strip())
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        (info.path / 'wip.txt').write_text('work\n')
+        await _run(['git', 'add', '-A'], cwd=info.path)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=info.path)
+        _, x_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        return git_ops, info.path, x_sha_raw.strip()
+
+    async def test_rebind_refuses_a_lane_attached_to_a_foreign_branch(
+        self, git_repo: Path,
+    ):
+        """(e) task 10991: a lane on task/F must never become task/X's tip.
+
+        reify task/10089 lost its commit when its resume ran ``checkout -B``
+        over a lane a foreign checkout had left on another task's branch.
+        """
+        git_ops, lane, x_sha = await self._lane_with_one_commit_on_x(git_repo)
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        await _run(['git', 'branch', 'task/F', 'main'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'checkout', 'task/F'], cwd=lane)
+        assert rc == 0, err
+
+        result = await git_ops.rebind_branch_to_head(lane, 'task/X')
+
+        assert result is False
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == x_sha
+        _, attached_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert attached_raw.strip() == 'task/F'
+        _, f_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/F'], cwd=git_repo,
+        )
+        assert f_sha_raw.strip() == main_sha_raw.strip()
+
+    async def test_rebind_refuses_a_lane_detached_off_the_branch_lineage(
+        self, git_repo: Path,
+    ):
+        """(f) Detached at neither task/X's tip nor a descendant: refused."""
+        git_ops, lane, x_sha = await self._lane_with_one_commit_on_x(git_repo)
+        rc, _, err = await _run(['git', 'checkout', '--detach', 'main'], cwd=lane)
+        assert rc == 0, err
+
+        result = await git_ops.rebind_branch_to_head(lane, 'task/X')
+
+        assert result is False
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == x_sha
+
 
 # ===========================================================================
 # Task-1923 step-5: RED — disk-backstop route end-to-end via acquire_warm_lane
@@ -12599,7 +12640,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12757,7 +12798,7 @@ class TestReuseWarmLaneBranchAware:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12903,7 +12944,7 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -13167,7 +13208,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(

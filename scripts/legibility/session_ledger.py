@@ -13,6 +13,7 @@ directory it shares.
 from __future__ import annotations
 
 import argparse
+import logging
 import sqlite3
 import sys
 from collections.abc import Iterable, Iterator, Mapping
@@ -275,6 +276,17 @@ def open_for_census(path: str | Path, *, prune_before: datetime) -> LedgerSnapsh
             return _read_snapshot(conn, path, state, pruned=pruned)
     except (sqlite3.Error, OSError, ValueError) as exc:
         return _unreadable(path, exc)
+
+
+def already_coded(snapshot: LedgerSnapshot, *, log: logging.Logger) -> frozenset[str]:
+    """The sessions a coder must not code again. An unreadable ledger skips
+    none, after one WARNING on the caller's *log*."""
+    if snapshot.state is LedgerState.UNREADABLE:
+        log.warning(
+            'session ledger unreadable, so no already-coded session is skipped: %s',
+            snapshot.error,
+        )
+    return snapshot.sessions
 
 
 def record_codings(path: str | Path, rows: Iterable[LedgerRow]) -> int:

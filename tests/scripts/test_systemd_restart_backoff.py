@@ -42,7 +42,6 @@ _EXPECTED_SWEPT_PATHS = frozenset(
         "fused-memory/fused-memory.service.example-systemd-config",
         "scripts/dashboard.service.template",
         "scripts/fused-memory.service.template",
-        "scripts/jcodemunch-watcher.service.template",
         "scripts/orchestrator-autopilot-video.service",
         "scripts/orchestrator-dark-factory.service",
         "scripts/orchestrator-know-live.service",

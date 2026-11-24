@@ -1,0 +1,63 @@
+"""Item 4: verify duration by chain size and host, stratified by (UTC day, runner).
+
+Population: completed merge_verify rows, PASSED only (a failed verify can stop early), gate re-verifies excluded.
+Stratified estimate: within each (day, runner) stratum, log(duration) minus the stratum's single-request median log;
+the per-bucket ratio is exp(median of those within-stratum deltas), only strata holding >=1 single."""
+import sys, math
+sys.path.insert(0, '/tmp/gate-10069/measure')
+from collections import defaultdict, Counter
+from common import verifies, pct, fmt
+
+V = [v for v in verifies('2026-11-05') if v['passed'] and not v['gate']]
+B = lambda k: '1' if k == 1 else ('2' if k == 2 else ('3' if k == 3 else ('4' if k == 4 else '5+')))
+
+print('## raw p50/p90 minutes by window x runner x bucket (passed, non-gate)')
+g = defaultdict(list)
+for v in V:
+    g[(v['win'], v['runner'], B(v['k']))].append(v['dur_s'] / 60)
+for k in sorted(g):
+    x = g[k]
+    print(f'| {k[0]} | {k[1]} | {k[2]} | {len(x)} | {pct(x,50):.0f} | {pct(x,90):.0f} |')
+
+print('\n## per-day per-runner medians (minutes): singles vs chains')
+d = defaultdict(list)
+for v in V:
+    d[(v['day'] + ('b' if v['win'] == 'b' else ''), v['runner'], 'single' if v['k'] == 1 else 'chain')].append(v['dur_s'] / 60)
+days = sorted({k[0] for k in d})
+for day in days:
+    row = []
+    for r in ('laptop', 'local'):
+        s = d.get((day, r, 'single'), []); c = d.get((day, r, 'chain'), [])
+        row.append(f"{r}: single n={len(s)} p50={fmt(pct(s,50),0)} | chain n={len(c)} p50={fmt(pct(c,50),0)}")
+    print(day, ' || '.join(row))
+
+print('\n## stratified ratio chain/single (within day x runner)')
+for win in ('a', 'b'):
+    strata = defaultdict(list)
+    for v in V:
+        if v['win'] == win:
+            strata[(v['day'], v['runner'])].append(v)
+    for runner in ('laptop', 'local', None):
+        deltas = defaultdict(list)
+        nstr = defaultdict(set)
+        for (day, r), rows in strata.items():
+            if runner and r != runner:
+                continue
+            singles = [math.log(x['dur_s']) for x in rows if x['k'] == 1]
+            if not singles:
+                continue
+            base = pct(singles, 50)
+            for x in rows:
+                if x['k'] > 1:
+                    deltas[B(x['k'])].append(math.log(x['dur_s']) - base)
+                    deltas['all chains'].append(math.log(x['dur_s']) - base)
+                    nstr[B(x['k'])].add((day, r)); nstr['all chains'].add((day, r))
+        for b in ('2', '3', '4', '5+', 'all chains'):
+            x = deltas.get(b, [])
+            if not x:
+                continue
+            # bootstrap CI on median delta
+            import random
+            random.seed(1)
+            bs = sorted(pct([random.choice(x) for _ in x], 50) for _ in range(2000))
+            print(f'| {win} | {runner or "both"} | {b} | n={len(x)} | strata={len(nstr[b])} | ratio p50 {math.exp(pct(x,50)):.2f} [{math.exp(bs[50]):.2f},{math.exp(bs[1949]):.2f}] | ratio p90 {math.exp(pct(x,90)):.2f} |')

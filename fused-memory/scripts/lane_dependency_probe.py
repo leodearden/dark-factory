@@ -8,6 +8,11 @@ run of the same outage. Diagnostics go to stderr, never a traceback.
 FalkorDB is checked on the scratch server the integration tests use (FALKOR_HOST/FALKOR_PORT), never on
 production: the check writes a graph. A FALKOR_* aimed at production is a broken probe, not an outage.
 
+The Claude CLI proxy is the endpoint the live-CLI tests reach Claude through (``shared.cli_proxy``). A host
+with no proxy client file passes it: those tests skip there, so they cannot be failing for want of it. A proxy
+that refuses the probe's own request as malformed (a 4xx other than auth, timeout or rate limit) is a broken
+probe, not an outage.
+
 Usage: ``python scripts/lane_dependency_probe.py [dependency ...]`` from ``fused-memory/``; naming
 dependencies checks only those, always in canonical order.
 """
@@ -28,12 +33,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import urlparse
 
+import httpx
 from cleanup_test_collections import PREFIX, hold_lease
 from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from shared.cli_boundary import LoudArgumentParser, run_cli
+from shared.cli_proxy import proxy_endpoint
 from shared.lane_probe import OUTAGE_EXIT_STATUS
 
 from fused_memory.arm_harness.checks import SMOKE_MESSAGES, SmokeEntities
@@ -49,13 +56,15 @@ from fused_memory.utils.store_mutation_preflight import (
     assert_store_mutation_allowed,
 )
 
-DEPENDENCIES = ('qdrant', 'falkordb', 'embedder', 'chat-model')
+DEPENDENCIES = ('qdrant', 'falkordb', 'embedder', 'chat-model', 'claude-proxy')
 CHECK_TIMEOUT_SECS = 30
 CLEANUP_TIMEOUT_SECS = 5
 LEASE_OWNER = 'lane-dependency-probe'
 PROBE_VALUE = 'lane dependency probe'
 SCRATCH_PAYLOAD = {'probe': 'lane-dependency'}
 BROKEN_CONFIG_EXIT_STATUS = 1
+PROXY_PROBE_MODEL = 'claude-sonnet-5-5'
+PROXY_UNAVAILABLE_4XX = frozenset({401, 403, 408, 429})
 
 
 class NotConfiguredReason(StrEnum):
@@ -68,6 +77,10 @@ class NotConfigured(Exception):
     def __init__(self, reason: NotConfiguredReason) -> None:
         super().__init__()
         self.reason = reason
+
+
+class BrokenProbe(Exception):
+    """The probe's own request is wrong, so its answer says nothing about the dependency."""
 
 
 class WrongAnswer(Exception):
@@ -97,6 +110,8 @@ def cause_of(error: BaseException) -> str:
         return f'no answer within {CHECK_TIMEOUT_SECS} s'
     if isinstance(error, UnexpectedResponse):
         return f'HTTP {error.status_code}'
+    if isinstance(error, httpx.HTTPStatusError):
+        return f'HTTP {error.response.status_code}'
     if isinstance(error, WrongAnswer):
         return error.cause
     if isinstance(error, ResponseHandlingException):
@@ -193,11 +208,30 @@ async def check_chat_model(cfg: FusedMemoryConfig, progress: Progress) -> None:
     await client.generate_response(list(SMOKE_MESSAGES), response_model=SmokeEntities)
 
 
+async def check_claude_proxy(_cfg: FusedMemoryConfig, progress: Progress) -> None:
+    progress.step = 'read client file'
+    endpoint = proxy_endpoint()
+    if endpoint is None:
+        return
+    progress.step = 'complete'
+    async with httpx.AsyncClient(timeout=CHECK_TIMEOUT_SECS) as client:
+        response = await client.post(
+            f'{endpoint.base_url}/v1/messages',
+            headers={'Authorization': f'Bearer {endpoint.auth_token}', 'anthropic-version': '2023-06-01'},
+            json={'model': PROXY_PROBE_MODEL, 'max_tokens': 1, 'messages': [{'role': 'user', 'content': 'ok'}]},
+        )
+    status = response.status_code
+    if 400 <= status < 500 and status not in PROXY_UNAVAILABLE_4XX:
+        raise BrokenProbe(f'claude-proxy refused the probe request: HTTP {status}')
+    response.raise_for_status()
+
+
 CHECKS: dict[str, Check] = {
     'qdrant': check_qdrant,
     'falkordb': check_falkordb,
     'embedder': check_embedder,
     'chat-model': check_chat_model,
+    'claude-proxy': check_claude_proxy,
 }
 
 
@@ -205,6 +239,8 @@ async def run_check(dependency: str, cfg: FusedMemoryConfig) -> Failure | None:
     progress = Progress()
     try:
         await asyncio.wait_for(CHECKS[dependency](cfg, progress), CHECK_TIMEOUT_SECS)
+    except BrokenProbe:
+        raise
     except Exception as error:
         return failure_of(dependency, progress, error)
     return None
@@ -252,7 +288,11 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as error:
         print(f'error: {error}', file=sys.stderr)
         return BROKEN_CONFIG_EXIT_STATUS
-    failure = asyncio.run(first_failure(selected, probe_config(cfg, scratch)))
+    try:
+        failure = asyncio.run(first_failure(selected, probe_config(cfg, scratch)))
+    except BrokenProbe as error:
+        print(f'error: {error}', file=sys.stderr)
+        return BROKEN_CONFIG_EXIT_STATUS
     if failure is None:
         return 0
     print(failure.line)

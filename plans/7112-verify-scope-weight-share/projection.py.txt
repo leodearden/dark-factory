@@ -1,0 +1,126 @@
+"""Task 7112 study projection: a reify merge scope's weight-fair share in three layouts, from one measured window.
+
+One-off and read-only. Run from the dark-factory checkout root:
+
+    /home/leo/src/dark-factory/.venv/bin/python plans/7112-verify-scope-weight-share/projection.py.txt
+
+Input: window 1 (07:20:40Z, procs_running/nproc 8.16) of census/20261119T071937Z-census.txt: every cgroup's
+cpu.weight and wanted cores (used + subtree wait, a lower bound) as measured, and user@1000.service's used cores as
+the capacity to divide. Rows the census hid (wanted < 0.05) are absent and negligible.
+
+The measured reify merge scope (wanted 0.89) is replaced by a hypothetical merge scope wanting D cores, so the
+question is what a merge that wanted D would be entitled to, with everything else as measured. Layouts:
+  flat    every df-verify scope a direct child of app.slice beside the orchestrator units (before task 3394)
+  slice   as measured: df.slice/df-<project>.slice/<scopes>; daemons and agents still in app.slice (now)
+  9985    as slice, but each orchestrator-<project>.service moved into df-<project>.slice (after task 9985;
+          a project with no slice yet gets one at weight 100)
+Weights are as measured; the 9985 layout adds no new weight values (that is task 9984's job).
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path('scripts').resolve()))
+from cgroup_weight_share import Claim, fair_shares  # noqa: E402
+
+CENSUS = Path('plans/7112-verify-scope-weight-share/census/20261119T071937Z-census.txt')
+USER = 'user.slice/user-1000.slice/user@1000.service'
+MERGE = f'{USER}/df.slice/df-reify.slice/df-verify-reify-4ae45bbd-521e658e98c5.scope'
+SERVICE_SLICE = {
+    'orchestrator-dark-factory.service': 'df-dark_factory.slice',
+    'orchestrator-reify.service': 'df-reify.slice',
+    'orchestrator-solar-challenge-platform.service': 'df-solar_challenge_platform.slice',
+    'orchestrator-my-solar-challenge.service': 'df-my_solar_challenge.slice',
+    'orchestrator-autopilot-video.service': 'df-autopilot_video.slice',
+    'orchestrator-know-live.service': 'df-know_live.slice',
+    'orchestrator-pump-web-ui.service': 'df-pump_web_ui.slice',
+    'orchestrator-scoping-intake.service': 'df-scoping_intake.slice',
+    'orchestrator-stream-touch.service': 'df-stream_touch.slice',
+}
+
+
+def first_window() -> tuple[float, dict[str, Claim]]:
+    rows: dict[str, Claim] = {}
+    for line in CENSUS.read_text().splitlines()[2:]:
+        if line.startswith('chain'):
+            break
+        path, weight, used, _wait, wanted, *_ = line.split()
+        rows[path] = Claim(None if weight == '-' else int(weight), float(wanted))
+        if path == USER:
+            capacity = float(used)
+    return capacity, rows
+
+
+def children(rows: dict[str, Claim], parent: str) -> dict[str, Claim]:
+    return {p: c for p, c in rows.items() if p.rsplit('/', 1)[0] == parent}
+
+
+def share(capacity: float, claims: dict[str, Claim], name: str) -> float:
+    shares = fair_shares(capacity, claims)
+    assert shares is not None
+    return shares[name]
+
+
+def chain(capacity: float, levels: list[tuple[dict[str, Claim], str]]) -> list[float]:
+    granted = []
+    for claims, name in levels:
+        capacity = share(capacity, claims, name)
+        granted.append(capacity)
+    return granted
+
+
+def top(rows: dict[str, Claim], overrides: dict[str, float]) -> dict[str, Claim]:
+    claims = children(rows, USER)
+    return {p: Claim(c.weight, overrides.get(p.rsplit('/', 1)[1], c.demand)) for p, c in claims.items()}
+
+
+def project(capacity: float, rows: dict[str, Claim], demand: float) -> dict[str, list[float]]:
+    rows = dict(rows) | {MERGE: Claim(100, demand)}
+    app, df = f'{USER}/app.slice', f'{USER}/df.slice'
+    scopes = {p: c for p, c in rows.items() if p.startswith(f'{df}/') and p.endswith('.scope')}
+    reify = f'{df}/df-reify.slice'
+    df_wanted = sum(c.demand for c in scopes.values())
+
+    flat_app = children(rows, app) | {f'{app}/{p.rsplit("/", 1)[1]}': c for p, c in scopes.items()}
+    flat_merge = f'{app}/{MERGE.rsplit("/", 1)[1]}'
+    flat = chain(capacity, [
+        (top(rows, {'app.slice': rows[app].demand + df_wanted, 'df.slice': 0.0}), f'{USER}/app.slice'),
+        (flat_app, flat_merge),
+    ])
+
+    slices = {p: Claim(c.weight, sum(s.demand for q, s in scopes.items() if q.startswith(f'{p}/')))
+              for p, c in children(rows, df).items()}
+    now = chain(capacity, [
+        (top(rows, {'df.slice': df_wanted}), df),
+        (slices, reify),
+        (children(rows, reify) | {MERGE: Claim(100, demand)}, MERGE),
+    ])
+
+    moved = {f'{df}/{SERVICE_SLICE[p.rsplit("/", 1)[1]]}': c for p, c in children(rows, app).items()
+             if p.rsplit('/', 1)[1] in SERVICE_SLICE}
+    slices_9985 = dict(slices)
+    for slice_path, service in moved.items():
+        base = slices_9985.get(slice_path, Claim(100, 0.0))
+        slices_9985[slice_path] = Claim(base.weight, base.demand + service.demand)
+    app_left = rows[app].demand - sum(c.demand for c in moved.values())
+    service = moved[f'{df}/df-reify.slice']
+    after = chain(capacity, [
+        (top(rows, {'app.slice': app_left, 'df.slice': df_wanted + sum(c.demand for c in moved.values())}), df),
+        (slices_9985, reify),
+        (children(rows, reify) | {MERGE: Claim(100, demand), f'{reify}/orchestrator-reify.service': service}, MERGE),
+    ])
+    return {'flat': flat, 'slice': now, '9985': after}
+
+
+def main() -> None:
+    capacity, rows = first_window()
+    print(f'# capacity user@1000.service used {capacity:.2f} cores; source {CENSUS.name} window 1')
+    print('merge_wants\tlayout\tlevel_grants (outermost first)\tmerge_fair_cores')
+    for demand in (2.0, 8.0, 16.0):
+        for layout, grants in project(capacity, rows, demand).items():
+            print(f'{demand:.0f}\t{layout}\t{" -> ".join(f"{g:.2f}" for g in grants)}\t{grants[-1]:.2f}')
+
+
+if __name__ == '__main__':
+    main()

@@ -5,12 +5,18 @@ eval axis, {shipped, pre-ψ}, measured on the production call (task 6151).
 :func:`judge_wording` swaps ``write_triage_judge.JUDGE_SYSTEM_PROMPT``, the
 module global every provider arm of the shipped ``_call_llm`` reads at call
 time, so shipped code is untouched and the request path stays the real one.
+A lever replay (task 7519) may instead hold an unregistered candidate prompt
+in force through :func:`judge_system_prompt`; such a prompt never joins
+:data:`SELECTABLE_WORDINGS`.
 
 The override is PROCESS-GLOBAL: a caller runs one wording at a time, and the
 context manager refuses to nest rather than let two wordings interleave.
 
 :data:`PROMPTS_WHILE_PSI_SHIPPED` freezes what each wording sent while ψ was
 shipped, the era the committed π and π2 populations measured.
+
+``psi`` is the prompt shipped from task 6149 (ψ) until task 7155's step-8,
+kept selectable, though off the D16 axis, for task 9045's 2x2 judge arms.
 """
 from __future__ import annotations
 
@@ -29,6 +35,10 @@ from fused_memory.server.write_triage_judge import (
 WORDING_SHIPPED = 'shipped'
 WORDING_PRE_PSI = 'pre-psi'
 WORDINGS = (WORDING_SHIPPED, WORDING_PRE_PSI)
+WORDING_PSI = 'psi'
+#: The wordings :func:`judge_wording` can hold in force: :data:`WORDINGS`, the
+#: D16 axis with one population fixture report per member, plus ψ.
+SELECTABLE_WORDINGS = (*WORDINGS, WORDING_PSI)
 
 #: The shipped prompt as imported, before any override can be in force.
 _SHIPPED = write_triage_judge.JUDGE_SYSTEM_PROMPT
@@ -124,9 +134,11 @@ PROMPTS_WHILE_PSI_SHIPPED: Mapping[str, str] = MappingProxyType({
 _PROMPTS = {
     WORDING_SHIPPED: _SHIPPED,
     WORDING_PRE_PSI: PRE_PSI_JUDGE_SYSTEM_PROMPT,
+    WORDING_PSI: PSI_JUDGE_SYSTEM_PROMPT,
 }
 
-#: The wording :func:`judge_wording` currently holds in force, if any.
+#: The label of the prompt :func:`judge_system_prompt` currently holds in
+#: force, if any.
 _in_force: str | None = None
 
 
@@ -136,29 +148,43 @@ def system_prompt(wording: str) -> str:
         return _PROMPTS[wording]
     except KeyError:
         raise ValueError(
-            f'unknown judge wording {wording!r}; known wordings are {list(WORDINGS)}',
+            f'unknown judge wording {wording!r}; known wordings are {list(SELECTABLE_WORDINGS)}',
         ) from None
 
 
-@contextlib.contextmanager
-def judge_wording(wording: str) -> Iterator[str]:
-    """Hold *wording* in force on the shipped judge; yield its prompt's sha256.
+def prompt_sha256(wording: str) -> str:
+    """The sha256 of *wording*'s prompt, which a report records as ``judge_system_prompt_sha256``."""
+    return hashlib.sha256(system_prompt(wording).encode()).hexdigest()
 
-    Refuses (``RuntimeError``) while any override is already active, whether
-    this one or another's, and always restores the shipped prompt on exit.
+
+@contextlib.contextmanager
+def judge_system_prompt(prompt: str, *, label: str) -> Iterator[str]:
+    """Hold *prompt* in force on the shipped judge; yield its sha256.
+
+    *label* names the override in refusals. Refuses (``RuntimeError``) while
+    any override is already active, whether this one or another's, and always
+    restores the shipped prompt on exit.
     """
     global _in_force
-    prompt = system_prompt(wording)
+    if not prompt:
+        raise ValueError(f'judge prompt {label!r} is empty')
     if _in_force is not None or write_triage_judge.JUDGE_SYSTEM_PROMPT is not _SHIPPED:
         active = _in_force or 'an unrecognised override'
         raise RuntimeError(
-            f'judge wording {active!r} is already in force; refusing to enter '
-            f'{wording!r}, since two wordings must never interleave in one process',
+            f'judge prompt {active!r} is already in force; refusing to enter '
+            f'{label!r}, since two prompts must never interleave in one process',
         )
-    _in_force = wording
+    _in_force = label
     write_triage_judge.JUDGE_SYSTEM_PROMPT = prompt
     try:
         yield hashlib.sha256(prompt.encode()).hexdigest()
     finally:
         write_triage_judge.JUDGE_SYSTEM_PROMPT = _SHIPPED
         _in_force = None
+
+
+@contextlib.contextmanager
+def judge_wording(wording: str) -> Iterator[str]:
+    """Hold *wording* in force on the shipped judge; yield its prompt's sha256."""
+    with judge_system_prompt(system_prompt(wording), label=wording) as sha:
+        yield sha

@@ -259,6 +259,18 @@ own work product; it does not block queueing and must never be read as a green G
 | storm counter keyed `(project, outcome)` (INV-4) | `wired` — `MarkupStormCounter` at `markup_tripwire.py:294` generalises | PASS |
 | residue escalation carrying raw payload (INV-7) | `wired` — `emit_markup_storm_escalation` at `:374`; `data/escalations/` live | PASS |
 
+**Correction, task 4809.** The table above is the decompose-time record and is left as written.
+The residue row was a **mis-bound-evidence PASS**: it cites the STORM filer, which carries no
+payload. Measured over the guard's deployed life, 2026-08-23..27: residue preservation failed for
+**11 of 15** refusals, all `add_memory.content`. The evidence is commit `e9c3ce99a4`, superseded by
+`a51dbfd13c`. The cause is that `add_memory` declares `content` before `project_id`, so the leak
+ate the routing key. The capability is actually delivered by
+`fused_memory.server.markup_tripwire::emit_markup_residue_escalation`, reached through
+`fused_memory.server.markup_guard::build_markup_guard`'s residue tiers (queue, then floor, then
+log). `fused_memory.server.markup_residue_spool::MarkupResidueSpool` is the floor, and
+`get_status.markup_residue` is the INV-4 loss count. Deferred re-sync tasks **4475** and **4476**
+inherit this correction.
+
 ### γ — register on four servers; retire the in-line gates — **SPLIT THREE WAYS 2026-08-19**
 
 **Superseded by γ1/γ2/γ3 below.** The decompose-time table is left exactly as written — it is the

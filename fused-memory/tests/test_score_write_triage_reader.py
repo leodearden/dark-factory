@@ -1,7 +1,8 @@
 """Tests for score_write_triage_reader.py — the rubric v2.1 reader-consequence scorer.
 
 Reached only through the public surface: ``score_reader``, its refusal
-``IncompleteJudgementError``, ``render_markdown`` and the ``main`` CLI. The
+``IncompleteJudgementError``, ``item_readings``, ``render_markdown`` and the
+``main`` CLI. The
 scripts are loaded by path (``scripts/`` is not a package), lazily through
 ``_mod()``.
 
@@ -42,6 +43,13 @@ def _stats() -> types.ModuleType:
 def _rubric() -> types.ModuleType:
     return load_script_module(
         SCRIPTS / 'write_triage_reader_rubric.py', mod_name='write_triage_reader_rubric',
+    )
+
+
+@functools.cache
+def _rounds() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'write_triage_rating_rounds.py', mod_name='write_triage_rating_rounds',
     )
 
 
@@ -134,12 +142,18 @@ def _corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 
 _STRATA = {'r': 40, 'a': 20, 'c': 5, 's': 30}
-SOAK_RUBRIC = 'v2.1'
-"""The rater brief the synthetic corpus and the committed soak baseline were rated under."""
+def _soak_brief() -> Any:
+    """The rater brief the synthetic corpus and the committed soak baseline were rated under."""
+    return _rounds().BRIEF_V2_1
+
+
+def _soak_brief_flags() -> list[str]:
+    """The CLI's explicit form of :func:`_soak_brief`, for a corpus that records no re-rate."""
+    return ['--rubric', _soak_brief().version, '--brief-sha256', _soak_brief().sha256]
 
 
 def _score_reader(*args: Any, **kwargs: Any) -> dict[str, Any]:
-    return _mod().score_reader(*args, rubric=SOAK_RUBRIC, **kwargs)
+    return _mod().score_reader(*args, brief=_soak_brief(), **kwargs)
 
 
 @functools.cache
@@ -162,29 +176,94 @@ def _block(hits: int, n: int, *, unclear: int = 0) -> dict[str, Any]:
     }
 
 
-class TestTheRubricLabel:
-    """The caller names the brief its verdicts were rated under; the scorer cannot tell."""
+class TestTheBrief:
+    """The report records the brief its verdicts were rated under, which verdict rows do not say.
 
-    def test_the_report_records_the_label_it_is_given(self) -> None:
-        items, verdicts = _corpus()
-        report = _mod().score_reader(items, verdicts, rubric='v2.2')
-        assert report['rubric'] == 'v2.2'
-        assert _mod().render_markdown(report).startswith('# Write-triage reader report (rubric v2.2)')
+    The CLI takes it from the corpus record's latest re-rate, or explicitly as
+    a label and sha256 for a corpus that records no re-rate.
+    """
 
-    def test_no_label_is_assumed(self) -> None:
+    def test_the_report_records_the_briefs_version_and_sha256(self) -> None:
         items, verdicts = _corpus()
-        with pytest.raises(TypeError, match='rubric'):
+        report = _mod().score_reader(items, verdicts, brief=_rounds().RaterBrief('v2.2', 'a' * 64))
+        assert (report['rubric'], report['brief_sha256']) == ('v2.2', 'a' * 64)
+        markdown = _mod().render_markdown(report)
+        assert markdown.startswith('# Write-triage reader report (rubric v2.2)')
+        assert 'a' * 64 in markdown
+
+    def test_no_brief_is_assumed(self) -> None:
+        items, verdicts = _corpus()
+        with pytest.raises(TypeError, match='brief'):
             _mod().score_reader(items, verdicts)
 
-    def test_the_cli_requires_the_label(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
-    ) -> None:
+    @staticmethod
+    def _inputs(tmp_path: Path) -> list[str]:
         items = _write_jsonl(tmp_path / 'items.jsonl', [_item('X', 'contested', 'P')])
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
+        return ['--items', str(items), '--verdicts', str(verdicts)]
+
+    def test_the_cli_requires_a_corpus_record_or_a_label(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
         with pytest.raises(SystemExit) as exited:
-            _mod().main(['--items', str(items), '--verdicts', str(verdicts)])
+            _mod().main(self._inputs(tmp_path))
         assert exited.value.code == 2
-        assert '--rubric' in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert '--corpus-record' in err and '--rubric' in err
+
+    def test_a_label_needs_its_sha256(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--rubric', 'v2.1'])
+        assert exited.value.code == 2
+        assert '--brief-sha256' in capsys.readouterr().err
+
+    def test_a_corpus_record_with_a_sha256_is_refused_naming_the_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': [
+            {'version': 'v2.2', 'round': 1, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}))
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record),
+                         '--brief-sha256', 'c' * 64])
+        assert exited.value.code == 2
+        assert '--brief-sha256' in capsys.readouterr().err
+
+    @pytest.mark.parametrize(('label', 'sha', 'named'), [
+        ('v2.1', 'xyz', "'xyz'"), ('2.1', 'a' * 64, "'2.1'"),
+    ])
+    def test_a_malformed_label_or_sha256_is_refused_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], label: str, sha: str, named: str,
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--rubric', label, '--brief-sha256', sha])
+        assert exited.value.code == 2
+        assert named in capsys.readouterr().err
+
+    def test_a_corpus_record_names_the_brief_of_its_latest_rerate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': [
+            {'version': 'v2.1', 'round': 1, 'pairs': 2, 'brief_sha256': 'b' * 64},
+            {'version': 'v2.2', 'round': 2, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}))
+        assert _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record)]) == 0
+        printed = json.loads(capsys.readouterr().out)
+        assert (printed['rubric'], printed['brief_sha256']) == ('v2.2', 'c' * 64)
+
+    def test_a_corpus_record_without_a_rerate_is_refused_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': []}))
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record)])
+        assert exited.value.code == 2
+        assert str(record) in capsys.readouterr().err
 
 
 class TestTheItemRowContract:
@@ -212,7 +291,8 @@ class TestTheItemRowContract:
 class TestTheReport:
     def test_states_its_rubric_rules_and_weights(self) -> None:
         report = _report()
-        assert report['rubric'] == SOAK_RUBRIC
+        assert (report['rubric'], report['brief_sha256']) == (
+            _soak_brief().version, _soak_brief().sha256)
         assert set(report['cell_rules']) == {
             'hidden_detail', 'hidden_conflict', 'digest_conflict', 'wrong_home',
             'false_conflict', 'duplicate_clutter', 'orphaned_conflict', 'attached_supersession',
@@ -708,7 +788,7 @@ class TestTheCli:
             '--items', str(_write_jsonl(tmp_path / 'items.jsonl', items)),
             '--verdicts', str(_write_jsonl(tmp_path / 'v1.jsonl', verdicts[:5])),
             str(_write_jsonl(tmp_path / 'v2.jsonl', verdicts[5:])),
-            '--strata', str(strata), '--rubric', SOAK_RUBRIC,
+            '--strata', str(strata), *_soak_brief_flags(),
         ]
 
     def test_prints_the_report_and_writes_both_files(
@@ -742,7 +822,7 @@ class TestTheCli:
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X0', 'P0', home='YES')])
         out, markdown = tmp_path / 'report.json', tmp_path / 'report.md'
         code = _mod().main([
-            '--items', str(items), '--verdicts', str(verdicts), '--rubric', SOAK_RUBRIC,
+            '--items', str(items), '--verdicts', str(verdicts), *_soak_brief_flags(),
             '--out', str(out), '--markdown', str(markdown),
         ])
         assert code == 1
@@ -759,7 +839,7 @@ class TestTheCli:
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
         with pytest.raises(ValueError, match=f'{items}:2'):
             _mod().main(['--items', str(items), '--verdicts', str(verdicts),
-                         '--rubric', SOAK_RUBRIC])
+                         *_soak_brief_flags()])
 
 
 def _table_rows(markdown: str) -> dict[str, list[str]]:
@@ -873,20 +953,30 @@ class TestTheV2ScriptsImportOnlyDownward:
         ('write_triage_reader_rubric', {'write_triage_reader_rubric'}),
         ('score_write_triage_reader', {
             'score_write_triage_reader', 'write_triage_reader_rubric', 'write_triage_stats',
+            'write_triage_rating_rounds',
         }),
         ('write_triage_rating_rounds', {
             'write_triage_rating_rounds', 'write_triage_reader_rubric',
         }),
+        ('mem0_history_at', {'mem0_history_at'}),
+        ('backfill_rating_shard_kinds', {
+            'backfill_rating_shard_kinds', 'write_triage_rating_rounds', 'write_triage_reader_rubric',
+        }),
         ('build_write_triage_v2_soak_baseline', {
             'build_write_triage_v2_soak_baseline', 'write_triage_rating_rounds',
-            'write_triage_reader_rubric',
+            'write_triage_reader_rubric', 'mem0_history_at',
+        }),
+        ('rebuild_write_triage_live_slates', {
+            'rebuild_write_triage_live_slates', 'mem0_history_at', 'write_triage_rating_rounds',
+            'write_triage_reader_rubric', 'freeze_write_triage_population',
+            'eval_write_triage_retrieval', 'calibrate_write_triage', 'eval_write_triage_scoring',
         }),
         ('build_write_triage_eval_set', {
             'build_write_triage_eval_set', 'write_triage_rating_rounds',
             'write_triage_reader_rubric', 'score_write_triage_reader', 'write_triage_stats',
             'run_write_triage_population_arms', 'freeze_write_triage_population',
             'calibrate_write_triage', 'eval_write_triage_retrieval', 'score_write_triage_pairs',
-            'write_triage_judge_wording',
+            'write_triage_judge_wording', 'eval_write_triage_scoring',
         }),
         ('rate_write_triage_cross_family', {
             'rate_write_triage_cross_family', 'build_write_triage_eval_set',
@@ -894,7 +984,7 @@ class TestTheV2ScriptsImportOnlyDownward:
             'write_triage_stats', 'run_write_triage_population_arms',
             'freeze_write_triage_population', 'calibrate_write_triage',
             'eval_write_triage_retrieval', 'score_write_triage_pairs',
-            'write_triage_judge_wording',
+            'write_triage_judge_wording', 'eval_write_triage_scoring',
         }),
     ])
     def test_a_module_loads_exactly_its_downward_closure(
@@ -972,6 +1062,7 @@ class TestTheCommittedSoakBaseline:
         extension = {stratum: counts['extension'] for stratum, counts in sample.items()}
         report = _rescored_baseline()
         assert report['rubric'] == 'v2.1'
+        assert report['brief_sha256'] == _rounds().BRIEF_V2_1_SHA256
         assert report['population']['n_items'] == 553 + sum(extension.values())
         assert report['population']['by_outcome'] == {
             'amended': 40 + extension['amended-sample'], 'contested': 473,
@@ -1019,3 +1110,71 @@ class TestTheCommittedSoakBaseline:
 
     def test_counts_at_least_the_13_parents_edited_after_attach(self) -> None:
         assert _rescored_baseline()['metrics']['m6']['parent_edited'] >= 13
+
+
+class TestItemReadings:
+    """Per-item endings under the scorer's own M3 rule (task 7519)."""
+
+    @staticmethod
+    def _readings() -> dict[str, Any]:
+        items, verdicts = _corpus()
+        items = [item for item in items if item['entry_id'] != 'C5']
+        return {reading.entry_id: reading for reading in _mod().item_readings(items, verdicts)}
+
+    def test_the_hidden_endings_are_the_ones_m3_counts(self) -> None:
+        hidden = _mod().HIDDEN_ENDINGS
+        assert hidden == frozenset({'restated', 'amended', 'stored_unlinked'})
+
+    @pytest.mark.xdist_group('committed_v2_soak_baseline')
+    def test_over_the_committed_soak_they_reproduce_m3(self) -> None:
+        items, verdicts, _ = _committed_inputs()
+        conflict = [
+            reading for reading in _mod().item_readings(items, verdicts)
+            if reading.decided is not None and reading.decided.conflict
+        ]
+        m3 = _rescored_baseline()['metrics']['m3']
+        hidden = [r for r in conflict if r.m3_ending in _mod().HIDDEN_ENDINGS]
+        assert len(hidden) == m3['hits']
+        endings = Counter(reading.m3_ending for reading in conflict)
+        assert {ending: endings[ending] for ending in m3['by_ending']} == m3['by_ending']
+        assert sum(endings.values()) == sum(m3['by_ending'].values())
+
+    def test_each_conflict_write_reads_its_ending(self) -> None:
+        readings = self._readings()
+        assert readings['R3'].m3_ending == 'restated'
+        assert readings['A2'].m3_ending == 'amended'
+        assert readings['C1'].m3_ending == 'contested'
+        assert readings['R3'].stratum == 'r'
+        assert readings['R3'].outcome == 'restated'
+
+    def test_a_non_conflict_or_undecided_write_has_no_ending(self) -> None:
+        items, verdicts = _corpus()
+        readings = {r.entry_id: r for r in _mod().item_readings(items, verdicts)}
+        assert readings['R1'].decided is not None
+        assert not readings['R1'].decided.conflict
+        assert readings['R1'].m3_ending is None
+        assert readings['C5'].decided is None
+        assert readings['C5'].m3_ending is None
+
+    def test_a_stored_conflict_reads_linked_only_when_its_record_is_marked(self) -> None:
+        readings = self._readings()
+        assert readings['S1'].m3_ending == 'stored_linked'
+        assert readings['S2'].m3_ending == 'stored_unlinked'
+
+    def test_a_decisive_tie_refuses_as_score_reader_does(self) -> None:
+        verdicts = [_vote('X', 'P', conflict='YES'),
+                    _vote('X', 'P', rater='sonnet', role='second', conflict='NO', home='YES',
+                          loss='NO')]
+        with pytest.raises(_mod().IncompleteJudgementError) as refusal:
+            _mod().item_readings([_item('X', 'contested', 'P')], verdicts)
+        assert refusal.value.gaps == (('X', 'P', 'conflict', 'tied'),)
+
+    def test_readings_are_sorted_by_entry_id(self) -> None:
+        items, verdicts = _corpus()
+        ids = [reading.entry_id for reading in _mod().item_readings(items[::-1], verdicts)]
+        assert ids == sorted(item['entry_id'] for item in items)
+
+    def test_a_reading_is_frozen(self) -> None:
+        reading = next(iter(self._readings().values()))
+        with pytest.raises(AttributeError):
+            reading.outcome = 'stored'

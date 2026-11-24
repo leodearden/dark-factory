@@ -26,7 +26,7 @@ Three PRD-text drifts are asserted as shipped:
 * Row 3: the CLI's exit 1 is RunnerUnavailable kind ``gate``, not
   ``transport``.  ``remote_gate.py::classify_remote_exit`` (the 6565 Q1
   ruling) keeps ``transport`` for ssh's own 255 and a spawn failure.
-* Row 32: readmission goes through ``SpeculativeMergeWorker.readmit_host``,
+* Row 32: readmission goes through ``merge_lane/host_quarantine.py::HostQuarantine.readmit_host``,
   which replaced ``_readmit_probed_host`` (task 5290).
 * Row 25: the per-module override refusal is logged once per dispatcher, at
   the first dispatch that meets it (``TaskVerifyDispatcher._warn_once``), not
@@ -311,7 +311,7 @@ class TestLaptopCli:
             call = scene.start([scene.module(MODULE, test='sleep 300')])
             request_id = await scene.laptop.until_verifying('verify-task')
             pgf = pgid_file(scene.laptop_worktree_base, request_id)
-            worktree = await scene.until_recorded_cold_worktree(pgf, watching=call)
+            worktree = await scene.until_recorded_cold_worktree(request_id, watching=call)
             pgid = int(pgf.read_text().strip())
 
             call.cancel()

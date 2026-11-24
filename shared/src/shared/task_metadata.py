@@ -36,6 +36,12 @@ from pydantic_core import PydanticCustomError
 
 from shared.cancel_dispositions import CancelDispositionEntry
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
+from shared.followup_hold_records import (
+    FOLLOWUP_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLDER_METADATA_KEY,
+    FollowupHold,
+    FollowupHolder,
+)
 from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
@@ -1211,6 +1217,10 @@ register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardi
 # declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
 register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
 
+# followup_holder, followup_hold: plans/follow-up-filing-shape-prd.md §4.3.
+register_metadata_submodel(FOLLOWUP_HOLDER_METADATA_KEY, FollowupHolder, cardinality='dict')
+register_metadata_submodel(FOLLOWUP_HOLD_METADATA_KEY, FollowupHold, cardinality='dict')
+
 # trigger_chain: plans/completion-driven-triggers-prd.md C2.
 register_metadata_submodel(TRIGGER_CHAIN_KEY, TriggerChain, cardinality='dict')
 
@@ -1261,55 +1271,13 @@ def _migrate_v0_to_v1(blob: dict) -> dict:
     return upgraded
 
 
-# RetryLedger fields that some legacy blobs (pre-2172 placement) still carry
-# as TOP-LEVEL metadata keys instead of nested under metadata.retry_ledger.
-_LEGACY_RETRY_LEDGER_COUNTER_KEYS = (
-    'consecutive_infra_resume_failures',
-    'last_infra_resume_iteration_count',
-)
-
-
 def _migrate_v1_to_v2(blob: dict) -> dict:
-    """v1->v2: lift legacy top-level infra-resume counters into ``retry_ledger``.
+    """v1->v2: stamp ``schema_version=2``.
 
-    ``consecutive_infra_resume_failures`` / ``last_infra_resume_iteration_count``
-    are :class:`RetryLedger` fields, but some legacy blobs still carry them
-    as top-level metadata keys (the live orchestrator writer already nests
-    them correctly; this migration only repairs old data at parse-time).
-
-    If ``retry_ledger`` is absent, any present legacy top-level counters are
-    popped and merged into a new ``retry_ledger`` dict. If ``retry_ledger``
-    is already a dict, it is ALWAYS copied — never the same object as
-    ``blob['retry_ledger']``, even when there are no top-level counters to
-    lift — and any present counters are merged in, with an existing nested
-    value winning on key conflict. If ``retry_ledger`` is present but not a
-    dict (already-malformed data), nothing is lifted or copied — the
-    top-level counters are left as-is and the existing ``invalid_field``
-    warning path (in :func:`parse_metadata`) handles the malformed value.
-    Always stamps ``schema_version=2``. Non-mutating overall, mirroring
-    :func:`_migrate_v0_to_v1`: ``blob`` itself is never modified in place.
+    The retry-ledger counter lift this step once carried was retired by task
+    7135 after the stored blobs were migrated.
     """
     upgraded = dict(blob)
-    present = {key: upgraded[key] for key in _LEGACY_RETRY_LEDGER_COUNTER_KEYS if key in upgraded}
-
-    existing_ledger = upgraded.get('retry_ledger')
-    if isinstance(existing_ledger, dict):
-        # Always copy, even when `present` is empty: the returned ledger
-        # must never be the same object as the caller's nested dict, so a
-        # later in-place mutation of it can never reach back into `blob`.
-        new_ledger = dict(existing_ledger)
-        for key, value in present.items():
-            new_ledger.setdefault(key, value)
-            del upgraded[key]
-        upgraded['retry_ledger'] = new_ledger
-    elif present and existing_ledger is None:
-        new_ledger = dict(present)
-        for key in present:
-            del upgraded[key]
-        upgraded['retry_ledger'] = new_ledger
-    # else: retry_ledger is present but not a dict (malformed) -- leave
-    # everything untouched; no lift, no copy.
-
     upgraded['schema_version'] = 2
     return upgraded
 
@@ -1691,7 +1659,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # ask to be merged ahead of the normal queue. Writers and reader are
         # named because that is what a future reader greps when deciding
         # whether the key is still load-bearing (all re-verified 2026-09-17):
-        # writers `orchestrator/src/orchestrator/merge_queue.py::
+        # writers `orchestrator/src/orchestrator/merge_lane/worker.py::
         # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
         # main-health fix task, 'high'), `orchestrator/src/orchestrator/
         # offline_lane_filing.py::build_lane_fix_task_arguments` and
@@ -1700,8 +1668,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high'),
         # plus the operator tool `escalation/src/escalation/server.py::
         # merge_relane` (task 5246, either value, on every task it re-lanes);
-        # reader `orchestrator/src/orchestrator/merge_queue.py::
-        # lane_for_task_metadata` -> `intake.py::normalize_lane`, consumed at
+        # reader `orchestrator/src/orchestrator/merge_lane/worker.py::
+        # lane_for_task_metadata` ->
+        # `orchestrator/src/orchestrator/merge_lane/intake.py::normalize_lane`,
+        # consumed at
         # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
         # _submit_to_merge_queue` to set `MergeRequest.lane` and -- as of this
         # task -- by `escalation/src/escalation/merge_lane_resolution.py::

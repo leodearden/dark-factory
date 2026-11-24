@@ -258,7 +258,7 @@ worktree, and return a structured JSON verdict.
 You MUST output ONLY valid JSON matching the schema provided by the
 --json-schema flag. No markdown fences, no prose outside the JSON.
 """,
-    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS],
     disallowed_tools=['Edit', 'Write'],
     default_model='sonnet',
     default_budget=0.50,
@@ -1722,7 +1722,7 @@ would become the floor for full-workflow cells, and it would fabricate a 100%
 Code: `orchestrator/src/orchestrator/evals/eval_gate.py`
 (`build_eval_usage_gate`, `owned_usage_gate`, `campaign_usage_gate`,
 `GATE_UNSET`, `InjectedGate`). Consumers:
-`runner.py`'s three executors and stage fan-outs, `cli.py::_run_single_eval`
+`runner.py`'s three executors and stage fan-outs, `evals/cli.py::_run_single_eval`
 and `reviewer_trial/__main__.py::campaign`.
 
 **Why an eval invoke is gated at all (eval-revival φ).** Ungated, a capped
@@ -1807,7 +1807,7 @@ build, yield and teardown have one implementation. It builds from
 `EVAL_PROFILE` nor the update dict mentioning `usage_cap`. The leaf is
 inherited verbatim and the campaign gate is identical to the one each cell
 would have built. That equivalence is emergent across two files, so
-`test_eval_architect.py::TestCampaignGatePremise` pins it as a tripwire. A
+`test_eval_architect_usage_gate.py::TestCampaignGatePremise` pins it as a tripwire. A
 `None` base config yields `None` without building: there is nothing to build
 from, and every stage function defaults it. A `None` yield, from that or from
 a degraded build, must be threaded to cells as an explicit `usage_gate=None`,

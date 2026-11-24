@@ -9,13 +9,14 @@ boundary test B10.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
 from pydantic import ValidationError
 
 from orchestrator.config import GitConfig
@@ -26,32 +27,11 @@ from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    """Temporary git repository with an initial commit.
-
-    Pre-creates the default warm-lane base and pool-storage sentinel so
-    tests that go through acquire_warm_lane()/create_worktree() see a
-    healthy base and mounted pool storage — mirrors
-    test_warm_lane_disk_guard.py's git_repo fixture verbatim (this test
-    file is self-contained per the task-2443 plan).
-    """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    """Temporary git repository with an initial commit + a resolvable warm base."""
+    repo = seed_repo(tmp_path / 'repo')
+    seed_default_warm_base(repo)
     return repo
 
 

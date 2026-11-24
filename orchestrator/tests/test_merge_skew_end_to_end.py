@@ -36,8 +36,8 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition
 from orchestrator.merge_lane.gates import _MAX_EVENT_EVIDENCE_ITEMS
+from orchestrator.merge_lane.verify_failure_outcome import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_PROBE_PENDING_NOTE,
     InflightEntry,
     MergeOutcome,
     MergeRequest,
@@ -369,7 +369,7 @@ async def _finalize_via_real_worker(
     entry = InflightEntry(
         item=item,
         lease=lease,
-        verify_task=asyncio.ensure_future(worker._run_inflight_verify(item, lease)),
+        verify_task=asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease)),
         merge_wt=None,
         was_speculative=False,
     )
@@ -412,7 +412,7 @@ def _assert_evidence_bounded(data: dict) -> None:
 
 class TestFirstAttemptSkewFailureDiagnostic:
     """A first-attempt integration-skew failure — driven through the REAL
-    SpeculativeMergeWorker._run_inflight_verify — must surface disposition
+    VerifyDispatcher.run_inflight_verify — must surface disposition
     and failure_diagnostic on the delivered MergeOutcome verbatim.  This is
     exactly what the escalation server's merge_request response builder
     (server.py ~1169-1170: ``if outcome.failure_diagnostic is not None:
@@ -433,7 +433,7 @@ class TestFirstAttemptSkewFailureDiagnostic:
                 tmp_path, repo, topology, future,
                 merged_branch_tip=topology['branch_tip_sha'],
             )
-            result = await worker._run_inflight_verify(item, lease)
+            result = await worker.verify_dispatch.run_inflight_verify(item, lease)
             return result.outcome
 
         outcome = asyncio.run(_run())
@@ -512,7 +512,7 @@ class TestFirstAttemptSkewL1Escalation:
                 tmp_path, repo, topology, future,
                 merged_branch_tip=topology['branch_tip_sha'],
             )
-            vr = await worker._run_inflight_verify(item, lease)
+            vr = await worker.verify_dispatch.run_inflight_verify(item, lease)
             outcome = vr.outcome
             assert outcome is not None
             assert outcome.disposition == MergeFailureDisposition.INTEGRATION_SKEW
@@ -621,7 +621,7 @@ class TestFirstAttemptSkewMergeAttemptDisposition:
         self, tmp_path: Path,
     ) -> None:
         """merged_branch_tip=None -> base facts absent -> classification is
-        skipped inside _run_post_merge_verify (I3) -> disposition stays the
+        skipped inside run_post_merge_verify (I3) -> disposition stays the
         MergeOutcome default INDETERMINATE -> the guarded step-18 emit must
         NOT fire (byte-identical to pre-β behaviour on this branch).
 
@@ -884,7 +884,7 @@ class TestReviewBounceStaleGreenTradeoff:
                 tmp_path, repo, topology, future,
                 merged_branch_tip=topology['post_bounce_sha'],
             )
-            result = await worker._run_inflight_verify(item, lease)
+            result = await worker.verify_dispatch.run_inflight_verify(item, lease)
             return result.outcome
 
         outcome = asyncio.run(_run())
@@ -921,7 +921,7 @@ class TestShippedMainHealthConfiguration:
     patch.  That knob defaults to True in ``config.py``, so without this case
     the module — whose whole stated value is that everything except the scoped
     verify runs against real production code — would never touch the shipped
-    configuration, and the deferred-probe arm of ``_run_post_merge_verify``
+    configuration, and the deferred-probe arm of ``run_post_merge_verify``
     would be unreachable from here.
 
     The probe is made CHEAP, not fake: ``get_main_sha()`` fail-opens to ``''``,

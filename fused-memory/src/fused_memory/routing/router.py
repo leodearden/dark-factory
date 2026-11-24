@@ -10,7 +10,7 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import QueryType, SourceStore
 from fused_memory.models.memory import ReadRouteResult
 from fused_memory.routing.json_extract import extract_json
-from fused_memory.routing.openai_client import LazyOpenAIClient
+from fused_memory.routing.openai_client import LazyOpenAIClient, routing_chat_params
 
 logger = logging.getLogger(__name__)
 
@@ -146,16 +146,14 @@ class ReadRouter:
 
     async def _llm_route(self, query: str) -> ReadRouteResult:
         """Use LLM to classify the query type."""
-        client = self._openai.get()
         try:
+            client = self._openai.get()
             response = await client.chat.completions.create(
-                model=self.config.llm.model,
                 messages=[
                     {'role': 'system', 'content': ROUTING_SYSTEM_PROMPT},
                     {'role': 'user', 'content': query[:1000]},
                 ],
-                temperature=0.0,
-                max_tokens=256,
+                **routing_chat_params(self.config),
             )
             raw = response.choices[0].message.content or ''
 

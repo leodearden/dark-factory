@@ -54,6 +54,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict, TypeVar
 
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cancel_dispositions import sibling_lookup_values
 from shared.cli_invoke import (
     AgentResult,
@@ -501,34 +502,40 @@ the answer is "create", not a half-hearted combine.
 
 _BATCH_CONTRACT = _CURATOR_CONTRACT + """
 
-## Within-batch duplicates
+## Within-batch duplicates and combines
 
 When you are given a BATCH of N candidates in a single call (sections labelled
 `# Candidate batch_index=0`, `# Candidate batch_index=1`, …), use the following
-additional rules for duplicates that exist WITHIN the batch:
+additional rules for duplicates and combines that exist WITHIN the batch:
 
 1. **Drop to a sibling candidate**: if candidate A is a duplicate of another
    candidate B in this batch (neither has been materialised as a task yet), emit
    `action='drop'` for A and set `batch_target_index=<B's batch_index>`.  Leave
    `target_id` null in this case — there is no existing pool task to reference.
 
-2. **Combine between two new batch items is NOT supported**: "combine" rewrites
-   an *existing* task; two candidates that are both new cannot combine with each
-   other.  Instead, choose one to "create" and emit `action='drop'` with
-   `batch_target_index` pointing at it for the other.
+2. **Combine into a sibling candidate**: if candidate A should be folded into
+   another candidate B in this batch, emit `action='combine'` for A with
+   `batch_target_index=<B's batch_index>` and `target_id` null.  Set
+   `target_fingerprint` to B's title, copied verbatim from the `title:` line of
+   its `# Candidate batch_index=<B>` section, and set `rewritten_task` to the
+   unified task subsuming both: B is created first, then rewritten with it.
+   B's own decision MUST be "create": never combine into a sibling you drop or
+   combine.  Such a combine is not applied, and A is created on its own.
 
-3. **batch_target_index must be valid**: the value MUST reference a *different*
-   candidate index that appears within the batch (0 ≤ batch_target_index < N,
-   batch_target_index ≠ candidate_index).  Do not emit cycles (A→B and B→A).
+3. **batch_target_index must be valid**: on a drop or a combine edge, the value
+   MUST reference a *different* candidate index that appears within the batch
+   (0 ≤ batch_target_index < N, batch_target_index ≠ candidate_index).  Do not
+   emit cycles of drop or combine edges (A→B and B→A).
 
-4. For non-duplicate candidates, batch_target_index MUST be null.
+4. For every decision that is not a drop or combine onto a sibling candidate,
+   batch_target_index MUST be null.
 """
 
 # Bumped whenever _CURATOR_CONTRACT/_BATCH_CONTRACT change materially, so a
 # stale per-(prompt, model, harness) pinned artifact stops resolving and
 # falls back to the (new) in-code baseline instead of pairing new heuristics
 # with an outdated contract assumption.
-_CURATOR_PROMPT_HARNESS_VERSION = 'curator-v1'
+_CURATOR_PROMPT_HARNESS_VERSION = 'curator-v2'
 
 CURATOR_SINGLE_SPEC = PromptSpec(
     prompt_id='curator_single', contract=_CURATOR_CONTRACT, baseline_heuristics=_CURATOR_HEURISTICS,
@@ -2855,6 +2862,9 @@ class TaskCurator:
             timeout_seconds=call.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
             park_on_frozen_pool=False,
+            work_class=WorkClass(
+                kind=WorkKind.ESSENTIAL, project_id=call.project_id, role=call.ledger_role,
+            ),
             **self._ledger_kwargs(call.ledger_role),
             **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
@@ -3404,8 +3414,8 @@ def _parse_decision_dict(
     if target_fingerprint is not None:
         target_fingerprint = str(target_fingerprint)
 
-    # batch_target_index: valid only for 'drop'; carries the sibling index when
-    # the candidate is a duplicate of another batch item (not yet materialised).
+    # batch_target_index: valid only on a batch edge (a drop or combine onto a
+    # sibling batch item not yet materialised); it carries the sibling's index.
     # Wrap int() coercion: if the LLM emits a non-numeric string or other
     # schema-drifted value, treat it as absent (degrade gracefully like every
     # other invalid field in this parser) rather than raising ValueError out
@@ -3421,16 +3431,22 @@ def _parse_decision_dict(
             batch_target_index = None
 
     # Safety: drop/combine must reference a pool task id that actually exists,
-    # UNLESS this is a within-batch drop (batch_target_index set, target_id None).
+    # UNLESS it is a batch edge onto a sibling (batch_target_index set,
+    # target_id None).  Only a batch edge keeps its batch_target_index.
+    is_batch_edge = (
+        action in ('drop', 'combine')
+        and batch_target_index is not None
+        and target_id is None
+    )
     valid_ids = {e.task_id for e in pool}
     if action in ('drop', 'combine'):
         # Guard: LLM emitted BOTH a pool target_id and a within-batch
         # batch_target_index.  We cannot resolve the intent safely, so degrade.
-        if action == 'drop' and batch_target_index is not None and target_id is not None:
+        if batch_target_index is not None and target_id is not None:
             return CuratorDecision(
                 action='create',
                 justification=(
-                    f'ambiguous-drop: both target_id={target_id!r} and '
+                    f'ambiguous-{action}: both target_id={target_id!r} and '
                     f'batch_target_index={batch_target_index} set; '
                     'cannot determine intent'
                 ),
@@ -3439,12 +3455,7 @@ def _parse_decision_dict(
                 cost_usd=cost_usd,
                 degraded=True,
             )
-        is_within_batch_drop = (
-            action == 'drop'
-            and batch_target_index is not None
-            and target_id is None
-        )
-        if not is_within_batch_drop:
+        if not is_batch_edge:
             # Two causes, two branches: they fall on opposite sides of the
             # degraded line (see CuratorDecision.degraded).
             if not target_id:
@@ -3552,7 +3563,7 @@ def _parse_decision_dict(
         pool_sizes=pool_sizes,
         latency_ms=latency_ms,
         cost_usd=cost_usd,
-        batch_target_index=batch_target_index,
+        batch_target_index=batch_target_index if is_batch_edge else None,
     )
 
 
@@ -3691,12 +3702,15 @@ def _parse_batch_decisions(
             )
         results.append(decision)
 
-    # --- Post-parse: validate and sanitize batch_target_index references ---
+    # --- Post-parse: validate and sanitize batch edges (drop or combine) ---
+    # Only a batch edge carries batch_target_index after _parse_decision_dict.
+    # Whether the edge's target sibling is itself created is judged at
+    # dispatch, which sees the sibling's real outcome, not here.
     # 1. Out-of-range or self-referential batch_target_index → degrade to create.
     # 2. Cycle detection: walk the graph of i → batch_target_index[i]; any node
     #    that is part of a cycle is degraded to create with 'batch-cycle'.
     for i, d in enumerate(results):
-        if d.action == 'drop' and d.batch_target_index is not None:
+        if d.batch_target_index is not None:
             bti = d.batch_target_index
             if bti == i or not (0 <= bti < n):
                 results[i] = CuratorDecision(
@@ -3711,7 +3725,7 @@ def _parse_batch_decisions(
                     degraded=True,
                 )
 
-    # Build the directed graph for cycle detection (only batch-drop edges).
+    # Build the directed graph for cycle detection (every batch edge).
     def _find_cycle_members() -> set[int]:
         """Return the set of indices that participate in any cycle.
 
@@ -3736,7 +3750,7 @@ def _parse_batch_decisions(
             colour[node] = 1
             path.append(node)
             d = results[node]
-            if d.action == 'drop' and d.batch_target_index is not None:
+            if d.batch_target_index is not None:
                 target = d.batch_target_index
                 if 0 <= target < n and target != node:
                     dfs(target, path)

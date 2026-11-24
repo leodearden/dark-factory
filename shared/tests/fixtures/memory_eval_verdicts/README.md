@@ -73,10 +73,11 @@ includes a value, a stamp or prose, so a persisting regression keeps its
 fingerprint across runs and a recovered item's `no_alarm` entry carries the
 same fingerprint as its still-open escalation.
 
-`dashboard/src/dashboard/data/memory_evals.py` renders one metric row per
-entry, keyed `(eval_id, metric_id, item | none)`, so each tripwire item is its
-own row. Its parity suite, `dashboard/tests/test_memory_evals_parity.py`, reads
-these exemplars.
+`dashboard/src/dashboard/data/memory_evals.py` renders one row per metric,
+with one `verdicts` entry per fingerprint identity, keyed
+`(eval_id, metric_id, item | none)`, so each tripwire item is its own entry
+under its metric's row. Its parity suite,
+`dashboard/tests/test_memory_evals_parity.py`, reads these exemplars.
 
 ## Fingerprints are opaque
 

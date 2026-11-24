@@ -85,9 +85,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'shared' / 'src', _REPO_ROOT / 'scripts'):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
-# legibility/coder.py imports its sibling as a bare `codebook`; appended last so no flat legibility module shadows anything.
-if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
-    sys.path.append(str(_REPO_ROOT / 'scripts' / 'legibility'))
 
 from legibility import account_pool  # noqa: E402
 from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6760
@@ -97,6 +94,7 @@ from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6
     set_backend,
     wrap_command,
 )
+from shared.account_reserve import WorkClass, WorkKind  # noqa: E402  # debt: task 6760
 from shared.cli_invoke import (  # noqa: E402  # debt: task 6760
     AgentResult,
     AllAccountsCappedException,
@@ -233,11 +231,17 @@ class TimedOut:
 
 @dataclass(frozen=True)
 class PoolExhausted:
-    """No seat could take the run: every one capped or rejecting its credentials, as the gate held them at the end."""
+    """No seat could take the run: every one capped or rejecting its credentials, as the gate held them at the end.
+
+    *reserved_account* is set when the one open seat is the allowance reserve, refused to this
+    background run until *release_at*.
+    """
 
     capped: tuple[str, ...]
     auth_failed: tuple[str, ...]
     earliest_reset: datetime | None
+    reserved_account: str | None = None
+    release_at: datetime | None = None
 
 
 Ending = AgentResult | TimedOut | PoolExhausted
@@ -328,16 +332,27 @@ async def _invoke_on_pool(gate: UsageGate, *, timeout_secs: float, **invoke_kwar
         async with deadline:
             return await invoke_with_cap_retry(
                 gate, 'nightly_prepare', max_cap_retries=gate.account_count, park_on_frozen_pool=False,
+                work_class=WorkClass(kind=WorkKind.BACKGROUND, role='nightly_prepare'),
                 **invoke_kwargs,
             )
     except TimeoutError:
         if not deadline.expired():
             raise
         return TimedOut(timeout_secs)
-    except (AllAccountsCappedException, PoolFrozen):
-        return PoolExhausted(gate.capped_account_names, gate.auth_failed_account_names, gate.soonest_resets_at)
+    except PoolFrozen as frozen:
+        return _pool_exhausted(gate, frozen)
+    except AllAccountsCappedException as exc:
+        return _pool_exhausted(gate, exc.pool_frozen)
     finally:
         await gate.shutdown()
+
+
+def _pool_exhausted(gate: UsageGate, frozen: PoolFrozen | None) -> PoolExhausted:
+    return PoolExhausted(
+        gate.capped_account_names, gate.auth_failed_account_names, gate.soonest_resets_at,
+        reserved_account=None if frozen is None else frozen.reserved_account,
+        release_at=None if frozen is None else frozen.release_at,
+    )
 
 
 def _spawn_command(claude: str, root: Path, grants: Sequence[Path]) -> Callable[[list[str]], list[str]]:
@@ -434,7 +449,7 @@ def _judge(ending: Ending, settings: Settings, outcome: Outcome) -> int:
         return EXIT_FAILED
     if isinstance(ending, PoolExhausted):
         reset = ending.earliest_reset.isoformat() if ending.earliest_reset else 'unknown'
-        _log(f'no pool account could take the run: capped [{", ".join(ending.capped)}], '
+        _log(f'no pool account could take the run: {_reserve_refusal(ending)}capped [{", ".join(ending.capped)}], '
              f'auth-failed [{", ".join(ending.auth_failed)}]; earliest reset {reset} ({run_label})')
         return EXIT_FAILED
     if not ending.success:
@@ -449,6 +464,13 @@ def _judge(ending: Ending, settings: Settings, outcome: Outcome) -> int:
         return EXIT_FAILED
     print(f'nightly_prepare: done ({summary}): {verdict}')
     return EXIT_OK
+
+
+def _reserve_refusal(ending: PoolExhausted) -> str:
+    if ending.reserved_account is None:
+        return ''
+    until = ending.release_at.isoformat() if ending.release_at else 'its release'
+    return f'the reserve {ending.reserved_account} is refused to background work until {until}; '
 
 
 def _tails(result: AgentResult) -> str:

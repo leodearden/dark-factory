@@ -16,6 +16,13 @@ from pydantic_settings import (
 from shared.config_models import UsageCapConfig
 
 from fused_memory.config.checkout_anchor import anchor_at_checkout
+from fused_memory.config.overlay import (
+    OVERLAY_ENV_VAR,
+    PROVENANCE_FIELD,
+    ConfigOverlayProvenance,
+    load_overlay,
+    merge_overlay,
+)
 from fused_memory.config.retired_keys import drop_retired_keys
 
 # The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
@@ -102,6 +109,15 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         return (None, field_name, False)
 
     def __call__(self) -> dict[str, Any]:
+        base = self._load_base()
+        overlay = load_overlay(os.environ, self.settings_cls)
+        if overlay is None:
+            return base
+        merged = merge_overlay(base, self._expand(overlay.data, overlay.provenance.path))
+        merged[PROVENANCE_FIELD] = overlay.provenance.model_dump()
+        return merged
+
+    def _load_base(self) -> dict[str, Any]:
         if not self.config_path.exists():
             return {}
         try:
@@ -109,12 +125,42 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
                 raw_config = yaml.safe_load(f) or {}
         except (yaml.YAMLError, OSError) as e:
             raise RuntimeError(f'Failed to load configuration from {self.config_path}: {e}') from e
+        if isinstance(raw_config, dict) and PROVENANCE_FIELD in raw_config:
+            raise _provenance_forged(str(self.config_path))
+        return self._expand(raw_config, self.config_path)
+
+    def _expand(self, raw_config: Any, source: Path | str) -> Any:
         try:
             return self._expand_env_vars(raw_config)
         except Exception as e:
             raise RuntimeError(
-                f'Failed to expand environment variables in {self.config_path}: {e}'
+                f'Failed to expand environment variables in {source}: {e}'
             ) from e
+
+
+def _provenance_forged(source: str) -> RuntimeError:
+    return RuntimeError(
+        f'{source} sets the reserved key {PROVENANCE_FIELD!r}. Only the loader writes '
+        f'it, from the overlay {OVERLAY_ENV_VAR} names; remove it from {source}.'
+    )
+
+
+class _ProvenanceRefusingSource(PydanticBaseSettingsSource):
+    """``inner``'s values, refused whole if they set the loader-only provenance field."""
+
+    def __init__(self, inner: PydanticBaseSettingsSource, source: str) -> None:
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+        self._source = source
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = self._inner()
+        if PROVENANCE_FIELD in values:
+            raise _provenance_forged(self._source)
+        return values
 
 
 # --- Shared leaf normalisers ---
@@ -450,11 +496,44 @@ class RoutingConfig(BaseModel):
             'llm.providers.openai.api_key. Restart-only, like openai_api_url.'
         ),
     )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "The routing LLM's own model. None or blank INHERITS llm.model. A set "
+            'model is a pin that never inherits an endpoint: it requires both '
+            'openai_api_url and openai_api_key, else routing degrades to its '
+            'non-LLM path (routing/openai_client.py::routing_endpoint). '
+            'Restart-only, like openai_api_url.'
+        ),
+    )
+    reasoning_effort: Literal['low', 'medium', 'high'] | None = Field(
+        default=None,
+        description=(
+            'The reasoning effort the routing call sends to the pinned '
+            'routing.model, which it requires: an effort on the inherited '
+            'llm.model is refused at load. None KEEPS the non-reasoning '
+            'request: temperature 0.0 and max_tokens. Set, it is sent with '
+            'max_completion_tokens and no temperature '
+            '(routing/openai_client.py::routing_chat_params). Restart-only, '
+            'like openai_api_url.'
+        ),
+    )
 
-    @field_validator('openai_api_url', 'openai_api_key')
+    @field_validator('openai_api_url', 'openai_api_key', 'model')
     @classmethod
     def _blank_leaf_inherits(cls, value: str | None) -> str | None:
         return blank_means_inherit(value)
+
+    @model_validator(mode='after')
+    def _effort_needs_a_pinned_model(self) -> 'RoutingConfig':
+        """The API refuses reasoning_effort for a non-reasoning model, and the routing layer degrades
+        every such call to its non-LLM path, so an effort on the inherited llm.model fails at load."""
+        if self.reasoning_effort is not None and self.model is None:
+            raise ValueError(
+                f'routing.reasoning_effort {self.reasoning_effort!r} requires routing.model; '
+                'an effort is never sent to the inherited llm.model',
+            )
+        return self
 
 
 # --- Queue ---
@@ -660,7 +739,24 @@ class TaskMetadataConfig(BaseModel):
     )
 
 
+class FollowupHoldConfig(BaseModel):
+    """The follow-up hold (plans/follow-up-filing-shape-prd.md §3 decision 12)."""
+
+    backfill_enabled: bool = Field(
+        default=True,
+        description=(
+            'RESTART-ONLY: when True, each fused-memory start holds every pending '
+            'follow-up the hold rule matches behind its project\'s holder, once per '
+            'known project, before the server serves (server/main.py::'
+            'backfill_followup_holds_at_startup). A second start adds nothing.'
+        ),
+    )
+
+
 # --- Mem0 metadata write-boundary validation (task 3195, leaf β) ---
+
+_RETIRED_MEMORY_METADATA_KEYS: frozenset[str] = frozenset({'enforce_kind_registry'})
+
 
 class MemoryMetadataConfig(BaseModel):
     """Governs ``MemoryService``'s write-boundary validation of Mem0 ``metadata``.
@@ -676,13 +772,17 @@ class MemoryMetadataConfig(BaseModel):
 
     ``extra='forbid'`` so a mistyped leaf fails loud at config load/reload
     rather than silently doing nothing: under ``extra='ignore'`` an operator
-    who typed ``enforce_kind_regsitry`` would get a silently-dropped key and
-    believe enforcement was on.
+    who typed ``enfroce`` would get a silently-dropped key and believe
+    enforcement was on.
+
+    ``enforce_kind_registry`` was retired by task 5266 (PRD §10 OQ1 option
+    (b): ``kind`` membership never rejects); a config still carrying it loads with a
+    ``retired key(s)`` WARNING.
 
     Reload tier: ``reload.py``'s ``RELOADABLE_FIELDS`` is an opt-IN allowlist,
     so every leaf here is restart-required by default and none is listed. That
-    is correct for BOTH pairs, not just the enforce flags — the storm-tuning
-    leaves are read once when ``MemoryService.__init__`` constructs the
+    is correct for the ``enforce`` flag and the storm-tuning leaves alike —
+    the storm-tuning leaves are read once when ``MemoryService.__init__`` constructs the
     ``UnknownKeyStormDetector``, so they are captured by value and a hot
     reload genuinely would not take effect. Allowlisting them would advertise
     a reload that silently does nothing.
@@ -697,21 +797,6 @@ class MemoryMetadataConfig(BaseModel):
             'validation violations emit a memory_metadata.schema_warning log '
             'line and the write proceeds; True rejects the write with '
             'MemoryMetadataValidationError. Not hot-reloadable.'
-        ),
-    )
-    enforce_kind_registry: bool = Field(
-        default=False,
-        description=(
-            'RED-TIER / restart-only: whether an unknown metadata.kind is '
-            'FATAL (rejectable) rather than census-only. Carved out from '
-            "`enforce` and left OFF even after `enforce` flips, because it is "
-            'specifically this check whose safety premise leaf α measured '
-            'FALSE: PRD D3 assumed kind writers are in-repo code + prompts, '
-            'but 242 of the 329 live kind values are singletons, i.e. the '
-            'population is agent-invented free text and open in practice. '
-            'Flipping this on day one would turn every newly invented kind '
-            'into a hard memory-write failure on the live fleet. See PRD §10 '
-            'open question 1. Not hot-reloadable.'
         ),
     )
     unknown_key_storm_threshold: int = Field(
@@ -743,6 +828,11 @@ class MemoryMetadataConfig(BaseModel):
             'the detector.'
         ),
     )
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        return drop_retired_keys(data, section='memory_metadata', retired=_RETIRED_MEMORY_METADATA_KEYS)
 
 
 # --- Task status transition authority (task 2175, rho1b) ---
@@ -2722,10 +2812,12 @@ def _default_curator_usage_cap() -> UsageCapConfig:
     )
 
 
-#: The reasoning efforts the write-triage judge may send on the Responses API.
-#: The single home of that vocabulary: the judge's resolver reads it with
-#: ``typing.get_args`` rather than restating the words.
-JudgeReasoningEffort = Literal['none', 'low', 'medium', 'high']
+#: The reasoning efforts a caller may send on the OpenAI Responses API.
+#: The single home of that vocabulary: the write-triage judge's resolver reads
+#: it with ``typing.get_args`` rather than restating the words.
+ReasoningEffort = Literal['none', 'low', 'medium', 'high']
+#: The write-triage judge's name for :data:`ReasoningEffort`.
+JudgeReasoningEffort = ReasoningEffort
 
 
 def _require_cutoffs_in_unit_range(
@@ -2845,7 +2937,7 @@ class WriteTriageConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            'Attach-guard HOIST GAP (task 7158): in the judge band only, refuse '
+            'Attach-guard HOIST GAP (task 7158): on judged writes only, refuse '
             'to hoist a write from the matched child to its parent when the '
             "parent's cosine to the write is more than this below the child's; "
             'the write is stored standalone instead, never filed under the '
@@ -2861,7 +2953,7 @@ class WriteTriageConfig(BaseModel):
     # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
     # they ship with real defaults, and None on the inheriting leaves means
     # "follow llm.*", never "uncalibrated". Every judge_* leaf is green-tier
-    # hot-reloadable and read LIVE per middle-band write by
+    # hot-reloadable and read LIVE per judged write by
     # server/write_triage_judge.py's resolvers — nothing is captured at import
     # or construction, which is what makes the registration in
     # config/reload.py real rather than restart-only in disguise.
@@ -2869,10 +2961,13 @@ class WriteTriageConfig(BaseModel):
     judge_enabled: bool = Field(
         default=True,
         description=(
-            "Kill switch for write triage's LLM judge arm — the middle band "
-            'between t_low and t_high. While False that band answers `stored` '
-            'without an LLM call, exactly as leaf beta\'s deliberate stub did, '
-            'and the deterministic bands keep running. Defaults TRUE, unlike '
+            "Kill switch for write triage's LLM judge arm, which judges every "
+            'write from t_low up except a near-verbatim restatement (task 7155). '
+            'While False those writes answer `stored` without an LLM call, '
+            'exactly as leaf beta\'s deliberate stub did, so the high band no '
+            'longer files `restated` without the judge; the near-verbatim '
+            '`restated` path and the below-t_low `stored` band keep running. '
+            'Defaults TRUE, unlike '
             'the `enabled` sibling above, and the asymmetry is deliberate: the '
             'judge is structurally INERT while write_triage.enabled is false '
             '(no triage code executes at all), so it costs nothing on the '
@@ -2881,7 +2976,7 @@ class WriteTriageConfig(BaseModel):
             'get stub behaviour, and read the resulting all-`stored` ack stream '
             'as evidence that the corpus is novel. Its real purpose is stopping '
             'an in-flight JUDGE incident (spend, latency, a bad model) while '
-            'leaving the deterministic bands running, which is a strictly finer '
+            'leaving the deterministic paths running, which is a strictly finer '
             'lever than `enabled` and green-tier for the same reason.'
         ),
     )
@@ -2917,10 +3012,21 @@ class WriteTriageConfig(BaseModel):
             "the judge's SDK base_url for whichever provider arm the judge "
             'resolves, and nothing else reads it: the main LLM arm keeps '
             'llm.providers.*.api_url, and add_memory auto-classification uses '
-            'routing.openai_api_url, which inherits it. The '
-            'api_key still comes from the provider section. Blank means '
+            'routing.openai_api_url, which inherits it. Its key is '
+            "judge_api_key's, which inherits on its own. Blank means "
             'inherit. Green-tier hot-reloadable, read live per judge call. See '
             "plans/write-triage-flip-readiness-prd.md C1' (task σ)."
+        ),
+    )
+    judge_api_key: str | None = Field(
+        default=None,
+        description=(
+            "The judge's OWN API key. None or blank INHERITS "
+            'llm.providers.<resolved judge provider>.api_key, and through it '
+            "the SDK's environment fallback. When set it is the judge's SDK "
+            'client api_key and nothing else reads it: the main LLM arm and '
+            'routing keep their own keys. Green-tier hot-reloadable, read live '
+            'per judge call.'
         ),
     )
     judge_timeout_seconds: float = Field(
@@ -3079,10 +3185,10 @@ class WriteTriageConfig(BaseModel):
         ),
     )
 
-    @field_validator('judge_api_url')
+    @field_validator('judge_api_url', 'judge_api_key')
     @classmethod
-    def _blank_judge_api_url_inherits(cls, value: str | None) -> str | None:
-        """A blank endpoint is stored as None, the leaf's one spelling of inherit.
+    def _blank_judge_endpoint_leaf_inherits(cls, value: str | None) -> str | None:
+        """A blank endpoint leaf is stored as None, its one spelling of inherit.
 
         The judge's resolver applies the same rule at use; normalising here
         too means a reload of a blank value reports null rather than an
@@ -3631,6 +3737,94 @@ class ConsolidationAutoConfig(BaseModel):
             'hot-reloadable.'
         ),
     )
+    max_adjudications_per_cycle: int = Field(
+        default=6,
+        ge=0,
+        description=(
+            'The ranked slice and the cap on adjudicator calls per cycle, read '
+            "by task γ's executor. 0 makes no call. Green-tier hot-reloadable. "
+            'plans/consolidation-adjudicator-prd.md K4, K7.'
+        ),
+    )
+    adjudicator_model: str = Field(
+        default='gpt-6.1-sol',
+        min_length=1,
+        description=(
+            'OpenAI model the consolidation adjudicator calls; part of its '
+            'identity, so a change recalibrates. Read by '
+            'reconciliation/consolidation_adjudicator.py. Green-tier '
+            'hot-reloadable. plans/consolidation-adjudicator-prd.md K3, K7.'
+        ),
+    )
+    adjudicator_reasoning_effort: ReasoningEffort | None = Field(
+        default='low',
+        description=(
+            "The adjudicator model's reasoning effort, or null for a "
+            'non-reasoning model; part of its identity. Read by '
+            'reconciliation/consolidation_adjudicator.py. Green-tier '
+            'hot-reloadable. plans/consolidation-adjudicator-prd.md K3, K7.'
+        ),
+    )
+    adjudicator_timeout_seconds: float = Field(
+        default=60,
+        gt=0,
+        description=(
+            'Per-call timeout of the adjudicator; deliberately outside its '
+            'identity. Read by reconciliation/consolidation_adjudicator.py. '
+            'Green-tier hot-reloadable. plans/consolidation-adjudicator-prd.md '
+            'K3, K7, §12 Q3.'
+        ),
+    )
+    adjudicator_field_chars: int = Field(
+        default=4000,
+        gt=0,
+        description=(
+            "Characters of each member's text the adjudicator is shown; part "
+            'of its identity. Read by reconciliation/consolidation_adjudicator.py. '
+            'Green-tier hot-reloadable. plans/consolidation-adjudicator-prd.md K3, K7.'
+        ),
+    )
+    adjudicator_member_max: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            'Most members a proposal may carry to the adjudicator, the largest '
+            'cluster the eval set measures; at least member_min (enforced '
+            'below) and part of the identity. Read by the adjudicator, '
+            'reconciliation/consolidation_adjudicator_calibration.py and task '
+            "γ's executor. Green-tier hot-reloadable. "
+            'plans/consolidation-adjudicator-prd.md K1, K7.'
+        ),
+    )
+    outcome_retention_days: int = Field(
+        default=90,
+        gt=0,
+        description=(
+            "Days a non-executed proposal outcome is kept, read by task γ's "
+            'executor. Green-tier hot-reloadable. '
+            'plans/consolidation-adjudicator-prd.md K6, K7.'
+        ),
+    )
+    memo_days: int = Field(
+        default=30,
+        gt=0,
+        description=(
+            'Days an original decision is reused for the same members, read by '
+            "task γ's executor. Green-tier hot-reloadable. "
+            'plans/consolidation-adjudicator-prd.md K4, K7.'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _adjudicator_member_max_admits_member_min(self):
+        """Reject an adjudicator size bound no proposal could ever satisfy."""
+        if self.member_min > self.adjudicator_member_max:
+            raise ValueError(
+                f'consolidation_auto.member_min ({self.member_min}) must be <= '
+                f'adjudicator_member_max ({self.adjudicator_member_max}); an '
+                'inverted range refuses every proposal before the adjudicator.',
+            )
+        return self
 
     @model_validator(mode='after')
     def _member_range_is_coherent(self):
@@ -3652,7 +3846,7 @@ class ConsolidationAutoConfig(BaseModel):
 
 class LinkHealConfig(BaseModel):
     """Caps, storm escapes, adjudicator knobs and the scheduled sweep for link
-    healing (tasks 6181, 6184, 7159).
+    healing (tasks 6181, 6184, 7159, 6188).
 
     Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
     escapes", and H2, the link adjudicator. The consumers are
@@ -3769,6 +3963,18 @@ class LinkHealConfig(BaseModel):
             'Read by maintenance/link_heal_sweep.py at each run start. Task 7159.'
         ),
     )
+    max_adjudications_per_run: int = Field(
+        default=200,
+        ge=1,
+        description=(
+            'The most pairs one scheduled sweep run asks the link adjudicator '
+            'about. Verdicts already ledgered at the current texts are reused '
+            'and do not count. The rest are recorded unexamined, the run is '
+            'partial and holds the sweep window, so a later sweep asks them. '
+            'Read by maintenance/link_heal_sweep.py at each run start. PRD ε, '
+            'task 6188.'
+        ),
+    )
     calibration_kappa_margin: float = Field(
         default=0.10,
         ge=0,
@@ -3832,6 +4038,7 @@ class FusedMemoryConfig(BaseSettings):
     )
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
+    followup_hold: FollowupHoldConfig = Field(default_factory=FollowupHoldConfig)
     memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)
     task_status: TaskStatusConfig = Field(default_factory=TaskStatusConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
@@ -3880,6 +4087,14 @@ class FusedMemoryConfig(BaseSettings):
     # Curator's usage-gate pool; independent from ``reconciliation.usage_cap``
     # because each UsageGate instance tracks cap state per-process / per-loop.
     usage_cap: UsageCapConfig | None = Field(default_factory=_default_curator_usage_cap)
+    config_overlay: ConfigOverlayProvenance | None = Field(
+        default=None,
+        description=(
+            'Provenance of the config overlay merged over the base file, or None '
+            'when no overlay is active. Set by the loader only: a config file or '
+            'environment variable setting it is refused. See fused_memory/config/overlay.py.'
+        ),
+    )
 
     @model_validator(mode='after')
     def _validate_socket_timeout_outlasts_backend_budgets(self) -> 'FusedMemoryConfig':
@@ -3917,4 +4132,11 @@ class FusedMemoryConfig(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         config_path = Path(os.environ.get('CONFIG_PATH', DEFAULT_CONFIG_PATH))
         yaml_settings = YamlSettingsSource(settings_cls, config_path)
-        return (init_settings, env_settings, yaml_settings, dotenv_settings)
+        return (
+            init_settings,
+            _ProvenanceRefusingSource(
+                env_settings, f'the environment ({PROVENANCE_FIELD.upper()}*)',
+            ),
+            yaml_settings,
+            _ProvenanceRefusingSource(dotenv_settings, 'the dotenv file'),
+        )

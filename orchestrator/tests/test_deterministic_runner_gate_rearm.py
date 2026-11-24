@@ -102,6 +102,7 @@ def _resolve_pending(queue: EscalationQueue) -> Escalation:
     queue.resolve(
         escalation.id, 'held behind its precondition',
         resolved_by='escalation-watcher', resolution_action='resume',
+        resolution_class='actionable',
     )
     return escalation
 

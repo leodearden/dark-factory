@@ -19,14 +19,19 @@ import asyncio
 import json
 import logging
 import math
+import sqlite3
+from bisect import bisect_right
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, TypedDict, TypeVar
 
 import aiosqlite
 import httpx
+from shared.quality_series.landings import UnrecognisedTrainEvent, recorded_landing_instants
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.datum import Datum, DatumState, map_datum, unknown_datum
@@ -91,6 +96,12 @@ BUCKET_LADDER: tuple[tuple[int | None, int], ...] = (
     (None, 1440),  # > 30 d  →  1-d  buckets   (≤ 3 651 pts, covers all=87 600 h)
 )
 
+TRAILING_WINDOW_LADDER: tuple[tuple[int | None, int], ...] = (
+    (14 * 24, 24 * 60),    # ≤ 14 d → each point counts the trailing day
+    (None, 7 * 24 * 60),   # > 14 d → each point counts the trailing week
+)
+"""(max_window_hours | None, trailing_minutes): how far back each landing-rate point counts."""
+
 
 def _cutoff_iso(hours: int, *, now: datetime | None = None) -> str:
     """Return ISO-format cutoff datetime for the given look-back window (hours).
@@ -127,16 +138,20 @@ def _bucket_minutes_for_window(hours: int) -> int:
       <= 720 h → 360 min (≤ 121 buckets)
       >  720 h → 1440 min (≤ 3 651 buckets, covers window=all / 87 600 h)
     """
-    for max_hours, bucket_min in BUCKET_LADDER:
+    return _ladder_minutes(BUCKET_LADDER, hours)
+
+
+def _trailing_minutes_for_window(hours: int) -> int:
+    """The trailing window, in minutes, each landing-rate point of an *hours* window counts over."""
+    return _ladder_minutes(TRAILING_WINDOW_LADDER, hours)
+
+
+def _ladder_minutes(ladder: tuple[tuple[int | None, int], ...], hours: int) -> int:
+    """The minutes of *ladder*'s first tier whose max_hours bound *hours* does not exceed."""
+    for max_hours, minutes in ladder:
         if max_hours is None or hours <= max_hours:
-            return bucket_min
-    return 1440  # unreachable — BUCKET_LADDER always ends with (None, ...)
-
-
-class DepthSeries(ChartData):
-    """merge_attempt counts per bucket, and the width in minutes each bucket spans."""
-
-    bucket_minutes: int
+            return minutes
+    raise ValueError(f'a window ladder ends in a catch-all tier (ladder={ladder!r}, hours={hours!r})')
 
 
 def _align_bucket(t: datetime, bucket_min: int) -> datetime:
@@ -175,11 +190,11 @@ async def queue_depth_timeseries(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> Datum[DepthSeries]:
+) -> Datum[ChartData]:
     """Approximate merge queue throughput as adaptive-width bucket counts.
 
-    The series carries ISO bucket-start labels, integer counts and the
-    ``bucket_minutes`` they were counted at.
+    The series carries ISO bucket-start labels and integer counts; its labels
+    are spaced at the window's ``BUCKET_LADDER`` width.
     Bucket width is chosen adaptively via ``_bucket_minutes_for_window`` so
     the point count stays manageable for all window sizes:
 
@@ -199,16 +214,16 @@ async def queue_depth_timeseries(
             get deterministic bucket counts and eliminate boundary flakiness.
 
     Returns:
-        One ``Datum[DepthSeries]``, FRESH at *now* when the window was read —
+        One ``Datum[ChartData]``, FRESH at *now* when the window was read —
         a readable empty window is a series of measured zeros. With no
         runs.db, or when the read fails, the Datum is UNKNOWN with a reason
-        saying which: an unread series counted nothing, at no width.
+        saying which: an unread series counted nothing.
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
     if db is None:
         return _no_runs_db()
 
-    async def _query(conn: aiosqlite.Connection) -> Datum[DepthSeries]:
+    async def _query(conn: aiosqlite.Connection) -> Datum[ChartData]:
         effective_now = resolve_now(now)
         cutoff = effective_now - timedelta(hours=hours)
 
@@ -253,13 +268,92 @@ async def queue_depth_timeseries(
 
         labels = [b.isoformat() for b in buckets]
         values: list[int | float] = [counts[lbl] for lbl in labels]
-        series: DepthSeries = {'labels': labels, 'values': values, 'bucket_minutes': bucket_min}
+        series: ChartData = {'labels': labels, 'values': values}
         return Datum(series, effective_now, DatumState.FRESH, None, bound)
 
     return await with_db(
         db, _query,
         unknown_datum('the merge_attempt depth series could not be read from runs.db', bound),
     )
+
+
+# ---------------------------------------------------------------------------
+# 1b. Landing rate — landings/day over the trailing window ending at each point
+# ---------------------------------------------------------------------------
+
+class LandingRateSeries(ChartData):
+    """Landings per day at each instant, each counted over the trailing window that ends there."""
+
+    trailing_minutes: int
+    window_mean_per_day: float
+
+
+def trailing_landing_rates(
+    landed: Iterable[datetime], *, now: datetime, hours: int,
+) -> LandingRateSeries:
+    """The landing rate at each bucket-width step from ``now - hours`` to ``now``.
+
+    *landed*, in any order, reaches one trailing window before the first
+    point, so every point counts a whole window: landings in
+    ``(t - trailing, t]``, scaled to landings per day.
+
+    ``window_mean_per_day`` is the landings in ``(now - hours, now]`` per day
+    of the window. No reading of the points recovers it, because each point
+    counts only its own trailing window.
+    """
+    landed = sorted(landed)
+    step = _bucket_minutes_for_window(hours)
+    trailing = _trailing_minutes_for_window(hours)
+    count = hours * 60 // step + 1
+    points = [now - timedelta(minutes=(count - 1 - k) * step) for k in range(count)]
+    values: list[int | float] = [
+        round(
+            (bisect_right(landed, t) - bisect_right(landed, t - timedelta(minutes=trailing)))
+            * 1440 / trailing,
+            2,
+        )
+        for t in points
+    ]
+    in_window = bisect_right(landed, now) - bisect_right(landed, now - timedelta(hours=hours))
+    return {
+        'labels': [t.isoformat() for t in points],
+        'values': values,
+        'trailing_minutes': trailing,
+        'window_mean_per_day': in_window * 24 / hours,
+    }
+
+
+def _landing_instants(path: Path, *, after: datetime, until: datetime) -> tuple[datetime, ...]:
+    """When each landing *path*'s runs.db records in (after, until] landed, oldest first."""
+    conn = connect_ro(path)
+    try:
+        return recorded_landing_instants(conn, after=after, until=until)
+    finally:
+        conn.close()
+
+
+async def landing_rate(
+    runs_db_path: Path | None, *, hours: int, now: datetime | None = None,
+) -> Datum[LandingRateSeries]:
+    """The landing rate the runs.db at *runs_db_path* records over the *hours* window, FRESH at *now* when read.
+
+    A readable runs.db with no landings is a series of measured zeros. With no
+    runs.db open, or when the read fails, the Datum is UNKNOWN with a reason.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if runs_db_path is None:
+        return _no_runs_db()
+    effective_now = resolve_now(now)
+    trailing = _trailing_minutes_for_window(hours)
+    try:
+        instants = await asyncio.to_thread(
+            _landing_instants, runs_db_path,
+            after=effective_now - timedelta(hours=hours, minutes=trailing), until=effective_now,
+        )
+    except (TaskDbUnreadable, sqlite3.Error, UnrecognisedTrainEvent, ValueError) as exc:
+        return unknown_datum(f'the landings could not be read from runs.db: {describe_exc(exc)}', bound)
+    series = trailing_landing_rates(instants, now=effective_now, hours=hours)
+    return Datum(series, effective_now, DatumState.FRESH, None, bound)
 
 
 # ---------------------------------------------------------------------------
@@ -806,15 +900,44 @@ def _leg_or_unread(result: _Leg | BaseException, unread: Callable[[str], _Leg], 
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectRunsDb:
+    """One project's runs.db: the pool's connection to it, None when unopened, and the file it is.
+
+    The connection and the path name one file, so the connection legs and
+    the landing read cannot read two different runs.dbs.
+    """
+
+    label: str
+    db: aiosqlite.Connection | None
+    path: Path
+
+
+def _unread_project(unread: Datum[Any], *, runs_db_present: bool) -> dict:
+    """A project's per-project entry with every runs.db leg read as *unread*."""
+    return {
+        'depth_timeseries': unread,
+        'attempts': unread,
+        'recent': [],
+        'recent_total': unread,
+        'speculative': unread,
+        'train_events': [],
+        'train_throughput': unread,
+        'landing_rate': unread,
+        'runs_db_present': runs_db_present,
+    }
+
+
 async def build_per_project_merge_queue(
-    project_dbs: Sequence[tuple[str, aiosqlite.Connection | None]],
+    project_dbs: Sequence[ProjectRunsDb],
     *,
     hours: int,
     now: datetime,
+    runs_db_absent: Collection[str] = frozenset(),
 ) -> dict[str, dict]:
     """Build per-project merge queue stats by querying each project's DB independently.
 
-    For each ``(pid, db)`` pair, gathers the per-DB stats concurrently. All
+    For each project's runs.db, gathers the per-DB stats concurrently. All
     per-project gathers also run concurrently across projects via a single
     top-level :func:`asyncio.gather`.
 
@@ -822,38 +945,55 @@ async def build_per_project_merge_queue(
     the same ``hours`` window every other leg uses, and ``recent_total`` is
     how many that window holds (see :func:`recent_merges`).
 
-    ``depth_timeseries``, ``attempts``, ``recent_total``, ``speculative`` and
-    ``train_throughput`` are Datums: a ``db=None`` pair, a leg that raises, or
-    a project whose whole build fails serves them UNKNOWN with a reason rather
-    than zeros that read as measured.
+    ``depth_timeseries``, ``attempts``, ``recent_total``, ``speculative``,
+    ``train_throughput`` and ``landing_rate`` are Datums: a ``db=None`` project, a
+    leg that raises, or a project whose whole build fails serves them UNKNOWN
+    with a reason rather than zeros that read as measured. ``landing_rate``
+    reads the file at the project's ``path``, not through the connection.
 
     Args:
-        project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
-            from :func:`_project_scoped_dbs_labeled`.
+        project_dbs: Each project's runs.db, labelled ``str(root)``.
         hours: Look-back window in hours (forwarded to each per-DB function).
         now: Shared reference timestamp captured once per request.
+        runs_db_absent: The ``str(root)`` labels with no runs.db file, from
+            ``dashboard/project_dbs.py::roots_without_file``. Honoured only
+            for a ``db=None`` project; a label it omits is never assumed absent.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput}}``,
-        where ``depth_timeseries`` is a ``Datum[DepthSeries]`` whose series
-        carries its ``bucket_minutes``, ``attempts`` a ``Datum[MergeAttempts]``
+        Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput, landing_rate, runs_db_present}}``,
+        where ``depth_timeseries`` is a ``Datum[ChartData]``, ``attempts`` a
+        ``Datum[MergeAttempts]``
         (the shaper projects its outcome chart and latency), ``recent_total``
-        a ``Datum[int]``, ``speculative`` a ``Datum[dict]`` and
-        ``train_throughput`` a ``Datum[TrainThroughput]``.
+        a ``Datum[int]``, ``speculative`` a ``Datum[dict]``,
+        ``train_throughput`` a ``Datum[TrainThroughput]`` and ``landing_rate``
+        a ``Datum[LandingRateSeries]``. ``runs_db_present``
+        is False only for a project with no runs.db file, which keeps that
+        project out of the client's runs.db totals.
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
-    async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
+    async def _one_project(project: ProjectRunsDb) -> tuple[str, dict]:
+        pid, db = project.label, project.db
+        if db is None and pid in runs_db_absent:
+            absent = unknown_datum('no runs.db file exists for this project', bound)
+            return pid, _unread_project(absent, runs_db_present=False)
         try:
-            depth_r, attempts_r, recent_r, spec_r, train_r, throughput_r = await asyncio.gather(
-                queue_depth_timeseries(db, hours=hours, now=now),
-                merge_attempts(db, hours=hours, now=now),
-                recent_merges(db, limit=RECENT_MERGES_CAP, hours=hours, now=now),
-                speculative_stats(db, hours=hours, now=now),
-                recent_train_events(db, hours=hours, now=now),
-                train_throughput_stats(db, hours=hours, now=now),
+            connection_legs, rate_r = await asyncio.gather(
+                asyncio.gather(
+                    queue_depth_timeseries(db, hours=hours, now=now),
+                    merge_attempts(db, hours=hours, now=now),
+                    recent_merges(db, limit=RECENT_MERGES_CAP, hours=hours, now=now),
+                    speculative_stats(db, hours=hours, now=now),
+                    recent_train_events(db, hours=hours, now=now),
+                    train_throughput_stats(db, hours=hours, now=now),
+                    return_exceptions=True,
+                ),
+                landing_rate(None if db is None else project.path, hours=hours, now=now),
                 return_exceptions=True,
             )
+            if isinstance(connection_legs, BaseException):
+                raise connection_legs
+            depth_r, attempts_r, recent_r, spec_r, train_r, throughput_r = connection_legs
             depth = _leg_or_unread(depth_r, _unread_leg(pid, 'merge depth'), f'{pid}/depth')
             attempts = _leg_or_unread(attempts_r, _unread_leg(pid, 'merge attempts'), f'{pid}/attempts')
             unread_total = _unread_leg(pid, 'recent merges')
@@ -867,6 +1007,7 @@ async def build_per_project_merge_queue(
             train_throughput = _leg_or_unread(
                 throughput_r, _unread_leg(pid, 'train throughput'), f'{pid}/train_throughput',
             )
+            rate = _leg_or_unread(rate_r, _unread_leg(pid, 'landing rate'), f'{pid}/landing_rate')
             return pid, {
                 'depth_timeseries': depth,
                 'attempts': attempts,
@@ -875,6 +1016,8 @@ async def build_per_project_merge_queue(
                 'speculative': spec,
                 'train_events': train_events_list,
                 'train_throughput': train_throughput,
+                'landing_rate': rate,
+                'runs_db_present': True,
             }
         except Exception as exc:
             logger.warning(
@@ -885,17 +1028,9 @@ async def build_per_project_merge_queue(
             unread = unknown_datum(
                 f'the merge history of {pid} could not be read: {describe_exc(exc)}', bound,
             )
-            return pid, {
-                'depth_timeseries': unread,
-                'attempts': unread,
-                'recent': [],
-                'recent_total': unread,
-                'speculative': unread,
-                'train_events': [],
-                'train_throughput': unread,
-            }
+            return pid, _unread_project(unread, runs_db_present=True)
 
-    results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
+    results = await asyncio.gather(*[_one_project(project) for project in project_dbs])
     return dict(results)
 
 

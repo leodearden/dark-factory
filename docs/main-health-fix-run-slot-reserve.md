@@ -83,14 +83,10 @@ Operator visibility:
 - `scheduler_tick.data.scope` is `main_health_fix` on a tick run against the
   reserve, and `any` otherwise.
 - Each dispatch on the reserve logs an INFO line naming the task.
-- Known false alarm, until follow-up ticket `tkt_0RX39GHVZQB8HE6J4X8944DD3W`
-  lands: the dashboard's E12 parity alarm
-  (`dashboard/src/dashboard/data/burndown.py::compute_parity_alarm`) still
-  takes `max_concurrent_tasks` alone as the cap. A fix running on the reserve
-  therefore logs "Concurrency cap breached" and records a breach row, for
-  example 37 live against 36. A breach of exactly
-  `main_health_fix_reserved_slots` while `scope` is `main_health_fix` is the
-  reserve working as designed, not an over-dispatch.
+- The dashboard's E12 parity alarm judges live in-progress against
+  `max_concurrent_tasks + main_health_fix_reserved_slots`, read by
+  `dashboard/src/dashboard/data/orchestrator.py::read_run_slot_capacity`, so
+  a fix running on the reserve is not recorded as a breach.
 
 `main_health_fix_reserved_slots` is restart-only, like `max_concurrent_tasks`.
 The warm-lane pool is sized from every run slot:
@@ -112,14 +108,12 @@ From `docs/code-quality.md`:
 
 - A fix whose planned files overlap a merge-waiter's held modules, or a pin
   head's reservation, still waits on module locks. That lock precedence is owned
-  by 10399 item (3) and by 8795.
-- The PSI admission gate still applies to fixes. Under a PSI hold with
-  `in_flight` at or above `psi_admission.min_inflight_floor`, which a full
-  general pool always meets, `_phase_select_scored` defers a fix on the reserve
-  just like any non-deterministic candidate. The fix is the exit owner of every
-  merge-waiter hold, so a saturated host can still stall the heal. Follow-up
-  ticket `tkt_0RX3ADTKWNEXGTDSQRCK2E6NND` owns deciding whether an admitted fix
-  is exempt, as deterministic tasks are (DA-D4), or recording why it is not.
+  by 10399 item (3) and by 8795. When the pin head is one the PSI hold defers,
+  that wait has no bound; DA-D10 of `docs/prds/dispatch-admission-load-cap.md`
+  records it.
+- Resolved by task 10600: an admitted fix is exempt from the PSI admission
+  gate's hold on every tick, in both dispatch loops. The rationale and the load
+  bound are DA-D10 of `docs/prds/dispatch-admission-load-cap.md`.
 - While the general pool is full and the reserve is free, a tick runs every
   `idle_poll_secs`, at the same cadence and cost as an idle tick
   (INV-8 `loop-thread-occupancy-bounded`). A general slot that frees during

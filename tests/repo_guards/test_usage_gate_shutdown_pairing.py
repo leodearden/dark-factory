@@ -55,6 +55,17 @@ ALLOWLIST: dict[str, str] = {
         'resume and auth-reprobe loops, and its probe dirs ride task 3086\'s '
         'atexit hook (shared/config_dir.py).'
     ),
+    'shared/src/shared/testing_reserve.py': (
+        'reserve_gate is a test factory: it returns the gate, so its callers own '
+        'the teardown. fused-memory/tests/test_curator_reserve.py::b2_gate and '
+        'fused-memory/tests/test_reconciliation_reserve.py::open_reserve_harness '
+        'shut it down in a finally; scripts/legibility/session_runner.py and '
+        'scripts/sitting/nightly_prepare.py shut down the gate their tests hand '
+        'them. The synchronous step-aside tests cannot await a teardown, and the '
+        'factory builds with wait_for_reset and auth_reprobe off and no cost '
+        'store, so those gates start no task and their probe dirs ride task '
+        "3086's atexit hook (shared/config_dir.py)."
+    ),
 }
 
 

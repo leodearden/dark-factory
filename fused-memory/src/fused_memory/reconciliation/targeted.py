@@ -15,6 +15,7 @@ from shared.task_fields import dependency_ids as task_dependency_ids
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.memory_metadata import (
     RECONCILIATION_COMPLETION_ECHO_MARKER,
+    RECONCILIATION_VERDICT_KEY,
     TARGETED_RECONCILIATION_SOURCE,
     is_reconciliation_completion_echo,
     normalize_supersedes,
@@ -39,7 +40,7 @@ from fused_memory.reconciliation.reconciler_escalation import (
     INSTALLED_ESCALATION_QUEUE_FACTORY,
     EscalationQueueFactory,
     file_reconciler_l1,
-    pending_escalations,
+    pinning_escalation_ids_by_task,
 )
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     retire_flag_markers_for_terminal_task,
@@ -607,10 +608,12 @@ class TargetedReconciler:
                     # done-transition later proves premature/false (e.g. the
                     # predates-own-deps architect close-out bug) — so this
                     # fallback is reframed to report the transition without
-                    # claiming the deliverable is verified.
+                    # claiming the deliverable is verified. C5 of
+                    # plans/live-task-facts-at-recall-prd.md: the wording
+                    # names no task status.
                     unverified_completion = True
                     content = (
-                        f"Task '{title}' transitioned to done; "
+                        f"Task '{title}' was marked finished; "
                         "completion not yet verified."
                     )
                     if description:
@@ -917,7 +920,7 @@ class TargetedReconciler:
                         metadata={
                             'source': TARGETED_RECONCILIATION_SOURCE,
                             'task_id': task_id,
-                            'verification_verdict': verification.verdict,
+                            RECONCILIATION_VERDICT_KEY: verification.verdict,
                         },
                         causation_id=run_id,
                     )
@@ -2006,8 +2009,8 @@ class TargetedReconciler:
         # rest of the sweep. Empty list = not yet attempted; single-element
         # list holds the value, or None/{} when it could not be built.
         #
-        # queue_memo: {task_id: [escalation_id, ...]} over all PENDING
-        #   escalations, scanned ONCE (targeted.py::_escalation_pin_index_for)
+        # queue_memo: {task_id: (pinning escalation_id, ...)}, from the
+        #   pending queue scanned ONCE (targeted.py::_escalation_pin_index_for)
         #   instead of one get_by_task glob-and-parse per dependent, which
         #   made the veto a D x E filesystem scan on the reconciliation hot
         #   path for a task with D blocked dependents and E open escalations.
@@ -2050,24 +2053,25 @@ class TargetedReconciler:
 
     async def _escalation_pin_index_for(
         self, project_root: ProjectRoot, queue_memo: list,
-    ) -> dict[str, list[str]] | None:
-        """Build the ``{task_id: [escalation_id, ...]}`` pin index used by the
-        dependent-unblock veto, memoizing the result (success OR failure) in
-        *queue_memo* so the escalation store is scanned at most once per sweep.
+    ) -> dict[str, tuple[str, ...]] | None:
+        """Build the pin index used by the dependent-unblock veto, memoizing
+        the result (success OR failure) in *queue_memo* so the escalation
+        store is scanned at most once per sweep.
 
-        Scans ONCE via ``escalation/queue.py::EscalationQueue.get_pending``
-        rather than calling ``get_by_task(dep_id, status='pending')`` per
-        dependent: both read the same ``queue_dir/esc-*.json`` glob and apply
-        the same ``status == 'pending'`` filter, so one scan plus a dict
-        lookup is equivalent to D scans while turning a D x E parse into
-        1 x E. Construction and scan run in one ``asyncio.to_thread`` hop
-        because ``EscalationQueue`` is synchronous blocking filesystem I/O and
-        this coroutine runs on the shared fused-memory event loop.
+        The index maps each task to the ids of its pending escalations that
+        PIN it, as decided by
+        ``reconciler_escalation.py::pinning_escalation_ids_by_task``. One
+        pending scan plus a dict lookup replaces a per-dependent
+        ``get_by_task`` scan, turning a D x E parse into 1 x E. Construction,
+        scan and classification run in one ``asyncio.to_thread`` hop because
+        ``EscalationQueue`` is synchronous blocking filesystem I/O and this
+        coroutine runs on the shared fused-memory event loop.
 
         Returns the index, or ``None`` when the store is unavailable -- there
         is no escalation-queue factory, construction raised, or the scan
         itself raised (the latter two logged at warning with
-        ``exc_info=True``). Every such arm vetoes rather than flips: a store
+        ``exc_info=True``; a classification failure counts as the scan
+        raising). Every such arm vetoes rather than flips: a store
         you cannot read cannot prove "no open escalation", and a false
         negative would unblock a task the orchestrator (or a human)
         deliberately parked -- the same fail-safe direction
@@ -2087,17 +2091,11 @@ class TargetedReconciler:
         if factory is None:
             queue_memo.append(None)
             return None
-        index: dict[str, list[str]] | None
+        index: dict[str, tuple[str, ...]] | None
         try:
-            index = {}
-            for esc in await asyncio.to_thread(pending_escalations, factory, project_root):
-                # str() both sides of what get_by_task compared with ==, so an
-                # int-typed task_id still pins its dependent rather than
-                # silently missing the lookup.
-                pinned = str(getattr(esc, 'task_id', '') or '')
-                esc_id = str(getattr(esc, 'id', '') or '')
-                if pinned:
-                    index.setdefault(pinned, []).append(esc_id)
+            index = await asyncio.to_thread(
+                pinning_escalation_ids_by_task, factory, project_root,
+            )
         except Exception:
             logger.warning(
                 'sweep: could not read the escalation store for the '
@@ -2192,9 +2190,8 @@ class TargetedReconciler:
             # Escalation-pin veto (task 4903): a task the orchestrator (or a
             # human) blocked *and* pinned with an open escalation must not be
             # unblocked here, or this sweep would immediately undo that park.
-            # See _escalation_pin_index_for for the fail-safe rationale and
-            # for why only PENDING escalations are indexed (resolved and
-            # dismissed ones pin nothing).
+            # An info record never pins (escalation.pins link 1). See
+            # _escalation_pin_index_for for the fail-safe rationale.
             pin_index = await self._escalation_pin_index_for(project_root, queue_memo)
             if pin_index is None:
                 return {
@@ -2204,15 +2201,15 @@ class TargetedReconciler:
                     'satisfied_by': satisfied_by,
                     'reason': 'escalation_store_unavailable',
                 }
-            open_escalations = pin_index.get(dep_id) or []
-            if open_escalations:
+            pinning_ids = pin_index.get(dep_id, ())
+            if pinning_ids:
                 return {
                     'type': 'dependent_unblock_vetoed',
                     'task_id': dep_id,
                     'title': dependent.get('title'),
                     'satisfied_by': satisfied_by,
                     'reason': 'escalation_pinned',
-                    'escalation_ids': list(open_escalations),
+                    'escalation_ids': list(pinning_ids),
                 }
 
             # Live status re-read -- the TOCTOU guard described in this

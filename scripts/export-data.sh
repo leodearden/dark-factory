@@ -34,6 +34,18 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 1b. Recovery archives
+# The FalkorDB pre-state dumps in scripts/recovery_archive.py::RECOVERY_ARCHIVES
+# (docs/falkordb-recovery-dumps.md), copied before anything is stopped.
+# ---------------------------------------------------------------------------
+info "Exporting recovery archives"
+
+RECOVERY_EXPORT="$EXPORT_DIR/recovery-archive"
+python3 "$REPO_ROOT/scripts/recovery_archive.py" copy "$REPO_ROOT" "$RECOVERY_EXPORT" \
+  || fail "Recovery archives: a pinned dump is missing or altered (listed above); nothing was stopped and no export is usable. See docs/falkordb-recovery-dumps.md before re-running"
+ok "Recovery archives: $(du -sh "$RECOVERY_EXPORT" | cut -f1)"
+
+# ---------------------------------------------------------------------------
 # 2. Stop fused-memory (clean WAL checkpoint)
 # ---------------------------------------------------------------------------
 info "Stopping fused-memory service"

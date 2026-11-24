@@ -1,0 +1,38 @@
+import json,collections
+E=sorted((json.loads(l) for l in open('/tmp/gate-10069/predict/events.jsonl')),key=lambda e:e['id'])
+bytask=collections.defaultdict(list)
+for e in E:
+    if e['et'] in('merge_verify','merge_finalized','merge_attempt','merge_queued','speculative_discard','merge_verify_cancelled'): bytask[e['task']].append(e)
+# NOTE: id order vs ts order: verify events are emitted possibly late? check monotonic
+bad=0
+for i in range(1,len(E)):
+    if E[i]['ts']<E[i-1]['ts']: bad+=1
+print('non-monotonic ts by id:',bad,'of',len(E))
+nxt=collections.Counter(); nxtp=collections.Counter()
+for t,ev in bytask.items():
+    ev.sort(key=lambda e:e['ts'])
+    for i,e in enumerate(ev):
+        if e['et']=='merge_verify' and (e['d'].get('chain_items') or 1)==1 and e['ts']>='2026-10-20':
+            seq=[]
+            for f in ev[i+1:i+4]:
+                s=f['et']
+                if s=='merge_attempt': s+=':'+str(f['d'].get('outcome'))+'/'+str(f['d'].get('disposition'))
+                if s=='merge_finalized': s+=':'+f['d']['state']+'/'+str(f['d'].get('reason'))[:28]
+                if s=='merge_verify': s+=':k%s:%s'%(f['d'].get('chain_items'),f['d'].get('passed'))
+                seq.append(s)
+            (nxtp if e['d']['passed'] else nxt)[' > '.join(seq[:2])]+=1
+print('FAILED solo ->'); 
+for k,v in nxt.most_common(25): print('  ',v,k)
+print('PASSED solo ->'); 
+for k,v in nxtp.most_common(25): print('  ',v,k)
+# request ids with multiple finalized
+c=collections.Counter(e['d']['request_id'] for e in E if e['et']=='merge_finalized')
+print('finalized rows per request:',collections.Counter(c.values()))
+m=collections.defaultdict(list)
+for e in E:
+    if e['et']=='merge_finalized': m[e['d']['request_id']].append((e['ts'][:10],e['d']['state'],str(e['d'].get('reason'))[:26]))
+k=0
+for r,v in m.items():
+    if len(v)>1 and v[0][0]<'2026-11-10':
+        print(r,v); k+=1
+        if k>6: break

@@ -3,21 +3,29 @@
 import asyncio
 import contextlib
 import logging
+import uuid
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_qdrant_live import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _fm_qdrant_live import (
+    EPHEMERAL_COLLECTION_PREFIX,
+    QDRANT_URL,
+    assert_reapable,
+    collection_vector_size,
+    qdrant_skipif,
+)
 from _qdrant_responses import missing_collection_404
 from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
 from mem0 import AsyncMemory
 from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
 
 from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
-from fused_memory.config.schema import Mem0BackendConfig
+from fused_memory.config.schema import FusedMemoryConfig, Mem0BackendConfig
 from fused_memory.models.scope import Scope
 
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
@@ -2094,52 +2102,60 @@ class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Integration: add_system_record fresh-point-per-call (task 2222 / W5-δ, P4)
-# ---------------------------------------------------------------------------
+# Live-Qdrant probe harness, shared by the add_system_record probe and the
+# scan_payload_text tripwire below.
 #
-# Mirrors tests/test_recon_dedup_premise.py's real-Qdrant harness (task 2221 /
-# W5-γ, which already empirically proved the underlying infer=False primitive
-# never dedup-drops), adapted to probe add_system_record instead of add().
-# This pins the SAME fresh-point-every-call guarantee for the new dedicated,
-# dedup-exempt method.
+# A probe's collection is shared by every xdist worker and session and reused
+# across runs; scripts/cleanup_test_collections.py reaps it, and each run is
+# isolated by its own run_id.
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def _asr_scope(worker_id) -> Scope:
-    """A recon-stage scope isolated per xdist worker for add_system_record tests."""
-    return Scope(
-        project_id=f'_test_add_system_record_{worker_id}',
-        agent_id='recon-stage-task_knowledge_sync',
-    )
+def _reapable_config(mock_config):
+    """``mock_config`` with the collection prefix scripts/cleanup_test_collections.py reaps."""
+    config = mock_config.model_copy(deep=True)
+    config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
+    return config
 
 
-@pytest.fixture
-def _asr_clean_collection(_asr_scope, mock_config):
-    """Delete the scope's Qdrant collection before AND after the test."""
-    collection = _asr_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+def _probe_collection(scope: Scope, config: FusedMemoryConfig) -> str:
+    return scope.mem0_collection_name(config.mem0.collection_prefix)
+
+
+def _isolated_run(scope: Scope, config: FusedMemoryConfig, label: str) -> Iterator[str]:
+    """Yield a fresh run_id, then best-effort delete that run's points; the collection stays."""
+    run_id = f'{label}-{uuid.uuid4().hex}'
+    yield run_id
     client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(collection)
-    yield collection
     with contextlib.suppress(Exception):
-        client.delete_collection(collection)
+        client.delete(
+            collection_name=_probe_collection(scope, config),
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key='run_id', match=MatchValue(value=run_id))],
+                ),
+            ),
+        )
     client.close()
 
 
-async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
+async def _build_stub_embedder_backend(
+    scope: Scope, config: FusedMemoryConfig, monkeypatch,
+) -> Mem0Backend:
     """Construct a real Mem0Backend with a stubbed constant-vector embedder.
 
-    Mirrors test_recon_dedup_premise._build_recon_backend's hermetic
-    (non-real-embedder) path: cosine=1.0 is the strongest-possible duplicate
-    signal the infer=False path could ever see.
+    Refuses, before anything is written, a config whose collection the reaper
+    would not reclaim. Mirrors test_recon_dedup_premise._build_recon_backend's
+    hermetic (non-real-embedder) path.
     """
+    collection = _probe_collection(scope, config)
+    assert_reapable(collection)
     monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
 
-    config = mock_config.model_copy(deep=True)
-    backend = Mem0Backend(config)
+    backend = Mem0Backend(config.model_copy(deep=True))
     inst = await backend._get_instance(scope)
 
-    collection = scope.mem0_collection_name(config.mem0.collection_prefix)
     # Race-safe vector-dim read: under `-n auto` load the just-created
     # collection can transiently 404 before it is durably readable, so retry
     # the read via the shared bounded-poll helper rather than a single get.
@@ -2154,11 +2170,43 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
     return backend
 
 
+# ---------------------------------------------------------------------------
+# Integration: add_system_record fresh-point-per-call (task 2222 / W5-δ, P4)
+# ---------------------------------------------------------------------------
+#
+# Mirrors tests/test_recon_dedup_premise.py's real-Qdrant harness (task 2221 /
+# W5-γ, which already empirically proved the underlying infer=False primitive
+# never dedup-drops), adapted to probe add_system_record instead of add().
+# This pins the SAME fresh-point-every-call guarantee for the new dedicated,
+# dedup-exempt method.
+
+
+@pytest.fixture
+def _asr_scope() -> Scope:
+    """The recon-stage scope every add_system_record run shares."""
+    return Scope(
+        project_id='_test_add_system_record',
+        agent_id='recon-stage-task_knowledge_sync',
+    )
+
+
+@pytest.fixture
+def _asr_run_id(_asr_scope, _reapable_config):
+    yield from _isolated_run(_asr_scope, _reapable_config, 'task-2222-add-system-record-probe')
+
+
+def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
+    _reapable_config, _asr_scope,
+):
+    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_probe_collection(_asr_scope, _reapable_config))
+
+
 class TestMem0BackendAddSystemRecordIntegration:
     """P4 boundary signal: N identical add_system_record calls -> N distinct points.
 
-    Real Qdrant, isolated collection, stubbed constant-vector embedder (the
-    worst-case cosine=1.0 duplicate signal) — mirrors
+    Real Qdrant through the live-probe harness, stubbed constant-vector
+    embedder (the worst-case cosine=1.0 duplicate signal) — mirrors
     test_recon_dedup_premise.py's harness for backend.add(), applied to the
     new dedup-exempt backend.add_system_record method.
     """
@@ -2167,10 +2215,10 @@ class TestMem0BackendAddSystemRecordIntegration:
 
     @pytest.mark.asyncio
     async def test_identical_calls_all_land_distinct(
-        self, mock_config, _asr_scope, _asr_clean_collection, monkeypatch,
+        self, _reapable_config, _asr_scope, _asr_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(mock_config, _asr_scope, monkeypatch)
-        run_id = 'task-2222-add-system-record-probe'
+        backend = await _build_stub_embedder_backend(_asr_scope, _reapable_config, monkeypatch)
+        run_id = _asr_run_id
         metadata = {'kind': 'cycle_summary', 'run_id': run_id}
         n = 6
         try:
@@ -2226,7 +2274,7 @@ _SCAN_LEAK_TEXT = _SCAN_BODY + _SCAN_LEAK_FRAGMENT
 _SCAN_DUP_TEXT = _SCAN_BODY + _SCAN_CLOSE_CONTENT + '\n' + _SCAN_OPEN_CONTENT + _SCAN_BODY
 
 
-def _scan_point(point_id: str, payload: dict):
+def _scan_point(point_id: str, payload: object):
     """Create a MagicMock that mimics a Qdrant Record."""
     point = MagicMock()
     point.id = point_id
@@ -2536,7 +2584,7 @@ class TestMem0BackendScanPayloadText:
 
         A bare ``async for`` closes the generator when the ITERATION ends or
         raises — but an exception from the loop BODY (a malformed payload
-        reaching the detector) or a cancellation is neither, and leaves
+        reaching the verdict) or a cancellation is neither, and leaves
         scroll_collection_pages suspended mid-walk for the event loop's
         async-generator hooks to finalise at some later, unpredictable point.
         ``contextlib.aclosing`` is what makes the close deterministic; the
@@ -2547,26 +2595,24 @@ class TestMem0BackendScanPayloadText:
         """
         closed = False
 
+        class _MalformedPayload:
+            def keys(self):
+                raise RuntimeError('malformed payload')
+
         def _pager(*args, **kwargs):
             async def _gen():
                 nonlocal closed
                 try:
-                    yield _scan_point('id-1', {'data': _SCAN_LEAK_TEXT})
+                    yield _scan_point('id-1', _MalformedPayload())
                     yield _scan_point('id-2', {'data': _SCAN_LEAK_TEXT})
                 finally:
                     closed = True
 
             return _gen()
 
-        def _explode(_text):
-            raise RuntimeError('malformed payload')
-
         with (
             patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
             patch.object(backend, 'scroll_collection_pages', _pager),
-            patch(
-                'fused_memory.utils.toolcall_xml_leak.find_toolcall_xml_leak', _explode
-            ),
             pytest.raises(RuntimeError, match='malformed payload'),
         ):
             await backend.scan_payload_text(scope=Scope(project_id='p'))
@@ -2736,7 +2782,7 @@ class TestMem0BackendScanPayloadText:
     @pytest.mark.asyncio
     async def test_data_wins_over_memory_and_content(self, backend):
         """`data` is the canonical Qdrant payload key for memory text
-        (memory_service._MEM0_CONTENT_KEYS)."""
+        (``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS``)."""
         point = _scan_point('p1', {'data': 'clean text', 'memory': _SCAN_LEAK_TEXT})
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(return_value=([point], None))
@@ -2805,6 +2851,142 @@ class TestMem0BackendScanPayloadText:
             assert isinstance(cond, qmodels.FieldCondition)
             assert isinstance(cond.match, qmodels.MatchText)
             assert cond.match.text == needle
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('needles', [None, []])
+    async def test_absent_needles_make_the_leak_detector_the_verdict(self, backend, needles):
+        """An empty needle list must not become an empty literal verdict, which
+        would match nothing and report a leaking corpus as clean."""
+        leak = _scan_point('leak', {'data': _SCAN_LEAK_TEXT})
+        clean = _scan_point('clean', {'data': _SCAN_BODY})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([leak, clean], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), needles=needles)
+
+        assert [m['id'] for m in result['matches']] == ['leak']
+        assert result['matches'][0]['matched_fragments'] == [_SCAN_LEAK_FRAGMENT]
+        assert result['scanned'] == 2
+
+    @pytest.mark.parametrize('needles', [[''], ['no JS test runner', '']])
+    @pytest.mark.asyncio
+    async def test_an_empty_string_needle_raises_rather_than_matching_everything(
+        self, backend, needles
+    ):
+        """'' is a substring of every text, so it would report every walked
+        record as a match."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(ValueError, match="must not contain ''"),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), needles=needles)
+
+        mock_client.scroll.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_present_custom_needle_is_reported(self, backend):
+        """The discovery-cycle shape: plain prose, no tool-call leak, a
+        caller needle it contains.  Reporting it is the whole point of a
+        custom needle (task 4857's false-absence defect)."""
+        point = _scan_point('prose', {'data': 'The repo has no JS test runner configured.'})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=['no JS test runner']
+            )
+
+        assert [m['id'] for m in result['matches']] == ['prose']
+        assert result['matches'][0]['matched_fragments'] == ['no JS test runner']
+        assert result['scanned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_absent_custom_needle_is_not_reported_but_is_counted(self, backend):
+        """The literal match is case-sensitive, mirroring un-indexed MatchText,
+        and a walked non-match still counts toward `scanned`."""
+        point = _scan_point('shouty', {'data': 'The repo has NO JS test runner configured.'})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=['no JS test runner']
+            )
+
+        assert result['matches'] == []
+        assert result['scanned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_matched_fragments_are_the_distinct_present_needles_in_caller_order(
+        self, backend
+    ):
+        point = _scan_point('p1', {'data': 'gamma then alpha, never the other one.'})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=['alpha', 'beta', 'gamma', 'alpha']
+            )
+
+        assert result['matches'][0]['matched_fragments'] == ['alpha', 'gamma']
+
+    async def _excerpt_of(self, backend, text: str, needles: list[str] | None = None) -> str:
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([_scan_point('p1', {'data': text})], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), needles=needles)
+
+        return result['matches'][0]['excerpt']
+
+    @pytest.mark.asyncio
+    async def test_the_excerpt_is_centred_on_a_needle_deep_in_the_record(self, backend):
+        needle = 'no JS test runner'
+        excerpt = await self._excerpt_of(backend, 'x' * 1000 + needle + 'y' * 1000, [needle])
+
+        assert excerpt.startswith('…')
+        assert excerpt.endswith('…')
+        assert excerpt.index(needle) * 2 == len(excerpt)
+
+    @pytest.mark.asyncio
+    async def test_the_excerpt_shows_a_tail_leak_and_marks_only_the_elided_head(self, backend):
+        excerpt = await self._excerpt_of(backend, 'word ' * 300 + _SCAN_LEAK_TEXT)
+
+        assert excerpt.startswith('…')
+        assert excerpt.endswith(_SCAN_LEAK_FRAGMENT)
+
+    @pytest.mark.asyncio
+    async def test_the_excerpt_of_a_head_match_starts_at_the_text(self, backend):
+        needle = 'no JS test runner'
+        excerpt = await self._excerpt_of(backend, needle + 'z' * 1000, [needle])
+
+        assert excerpt.startswith(needle)
+        assert excerpt.endswith('…')
+
+    @pytest.mark.asyncio
+    async def test_custom_needles_stay_the_verdict_in_exhaustive_mode(self, backend):
+        """`exhaustive` skips only the prefilter.  It is also the only mode
+        that sees text under the fallback keys, so needles + exhaustive is the
+        complete literal enumeration."""
+        fallback = _scan_point('fallback', {'memory': 'The repo has no JS test runner.'})
+        leak_only = _scan_point('leak', {'data': _SCAN_LEAK_TEXT})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([fallback, leak_only], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=['no JS test runner'], exhaustive=True
+            )
+
+        assert [m['id'] for m in result['matches']] == ['fallback']
+        assert result['scanned'] == 2
+        assert mock_client.scroll.call_args.kwargs.get('scroll_filter') is None
 
     @pytest.mark.asyncio
     async def test_timeout_propagates_not_swallowed(self, backend):
@@ -3056,24 +3238,27 @@ class TestMem0BackendScanPayloadTextNamesItsCollection:
 # Correctness does not depend on this test passing: the mandatory Python
 # re-verify keeps the result exact either way, because tokenized matching is
 # strictly MORE permissive for these needles. Only speed would degrade.
+#
+# Runs through the live-probe harness; every scan is filtered to its run_id.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def _spt_scope(worker_id) -> Scope:
-    return Scope(project_id=f'_test_scan_payload_text_{worker_id}')
+def _spt_scope() -> Scope:
+    """The scope every scan_payload_text tripwire run shares."""
+    return Scope(project_id='_test_scan_payload_text')
 
 
 @pytest.fixture
-def _spt_clean_collection(_spt_scope, mock_config):
-    collection = _spt_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(collection)
-    yield collection
-    with contextlib.suppress(Exception):
-        client.delete_collection(collection)
-    client.close()
+def _spt_run_id(_spt_scope, _reapable_config):
+    yield from _isolated_run(_spt_scope, _reapable_config, 'task-3083-scan-payload-text-probe')
+
+
+def test_the_scan_payload_text_probe_collection_is_one_the_reaper_can_reclaim(
+    _reapable_config, _spt_scope,
+):
+    """The tripwire's collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_probe_collection(_spt_scope, _reapable_config))
 
 
 class TestMem0BackendScanPayloadTextIntegration:
@@ -3083,19 +3268,21 @@ class TestMem0BackendScanPayloadTextIntegration:
 
     @pytest.mark.asyncio
     async def test_matchtext_prefilter_is_a_literal_substring_match(
-        self, mock_config, _spt_scope, _spt_clean_collection, monkeypatch,
+        self, _reapable_config, _spt_scope, _spt_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(mock_config, _spt_scope, monkeypatch)
+        backend = await _build_stub_embedder_backend(_spt_scope, _reapable_config, monkeypatch)
+        run_id = _spt_run_id
         try:
             await backend.add_system_record(
                 content='The reconciliation stage two judge halts on an empty backlog.',
                 scope=_spt_scope,
-                metadata={'kind': 'scan_payload_text_probe'},
+                metadata={'kind': 'scan_payload_text_probe', 'run_id': run_id},
             )
 
             # Mid-word substring: proves `contains`, not tokenization.
             midword = await backend.scan_payload_text(
-                scope=_spt_scope, needles=['econciliatio'], exhaustive=False
+                scope=_spt_scope, needles=['econciliatio'], exhaustive=False,
+                filters={'run_id': run_id},
             )
             assert midword['scanned'] == 1, (
                 'un-indexed MatchText must substring-match mid-word; a text '
@@ -3104,7 +3291,8 @@ class TestMem0BackendScanPayloadTextIntegration:
 
             # Reversed word order must NOT match a substring engine.
             reversed_order = await backend.scan_payload_text(
-                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False
+                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False,
+                filters={'run_id': run_id},
             )
             assert reversed_order['scanned'] == 0, (
                 'reversed word order matched — MatchText is tokenized here, so '
@@ -3114,7 +3302,7 @@ class TestMem0BackendScanPayloadTextIntegration:
             # Sanity: exhaustive mode ignores the prefilter entirely, so it
             # still walks the record regardless of MatchText semantics.
             assert (await backend.scan_payload_text(
-                scope=_spt_scope, exhaustive=True
+                scope=_spt_scope, exhaustive=True, filters={'run_id': run_id},
             ))['scanned'] == 1
         finally:
             await backend.close()
@@ -3125,22 +3313,20 @@ class TestBuildConfigDictEndpointPlumbing:
     AsyncMemory, no _get_instance. Greenfield: nothing tested this dict before.
     """
 
-    # --- default (shipped-config) behaviour: must stay byte-identical ---
-
-    def test_default_omits_embedding_dims_entirely(self, backend):
-        """The load-bearing byte-identical assertion.
-
-        mem0/embeddings/openai.py sets
-        ``_pass_dimensions_to_api = self.config.embedding_dims is not None``.
-        We omit the key today, so ``dimensions`` is NEVER sent on an
-        embeddings request. Emitting the key at all — even as 1536 — would
-        start sending it on every request under the shipped config. Hence the
-        emit-only-when-non-default rule; do not "simplify" it away.
+    @pytest.mark.parametrize('dims', [768, 1024, 1536])
+    def test_no_width_ever_reaches_the_embedder_config(self, mock_config, dims):
+        """mem0/embeddings/openai.py sends ``dimensions`` exactly when
+        ``embedding_dims`` is set, and no client may send it (PRD C3), so the
+        key is absent at every width while the vector store follows the config.
         """
-        config_dict = backend._build_config_dict('some_collection')
+        mock_config.embedder.dimensions = dims
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
 
-        assert backend.config.embedder.dimensions == 1536
         assert 'embedding_dims' not in config_dict['embedder']['config']
+        assert (
+            config_dict['vector_store']['config']['embedding_model_dims']
+            == mock_config.embedder.dimensions
+        )
 
     def test_default_emits_incumbent_base_urls(self, backend):
         config_dict = backend._build_config_dict('some_collection')
@@ -3151,18 +3337,20 @@ class TestBuildConfigDictEndpointPlumbing:
             == 'https://api.openai.com/v1'
         )
 
-    def test_default_vector_store_dims_match_mem0s_own_default(self, backend):
-        """Emitting this key is a no-op at the shipped config — mem0's Qdrant
-        default is already 1536 — but it is required for a collection to be
-        CREATED at a non-default dimensionality."""
+    def test_vector_store_dims_follow_the_configured_width(self, backend):
+        """mem0's own Qdrant default is 1536, so this key is what lets a
+        collection be CREATED at any other configured width."""
         from mem0.configs.vector_stores.qdrant import QdrantConfig
 
         config_dict = backend._build_config_dict('some_collection')
 
-        assert config_dict['vector_store']['config']['embedding_model_dims'] == 1536
+        assert (
+            config_dict['vector_store']['config']['embedding_model_dims']
+            == backend.config.embedder.dimensions
+        )
         assert (
             QdrantConfig.model_fields['embedding_model_dims'].default == 1536
-        ), 'mem0 changed its Qdrant dims default — the no-op claim above no longer holds'
+        ), 'mem0 changed its Qdrant dims default — the claim above no longer holds'
 
     def test_preexisting_keys_are_unchanged(self, backend):
         config_dict = backend._build_config_dict('some_collection')
@@ -3181,7 +3369,7 @@ class TestBuildConfigDictEndpointPlumbing:
 
         embedder = config_dict['embedder']['config']
         assert config_dict['embedder']['provider'] == 'openai'
-        assert embedder['model'] == 'text-embedding-3-small'
+        assert embedder['model'] == backend.config.embedder.model
         assert embedder['api_key'] == 'test-key'
 
     # --- local-endpoint behaviour ---
@@ -3200,17 +3388,16 @@ class TestBuildConfigDictEndpointPlumbing:
             == 'http://127.0.0.1:5678/v1'
         )
 
-    def test_non_default_dims_emitted_under_both_key_names(self, mock_config):
-        """BOTH keys are required for a non-1536 arm, and they are NOT the same
-        key: the embedder key controls what dimensionality is requested from
-        the API, the vector-store key controls what Qdrant creates the
-        collection with. Setting only one silently yields a mismatch.
+    def test_a_non_default_width_sets_only_the_vector_store_dims(self, mock_config):
+        """The vector-store key sets the width Qdrant creates the collection
+        at; the embedder gets no width key, so it receives the model's native
+        width and the endpoint never sees ``dimensions``.
         """
         mock_config.embedder.dimensions = 768
         config_dict = Mem0Backend(mock_config)._build_config_dict('c')
 
-        assert config_dict['embedder']['config']['embedding_dims'] == 768
         assert config_dict['vector_store']['config']['embedding_model_dims'] == 768
+        assert 'embedding_dims' not in config_dict['embedder']['config']
 
     def test_anthropic_llm_block_carries_no_openai_base_url(self, mock_config):
         """openai_base_url is an OpenAIConfig-only parameter; passing it to the
@@ -3242,8 +3429,7 @@ class TestBuildConfigDictEndpointPlumbing:
         from mem0.configs.llms.openai import OpenAIConfig
         from mem0.configs.vector_stores.qdrant import QdrantConfig
 
-        # Non-default dims so every optional key is actually emitted.
-        mock_config.embedder.dimensions = 768
+        # Local endpoints, so the endpoint keys carry non-default values.
         mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
         mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
         config_dict = Mem0Backend(mock_config)._build_config_dict('c')

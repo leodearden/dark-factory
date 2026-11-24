@@ -20,8 +20,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator import substrate_gate as gate
+from orchestrator.slot_lease import SlotLease
 
 # ---------------------------------------------------------------------------
 # Shared scaffolding (pre-1)
@@ -1151,7 +1153,7 @@ class TestRunSlotSubstrateGateWiring:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (a1) TaskWorkflow must NOT have been constructed.
         assert not MockWorkflow.called, (
@@ -1183,7 +1185,7 @@ class TestRunSlotSubstrateGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (b1) TaskWorkflow must have been constructed.
         assert MockWorkflow.called, 'TaskWorkflow must be constructed on PASS gate verdict'
@@ -1208,7 +1210,7 @@ class TestRunSlotSubstrateGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (c1) _run_substrate_gate must NOT have been called.
         gate_mock.assert_not_awaited()
@@ -1289,7 +1291,7 @@ class TestRunSlotSubstrateFailClosed:
             patch('orchestrator.harness.build_workflow') as MockWorkflow,
         ):
             MockWorkflow.return_value = _make_mock_workflow()
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert not MockWorkflow.called, (
             f'TaskWorkflow must NOT be constructed for malformed descriptor '
@@ -1348,7 +1350,7 @@ class TestRunSlotSubstrateFailClosed:
         ):
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert MockWorkflow.called, 'TaskWorkflow must be constructed when no probe is declared'
         mock_wf.run.assert_awaited_once()
@@ -1387,17 +1389,6 @@ async def _init_unborn_repo(repo: Path) -> None:
     from orchestrator.git_ops import _run
 
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
-
-
-async def _init_gate_repo(repo: Path) -> None:
-    from orchestrator.git_ops import _run
-
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 def _make_real_git_harness(repo: Path, *, escalation_queue=None):
@@ -1439,9 +1430,7 @@ class TestSubstrateGateForeignBandGuard:
         (gate_path, frozenset({'_substrate-gate-'}), 'substrate-gate-cleanup')."""
         from orchestrator.git_ops import _run
 
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         h = _make_real_git_harness(repo)
         assignment = _make_assignment()
 
@@ -1498,9 +1487,7 @@ class TestSubstrateGateForeignBandGuard:
         would fail on the still-registered path and the gate would FLIP)."""
         from orchestrator.git_ops import _run
 
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         h = _make_real_git_harness(repo)
         assignment = _make_assignment()
 
@@ -1623,9 +1610,7 @@ class TestSubstrateGatePruneChokepoint:
         gate proceeds normally rather than FLIPping on 'already exists'."""
         from orchestrator.git_ops import _run
 
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         h = _make_real_git_harness(repo)
         assignment = _make_assignment()
 
@@ -1666,12 +1651,12 @@ def _single_l1(esc_queue, task_id: str):
     return esc
 
 
-async def _blocked_gate_l1(tmp_path: Path, assignment):
-    """Run the REAL gate on ``tmp_path / 'repo'``; assert it blocked; return its one L1."""
+async def _blocked_gate_l1(tmp_path: Path, repo: Path, assignment):
+    """Run the REAL gate on ``repo``; assert it blocked; return its one L1."""
     from escalation.queue import EscalationQueue
 
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    h = _make_real_git_harness(tmp_path / 'repo', escalation_queue=esc_queue)
+    h = _make_real_git_harness(repo, escalation_queue=esc_queue)
     set_status = AsyncMock()
     h.scheduler.set_task_status = set_status
 
@@ -1700,7 +1685,7 @@ class TestUnverifiableRecheckEscalation:
         # back to the symbolic ref, and the real `git worktree add` fails.
         await _init_unborn_repo(repo)
 
-        esc = await _blocked_gate_l1(tmp_path, _make_assignment('8372'))
+        esc = await _blocked_gate_l1(tmp_path, repo, _make_assignment('8372'))
 
         _assert_unverified_text(esc)
         assert 'git worktree add failed' in esc.detail, esc.detail
@@ -1709,9 +1694,7 @@ class TestUnverifiableRecheckEscalation:
 
     @pytest.mark.asyncio
     async def test_recheck_crash_files_unverified_l1(self, tmp_path: Path):
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
 
         # run_substrate_recheck catches its own subprocess errors, so patching
         # the public function is the honest way to reach the except branch
@@ -1720,7 +1703,7 @@ class TestUnverifiableRecheckEscalation:
             'orchestrator.substrate_gate.run_substrate_recheck',
             side_effect=RuntimeError('checker host vanished'),
         ):
-            esc = await _blocked_gate_l1(tmp_path, _make_assignment('8372'))
+            esc = await _blocked_gate_l1(tmp_path, repo, _make_assignment('8372'))
 
         _assert_unverified_text(esc)
         assert 'RuntimeError' in esc.detail, esc.detail
@@ -1728,12 +1711,10 @@ class TestUnverifiableRecheckEscalation:
 
     @pytest.mark.asyncio
     async def test_checker_that_cannot_launch_files_unverified_l1(self, tmp_path: Path):
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         assignment = _make_assignment('8372', checker=[str(tmp_path / 'no-such-checker')])
 
-        esc = await _blocked_gate_l1(tmp_path, assignment)
+        esc = await _blocked_gate_l1(tmp_path, repo, assignment)
 
         _assert_unverified_text(esc)
         assert 'rc=99' in esc.detail, esc.detail
@@ -1741,15 +1722,13 @@ class TestUnverifiableRecheckEscalation:
 
     @pytest.mark.asyncio
     async def test_real_probe_failure_still_files_substrate_flip(self, tmp_path: Path):
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         # The probe_set path is appended as an argv the -c script ignores.
         assignment = _make_assignment(
             '8372', checker=[sys.executable, '-c', 'import sys; sys.exit(1)'],
         )
 
-        esc = await _blocked_gate_l1(tmp_path, assignment)
+        esc = await _blocked_gate_l1(tmp_path, repo, assignment)
 
         assert esc.summary == 'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task 8372)'
         assert 're-spec required' in esc.detail, esc.detail

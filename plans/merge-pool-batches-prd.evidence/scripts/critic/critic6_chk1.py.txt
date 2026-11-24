@@ -1,0 +1,49 @@
+import itertools, sys
+sys.path.insert(0,'/tmp/gate-10069/critic6')
+from rule7 import fallback_cost, batch_cost, going_costs, plan_batch
+
+# 1. convergence: wider q, r, u, caps; start dependence
+def gc_from(q,r,u,sc,mf,mt,start,tol=1e-9,mx=500):
+    a_new,a_cl=start
+    for i in range(mx):
+        nc=min(batch_cost(0,c,q,r,u,sc,a_new,a_cl)/c for c in range(1,mt+1))
+        nf=min(batch_cost(f,0,q,r,u,sc,a_new,nc)/f for f in range(1,mf+1))
+        if abs(nc-a_cl)<tol and abs(nf-a_new)<tol: return nf,nc,i
+        a_new,a_cl=nf,nc
+    return None
+bad=0; multi=0; cells=0; maxit=0
+qs=[1e-9,1e-4,0.001,0.01,0.05,0.14,0.3,0.5,0.7,0.9,0.99,0.999999]
+for q in qs:
+  for r in (0.0,1e-6,0.01,0.1,0.5,0.9):   # r may exceed q after fitting drift
+    for u in (0.0,0.15,0.5,1.0):
+      for sc in (True,False):
+        for mf,mt in ((12,24),(1,1),(1,24),(4,4),(24,48),(48,96),(12,12),(2,3)):
+          cells+=1
+          res=[gc_from(q,r,u,sc,mf,mt,s) for s in ((1.0,1.0),(0.01,0.01),(5.0,5.0),(1.0,0.04))]
+          if any(x is None for x in res): bad+=1; print('NOCONV',q,r,u,sc,mf,mt) if bad<8 else None; continue
+          maxit=max(maxit,max(x[2] for x in res))
+          if len({(round(x[0],6),round(x[1],6)) for x in res})>1:
+              multi+=1
+              if multi<8: print('MULTI',q,r,u,sc,mf,mt,[(round(x[0],4),round(x[1],4)) for x in res])
+print('cells',cells,'nonconv',bad,'start-dependent',multi,'max iters',maxit)
+
+# 2. second-kind walk: does a joint addition of j>walk members pass where the one-at-a-time walk stopped?
+worse=[]
+for q in (0.01,0.03,0.05,0.08,0.14,0.2,0.3,0.5):
+  for r in (0.001,0.005,0.01,0.02,0.05):
+    if r>q: continue
+    for u in (0.0,0.05,0.15,0.3,0.6,1.0):
+      for sc in (True,False):
+        a_new,a_cl,_=going_costs(q,r,u,sc)
+        C=lambda f,c: batch_cost(f,c,q,r,u,sc,a_new,a_cl)
+        for front,nn,nc_ in (('new',30,30),('cleared',30,30),('new',1,30),('cleared',30,1),('new',3,30),('cleared',30,3),('cleared',30,6)):
+            cands=(['new']*(nn-(front=='new')))+(['cleared']*(nc_-(front=='cleared')))
+            f,c=plan_batch(front,cands,q,r,u,sc)
+            if front=='new':
+                for j in range(c+2, min(24-f, nc_)+1):
+                    if C(f,j)-C(f,c) < (j-c)*a_cl*0.98: worse.append((q,r,u,sc,front,nn,nc_,(f,c),'joint cleared',j,round((C(f,j)-C(f,c))/(j-c),4),round(a_cl,4))); break
+            else:
+                for j in range(f+2, min(12, 24-c, nn)+1):
+                    if C(j,c)-C(f,c) < (j-f)*a_new*0.98: worse.append((q,r,u,sc,front,nn,nc_,(f,c),'joint new',j,round((C(j,c)-C(f,c))/(j-f),4),round(a_new,4))); break
+print('joint-addition-beats-walk cases:',len(worse))
+for w in worse[:14]: print('  ',w)

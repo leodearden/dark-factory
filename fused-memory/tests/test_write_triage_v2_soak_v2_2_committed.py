@@ -4,7 +4,8 @@ Built by ``scripts/build_write_triage_v2_soak_baseline.py`` (``rerate
 --brief-version v2.2`` then ``assemble``) from the rounds scratch
 ``calibration/write_triage_v2_soak_rounds/``, the v2.1 soak rounds of task
 7174 with the soak's LOSS-reading pairs re-rated under rater brief v2.2, and
-scored by ``scripts/score_write_triage_reader.py --rubric v2.2``. The
+scored by ``scripts/score_write_triage_reader.py --corpus-record
+calibration/write_triage_v2_soak_derivation_v2_2.json``. The
 invariants below hold whatever the ratings say: no rate and no kappa value is
 pinned. The classes run on one xdist worker, so the cached loads are paid once
 per run.
@@ -38,6 +39,12 @@ def _soak() -> types.ModuleType:
 def _rounds() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'write_triage_rating_rounds.py',
                               mod_name='write_triage_rating_rounds')
+
+
+@functools.cache
+def _backfill() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'backfill_rating_shard_kinds.py',
+                              mod_name='backfill_rating_shard_kinds')
 
 
 @functools.cache
@@ -105,10 +112,12 @@ def _current_rows_by_pair() -> dict[tuple[str, str], list[dict[str, Any]]]:
 class TestTheCommittedV22SoakReport:
 
     def test_rescoring_the_inputs_under_v2_2_reproduces_the_report(self) -> None:
-        rescored = _score().score_reader(_items(), _verdicts(), rubric='v2.2',
+        rescored = _score().score_reader(_items(), _verdicts(),
+                                         brief=_rounds().latest_rerate_brief(_derivation()),
                                          strata=_json('strata.json'))
         assert rescored == _report()
         assert _report()['rubric'] == 'v2.2'
+        assert _report()['brief_sha256'] == _rerate()['brief_sha256']
 
     def test_the_markdown_is_the_rendered_report(self) -> None:
         markdown = (CALIBRATION / f'{STEM}_baseline_v2_2.md').read_text()
@@ -136,6 +145,9 @@ class TestTheCommittedV22SoakReport:
 
 @pytest.mark.xdist_group('committed_v2_soak_v2_2')
 class TestTheCommittedV22Rerate:
+
+    def test_every_shard_records_the_kind_and_basis_its_fields_derive(self) -> None:
+        assert _backfill().backfilled(_key()) == _key()
 
     def test_every_round_0_double_shard_records_brief_v2_1(self) -> None:
         briefs = {spec['brief_sha256'] for spec in _key()['shards'].values()

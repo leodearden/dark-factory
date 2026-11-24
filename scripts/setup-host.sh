@@ -773,8 +773,8 @@ else
   # Each copy is INDIVIDUALLY fault-tolerant, for the same reason the source
   # existence test above exists: under `set -euo pipefail` one failing `cp`
   # aborts this script outright, taking daemon-reload, every enable, and every
-  # LATER section of the host installer (jCodeMunch, Claude config, ...) with
-  # it. A unit is a bad reason to abandon a host setup.
+  # LATER section of the host installer (dashboard units, skill symlinks, git
+  # hooks, ...) with it. A unit is a bad reason to abandon a host setup.
   #
   # The existence test cannot cover this: the checker's `unreadable` is raised
   # on (OSError, UnicodeDecodeError), and the OSError half is exactly a file
@@ -834,111 +834,6 @@ else
     ok "orchestrator units + watchdog installed and enabled (${#_orch_installed_units[@]}/${#_orch_units[@]})"
   fi
 fi
-
-# ---------------------------------------------------------------------------
-# 6. jCodeMunch — structured code retrieval for coding agents
-# ---------------------------------------------------------------------------
-info "Installing jCodeMunch (AST-based code indexing)"
-
-# Global config (ignore patterns shared across all projects)
-CODE_INDEX_DIR="$HOME/.code-index"
-mkdir -p "$CODE_INDEX_DIR"
-
-if [ ! -f "$CODE_INDEX_DIR/config.jsonc" ]; then
-  cat > "$CODE_INDEX_DIR/config.jsonc" << 'JCEOF'
-{
-  "max_folder_files": 10000,
-  "extra_ignore_patterns": [
-    ".worktrees/",
-    ".eval-worktrees/",
-    "*-eval-worktrees/",
-    ".claude/worktrees/",
-    ".taskmaster/",
-    ".playwright-mcp/",
-    "node_modules/",
-    "target/",
-    "__pycache__/",
-    ".venv/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    ".pytest_cache/",
-    "*.png",
-    "uv.lock",
-    "Cargo.lock",
-    "pnpm-lock.yaml",
-    "package-lock.json"
-  ],
-  "staleness_days": 3
-}
-JCEOF
-  ok "Global config written to $CODE_INDEX_DIR/config.jsonc"
-else
-  ok "Global config already exists"
-fi
-
-# Project-level config
-if [ ! -f "$REPO_ROOT/.jcodemunch.jsonc" ]; then
-  cat > "$REPO_ROOT/.jcodemunch.jsonc" << 'JCEOF'
-{
-  // dark-factory: Python monorepo (fused-memory, orchestrator, escalation, shared)
-  "languages": ["python"],
-  "max_folder_files": 5000,
-  "disabled_tools": ["search_columns"],
-  "staleness_days": 3
-}
-JCEOF
-  ok "Project config written"
-else
-  ok "Project config already exists"
-fi
-
-# Install the prebuilt, version-pinned launcher the shared launch contract
-# (shared/src/shared/jcodemunch_launch.py) names, then register jcodemunch in
-# the user-level Claude config from that contract, replacing any existing entry
-# so every run converges on it: `claude mcp add-json` refuses a name that
-# already exists. `uv tool install` exits 0 even when its bin dir is not on
-# PATH, so registration is gated on the registered command resolving.
-if ! _jcodemunch_server_json="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch)" \
-  || ! _jcodemunch_install_argv_lines="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch install-argv)" \
-  || ! _jcodemunch_command="$(jq -r .command <<<"$_jcodemunch_server_json")"; then
-  fail "The jcodemunch launch contract did not render, so its launcher was not installed and jcodemunch was not registered in user config"
-  warn "  Fix: make 'PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch [install-argv]' succeed, then re-run scripts/setup-host.sh"
-else
-  mapfile -t _jcodemunch_install_argv <<<"$_jcodemunch_install_argv_lines"
-  if "${_jcodemunch_install_argv[@]}"; then
-    ok "$_jcodemunch_command launcher installed at the contract's pin"
-  else
-    fail "$_jcodemunch_command launcher install failed"
-    warn "  Fix: ${_jcodemunch_install_argv[*]}"
-  fi
-  if ! command -v "$_jcodemunch_command" &>/dev/null; then
-    fail "$_jcodemunch_command is not on PATH, so jcodemunch was not registered in user config"
-    warn "  Fix: put \"\$(uv tool dir --bin)\" on PATH (uv tool update-shell), then re-run scripts/setup-host.sh"
-  elif command -v claude &>/dev/null; then
-    _jcodemunch_removed=""
-    if claude mcp remove --scope user jcodemunch >/dev/null 2>&1; then
-      _jcodemunch_removed=", and its previous registration there was removed"
-    fi
-    if claude mcp add-json --scope user jcodemunch "$_jcodemunch_server_json"; then
-      ok "jcodemunch MCP registered in user config"
-    else
-      fail "jcodemunch MCP not registered in user config$_jcodemunch_removed"
-      warn "  Fix: claude mcp add-json --scope user jcodemunch \"\$(PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch)\""
-    fi
-  fi
-fi
-
-# Systemd watcher unit
-sed \
-  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
-  -e "s|__UV_PATH__|$UV_PATH|g" \
-  "$REPO_ROOT/scripts/jcodemunch-watcher.service.template" \
-  > "$UNIT_DIR/jcodemunch-watcher.service"
-
-systemctl --user daemon-reload
-systemctl --user enable jcodemunch-watcher
-systemctl --user restart jcodemunch-watcher
-ok "jcodemunch-watcher unit installed and started"
 
 # ---------------------------------------------------------------------------
 # 7. Dashboard systemd units
@@ -1572,13 +1467,6 @@ else
     fail "  see the [network_exposure] report above."
     ;;
   esac
-fi
-
-# jCodeMunch watcher
-if systemctl --user is-active jcodemunch-watcher &>/dev/null; then
-  ok "jCodeMunch watcher: running"
-else
-  warn "jCodeMunch watcher: not running (check: journalctl --user -u jcodemunch-watcher)"
 fi
 
 echo ""

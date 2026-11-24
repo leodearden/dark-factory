@@ -1,0 +1,108 @@
+"""Shared loading and classification for the gate-10069 measurements."""
+import json, math
+from collections import defaultdict
+from datetime import datetime
+
+DIR = '/tmp/gate-10069/measure/'
+T0 = '2026-11-05T00:00:00+00:00'
+# 8528 deploy: last merge event of run-9a6d5c55b0a4 04:25:35Z, first of run-c1a1cfef15e7 04:29:06Z.
+T8528 = '2026-11-19T04:25:45+00:00'
+# 10617 merged 11-17T18:45Z; first run after it: run-7c108b742770, first merge event 11-17T20:51:47Z.
+T10617 = '2026-11-17T20:49:00+00:00'
+RUN_STARTS = ['2026-11-07T09:15:25', '2026-11-07T22:07:22', '2026-11-09T18:08:42', '2026-11-10T23:48:54',
+              '2026-11-14T00:56:54', '2026-11-15T11:00:38', '2026-11-17T07:13:50', '2026-11-17T20:49:05',
+              '2026-11-18T18:34:41', '2026-11-19T04:25:53']
+TEND = '2026-11-20T00:00:00+00:00'
+
+E = json.load(open(DIR + 'events.json'))
+TE = json.load(open(DIR + 'task_events.json'))
+GIT = json.load(open(DIR + 'git_branches.json'))
+
+
+def ts(s):
+    return datetime.fromisoformat(s).timestamp()
+
+
+def window(t):
+    if t < T0:
+        return None
+    return 'a' if t < T8528 else 'b'
+
+
+def by_type(t, lo='2026-10-20'):
+    return [e for e in E if e['type'] == t and e['ts'] >= lo]
+
+
+GATE_SHAS = defaultdict(set)
+for g in by_type('merge_reverify_gate'):
+    if g['d'].get('merge_sha'):
+        GATE_SHAS[g['d']['merge_sha']].add(g['task'])
+
+
+def verifies(lo=T0):
+    out = []
+    for e in by_type('merge_verify', lo):
+        d = e['d']
+        if d.get('runner') == 'history-leg':
+            continue
+        k = d.get('chain_items') or 1
+        out.append({
+            'id': e['id'], 'ts': e['ts'], 'task': e['task'], 'k': k,
+            'passed': d.get('passed') is True, 'runner': d.get('runner'),
+            'dur_s': (d.get('duration_ms') or 0) / 1000.0,
+            'start_ts': ts(e['ts']) - (d.get('duration_ms') or 0) / 1000.0,
+            'end_ts': ts(e['ts']),
+            'gate': d.get('merge_sha') in GATE_SHAS,
+            'gate_same_task': e['task'] in GATE_SHAS.get(d.get('merge_sha'), ()),
+            'runner_reason': d.get('runner_reason'),
+            'members': d.get('chain_task_ids'),
+            'req_ids': d.get('chain_request_ids'),
+            'cdr': d.get('chain_depth_reason', 'ABSENT'),
+            'merge_sha': d.get('merge_sha'),
+            'win': window(e['ts']), 'day': e['ts'][:10],
+            'n_red': d.get('_n_red'), 'red_units': d.get('_red_units'),
+        })
+    return out
+
+
+def pct(vals, p):
+    if not vals:
+        return None
+    s = sorted(vals)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * p / 100
+    f, c = math.floor(k), math.ceil(k)
+    return s[f] + (k - f) * (s[c] - s[f])
+
+
+def wilson(x, n, z=1.96):
+    if n == 0:
+        return (None, None)
+    p = x / n
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return (c - h, c + h)
+
+
+def binom_cdf(x, n, p):
+    return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(x + 1))
+
+
+def cp_upper(x, n, alpha=0.05):
+    """One-sided 95% Clopper-Pearson upper bound on p given x of n."""
+    if x >= n:
+        return 1.0
+    lo, hi = x / n, 1.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if binom_cdf(x, n, mid) > alpha:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def fmt(x, d=3):
+    return '-' if x is None else (f'{x:.{d}f}' if isinstance(x, float) else str(x))

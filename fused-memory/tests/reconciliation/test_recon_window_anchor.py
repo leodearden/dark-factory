@@ -19,8 +19,8 @@ anchor dropped, that includes two classes it hid:
 - items created between the anchor and Stage 1's fetch, which this cycle
   already saw and the next one sees again;
 - every record this cycle wrote itself after its fetch, e.g. memories added by
-  consolidation, completion memories, and the ``cycle_summary`` mirror and
-  ``task_count_snapshot`` records. No cycle was ever shown these before.
+  consolidation, completion memories, and the ``cycle_summary`` mirror
+  records. No cycle was ever shown these before.
 
 Both cost Stage 1 prompt tokens, and the second class may lead Stage 1 to
 re-consolidate its predecessor's output. That cost is recoverable; a skipped

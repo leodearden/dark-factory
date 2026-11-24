@@ -33,6 +33,7 @@ from shared.defects import (
     DeclareEvent,
     OutcomeEvent,
 )
+from shared.dependency_cycle import cycle_closed_by_edge
 from shared.elision import elide_at_word
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
@@ -48,6 +49,7 @@ from shared.task_metadata import (
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL, TaskStatus
 from shared.task_store_schema import TASK_STORE_DDL
+from shared.task_tags import DEFAULT_TAG
 from shared.task_timestamp import format_task_timestamp
 
 from fused_memory.backends.defect_records import (
@@ -65,6 +67,7 @@ from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
     DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
+    DependencyCycle,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     MetadataNotAnObjectError,
@@ -149,8 +152,6 @@ _warned_malformed_task_ids: set[tuple[str, str, int]] = set()
 # key, same growth bound, same "restart re-emits" discipline.
 _warned_machine_authored_task_ids: set[tuple[str, str, int]] = set()
 
-
-DEFAULT_TAG = 'master'
 
 _PROMPT_TITLE_MAX = 200
 
@@ -1748,6 +1749,38 @@ async def _fetch_task_dependencies(read_all: _ReadAll, tag: str, tid: int) -> li
     return [row['depends_on'] for row in rows]
 
 
+async def _refuse_missing_or_self_dependency(
+    conn: aiosqlite.Connection, tag: str, tid: int, deps: Sequence[int], operation: str,
+) -> None:
+    """Refuse a dependency of *tid* on a task absent from *tag*, or on *tid* itself."""
+    for dep in deps:
+        cursor = await conn.execute('SELECT id FROM tasks WHERE tag = ? AND id = ?', (tag, dep))
+        if (await cursor.fetchone()) is None:
+            raise TaskmasterError('TASKMASTER_TOOL_ERROR', f'No tasks found for ID(s): {dep}')
+        if dep == tid:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR', f'{operation}: task cannot depend on itself',
+            )
+
+
+async def _refuse_cycle_closing_edges(
+    conn: aiosqlite.Connection, tag: str, tid: int, deps: Sequence[int], operation: str,
+) -> None:
+    """Raise :class:`DependencyCycle` for the first of *deps* whose edge from *tid* closes a cycle.
+
+    Walks one load of the tag's whole edge table. Call it only AFTER the unit's
+    first write: that write opens the transaction, so no other connection can
+    commit into the walk (shared/src/shared/async_sqlite_base.py::AtomicConnection.write).
+    """
+    if not deps:
+        return
+    edges = await _fetch_dependencies(conn.execute_fetchall, tag)
+    for dep in deps:
+        cycle = cycle_closed_by_edge(tid, dep, lambda task: edges.get(task, ()))
+        if cycle is not None:
+            raise DependencyCycle(operation, cycle)
+
+
 class SqliteTaskBackend:
     """Implements :class:`TaskBackendProtocol` against per-project SQLite files.
 
@@ -3284,7 +3317,7 @@ class SqliteTaskBackend:
         # carry the STORED done_provenance through verbatim, which can only
         # be judged against the row, so _assert_passthrough_only_keys
         # checks it inside the transaction below. The same floor, from the
-        # same table (_PASSTHROUGH_ONLY_METADATA_KEYS), covers the two defect
+        # same table (_PASSTHROUGH_ONLY_REFUSALS), covers the two defect
         # keys, whose only writers are declare_defect / record_defect_outcome. The gate reads the RAW
         # metadata_mode because _resolve_metadata_mode can itself raise, and
         # resolving first would change which error a bad call surfaces.
@@ -3358,7 +3391,9 @@ class SqliteTaskBackend:
         #   visible in ``get_task`` and cheap to re-derive, unlike the multi-KB
         #   authored prose the repros destroyed. That is a decision, not an
         #   oversight — widening the guard to a list-valued parameter with
-        #   different merge semantics is a separate call.
+        #   different merge semantics is a separate call. Each new entry must
+        #   exist, must not be the task itself, and must not close a local
+        #   cycle (DependencyCycle, path named; qualified deps are not walked).
         # Validate the metadata_mode VALUE unconditionally — a bad value should
         # always raise immediately, even if no metadata is supplied in this
         # call. But scope the bare-append=False rejection (the task-2180
@@ -3598,8 +3633,20 @@ class SqliteTaskBackend:
                 ) from exc
 
             # Dependencies: replace-mode only. Empty list clears all deps.
+            # Runs after the UPDATE above, the unit's first write, as the
+            # cycle walk requires. An entry already stored is exempt from the
+            # existence check: remove_tasks leaves rows pointing AT a removed
+            # task, and writing such a list back adds no new edge.
             if dependencies is not None:
                 parsed_deps: list[int] = [_parse_task_id(raw) for raw in dependencies]
+                stored_deps = set(
+                    await _fetch_task_dependencies(conn.execute_fetchall, tag, tid),
+                )
+                await _refuse_missing_or_self_dependency(
+                    conn, tag, tid,
+                    [dep for dep in parsed_deps if dep not in stored_deps],
+                    'update_task',
+                )
                 await conn.execute(
                     'DELETE FROM dependencies WHERE tag = ? AND task_id = ?',
                     (tag, tid),
@@ -3610,6 +3657,7 @@ class SqliteTaskBackend:
                         '(tag, task_id, depends_on) VALUES (?, ?, ?)',
                         (tag, tid, dep),
                     )
+                await _refuse_cycle_closing_edges(conn, tag, tid, parsed_deps, 'update_task')
 
             refreshed_cursor = await conn.execute(
                 'SELECT * FROM tasks WHERE tag = ? AND id = ?',
@@ -3936,12 +3984,16 @@ class SqliteTaskBackend:
 
         * **Bare integer** (e.g. ``"3"``): the traditional integer-table path.
           Both the dependent task and the target must exist in this project.
+          An edge that would close a cycle is refused with
+          :class:`DependencyCycle`, path named, walked over the local
+          dependencies table at every status.
         * **Qualified** (e.g. ``"dark_factory:13"``): cross-project dependency
           stored in the dependent task's ``metadata.external_deps`` list.
           The foreign target is **not** verified at write time (lenient write —
           the target may be filed later or live in another project).
           ``'-'`` in the project_id portion is normalised to ``'_'`` before
-          storing.
+          storing. Qualified deps are not walked for cycles: the cycle rule
+          covers the local graph only.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -4000,27 +4052,20 @@ class SqliteTaskBackend:
         dep_tid = _parse_task_id(depends_on)
 
         async with self._write_unit(project_root) as conn:
-            # Verify both endpoints exist before inserting.
-            for tid_check in (tid, dep_tid):
-                cursor = await conn.execute(
-                    'SELECT id FROM tasks WHERE tag = ? AND id = ?',
-                    (tag, tid_check),
-                )
-                if (await cursor.fetchone()) is None:
-                    raise TaskmasterError(
-                        'TASKMASTER_TOOL_ERROR',
-                        f'No tasks found for ID(s): {tid_check}',
-                    )
-            if tid == dep_tid:
-                raise TaskmasterError(
-                    'TASKMASTER_TOOL_ERROR',
-                    'add_dependency: task cannot depend on itself',
-                )
+            cursor = await conn.execute(
+                'SELECT id FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+            )
+            if (await cursor.fetchone()) is None:
+                raise TaskmasterError('TASKMASTER_TOOL_ERROR', f'No tasks found for ID(s): {tid}')
+            await _refuse_missing_or_self_dependency(
+                conn, tag, tid, (dep_tid,), 'add_dependency',
+            )
             await conn.execute(
                 'INSERT OR IGNORE INTO dependencies '
                 '(tag, task_id, depends_on) VALUES (?, ?, ?)',
                 (tag, tid, dep_tid),
             )
+            await _refuse_cycle_closing_edges(conn, tag, tid, (dep_tid,), 'add_dependency')
         return {
             'id': str(tid),
             'dependency_id': str(dep_tid),
@@ -4446,7 +4491,7 @@ def _metadata_object_or_raise(metadata: str | dict, task_id: str | None) -> dict
     return loaded
 
 
-_PASSTHROUGH_ONLY_METADATA_KEYS: Mapping[str, Callable[[str], TaskmasterError]] = (
+_PASSTHROUGH_ONLY_REFUSALS: Mapping[str, Callable[[str], TaskmasterError]] = (
     MappingProxyType(
         {
             'done_provenance': DoneProvenanceWriteAuthorityError,
@@ -4464,10 +4509,13 @@ set_task_status (and the privileged stamp_audit_metadata seam) writes
 defect keys (``fused_memory/backends/defect_records.py``).
 """
 
+PASSTHROUGH_ONLY_METADATA_KEYS: frozenset[str] = frozenset(_PASSTHROUGH_ONLY_REFUSALS)
+"""The key names of :data:`_PASSTHROUGH_ONLY_REFUSALS`, for callers outside this backend."""
+
 
 def _refuse_passthrough_only_keys(incoming: dict, task_id: str) -> None:
     """update_task's pre-connect floor outside replace: any carried key is refused, echo included."""
-    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+    for key, refusal in _PASSTHROUGH_ONLY_REFUSALS.items():
         if key in incoming:
             raise refusal(task_id)
 
@@ -4511,7 +4559,7 @@ def _keys_changed_by_write(
 def _assert_passthrough_only_keys(
     stored_raw: str | None, incoming: dict, task_id: str,
 ) -> None:
-    """Refuse a whole-blob replace that would move any :data:`_PASSTHROUGH_ONLY_METADATA_KEYS` key.
+    """Refuse a whole-blob replace that would move any key of :data:`_PASSTHROUGH_ONLY_REFUSALS`.
 
     The contract: update_task may never ADD, CHANGE or REMOVE one of those
     keys. Under metadata_mode='replace' the payload must carry the stored
@@ -4550,7 +4598,7 @@ def _assert_passthrough_only_keys(
     if not isinstance(stored, dict):
         _refuse_passthrough_only_keys(incoming, task_id)
         return
-    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+    for key, refusal in _PASSTHROUGH_ONLY_REFUSALS.items():
         if not _json_identical(stored.get(key, _ABSENT), incoming.get(key, _ABSENT)):
             raise refusal(task_id)
 

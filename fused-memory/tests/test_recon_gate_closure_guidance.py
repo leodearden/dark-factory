@@ -5,7 +5,7 @@ deterministic-gate closure rule is only sound if BOTH stages hold it.  These
 tests pin the WIRING (one shared constant, embedded verbatim in both assembled
 prompts and surviving both branches of ``build_stage2_system_prompt``) rather
 than the prose — the same shape as the existing
-``_STAGE1_/_STAGE2_GRAPHITI_QUEUED_GUIDANCE`` constants.  Prose may be reworded
+``GRAPHITI_QUEUED_GUIDANCE`` constant.  Prose may be reworded
 freely; the wiring may not silently break.
 
 The guidance is rendered as a SUBSECTION of the shared escalation-store

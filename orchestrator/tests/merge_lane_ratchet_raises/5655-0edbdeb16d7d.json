@@ -1,0 +1,18 @@
+{
+  "task_id": "5655",
+  "reason": "Net-additive guard wiring (esc-5655-3): orchestrator/tests/conftest.py::_isolate_orch_config unsets DF_VERIFY_CACHE with a function-local orchestrator.verify_cache.modes import, because a module-level import after the sys.path setup would need a new E402 noqa line that the INV-12 suppression ratchet rejects (same shape as task 6275's entry).",
+  "measures": [
+    {
+      "measure": "function_local_imports",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 8,
+      "current": 9
+    },
+    {
+      "measure": "total:function_local_imports",
+      "key": "<cluster>",
+      "baseline": 17,
+      "current": 18
+    }
+  ]
+}

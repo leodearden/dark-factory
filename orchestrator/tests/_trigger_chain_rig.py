@@ -376,7 +376,10 @@ class TriggerChainRig:
         effect = effect_for(action, escalation.level, escalation.category)
         if effect is None:
             raise AssertionError(f'{action!r} is not a resolve action for {escalation.category}')
-        self.queue.resolve(escalation.id, resolution, resolution_action=action, resolved_by='lambda-e2e')
+        self.queue.resolve(
+            escalation.id, resolution, resolution_action=action, resolved_by='lambda-e2e',
+            resolution_class='actionable',
+        )
         if effect.target_status is not None:
             await self.scheduler.set_task_status(escalation.task_id, effect.target_status)
 

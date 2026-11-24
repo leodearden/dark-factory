@@ -89,7 +89,7 @@ Phase 1 always runs in full: it is cheap, mechanical, and main may be red. Phase
 | Phase 1 tests, lint, typecheck, smoke | recomputed | recomputed |
 | Briefing validate checks | recomputed | recomputed |
 | Inputs (hotspot, `/review-all`, codebook) | re-read | re-read |
-| Project `/audit` | recomputed from `since`'s committer date | recomputed over `audit.window_days` |
+| Project `/audit` | recomputed over the whole corpus | recomputed over the whole corpus |
 | Stub scan, invariants audit, deep read, cross-module, coverage | changed scope only | whole scope |
 | Critical-path tracing | paths whose trace touches the changed scope | every path |
 | Dead-code scan | mechanical scan whole tree; judged only for candidates whose key is not in the carry set | whole scope |

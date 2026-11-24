@@ -99,7 +99,7 @@ def test_refresh_path_writes_normally_to_a_bound_launching_record(
     tmp_path: Path,
 ) -> None:
     # The window is LAUNCHING *and unbound*. A LAUNCHING record that already
-    # carries a binding HAS a discriminator, so _env_slug_is_owned has proved
+    # carries a binding HAS a discriminator, so _env_slug_ownership has proved
     # this event belongs to the owner -- withholding there would strand a
     # legitimately-owned record at `launching`.
     slug = 'session-cockpit-3215104'
@@ -341,8 +341,8 @@ def test_owner_stop_is_not_withheld_from_a_still_launching_record(
     # Ruling item 4-iii. The launch-window withholding suppressed status AND
     # the pending question for EVERY event, including the legitimate
     # owner's. A SessionStart killed by _HOOK_TIMEOUT_SECS (reachable:
-    # _resolve_wm_window_id's own docstring prices the pathological wmctrl
-    # case at ~10.8s against a 10s budget) writes nothing, so the record
+    # session_windows.py::resolve_window_id_by_title's docstring prices the
+    # pathological wmctrl case at ~10.8s against a 10s budget) writes nothing, so the record
     # stays LAUNCHING+unbound and the session went invisible for its whole
     # life. An event whose OWNER_PPID matches must write.
     slug = 'session-cockpit-4193004'

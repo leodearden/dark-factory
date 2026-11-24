@@ -101,7 +101,13 @@ whenever a finding or a design decision turns on it. An unnamed appeal to
     private state fail 13 while passing 14. Layering is a downward import of
     names a lower file defines and never takes back; a satellite that imports
     from the file that imports it is stitching, regardless of what the import
-    brings across.
+    brings across. A test file is sized by its subject: it is partitioned
+    with the module it tests, so a change that moves code into a new module
+    moves that code's tests into the new module's test file, driving its
+    public seam. A test file is split on its own only when it tests several
+    subjects (heuristic 6), never for its length alone. Fixtures and builders
+    the resulting files share move down into a helper module first; a test
+    file never imports from another test file.
 
 ## Two stances
 
@@ -128,7 +134,12 @@ whenever a finding or a design decision turns on it. An unnamed appeal to
   into a parent module, a function-local import placed to break a cycle, a
   re-export shim kept only so an old path resolves — is reportable as an
   interface-design finding, not a style nit. Reworking such seams is in scope
-  for quality work, not a distraction from it.
+  for quality work, not a distraction from it. A test depends on timing only
+  when timing is the behaviour under test — a deadline, grace period or
+  timeout path — and then it runs on an injected or virtual clock or, against
+  a real child process, bounds it by the child's own time (wall time less the
+  time it spent queued for a CPU); sleep-until-ready is never justified, and a
+  wall-clock performance assertion does not belong in a merge gate.
 
 ## What to measure
 

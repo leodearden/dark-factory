@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TaskmasterConfig
@@ -32,6 +33,8 @@ from fused_memory.middleware.curator_types import CuratorDecision, PreparedCandi
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
+from fused_memory.models.reconciliation import EventType
+from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 
@@ -49,17 +52,42 @@ class Stack:
     interceptor: TaskInterceptor
     server: Any
     ticket_store: TicketStore
+    event_buffer: EventBuffer
 
     async def call(self, tool: str, **args: Any) -> Any:
         return await self.server._tool_manager.call_tool(tool, {'project_root': self.root, **args})
 
+    async def events(self, event_type: EventType) -> list[dict[str, Any]]:
+        """The payloads of this project's journaled events of *event_type*, oldest first.
+
+        The interceptor's ``_project_root`` envelope key is dropped, so a payload reads as emitted.
+        """
+        journaled = await self.event_buffer.peek_buffered(resolve_project_id(self.root), limit=10_000)
+        return [
+            {key: value for key, value in event.payload.items() if key != '_project_root'}
+            for event in journaled if event.type == event_type
+        ]
+
     async def task_count(self) -> int:
         return len((await self.call('get_tasks'))['tasks'])
 
-    async def metadata(self, task_id: str) -> dict[str, Any]:
+    async def row(self, task_id: str) -> dict[str, Any]:
         result = await self.call('get_task', id=task_id)
         assert 'error' not in result, result
-        return result['metadata']
+        return result
+
+    async def metadata(self, task_id: str) -> dict[str, Any]:
+        return (await self.row(task_id))['metadata']
+
+    async def dependencies(self, task_id: str) -> list[str]:
+        """The task's local dependency ids, as strings."""
+        return [str(dependency) for dependency in (await self.row(task_id)).get('dependencies') or []]
+
+    async def holder_ids(self) -> list[str]:
+        """Every task carrying the follow-up holder marker, in any status."""
+        found = await self.call('find_tasks_by_metadata', key=FOLLOWUP_HOLDER_METADATA_KEY)
+        assert 'error' not in found, found
+        return [str(row['task_id']) for row in found['results']]
 
     async def seed(self, title: str, metadata: dict[str, Any], **fields: str) -> str:
         """A row written straight to the store, past every submit-boundary guard.
@@ -112,7 +140,7 @@ async def stack(tmp_path: Path) -> AsyncIterator[Stack]:
     try:
         yield Stack(
             root=str(tmp_path / 'proj'), backend=backend, interceptor=interceptor, server=server,
-            ticket_store=ticket_store,
+            ticket_store=ticket_store, event_buffer=event_buffer,
         )
     finally:
         await interceptor.close()

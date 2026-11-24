@@ -25,31 +25,25 @@ here is shaped identically to 3182's and the two read as one defence.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import sys
 import tomllib
-from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from nested_pytest_session import run_nested_pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (  # noqa: E402
+from df_pytest_isolation import (
     basetemp_rejection_reason,
     git_ceiling_value,
     reject_unsafe_basetemp,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CEILING_KEY = 'GIT_CEILING_DIRECTORIES'
@@ -392,9 +386,9 @@ class TestCeilingIsLiveInThisRun:
 
         assert basetemp in entries, (
             f'{_CEILING_KEY} does not contain this run\'s basetemp {basetemp}.\n'
-            'The session ceiling fixture is not loaded for this rootdir. Wire '
-            'the test-root conftest to import _df_git_ceiling_at_basetemp from '
-            'df_pytest_isolation.'
+            'The session ceiling fixture is not armed for this rootdir. Call '
+            'arm_test_root_isolation(config) from the test-root conftest\'s '
+            'pytest_configure.'
         )
 
     def test_the_ambient_ceiling_has_no_duplicate_entries(self) -> None:
@@ -418,9 +412,9 @@ class TestCeilingIsLiveInThisRun:
 # needs it most.  This guard is what makes the coverage uniform and keeps it
 # that way, rather than trusting the next person to remember.
 
-# Every suite-wide fixture a test-root conftest must bind, mapped to the clause
+# Every suite-wide fixture a test-root conftest must arm, mapped to the clause
 # its defect message appends: what goes wrong in a suite that forgets it.
-_REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
+_REQUIRED_ARMED_FIXTURES: dict[str, str] = {
     '_df_git_ceiling_at_basetemp': (
         ' — without it a cwd=tmp_path git call can walk up into the enclosing '
         'live worktree (esc-3072-3)'
@@ -428,6 +422,10 @@ _REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
     '_df_deploy_clocks_unwritten': (
         ' — without it this suite can stamp a REAL deploy clock and suppress the '
         'watchdog staleness backstop for 8h (task 3797)'
+    ),
+    '_df_git_env_hermetic': (
+        ' — without it a leaked GIT_DIR/GIT_WORK_TREE redirects every '
+        '`git -C tmp_path` write into the repository it names (incident 2026-08-31)'
     ),
     '_df_claude_binary_unset': (
         ' — without it an ambient CLAUDE_BINARY outranks PATH '
@@ -443,29 +441,32 @@ _REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
 
 
 def _conftest_sample(
-    bindings: Iterable[str] = tuple(_REQUIRED_FIXTURE_BINDINGS),
     *,
-    binding_suffix: str = '',
     bootstrap: str = (
-        'if str(REPO_ROOT) not in sys.path:\n'
-        '    sys.path.append(str(REPO_ROOT))   # APPEND — never insert(0, ...)\n'
+        'if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:\n'
+        '    sys.path.append(str(REPO_ROOT))  # APPEND — never insert(0, ...)\n'
     ),
-    configure_body: str = '    reject_unsafe_basetemp(config)\n',
+    configure_body: str = (
+        '    reject_unsafe_basetemp(config)\n'
+        '    arm_test_root_isolation(config)\n'
+    ),
 ) -> str:
-    """A test-root conftest binding *bindings*: the printed remediation and the self-tests' input."""
-    imported = ''.join(f'    {name},{binding_suffix}\n' for name in sorted(bindings))
+    """A test-root conftest: the printed remediation and the self-tests' input."""
     return (
         'import sys\n'
         'from pathlib import Path\n'
-        'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+        '\n'
         f'{bootstrap}'
-        f'from df_pytest_isolation import (\n{imported}    reject_unsafe_basetemp,\n)\n'
+        '\n'
+        'from df_pytest_isolation import arm_test_root_isolation, reject_unsafe_basetemp\n'
+        '\n'
+        '\n'
         'def pytest_configure(config):\n'
         f'{configure_body}'
     )
 
 
-_WIRING_SNIPPET = _conftest_sample(binding_suffix='  # noqa: F401')
+_WIRING_SNIPPET = _conftest_sample()
 
 
 def _test_root_conftests() -> list[Path]:
@@ -507,12 +508,15 @@ def _file_based_path(node: ast.expr, conftest: Path) -> Path | None:
 
 
 def _repo_root_names(tree: ast.Module, conftest: Path) -> set[str]:
-    """Names bound to a path expression that evaluates to the repo root."""
+    """Names bound, by assignment or walrus, to a path expression that evaluates to the repo root."""
     names: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.NamedExpr):
+            target = node.target
+        else:
             continue
-        target = node.targets[0]
         if not isinstance(target, ast.Name):
             continue
         value = _file_based_path(node.value, conftest)
@@ -557,27 +561,30 @@ def _wiring_defects(source: str, conftest: Path) -> list[str]:
         for alias in node.names
     }
     defects.extend(
-        f'does not import {fixture} from df_pytest_isolation (pytest only collects '
-        f'fixtures bound into the conftest namespace, so the import IS the wiring){consequence}'
-        for fixture, consequence in _REQUIRED_FIXTURE_BINDINGS.items()
-        if fixture not in imported
+        f'does not import {name} from df_pytest_isolation'
+        for name in ('arm_test_root_isolation', 'reject_unsafe_basetemp')
+        if name not in imported
     )
-    if 'reject_unsafe_basetemp' not in imported:
-        defects.append('does not import reject_unsafe_basetemp from df_pytest_isolation')
 
     configures = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == 'pytest_configure'
     ]
+    called = {
+        inner.func.id
+        for node in configures for inner in ast.walk(node)
+        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+    }
     if not configures:
         defects.append('defines no pytest_configure hook')
-    elif not any(
-        isinstance(inner, ast.Call)
-        and isinstance(inner.func, ast.Name)
-        and inner.func.id == 'reject_unsafe_basetemp'
-        for node in configures for inner in ast.walk(node)
-    ):
+    elif 'reject_unsafe_basetemp' not in called:
         defects.append('pytest_configure does not call reject_unsafe_basetemp(config)')
+    if configures and 'arm_test_root_isolation' not in called:
+        defects.append(
+            'pytest_configure does not call arm_test_root_isolation(config) (pytest only '
+            'collects fixtures a plugin or conftest registers, so that call IS the wiring)'
+            + ''.join(_REQUIRED_ARMED_FIXTURES.values())
+        )
 
     root_names = _repo_root_names(tree, conftest)
     if not root_names:
@@ -658,23 +665,50 @@ class TestEveryTestRootConftestIsWired:
 
         assert defects == [], f'{defects}\n{_WIRING_SNIPPET}'
 
-    @pytest.mark.parametrize('missing', sorted(_REQUIRED_FIXTURE_BINDINGS))
-    def test_the_detector_flags_a_conftest_missing_only_one_required_binding(
-        self, missing: str,
+    def test_the_wiring_snippet_needs_no_suppression(self, tmp_path: Path) -> None:
+        """Self-test: the printed wiring, copied verbatim, is clean under the repo's ruff rules.
+
+        Task 6966 copied the old printed wiring and then had to add suppressions
+        to get it past lint. ``--ignore-noqa`` means a suppression in the snippet
+        cannot hide a finding either.
+        """
+        conftest = tmp_path / 'conftest.py'
+        conftest.write_text(_WIRING_SNIPPET, encoding='utf-8')
+
+        proc = subprocess.run(
+            [
+                sys.executable, '-m', 'ruff', 'check', '--no-cache', '--ignore-noqa',
+                '--output-format', 'json', '--config', str(REPO_ROOT / 'pyproject.toml'),
+                str(conftest),
+            ],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+
+        assert proc.returncode in (0, 1), (
+            f'`ruff check` exited {proc.returncode}; a missing ruff or a bad '
+            f'invocation must fail this guard, not skip it. stderr: {proc.stderr.strip()!r}'
+        )
+        findings = [f'{f["code"]}: {f["message"]}' for f in json.loads(proc.stdout)]
+        assert findings == [], f'{findings}\n{_WIRING_SNIPPET}'
+
+    def test_the_detector_flags_a_pytest_configure_that_does_not_arm_the_test_root_isolation(
+        self,
     ) -> None:
-        """Self-test: each required-binding rule is not vacuous on its own.
+        """Self-test: the arm-call rule fires on its own and says what the suite loses.
 
         A conftest correctly wired for everything else must still be flagged
-        for the one binding it lacks — otherwise that rule would only ever
+        when it never arms the bundle — otherwise that rule would only ever
         fire alongside another defect and could be deleted without any test
         noticing (task 3797).
         """
-        sample = _conftest_sample(b for b in _REQUIRED_FIXTURE_BINDINGS if b != missing)
+        sample = _conftest_sample(configure_body='    reject_unsafe_basetemp(config)\n')
 
         defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
-        assert len(defects) == 1, f'only the {missing} rule should fire: {defects}'
-        assert missing in defects[0], defects
+        assert len(defects) == 1, f'only the arm rule should fire: {defects}'
+        assert 'arm_test_root_isolation' in defects[0], defects
+        missing = [c for c in _REQUIRED_ARMED_FIXTURES.values() if c not in defects[0]]
+        assert not missing, f'the defect omits consequence clause(s) {missing}: {defects[0]}'
 
     def test_the_detector_flags_an_insert_of_the_repo_root(self) -> None:
         """Self-test: the namespace-package hazard is pinned STRUCTURALLY.
@@ -682,7 +716,9 @@ class TestEveryTestRootConftestIsWired:
         insert(0, ...) is invisible in review and only bites much later, far
         from this change, as confusing import breakage.
         """
-        sample = _conftest_sample(bootstrap='sys.path.insert(0, str(REPO_ROOT))\n')
+        sample = _conftest_sample(
+            bootstrap='sys.path.insert(0, str(REPO_ROOT := Path(__file__).resolve().parents[2]))\n',
+        )
 
         defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
@@ -704,3 +740,50 @@ class TestEveryTestRootConftestIsWired:
 
         assert REPO_ROOT / 'conftest.py' in conftests
         assert len(conftests) > 1
+
+
+_ARMING_ONLY_CONFTEST = '''\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from df_pytest_isolation import arm_test_root_isolation
+
+
+def pytest_configure(config):
+    arm_test_root_isolation(config)
+'''
+
+_ARMED_FIXTURES_PROBE = f'''\
+REQUIRED = {sorted(_REQUIRED_ARMED_FIXTURES)!r}
+
+
+def test_every_required_fixture_is_armed(request):
+    missing = [name for name in REQUIRED if name not in request.fixturenames]
+    assert not missing, missing
+
+
+def test_the_fleet_deploy_clock_redirect_is_requestable_by_name(request):
+    assert request.getfixturevalue('_df_fleet_deploy_clock_redirect')
+'''
+
+
+class TestArmTestRootIsolation:
+    """The bundle every test root calls arms the whole required set, independently checked."""
+
+    def test_it_arms_every_required_fixture(self, tmp_path: Path) -> None:
+        """A conftest that only calls arm_test_root_isolation gets every fixture this guard requires.
+
+        The required map above is kept independent of the bundle, so a defence
+        dropped from the bundle fails here instead of silently leaving every
+        test root without it.
+        """
+        result = run_nested_pytest(
+            tmp_path / 'armed',
+            {'conftest.py': _ARMING_ONLY_CONFTEST, 'test_probe.py': _ARMED_FIXTURES_PROBE},
+        )
+
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert '2 passed' in output, output

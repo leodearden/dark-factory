@@ -107,6 +107,21 @@ class GateReplyError(ValueError):
     """A gate's stdout is not the documented reply; the caller classes it 'gate'."""
 
 
+_WIRE_METADATA_KEY = 'df_wire'
+
+_FieldValue = typing.TypeVar('_FieldValue')
+
+
+def off_wire_field(*, default: _FieldValue, compare: bool = True) -> _FieldValue:
+    """A dataclass field, defaulting to *default*, that never crosses the dispatcher/remote boundary."""
+    return dataclasses.field(default=default, compare=compare, metadata={_WIRE_METADATA_KEY: False})
+
+
+def wire_fields(cls: type) -> tuple[dataclasses.Field[typing.Any], ...]:
+    """*cls*'s fields that cross the dispatcher/remote boundary: all but its off-wire ones."""
+    return tuple(f for f in dataclasses.fields(cls) if f.metadata.get(_WIRE_METADATA_KEY, True))
+
+
 def _annotation_text(annotation: object) -> str:
     return annotation if isinstance(annotation, str) else inspect.formatannotation(annotation)
 
@@ -118,7 +133,7 @@ def _field_shapes(cls: type) -> list[list[str]]:
         hints = {}
     return [
         [f.name, _annotation_text(hints.get(f.name, f.type))]
-        for f in dataclasses.fields(cls)
+        for f in wire_fields(cls)
     ]
 
 
@@ -253,9 +268,9 @@ def reap_script_text() -> str:
     """The text of ``remote_gate/reap-gates.sh``, shipped as package data.
 
     Its contract: env ``GATE_ROOT`` (absolute).  Under a root carrying
-    :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days and trash
-    older than a day; elsewhere it does nothing.  Run detached: it prints
-    nothing and its outcome is not awaited.
+    :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days, each with
+    its build lock, and trash older than a day; elsewhere it does nothing.
+    Run detached: it prints nothing and its outcome is not awaited.
     """
     return _packaged_script('reap-gates.sh')
 

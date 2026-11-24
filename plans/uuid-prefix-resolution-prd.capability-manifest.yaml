@@ -234,13 +234,15 @@ tasks:
       reason: verdict-identity across a 30-specimen corpus is a test property, not
         a grep
   - name: client-renders-meta
-    binding: manual — PRD open question 1; γ probes it as its first step and folds
-      into structuredContent if not
-    verdict: OPEN
+    binding: manual — PRD open question 1, answered by γ's live probe on 2026-11-14;
+      the agent's MCP client does not surface _meta to the model, so the fused-memory
+      shim folds uuid_prefix_repair into structuredContent (schema-checked) and the
+      JSON text block. See PRD §11 Q1, Resolved 2026-11-14 (task 4643)
+    verdict: PASS
     delivered_check:
       kind: manual
-      reason: whether the agent's MCP client surfaces _meta to the model is measured
-        live during γ, not from the tree
+      reason: whether the agent's MCP client surfaces _meta to the model was measured
+        live by γ, not from the tree
 - label: δ
   task_id: 5324
   title: 'escalation servers: httpx resolver client + registration on 8100 / 8102

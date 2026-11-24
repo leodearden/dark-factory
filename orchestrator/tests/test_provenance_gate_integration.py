@@ -25,11 +25,13 @@ scenarios #5 and #6, plus a control:
       guard accepts, the gate marks the task done anchored on the marker
       sha, and no escalation is filed.
   #6  A branch's changed files coincidentally match main's independent
-      content (the content-equivalence fallback engages) but no commit on
-      main cites the task and none is the tip's patch-id twin — DISCOVERY
-      mode rejects with ``no_citation``.  The deleted
-      ``citation or get_main_sha()`` fallback must not resurface: no
-      fabricated anchor, no ``mark_done``, one escalation.
+      content, but no commit on main cites the task and none is the tip's
+      patch-id twin.  The live tip is not an ancestor of main, so the gate's
+      off-main-tip arm asks ``branch_work_landed`` (task 4648): the branch's
+      own commit is not patch-id contained in main, so it is ``not_landed``.
+      The deleted ``citation or get_main_sha()`` fallback must not resurface:
+      no fabricated anchor, no ``mark_done``, and no escalation, since
+      nothing of the branch is on main to attribute.
   twin #6's narrowing (esc-4862-1): when main's independent commit IS the
       tip's patch-id twin, that real commit carries the branch's diff, so
       the gate marks done anchored on it — never on main HEAD.
@@ -37,17 +39,19 @@ scenarios #5 and #6, plus a control:
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.git_ops import _run
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.landing_evidence import (
     LandingMethod,
+    LandingReason,
+    branch_work_landed,
     validate_landing_evidence,
 )
 
@@ -55,25 +59,13 @@ pytestmark = pytest.mark.asyncio
 
 
 # ---------------------------------------------------------------------------
-# Real git repo fixture (mirrors test_git_ops.py's git_repo/_setup_repo).
+# Real git repo fixture (mirrors test_git_ops.py::git_repo, via _git_fixtures.seed_repo).
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit on main."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
-
-
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    return seed_repo(tmp_path / 'repo')
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +82,9 @@ def _build_harness(mock_orch_config) -> Harness:
     ``mock_orch_config.project_root`` at a real git repo BEFORE calling this
     so every git_ops call (``resolve_branch_sha``, ``is_ancestor``,
     ``find_merge_marker``, ``commit_effect_present_in_main``,
-    ``branch_content_in_main``, ``find_task_citation_commit``) runs a real
-    git subprocess against genuine repository state instead of a mock.
+    ``find_task_citation_commit``, and the patch-id reads behind
+    ``branch_work_landed``) runs a real git subprocess against genuine
+    repository state instead of a mock.
     """
     mock_orch_config.max_concurrent_tasks = 2
     mock_orch_config.fused_memory.project_id = 'test'
@@ -315,17 +308,21 @@ class TestAlreadyLandedGateRealGitBoundaries:
         assert call.kwargs['sha'] == marker_sha
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
-    async def test_content_equivalent_no_citation_escalates_no_mark_done(
+    async def test_content_equivalent_no_citation_is_not_landed_no_mark_done(
         self, mock_orch_config, git_repo,
     ) -> None:
         """PRD boundary-test #6, end-to-end, as narrowed by esc-4862-1:
         branch content coincidentally matches main, but no commit on main
-        cites the task AND main holds no patch-id twin of the branch tip —
-        DISCOVERY mode rejects with reason ``no_citation`` against REAL git
-        state, its probe naming the declined fallback ``unanchored``.  The
-        gate must not fabricate an anchor from main HEAD (the deleted
-        ``or get_main_sha()`` fallback); it escalates instead of stamping
-        done.
+        cites the task AND main holds no patch-id twin of the branch tip.
+
+        What the gate's producer decides, measured on this fixture: the
+        branch's own commit has no patch-id equivalent in main, so
+        ``branch_work_landed`` answers ``not_landed``.  The gate must not
+        fabricate an anchor from main HEAD (the deleted ``or
+        get_main_sha()`` fallback), must not stamp done, and files no
+        escalation: there is no landed work to attribute.  The legacy
+        DISCOVERY producer's own answer on the same fixture is still
+        ``no_citation`` with the declined fallback ``unanchored``.
         """
         task_id = '77'
         branch = f'task/{task_id}'
@@ -333,18 +330,23 @@ class TestAlreadyLandedGateRealGitBoundaries:
             git_repo, task_id, main_commit_is_twin=False,
         )
         h = _wire_gate_harness(mock_orch_config, git_repo, task_id=task_id)
+        tip = await h.git_ops.resolve_branch_sha(branch)
+
+        decided = await branch_work_landed(
+            h.git_ops, task_id, branch, branch_tip_sha=tip, pattern_template=None,
+        )
+        assert decided.reason is LandingReason.not_landed
+        legacy = await validate_landing_evidence(
+            h.git_ops, task_id, branch, branch_tip_sha=tip,
+        )
+        assert legacy.reason == 'no_citation'
+        assert legacy.probe['content_fallback'] == 'unanchored'
 
         result, submit = await _drive_gate(h, task_id)
 
         assert result is False
         cast(AsyncMock, h.scheduler.mark_done).assert_not_awaited()
-        submit.assert_called_once()
-        esc = submit.call_args[0][0]
-        assert esc.category == 'provenance_unattributed'
-        assert esc.task_id == task_id
-        assert branch in esc.detail
-        assert 'no_citation' in esc.detail
-        assert 'unanchored' in esc.detail
+        submit.assert_not_called()
 
     async def test_content_equivalent_patch_id_twin_marks_done_on_the_twin(
         self, mock_orch_config, git_repo,
@@ -352,10 +354,12 @@ class TestAlreadyLandedGateRealGitBoundaries:
         """The accepting side of #6's narrowing (esc-4862-1): the same
         uncited, content-equivalent branch, but main's independent commit IS
         the tip's ``git patch-id --stable`` twin — a real main commit
-        carrying the branch's diff, not a fabricated anchor.  DISCOVERY's
-        fallback attributes it as ``content_equivalence``, and the gate
-        marks the task done anchored on that twin, never on main HEAD or the
-        branch tip, with no escalation.
+        carrying the branch's diff, not a fabricated anchor.  The gate's
+        producer, ``branch_work_landed``, finds the branch's commit
+        contained and attributes it to that twin (DISCOVERY's own fallback
+        would attribute the same commit as ``content_equivalence``), and the
+        gate marks the task done anchored on that twin, never on main HEAD
+        or the branch tip, with no escalation.
         """
         task_id = '78'
         branch = f'task/{task_id}'
@@ -371,6 +375,11 @@ class TestAlreadyLandedGateRealGitBoundaries:
         )
         assert verdict.method is LandingMethod.content_equivalence
         assert verdict.evidence_sha == twin
+        decided = await branch_work_landed(
+            h.git_ops, task_id, branch, branch_tip_sha=tip, pattern_template=None,
+        )
+        assert decided.method is LandingMethod.patch_id
+        assert decided.evidence_sha == twin
 
         result, submit = await _drive_gate(h, task_id)
 

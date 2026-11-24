@@ -33,7 +33,13 @@ from _orch_helpers import (
 )
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.defect_tests_config import DefectTestsConfig, DefectTestsMode
 from orchestrator.verify import run_verification
+from orchestrator.verify_cmd import parse_config_command, render, with_defect_plugin
+
+#: The configured test command as the test leg runs it: the default defect
+#: mode (shadow) adds ``-p _df_defect_plugin``.
+INJECTED_TEST_CMD = render(with_defect_plugin(parse_config_command(ADMISSION_TEST_CMD)))
 
 
 class TestVerifyAdmissionAcquireWiring:
@@ -95,6 +101,7 @@ class TestVerifyAdmissionAcquireWiring:
             verify_admission_enabled=False,
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
+            defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
         )
         worktree = tmp_path / 'wt'
         worktree.mkdir()
@@ -189,7 +196,7 @@ class TestVerifyAdmissionAcquireWiring:
         )
         # The slot ACQUIRE fails open (no flock held), but the nice-prefix wrap is
         # independent of acquisition and still applies to the test leg.
-        assert run_cmd_calls[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(ADMISSION_TEST_CMD)
+        assert run_cmd_calls[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(INJECTED_TEST_CMD)
         assert run_cmd_calls[1] == ADMISSION_LINT_CMD
         assert run_cmd_calls[2] == ADMISSION_TYPE_CMD
 
@@ -318,7 +325,7 @@ class TestNicePrefixIntegration:
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(ADMISSION_TEST_CMD)
+        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(INJECTED_TEST_CMD)
         assert captured_cmds[1] == ADMISSION_LINT_CMD, 'lint leg must not be niced'
         assert captured_cmds[2] == ADMISSION_TYPE_CMD, 'type leg must not be niced'
 
@@ -350,7 +357,7 @@ class TestNicePrefixIntegration:
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == 'nice -n 5 /bin/bash -c ' + shlex.quote(ADMISSION_TEST_CMD)
+        assert captured_cmds[0] == 'nice -n 5 /bin/bash -c ' + shlex.quote(INJECTED_TEST_CMD)
         assert captured_cmds[1] == ADMISSION_LINT_CMD, 'lint leg must not be niced'
         assert captured_cmds[2] == ADMISSION_TYPE_CMD, 'type leg must not be niced'
 
@@ -368,6 +375,7 @@ class TestNicePrefixIntegration:
             verify_admission_enabled=False,
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
+            defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
         )
         worktree = tmp_path / 'wt'
         worktree.mkdir()
@@ -491,7 +499,7 @@ class TestBackgroundRoleWiring:
             f'Expected the background role to acquire a slot before the test leg runs; '
             f'got events={events!r}'
         )
-        assert captured_cmds[0] == 'nice -n 19 ionice -c3 /bin/bash -c ' + shlex.quote(ADMISSION_TEST_CMD), (
+        assert captured_cmds[0] == 'nice -n 19 ionice -c3 /bin/bash -c ' + shlex.quote(INJECTED_TEST_CMD), (
             f'Expected the test leg to be wrapped with the background nice-19/ionice-idle '
             f'tier; got {captured_cmds[0]!r}'
         )

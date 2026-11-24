@@ -1,4 +1,4 @@
-"""S6: a shadow cell's sandboxed legs reach the landlock wrapper, a corpus cell's do not (task 5386).
+"""S6: shadow and corpus cells' sandboxed legs both reach the landlock wrapper (tasks 5386, 9849).
 
 The dispatch path is the real one end to end: ``TaskWorkflow._invoke`` in a
 real detached eval worktree records the ``invoke_agent`` kwargs, and the REAL
@@ -23,7 +23,7 @@ from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invocation_scope import invocation_scope
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, AgentRole
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
 from orchestrator.evals.runner import build_eval_orch_config, eval_mcp_lifecycle
@@ -46,6 +46,7 @@ class _EvalCell:
             project_root=self.repo, max_concurrent_tasks=1,
             git=GitConfig(main_branch='main', branch_prefix='task/', remote='origin',
                           worktree_dir='.worktrees'),
+            sandbox=SandboxConfig(enabled=True, backend='landlock'),
         )
 
 
@@ -148,19 +149,24 @@ async def test_shadow_implementer_is_strict_and_landlock_wrapped(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures('landlock_host')
-async def test_corpus_eval_implementer_stays_unsandboxed(
+async def test_corpus_eval_implementer_is_landlock_wrapped(
     eval_cell: _EvalCell, pinned_claude: str, monkeypatch,
 ) -> None:
     orch = build_eval_orch_config(_IMPL, eval_cell.fixture, eval_cell.base_config())
+    shadow = build_shadow_orch_config(_IMPL, eval_cell.fixture, eval_cell.base_config())
+    worktree = str(eval_cell.worktree.resolve())
 
     kwargs = await _dispatched_kwargs(eval_cell, orch, IMPLEMENTER, monkeypatch)
+    shadow_kwargs = await _dispatched_kwargs(eval_cell, shadow, IMPLEMENTER, monkeypatch)
 
-    assert kwargs['sandbox_modules'] is None
+    assert kwargs['sandbox_modules'] == []
+    assert worktree in kwargs['sandbox_extras']
+    assert kwargs['sandbox_extras'] == shadow_kwargs['sandbox_extras']
 
     argv = await _spawned_argv(kwargs)
 
-    assert argv[0] == pinned_claude
-    assert not any(token.endswith('landlock_exec.py') for token in argv)
+    assert argv[1].endswith('landlock_exec.py')
+    assert ('--writable', worktree) in zip(argv, argv[1:], strict=False)
 
 
 @pytest.mark.asyncio

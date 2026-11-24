@@ -118,11 +118,10 @@ _MAX_ANCHOR_TOPICS = 3
 _ANCHOR_SCROLL_LIMIT = 25
 
 #: The two ``KIND_REGISTRY`` members that attach to a parent (task 3195).
-#: DELIBERATELY restated rather than imported from ``server/grouped_read.py``:
-#: that module imports ``_MEM0_CONTENT_KEYS`` from ``services/memory_service.py``,
-#: which imports this module, so a ``services -> server`` import here would close
-#: an import cycle.  ``test_child_kinds_matches_the_grouped_read_registry`` pins
-#: the two copies equal so the duplication cannot drift silently (INV-5).
+#: Restated rather than imported from ``server/grouped_read.py`` until task 6720
+#: moves the child rule into ``memory_metadata.py`` and deletes this copy.
+#: ``test_child_kinds_matches_the_grouped_read_registry`` pins the two copies
+#: equal so the duplication cannot drift silently (INV-5).
 _CHILD_KINDS = frozenset({'amendment', 'sighting'})
 
 #: Sorts ahead of every real ISO-8601 timestamp, so a payload with a missing or

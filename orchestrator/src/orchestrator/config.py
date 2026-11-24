@@ -10,6 +10,7 @@ import posixpath
 import re
 import stat
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from types import UnionType
 from typing import Annotated, Any, Literal, NamedTuple, Union, get_args, get_origin
@@ -20,6 +21,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -50,11 +52,14 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.defect_tests_config import DefectTestsConfig
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
+from orchestrator.merge_pool_config import MergePoolConfig
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
+from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
-from orchestrator.verify_cache.modes import CacheMode, VerifyRole
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off
 
 logger = logging.getLogger(__name__)
 
@@ -80,14 +85,14 @@ VerifyTaskHostPolicy = Literal['local', 'remote_modules', 'remote_all']
 
 # --- Priority-tier constants (value/h scheduler) ---
 #
-# Canonical 5-tier priority order.  Lower rank = higher priority.  An unset
-# (None) priority silently coerces to DEFAULT_TIER — that is a normal,
+# The canonical 5-tier order is orchestrator/task_priority.py::PRIORITY_TIERS.
+# Lower rank = higher priority.  An unset (None) priority silently coerces
+# to DEFAULT_TIER — that is a normal,
 # expected state (e.g. subtasks in this repo's tasks.json routinely carry no
 # priority), not an anomaly.  An unrecognized non-None value (a typo or a
 # stale tier string) also coerces to DEFAULT_TIER so it never crashes the
 # scheduler, but that path is logged loudly instead, since it means some
 # upstream caller passed something the config layer doesn't understand.
-PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
 PRIORITY_RANK: dict[str, int] = {tier: i for i, tier in enumerate(PRIORITY_TIERS)}
 DEFAULT_TIER: str = 'medium'
 
@@ -334,7 +339,7 @@ class EffortConfig(BaseModel):
     steward: str = Field(default='high')
     triage: str = Field(default='medium')
     module_tagger: str = Field(default='medium')
-    deep_reviewer: str = Field(default='max')
+    deep_reviewer: str = Field(default='xhigh')
     judge: str = Field(default='medium')
     simple_task: str = Field(default='high')
 
@@ -1063,6 +1068,20 @@ class DeliveredChecksConfig(BaseModel):
             'budget remain uncached and are retried next tick (fail-safe wait).'
         ),
     )
+    max_record_fetches_per_tick: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Maximum number of terminal dep records '
+            'Scheduler._phase_backfill_terminal_dep_records fetches per '
+            'scheduler tick; the delivered-check gate and the scheduled '
+            'self-deploy hold both read those records. Must be >= 1. A '
+            'never-cached dep it defers makes its dependents wait for a later '
+            'tick, so after a restart it sets how fast the cold record cache '
+            'warms; one slot per tick is kept for never-cached deps while any '
+            'wait.'
+        ),
+    )
     grace_cycles: int = Field(
         default=3,
         ge=1,
@@ -1341,6 +1360,53 @@ class SessionResumeConfig(BaseModel):
         return self
 
 
+class EarlyStartConfig(BaseModel):
+    """Starting a dependent early on its predecessor's branch while the predecessor waits for its merge.
+
+    ``plans/early-start-on-predecessor-branch-prd.md`` section 7, Config.  The
+    defaults live here only, not in ``defaults.yaml``.  Every leaf is green
+    tier.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Gates new early starts only; a live pair and a branch with a ledger '
+            'record are handled whatever it says. Off in the code until T7.'
+        ),
+    )
+    pass_interval_secs: float = Field(
+        default=60,
+        gt=0,
+        description='Seconds between timer-driven early-start selection passes (a pass also runs after a merge request).',
+    )
+    picture_max_age_secs: float = Field(
+        default=600,
+        gt=0,
+        description='Seconds the early-start selection keeps its task picture before building a new one.',
+    )
+    merge_entry_alert_secs: float = Field(
+        default=43200,
+        gt=0,
+        description="Seconds a dependent may wait at its merge phase for its predecessor's slot to end before one escalation; the wait stays.",
+    )
+    stop_streak_pause: int = Field(
+        default=5,
+        ge=1,
+        description='Early starts in a row ending in a stop after which the feature pauses itself and escalates once.',
+    )
+    stop_hard_cancel_secs: float = Field(
+        default=300,
+        gt=0,
+        description='Seconds a stopped dependent has to exit after its soft cancel before it is hard-cancelled.',
+    )
+    unknown_streak_alert: int = Field(
+        default=3,
+        ge=1,
+        description='Unknown answers in a row to the landed question after which one escalation is raised.',
+    )
+
+
 class SpeculationProbeConfig(BaseModel):
     """Variable-depth speculative verify placement (task 2359, sibling of
     task 2340's depth telemetry).
@@ -1432,12 +1498,24 @@ class VerifyCacheConfig(BaseModel):
     merge_mode: CacheMode = CacheMode.OFF
 
     def mode_for(self, role: VerifyRole) -> CacheMode:
-        """*role*'s mode; the cache has no background role, so that is always OFF."""
+        """*role*'s mode; the cache has no background role, so that is always OFF.
+        DF_VERIFY_CACHE=off forces every role OFF (plans/verify-result-cache-prd.md, Amendment A3)."""
+        if forced_off():
+            return CacheMode.OFF
         if role == 'task':
             return self.task_mode
         if role == 'merge':
             return self.merge_mode
         return CacheMode.OFF
+
+
+class DepthRow(NamedTuple):
+    """One ``merge_deep.depth_table`` row: chain ``depth`` items when the
+    rolling per-item pass estimate is at least ``min_pass_estimate``.
+    """
+
+    min_pass_estimate: float
+    depth: int
 
 
 class MergeDeepConfig(BaseModel):
@@ -1447,20 +1525,17 @@ class MergeDeepConfig(BaseModel):
     worktree, sequential in-order merges, one verify on the tip) instead of one
     item at a time, so a passing tip lands the whole clean prefix in one round.
 
-    ``chain_cap`` is the single gate for the whole feature. The dispatch contract
-    it feeds (when a chain is built, and how ``target_depth`` is derived) and the
-    cap-staging plan live in the PRD, which is the ONE canonical narrative for
-    both — deliberately not restated here, because β (task 3184, the chain
-    builder) and γ (task 3185, the dispatch gate) are the consumers that
-    implement that contract and may change it.
+    ``chain_cap`` is the KILL SWITCH and nothing else (task 8528): 0 (the
+    shipped default) means no chain code runs on any dispatch path, so
+    behaviour is byte-identical to pre-PRD merging — the ``probe_fraction=0.0``
+    precedent in :class:`SpeculationProbeConfig`. Any positive value turns
+    chains on and bounds nothing. Depth comes from ``depth_table`` through the
+    rolling per-item pass estimate, and every member of a failed chain next
+    verifies alone; plans/merge-lane-policy-prd.md D6/D7 is the one canonical
+    narrative for both, deliberately not restated here.
 
     ``chain_build_timeout_secs`` bounds one chain build (lane acquisition plus
     the merges) inside ``SpeculativeMergeWorker._deep_chain_placement``.
-
-    ``chain_cap=0`` (the shipped default) is the KILL SWITCH: the gate can never
-    open, so no chain code runs on any dispatch path and behaviour is
-    byte-identical to pre-PRD merging — the ``probe_fraction=0.0`` precedent in
-    :class:`SpeculationProbeConfig`.
 
     Plain BaseModel (no ``frozen``, no ``validate_assignment``) so ``_set_leaf``
     can mutate it in place on hot-reload and held references observe the update
@@ -1475,13 +1550,28 @@ class MergeDeepConfig(BaseModel):
         default=0,
         ge=0,
         description=(
-            'Maximum number of queued items a single deep merge-ahead chain may '
-            'contain. 0 (the default) disables the feature entirely -- the kill '
-            'switch: no chain is ever built, so merge behaviour is byte-identical '
-            'to pre-task-3183 behaviour. Must be >= 0; a negative cap is rejected '
-            'at load rather than reaching dispatch. No upper bound is imposed. '
-            'See plans/deep-merge-ahead-prd.md for the dispatch contract this '
-            'gates and for the cap-staging plan.'
+            'Kill switch for deep merge-ahead chains. 0 (the default) disables '
+            'the feature entirely: no chain is ever built, so merge behaviour is '
+            'byte-identical to pre-task-3183 behaviour. Any positive value turns '
+            'chains on; it does not bound chain depth, which depth_table sets. '
+            'Must be >= 0; a negative cap is rejected at load rather than '
+            'reaching dispatch. See plans/merge-lane-policy-prd.md D6/D7.'
+        ),
+    )
+    depth_table: list[DepthRow] = Field(
+        default_factory=lambda: [
+            DepthRow(0.992, 12), DepthRow(0.990, 11), DepthRow(0.988, 10), DepthRow(0.984, 9),
+            DepthRow(0.979, 8), DepthRow(0.972, 7), DepthRow(0.959, 6), DepthRow(0.934, 5),
+            DepthRow(0.876, 4), DepthRow(0.75, 3),
+        ],
+        description=(
+            'Chain depth by rolling per-item pass estimate: the first row whose '
+            'min_pass_estimate the estimate meets gives the depth, and an '
+            'estimate below every row chains nothing (depth 1). Rows are '
+            '[min_pass_estimate, depth] pairs, thresholds in [0, 1] and depths '
+            '>= 2, both strictly descending. A [0.0, N] row always chains N. '
+            'The default puts each depth where it starts to cost fewer verifies '
+            'per item than the depth below. See plans/merge-lane-policy-prd.md D7.'
         ),
     )
     chain_build_timeout_secs: float = Field(
@@ -1504,6 +1594,39 @@ class MergeDeepConfig(BaseModel):
             'with a WARNING. Read live at each chain\'s confirm; must be > 0.'
         ),
     )
+
+    @field_validator('depth_table', mode='after')
+    @classmethod
+    def _validate_depth_table(cls, table: list[DepthRow]) -> list[DepthRow]:
+        if not table:
+            raise ValueError(
+                'depth_table must not be empty: depth 1 is the implicit else-row '
+                'and chain_cap: 0 is the only kill switch'
+            )
+        out_of_range = [row for row in table if not 0.0 <= row.min_pass_estimate <= 1.0]
+        if out_of_range:
+            raise ValueError(
+                f'depth_table thresholds must lie in [0, 1]; offending rows: {out_of_range!r}'
+            )
+        too_shallow = [row for row in table if row.depth < 2]
+        if too_shallow:
+            raise ValueError(
+                f'depth_table depths must be >= 2 (depth 1 is the implicit '
+                f'else-row); offending rows: {too_shallow!r}'
+            )
+        for column in ('min_pass_estimate', 'depth'):
+            unordered = [
+                later
+                for earlier, later in pairwise(table)
+                if getattr(later, column) >= getattr(earlier, column)
+            ]
+            if unordered:
+                label = 'thresholds' if column == 'min_pass_estimate' else 'depths'
+                raise ValueError(
+                    f'depth_table {label} must be strictly descending; offending '
+                    f'rows: {unordered!r}'
+                )
+        return table
 
 
 class RetentionConfig(BaseModel):
@@ -3515,6 +3638,11 @@ class PriceEntry(BaseModel):
         ge=0,
         description='USD per 1M cached input tokens; None prices them at input_per_1m.',
     )
+    cache_write_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        description='USD per 1M cache-creation input tokens; None prices them at input_per_1m.',
+    )
 
 
 def default_price_table() -> dict[str, dict[str, float]]:
@@ -4363,7 +4491,7 @@ class OrchestratorConfig(BaseSettings):
     # local RunnerUnavailable -> fail-safe (trust the remote green, emit
     # verify_cross_check_inconclusive).  Default True is safety-first per the
     # loud-over-silent norm AND provably INERT on main today: reify's
-    # verify_runners is not yet enabled, so _run_post_merge_verify always gets
+    # verify_runners is not yet enabled, so merge_lane/post_merge_verify.py::run_post_merge_verify always gets
     # runner=None (local dispatch path) and the ``runner is not None``
     # cross-check branch never executes — zero behaviour change until Lever C
     # is turned on.  UNLIKE its restart-only merge_verify_workspace /
@@ -4429,9 +4557,9 @@ class OrchestratorConfig(BaseSettings):
     # Per-role cgroup v2 cpu.weight each verify scope is spawned with
     # (`systemd-run -p CPUWeight=`), only when verify_use_cgroup_scope is on.
     # nice orders threads only INSIDE one cgroup, so without a weight the role
-    # tiers are inert across sibling scopes. task/background are lowered rather than merge raised, so the
-    # merge scope stays at parity (100) with each orchestrator unit and the
-    # operator's terminals under app.slice; 33/10 keep the 3:1 merge:task intent.
+    # tiers are inert across sibling scopes. The weights split the project's
+    # df-<project_id>.slice among its verify scopes and its daemon (contract:
+    # docs/cgroup-slice-topology.md); 33/10 keep the 3:1 merge:task intent.
     verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
     verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
     verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
@@ -4501,6 +4629,11 @@ class OrchestratorConfig(BaseSettings):
     steward_completion_timeout: float = Field(default=900.0)
     steward_max_timeouts_per_escalation: int = Field(default=3, ge=2, le=5)
     steward_max_empty_outputs_per_escalation: int = Field(default=2, ge=2, le=4)
+    # 'fresh_per_l0' handles every L0 in a new session with a full briefing plus a
+    # digest of the L0s this steward already concluded; 'resume' keeps one resumed
+    # session across L0s (the shadow-eval comparison arm, task 5820). Behaviour:
+    # orchestrator/src/orchestrator/steward.py::TaskSteward.
+    steward_session_mode: Literal['fresh_per_l0', 'resume'] = Field(default='fresh_per_l0')
 
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
@@ -5305,6 +5438,17 @@ class OrchestratorConfig(BaseSettings):
             'or the task leaving the pin queue, resets it.'
         ),
     )
+    park_refused_emit_interval_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'park_refused is emitted once a dispatch candidate has been refused '
+            'its locks by parks alone, none of which outranks it, for this many '
+            'seconds, then at most once per this many seconds while that lasts. '
+            'A dispatch, a refusal by anything else, or the task leaving the '
+            'dispatch candidates ends the episode.'
+        ),
+    )
 
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
@@ -5372,7 +5516,7 @@ class OrchestratorConfig(BaseSettings):
     # Disable either ceiling by setting to a very high value (no enable-flag
     # needed — mirrors auto_eval_redo_budget_usd pattern).
     watcher_daily_cost_ceiling_usd: float = Field(
-        default=50.0,
+        default=150.0,
         description=(
             'Daily USD ceiling for escalation-watcher invocations (trailing 24h '
             'sum of cost_usd WHERE role LIKE \'%watcher%\'). On breach, '
@@ -5381,7 +5525,7 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     orch_daily_cost_ceiling_usd: float = Field(
-        default=200.0,
+        default=10000.0,
         description=(
             'Daily USD ceiling for ALL orchestrator invocations (trailing 24h '
             'sum of all cost_usd rows). On breach, pause_scheduler is called '
@@ -5527,6 +5671,9 @@ class OrchestratorConfig(BaseSettings):
     test_command: str = Field(default='pytest')
     lint_command: str = Field(default='ruff check')
     type_check_command: str = Field(default='pyright')
+    # When a no-module-config fallback verify's test slot runs nothing, True lets it
+    # pass and False fails it as no_tests_ran; see docs/fallback-test-floor.md.
+    verify_allow_no_tests_ran: bool = Field(default=False)
 
     # Fused memory
     fused_memory: FusedMemoryConfig = Field(default_factory=FusedMemoryConfig)
@@ -5569,6 +5716,9 @@ class OrchestratorConfig(BaseSettings):
     # checks PRD delta). Task 2583 (epsilon) extends this sub-model further.
     delivered_checks: DeliveredChecksConfig = Field(default_factory=DeliveredChecksConfig)
 
+    # Defect-test gates and the verify-leg plugin injection (plans/defect-tests-prd.md).
+    defect_tests: DefectTestsConfig = Field(default_factory=DefectTestsConfig)
+
     # Warm-lane session-resume guard (task γ, plans/warm-lane-session-resume-prd.md).
     # An absent stanza yields the enabled-by-default instance (default_factory
     # suffices — no defaults.yaml edit, like delivered_checks). Read by the
@@ -5585,6 +5735,14 @@ class OrchestratorConfig(BaseSettings):
     # (chain_cap=0, byte-identical current merge behaviour); the shipped
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
+
+    # The merge pool's order, promotion period and bounce cap (task 9933,
+    # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
+    merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
+
+    # Early start on a predecessor's branch (plans/early-start-on-predecessor-branch-prd.md).
+    # The defaults live in EarlyStartConfig only, not in defaults.yaml.
+    early_start: EarlyStartConfig = Field(default_factory=EarlyStartConfig)
 
     # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
     # An absent stanza is OFF for both roles.
@@ -6710,16 +6868,33 @@ PROJECT_CONFIG_FILENAME = 'dark-factory-orchestrator.yaml'
 """The canonical name of a project's orchestrator config, at its project root."""
 
 
-def project_review_config(project_root: Path) -> ReviewConfig:
-    """The ``review`` block the orchestrator of the project at *project_root* runs with.
+def _project_config_layers(project_root: Path) -> dict[str, Any]:
+    """The YAML layers of the orchestrator config of the project at *project_root*.
 
     Layered the way OrchestratorConfig layers its YAML source (defaults.yaml,
     then the project's own file, then ``${VAR}`` expansion), but without
     setting ``ORCH_CONFIG_PATH``, so one process can read another project's
-    setting. A project with no config file gets the shipped defaults.
+    settings. A project with no config file gets the shipped defaults.
     """
-    layered = YamlSettingsSource(OrchestratorConfig, project_root / PROJECT_CONFIG_FILENAME)()
-    return ReviewConfig.model_validate(layered.get('review') or {})
+    return YamlSettingsSource(OrchestratorConfig, project_root / PROJECT_CONFIG_FILENAME)()
+
+
+def project_review_config(project_root: Path) -> ReviewConfig:
+    """The ``review`` block the orchestrator of the project at *project_root* runs with."""
+    return ReviewConfig.model_validate(_project_config_layers(project_root).get('review') or {})
+
+
+_ROLE_ENV_OVERRIDES = TypeAdapter(OrchestratorConfig.model_fields['role_env_overrides'].annotation)
+
+
+def project_role_env_overrides(project_root: Path) -> dict[str, dict[str, str]]:
+    """The role_env_overrides the orchestrator of the project at *project_root* gives its agents.
+
+    Validated as the field validates it: its own annotation, then its unknown-role warning.
+    """
+    layers = _project_config_layers(project_root)
+    shaped = _ROLE_ENV_OVERRIDES.validate_python(layers.get('role_env_overrides') or {})
+    return OrchestratorConfig._warn_unknown_role_env_overrides_keys(shaped)
 
 
 # ---------------------------------------------------------------------------
@@ -6808,11 +6983,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # hot-reloadable with no separate RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('speculation_probe', SpeculationProbeConfig),
     # Deep merge-ahead chains (task 3183, PRD alpha, decision #7) — a new
-    # dedicated submodel, same whole-submodel-group idiom: chain_cap (and any
-    # knob beta/gamma add later) is green-tier hot-reloadable with no separate
-    # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
-    # (-> 0) without a restart. See MergeDeepConfig for the rest.
+    # dedicated submodel, same whole-submodel-group idiom: chain_cap,
+    # depth_table and any later knob are green-tier hot-reloadable with no
+    # separate RELOADABLE_FIELDS edit, so chains can be turned on, retuned or
+    # killed (chain_cap -> 0) without a restart. See MergeDeepConfig.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # The merge pool's knobs (task 9933): every leaf hot, as merge_deep's are.
+    _submodel_leaf_paths('merge_pool', MergePoolConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
     # each role's mode is its own leaf, so a task-only edit applies alone.
     _submodel_leaf_paths('verify_cache', VerifyCacheConfig),
@@ -6835,6 +7012,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # count that drifts reads as a checked claim and is not one — the check is
     # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Green tier: T4-T6 read every leaf at use.
+    _submodel_leaf_paths('early_start', EarlyStartConfig),
     # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
     # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
     # which is why the old age_alpha / cpm_beta constants were never tuned.
@@ -6855,10 +7034,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # Live shadow eval (task 5382, plans/live-shadow-eval-prd.md C6): green tier on
     # purpose, NOT auto_eval_redo_budget_usd's restart tier (PRD S2).
     _submodel_leaf_paths('shadow_eval', ShadowEvalConfig),
+    # Defect tests: green tier, so the human gate flips mode without a restart (PRD Config).
+    _submodel_leaf_paths('defect_tests', DefectTestsConfig),
     {
         # Steward grace
         'steward_completion_timeout',
         'steward_lifetime_budget',
+        'steward_session_mode',
         # Scheduler tuning
         'fairness.skip_threshold',
         # Transient-requeue jittered backoff (task 3317 / PRD contract C3,
@@ -6899,6 +7081,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'pin_reservations_enabled',
         'pin_reservation_max_active',
         'pin_blocked_emit_interval_secs',
+        # park_refused cadence (task 6328): the same flat, tick-time read.
+        'park_refused_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.
@@ -6966,6 +7150,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # split), so an operator can tune or disable the pre-provision live
         # without a restart.
         'verify_cold_preprovision_command',
+        # Read fresh off the config at each fallback verify; decides one verdict only.
+        'verify_allow_no_tests_ran',
         # Per-land remote-green cross-check gate (task 2822, fix b) — green-tier
         # unlike its restart-only merge_verify_workspace/merge_verify_breadth
         # siblings: it only ever ADDS a second-opinion local verify, so flipping
@@ -7056,9 +7242,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # lowers the merge fan-out without a restart.
         'merge_verify_max_concurrent_modules',
         # Delivered-check dep-gate sweep budget (task 2580, capability-
-        # delivered-checks PRD delta) — scheduler tuning, same tier as
+        # delivered-checks PRD delta) and the terminal-dep record-fetch budget
+        # (task 9029, S16 D13) — scheduler tuning, same tier as
         # fairness.skip_threshold / starvation_watchdog.*.
         'delivered_checks.max_checks_per_tick',
+        'delivered_checks.max_record_fetches_per_tick',
         # Delivered-check grace-streak escalation knobs (task 2583, epsilon
         # of the same PRD) — same green tier: an operator may flip the kill
         # switch, retune the grace window, or adjust the per-check timeout

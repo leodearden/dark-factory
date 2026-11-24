@@ -286,6 +286,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         SessionBudgetExhausted,
     )
 
+    from orchestrator.branch_stack import RestackBlocked, RestackConflict
     from orchestrator.git_ops import (
         BranchResetError,
         CitationPatternInvalid,
@@ -297,6 +298,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         MergeParkError,
         MergeVerifyLeaseContended,
         MergeVerifyLeaseHeld,
+        StackRecordUnconfirmed,
         WarmLaneDiskPressure,
         WarmLaneLockContention,
         WarmLaneLockTimeout,
@@ -625,6 +627,37 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             reason_prefix='Task branch checked out in another worktree',
             block_class=BlockClass.AGENT_FAILURE,
         ),
+        # Re-stacking a dependent onto its predecessor's new tip (task 10473,
+        # PRD early-start 5.3). A conflict left the branch, tree and record as
+        # they were, so it requeues without charging the task. Every other
+        # stop (refused, abort failed, record failed) blocks and goes to a
+        # human, as BranchResetError does: it may leave a rebase in progress
+        # or a branch on a base its record does not name. The result's
+        # message names the branch, its old tip and base, and any recovery.
+        RestackConflict: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='restack_conflict',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        RestackBlocked: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-stack blocked: branch and record may need restoring',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        StackRecordUnconfirmed: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Stack-base record unconfirmed',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but
         # not (today) caught by name anywhere in _drive()'s ladder ─────────
         # NOTE (amendment, reviewer_comprehensive correctness): this row is
@@ -667,7 +700,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         # requeue cap.
         #
         # task 3003: this is no longer a BD-2-completeness-only row. The merge
-        # worker's _run_inflight_verify now genuinely requeues this type (its
+        # worker's VerifyDispatcher.run_inflight_verify now genuinely requeues this type (its
         # defer arm catches (MergeVerifyLeaseContended, MergeVerifyLeaseHeld)),
         # so the values below finally describe what the code does. Until then
         # the type fell to the generic `except Exception` and resolved a
@@ -684,7 +717,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         # A contended merge-verify lane lock (task 2828) is transient "come back
         # later," identical in shape to MergeVerifyLeaseHeld above: REQUEUE,
         # never escalates, never counts against the requeue cap. Requeued by
-        # the merge worker's _run_inflight_verify (BD-2 forces this explicit
+        # the merge worker's VerifyDispatcher.run_inflight_verify (BD-2 forces this explicit
         # row). Raised by BOTH bounded-wait acquires on the shared
         # <lane_dir>.lock: GitOps.merge_verify_lease (the verify span, 2828)
         # and GitOps.reset_persistent_merge_worktree (the warm-swap reset,

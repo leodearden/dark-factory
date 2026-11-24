@@ -10,10 +10,13 @@ event store.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
-from unittest.mock import AsyncMock
+from typing import NamedTuple
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _startup_harness import journal_merge_request, merge_lane_harness_factory
@@ -24,6 +27,7 @@ from shared.project_layout import runs_db, startup_failures_json
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
+from orchestrator.run_store import RunStore
 from orchestrator.startup_steps import CRASH_LOOP_THRESHOLD, StartupFailureStreak
 
 SENTINEL = 'orchestrator-startup-crash-loop'
@@ -34,14 +38,29 @@ def make_harness(tmp_path: Path) -> Callable[[], Harness]:
     return merge_lane_harness_factory(tmp_path)
 
 
+class _RunRow(NamedTuple):
+    run_id: str
+    startup_completed_at: str | None
+    exit_reason: str | None
+    completed_at: str | None
+
+
+def _run_rows(db: Path) -> list[_RunRow]:
+    with closing(sqlite3.connect(db)) as conn:
+        return [
+            _RunRow(*row)
+            for row in conn.execute(
+                'SELECT run_id, startup_completed_at, exit_reason, completed_at '
+                'FROM runs ORDER BY rowid',
+            )
+        ]
+
+
 def _runs(h: Harness) -> list[tuple[str | None, str | None]]:
-    conn = sqlite3.connect(runs_db(h.config.project_root))
-    try:
-        return conn.execute(
-            'SELECT startup_completed_at, exit_reason FROM runs ORDER BY rowid',
-        ).fetchall()
-    finally:
-        conn.close()
+    return [
+        (row.startup_completed_at, row.exit_reason)
+        for row in _run_rows(runs_db(h.config.project_root))
+    ]
 
 
 def _streak(h: Harness) -> StartupFailureStreak | None:
@@ -224,14 +243,14 @@ class TestCrashOutsideAnyStep:
             with pytest.raises(RuntimeError, match='fm down'):
                 await h.run(prd_path=None)
 
-        assert _runs(h) == [(None, 'startup_crash:after-1c1h')] * CRASH_LOOP_THRESHOLD
+        assert _runs(h) == [(None, 'startup_crash:after-1c1i')] * CRASH_LOOP_THRESHOLD
 
         healthy = make_harness()
-        leftover_reaper = AsyncMock()
-        healthy._run_leftover_verify_scope_reaper_pass = leftover_reaper
+        slice_weight = AsyncMock()
+        healthy._ensure_project_slice_weight = slice_weight
         await healthy.run(prd_path=None, dry_run=True)
 
-        leftover_reaper.assert_awaited_once()
+        slice_weight.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -245,3 +264,83 @@ class TestHealthyStart:
         [(startup_completed_at, exit_reason)] = _runs(h)
         assert startup_completed_at is not None
         assert exit_reason is None
+
+
+def _after_finish_startup(h: Harness, probe: Callable[[], None]) -> None:
+    """Run ``probe`` once, inside ``h.run``, at the first task-tree read after startup finished."""
+    probed = False
+    finish_startup = MagicMock()
+    h.scheduler.finish_startup = finish_startup
+
+    def statuses() -> tuple[dict[str, str], None]:
+        nonlocal probed
+        if finish_startup.called and not probed:
+            probed = True
+            probe()
+        return {'1': 'pending'}, None
+
+    h.scheduler.get_statuses = AsyncMock(side_effect=statuses)
+
+
+@pytest.mark.asyncio
+class TestStartupCompletionIsDurableBeforeExit:
+    async def test_a_live_run_reads_startup_completed_before_run_returns(
+        self, make_harness,
+    ) -> None:
+        h = make_harness()
+        db = runs_db(h.config.project_root)
+        live_rows: list[_RunRow] = []
+        _after_finish_startup(h, lambda: live_rows.extend(_run_rows(db)))
+
+        await h.run(prd_path=None, dry_run=True)
+
+        [live] = live_rows
+        assert live.startup_completed_at is not None
+        assert live.exit_reason is None
+        assert live.completed_at is None
+        [final] = _run_rows(db)
+        assert final.startup_completed_at == live.startup_completed_at
+
+    async def test_a_run_sigkilled_after_startup_keeps_startup_completed_at(
+        self, make_harness, tmp_path,
+    ) -> None:
+        h = make_harness()
+        snapshot = tmp_path / 'sigkilled-runs.db'
+
+        def copy_live_db() -> None:
+            with (
+                closing(sqlite3.connect(runs_db(h.config.project_root))) as live,
+                closing(sqlite3.connect(snapshot)) as copy,
+            ):
+                live.backup(copy)
+
+        _after_finish_startup(h, copy_live_db)
+
+        await h.run(prd_path=None, dry_run=True)
+
+        [sigkilled] = _run_rows(snapshot)
+        assert sigkilled.startup_completed_at is not None
+        assert sigkilled.exit_reason is None
+        assert sigkilled.completed_at is None
+
+    async def test_a_failing_stamp_logs_a_warning_and_startup_still_completes(
+        self, make_harness, caplog,
+    ) -> None:
+        h = make_harness()
+        injected = sqlite3.OperationalError('database is locked')
+
+        with (
+            patch.object(RunStore, 'mark_startup_completed', side_effect=injected),
+            caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
+        ):
+            await h.run(prd_path=None, dry_run=True)
+
+        h.scheduler.finish_startup.assert_called_once()
+        [row] = _run_rows(runs_db(h.config.project_root))
+        assert row.exit_reason is None
+        [stamp_failure] = [
+            record for record in caplog.records
+            if record.exc_info is not None and record.exc_info[1] is injected
+        ]
+        assert stamp_failure.levelno == logging.WARNING
+        assert row.run_id in stamp_failure.getMessage()

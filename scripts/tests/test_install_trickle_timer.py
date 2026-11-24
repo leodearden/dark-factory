@@ -2,21 +2,18 @@
 install script that replaces the fail-loud stub committed with
 plans/confusion-reduction-prd.md (PRD task epsilon).
 
-Drives the script via subprocess with a FAKE `systemctl` shimmed onto PATH
-(records every invocation, minus `--user`, into a shared JSON state file —
-mirrors scripts/tests/test_deploy_w5_recon_reliability.py and
-scripts/tests/test_deploy_w11_lane_lifecycle.py) plus a real invocation of
+Drives the script via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
+first on PATH, plus a real invocation of
 `nightly.py resolve-config` (the REAL Python resolver — no mock — with
 INSTALL_TRICKLE_TIMER_PYTHON=sys.executable substituting for the default `uv
 run` prefix, mirroring watcher-rearm.sh's WATCHER_REARM_PYTHON override, and
-LEGIBILITY_SEARCH_ROOTS pointed at a tmp fixture project). Real systemd is
-never touched.
+LEGIBILITY_SEARCH_ROOTS pointed at a tmp fixture project). The committed
+units are read through `scripts/tests/conftest.py::unit_values` and
+`scripts/tests/conftest.py::unit_environment`. Real systemd is never touched.
 """
 from __future__ import annotations
 
-import json
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -39,100 +36,6 @@ PRODUCTION_CLAUDE_DIR = "/home/leo/.local/bin"
 # The account tokens the unit reads come from THE production checkout's .env,
 # never a worktree's. The leading "-" makes it optional to systemd.
 PRODUCTION_ENV_FILE = "-/home/leo/src/dark-factory/.env"
-
-
-# ---------------------------------------------------------------------------
-# Fake systemctl (marker-file + canned `enable`/`list-timers` responses)
-# ---------------------------------------------------------------------------
-
-_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
-"""Fake `systemctl` for testing install-trickle-timer.sh.
-
-Records every invocation (minus `--user`) into a JSON state file at
-$FAKE_SYSTEMCTL_STATE. `enable --now <unit>` marks each non-flag arg as an
-enabled unit; `list-timers` echoes back one line per *.timer unit enabled so
-far THIS RUN, unless FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 -- simulating a
-self-verify failure where `enable` nominally succeeded but the unit is
-absent from `list-timers`.
-"""
-import json
-import os
-import sys
-
-STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
-
-
-def _load():
-    with open(STATE_PATH) as f:
-        return json.load(f)
-
-
-def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
-
-
-def main(argv):
-    args = [a for a in argv[1:] if a != "--user"]
-    if not args:
-        return 1
-    verb, rest = args[0], args[1:]
-
-    state = _load()
-    state.setdefault("calls", []).append(args)
-
-    if verb == "daemon-reload":
-        _save(state)
-        return 0
-
-    if verb == "enable":
-        units = [a for a in rest if not a.startswith("-")]
-        enabled = state.setdefault("enabled_timers", [])
-        for u in units:
-            if u not in enabled:
-                enabled.append(u)
-        _save(state)
-        return 0
-
-    if verb == "list-timers":
-        _save(state)
-        if os.environ.get("FAKE_SYSTEMCTL_OMIT_LIST_TIMERS") == "1":
-            print("0 timers listed.")
-            return 0
-        enabled = state.get("enabled_timers", [])
-        for unit in enabled:
-            service = unit.replace(".timer", ".service")
-            print(f"Mon 2026-07-14 03:00:00 UTC  8h left  n/a  n/a  {unit}  {service}")
-        print(f"{len(enabled)} timers listed.")
-        return 0
-
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
-'''
-
-
-def _fake_systemctl(tmp_path):
-    """Write an executable fake `systemctl` into <tmp_path>/bin/systemctl and
-    its backing JSON state file. Returns (bin_dir, state_path)."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    fake = bin_dir / "systemctl"
-    fake.write_text(_FAKE_SYSTEMCTL_SRC)
-    fake.chmod(0o755)
-
-    state_path = tmp_path / "systemctl_state.json"
-    state_path.write_text(json.dumps({"calls": [], "enabled_timers": []}))
-    return bin_dir, state_path
-
-
-def _systemctl_calls(tmp_path):
-    state_path = tmp_path / "systemctl_state.json"
-    if not state_path.is_file():
-        return []
-    return json.loads(state_path.read_text())["calls"]
 
 
 # ---------------------------------------------------------------------------
@@ -165,20 +68,19 @@ def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_script(tmp_path, project_id, *, env=None):
+def _run_script(fake_timer_systemctl, project_id, *, env=None):
     """Run install-trickle-timer.sh <project_id> via subprocess.
 
-    Puts a fresh fake `systemctl` on PATH (state reset each call) and
+    Puts *fake_timer_systemctl* first on PATH, reset on every call, and
     defaults INSTALL_TRICKLE_TIMER_PYTHON=sys.executable so the script's
     `nightly.py resolve-config` delegation runs the REAL resolver directly
     -- no `uv run` needed in-test. Callers supply
     XDG_CONFIG_HOME and LEGIBILITY_SEARCH_ROOTS via *env*.
     """
-    bin_dir, state_path = _fake_systemctl(tmp_path)
+    fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
-    full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
+    full_env["PATH"] = f"{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["INSTALL_TRICKLE_TIMER_PYTHON"] = sys.executable
     full_env.pop("LEGIBILITY_SEARCH_ROOTS", None)
     if env:
@@ -200,12 +102,12 @@ def test_script_is_executable():
     )
 
 
-def test_install_copies_templates_and_enables_timer(tmp_path):
+def test_install_copies_templates_and_enables_timer(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
     )
 
@@ -228,39 +130,34 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
     assert "nightly.py" in service_text
     assert "--project-id %i" in service_text
 
-    calls = _systemctl_calls(tmp_path)
+    calls = fake_timer_systemctl.calls()
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", "legibility-trickle@proj_a.timer"] in calls, f"calls={calls!r}"
     assert any(c[0] == "list-timers" for c in calls), f"calls={calls!r}"
 
 
-def _service_environment(service_text):
-    """Parse the [Service] section's `Environment=` assignments into a dict.
+def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path):
+    """No surprise run at install time.
 
-    Scans from the `[Service]` header to the next section header, and
-    shlex.split()s each directive's right-hand side before splitting every
-    token on its FIRST `=`. The shlex step handles BOTH the
-    one-assignment-per-line form this template uses and systemd's legal
-    space-separated multi-assignment form, so a future reflow of the unit
-    onto a single Environment= line does not silently stop being checked.
+    A `start` of `legibility-trickle@<project>.service` is a whole nightly
+    digest pass: it spends LLM budget off-cadence, at whatever hour the
+    operator happened to install. The installer arms the timer and leaves the
+    run to it.
     """
-    env = {}
-    in_service = False
-    for raw_line in service_text.splitlines():
-        line = raw_line.strip()
-        if line.startswith("["):
-            in_service = line == "[Service]"
-            continue
-        if not in_service or not line.startswith("Environment="):
-            continue
-        for token in shlex.split(line[len("Environment="):]):
-            name, sep, value = token.partition("=")
-            if sep:
-                env[name] = value
-    return env
+    search_root = _write_project_config(tmp_path, project_id="proj_a")
+
+    result = _run_script(
+        fake_timer_systemctl, "proj_a",
+        env={"XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+             "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    for call in fake_timer_systemctl.calls():
+        assert call[:1] != ["start"], f"unexpected immediate run: {call!r}"
 
 
-def test_service_template_pins_a_path_that_finds_claude():
+def test_service_template_pins_a_path_that_finds_claude(unit_environment):
     """Template-content invariant (NOT install behavior): the committed
     @.service must pin PATH to an absolute list that reaches ``claude``.
 
@@ -273,8 +170,7 @@ def test_service_template_pins_a_path_that_finds_claude():
     digests on reify and 38/38 on dark_factory in about one second. The pin
     is load-bearing, not redundant belt-and-braces; do not "clean it up".
     """
-    service_text = (TEMPLATES_DIR / "legibility-trickle@.service").read_text()
-    env = _service_environment(service_text)
+    env = unit_environment(TEMPLATES_DIR / "legibility-trickle@.service", "Service")
 
     assert "PATH" in env, (
         f"The trickle @.service must pin PATH= so claude resolves under a "
@@ -304,28 +200,7 @@ def test_service_template_pins_a_path_that_finds_claude():
     )
 
 
-def _service_directive(service_text, name):
-    """Every value assigned to directive *name* in the ``[Service]`` section.
-
-    A directive can legally repeat (systemd appends), so this returns a LIST.
-    Sectioned parsing rather than a substring scan over the whole file, for
-    the same reason ``_service_environment`` does it: a directive in [Unit]
-    or [Install] is a different directive, and a test that cannot tell them
-    apart would pass on a unit systemd reads differently.
-    """
-    values = []
-    in_service = False
-    for raw_line in service_text.splitlines():
-        line = raw_line.strip()
-        if line.startswith("["):
-            in_service = line == "[Service]"
-            continue
-        if in_service and line.startswith(f"{name}="):
-            values.append(line[len(name) + 1:].strip())
-    return values
-
-
-def test_service_template_carries_the_account_pool_and_pins_no_account():
+def test_service_template_carries_the_account_pool_and_pins_no_account(unit_values):
     """Template-content invariant (NOT install behavior), task 5488: the unit
     must supply the account POOL and pin no single account out of it.
 
@@ -335,9 +210,10 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     here -- what the 2026-09-14 stopgap drop-in did with max-h -- would make
     the whole pool inert again while leaving every test above green.
     """
-    service_text = (TEMPLATES_DIR / "legibility-trickle@.service").read_text()
+    service = TEMPLATES_DIR / "legibility-trickle@.service"
+    service_text = service.read_text()
 
-    env_files = _service_directive(service_text, "EnvironmentFile")
+    env_files = unit_values(service, "Service", "EnvironmentFile")
     assert env_files == [PRODUCTION_ENV_FILE], (
         f"The trickle @.service must name the project .env as the source of "
         f"the CLAUDE_OAUTH_TOKEN_* pool (build_pool loads it in-process too; "
@@ -352,7 +228,7 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     # (shared/src/shared/cli_invoke.py::_invoke_claude) is a separate
     # mechanism for a separate process. Two independent guards of one policy
     # is the intent (docs/code-quality.md heuristic 10), not a duplication.
-    assert _service_directive(service_text, "UnsetEnvironment") == [
+    assert unit_values(service, "Service", "UnsetEnvironment") == [
         "ANTHROPIC_API_KEY"
     ], (
         "The trickle @.service must unset ANTHROPIC_API_KEY: the CLI prefers "
@@ -377,17 +253,17 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     )
 
 
-def test_install_is_idempotent(tmp_path):
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
     env = {"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)}
 
-    result_1 = _run_script(tmp_path, "proj_a", env=env)
+    result_1 = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert result_1.returncode == 0, (
         f"stdout={result_1.stdout!r} stderr={result_1.stderr!r}"
     )
 
-    result_2 = _run_script(tmp_path, "proj_a", env=env)
+    result_2 = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert result_2.returncode == 0, (
         f"Expected re-running the install to still exit 0; "
         f"stdout={result_2.stdout!r} stderr={result_2.stderr!r}"
@@ -434,13 +310,13 @@ def _seed_stale_dropin(xdg_config):
     return path
 
 
-def test_install_removes_the_stale_account_pin_dropin(tmp_path):
+def test_install_removes_the_stale_account_pin_dropin(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
     stale = _seed_stale_dropin(xdg_config)
 
     result = _run_script(
-        tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
     )
 
@@ -463,7 +339,7 @@ def test_install_removes_the_stale_account_pin_dropin(tmp_path):
     )
 
 
-def test_install_is_idempotent_with_no_dropin_present(tmp_path):
+def test_install_is_idempotent_with_no_dropin_present(fake_timer_systemctl, tmp_path):
     """The removal must be a no-op when there is nothing to remove.
 
     Under `set -euo pipefail` a bare `rm`/`rmdir` of a missing path exits
@@ -474,14 +350,14 @@ def test_install_is_idempotent_with_no_dropin_present(tmp_path):
     xdg_config = tmp_path / "xdg-config"
     env = {"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)}
 
-    first = _run_script(tmp_path, "proj_a", env=env)
+    first = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert first.returncode == 0, f"stdout={first.stdout!r} stderr={first.stderr!r}"
 
     _seed_stale_dropin(xdg_config)
-    second = _run_script(tmp_path, "proj_a", env=env)
+    second = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert second.returncode == 0
 
-    third = _run_script(tmp_path, "proj_a", env=env)
+    third = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert third.returncode == 0, (
         f"a re-run with the drop-in already gone must still exit 0; "
         f"stdout={third.stdout!r} stderr={third.stderr!r}"
@@ -491,7 +367,7 @@ def test_install_is_idempotent_with_no_dropin_present(tmp_path):
     )
 
 
-def test_install_removes_only_the_named_dropin(tmp_path):
+def test_install_removes_only_the_named_dropin(fake_timer_systemctl, tmp_path):
     """The guard that matters: an operator's OWN override must survive.
 
     A blanket `rm -rf .service.d` would silently delete a deliberate local
@@ -505,7 +381,7 @@ def test_install_removes_only_the_named_dropin(tmp_path):
     operator_override.write_text("[Service]\nNice=10\n", encoding="utf-8")
 
     result = _run_script(
-        tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
     )
 
@@ -519,12 +395,12 @@ def test_install_removes_only_the_named_dropin(tmp_path):
     assert operator_override.read_text() == "[Service]\nNice=10\n"
 
 
-def test_install_fails_when_self_verify_omits_timer(tmp_path):
+def test_install_fails_when_self_verify_omits_timer(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={
             "XDG_CONFIG_HOME": str(xdg_config),
             "LEGIBILITY_SEARCH_ROOTS": str(search_root),
@@ -538,13 +414,13 @@ def test_install_fails_when_self_verify_omits_timer(tmp_path):
     )
 
 
-def test_install_fails_when_project_config_unresolvable(tmp_path):
+def test_install_fails_when_project_config_unresolvable(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
     empty_search_root = tmp_path / "empty-search-root"
     empty_search_root.mkdir()
 
     result = _run_script(
-        tmp_path, "no_such_project",
+        fake_timer_systemctl, "no_such_project",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(empty_search_root)},
     )
 
@@ -552,9 +428,9 @@ def test_install_fails_when_project_config_unresolvable(tmp_path):
         f"Expected a non-zero exit for an unresolvable project_id; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert _systemctl_calls(tmp_path) == [], (
+    assert fake_timer_systemctl.calls() == [], (
         f"Expected NO systemctl invocation when config resolution fails first; "
-        f"calls={_systemctl_calls(tmp_path)!r}"
+        f"calls={fake_timer_systemctl.calls()!r}"
     )
     assert not (xdg_config / "systemd" / "user" / "legibility-trickle@.service").exists(), (
         "Expected no unit file to be installed when config resolution fails"

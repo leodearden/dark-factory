@@ -45,7 +45,7 @@ class CacheDecision:
 
 @dataclass(frozen=True)
 class Unavailable:
-    """The registry could not be consulted; *reason* says why."""
+    """What a verify's cache decision could not read (the registry, or the code identity its keys carry); *reason* says why."""
 
     reason: str
 
@@ -53,7 +53,7 @@ class Unavailable:
 async def consult(registry: Registry | None, keys: Sequence[UnitKey]) -> RegistryView | Unavailable:
     """One batched registry read for a verify's *keys*; never raises (I2)."""
     if registry is None:
-        return Unavailable('no registry (e.g. a remote runner)')
+        return Unavailable('no registry on this host (no_registry_on_runner)')
     try:
         return await registry.view(keys)
     except Exception as exc:

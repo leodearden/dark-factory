@@ -26,7 +26,6 @@ import contextlib
 import dataclasses
 import functools
 import importlib
-import math
 import sys
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
@@ -40,7 +39,12 @@ from _tree_scan import (
     TreePass,
     orchestrator_test_modules,
 )
-from _wait_budget_audit import ItemWaitAudit, audit_module, is_module_level_item
+from _wait_budget_audit import (
+    ItemWaitAudit,
+    audit_module_in,
+    is_module_level_item,
+    may_bill_a_wait,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
@@ -69,11 +73,7 @@ _SYNTHETIC_CLOCK_MODULES: frozenset[str] = frozenset(
 #: entry as its bill falls, delete it when the item stops offending, and never
 #: add one for new code.
 _WAIT_BUDGET_DEBT: Mapping[str, float] = MappingProxyType(
-    {
-        # Landed by task 5556 before this guard: its dispatch wait is bounded
-        # by a local built from a call. Burned down by task 7624.
-        'test_laptop_warm_verify_boundary.py::test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_warning': math.inf,
-    }
+    {}
 )
 
 # Non-vacuity floors, ~75% of the census measured when this guard landed.
@@ -139,7 +139,9 @@ def _module_census(audits: list[ItemWaitAudit]) -> _ModuleCensus:
 def _module_audits(module: ParsedModule) -> tuple[ItemWaitAudit, ...] | None:
     """The billed items of a test module importable by its stem, or None when
     it has nothing to audit."""
-    audits = audit_module(module.source, functools.partial(_module_namespace, module.path))
+    if not may_bill_a_wait(module.may_name):
+        return None
+    audits = audit_module_in(module.tree, functools.partial(_module_namespace, module.path))
     return None if audits is None else tuple(audits)
 
 
@@ -331,6 +333,41 @@ def test_the_scan_drops_a_module_that_skips_at_import(tmp_path: Path) -> None:
     )
     assert [(module, offender.item) for module, offender in scan.offenders] == [
         ('test_wbcg_probe_audited.py', 'test_waits')
+    ]
+
+
+_BILLED_WAIT_SPELLINGS = {
+    'nfkc_asyncio_wait_for': (
+        'import ａsyncio\n'
+        'async def test_waits():\n'
+        '    await ａsyncio.ｗait_for(ａsyncio.sleep(0), timeout=10**6)\n'
+    ),
+    'asyncio_timeout_at': (
+        'import asyncio\n'
+        'async def test_waits():\n'
+        '    async with asyncio.timeout_at(0):\n'
+        '        pass\n'
+    ),
+    'await_outcome': 'async def test_waits(fut):\n    await _await_outcome(fut, timeout=10**6)\n',
+    'stop_merge_worker': (
+        'async def test_waits(worker, task):\n'
+        '    await stop_merge_worker(worker, task, join_timeout=10**6)\n'
+    ),
+    'poll_responsive': (
+        'async def test_waits(probe):\n'
+        '    await poll_responsive(probe, max_wall_s=10**6)\n'
+    ),
+}
+
+
+@pytest.mark.parametrize('spelling', sorted(_BILLED_WAIT_SPELLINGS))
+def test_the_scan_bills_every_recognised_wait_spelling(tmp_path: Path, spelling: str) -> None:
+    stem = f'test_wbcg_probe_{spelling}'
+    with _probe_tests_dir(tmp_path, {stem: _BILLED_WAIT_SPELLINGS[spelling]}) as tests_dir:
+        scan = _scan_tree(_probe_audits(tests_dir, [stem]))
+
+    assert [(module, offender.item) for module, offender in scan.offenders] == [
+        (f'{stem}.py', 'test_waits')
     ]
 
 

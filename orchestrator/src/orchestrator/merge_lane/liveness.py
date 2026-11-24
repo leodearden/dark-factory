@@ -4,8 +4,9 @@ verify-host-unreachable alarms, and persistent-worktree operational guards
 
 The startup liveness-margin guard (heartbeat-floor vs. reaper-window safety
 check), the in-flight verify's progress evidence (task 5290), the
-verify-host-unreachable alarm/recovery helpers, and the
-persistent warm-merge-verify-worktree serial-lane guards.  These subsystems are
+verify-host-unreachable alarm/recovery helpers, the
+persistent warm-merge-verify-worktree serial-lane guards, and the merge lane's
+worktree-routing seams (which lane a verify, chain build or drift check uses).  These subsystems are
 folded into one module as "operational guards" (PRD Open Q5 resolution —
 see plan.json design_decisions) rather than split into their own modules,
 since none is individually large and all three gate/monitor worker-level
@@ -25,12 +26,13 @@ any of them is seen by the next call.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import math
 import os
 import shlex
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,7 +40,7 @@ from escalation.models import Escalation
 from shared.proc_group import cpu_ticks_under_path
 
 from orchestrator.event_store import EventType
-from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, WorktreeKind
 from orchestrator.merge_lane.types import (
     MergeRequest,
     QuarantineClass,
@@ -159,7 +161,7 @@ def newest_content_mtime(root: Path) -> float | None:
 
     Pure, heartbeat-immune liveness signal backing the merge-worktree
     no-progress budget in
-    :meth:`orchestrator.merge_lane.worker.SpeculativeMergeWorker._run_inflight_verify`.
+    :meth:`orchestrator.merge_lane.verify_dispatch.VerifyDispatcher.run_inflight_verify`.
     ``root`` itself is never stat'd, and any ``.git`` subtree is pruned from
     the walk entirely — so the #1728 alpha owner-heartbeat
     (``_touch_owned_merge_worktrees``), which calls ``os.utime`` on every
@@ -721,7 +723,10 @@ def _resolve_pending_alarm(escalation_queue: Any, sentinel: str, resolution: str
     """
     pending = escalation_queue.get_by_task(sentinel, status='pending')
     for esc in pending:
-        escalation_queue.resolve(esc.id, resolution, resolved_by='orchestrator-verify-host-monitor')
+        escalation_queue.resolve(
+            esc.id, resolution, resolved_by='orchestrator-verify-host-monitor',
+            resolution_class='benign',
+        )
     return tuple(esc.id for esc in pending)
 
 
@@ -990,7 +995,7 @@ async def _acquire_warm_verify_worktree(
         deterministic reason string, hence an identical
         ``merge_outcome_signature`` on every attempt, which trips workflow.py's
         ``consecutive_merge_thrash`` ladder into a false-positive human
-        escalation.  ``merge_queue._run_inflight_verify`` implements that
+        escalation.  ``VerifyDispatcher.run_inflight_verify`` implements that
         defer in an ``except`` arm placed BEFORE its generic
         ``except Exception``.  This swap seam is the only place a reader can
         see that this call can raise at all, hence the note here.
@@ -1032,6 +1037,8 @@ async def acquire_chain_build_lane(
     git_ops: GitOps,
     config: OrchestratorConfig,
     base_commit: str,
+    *,
+    verify_is_local: bool = True,
 ) -> tuple[Path | None, bool]:
     """Acquire the ONE scratch worktree a deep merge-ahead chain builds in
     (task 3184, PRD β).
@@ -1042,17 +1049,24 @@ async def acquire_chain_build_lane(
     place and ``build_chain`` itself contains no worktree-provisioning
     branching.
 
-    Delegates to :meth:`~orchestrator.git_ops.GitOps.acquire_spec_lane` — the
-    single lane the whole chain build AND γ's tip verify run in.  γ (task
-    3185) has landed: ``SpeculativeMergeWorker._run_inflight_verify`` now
-    verifies ``ChainResult.tip`` inside THIS lane rather than acquiring a
+    For a local verify (*verify_is_local*) delegates to
+    :meth:`~orchestrator.git_ops.GitOps.acquire_spec_lane` — the single lane
+    the whole chain build AND γ's tip verify run in.  A remote verify never
+    reads the local lane's ``target/``, so it takes no ``_spec-`` lane and pays
+    no seed: it builds in
+    :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree`
+    (``warm=False``), mirroring the ordinary remote path, which takes no local
+    lane at all (task 7721).
+
+    γ (task 3185) has landed: ``VerifyDispatcher.run_inflight_verify``
+    now verifies ``ChainResult.tip`` inside THIS lane rather than acquiring a
     verify worktree of its own, and releases it — once, in its ``finally``,
     on every exit — via :func:`release_chain_build_lane`.  That is why the
     serial-lane refusal below is load-bearing twice over: borrowing
     ``_merge-verify`` would make both the build and the subsequent verify
     contend with the serial head verify.
-    That method already handles knob-off (``spec_warm_lane_pool is None``) and
-    pool exhaustion by cold-falling-back to
+    ``acquire_spec_lane`` itself handles knob-off (``spec_warm_lane_pool is
+    None``) and pool exhaustion by cold-falling-back to
     :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree` with
     ``warm=False``, so no knob branch is needed here.
 
@@ -1067,10 +1081,11 @@ async def acquire_chain_build_lane(
     contend with the serial head verify, and 3071's guard would then read the
     lane BUSY and defer the fleet.
 
-    **Never raises.**  Any exception degrades the round to "no chain this
-    round" (``(None, False)``, logged at WARNING with ``exc_info``) rather
-    than propagating into the dispatch loop — mirroring ``acquire_spec_lane``'s
-    own documented never-raise contract (inv.6).
+    **Never raises Exception.**  Any exception degrades the round to "no
+    chain this round" (``(None, False)``, logged at WARNING with
+    ``exc_info``) rather than propagating into the dispatch loop — mirroring
+    ``acquire_spec_lane``'s fail-open contract (inv.6).  A ``CancelledError``
+    propagates, and by then the acquirer has already given the lane back.
 
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
@@ -1080,6 +1095,8 @@ async def acquire_chain_build_lane(
         base_commit: The SHA to check the lane out at — the frozen prefix tip
             (``SpeculativeMergeWorker.frozen_prefix_tip``), i.e. the chain's
             ``head_merge_commit``.
+        verify_is_local: Whether the chain tip will be verified on this host
+            (the dispatch's host-lease locality).
 
     Returns:
         ``(lane, warm)`` on success; ``(None, False)`` when no chain is
@@ -1088,7 +1105,10 @@ async def acquire_chain_build_lane(
     """
     del config  # accepted for seam symmetry; lane choice is git_ops-resident
     try:
-        lane, warm = await git_ops.acquire_spec_lane(base_commit)
+        if verify_is_local:
+            lane, warm = await git_ops.acquire_spec_lane(base_commit)
+        else:
+            lane, warm = await git_ops.create_ephemeral_verify_worktree(base_commit), False
     except Exception:
         logger.warning(
             'acquire_chain_build_lane: lane acquisition failed for %s — '
@@ -1132,6 +1152,30 @@ async def release_chain_build_lane(
     if lane is None:
         return
     await git_ops.release_spec_lane(lane, warm=warm)
+
+
+@contextlib.asynccontextmanager
+async def drift_check_lane(git_ops: GitOps, merge_commit: str) -> AsyncIterator[Path]:
+    """The worktree the drift check's local leg verifies *merge_commit* in.
+
+    Where a warm-lane pool is configured it is a CoW-seeded ``_driftcheck-<hex>``
+    throwaway, never silently cold: an unseedable one raises
+    :class:`~orchestrator.git_ops.WarmSeedUnavailable` and the caller defers.
+    With no pool it is the cold ``_merge-<hex>`` throwaway, held under its lane
+    flock against the periodic reap (task 3018), which must close before the
+    cleanup.  Pinned by orchestrator/tests/test_merge_liveness.py::TestDriftCheckLane
+    and orchestrator/tests/test_merge_drift.py::TestDriftCheckHoldsLaneLease.
+    """
+    if git_ops.pool_in_use():
+        async with git_ops.warm_ephemeral_worktree(WorktreeKind.DRIFT_CHECK, merge_commit) as wt:
+            yield wt
+        return
+    wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
+    try:
+        async with git_ops.merge_verify_lease(lane_dir=wt):
+            yield wt
+    finally:
+        await git_ops.cleanup_merge_worktree(wt)
 
 
 def per_host_inflight_bound(merge_ahead_bound: int, num_hosts: int) -> int:

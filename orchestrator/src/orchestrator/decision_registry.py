@@ -125,7 +125,7 @@ class DecisionRecord:
 
     Only id/project/text/filed_at are mandatory; every other field has a
     documented default so a minimally-filed decision is still well-formed.
-    Mirrors session_registry.py::LeaseHolder's plain to_dict/from_dict/to_json/from_json shape.
+    Mirrors session_leases.py::LeaseHolder's plain to_dict/from_dict/to_json/from_json shape.
 
     id: this record's identity/filename key; see decision_path_for_id.
     project: the project_id this decision concerns.
@@ -336,7 +336,7 @@ def decision_path_for_id(decision_id: str, root: Path | str | None = None) -> Pa
 
     *decision_id* is sanitized through _DECISION_ID_SANITIZE_RE first, so it
     always resolves to a single file directly inside decisions_dir (mirrors
-    session_registry.py::lease_path_for_name's path-escape guard).
+    session_leases.py::lease_path_for_name's path-escape guard).
     """
     stem = _DECISION_ID_SANITIZE_RE.sub('-', decision_id)
     return decisions_dir(root) / f'{stem}.json'
@@ -383,7 +383,7 @@ def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
     """Read every decision under decisions_dir. Missing dir -> [] (no raise).
 
     A single corrupt or foreign ``*.json`` file is skipped (logged at ERROR)
-    rather than aborting the whole read -- mirrors session_registry.py::reap_stale_records'
+    rather than aborting the whole read -- mirrors session_reaper.py::reap_stale_records'
     corrupt-body handling, so one bad file never breaks the cockpit's
     whole-queue read.
     """
@@ -575,6 +575,23 @@ class DecisionCloseRefused(Exception):
     """
 
 
+def refuse_unclosable_arguments(decision_id: str, state: str, evidence: str) -> None:
+    """Raise DecisionCloseRefused unless *state* is a closing state and *evidence* is non-blank.
+
+    The close arguments no record could ever accept, checked without reading
+    one: close_decision_with_evidence runs it before its lock, and the
+    file-and-close-decision verb before its filing.
+    """
+    if state not in CLOSING_DECISION_STATES:
+        raise DecisionCloseRefused(
+            f'{decision_id}: close-decision closes to answered or dropped, not {str(state)!r}'
+        )
+    if not evidence.strip():
+        raise DecisionCloseRefused(
+            f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
+        )
+
+
 def close_decision_with_evidence(
     decision_id: str,
     state: str,
@@ -612,14 +629,7 @@ def close_decision_with_evidence(
     Concurrency: serialized per-decision-id via _mutate_decision, see
     DecisionRecord's docstring.
     """
-    if state not in CLOSING_DECISION_STATES:
-        raise DecisionCloseRefused(
-            f'{decision_id}: close-decision closes to answered or dropped, not {str(state)!r}'
-        )
-    if not evidence.strip():
-        raise DecisionCloseRefused(
-            f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
-        )
+    refuse_unclosable_arguments(decision_id, state, evidence)
 
     wanted = _decision_identity(expected_project, expected_escalations_dir)
 

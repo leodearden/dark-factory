@@ -98,6 +98,9 @@ routing:
   # config/schema.py::RoutingConfig.
   openai_api_url: null
   openai_api_key: null
+  # The routing call's model and effort; null keeps llm.model at temperature 0.0. See RoutingConfig.
+  model: null
+  reasoning_effort: null
 
 queue:
   semaphore_limit: ${SEMAPHORE_LIMIT:3}
@@ -620,12 +623,15 @@ mem0_update:
 link_heal:
   # The projects with write-triage children in the 2026-10-19 soak.
   projects: [dark_factory, reify, solar_challenge, solar_challenge_platform, scoping_intake]
-  # Writes need a passing soak calibration and an operator flip (INV-12 owned hold; runbook: OPERATIONS.md).
+  # Writes stay off until gate θ (task 6191, the report-mode week) and task ξ (6192) turn them on;
+  # a writing sweep also needs a passing calibration (INV-12 owned hold; runbook: OPERATIONS.md).
   writes: false
 #   # Heal actions a sweep may stage; the rest are recorded as not_enabled.
 #   sweep_actions: [detach, relabel]
 #   # How far back the first sweep looks; later sweeps resume from the last complete one.
 #   sweep_window_hours: 24
+#   # Most pairs one sweep run asks the adjudicator; the rest wait for the next run.
+#   max_adjudications_per_run: 200
 #   # Calibration passes at no less than the raters' own kappa minus this.
 #   calibration_kappa_margin: 0.10
 #   # Rated pairs a project needs before calibration gates on it.
@@ -697,7 +703,7 @@ link_heal:
 # Deterministic auto-consolidation of Mem0 near-duplicate clusters (task 5237,
 # plans/memory-auto-consolidation-prd.md). Recon Stage 1 proposes a cluster, a
 # pure predicate rules on it, and a passing cluster is consolidated WITH NO
-# HUMAN IN THE LOOP. All fourteen leaves are green-tier hot-reloadable: they
+# HUMAN IN THE LOOP. All twenty-two leaves are green-tier hot-reloadable: they
 # are registered in `config/reload.py::RELOADABLE_FIELDS`, which is the
 # authoritative list, and `mcp__escalation__reload_config` applies a change to
 # any of them to a RUNNING server with no restart.
@@ -775,6 +781,24 @@ link_heal:
 #     procedural_knowledge: 1.0
 #     preferences_and_norms: 1.0
 #     observations_and_summaries: 0.7
+#   # The adjudicator (plans/consolidation-adjudicator-prd.md K7). The ranked
+#   # slice and the cap on adjudicator calls per cycle; 0 makes no call.
+#   max_adjudications_per_cycle: 6
+#   # Model and reasoning effort (null for a non-reasoning model). Both are part
+#   # of the adjudicator's identity, so changing either recalibrates it.
+#   adjudicator_model: gpt-6.1-sol
+#   adjudicator_reasoning_effort: low
+#   # Per-call timeout. Not part of the identity: retuning it never recalibrates.
+#   adjudicator_timeout_seconds: 60
+#   # Characters of each member's text shown to the adjudicator (identity).
+#   adjudicator_field_chars: 4000
+#   # Most members a proposal may carry to the adjudicator, the largest cluster
+#   # the eval set measures. At least member_min (identity).
+#   adjudicator_member_max: 8
+#   # Days a non-executed proposal outcome is kept.
+#   outcome_retention_days: 90
+#   # Days an original decision is reused for the same members.
+#   memo_days: 30
 
 write_triage:
   # OPERATOR KNOBS — hand-set, NOT calibration outputs. The keys above the
@@ -809,7 +833,7 @@ write_triage:
   # On replay the 0.60 floor removed 28 contested misfiles for 2 correct
   # contests.
   min_parent_cosine: 0.60
-  # hoist_max_cosine_gap: in the judge band, refuse to hoist from the matched
+  # hoist_max_cosine_gap: on a judged write, refuse to hoist from the matched
   # child to its parent when the parent's cosine is more than this below the
   # child's; store standalone. On replay the 0.05 gap removed 32 contested
   # misfiles for 1 correct contest; with F1 (task 6956) contested misfile fell
@@ -818,14 +842,16 @@ write_triage:
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
   # them. Every judge knob is green-tier hot-reloadable and read live per
-  # middle-band write.
+  # judged write: every write from t_low up except a near-verbatim restatement
+  # (task 7155), so with the judge off the high band stores rather than files
+  # `restated`.
   #
   # judge_enabled: the kill switch for the LLM arm alone. Defaults TRUE,
   # unlike `enabled` above, because the judge is inert while triage is off —
   # and because a judge that had to be switched on SEPARATELY at the 3169 flip
   # is a footgun: the operator would flip `enabled`, get stub behaviour, and
   # read the all-`stored` ack stream as "the corpus is novel". Set false to
-  # stop an in-flight judge incident without disabling the deterministic bands.
+  # stop an in-flight judge incident without disabling the deterministic paths.
   judge_enabled: true
   # judge_provider / judge_model: null INHERITS llm.provider / llm.model, so
   # the judge follows the model this deployment already trusts for add_memory
@@ -836,8 +862,12 @@ write_triage:
   # llm.model, which scored worse than the status quo on the comparative.
   judge_provider: openai
   judge_model: gpt-6.1-sol
-  # judge_api_url: the judge's OWN endpoint (null inherits llm.providers.<provider>.api_url); see plans/write-triage-flip-readiness-prd.md task σ.
-  judge_api_url: null
+  # judge_api_url / judge_api_key: the judge's OWN endpoint and key, each null
+  # inheriting llm.providers.<provider>.api_url / api_key. Both point at the
+  # ChatGPT-plan proxy (CLIProxyAPI) per ruling esc-9522-1, task 9946. An unset
+  # variable expands to null and so inherits the API-key route.
+  judge_api_url: ${OPENAI_PLAN_PROXY_URL}
+  judge_api_key: ${OPENAI_PLAN_PROXY_KEY}
   # judge_timeout_seconds: NOT optional. No LLM call elsewhere in fused-memory
   # sets a timeout and the openai SDK default is 600s; on the synchronous
   # add_memory write path that is a wedge, not a degradation. A timeout

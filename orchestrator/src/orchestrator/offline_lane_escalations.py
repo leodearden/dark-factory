@@ -224,6 +224,7 @@ def resolve_stuck_filing(queue: EscalationQueue, escalation_id: str) -> None:
         escalation_id,
         'No filing of this command has stayed due; the lane closed its own record.',
         resolved_by=LANE_ESCALATION_ROLE,
+        resolution_class='benign',
     )
 
 
@@ -249,6 +250,7 @@ def resolve_tick_failure(queue: EscalationQueue, escalation_id: str) -> None:
         "This command's tick no longer fails: it ran clean again, or the command has no record "
         "left in the lane's store to tick. The lane closed its own record.",
         resolved_by=LANE_ESCALATION_ROLE,
+        resolution_class='benign',
     )
 
 
@@ -285,12 +287,16 @@ def release_lane_record(queue: EscalationQueue, escalation_id: str, resolution: 
     amended to say the record closed.  Idempotent: a repeat resolves and amends nothing new.
     """
     if escalation_state(queue, escalation_id) == PENDING_ESCALATION:
-        queue.resolve(escalation_id, resolution, resolved_by=LANE_ESCALATION_ROLE)
+        queue.resolve(
+            escalation_id, resolution, resolved_by=LANE_ESCALATION_ROLE, resolution_class='benign',
+        )
     for holder in queue.get_pending():
         if holder.level != _HOLDER_LEVEL or escalation_id not in holder.members:
             continue
         if list(dict.fromkeys(holder.members)) == [escalation_id]:
-            queue.resolve(holder.id, resolution, resolved_by=LANE_ESCALATION_ROLE)
+            queue.resolve(
+                holder.id, resolution, resolved_by=LANE_ESCALATION_ROLE, resolution_class='benign',
+            )
         else:
             queue.amend(
                 holder.id,

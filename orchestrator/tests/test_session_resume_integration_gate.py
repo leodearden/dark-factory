@@ -68,6 +68,7 @@ from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.quarantine_provenance import NOT_RELOCATED
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.warm_lane_pool import WarmLanePool
 from orchestrator.workflow import TaskWorkflow
 
@@ -384,7 +385,7 @@ async def _dispatch_capture(
             total_cost_usd=0.0, total_duration_ms=0, agent_invocations=0,
         )
         MockWorkflow.return_value = mock_wf
-        await harness._run_slot(assignment, sem)
+        await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
         kwargs = MockWorkflow.call_args.kwargs
     return _DispatchCapture(
         resume_session_id=kwargs['resume_session_id'],
