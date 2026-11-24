@@ -74,7 +74,7 @@ from dashboard.data.quality_snapshot_sampler import refresh_snapshots
 from dashboard.data.quality_snapshots import BASELINE_HOME
 from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
-from dashboard.data.served_read import join_outlived_waits, outlived_wait_count
+from dashboard.data.served_read import join_outlived_waits, unanswered_wait_count
 from dashboard.loops import _QualityStore
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
@@ -662,16 +662,17 @@ the third."""
 
 
 def _render_prds_settled(client: TestClient, at: datetime) -> dict[str, Any]:
-    """GET /prds at *at* from a render no read outlived its request wait in."""
+    """GET /prds at *at* from a render in which every read answered within its request wait."""
     assert client.portal is not None, 'a settled render joins its reads inside a live TestClient'
     for _ in range(_SETTLE_RENDERS):
-        outlived = outlived_wait_count()
+        unanswered = unanswered_wait_count()
         body = _render_prds(client, at)
-        if outlived_wait_count() == outlived:
+        if unanswered_wait_count() == unanswered:
             return body
         client.portal.call(join_outlived_waits)
     raise AssertionError(
-        f'GET /prds still left reads outliving their request waits after {_SETTLE_RENDERS} renders',
+        f'GET /prds still had reads that did not answer within their request waits after '
+        f'{_SETTLE_RENDERS} renders',
     )
 
 

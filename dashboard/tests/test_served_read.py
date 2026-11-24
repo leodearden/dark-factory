@@ -293,11 +293,11 @@ async def test_a_wait_its_work_outlives_is_counted_and_joining_lands_the_work():
         landed.append(7)
         return 7
 
-    before = served_read.outlived_wait_count()
+    before = served_read.unanswered_wait_count()
     with pytest.raises(TimeoutError):
         await wait_shielded(walk(), 0.01, what='the test walk')
 
-    assert served_read.outlived_wait_count() == before + 1
+    assert served_read.unanswered_wait_count() == before + 1
     release.set()
     await served_read.join_outlived_waits()
     assert landed == [7]
@@ -307,10 +307,10 @@ async def test_work_inside_its_wait_is_not_counted():
     async def answers() -> int:
         return 7
 
-    before = served_read.outlived_wait_count()
+    before = served_read.unanswered_wait_count()
 
     assert await wait_shielded(answers(), 1.0, what='the answer') == 7
-    assert served_read.outlived_wait_count() == before
+    assert served_read.unanswered_wait_count() == before
     await served_read.join_outlived_waits()
 
 
@@ -318,22 +318,22 @@ async def test_a_wait_whose_deadline_expires_as_its_work_ends_is_counted():
     async def answers() -> int:
         return 7
 
-    before = served_read.outlived_wait_count()
+    before = served_read.unanswered_wait_count()
     with pytest.raises(TimeoutError):
         await wait_shielded(answers(), 0, what='the answer')
 
-    assert served_read.outlived_wait_count() == before + 1
+    assert served_read.unanswered_wait_count() == before + 1
 
 
 async def test_work_that_raises_timeout_error_inside_its_wait_is_not_counted():
     async def times_out() -> int:
         raise TimeoutError('its own timeout')
 
-    before = served_read.outlived_wait_count()
+    before = served_read.unanswered_wait_count()
     with pytest.raises(TimeoutError, match='its own timeout'):
         await wait_shielded(times_out(), 1.0, what='the walk')
 
-    assert served_read.outlived_wait_count() == before
+    assert served_read.unanswered_wait_count() == before
 
 
 async def test_a_served_read_that_fails_after_its_wait_is_logged_as_a_bug_naming_its_key(caplog):

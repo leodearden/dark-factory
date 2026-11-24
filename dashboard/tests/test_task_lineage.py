@@ -296,10 +296,10 @@ class TestAcquireLineage:
             return await canned(client, url, tool, args, **kwargs)
 
         with patch('dashboard.data.tasks.mcp_tool_call', new=held):
-            before = served_read.outlived_wait_count()
+            before = served_read.unanswered_wait_count()
             pending = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
             assert pending.state is DatumState.UNKNOWN
-            assert served_read.outlived_wait_count() == before + 1
+            assert served_read.unanswered_wait_count() == before + 1
             release.set()
             await served_read.join_outlived_waits()
             landed = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)

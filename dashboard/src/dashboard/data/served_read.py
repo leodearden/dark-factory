@@ -26,7 +26,7 @@ V = TypeVar('V')
 T = TypeVar('T')
 
 _OUTLIVED_WAITS: set[asyncio.Task[Any]] = set()
-_outlived_wait_count = 0
+_unanswered_wait_count = 0
 
 
 async def wait_shielded(
@@ -38,19 +38,26 @@ async def wait_shielded(
     lands for the next caller. Nobody is left to receive a failure it then
     ends in, so that failure is logged as a BUG naming *what*.
     """
-    global _outlived_wait_count
+    global _unanswered_wait_count
     task = asyncio.ensure_future(work)
+    deadline = asyncio.timeout(wait_seconds)
     try:
-        return await asyncio.wait_for(asyncio.shield(task), wait_seconds)
+        async with deadline:
+            return await asyncio.shield(task)
     finally:
+        if deadline.expired() or not task.done():
+            _unanswered_wait_count += 1
         if not task.done():
-            _outlived_wait_count += 1
             track_task(task, _OUTLIVED_WAITS, on_done=functools.partial(_log_late_failure, what))
 
 
-def outlived_wait_count() -> int:
-    """How many waits in this process have ended before their work did; it only grows."""
-    return _outlived_wait_count
+def unanswered_wait_count() -> int:
+    """How many waits in this process did not answer their caller with their work's outcome.
+
+    A wait goes unanswered when its deadline expired, or its caller stopped
+    waiting, before its work ended. The count only grows.
+    """
+    return _unanswered_wait_count
 
 
 async def join_outlived_waits() -> None:
