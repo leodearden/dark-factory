@@ -347,7 +347,6 @@ async def track_human_operator_stalls(
             },
             causation_id=run_id,
             _source='stage1_stall_detector',
-            declared_referents=[{'kind': 'task', 'id': tid}],
         )
         for tid in task_ids
     )
