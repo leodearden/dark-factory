@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Cross-repo lock-charter reconciliation — EXPLICITLY INVOKED, never collected by pytest.
+"""Cross-repo lock-charter reconciliation — run NIGHTLY off the gate, never collected by pytest.
+
+``scripts/lock_charter_drift_heal.py`` runs this reconciliation nightly via
+``lock-charter-drift-check.timer`` and routes its outcome to an owner; the
+in-suite live reify guards it replaces are retired (task 11623).  Operations:
+``OPERATIONS.md`` section 9a.
 
 WHY THIS IS A SCRIPT AND NOT A TEST.  The lock-charter predicate is mirrored
 across two repositories: reify's ``scripts/lock-charter-guard.sh`` (the α copy,
@@ -9,8 +14,8 @@ and necessary work.  Doing it from INSIDE dark-factory's pytest suite is what
 caused the 2026-07-29 incident:
 
   * reify widened its allowlist 36 -> 58 extensions in a single commit;
-  * dark-factory's in-suite Tier-2 drift guard shells out to that script LIVE,
-    so every dark-factory worktree's full suite went red simultaneously;
+  * dark-factory's in-suite Tier-2 drift guard then shelled out to that script
+    LIVE, so every dark-factory worktree's full suite went red simultaneously;
   * task 3118's ``post_merge_verify`` then failed on a SEVEN-FILE,
     orchestrator-only diff that could not possibly have caused it.
 
@@ -20,9 +25,9 @@ path.**  A reify commit is reify's news.  It should surface here as a drift
 REPORT from a run somebody asked for — an operator, a scheduled job — not as a
 red gate on an unrelated dark-factory branch that has no way to fix it.
 
-WHY THERE IS NO SKIP STATE.  The in-suite guards degrade to a pytest SKIP when
-no reify checkout is discoverable, and a skip is indistinguishable from a pass
-to anything reading an exit code.  That conflation is the second half of this
+WHY THERE IS NO SKIP STATE.  The retired in-suite guards degraded to a pytest
+SKIP when no reify checkout was discoverable, and a skip is indistinguishable
+from a pass to anything reading an exit code.  That conflation is the second half of this
 task's charter, and it would be self-defeating to rebuild it here.  So this
 script has exactly three outcomes and no fourth:
 
@@ -46,10 +51,10 @@ fused-memory dependency).  Importing the fused-memory copy would make this file
 uncollectable in the lane that lints and type-checks it.
 
 NOTHING AT MODULE SCOPE RESOLVES A REAL CHECKOUT.  Reify discovery happens
-inside `resolve`, per call.  Module-level resolution is what makes the in-suite
-guards' constants evaluate at IMPORT time and therefore un-steerable by a test's
-``monkeypatch``; here it would additionally mean a bare ``--help`` depended on
-the ambient ``REIFY_ROOT``.
+inside `resolve`, per call.  Module-level resolution is what made the retired
+in-suite guards' constants evaluate at IMPORT time and therefore un-steerable by
+a test's ``monkeypatch``; here it would additionally mean a bare ``--help``
+depended on the ambient ``REIFY_ROOT``.
 
 Contract pinned by ``tests/scripts/test_check_lock_charter_drift.py``.
 """
@@ -82,9 +87,7 @@ _STATUS_BY_EXIT = {
 }
 
 #: reify-relative path of the emitter this script compares against.  Also the
-#: MARKER that identifies a reify checkout usable by this caller — the same
-#: marker fused-memory's in-suite guard binds, so one ``export REIFY_ROOT=...``
-#: steers both to the same root.
+#: MARKER that identifies a reify checkout usable by this caller.
 GUARD_RELPATH = Path('scripts') / 'lock-charter-guard.sh'
 
 #: Bound on every subprocess this script runs — the guard script and ``git``.
@@ -162,15 +165,11 @@ def _record_holding(exc: UnicodeDecodeError) -> bytes:
 def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> list[str]:
     """Return the sorted vector emitted by reify's guard *script* for *flag*.
 
-    LOUD on failure, by design, and the distinction matters.  The in-suite
-    copies of this call (``_reify_guard_vector`` in
-    ``fused-memory/tests/test_lock_charter_guard.py`` and
-    ``tests/repo_guards/test_lock_charter_reify_parity.py``) hard-assert ``rc == 0`` for the same
-    reason recorded there: measured 2026-08-09 on the live script, an
-    unrecognised flag prints usage to stderr and exits 2, so a
-    skip-on-any-non-zero would silently retire the comparison the moment reify
-    renamed or dropped an emitter, leaving it green forever while enforcing
-    nothing.
+    LOUD on failure, by design, and the distinction matters: measured
+    2026-08-09 on the live script, an unrecognised flag prints usage to stderr
+    and exits 2, so a skip-on-any-non-zero would silently retire the comparison
+    the moment reify renamed or dropped an emitter, leaving it green forever
+    while enforcing nothing.
 
     Raises `GuardUnavailable` for a missing script and a non-zero rc here, and
     for a timeout, an ``OSError`` or an undecodable stdout via `_run_or_unavailable`.
@@ -354,7 +353,7 @@ def check_corpus(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) 
     (``README``) is also rejected by the predicate, but there is no token to
     allowlist: reporting it under a key of ``''`` would tell the reader to add
     an empty extension.  Widening ``EXTENSIONLESS_FILENAMES`` is a separate,
-    name-by-name judgement and stays out of this sweep.
+    name-by-name judgement, swept by `check_extensionless`.
     """
     try:
         paths, gitlinks = tracked_paths(Path(reify_repo), timeout=timeout)
@@ -407,6 +406,94 @@ def check_corpus(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) 
     }
 
 
+def check_extensionless(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> Report:
+    """Sweep reify's tracked corpus for the two EXTENSION-LESS hazards.
+
+    ``findings``: tracked non-gitlink paths whose final segment has no ``.``
+    and which `is_file_path` rejects, keyed by that segment and valued by the
+    first such path.  The 2026-11-23 shape: reify started tracking
+    ``scripts/canon-bin/guard/sccache`` before dark-factory allowlisted
+    ``sccache``, so a reify task declaring it was refused as a directory.
+
+    ``collisions``: `EXTENSIONLESS_FILENAMES` members that name a DIRECTORY in
+    the tree, keyed by name and valued by the first witnessing path.  A member
+    that is also a directory makes that directory declarable as a file-level
+    lock charter — an over-wide lock.  A gitlink is a directory in this repo,
+    so its own name counts as well as its parents'.
+
+    Both are judged name by name, which is why `check_corpus` leaves no-dot
+    segments to this part.  Never raises for a reify-side problem: a ``git``
+    that could not answer becomes an `EXIT_UNAVAILABLE` report.
+    """
+    try:
+        paths, gitlinks = tracked_paths(Path(reify_repo), timeout=timeout)
+    except GuardUnavailable as exc:
+        return {
+            'status': _STATUS_BY_EXIT[EXIT_UNAVAILABLE],
+            'exit_code': EXIT_UNAVAILABLE,
+            'findings': {},
+            'collisions': {},
+            'detail': (
+                f'extension-less corpus sweep NOT PERFORMED: {exc}  '
+                f'This is not a pass — nothing was swept.'
+            ),
+        }
+
+    findings: dict[str, str] = {}
+    for path in paths:
+        segment = path.rsplit('/', 1)[-1]
+        if '.' not in segment and not is_file_path(path):
+            findings.setdefault(segment, path)
+
+    collisions: dict[str, str] = {}
+    directories = [(p.split('/')[:-1], p) for p in paths] + [(g.split('/'), g) for g in gitlinks]
+    for components, path in directories:
+        for component in components:
+            if component in EXTENSIONLESS_FILENAMES:
+                collisions.setdefault(component, path)
+
+    if not findings and not collisions:
+        return {
+            'status': _STATUS_BY_EXIT[EXIT_OK],
+            'exit_code': EXIT_OK,
+            'findings': {},
+            'collisions': {},
+            'detail': (
+                f'every extension-less tracked path in {reify_repo} is allowlisted, '
+                f'and no allowlisted name is a directory there'
+            ),
+        }
+
+    lines: list[str] = []
+    if findings:
+        lines.append(
+            f'{len(findings)} extension-less tracked name(s) in {reify_repo} are '
+            f'REJECTED by is_file_path, so a declaration naming such a file is '
+            f'refused as a directory:'
+        )
+        lines += [f'  {name} — e.g. {path}' for name, path in sorted(findings.items())]
+    if collisions:
+        lines.append(
+            f'{len(collisions)} EXTENSIONLESS_FILENAMES member(s) are also DIRECTORY '
+            f'names in {reify_repo}, so declaring that directory is accepted as a '
+            f'file-level lock charter:'
+        )
+        lines += [f'  {name} — e.g. {path}' for name, path in sorted(collisions.items())]
+        lines.append('Drop the name from the allowlist, or rename the directory.')
+    lines.append(
+        'This is a CROSS-REPO MIRROR gap owned by a mirror task: the shared '
+        'extension-less allowlist does not fit reify\'s tracked corpus.  It is '
+        'NOT a fault in any dark-factory branch under test.'
+    )
+    return {
+        'status': _STATUS_BY_EXIT[EXIT_DRIFT],
+        'exit_code': EXIT_DRIFT,
+        'findings': findings,
+        'collisions': collisions,
+        'detail': '\n'.join(lines),
+    }
+
+
 #: Severity order for folding part exit codes: an UNAVAILABLE half can never be
 #: masked by an OK (or even a DRIFT) half.  `max` over this ranking rather than
 #: over the raw codes, so the ordering stays explicit and survives any future
@@ -415,26 +502,27 @@ _SEVERITY = {EXIT_OK: 0, EXIT_DRIFT: 1, EXIT_UNAVAILABLE: 2}
 
 
 def check(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> Report:
-    """Run both halves and fold them into one report, worst outcome wins.
+    """Run every part and fold them into one report, worst outcome wins.
 
     Ordering is UNAVAILABLE > DRIFT > OK.  This is the same "absence is never a
     pass" invariant as the individual halves, applied to composition: a reify
     checkout can easily have a git index and no guard script, and reporting OK
     because the half that COULD run agreed would be the silent green of a pytest
-    skip, one level up.  Likewise a drifting half plus an unavailable half is
-    not a complete drift report — the unexamined half may hold worse.
+    skip, one level up.  Likewise a drifting part plus an unavailable part is
+    not a complete drift report — the unexamined part may hold worse.
 
-    Both halves ALWAYS run; neither short-circuits the other.  A single
+    Every part ALWAYS runs; none short-circuits another.  A single
     invocation should tell the operator everything that is knowable right now,
     and a report that stopped at the first problem would need re-running to
     find the second.
 
     The per-part sub-reports are kept under ``parts`` so a ``--json`` consumer
-    can see exactly WHICH half was unavailable rather than inferring it.
+    can see exactly WHICH part was unavailable rather than inferring it.
     """
     parts = {
         'vectors': check_vectors(Path(reify_repo), timeout=timeout),
         'corpus': check_corpus(Path(reify_repo), timeout=timeout),
+        'extensionless': check_extensionless(Path(reify_repo), timeout=timeout),
     }
     exit_code = max((p['exit_code'] for p in parts.values()), key=lambda c: _SEVERITY[c])
     return {
@@ -483,6 +571,34 @@ def resolve(explicit: str | None = None) -> reify_checkout.ReifyCheckout:
     return reify_checkout.resolve_reify_checkout(GUARD_RELPATH, start=Path(__file__))
 
 
+def reconcile(explicit: str | None = None) -> Report:
+    """Resolve the reify checkout and reconcile against it: the one body the CLI and the heal router share.
+
+    A resolution problem short-circuits before any comparison, and its message
+    comes from `shared.reify_checkout.reify_skip_reason` rather than a local
+    string.  That single-sourcing is what keeps the two arms distinct — the
+    benign standalone-checkout MISS ("nobody has reify here") versus an
+    operator's ``REIFY_ROOT`` naming a path that is not there — which two
+    hand-rolled strings in two call sites reliably conflate.
+    """
+    checkout = resolve(explicit)
+    reason = reify_checkout.reify_skip_reason(
+        GUARD_RELPATH, checkout.root, named_by_env=checkout.named_by_env
+    )
+    if reason is not None:
+        return {
+            'status': _STATUS_BY_EXIT[EXIT_UNAVAILABLE],
+            'exit_code': EXIT_UNAVAILABLE,
+            'parts': {},
+            'detail': (
+                f'cross-repo lock-charter reconciliation NOT PERFORMED: {reason}.  '
+                f'This is not a pass — nothing was compared.'
+            ),
+        }
+    assert checkout.root is not None  # reify_skip_reason returned None
+    return check(checkout.root)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the reconciliation and return its exit code.
 
@@ -496,13 +612,6 @@ def main(argv: list[str] | None = None) -> int:
     including drift and unavailable: a consumer that piped ``--json`` and got
     nothing on the run it most needs to parse would have to fall back to
     scraping the human text.
-
-    A resolution problem short-circuits before any comparison, and its message
-    comes from `shared.reify_checkout.reify_skip_reason` rather than a local
-    string.  That single-sourcing is what keeps the two arms distinct — the
-    benign standalone-checkout MISS ("nobody has reify here") versus an
-    operator's ``REIFY_ROOT`` naming a path that is not there — which two
-    hand-rolled strings in two call sites reliably conflate.
     """
     parser = argparse.ArgumentParser(
         prog='check_lock_charter_drift.py',
@@ -522,24 +631,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    checkout = resolve(args.reify_repo)
-    reason = reify_checkout.reify_skip_reason(
-        GUARD_RELPATH, checkout.root, named_by_env=checkout.named_by_env
-    )
-    if reason is not None:
-        report: Report = {
-            'status': _STATUS_BY_EXIT[EXIT_UNAVAILABLE],
-            'exit_code': EXIT_UNAVAILABLE,
-            'parts': {},
-            'detail': (
-                f'cross-repo lock-charter reconciliation NOT PERFORMED: {reason}.  '
-                f'This is not a pass — nothing was compared.'
-            ),
-        }
-    else:
-        assert checkout.root is not None  # reify_skip_reason returned None
-        report = check(checkout.root)
-
+    report = reconcile(args.reify_repo)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     elif report['exit_code'] == EXIT_OK:
