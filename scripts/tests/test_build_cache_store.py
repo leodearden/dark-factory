@@ -13,13 +13,11 @@ user manager, ~/.config, ~/.cache or ports 4226/4227.
 from __future__ import annotations
 
 import base64
-import contextlib
 import http.client
 import json
 import os
 import shlex
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -34,6 +32,13 @@ from typing import Any
 
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
+from fake_user_systemctl_state import (
+    calls_log,
+    enabled_marker,
+    kill_all_units,
+    log_file,
+    unit_pid,
+)
 from laptop_battery_guard_fixtures import write_shims
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from socket_activation import socket_activated
@@ -440,10 +445,10 @@ class StoreWorld:
             timeout=2 * CLI_TIMEOUT,
         )
 
-    def install_failure(self, proc: subprocess.CompletedProcess[str]) -> str:
+    def install_report(self, proc: subprocess.CompletedProcess[str]) -> str:
         """The installer's output, then the tail of the store unit's log when it has one."""
         report = proc.stdout + proc.stderr
-        store_log = self.state / f"{STORE_UNIT}.log"
+        store_log = log_file(self.state, STORE_UNIT)
         if store_log.exists():
             report += f"\n--- {store_log} ends:\n{log_tail(store_log)}"
         return report
@@ -469,7 +474,7 @@ class StoreWorld:
         return shlex.split(lines[0])
 
     def systemctl_calls(self) -> list[list[str]]:
-        log = self.state / "systemctl.log"
+        log = calls_log(self.state)
         if not log.exists():
             return []
         return [json.loads(line) for line in log.read_text().splitlines()]
@@ -480,15 +485,13 @@ class StoreWorld:
         ]
 
     def store_pid(self) -> int:
-        return int((self.state / f"{STORE_UNIT}.pid").read_text())
+        return unit_pid(self.state, STORE_UNIT)
 
     def is_enabled(self, unit: str) -> bool:
-        return (self.state / f"{unit}.enabled").exists()
+        return enabled_marker(self.state, unit).exists()
 
     def kill_services(self) -> None:
-        for pid_file in self.state.glob("*.pid"):
-            with contextlib.suppress(ProcessLookupError, ValueError):
-                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+        kill_all_units(self.state)
 
 
 TMPFS = Path("/dev/shm")
@@ -526,7 +529,7 @@ def store_world(tmp_path: Path) -> Iterator[StoreWorld]:
 @pytest.fixture
 def installed(store_world: StoreWorld) -> StoreWorld:
     proc = store_world.install()
-    assert proc.returncode == 0, store_world.install_failure(proc)
+    assert proc.returncode == 0, store_world.install_report(proc)
     return store_world
 
 
@@ -594,7 +597,7 @@ class TestStoreInstall:
 
     def test_check_after_apply_passes(self, installed: StoreWorld) -> None:
         proc = installed.install("--check")
-        assert proc.returncode == 0, installed.install_failure(proc)
+        assert proc.returncode == 0, installed.install_report(proc)
 
     def test_reapply_changes_nothing_and_keeps_the_store_running(
         self, installed: StoreWorld
@@ -606,7 +609,7 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 0, installed.install_failure(proc)
+        assert proc.returncode == 0, installed.install_report(proc)
         assert {unit: installed.unit_text(unit) for unit in STORE_UNITS} == before
         assert installed.credentials_file.read_bytes() == credentials
         assert installed.store_pid() == pid
@@ -628,7 +631,7 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 0, installed.install_failure(proc)
+        assert proc.returncode == 0, installed.install_report(proc)
         new_auth = installed.auth()
         assert new_auth[1] != old_password
         rerun_calls = installed.systemctl_calls()[calls_before:]
@@ -659,7 +662,7 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 1, installed.install_failure(proc)
+        assert proc.returncode == 1, installed.install_report(proc)
         assert "nothing was restarted" in proc.stderr
         assert installed.store_pid() == pid
         assert not installed.systemctl_calls()[calls_before:]

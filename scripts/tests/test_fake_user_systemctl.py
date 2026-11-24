@@ -8,11 +8,9 @@ port.
 """
 from __future__ import annotations
 
-import contextlib
 import errno
 import os
 import shlex
-import signal
 import socket
 import subprocess
 import sys
@@ -23,6 +21,7 @@ from pathlib import Path
 
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
+from fake_user_systemctl_state import kill_all_units, log_file, unit_pid
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from zombie_leader_service import SYS_EXIT
 
@@ -79,10 +78,10 @@ class UnitWorld:
         )
 
     def pid(self) -> int:
-        return int((self.state / f"{UNIT}.pid").read_text())
+        return unit_pid(self.state, UNIT)
 
     def unit_log(self) -> str:
-        log = self.state / f"{UNIT}.log"
+        log = log_file(self.state, UNIT)
         return log.read_text(errors="replace") if log.exists() else "(no log)"
 
     def wait_until_ready(self) -> int:
@@ -94,9 +93,7 @@ class UnitWorld:
 
     def kill_all(self) -> None:
         self.release.touch()
-        for pid_file in self.state.glob("*.pid"):
-            with contextlib.suppress(ProcessLookupError, ValueError):
-                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+        kill_all_units(self.state)
 
 
 @pytest.fixture

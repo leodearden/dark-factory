@@ -3,10 +3,9 @@
 It really runs a service: `start` and `restart` read the unit file the
 installer wrote under $HOME/.config/systemd/user, apply its Environment= and
 EnvironmentFile= lines, and spawn its one-line ExecStart= in a new session.
-Every invocation's argv is appended as a JSON list to
-$FAKE_SYSTEMD_STATE/systemctl.log; a service's pid is kept in
-$FAKE_SYSTEMD_STATE/<unit>.pid and an enabled unit leaves <unit>.enabled.
-A service counts as running until every thread of its process has exited, as
+Every invocation's argv, a service's pid and output, and a marker for each
+enabled unit are kept under $FAKE_SYSTEMD_STATE, laid out by
+fake_user_systemctl_state.py. A service counts as running until every thread of its process has exited, as
 systemd's stop waits for the unit's cgroup to empty.
 A timer is active exactly when it is enabled.
 """
@@ -23,6 +22,13 @@ import time
 from pathlib import Path
 
 from shared.testing_own_time import state_letter
+
+# Sibling import that survives `python -I`, which leaves this directory off sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from fake_user_systemctl_state import calls_log, enabled_marker, log_file, pid_file, unit_pid
+finally:
+    del sys.path[0]
 
 STATE = Path(os.environ["FAKE_SYSTEMD_STATE"])
 UNIT_DIR = Path(os.environ["HOME"]) / ".config" / "systemd" / "user"
@@ -41,7 +47,7 @@ def task_state(stat: Path) -> str:
 def live_pid(unit: str) -> int:
     """The unit's pid while any thread of its process still runs, else 0."""
     try:
-        pid = int((STATE / f"{unit}.pid").read_text())
+        pid = unit_pid(STATE, unit)
         tasks = list(Path(f"/proc/{pid}/task").iterdir())
     except (OSError, ValueError):
         return 0
@@ -50,7 +56,7 @@ def live_pid(unit: str) -> int:
 
 
 def is_enabled(unit: str) -> bool:
-    return (STATE / f"{unit}.enabled").exists()
+    return enabled_marker(STATE, unit).exists()
 
 
 def stop(unit: str) -> bool:
@@ -93,7 +99,7 @@ def start(unit: str) -> int:
     if not command:
         print(f"{unit} has no ExecStart=", file=sys.stderr)
         return 1
-    with (STATE / f"{unit}.log").open("ab") as out:
+    with log_file(STATE, unit).open("ab") as out:
         proc = subprocess.Popen(
             command,
             env=env,
@@ -102,7 +108,7 @@ def start(unit: str) -> int:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    (STATE / f"{unit}.pid").write_text(str(proc.pid))
+    pid_file(STATE, unit).write_text(str(proc.pid))
     return 0
 
 
@@ -111,7 +117,7 @@ def enable(units: list[str], now: bool) -> int:
         if not (UNIT_DIR / unit).is_file():
             print(f"Unit file {unit} does not exist.", file=sys.stderr)
             return 1
-        (STATE / f"{unit}.enabled").touch()
+        enabled_marker(STATE, unit).touch()
         if now and start(unit):
             return 1
     return 0
@@ -135,7 +141,7 @@ def show(rest: list[str]) -> int:
 
 def main(argv: list[str]) -> int:
     STATE.mkdir(parents=True, exist_ok=True)
-    with (STATE / "systemctl.log").open("a") as log:
+    with calls_log(STATE).open("a") as log:
         log.write(json.dumps(argv) + "\n")
     if argv[:1] != ["--user"]:
         print("fake systemctl: only --user is supported", file=sys.stderr)
