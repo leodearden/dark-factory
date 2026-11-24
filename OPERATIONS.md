@@ -4542,7 +4542,11 @@ audit (task 5655) lands while the project's merge gate runs
 `merge_verify_breadth: "full"` (the default): that gate still runs every unit a
 task-role replay skipped, so a task-role false hit cannot land a red on main. A
 project set to `scoped` keeps `task_mode` behind the audit too. The merge role (and `remote_merge_mode`) stays
-behind the audit: `merge_mode: on` waits for task 5655. Before flipping a role
+behind the audit: `merge_mode: on` waits for task 5655 and task 9094. The audit
+runs test legs only, and
+`orchestrator/src/orchestrator/merge_lane/gates.py::_type_covered_modules`
+counts a `cache_hit` type unit as coverage, so a replayed pyright unit would be
+neither audited nor re-checked by the pre-advance unscoped type gate. Before flipping a role
 to `on`, check its `log` window for a `ran_red` unit carrying an
 `evidence_event_id` for a cause the branch's own diff explains; spurious reds (infra kill, worker crash,
 deploy clock, known load flake) do not block the flip.
@@ -4628,7 +4632,7 @@ commands arrive with the tasks named.
 
 | Lane command | Task | What it does |
 |---|---|---|
-| `verify-cache-audit` | 5655 (ε) | Runs the merge-role command set uncached (`DF_VERIFY_CACHE=off`) at the head each lane pass runs from (above). A red attributable to a `cache_hit` unit evicts that unit's entries, bumps the streak and returns the leak record as an evidence note; the lane renders it into the fix task it files once the red persists. A repeated pass of the same leak is counted once |
+| `verify-cache-audit` | 5655 (ε) | Runs every module's test leg uncached (`DF_VERIFY_CACHE=off`) at the head each lane pass runs from (above). Lint and type legs are not audited until task 9094. A red attributable to a `cache_hit` unit evicts that unit's entries, bumps the streak and returns the leak record as an evidence note; the lane renders it into the fix task it files once the red persists. A repeated pass of the same leak is counted once |
 | the separate recording lane command | 5656 (ζ1) | Records per-test input sets from green runs for the per-test tier. It consumes green runs' coverage only, so it does not wait for the audit |
 
 The audit plugs into the offline lane's red path through the `on_pass_outcome`
@@ -4643,7 +4647,14 @@ is under "Kill switch and re-enabling".
 
 Two attributable leaks within seven days set `policy_state.disabled_until` (14
 days from the second leak, with a reason and the leak evidence) and file an L2
-blocker naming both. While it is in the future **both roles run every unit**,
+blocker naming both. If that filing fails, every later reproduced audit red
+files it from the policy row
+(`orchestrator/src/orchestrator/verify_cache/audit_hook.py::VerifyCacheAuditHook`);
+a green pass asks no hook, so a queue still broken when the audit goes green
+leaves the blocker unfiled until the audit's next reproduced red. An audit with
+no escalation queue wired files on the project's on-disk queue
+(`orchestrator/src/orchestrator/offline_lane_pass.py::lane_pass_outcome_hooks`).
+While `disabled_until` is in the future **both roles run every unit**,
 whatever the modes say, and remote dispatches carry it. A cacheable unit shows
 as `unavailable` (or `ran_red`; see the `disabled` row above). The units settled
 before the switch is read (listed under "Reading a verify event") show plain
@@ -4652,10 +4663,14 @@ effect. The switch lives in the
 registry, not in config, so a reload does not clear it.
 
 To re-enable once the leaks are fixed, an operator runs `orchestrator
-verify-cache enable --config <path>`, or calls `resolve_issue` on the blocker;
-either records the re-enable. Waiting out `disabled_until` also re-enables. Both
-arrive with task 5655; `orchestrator verify-cache status` shows the switch
-meanwhile (`policy: DISABLED until …` with the reason and leaks).
+verify-cache enable --reason "<why the cache is safe again>" --config <path>`,
+which clears `disabled_until` with that reason and resolves the pending
+blocker. Resolving the blocker by hand (`resolve_issue`) does **not** re-enable
+the cache: while `disabled_until` is in the future, the audit re-files a
+hand-resolved blocker at its next reproduced red. Waiting out `disabled_until`
+also re-enables, and the audit's next reproduced red resolves that disable's
+blocker. `orchestrator verify-cache status` shows the switch meanwhile
+(`policy: DISABLED until …` with the reason and leaks).
 
 ### Never cached
 

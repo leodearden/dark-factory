@@ -21,6 +21,7 @@ from orchestrator.verify_cache.audit import (
     LeakResponse,
     apply,
     attribute,
+    held_reason,
 )
 from orchestrator.verify_cache.audit_run import AUDIT_COMMAND
 from orchestrator.verify_cache.registry import PolicyState, Registry
@@ -50,13 +51,13 @@ class VerifyCacheAuditHook:
     """The lane's section 5.7 hook for the verify-cache-audit command (plans/verify-result-cache-prd.md § Audit).
 
     Only a confirmed red's reproduced nodes are evidence; registry errors propagate, so the lane drops only these notes.
-    An escalation-queue error costs only the blocker sync, which the next attributable pass retries.
+    An escalation-queue error costs only the blocker sync, which the next reproduced audit red retries.
     """
 
     def __init__(
         self,
         registry: Registry,
-        escalation_queue: EscalationQueue | None,
+        escalation_queue: EscalationQueue,
         *,
         now: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -73,19 +74,17 @@ class VerifyCacheAuditHook:
         verdict = await attribute(head, outcome.reproduced, self._registry)
         if not verdict.attributions:
             await self._note_unattributable(verdict)
-            return ()
         now = self._now()
         response = await apply(verdict, self._registry, now)
-        notes = _notes(response, now)
         try:
             await asyncio.to_thread(self._sync_blockers, response, now)
         except Exception:
             logger.exception(
                 'verify-cache audit: syncing the kill-switch blocker with the escalation queue failed '
-                '(policy disabled_until=%s); the next attributable pass retries it',
+                '(policy disabled_until=%s); the next reproduced audit red retries it',
                 response.policy.disabled_until,
             )
-        return notes
+        return _notes(response, now)
 
     async def _note_unattributable(self, verdict: AuditVerdict) -> None:
         """Tell 'nothing records a consumption' apart from 'no leak', once per process (INV-13)."""
@@ -104,14 +103,6 @@ class VerifyCacheAuditHook:
 
     def _sync_blockers(self, response: LeakResponse, now: datetime) -> None:
         """Resolve the blockers of ended disables, then file the live disable's blocker if it has none."""
-        if self._queue is None:
-            if response.l2_required:
-                logger.error(
-                    'verify-cache audit: the cache is DISABLED until %s but there is no escalation queue '
-                    'to file its L2 blocker on',
-                    response.policy.disabled_until,
-                )
-            return
         resolve_ended_blockers(
             self._queue, response.policy, now,
             resolved_by=AUDIT_ESCALATION_ROLE,
@@ -143,7 +134,7 @@ def _pending_blockers(queue: EscalationQueue) -> list[Escalation]:
 def _policy_now(policy: PolicyState, now: datetime) -> str:
     if policy.is_disabled(now):
         return f'the cache is now DISABLED until {_until(policy)} under a later disable'
-    return f'the cache is enabled ({policy.reason})'
+    return f'the cache is enabled ({held_reason(policy, now)})'
 
 
 def _disable_episode(policy: PolicyState) -> str:
@@ -176,13 +167,14 @@ def _blocker(escalation_id: str, response: LeakResponse) -> Escalation:
 def _blocker_detail(records: Sequence[LeakRecord], response: LeakResponse) -> str:
     streak = frozenset(leak.identity for leak in response.streak_leaks)
     lines = [
-        'The verify-cache audit ran the merge-role command set uncached on the offline lane and reproduced '
+        "The verify-cache audit ran every module's test leg uncached on the offline lane and reproduced "
         'reds on units whose greens the named landings had replayed from the cache.',
         f'Kill switch: disabled until {_until(response.policy)} - {response.policy.reason}',
         'Leak records:',
         *(f'- {_leak_line(record, streak)}' for record in records),
         'Evicted by this pass:',
         *(f'- key {key}: {count} entries' for key, count in response.evicted.items()),
+        *(() if response.evicted else ('- none',)),
     ]
     return '\n'.join(lines)
 
