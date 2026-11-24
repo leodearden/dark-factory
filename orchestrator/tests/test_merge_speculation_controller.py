@@ -5,7 +5,9 @@ Steps covered:
   step-1  RED   — SpeculationController initial state + is_idle/take_prefetched/
                   base_for/snapshot
   step-2  GREEN — implement SpeculationController skeleton
-  step-3  RED   — on_dequeue ATTACH/FALLBACK four-condition rule
+  step-3  RED   — on_dequeue: attach to the pending base while its predecessor
+                  is in flight, with the held or a free permit, else fall
+                  back to main
   step-4  GREEN — implement on_dequeue
   step-5  RED   — look-ahead + transfer lifecycle
   step-6  GREEN — implement acquire_for_lookahead/on_lookahead_found/
@@ -159,15 +161,16 @@ class TestSpeculationControllerInitialState:
 
 
 # ---------------------------------------------------------------------------
-# step-3 RED / step-4 GREEN: on_dequeue ATTACH/FALLBACK four-condition rule
+# step-3 RED / step-4 GREEN: on_dequeue attaches to the pending base while its
+# predecessor is in flight, with the held or a free permit, else falls back to main
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestOnDequeueAttachFallback:
-    """SpeculationController.on_dequeue ATTACH/FALLBACK rule (task 1993 step-3).
-
-    RED until step-4 GREEN implements on_dequeue.
+    """SpeculationController.on_dequeue attaches to the pending base while its
+    predecessor is in flight, with the held or a free permit, else falls back
+    to main (task 1993 step-3; the free permit since task 10851).
     """
 
     async def _seeded_controller(self, depth: int = 1):
@@ -193,7 +196,7 @@ class TestOnDequeueAttachFallback:
         controller.pending_predecessor = pred
         return controller, ledger, pred
 
-    async def test_attach_when_all_four_conditions_hold(self) -> None:
+    async def test_attach_to_a_pending_base_whose_predecessor_is_in_flight(self) -> None:
         controller, ledger, pred = await self._seeded_controller()
         new_req = _make_pending_request('new')
 
@@ -208,9 +211,28 @@ class TestOnDequeueAttachFallback:
         assert controller.pending_spec_base is None
         assert controller.pending_predecessor is None
 
+    async def test_a_pending_base_with_an_in_flight_predecessor_takes_a_free_slot_when_no_permit_is_held(
+        self,
+    ) -> None:
+        controller = await _controller_holding()
+        assert controller.on_transfer() is not None
+        pred = _make_pending_request('pred')
+        controller.on_lookahead_pending('p', pred)
+        before = controller.snapshot()
+
+        result = controller.on_dequeue(_make_pending_request('new'), live_tip=None)
+
+        assert result is not None
+        assert result.sha == 'p'
+        assert result.owner is pred
+        after = controller.snapshot()
+        assert after['spec_base'] == 'p'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available'] - 1
+
     async def test_fallback_when_pending_spec_base_is_none(self) -> None:
         controller, ledger, _pred = await self._seeded_controller()
-        controller.pending_spec_base = None  # break condition (a)
+        controller.pending_spec_base = None  # no pending base
         new_req = _make_pending_request('new')
 
         result = controller.on_dequeue(new_req, live_tip=None)
@@ -222,9 +244,11 @@ class TestOnDequeueAttachFallback:
         assert controller.held_by_merger == 0
         assert ledger.slot_available == 1  # released
 
-    async def test_fallback_when_not_held(self) -> None:
+    async def test_fallback_when_no_permit_is_held_and_no_slot_is_free(self) -> None:
         controller, ledger, _pred = await self._seeded_controller()
-        controller._permit = None  # break condition (b)
+        # The merger holds no permit, and the depth-1 ledger's only slot stays
+        # taken, so no free slot exists.
+        controller._permit = None
         new_req = _make_pending_request('new')
 
         result = controller.on_dequeue(new_req, live_tip=None)
@@ -238,7 +262,7 @@ class TestOnDequeueAttachFallback:
 
     async def test_fallback_when_pending_predecessor_is_none(self) -> None:
         controller, ledger, _pred = await self._seeded_controller()
-        controller.pending_predecessor = None  # break condition (c)
+        controller.pending_predecessor = None  # no pending predecessor
         new_req = _make_pending_request('new')
 
         result = controller.on_dequeue(new_req, live_tip=None)
@@ -252,7 +276,7 @@ class TestOnDequeueAttachFallback:
 
     async def test_fallback_when_predecessor_already_done(self) -> None:
         controller, ledger, pred = await self._seeded_controller()
-        pred.result.set_result(MergeOutcome('done'))  # break condition (d)
+        pred.result.set_result(MergeOutcome('done'))  # the predecessor resolved
         new_req = _make_pending_request('new')
 
         result = controller.on_dequeue(new_req, live_tip=None)
