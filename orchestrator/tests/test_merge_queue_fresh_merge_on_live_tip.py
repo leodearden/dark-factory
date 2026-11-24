@@ -49,11 +49,26 @@ _HEAD_HOST = 'head-host'
 Tree = frozenset[str]
 
 
+class _SignalsDequeueOf(EventStore):
+    """An event store that sets ``dequeued[task_id]`` on each of *task_ids*'
+    ``merge_dequeued`` rows, which the merger writes once its fresh-dequeue
+    decision is made."""
+
+    def __init__(self, db_path: Path, run_id: str, *, task_ids: Collection[str]) -> None:
+        super().__init__(db_path, run_id)
+        self.dequeued = {task_id: asyncio.Event() for task_id in task_ids}
+
+    def emit(self, event_type: EventType, **fields: Any) -> int | None:
+        if event_type is EventType.merge_dequeued and fields.get('task_id') in self.dequeued:
+            self.dequeued[fields['task_id']].set()
+        return super().emit(event_type, **fields)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Scene:
     git_ops: GitOps
     config: OrchestratorConfig
-    events: EventStore
+    events: _SignalsDequeueOf
     escalations: RecordingEscalations
 
     @property
@@ -61,7 +76,8 @@ class _Scene:
         return self.git_ops.project_root
 
 
-def _scene(tmp_path: Path) -> _Scene:
+def _scene(tmp_path: Path, *, dequeues_of: Collection[str] = ()) -> _Scene:
+    """A seeded repo and lane config; ``events.dequeued`` signals each of *dequeues_of*."""
     repo = seed_repo(tmp_path / 'repo')
     config = lane_scene_config(
         repo, _GIT, verify_host_policy='prefer_remote', verify_cross_check_remote_green=False,
@@ -73,13 +89,16 @@ def _scene(tmp_path: Path) -> _Scene:
     return _Scene(
         git_ops=GitOps(_GIT, repo),
         config=config,
-        events=EventStore(db_path=tmp_path / 'events.db', run_id='fresh-merge-on-live-tip'),
+        events=_SignalsDequeueOf(
+            tmp_path / 'events.db', 'fresh-merge-on-live-tip', task_ids=dequeues_of,
+        ),
         escalations=RecordingEscalations(),
     )
 
 
 async def _request(scene: _Scene, name: str, files: Mapping[str, str]) -> MergeRequest:
-    """The request merging task *name*'s branch, one commit writing *files*."""
+    """The request merging task *name*'s branch: one commit writing *files*,
+    or no commit at all when *files* is empty."""
     worktree = (await scene.git_ops.create_worktree(name)).path
     for filename, content in files.items():
         (worktree / filename).write_text(content)
@@ -121,21 +140,6 @@ async def _status(req: MergeRequest) -> str:
     return outcome.status
 
 
-class _SignalsDequeueOf(EventStore):
-    """An event store that sets ``dequeued[task_id]`` on each of *task_ids*'
-    ``merge_dequeued`` rows, which the merger writes once its fresh-dequeue
-    decision is made."""
-
-    def __init__(self, db_path: Path, run_id: str, *, task_ids: Collection[str]) -> None:
-        super().__init__(db_path, run_id)
-        self.dequeued = {task_id: asyncio.Event() for task_id in task_ids}
-
-    def emit(self, event_type: EventType, **fields: Any) -> int | None:
-        if event_type is EventType.merge_dequeued and fields.get('task_id') in self.dequeued:
-            self.dequeued[fields['task_id']].set()
-        return super().emit(event_type, **fields)
-
-
 @dataclasses.dataclass
 class _Run:
     """A running lane: H's verify is held until ``release_h``."""
@@ -167,10 +171,10 @@ class _Run:
 @contextlib.asynccontextmanager
 async def _running_with_head(
     scene: _Scene, head: MergeRequest, local: FakeVerifier, *,
-    head_host: str, release_h: asyncio.Event, h_entered: asyncio.Event,
+    release_h: asyncio.Event, h_entered: asyncio.Event,
     speculation_depth: int, remote_runners: Sequence[FakeRemoteRunner],
 ) -> AsyncIterator[_Run]:
-    """*head* merged on main and verifying on *head_host*, held there until *release_h*."""
+    """*head* merged on main and verifying, held there until *release_h*."""
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue, verifier=local, clock=healthy_verify_clock(),
@@ -180,7 +184,7 @@ async def _running_with_head(
     async with running_lane(lane):
         run = _Run(scene, lane, queue, local, release_h)
         run.put(head)
-        await _entered(h_entered, f'{head.task_id} verifying on {head_host}')
+        await _entered(h_entered, f'{head.task_id} verifying')
         yield run
 
 
@@ -191,8 +195,7 @@ async def _running(
     """*head* merged on main and verifying on 'head-host', held there."""
     h_entered, release_h = asyncio.Event(), asyncio.Event()
     async with _running_with_head(
-        scene, head, local, head_host=_HEAD_HOST, release_h=release_h, h_entered=h_entered,
-        speculation_depth=2,
+        scene, head, local, release_h=release_h, h_entered=h_entered, speculation_depth=2,
         remote_runners=[FakeRemoteRunner(_HEAD_HOST, release=release_h, entered=h_entered)],
     ) as run:
         yield run
@@ -207,7 +210,7 @@ async def _running_on_one_host(
     local script on *release_h*. Depth 3 is production's K = verify hosts + 1
     for a configured two-host fleet with one host unavailable."""
     async with _running_with_head(
-        scene, head, local, head_host='local', release_h=release_h, h_entered=h_entered,
+        scene, head, local, release_h=release_h, h_entered=h_entered,
         speculation_depth=3, remote_runners=[],
     ) as run:
         yield run
@@ -267,10 +270,7 @@ class TestAFreshDequeueAfterARequestThatBuiltNothing:
         (orchestrator/suffix_graph.py::SuffixConflictTracker.bounce_conflicting_suffix_items)
         escalates a request conflicting with the frozen tip before the merger
         ever dequeues it."""
-        events = _SignalsDequeueOf(
-            tmp_path / 'events-dequeue.db', 'fresh-after-nothing', task_ids=('Y',),
-        )
-        scene = dataclasses.replace(_scene(tmp_path), events=events)
+        scene = _scene(tmp_path, dequeues_of=('Y',))
         h = await _request(scene, 'H', {'H.txt': 'H\n'})
         y = await _request(scene, 'Y', {})
         x = await _request(scene, 'X', {'X.txt': 'X\n'})
@@ -278,7 +278,7 @@ class TestAFreshDequeueAfterARequestThatBuiltNothing:
         local = FakeVerifier(scripts={'X': hangs_until(release_x, entered=x_entered)})
         async with _running(scene, h, local) as run:
             run.put(y)
-            await _entered(events.dequeued['Y'], 'Y dequeued behind H')
+            await _entered(scene.events.dequeued['Y'], 'Y dequeued behind H')
 
             run.put(x)
             await _entered(x_entered, 'X verifying on local')
@@ -306,10 +306,7 @@ class TestAFreshDequeueBehindABuildAwaitingAHost:
         """H holds 'local', the only host. M merges on H's commit and waits
         for a host; Y, with no work of its own, consumes M's commit as its
         base and is found already merged. X, dequeued next, stacks on M."""
-        events = _SignalsDequeueOf(
-            tmp_path / 'events-dequeue.db', 'fresh-behind-awaiting-host', task_ids=('Y', 'X'),
-        )
-        scene = dataclasses.replace(_scene(tmp_path), events=events)
+        scene = _scene(tmp_path, dequeues_of=('Y', 'X'))
         h = await _request(scene, 'H', {'H.txt': 'H\n'})
         m = await _request(scene, 'M', {'M.txt': 'M\n'})
         y = await _request(scene, 'Y', {})
@@ -325,10 +322,10 @@ class TestAFreshDequeueBehindABuildAwaitingAHost:
         ) as run:
             run.put(m)
             run.put(y)
-            await _entered(events.dequeued['Y'], 'Y dequeued behind M')
+            await _entered(scene.events.dequeued['Y'], 'Y dequeued behind M')
 
             run.put(x)
-            await _entered(events.dequeued['X'], 'X dequeued behind M')
+            await _entered(scene.events.dequeued['X'], 'X dequeued behind M')
 
             run.release_h.set()
             await _entered(x_entered, 'X verifying on local')
