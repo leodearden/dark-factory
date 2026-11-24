@@ -3,7 +3,8 @@
 ``TaskWorkflow`` dispatches the architect through ``self._invoke(ARCHITECT,
 build_prompt, ...)``, either directly or through a *runner*: a method such as
 ``_run_architect_for_plan`` that receives a prompt builder as a parameter and
-forwards it to ARCHITECT, itself or through another runner. This module finds
+forwards it to ARCHITECT, bare or wrapped in ``partial(...)``, itself or through
+another runner. This module finds
 those dispatch sites and follows every argument they hand to ARCHITECT back
 through the method's own bindings, nested ``def``s and assignments, to the
 ``self.briefing.build_*`` builders it names. A builder counts whether it is
@@ -90,10 +91,19 @@ def _dispatch_arguments(method: _Method, runners: set[str]) -> list[ast.expr]:
     return arguments
 
 
+def _forwarded_names(argument: ast.expr) -> set[str]:
+    """The names *argument* hands on as a prompt builder: itself, or what a ``partial(...)`` wraps."""
+    if isinstance(argument, ast.Name):
+        return {argument.id}
+    if isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name) and argument.func.id == 'partial':
+        return {name for wrapped in argument.args for name in _forwarded_names(wrapped)}
+    return set()
+
+
 def _is_runner(method: _Method, runners: set[str]) -> bool:
     parameters = {arg.arg for arg in (*method.args.args, *method.args.kwonlyargs)}
     return any(
-        isinstance(argument, ast.Name) and argument.id in parameters
+        _forwarded_names(argument) & parameters
         for argument in _dispatch_arguments(method, runners)
     )
 
