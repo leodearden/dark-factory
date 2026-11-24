@@ -190,6 +190,19 @@ def tree_entries(root: Path, commit: str) -> tuple[TreeEntry, ...]:
         return tuple(_tree_entry(record) for record in output.split(b'\0') if record)
 
 
+def path_entry(root: Path, commit: str, path: str) -> TreeEntry | None:
+    """The entry at `path` in `commit`'s tree; None when the tree holds no file, symlink or submodule there.
+
+    With -r a directory named `path` lists only the entries below it, so it reads as absent.
+    """
+    output = _run(
+        root, 'ls-tree', '-r', '-l', '-z', '--full-tree', _require_sha(commit), '--', path
+    ).stdout
+    with _parsing('ls-tree'):
+        entries = [_tree_entry(record) for record in output.split(b'\0') if record]
+    return next((entry for entry in entries if entry.path == path), None)
+
+
 def _cat_file_error(reason: str, process: subprocess.Popen[bytes]) -> GitError:
     return GitError(subcommand='cat-file', returncode=process.poll(), stderr=reason)
 
