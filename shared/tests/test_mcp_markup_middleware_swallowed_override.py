@@ -5,8 +5,11 @@ swallows the parameters that FOLLOW the leaking one, so an override sent after
 the leaking string arrives as text inside that string's value, where the guard
 cannot honour it and must not: a genuine quotation never makes the harness
 over-consume, so finding the flag there proves a real leak. The guard reports
-it as ``override_swallowed`` with a hint naming the remedy, which is to send
-``metadata`` FIRST, ahead of the argument that carries the markup.
+it as ``override_swallowed`` and extends the hint it would give for the same
+leak without the override; the extension names the remedy, which is to send
+``metadata`` FIRST, ahead of the argument that carries the markup. A bounce's
+``repaired_call`` restores the swallowed ``metadata`` without the flag, so the
+verbatim resubmission it invites is guarded again.
 
 Driven through a ``Client``, the one harness that runs registered middleware,
 over a small toy server whose tool declares ``metadata`` through
@@ -34,7 +37,12 @@ from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
 )
-from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, MARKUP_OVERRIDE_KEY, closer_for
+from shared.toolcall_markup import (
+    CANONICAL_OPENER_PREFIX,
+    MARKUP_OVERRIDE_KEY,
+    closer_for,
+    markup_override_requested,
+)
 
 BOTH_POLICIES = pytest.mark.parametrize(
     'policy',
@@ -68,9 +76,17 @@ _REPAIRABLE_WITH_OVERRIDE = _leaked(_SWALLOWED_METADATA)
 _REPAIRABLE_WITHOUT_OVERRIDE = _leaked()
 
 
-def _names_the_swallowed_override(hint: str) -> bool:
-    lowered = hint.lower()
-    return 'swallowed by this leak' in lowered and 'metadata as the first argument' in lowered
+def _swallowed_override_remedy(swallowed: dict[str, Any], plain: dict[str, Any]) -> str:
+    """What a swallowed override adds to the hint the same leak gets without one.
+
+    Compared rather than phrase-matched, so the remedy's wording is free to
+    change: it must EXTEND the plain hint, and the plain hint must not carry it.
+    """
+    assert swallowed['hint'].startswith(plain['hint'])
+    remedy = swallowed['hint'][len(plain['hint']):]
+    assert remedy
+    assert remedy not in plain['hint']
+    return remedy
 
 
 class _Harness:
@@ -113,14 +129,15 @@ class _Harness:
 class TestAnUnrepairableLeakThatSwallowedTheOverride:
 
     @BOTH_POLICIES
-    async def test_is_refused_and_names_the_swallowed_override(self, policy):
+    async def test_is_refused_with_the_remedy_added_to_its_hint(self, policy):
         h = _Harness(policy)
 
         payload = await h.refusal({'decision': _DECISION, 'rationale': _UNREPAIRABLE_WITH_OVERRIDE})
+        plain = await h.refusal({'decision': _DECISION, 'rationale': _UNREPAIRABLE_WITHOUT_OVERRIDE})
 
         assert payload['error_type'] == MARKUP_UNREPAIRABLE_ERROR_TYPE
         assert payload['override_swallowed'] is True
-        assert _names_the_swallowed_override(payload['hint'])
+        _swallowed_override_remedy(payload, plain)
         assert h.calls == []
 
     @BOTH_POLICIES
@@ -135,17 +152,25 @@ class TestAnUnrepairableLeakThatSwallowedTheOverride:
 
 class TestARepairableLeakThatSwallowedTheOverride:
 
-    async def test_the_bounce_names_it_and_restores_the_map(self):
+    async def test_the_bounce_adds_the_remedy_to_its_hint(self):
+        h = _Harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        payload = await h.refusal({'decision': _DECISION, 'rationale': _REPAIRABLE_WITH_OVERRIDE})
+        plain = await h.refusal({'decision': _DECISION, 'rationale': _REPAIRABLE_WITHOUT_OVERRIDE})
+
+        assert payload['override_swallowed'] is True
+        _swallowed_override_remedy(payload, plain)
+        assert h.calls == []
+
+    async def test_the_bounce_restores_the_map_without_the_override(self):
         h = _Harness(RepairPolicy.REJECT_WITH_REPAIR)
 
         payload = await h.refusal({'decision': _DECISION, 'rationale': _REPAIRABLE_WITH_OVERRIDE})
 
-        assert payload['override_swallowed'] is True
-        assert _names_the_swallowed_override(payload['hint'])
         assert payload['repaired_call'] == {
-            'decision': _DECISION, 'rationale': _INTENDED, 'metadata': _OVERRIDE_MAP,
+            'decision': _DECISION, 'rationale': _INTENDED, 'metadata': {},
         }
-        assert h.calls == []
+        assert not markup_override_requested(payload['repaired_call']['metadata'])
 
     async def test_resubmitting_repaired_call_verbatim_is_accepted(self):
         h = _Harness(RepairPolicy.REJECT_WITH_REPAIR)
@@ -165,7 +190,6 @@ class TestALeakWithNoOverrideReportsFalse:
         payload = await h.refusal({'decision': _DECISION, 'rationale': _UNREPAIRABLE_WITHOUT_OVERRIDE})
 
         assert payload['override_swallowed'] is False
-        assert not _names_the_swallowed_override(payload['hint'])
         assert [record['override_swallowed'] for record in h.escalations] == [False]
 
     async def test_on_the_reject_bounce(self):
@@ -174,7 +198,6 @@ class TestALeakWithNoOverrideReportsFalse:
         payload = await h.refusal({'decision': _DECISION, 'rationale': _REPAIRABLE_WITHOUT_OVERRIDE})
 
         assert payload['override_swallowed'] is False
-        assert not _names_the_swallowed_override(payload['hint'])
 
 
 class TestAnOverrideSentAheadOfTheLeakStillBypassesTheGuard:

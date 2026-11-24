@@ -187,10 +187,18 @@ _OVERRIDE_SWALLOWED_HINT = (
     'markup really is quoted, resend with metadata as the FIRST argument.'
 )
 
+#: Follows :data:`_OVERRIDE_SWALLOWED_HINT` on the one payload that offers a
+#: ``repaired_call``, so the verbatim resubmission ``_REJECT_HINT`` prescribes
+#: is not mistaken for the metadata-first remedy.
+_OVERRIDE_STRIPPED_HINT = (
+    ' repaired_call restores your metadata WITHOUT the override, so '
+    'resubmitting it verbatim is guarded like any other call.'
+)
 
-def _with_swallowed_override(hint: str, override_swallowed: bool) -> str:
-    """*hint*, plus the swallowed-override remedy when it applies."""
-    return hint + _OVERRIDE_SWALLOWED_HINT if override_swallowed else hint
+
+def _with_swallowed_override(hint: str, override_swallowed: bool, tail: str = '') -> str:
+    """*hint*, plus the swallowed-override remedy and *tail* when it applies."""
+    return hint + _OVERRIDE_SWALLOWED_HINT + tail if override_swallowed else hint
 
 #: Surfaced at the point of rejection, mirroring markup_tripwire's
 #: ``_MARKUP_HINT``: the remediation must be discoverable where the caller is
@@ -1352,6 +1360,13 @@ class MarkupGuardMiddleware(Middleware):
                 name: value for name, value in coerced.items()
                 if name not in unrecovered
             }
+        # A swallowed override is reported, never honoured (PRD D13), so the
+        # metadata it rode in on is restored WITHOUT it — on both tiers, here
+        # at the one point that shapes what either tier hands on. Otherwise
+        # the verbatim resubmission ``_REJECT_HINT`` prescribes would carry the
+        # flag past this guard for every value in it.
+        if override_swallowed and 'metadata' in coerced:
+            coerced['metadata'] = strip_markup_override(coerced['metadata'])
         fix = fix._replace(recovered=coerced)
 
         # Attribution from the REPAIRED view. If the leak ate the caller's own
@@ -1806,7 +1821,9 @@ class MarkupGuardMiddleware(Middleware):
             'quoted_markup_params': list(quoting),
             'repaired_call': repaired_call,
             'override_swallowed': override_swallowed,
-            'hint': _with_swallowed_override(_REJECT_HINT, override_swallowed),
+            'hint': _with_swallowed_override(
+                _REJECT_HINT, override_swallowed, _OVERRIDE_STRIPPED_HINT,
+            ),
         }, storm)))
 
     async def _forward(

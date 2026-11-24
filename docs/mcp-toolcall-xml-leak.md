@@ -391,7 +391,9 @@ markup. A leak swallows only the parameters that follow the leaking one, so an
 override sent after it arrives inside the leaked value. The guard never honours
 an override found there, because finding it there proves the leak is real. It
 reports it as `override_swallowed: true` on the refusal and on the residue
-record, and its hint repeats the metadata-first remedy (task 5055).
+record, and its hint repeats the metadata-first remedy (task 5055). A
+`repaired_call` restores the swallowed `metadata` without the flag, so
+resubmitting it verbatim is guarded again.
 
 When this section was first written, the guard was task 3141's
 `fused_memory/server/markup_tripwire.py`, returning
