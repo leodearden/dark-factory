@@ -63,8 +63,8 @@ def test_clean_text_has_no_status_words(text: str) -> None:
 
 
 def test_the_tool_name_sets_are_the_four_writes_and_the_named_callers() -> None:
-    assert WRITE_TOOLS == frozenset({'add_memory', 'add_episode', 'add_system_record', 'update_memory'})
-    assert MCP_TOOL_CALLERS == frozenset({'post_mcp_tool_call', 'call_mcp_tool', 'call_tool', '_call_tool'})
+    assert frozenset({'add_memory', 'add_episode', 'add_system_record', 'update_memory'}) == WRITE_TOOLS
+    assert frozenset({'post_mcp_tool_call', 'call_mcp_tool', 'call_tool', '_call_tool'}) == MCP_TOOL_CALLERS
 
 
 @pytest.mark.parametrize('tool', sorted(WRITE_TOOLS))
