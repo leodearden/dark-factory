@@ -39,6 +39,7 @@ import time
 import pytest
 from _ast_guard import calls_named, parse_python_module
 from pydantic import ValidationError
+from shared.testing_virtual_clock import virtual_clock_test
 
 from fused_memory.config.schema import ServerConfig
 from fused_memory.server import main as server_main
@@ -231,18 +232,13 @@ class TestLoopLagMonitorMeasurement:
         warnings = [r for r in _lag_records(caplog) if r.levelno >= logging.WARNING]
         assert warnings == [], f'idle loop must not warn; got {[r.getMessage() for r in warnings]}'
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_overshoot_excludes_the_intended_sleep(self, monkeypatch):
         """The reported number is OVERSHOOT, not elapsed time.
 
-        A 10 ms sample interval that returns after 10 ms is a lag of ~0, not of
-        10.  Getting this wrong would make every idle sample look like a stall
-        the size of the sample interval.
-
-        Asserted on the MINIMUM over several samples against half the interval:
-        an implementation that counted the sleep would report ~interval on
-        *every* sample, so failing this needs only one quiet sample, while a
-        momentarily loaded box (which delays some samples) cannot fail it.
+        On the virtual clock every timer resumes exactly when due, so a correct
+        monitor reports ~0 on every sample, while one that counted the sleep
+        would report ~interval on every sample. Host load can move neither.
         """
         interval = 0.1
         recorded: list[float] = []
@@ -257,19 +253,14 @@ class TestLoopLagMonitorMeasurement:
         )
         try:
             await asyncio.sleep(interval * 5.5)
-            # Gate to THREE samples: the assertion below is on the MINIMUM, so
-            # extra samples only ever help it, and 'several samples' is the
-            # property the docstring above leans on — a starved box that landed
-            # a single delayed sample would otherwise fail on that one alone.
-            await _await_samples(recorded, 3)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        assert recorded
-        assert min(recorded) < interval * 1000 / 2, (
-            f'overshoot {min(recorded):.1f}ms is not small relative to the '
+        assert len(recorded) == 5, f'expected one sample per whole interval; got {recorded}'
+        assert recorded == pytest.approx([0.0] * len(recorded), abs=1e-6), (
+            f'timers that fired exactly on time reported lag {recorded}ms against the '
             f'{interval * 1000:.0f}ms interval — the sleep itself is being counted as lag'
         )
 
