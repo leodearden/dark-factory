@@ -113,24 +113,26 @@ def classify_billing_exhaustion(exc: BaseException) -> BillingExhaustion | None:
     return None
 
 
-def plan_cap_of(status_code: int, body: bytes) -> BillingExhaustion | None:
-    """Return the plan cap a plan-proxy response reports, or None if it is not one.
+def is_plan_cap_status(status_code: int) -> bool:
+    """The plan-route rule: a plan-proxy response is a cap exactly when it is a 429."""
+    return status_code == _PLAN_CAP_STATUS
 
-    On the plan route every 429 is a cap. Its code is ``usage_limit_reached``
-    when the body names it, else ``http_429``.
+
+def plan_cap_of(body: bytes) -> BillingExhaustion:
+    """The plan cap a plan-proxy 429 carrying *body* reports.
+
+    Its code is ``usage_limit_reached`` when the body names it, else ``http_429``.
     """
-    if status_code != _PLAN_CAP_STATUS:
-        return None
     text = body.decode('utf-8', errors='replace')
     code = next(
         (
             marker for marker in _body_markers(_json_or_none(text))
             if _SOURCE_BY_EXHAUSTION_CODE.get(marker) is BillingSource.PLAN_CAP
         ),
-        f'http_{status_code}',
+        f'http_{_PLAN_CAP_STATUS}',
     )
     return exhaustion_of(
-        BillingSource.PLAN_CAP, code=code, error_type=f'HTTP {status_code}',
+        BillingSource.PLAN_CAP, code=code, error_type=f'HTTP {_PLAN_CAP_STATUS}',
         provider_message=text,
     )
 

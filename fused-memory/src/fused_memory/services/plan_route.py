@@ -32,6 +32,7 @@ from fused_memory.config.schema import PlanRouteConfig
 from fused_memory.services.provider_billing import (
     GATE_ANSWER_TYPE,
     BillingExhaustion,
+    is_plan_cap_status,
     plan_cap_of,
 )
 
@@ -199,17 +200,14 @@ class PlanRoute:
             self._count(site)
             return self._cap_response(request)
         response = await inner.handle_async_request(request)
-        if response.status_code != httpx.codes.TOO_MANY_REQUESTS:
+        if not is_plan_cap_status(response.status_code):
             if response.is_success and admission is _Admission.PROBE:
                 await self._recover(evidence="the gate's probe")
             return response
         body = await response.aread()
         await response.aclose()
-        exhaustion = plan_cap_of(response.status_code, body)
-        if exhaustion is None:
-            return _replayed(response, body, request)
         await self._on_cap(
-            exhaustion, resets_at=_resets_at(body, response.headers, now=self._clock()),
+            plan_cap_of(body), resets_at=_resets_at(body, response.headers, now=self._clock()),
             site=site, probe=admission is _Admission.PROBE,
         )
         return self._cap_response(request)
@@ -354,15 +352,6 @@ class _PlanRouteTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self) -> None:
         await self._inner.aclose()
-
-
-def _replayed(response: httpx.Response, body: bytes, request: httpx.Request) -> httpx.Response:
-    """*response* rebuilt around its already-decoded *body*."""
-    headers = [
-        (name, value) for name, value in response.headers.items()
-        if name.lower() not in {'content-encoding', 'content-length', 'transfer-encoding'}
-    ]
-    return httpx.Response(response.status_code, headers=headers, content=body, request=request)
 
 
 def _normalised(url: str) -> str:

@@ -24,6 +24,7 @@ from fused_memory.services.provider_billing import (
     BillingSource,
     billing_source_of,
     classify_billing_exhaustion,
+    is_plan_cap_status,
     plan_cap_of,
 )
 
@@ -187,29 +188,32 @@ class TestPlanCapOfAProxyResponse:
     """The plan-route rule: any 429 from the plan proxy is a cap."""
 
     def test_usage_limit_body_names_its_code(self):
-        result = _assert_plan_cap(plan_cap_of(429, _USAGE_LIMIT_BODY))
+        result = _assert_plan_cap(plan_cap_of(_USAGE_LIMIT_BODY))
         assert result.code == 'usage_limit_reached'
         assert result.error_type == 'HTTP 429'
         assert 'The usage limit has been reached' in result.provider_message
 
     def test_top_level_type_names_its_code(self):
         body = b'{"type": "usage_limit_reached", "message": "capped"}'
-        assert _assert_plan_cap(plan_cap_of(429, body)).code == 'usage_limit_reached'
+        assert _assert_plan_cap(plan_cap_of(body)).code == 'usage_limit_reached'
 
     def test_bodyless_429_is_a_cap(self):
-        assert _assert_plan_cap(plan_cap_of(429, b'')).code == 'http_429'
+        assert _assert_plan_cap(plan_cap_of(b'')).code == 'http_429'
 
     def test_unparseable_429_is_a_cap(self):
-        result = _assert_plan_cap(plan_cap_of(429, b'<html>slow down</html>'))
+        result = _assert_plan_cap(plan_cap_of(b'<html>slow down</html>'))
         assert result.code == 'http_429'
         assert 'slow down' in result.provider_message
 
     def test_provider_message_is_bounded(self):
-        assert len(_assert_plan_cap(plan_cap_of(429, b'x' * 10_000)).provider_message) <= 400
+        assert len(_assert_plan_cap(plan_cap_of(b'x' * 10_000)).provider_message) <= 400
+
+    def test_a_429_is_a_cap(self):
+        assert is_plan_cap_status(429)
 
     @pytest.mark.parametrize('status', [200, 400, 500, 503])
     def test_any_other_status_is_not_a_cap(self, status):
-        assert plan_cap_of(status, _USAGE_LIMIT_BODY) is None
+        assert not is_plan_cap_status(status)
 
 
 class TestEachSourceNamesItsOwnAlarm:

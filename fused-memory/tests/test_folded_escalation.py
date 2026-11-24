@@ -1009,7 +1009,7 @@ def _plan_cap(module: Any, project_root: str) -> object:
     snapshot = PlanRouteSnapshot(
         state=PlanRouteStateName.CAPPED, proxy_host='127.0.0.1:8317',
         capped_since=since, next_probe_at=since + timedelta(minutes=15),
-        exhaustion=plan_cap_of(429, b'{"error": {"code": "usage_limit_reached"}}'),
+        exhaustion=plan_cap_of(b'{"error": {"code": "usage_limit_reached"}}'),
     )
     alarm = module.PlanCapAlarm(
         resolve_project_root=lambda: project_root, count_parked=_no_parked_writes,

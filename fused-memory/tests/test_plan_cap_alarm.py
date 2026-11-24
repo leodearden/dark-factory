@@ -53,7 +53,7 @@ def _snapshot(*, resets_at: datetime | None = _RESETS, judge_calls: int = 3) -> 
         affected_calls_by_site=MappingProxyType({
             PlanRouteSite.WRITE_TRIAGE_JUDGE: judge_calls, PlanRouteSite.GRAPHITI: 1,
         }),
-        exhaustion=plan_cap_of(429, _PROXY_BODY.encode()),
+        exhaustion=plan_cap_of(_PROXY_BODY.encode()),
     )
 
 
