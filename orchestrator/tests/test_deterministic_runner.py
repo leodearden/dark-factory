@@ -6236,6 +6236,51 @@ class TestBeforeDoneCrashWindow:
 
 
 @pytest.mark.asyncio
+class TestRunActsOnTheStoreRow:
+    """run() re-reads the task at entry and acts on the store's row, not the dispatched one (task 11430)."""
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled'])
+    async def test_a_row_the_store_holds_terminal_returns_done_with_no_side_effect(
+        self, tmp_path: Path, status: str,
+    ):
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        dispatched = {**_gate_task(), 'status': 'pending'}
+        scheduler = _mock_scheduler({**dispatched, 'status': status})
+        queue = EscalationQueue(tmp_path)
+
+        outcome = await DeterministicRunner(scheduler=scheduler, escalation_queue=queue).run(
+            _make_assignment(dispatched),
+        )
+
+        assert outcome == WorkflowOutcome.DONE
+        assert queue.get_by_task('99') == []
+        scheduler.set_task_status.assert_not_awaited()
+        scheduler.update_task.assert_not_awaited()
+
+    async def test_an_unreadable_store_row_falls_back_to_the_dispatched_row(self, tmp_path: Path):
+        from shared.task_metadata import GATE_ESCALATED_PRECONDITIONS_KEY
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        dispatched = _gate_task(deps=[10])
+        scheduler = _mock_scheduler(dispatched)
+        scheduler.get_task = AsyncMock(return_value=None)
+        queue = EscalationQueue(tmp_path)
+
+        outcome = await DeterministicRunner(scheduler=scheduler, escalation_queue=queue).run(
+            _make_assignment(dispatched),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert [e.category for e in queue.get_by_task('99', status='pending')] == ['milestone_gate']
+        stamps = [call.args[1] for call in scheduler.update_task.await_args_list]
+        assert [stamp[GATE_ESCALATED_PRECONDITIONS_KEY]['dependencies'] for stamp in stamps] == [['10']]
+
+
+@pytest.mark.asyncio
 class TestCrashWindowScheduledDoubleDispatch:
     """Task 2983 fix (a): a double-dispatched, already-completed scheduled
     self-deploy must NOT trip the crash-window false positive.
@@ -6307,11 +6352,13 @@ class TestCrashWindowScheduledDoubleDispatch:
         )
         scheduler.set_task_status.assert_not_awaited()
 
-    async def test_double_dispatch_via_scheduled_stamp_returns_done_no_side_effects(
+    async def test_double_dispatch_via_scheduled_stamp_takes_the_b_self_resume(
         self, tmp_path: Path,
     ):
-        """Fresh get_task carries before_done_scheduled_at → DONE, no escalation,
-        no status write (recognized via the stamp even without done_provenance)."""
+        """The store row carries before_done_scheduled_at while the done write has
+        not landed. run() reads that row at entry (task 11430), so the b-self
+        resume drives it to done: DONE, no escalation, one scheduled-deploy done write."""
+        from orchestrator.deploy_state import SCHEDULED_DEPLOY_PROVENANCE_KIND
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
@@ -6342,7 +6389,9 @@ class TestCrashWindowScheduledDoubleDispatch:
 
         assert outcome == WorkflowOutcome.DONE
         assert queue.get_by_task('2912') == []
-        scheduler.set_task_status.assert_not_awaited()
+        status_writes = scheduler.set_task_status.await_args_list
+        assert [call.args[1] for call in status_writes] == ['done']
+        assert status_writes[0].kwargs['done_provenance']['kind'] == SCHEDULED_DEPLOY_PROVENANCE_KIND
 
     async def test_genuine_crash_window_still_reescalates_and_blocks(
         self, tmp_path: Path,
