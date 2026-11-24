@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS entries (
     UNIQUE (unit_id, key)
 );
 CREATE INDEX IF NOT EXISTS entries_by_key ON entries (key);
+CREATE INDEX IF NOT EXISTS entries_by_unit_recency ON entries (unit_id, recorded_at);
 CREATE TABLE IF NOT EXISTS consumed (
     landing_sha TEXT NOT NULL,
     entry_id INTEGER NOT NULL,
@@ -106,6 +107,36 @@ class Entry:
         UnitKey(self.unit_id, self.tier, self.key, self.spec_hash, self.inputs)
         _require_aware('entry.recorded_at', self.recorded_at)
 
+    @property
+    def candidate(self) -> Candidate:
+        return Candidate(self.unit_id, self.key, self.entry_id, self.evidence_event_id)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A recorded green as a remote verify decides against it (plans/verify-result-cache-prd.md A5)."""
+
+    unit_id: str
+    key: str
+    entry_id: int
+    evidence_event_id: int
+
+
+@dataclass(frozen=True)
+class KillSwitch:
+    """The kill switch's window alone, as a remote verify is shipped it."""
+
+    disabled_until: datetime | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_aware('kill_switch.disabled_until', self.disabled_until)
+        if self.disabled_until is not None and not self.reason:
+            raise ValueError(f'kill_switch.disabled_until is set but reason is {self.reason!r}')
+
+    def is_disabled(self, now: datetime) -> bool:
+        return self.disabled_until is not None and now < self.disabled_until
+
 
 @dataclass(frozen=True)
 class PolicyState:
@@ -133,15 +164,22 @@ class PolicyState:
             )
 
     def is_disabled(self, now: datetime) -> bool:
-        return self.disabled_until is not None and now < self.disabled_until
+        return self.kill_switch.is_disabled(now)
+
+    @property
+    def kill_switch(self) -> KillSwitch:
+        return KillSwitch(self.disabled_until, self.reason)
 
 
 @dataclass(frozen=True)
 class RegistryView:
-    """The entries recorded for a verify's keys, by ``(unit_id, key)``, and the policy row."""
+    """The entries recorded for a verify's keys, by ``(unit_id, key)``, and the policy row.
+    A remote verify's view holds shipped Candidates, and is *truncated* when the
+    dispatcher shipped fewer greens than it holds."""
 
-    entries: Mapping[tuple[str, str], Entry]
-    policy: PolicyState
+    entries: Mapping[tuple[str, str], Entry | Candidate]
+    policy: PolicyState | KillSwitch
+    truncated: bool = False
 
 
 class Pruned(NamedTuple):
@@ -174,8 +212,20 @@ class Registry:
         self._clock = clock
 
     async def view(self, keys: Iterable[UnitKey]) -> RegistryView:
-        wanted = [(key.unit_id, key.key) for key in keys]
+        return await self.view_of((key.unit_id, key.key) for key in keys)
+
+    async def view_of(self, pairs: Iterable[tuple[str, str]]) -> RegistryView:
+        """The live entry of each present ``(unit_id, key)`` in *pairs*, and the policy row."""
+        wanted = list(pairs)
         return await self._call(lambda conn: _view(conn, wanted))
+
+    async def candidates(self, unit_ids: Sequence[str], *, per_unit: int) -> tuple[Candidate, ...]:
+        """The *per_unit* most recently recorded greens of each of *unit_ids*,
+        most recent first, from any host (A6)."""
+        if not unit_ids:
+            return ()
+        wanted = list(unit_ids)
+        return await self._call(lambda conn: _candidates(conn, wanted, per_unit))
 
     async def record_green(self, key: UnitKey, *, evidence_event_id: int, run_id: str, sha: str) -> Entry:
         now = self._clock()
@@ -264,6 +314,19 @@ def _view(conn: sqlite3.Connection, wanted: list[tuple[str, str]]) -> RegistryVi
         if row is not None:
             entries[(unit_id, key)] = _entry(row)
     return RegistryView(MappingProxyType(entries), _policy_state(conn))
+
+
+def _candidates(conn: sqlite3.Connection, unit_ids: list[str], per_unit: int) -> tuple[Candidate, ...]:
+    placeholders = ', '.join('?' * len(unit_ids))
+    rows = conn.execute(
+        'SELECT unit_id, key, entry_id, evidence_event_id FROM ('
+        'SELECT entry_id, unit_id, key, evidence_event_id, ROW_NUMBER() OVER ('
+        'PARTITION BY unit_id ORDER BY recorded_at DESC, entry_id DESC) AS rank '
+        f'FROM entries WHERE unit_id IN ({placeholders})'
+        ') WHERE rank <= ? ORDER BY unit_id, rank',
+        (*unit_ids, per_unit),
+    ).fetchall()
+    return tuple(Candidate(str(unit_id), str(key), int(entry_id), int(evidence)) for unit_id, key, entry_id, evidence in rows)
 
 
 def _record_green(
