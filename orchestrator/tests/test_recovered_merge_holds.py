@@ -10,6 +10,7 @@ module: it reads harness privates, which the merge-lane ratchet
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,8 @@ from _startup_harness import (
     start_real_merge_worker,
 )
 from escalation.queue import EscalationQueue
+from shared.project_layout import scheduler_state_json
+from shared.scheduler_state import SchedulerStateSnapshot
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.event_store import EventStore
@@ -60,11 +63,9 @@ def _scheduler(config: OrchestratorConfig, store: EventStore, *, status: str) ->
     return scheduler
 
 
-def _scene(
-    tmp_path: Path, *, status: str = 'in-progress', real_steps: frozenset[str] = frozenset(),
-) -> _Scene:
+def _scene(tmp_path: Path, *, status: str = 'in-progress') -> _Scene:
     """Step 1c0a's harness over a real Scheduler built from the harness's own config."""
-    h = merge_lane_harness_factory(tmp_path, real_steps=real_steps)()
+    h = merge_lane_harness_factory(tmp_path)()
     store = EventStore(tmp_path / 'runs.db', 'run-test')
     scheduler = _scheduler(h.config, store, status=status)
     h.scheduler = scheduler
@@ -72,11 +73,9 @@ def _scene(
     return _Scene(h, scheduler, store)
 
 
-async def _scene_with_real_merge_worker(
-    tmp_path: Path, *, real_steps: frozenset[str] = frozenset(),
-) -> _Scene:
+async def _scene_with_real_merge_worker(tmp_path: Path) -> _Scene:
     """Step 1c0a's harness over a real Scheduler, holding a real merge worker."""
-    scene = _scene(tmp_path, real_steps=real_steps)
+    scene = _scene(tmp_path)
     await start_real_merge_worker(scene.harness, scene.scheduler)
     return scene
 
@@ -91,6 +90,12 @@ def _event_data(store: EventStore, name: str, task_id: str) -> list[dict]:
 
 def _held(scheduler: Scheduler) -> Mapping[str, tuple[str, ...]]:
     return scheduler.get_state_snapshot().held_by_task
+
+
+def _held_on_disk(h: Harness) -> Mapping[str, tuple[str, ...]]:
+    """``held_by_task`` of the snapshot file ``get_scheduler_state`` reads."""
+    path = scheduler_state_json(h.config.project_root)
+    return SchedulerStateSnapshot.from_json(json.loads(path.read_text())).held_by_task
 
 
 async def _dispatch_all(scheduler: Scheduler) -> list[str]:
@@ -115,6 +120,7 @@ class TestRestoreAtStartup:
 
         keys = _keys(h, _FILES)
         assert _held(scheduler)[_TID] == keys
+        assert tuple(sorted(_held_on_disk(h)[_TID])) == keys
         [acquired] = _event_data(store, 'lock_acquired', _TID)
         assert tuple(sorted(acquired['modules'])) == keys
         assert acquired['reason'] == LockRestoreReason.RECOVERED_MERGE
@@ -157,6 +163,13 @@ _VERIFY_RED = SimpleNamespace(
     status='blocked', reason='post-merge verify red',
     block_category=SimpleNamespace(value='merge_error'),
     failure_category=None, failure_cause_hint=None,
+)
+_SUPERSEDED = SimpleNamespace(status='superseded', reason='a newer request replaced it')
+# With no merge worker the harness finds no landed-outbox row for the task.
+_LANDED_UNRECORDED = SimpleNamespace(status='done', merge_sha='0' * 40, reason='')
+_STASH_FAILED = SimpleNamespace(
+    status='stash_failed', reason='park failed', dirty_files=['README.md'],
+    recovery_branch=None, overlap_files=None, merge_sha=None,
 )
 
 
@@ -308,6 +321,51 @@ class TestRestoredHoldEndsWithItsRequest:
         assert _TID not in _held(scheduler)
         [esc] = h._escalation_queue.get_by_task(_TID, status='pending', level=1)
         assert esc.category == 'merge_error'
+
+    async def test_a_halting_request_releases_its_files_after_owning_the_halt(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, _store = await _scene_with_real_merge_worker(tmp_path)
+        worker = h._merge_worker
+        assert worker is not None
+        worker.halt_for_wip('park of the main checkout failed')
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+        held_at_block: list = []
+        scheduler.clear_claim_then_set_status = _recording_hold(scheduler, held_at_block)
+        request = _request()
+        await recover_requests(h, request)
+
+        request.result.set_result(_STASH_FAILED)
+        await drain_background_tasks(h)
+
+        assert h._escalation_queue is not None
+        [esc] = h._escalation_queue.get_by_task(_TID, status='pending', level=1)
+        assert worker.is_halt_owner(esc.id)
+        assert held_at_block == [_keys(h, _FILES)]
+        assert _TID not in _held(scheduler)
+
+    @pytest.mark.parametrize(('outcome', 'store_fails'), [
+        pytest.param(_SUPERSEDED, False, id='transient'),
+        pytest.param(_LANDED_UNRECORDED, False, id='landing_unrecorded'),
+        pytest.param(_VERIFY_RED, True, id='routing_raised'),
+    ])
+    async def test_every_other_outcome_releases_the_files(
+        self, tmp_path: Path, outcome: SimpleNamespace, store_fails: bool,
+    ) -> None:
+        h, scheduler, store = _scene(tmp_path)
+        block_write = _stub_routing_writes(scheduler)
+        if store_fails:
+            scheduler.get_status = AsyncMock(side_effect=RuntimeError('store down'))
+        request = _request()
+        await recover_requests(h, request)
+
+        request.result.set_result(outcome)
+        await drain_background_tasks(h)
+
+        assert _TID not in _held(scheduler)
+        [released] = _event_data(store, 'lock_released', _TID)
+        assert tuple(sorted(released['modules'])) == _keys(h, _FILES)
+        block_write.assert_not_awaited()
 
     async def test_an_operator_cancel_releases_the_files(self, tmp_path: Path) -> None:
         h, scheduler, _store = _scene(tmp_path)
