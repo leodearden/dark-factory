@@ -37,6 +37,7 @@ from shared.mcp_markup_middleware import (
     OUTCOMES as MARKUP_OUTCOMES,
 )
 from shared.mcp_markup_middleware import (
+    HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
 )
@@ -260,8 +261,7 @@ MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     storm_anchor_task_id='verdict-tools-markup-storm',
     refusal_consequence=(
         'NO verdict was written, so the review gate this call was supposed to '
-        "close is still open and the reviewer's findings list below is the "
-        'only copy of it that exists.'
+        'close stays open until the reviewer resends it.'
     ),
     storm_consequence=(
         'further review gates strand on verdicts that never land.'
@@ -489,6 +489,7 @@ def create_server(
             loss_sink=fact_journal,
             resolve_root=resolve_project_root,
         ),
+        host_attribution=lambda: HostAttribution(agent_role=role),
     ))
     mcp.add_middleware(MissingArgumentMiddleware())
 

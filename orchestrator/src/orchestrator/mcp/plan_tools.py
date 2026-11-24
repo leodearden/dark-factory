@@ -1391,8 +1391,7 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
     no plan yet (a ``create_plan`` refused before any plan exists); an explicit
     "unattributed" only when even that is empty — the last two fallbacks are
     ``markup_sink``'s, applied to whatever this returns. An unreadable plan
-    degrades to the same fallback rather than losing the record: the payload it
-    carries is the only copy that exists.
+    degrades to the same fallback rather than losing the record.
     """
     try:
         plan = artifacts.read_plan()
