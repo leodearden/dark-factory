@@ -7,6 +7,7 @@ no ``__init__.py``).
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -106,8 +107,15 @@ async def harness_with_real_merge_worker(
     return h
 
 
-async def journal_merge_request(h: Harness, task_id: str) -> str:
-    """Journal a real merge of task *task_id*'s new branch, as the live enqueue does; its id."""
+async def journal_merge_request(
+    h: Harness, task_id: str, *, task_files: list[str] | None = None,
+) -> str:
+    """Journal a real merge of task *task_id*'s new branch, as the live enqueue does; its id.
+
+    *task_files* are the files the journalled request records for the task.
+    """
     request = await branch_merge_request(h.git_ops, h.config, task_id, filename=f'{task_id}.txt')
+    if task_files is not None:
+        request = dataclasses.replace(request, task_files=task_files)
     h._merge_store.record(request)
     return request.request_id
