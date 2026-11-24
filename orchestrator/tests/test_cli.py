@@ -1,6 +1,7 @@
 """Tests for the `orchestrator run` command and its shutdown helpers."""
 
 import asyncio
+import contextlib
 import io
 import logging
 import threading
@@ -520,6 +521,93 @@ class TestForceExitWatchdog:
             f'shutdown-watchdog thread(s) still alive after firing and join: '
             f'{live_watchdog_threads}'
         )
+
+
+_HANG_GUARD_SECS = 10.0
+
+
+async def _ignore_cancels_until(release: asyncio.Event) -> None:
+    while not release.is_set():
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            continue
+
+
+def _shutdown_watchdog_threads() -> set[threading.Thread]:
+    return {t for t in threading.enumerate() if t.name == 'shutdown-watchdog'}
+
+
+class TestRunWithBoundedTeardown:
+    """asyncio.run()'s own teardown waits, unbounded, on every task left when
+    the main coroutine ends; _run_with_bounded_teardown bounds that wait."""
+
+    @pytest.mark.parametrize('ending', ['returns', 'raises_cancelled'])
+    def test_a_leftover_task_that_ignores_its_cancel_is_force_exited(self, ending, capsys):
+        box: dict = {}
+        exits: list[int] = []
+        guard_fired = threading.Event()
+
+        async def main():
+            box['loop'] = asyncio.get_running_loop()
+            box['release'] = asyncio.Event()
+            box['leftover'] = asyncio.create_task(
+                _ignore_cancels_until(box['release']), name='immune-leftover',
+            )
+            await asyncio.sleep(0)
+            if ending == 'raises_cancelled':
+                raise asyncio.CancelledError()
+            return 'report'
+
+        def release() -> None:
+            with contextlib.suppress(RuntimeError):
+                box['loop'].call_soon_threadsafe(box['release'].set)
+
+        def exit_stub(code: int) -> None:
+            exits.append(code)
+            release()
+
+        def on_guard() -> None:
+            guard_fired.set()
+            release()
+
+        guard = threading.Timer(_HANG_GUARD_SECS, on_guard)
+        guard.start()
+        try:
+            if ending == 'raises_cancelled':
+                with pytest.raises(asyncio.CancelledError):
+                    cli_module._run_with_bounded_teardown(
+                        main, teardown_secs=0.2, _exit=exit_stub,
+                    )
+            else:
+                result = cli_module._run_with_bounded_teardown(
+                    main, teardown_secs=0.2, _exit=exit_stub,
+                )
+                assert result == 'report'
+        finally:
+            guard.cancel()
+
+        assert exits == [137]
+        assert not guard_fired.is_set(), 'the hang guard, not the watchdog, ended the teardown'
+        assert "asyncio.run()'s teardown" in capsys.readouterr().err
+
+    def test_a_clean_teardown_disarms_the_watchdog(self):
+        exits: list[int] = []
+        leftovers: list[asyncio.Task] = []
+
+        async def main():
+            leftovers.append(asyncio.create_task(asyncio.sleep(3600)))
+            return 'report'
+
+        before = _shutdown_watchdog_threads()
+        result = cli_module._run_with_bounded_teardown(
+            main, teardown_secs=0.5, _exit=exits.append,
+        )
+        for thread in _shutdown_watchdog_threads() - before:
+            thread.join(timeout=5.0)
+
+        assert result == 'report'
+        assert exits == [], 'the teardown watchdog stayed armed after asyncio.run returned'
 
 
 def _wire_run_with_fake_harness(monkeypatch, fake_report):
