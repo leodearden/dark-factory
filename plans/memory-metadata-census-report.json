@@ -22,64 +22,64 @@
   "projects": {
     "dark_factory": {
       "total": {
-        "records": 39242,
+        "records": 39480,
         "keys": {
           "entries": [
             {
               "value": "category",
-              "count": 39242
+              "count": 39480
             },
             {
               "value": "created_at",
-              "count": 39242
+              "count": 39480
             },
             {
               "value": "data",
-              "count": 39242
+              "count": 39480
             },
             {
               "value": "hash",
-              "count": 39242
+              "count": 39480
             },
             {
               "value": "user_id",
-              "count": 39242
+              "count": 39480
             },
             {
               "value": "updated_at",
-              "count": 37982
+              "count": 38220
             },
             {
               "value": "agent_id",
-              "count": 30714
+              "count": 30893
             },
             {
               "value": "role",
-              "count": 30062
+              "count": 30300
             },
             {
               "value": "task_id",
-              "count": 14306
+              "count": 14464
             },
             {
               "value": "source",
-              "count": 10580
+              "count": 10681
             },
             {
               "value": "transition",
-              "count": 8864
+              "count": 8923
             },
             {
               "value": "kind",
-              "count": 4568
+              "count": 4679
             },
             {
               "value": "stage2_suppress",
-              "count": 4533
+              "count": 4592
             },
             {
               "value": "echo_used_provenance",
-              "count": 4395
+              "count": 4453
             },
             {
               "value": "_causation_id",
@@ -91,11 +91,11 @@
             },
             {
               "value": "topic",
-              "count": 3516
+              "count": 3559
             },
             {
               "value": "parent_id",
-              "count": 3005
+              "count": 3074
             },
             {
               "value": "run_id",
@@ -107,11 +107,11 @@
             },
             {
               "value": "x_contested",
-              "count": 850
+              "count": 872
             },
             {
               "value": "x_contested_by_triage",
-              "count": 604
+              "count": 626
             },
             {
               "value": "commit",
@@ -255,7 +255,7 @@
             },
             {
               "value": "echo_suppressed_stale_description",
-              "count": 81
+              "count": 82
             },
             {
               "value": "tasks_created",
@@ -286,11 +286,11 @@
               "count": 64
             },
             {
-              "value": "severity",
-              "count": 62
+              "value": "unverified_claim",
+              "count": 63
             },
             {
-              "value": "unverified_claim",
+              "value": "severity",
               "count": 62
             },
             {
@@ -2534,6 +2534,10 @@
               "count": 2
             },
             {
+              "value": "x_unlanded_path_note",
+              "count": 2
+            },
+            {
               "value": "x_verified_at",
               "count": 2
             },
@@ -4624,10 +4628,6 @@
             {
               "value": "x_supersedes_disposition_of",
               "count": 1
-            },
-            {
-              "value": "x_unlanded_path_note",
-              "count": 1
             }
           ],
           "distinct_total": 1151
@@ -4636,7 +4636,7 @@
           "entries": [
             {
               "value": "amendment",
-              "count": 2828
+              "count": 2897
             },
             {
               "value": "cycle_summary",
@@ -4644,7 +4644,7 @@
             },
             {
               "value": "task_completion",
-              "count": 280
+              "count": 322
             },
             {
               "value": "sighting",
@@ -5565,16 +5565,16 @@
           ],
           "distinct_total": 232
         },
-        "kind_missing": 34674,
+        "kind_missing": 34801,
         "source": {
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 8789
+              "count": 8848
             },
             {
               "value": "orchestrator_completion",
-              "count": 1259
+              "count": 1301
             },
             {
               "value": "remediation_run",
@@ -6127,7 +6127,7 @@
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 8776
+              "count": 8835
             },
             {
               "value": "orchestrator_completion",
@@ -6604,7 +6604,7 @@
           ],
           "distinct_total": 119
         },
-        "topic_present": 3516,
+        "topic_present": 3559,
         "topic": {
           "entries": [
             {
@@ -6613,7 +6613,7 @@
             },
             {
               "value": "dashboard-js-test-substrate",
-              "count": 68
+              "count": 70
             },
             {
               "value": "inline-suppression-ratchet",
@@ -6645,7 +6645,7 @@
             },
             {
               "value": "vacuous-test-guard",
-              "count": 30
+              "count": 31
             },
             {
               "value": "orchestrator-xdist-worker-crash-under-load",
@@ -6872,6 +6872,14 @@
               "count": 6
             },
             {
+              "value": "lock-charter-extension-allowlist",
+              "count": 6
+            },
+            {
+              "value": "loop-blocking-gate-allowlist",
+              "count": 6
+            },
+            {
               "value": "nested-pytest-basetemp",
               "count": 6
             },
@@ -6892,6 +6900,10 @@
               "count": 5
             },
             {
+              "value": "dashboard-payload-budgets",
+              "count": 5
+            },
+            {
               "value": "dashboard-test-suite-blast-radius",
               "count": 5
             },
@@ -6909,10 +6921,6 @@
             },
             {
               "value": "head-limited-grep-truncates-the-decisive-hit",
-              "count": 5
-            },
-            {
-              "value": "loop-blocking-gate-allowlist",
               "count": 5
             },
             {
@@ -6969,10 +6977,6 @@
             },
             {
               "value": "completion-claim-gate-measurement",
-              "count": 4
-            },
-            {
-              "value": "dashboard-payload-budgets",
               "count": 4
             },
             {
@@ -7108,6 +7112,10 @@
               "count": 3
             },
             {
+              "value": "flake-debt-triage",
+              "count": 3
+            },
+            {
               "value": "fused-memory-clip-disclosure",
               "count": 3
             },
@@ -7153,10 +7161,6 @@
             },
             {
               "value": "local-repo-seeder-guard",
-              "count": 3
-            },
-            {
-              "value": "lock-charter-extension-allowlist",
               "count": 3
             },
             {
@@ -7244,6 +7248,10 @@
               "count": 3
             },
             {
+              "value": "rule-c-wall-clock-debt-budget",
+              "count": 3
+            },
+            {
               "value": "sample-manifest-verify-frame-bound",
               "count": 3
             },
@@ -7297,6 +7305,14 @@
             },
             {
               "value": "architect-plan-tools-recipe",
+              "count": 2
+            },
+            {
+              "value": "architect-plan-tools-recipe-single-home",
+              "count": 2
+            },
+            {
+              "value": "asyncio-bounded-cancel-wait",
               "count": 2
             },
             {
@@ -7381,6 +7397,10 @@
             },
             {
               "value": "curator-dedup-outage-2026-08",
+              "count": 2
+            },
+            {
+              "value": "curator-test-seams",
               "count": 2
             },
             {
@@ -7504,10 +7524,6 @@
               "count": 2
             },
             {
-              "value": "flake-debt-triage",
-              "count": 2
-            },
-            {
               "value": "flake-debt-write-triage-judge-live-timeout",
               "count": 2
             },
@@ -7540,6 +7556,10 @@
               "count": 2
             },
             {
+              "value": "fused-memory-real-store-test-seeding",
+              "count": 2
+            },
+            {
               "value": "fused-memory-test-config-isolation",
               "count": 2
             },
@@ -7549,6 +7569,10 @@
             },
             {
               "value": "gather-unwound",
+              "count": 2
+            },
+            {
+              "value": "git-index-lock-liveness",
               "count": 2
             },
             {
@@ -7781,10 +7805,6 @@
             },
             {
               "value": "ruff-e402-sys-path-insert",
-              "count": 2
-            },
-            {
-              "value": "rule-c-wall-clock-debt-budget",
               "count": 2
             },
             {
@@ -8084,11 +8104,11 @@
               "count": 1
             },
             {
-              "value": "architect-plan-tools-recipe-single-home",
+              "value": "architect-prototype-flip-measurement",
               "count": 1
             },
             {
-              "value": "architect-prototype-flip-measurement",
+              "value": "architect-redispatch-forensics",
               "count": 1
             },
             {
@@ -8492,6 +8512,10 @@
               "count": 1
             },
             {
+              "value": "combine-audit-row-partition",
+              "count": 1
+            },
+            {
               "value": "commit-attribution-by-merge-marker-range",
               "count": 1
             },
@@ -8600,6 +8624,10 @@
               "count": 1
             },
             {
+              "value": "count-memories-by-metadata-prompt-spelling",
+              "count": 1
+            },
+            {
               "value": "cpu-attribution-verify-ceiling",
               "count": 1
             },
@@ -8673,10 +8701,6 @@
             },
             {
               "value": "curator-spawned-from-canonical-form",
-              "count": 1
-            },
-            {
-              "value": "curator-test-seams",
               "count": 1
             },
             {
@@ -9628,6 +9652,10 @@
               "count": 1
             },
             {
+              "value": "flake-debt-forensics",
+              "count": 1
+            },
+            {
               "value": "flake-debt-mem0-create-col-readtimeout",
               "count": 1
             },
@@ -9709,6 +9737,10 @@
             },
             {
               "value": "folded-escalation-filer-table",
+              "count": 1
+            },
+            {
+              "value": "followup-hold-waiting-dependent",
               "count": 1
             },
             {
@@ -9840,10 +9872,6 @@
               "count": 1
             },
             {
-              "value": "fused-memory-real-store-test-seeding",
-              "count": 1
-            },
-            {
               "value": "fused-memory-rebuild-test-layout",
               "count": 1
             },
@@ -9861,6 +9889,10 @@
             },
             {
               "value": "fused-memory-script-sys-path-bootstrap",
+              "count": 1
+            },
+            {
+              "value": "fused-memory-search-test-backend-mocks",
               "count": 1
             },
             {
@@ -9909,6 +9941,10 @@
             },
             {
               "value": "fused-memory-test-fixtures",
+              "count": 1
+            },
+            {
+              "value": "fused-memory-test-flakes",
               "count": 1
             },
             {
@@ -10001,10 +10037,6 @@
             },
             {
               "value": "git-hook-signal-handling",
-              "count": 1
-            },
-            {
-              "value": "git-index-lock-liveness",
               "count": 1
             },
             {
@@ -10164,6 +10196,10 @@
               "count": 1
             },
             {
+              "value": "harness-slot-lease",
+              "count": 1
+            },
+            {
               "value": "harness-startup-steps",
               "count": 1
             },
@@ -10205,6 +10241,10 @@
             },
             {
               "value": "implementer-sandbox-main-data-write",
+              "count": 1
+            },
+            {
+              "value": "index-lock-standoff-test-recipe",
               "count": 1
             },
             {
@@ -10325,6 +10365,10 @@
             },
             {
               "value": "landing-evidence-baselines",
+              "count": 1
+            },
+            {
+              "value": "landlock-proc-ptrace-gated-reads",
               "count": 1
             },
             {
@@ -10516,6 +10560,14 @@
               "count": 1
             },
             {
+              "value": "lint-command-chain-tail",
+              "count": 1
+            },
+            {
+              "value": "live-gate-integration-tier",
+              "count": 1
+            },
+            {
               "value": "live-openai-integration-test-credentials",
               "count": 1
             },
@@ -10581,6 +10633,10 @@
             },
             {
               "value": "lock-charter-extensionless-sweep",
+              "count": 1
+            },
+            {
+              "value": "lock-charter-extensionless-vector",
               "count": 1
             },
             {
@@ -10708,6 +10764,10 @@
               "count": 1
             },
             {
+              "value": "mcp-lifecycle-session-leak",
+              "count": 1
+            },
+            {
               "value": "mcp-markup-doc-verification",
               "count": 1
             },
@@ -10824,6 +10884,10 @@
               "count": 1
             },
             {
+              "value": "mem0-search-item-shape",
+              "count": 1
+            },
+            {
               "value": "mem0-sync-qdrant-hidden-timeout",
               "count": 1
             },
@@ -10912,6 +10976,10 @@
               "count": 1
             },
             {
+              "value": "memory-write-census",
+              "count": 1
+            },
+            {
               "value": "memory-write-path",
               "count": 1
             },
@@ -10953,6 +11021,10 @@
             },
             {
               "value": "merge-finalized-payload-shape",
+              "count": 1
+            },
+            {
+              "value": "merge-gate-history-census",
               "count": 1
             },
             {
@@ -11025,6 +11097,10 @@
             },
             {
               "value": "merge-lane-forensics",
+              "count": 1
+            },
+            {
+              "value": "merge-lane-fresh-dequeue-base",
               "count": 1
             },
             {
@@ -11168,6 +11244,10 @@
               "count": 1
             },
             {
+              "value": "merge-lane-rebased-head-resubmission-test-flake",
+              "count": 1
+            },
+            {
               "value": "merge-lane-remote-verify-abort-order",
               "count": 1
             },
@@ -11197,6 +11277,10 @@
             },
             {
               "value": "merge-lane-test-remote-verify-attribution",
+              "count": 1
+            },
+            {
+              "value": "merge-lane-test-scenes",
               "count": 1
             },
             {
@@ -12708,7 +12792,15 @@
               "count": 1
             },
             {
+              "value": "scheduler-claim-started-set",
+              "count": 1
+            },
+            {
               "value": "scheduler-continuity-probe-test-seam",
+              "count": 1
+            },
+            {
+              "value": "scheduler-dated-gate-dispatch",
               "count": 1
             },
             {
@@ -12817,6 +12909,10 @@
             },
             {
               "value": "sdk-client-test-double",
+              "count": 1
+            },
+            {
+              "value": "secret-env-name-rule",
               "count": 1
             },
             {
@@ -13272,6 +13368,10 @@
               "count": 1
             },
             {
+              "value": "t3-code-deep-links",
+              "count": 1
+            },
+            {
               "value": "t3-thread-wait-semantics",
               "count": 1
             },
@@ -13512,6 +13612,10 @@
               "count": 1
             },
             {
+              "value": "timing-dependence-lint",
+              "count": 1
+            },
+            {
               "value": "tmp-project-root-literal-census",
               "count": 1
             },
@@ -13708,7 +13812,15 @@
               "count": 1
             },
             {
+              "value": "verify-cache-kill-switch",
+              "count": 1
+            },
+            {
               "value": "verify-cache-module-keys",
+              "count": 1
+            },
+            {
+              "value": "verify-cache-unit-outcomes",
               "count": 1
             },
             {
@@ -14208,9 +14320,9 @@
               "count": 1
             }
           ],
-          "distinct_total": 1900
+          "distinct_total": 1928
         },
-        "parent_id_present": 3005,
+        "parent_id_present": 3074,
         "canonical_true": 85,
         "canonical_false": 45,
         "canonical_non_bool": 0,
@@ -14564,7 +14676,7 @@
           "entries": [
             {
               "value": "absent",
-              "count": 38982
+              "count": 39220
             },
             {
               "value": "list",
@@ -14633,12 +14745,12 @@
         }
       },
       "topic_coverage": {
-        "records": 39242,
-        "topic_present": 3516,
-        "topic_coverage_pct": 8.9598,
-        "distinct_topics": 1900,
+        "records": 39480,
+        "topic_present": 3559,
+        "topic_coverage_pct": 9.0147,
+        "distinct_topics": 1928,
         "topics_with_one_canonical": 85,
-        "topics_with_zero_canonical": 1815,
+        "topics_with_zero_canonical": 1843,
         "topics_with_multiple_canonical": 0,
         "multiple_canonical_topics": [],
         "canonical_uniqueness_enforced": false,
@@ -14666,7 +14778,7 @@
             "source": "task 3626 ([MILESTONE] memory_metadata.enforce flip gate)"
           }
         ],
-        "slug_conforming": 1809,
+        "slug_conforming": 1837,
         "slug_non_conforming": 91,
         "non_conforming_topics": [
           {
@@ -15042,60 +15154,60 @@
       },
       "categories": {
         "observations_and_summaries": {
-          "records": 27204,
+          "records": 27347,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 27204
+                "count": 27347
               },
               {
                 "value": "created_at",
-                "count": 27204
+                "count": 27347
               },
               {
                 "value": "data",
-                "count": 27204
+                "count": 27347
               },
               {
                 "value": "hash",
-                "count": 27204
+                "count": 27347
               },
               {
                 "value": "user_id",
-                "count": 27204
+                "count": 27347
               },
               {
                 "value": "updated_at",
-                "count": 26065
+                "count": 26208
               },
               {
                 "value": "role",
-                "count": 18727
+                "count": 18870
               },
               {
                 "value": "agent_id",
-                "count": 18683
+                "count": 18767
               },
               {
                 "value": "task_id",
-                "count": 12084
+                "count": 12194
               },
               {
                 "value": "source",
-                "count": 10439
+                "count": 10540
               },
               {
                 "value": "transition",
-                "count": 8862
+                "count": 8921
               },
               {
                 "value": "stage2_suppress",
-                "count": 4528
+                "count": 4587
               },
               {
                 "value": "echo_used_provenance",
-                "count": 4395
+                "count": 4453
               },
               {
                 "value": "_causation_id",
@@ -15107,7 +15219,7 @@
               },
               {
                 "value": "kind",
-                "count": 2801
+                "count": 2866
               },
               {
                 "value": "run_id",
@@ -15115,7 +15227,7 @@
               },
               {
                 "value": "parent_id",
-                "count": 1324
+                "count": 1347
               },
               {
                 "value": "stage",
@@ -15123,15 +15235,15 @@
               },
               {
                 "value": "topic",
-                "count": 764
+                "count": 771
               },
               {
                 "value": "x_contested",
-                "count": 380
+                "count": 391
               },
               {
                 "value": "x_contested_by_triage",
-                "count": 274
+                "count": 285
               },
               {
                 "value": "task_ids",
@@ -15263,7 +15375,7 @@
               },
               {
                 "value": "echo_suppressed_stale_description",
-                "count": 81
+                "count": 82
               },
               {
                 "value": "supersedes",
@@ -15307,7 +15419,7 @@
               },
               {
                 "value": "unverified_claim",
-                "count": 53
+                "count": 54
               },
               {
                 "value": "action",
@@ -17230,6 +17342,10 @@
                 "count": 2
               },
               {
+                "value": "x_unlanded_path_note",
+                "count": 2
+              },
+              {
                 "value": "x_verified_at",
                 "count": 2
               },
@@ -18892,10 +19008,6 @@
               {
                 "value": "x_supersedes_disposition_of",
                 "count": 1
-              },
-              {
-                "value": "x_unlanded_path_note",
-                "count": 1
               }
             ],
             "distinct_total": 963
@@ -18904,7 +19016,7 @@
             "entries": [
               {
                 "value": "amendment",
-                "count": 1200
+                "count": 1223
               },
               {
                 "value": "cycle_summary",
@@ -18912,7 +19024,7 @@
               },
               {
                 "value": "task_completion",
-                "count": 280
+                "count": 322
               },
               {
                 "value": "cgl_eta_cross_target_rehome",
@@ -19713,16 +19825,16 @@
             ],
             "distinct_total": 202
           },
-          "kind_missing": 24403,
+          "kind_missing": 24481,
           "source": {
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 8779
+                "count": 8838
               },
               {
                 "value": "orchestrator_completion",
-                "count": 1259
+                "count": 1301
               },
               {
                 "value": "reconciliation",
@@ -20143,7 +20255,7 @@
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 8766
+                "count": 8825
               },
               {
                 "value": "orchestrator_completion",
@@ -20500,7 +20612,7 @@
             ],
             "distinct_total": 89
           },
-          "topic_present": 764,
+          "topic_present": 771,
           "topic": {
             "entries": [
               {
@@ -21412,6 +21524,10 @@
                 "count": 1
               },
               {
+                "value": "followup-hold-waiting-dependent",
+                "count": 1
+              },
+              {
                 "value": "forbid-live-mcp-guard",
                 "count": 1
               },
@@ -21461,6 +21577,10 @@
               },
               {
                 "value": "fused-memory-tasks-shape",
+                "count": 1
+              },
+              {
+                "value": "fused-memory-test-flakes",
                 "count": 1
               },
               {
@@ -21636,7 +21756,15 @@
                 "count": 1
               },
               {
+                "value": "lock-charter-extension-allowlist",
+                "count": 1
+              },
+              {
                 "value": "lock-charter-extension-drift-main-red",
+                "count": 1
+              },
+              {
+                "value": "lock-charter-extensionless-vector",
                 "count": 1
               },
               {
@@ -21793,6 +21921,10 @@
               },
               {
                 "value": "merge-lane-ratchet-private-reads-new-test-rows",
+                "count": 1
+              },
+              {
+                "value": "merge-lane-rebased-head-resubmission-test-flake",
                 "count": 1
               },
               {
@@ -22208,6 +22340,10 @@
                 "count": 1
               },
               {
+                "value": "rule-c-wall-clock-debt-budget",
+                "count": 1
+              },
+              {
                 "value": "ruling-overreach-lever",
                 "count": 1
               },
@@ -22237,6 +22373,10 @@
               },
               {
                 "value": "scan_memory_content_is_not_substring_search",
+                "count": 1
+              },
+              {
+                "value": "scheduler-dated-gate-dispatch",
                 "count": 1
               },
               {
@@ -22704,9 +22844,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 550
+            "distinct_total": 557
           },
-          "parent_id_present": 1324,
+          "parent_id_present": 1347,
           "canonical_true": 10,
           "canonical_false": 3,
           "canonical_non_bool": 0,
@@ -22760,7 +22900,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 27123
+                "count": 27266
               },
               {
                 "value": "list",
@@ -22813,60 +22953,60 @@
           }
         },
         "preferences_and_norms": {
-          "records": 2433,
+          "records": 2443,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 2433
+                "count": 2443
               },
               {
                 "value": "created_at",
-                "count": 2433
+                "count": 2443
               },
               {
                 "value": "data",
-                "count": 2433
+                "count": 2443
               },
               {
                 "value": "hash",
-                "count": 2433
+                "count": 2443
               },
               {
                 "value": "user_id",
-                "count": 2433
+                "count": 2443
               },
               {
                 "value": "agent_id",
-                "count": 2429
+                "count": 2439
               },
               {
                 "value": "updated_at",
-                "count": 2335
+                "count": 2345
               },
               {
                 "value": "role",
-                "count": 2019
+                "count": 2029
               },
               {
                 "value": "topic",
-                "count": 305
+                "count": 309
               },
               {
                 "value": "task_id",
-                "count": 213
+                "count": 218
               },
               {
                 "value": "kind",
-                "count": 169
+                "count": 175
               },
               {
                 "value": "parent_id",
-                "count": 157
+                "count": 163
               },
               {
                 "value": "x_contested",
-                "count": 62
+                "count": 67
               },
               {
                 "value": "source",
@@ -22874,7 +23014,7 @@
               },
               {
                 "value": "x_contested_by_triage",
-                "count": 48
+                "count": 53
               },
               {
                 "value": "escalation_id",
@@ -23303,7 +23443,7 @@
             "entries": [
               {
                 "value": "amendment",
-                "count": 151
+                "count": 157
               },
               {
                 "value": "sighting",
@@ -23340,7 +23480,7 @@
             ],
             "distinct_total": 9
           },
-          "kind_missing": 2264,
+          "kind_missing": 2268,
           "source": {
             "entries": [
               {
@@ -23559,7 +23699,7 @@
             ],
             "distinct_total": 26
           },
-          "topic_present": 305,
+          "topic_present": 309,
           "topic": {
             "entries": [
               {
@@ -23624,6 +23764,10 @@
               },
               {
                 "value": "curator-test-doubles",
+                "count": 2
+              },
+              {
+                "value": "curator-test-seams",
                 "count": 2
               },
               {
@@ -23735,6 +23879,10 @@
                 "count": 1
               },
               {
+                "value": "count-memories-by-metadata-prompt-spelling",
+                "count": 1
+              },
+              {
                 "value": "curator-escalation-filing",
                 "count": 1
               },
@@ -23748,10 +23896,6 @@
               },
               {
                 "value": "curator-spawned-from-canonical-form",
-                "count": 1
-              },
-              {
-                "value": "curator-test-seams",
                 "count": 1
               },
               {
@@ -23903,6 +24047,10 @@
                 "count": 1
               },
               {
+                "value": "fused-memory-search-test-backend-mocks",
+                "count": 1
+              },
+              {
                 "value": "fused-memory-shared-test-helpers",
                 "count": 1
               },
@@ -23980,6 +24128,10 @@
               },
               {
                 "value": "legibility-sibling-import-spelling",
+                "count": 1
+              },
+              {
+                "value": "live-gate-integration-tier",
                 "count": 1
               },
               {
@@ -24327,9 +24479,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 191
+            "distinct_total": 194
           },
-          "parent_id_present": 157,
+          "parent_id_present": 163,
           "canonical_true": 8,
           "canonical_false": 2,
           "canonical_non_bool": 0,
@@ -24375,7 +24527,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 2414
+                "count": 2424
               },
               {
                 "value": "list",
@@ -24412,64 +24564,64 @@
           }
         },
         "procedural_knowledge": {
-          "records": 9581,
+          "records": 9666,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 9581
+                "count": 9666
               },
               {
                 "value": "created_at",
-                "count": 9581
+                "count": 9666
               },
               {
                 "value": "data",
-                "count": 9581
+                "count": 9666
               },
               {
                 "value": "hash",
-                "count": 9581
+                "count": 9666
               },
               {
                 "value": "user_id",
-                "count": 9581
+                "count": 9666
               },
               {
                 "value": "agent_id",
-                "count": 9578
+                "count": 9663
               },
               {
                 "value": "updated_at",
-                "count": 9558
+                "count": 9643
               },
               {
                 "value": "role",
-                "count": 9292
+                "count": 9377
               },
               {
                 "value": "topic",
-                "count": 2442
+                "count": 2474
               },
               {
                 "value": "task_id",
-                "count": 2006
+                "count": 2049
               },
               {
                 "value": "kind",
-                "count": 1598
+                "count": 1638
               },
               {
                 "value": "parent_id",
-                "count": 1524
+                "count": 1564
               },
               {
                 "value": "x_contested",
-                "count": 408
+                "count": 414
               },
               {
                 "value": "x_contested_by_triage",
-                "count": 282
+                "count": 288
               },
               {
                 "value": "task_ref",
@@ -25566,7 +25718,7 @@
             "entries": [
               {
                 "value": "amendment",
-                "count": 1477
+                "count": 1517
               },
               {
                 "value": "sighting",
@@ -25679,7 +25831,7 @@
             ],
             "distinct_total": 28
           },
-          "kind_missing": 7983,
+          "kind_missing": 8028,
           "source": {
             "entries": [
               {
@@ -25906,7 +26058,7 @@
             ],
             "distinct_total": 24
           },
-          "topic_present": 2442,
+          "topic_present": 2474,
           "topic": {
             "entries": [
               {
@@ -25915,7 +26067,7 @@
               },
               {
                 "value": "dashboard-js-test-substrate",
-                "count": 56
+                "count": 58
               },
               {
                 "value": "inline-suppression-ratchet",
@@ -25935,7 +26087,7 @@
               },
               {
                 "value": "vacuous-test-guard",
-                "count": 30
+                "count": 31
               },
               {
                 "value": "pytest-xdist-serial-override",
@@ -26106,6 +26258,10 @@
                 "count": 6
               },
               {
+                "value": "loop-blocking-gate-allowlist",
+                "count": 6
+              },
+              {
                 "value": "merge-queue-wait-budget-audit",
                 "count": 6
               },
@@ -26126,7 +26282,7 @@
                 "count": 5
               },
               {
-                "value": "loop-blocking-gate-allowlist",
+                "value": "lock-charter-extension-allowlist",
                 "count": 5
               },
               {
@@ -26242,11 +26398,19 @@
                 "count": 3
               },
               {
+                "value": "dashboard-payload-budgets",
+                "count": 3
+              },
+              {
                 "value": "escalation-category-vocabulary",
                 "count": 3
               },
               {
                 "value": "find-tasks-by-metadata-type-strict-match",
+                "count": 3
+              },
+              {
+                "value": "flake-debt-triage",
                 "count": 3
               },
               {
@@ -26287,10 +26451,6 @@
               },
               {
                 "value": "legibility-census-similarity-stage",
-                "count": 3
-              },
-              {
-                "value": "lock-charter-extension-allowlist",
                 "count": 3
               },
               {
@@ -26378,6 +26538,10 @@
                 "count": 2
               },
               {
+                "value": "asyncio-bounded-cancel-wait",
+                "count": 2
+              },
+              {
                 "value": "asyncio-subprocess-mid-spawn-cancel",
                 "count": 2
               },
@@ -26423,10 +26587,6 @@
               },
               {
                 "value": "dashboard-memory-evals-test-seams",
-                "count": 2
-              },
-              {
-                "value": "dashboard-payload-budgets",
                 "count": 2
               },
               {
@@ -26498,10 +26658,6 @@
                 "count": 2
               },
               {
-                "value": "flake-debt-triage",
-                "count": 2
-              },
-              {
                 "value": "fused-memory-config-schema-import-cycle",
                 "count": 2
               },
@@ -26514,11 +26670,19 @@
                 "count": 2
               },
               {
+                "value": "fused-memory-real-store-test-seeding",
+                "count": 2
+              },
+              {
                 "value": "fused-memory-test-config-isolation",
                 "count": 2
               },
               {
                 "value": "gather-unwound",
+                "count": 2
+              },
+              {
+                "value": "git-index-lock-liveness",
                 "count": 2
               },
               {
@@ -26870,7 +27034,15 @@
                 "count": 1
               },
               {
+                "value": "architect-plan-tools-recipe-single-home",
+                "count": 1
+              },
+              {
                 "value": "architect-prototype-flip-measurement",
+                "count": 1
+              },
+              {
+                "value": "architect-redispatch-forensics",
                 "count": 1
               },
               {
@@ -27143,6 +27315,10 @@
               },
               {
                 "value": "codex-token-usage-accounting",
+                "count": 1
+              },
+              {
+                "value": "combine-audit-row-partition",
                 "count": 1
               },
               {
@@ -27874,6 +28050,10 @@
                 "count": 1
               },
               {
+                "value": "flake-debt-forensics",
+                "count": 1
+              },
+              {
                 "value": "flake-debt-mem0-create-col-readtimeout",
                 "count": 1
               },
@@ -27998,10 +28178,6 @@
                 "count": 1
               },
               {
-                "value": "fused-memory-real-store-test-seeding",
-                "count": 1
-              },
-              {
                 "value": "fused-memory-sandbox-test-artifacts",
                 "count": 1
               },
@@ -28095,10 +28271,6 @@
               },
               {
                 "value": "git-hook-signal-handling",
-                "count": 1
-              },
-              {
-                "value": "git-index-lock-liveness",
                 "count": 1
               },
               {
@@ -28214,6 +28386,10 @@
                 "count": 1
               },
               {
+                "value": "harness-slot-lease",
+                "count": 1
+              },
+              {
                 "value": "harness-startup-steps",
                 "count": 1
               },
@@ -28255,6 +28431,10 @@
               },
               {
                 "value": "implementer-sandbox-main-data-write",
+                "count": 1
+              },
+              {
+                "value": "index-lock-standoff-test-recipe",
                 "count": 1
               },
               {
@@ -28339,6 +28519,10 @@
               },
               {
                 "value": "landing-evidence-baselines",
+                "count": 1
+              },
+              {
+                "value": "landlock-proc-ptrace-gated-reads",
                 "count": 1
               },
               {
@@ -28482,6 +28666,10 @@
                 "count": 1
               },
               {
+                "value": "lint-command-chain-tail",
+                "count": 1
+              },
+              {
                 "value": "live-openai-integration-test-credentials",
                 "count": 1
               },
@@ -28614,6 +28802,10 @@
                 "count": 1
               },
               {
+                "value": "mcp-lifecycle-session-leak",
+                "count": 1
+              },
+              {
                 "value": "mcp-markup-doc-verification",
                 "count": 1
               },
@@ -28702,6 +28894,10 @@
                 "count": 1
               },
               {
+                "value": "mem0-search-item-shape",
+                "count": 1
+              },
+              {
                 "value": "mem0-tombstone-coverage",
                 "count": 1
               },
@@ -28758,6 +28954,10 @@
                 "count": 1
               },
               {
+                "value": "memory-write-census",
+                "count": 1
+              },
+              {
                 "value": "memory-write-path",
                 "count": 1
               },
@@ -28783,6 +28983,10 @@
               },
               {
                 "value": "merge-finalized-payload-shape",
+                "count": 1
+              },
+              {
+                "value": "merge-gate-history-census",
                 "count": 1
               },
               {
@@ -28839,6 +29043,10 @@
               },
               {
                 "value": "merge-lane-forensics",
+                "count": 1
+              },
+              {
+                "value": "merge-lane-fresh-dequeue-base",
                 "count": 1
               },
               {
@@ -28979,6 +29187,10 @@
               },
               {
                 "value": "merge-lane-test-remote-verify-attribution",
+                "count": 1
+              },
+              {
+                "value": "merge-lane-test-scenes",
                 "count": 1
               },
               {
@@ -30002,6 +30214,10 @@
                 "count": 1
               },
               {
+                "value": "scheduler-claim-started-set",
+                "count": 1
+              },
+              {
                 "value": "scheduler-continuity-probe-test-seam",
                 "count": 1
               },
@@ -30083,6 +30299,10 @@
               },
               {
                 "value": "scripts-tests-shared-fixtures",
+                "count": 1
+              },
+              {
+                "value": "secret-env-name-rule",
                 "count": 1
               },
               {
@@ -30382,6 +30602,10 @@
                 "count": 1
               },
               {
+                "value": "t3-code-deep-links",
+                "count": 1
+              },
+              {
                 "value": "t3-thread-wait-semantics",
                 "count": 1
               },
@@ -30538,6 +30762,10 @@
                 "count": 1
               },
               {
+                "value": "timing-dependence-lint",
+                "count": 1
+              },
+              {
                 "value": "tmp-project-root-literal-census",
                 "count": 1
               },
@@ -30682,7 +30910,15 @@
                 "count": 1
               },
               {
+                "value": "verify-cache-kill-switch",
+                "count": 1
+              },
+              {
                 "value": "verify-cache-module-keys",
+                "count": 1
+              },
+              {
+                "value": "verify-cache-unit-outcomes",
                 "count": 1
               },
               {
@@ -31006,9 +31242,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 1274
+            "distinct_total": 1295
           },
-          "parent_id_present": 1524,
+          "parent_id_present": 1564,
           "canonical_true": 67,
           "canonical_false": 40,
           "canonical_non_bool": 0,
@@ -31290,7 +31526,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 9421
+                "count": 9506
               },
               {
                 "value": "list",
@@ -31625,52 +31861,52 @@
     },
     "reify": {
       "total": {
-        "records": 41206,
+        "records": 41307,
         "keys": {
           "entries": [
             {
               "value": "category",
-              "count": 41206
+              "count": 41307
             },
             {
               "value": "created_at",
-              "count": 41206
+              "count": 41307
             },
             {
               "value": "data",
-              "count": 41206
+              "count": 41307
             },
             {
               "value": "hash",
-              "count": 41206
+              "count": 41307
             },
             {
               "value": "user_id",
-              "count": 41206
+              "count": 41307
             },
             {
               "value": "updated_at",
-              "count": 38730
+              "count": 38831
             },
             {
               "value": "agent_id",
-              "count": 29648
+              "count": 29731
             },
             {
               "value": "role",
-              "count": 27668
+              "count": 27769
             },
             {
               "value": "task_id",
-              "count": 16317
+              "count": 16356
             },
             {
               "value": "source",
-              "count": 13632
+              "count": 13664
             },
             {
               "value": "transition",
-              "count": 12185
+              "count": 12203
             },
             {
               "value": "_causation_id",
@@ -31682,11 +31918,11 @@
             },
             {
               "value": "kind",
-              "count": 3367
+              "count": 3418
             },
             {
               "value": "stage2_suppress",
-              "count": 2614
+              "count": 2632
             },
             {
               "value": "run_id",
@@ -31694,11 +31930,11 @@
             },
             {
               "value": "echo_used_provenance",
-              "count": 2263
+              "count": 2281
             },
             {
               "value": "topic",
-              "count": 2231
+              "count": 2242
             },
             {
               "value": "stage",
@@ -31706,7 +31942,7 @@
             },
             {
               "value": "parent_id",
-              "count": 1447
+              "count": 1484
             },
             {
               "value": "task_ids",
@@ -31714,7 +31950,7 @@
             },
             {
               "value": "x_contested",
-              "count": 384
+              "count": 394
             },
             {
               "value": "commit",
@@ -31722,19 +31958,19 @@
             },
             {
               "value": "supersedes",
-              "count": 254
+              "count": 255
             },
             {
               "value": "flag_id",
               "count": 231
             },
             {
-              "value": "cycle",
-              "count": 219
+              "value": "x_contested_by_triage",
+              "count": 223
             },
             {
-              "value": "x_contested_by_triage",
-              "count": 213
+              "value": "cycle",
+              "count": 219
             },
             {
               "value": "escalation_id",
@@ -32049,15 +32285,15 @@
               "count": 25
             },
             {
+              "value": "x_superseded_by",
+              "count": 25
+            },
+            {
               "value": "edge_updates",
               "count": 24
             },
             {
               "value": "entity_refresh_failed_uuids",
-              "count": 24
-            },
-            {
-              "value": "x_superseded_by",
               "count": 24
             },
             {
@@ -36747,7 +36983,7 @@
           "entries": [
             {
               "value": "amendment",
-              "count": 1303
+              "count": 1340
             },
             {
               "value": "cycle_summary",
@@ -36755,7 +36991,7 @@
             },
             {
               "value": "task_completion",
-              "count": 296
+              "count": 310
             },
             {
               "value": "sighting",
@@ -37896,16 +38132,16 @@
           ],
           "distinct_total": 287
         },
-        "kind_missing": 37839,
+        "kind_missing": 37889,
         "source": {
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 11947
+              "count": 11965
             },
             {
               "value": "orchestrator_completion",
-              "count": 750
+              "count": 764
             },
             {
               "value": "consolidation",
@@ -38498,7 +38734,7 @@
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 11937
+              "count": 11955
             },
             {
               "value": "orchestrator_completion",
@@ -39011,7 +39247,7 @@
           ],
           "distinct_total": 128
         },
-        "topic_present": 2231,
+        "topic_present": 2242,
         "topic": {
           "entries": [
             {
@@ -39020,7 +39256,7 @@
             },
             {
               "value": "tree-sitter-reify-build-grammar",
-              "count": 37
+              "count": 38
             },
             {
               "value": "harness-layout-gate-decision-rule",
@@ -39883,6 +40119,18 @@
               "count": 2
             },
             {
+              "value": "tree-sitter-freshness-test-isolation",
+              "count": 2
+            },
+            {
+              "value": "tree-sitter-pipeline-suite-runtime",
+              "count": 2
+            },
+            {
+              "value": "verify-executor-exit-codes",
+              "count": 2
+            },
+            {
               "value": "verify-fixture-copy-lists",
               "count": 2
             },
@@ -40259,6 +40507,10 @@
               "count": 1
             },
             {
+              "value": "canon-run-signal-propagation",
+              "count": 1
+            },
+            {
               "value": "canonical-memory-authoring-rules",
               "count": 1
             },
@@ -40284,6 +40536,10 @@
             },
             {
               "value": "capability-manifest-yaml-validation",
+              "count": 1
+            },
+            {
+              "value": "cargo-build-script-run-eviction",
               "count": 1
             },
             {
@@ -40440,6 +40696,10 @@
             },
             {
               "value": "compile-perf-ab-measurement",
+              "count": 1
+            },
+            {
+              "value": "compile-side-import-visibility",
               "count": 1
             },
             {
@@ -41740,6 +42000,10 @@
             },
             {
               "value": "manifold-face-edge-index-space",
+              "count": 1
+            },
+            {
+              "value": "mcp-chunk-prose-idiom-gate",
               "count": 1
             },
             {
@@ -43939,11 +44203,11 @@
               "count": 1
             },
             {
-              "value": "tree-sitter-cli-vs-runtime-recovery",
+              "value": "trampoline-decode-ratchet-rows",
               "count": 1
             },
             {
-              "value": "tree-sitter-freshness-test-isolation",
+              "value": "tree-sitter-cli-vs-runtime-recovery",
               "count": 1
             },
             {
@@ -43956,10 +44220,6 @@
             },
             {
               "value": "tree-sitter-grammar-byte-identity-sweep",
-              "count": 1
-            },
-            {
-              "value": "tree-sitter-pipeline-suite-runtime",
               "count": 1
             },
             {
@@ -44132,6 +44392,10 @@
             },
             {
               "value": "verify-infra-contention",
+              "count": 1
+            },
+            {
+              "value": "verify-infra-suite-wall-timeout",
               "count": 1
             },
             {
@@ -44479,9 +44743,9 @@
               "count": 1
             }
           ],
-          "distinct_total": 1366
+          "distinct_total": 1373
         },
-        "parent_id_present": 1447,
+        "parent_id_present": 1484,
         "canonical_true": 122,
         "canonical_false": 6,
         "canonical_non_bool": 1,
@@ -44983,11 +45247,11 @@
           "entries": [
             {
               "value": "absent",
-              "count": 40952
+              "count": 41052
             },
             {
               "value": "list",
-              "count": 201
+              "count": 202
             },
             {
               "value": "scalar",
@@ -45000,7 +45264,7 @@
           "entries": [
             {
               "value": "full_uuid",
-              "count": 359
+              "count": 360
             },
             {
               "value": "other",
@@ -45017,7 +45281,7 @@
             },
             {
               "value": 1,
-              "count": 60
+              "count": 61
             },
             {
               "value": 2,
@@ -45064,12 +45328,12 @@
         }
       },
       "topic_coverage": {
-        "records": 41206,
-        "topic_present": 2231,
-        "topic_coverage_pct": 5.4143,
-        "distinct_topics": 1366,
+        "records": 41307,
+        "topic_present": 2242,
+        "topic_coverage_pct": 5.4277,
+        "distinct_topics": 1373,
         "topics_with_one_canonical": 122,
-        "topics_with_zero_canonical": 1244,
+        "topics_with_zero_canonical": 1251,
         "topics_with_multiple_canonical": 0,
         "multiple_canonical_topics": [],
         "canonical_uniqueness_enforced": false,
@@ -45097,7 +45361,7 @@
             "source": "task 3626 ([MILESTONE] memory_metadata.enforce flip gate)"
           }
         ],
-        "slug_conforming": 1300,
+        "slug_conforming": 1307,
         "slug_non_conforming": 66,
         "non_conforming_topics": [
           {
@@ -45382,52 +45646,52 @@
       },
       "categories": {
         "observations_and_summaries": {
-          "records": 30972,
+          "records": 31022,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 30972
+                "count": 31022
               },
               {
                 "value": "created_at",
-                "count": 30972
+                "count": 31022
               },
               {
                 "value": "data",
-                "count": 30972
+                "count": 31022
               },
               {
                 "value": "hash",
-                "count": 30972
+                "count": 31022
               },
               {
                 "value": "user_id",
-                "count": 30972
+                "count": 31022
               },
               {
                 "value": "updated_at",
-                "count": 28753
+                "count": 28803
               },
               {
                 "value": "agent_id",
-                "count": 19420
+                "count": 19452
               },
               {
                 "value": "role",
-                "count": 18527
+                "count": 18577
               },
               {
                 "value": "task_id",
-                "count": 15212
+                "count": 15246
               },
               {
                 "value": "source",
-                "count": 13354
+                "count": 13386
               },
               {
                 "value": "transition",
-                "count": 12177
+                "count": 12195
               },
               {
                 "value": "_causation_id",
@@ -45439,19 +45703,19 @@
               },
               {
                 "value": "stage2_suppress",
-                "count": 2611
+                "count": 2629
+              },
+              {
+                "value": "kind",
+                "count": 2393
               },
               {
                 "value": "run_id",
                 "count": 2372
               },
               {
-                "value": "kind",
-                "count": 2364
-              },
-              {
                 "value": "echo_used_provenance",
-                "count": 2263
+                "count": 2281
               },
               {
                 "value": "stage",
@@ -45459,11 +45723,11 @@
               },
               {
                 "value": "topic",
-                "count": 756
+                "count": 758
               },
               {
                 "value": "parent_id",
-                "count": 589
+                "count": 604
               },
               {
                 "value": "task_ids",
@@ -45487,7 +45751,7 @@
               },
               {
                 "value": "x_contested",
-                "count": 172
+                "count": 176
               },
               {
                 "value": "memories_added",
@@ -45570,6 +45834,10 @@
                 "count": 99
               },
               {
+                "value": "x_contested_by_triage",
+                "count": 90
+              },
+              {
                 "value": "related_tasks",
                 "count": 89
               },
@@ -45583,10 +45851,6 @@
               },
               {
                 "value": "summary_nonce",
-                "count": 86
-              },
-              {
-                "value": "x_contested_by_triage",
                 "count": 86
               },
               {
@@ -49756,11 +50020,11 @@
               },
               {
                 "value": "amendment",
-                "count": 525
+                "count": 540
               },
               {
                 "value": "task_completion",
-                "count": 296
+                "count": 310
               },
               {
                 "value": "cgl_eta_cross_target_rehome",
@@ -50581,16 +50845,16 @@
             ],
             "distinct_total": 207
           },
-          "kind_missing": 28608,
+          "kind_missing": 28629,
           "source": {
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 11925
+                "count": 11943
               },
               {
                 "value": "orchestrator_completion",
-                "count": 750
+                "count": 764
               },
               {
                 "value": "consolidation",
@@ -50959,7 +51223,7 @@
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 11915
+                "count": 11933
               },
               {
                 "value": "orchestrator_completion",
@@ -51308,7 +51572,7 @@
             ],
             "distinct_total": 87
           },
-          "topic_present": 756,
+          "topic_present": 758,
           "topic": {
             "entries": [
               {
@@ -51817,6 +52081,10 @@
               },
               {
                 "value": "compile-function-decl-arg-bundle",
+                "count": 1
+              },
+              {
+                "value": "compile-side-import-visibility",
                 "count": 1
               },
               {
@@ -53300,6 +53568,10 @@
                 "count": 1
               },
               {
+                "value": "tree-sitter-pipeline-suite-runtime",
+                "count": 1
+              },
+              {
                 "value": "ts-parser-top-level-fault-reporting",
                 "count": 1
               },
@@ -53512,9 +53784,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 550
+            "distinct_total": 552
           },
-          "parent_id_present": 589,
+          "parent_id_present": 604,
           "canonical_true": 27,
           "canonical_false": 0,
           "canonical_non_bool": 1,
@@ -53636,7 +53908,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 30884
+                "count": 30934
               },
               {
                 "value": "list",
@@ -53689,40 +53961,40 @@
           }
         },
         "preferences_and_norms": {
-          "records": 2157,
+          "records": 2158,
           "keys": {
             "entries": [
               {
                 "value": "agent_id",
-                "count": 2157
+                "count": 2158
               },
               {
                 "value": "category",
-                "count": 2157
+                "count": 2158
               },
               {
                 "value": "created_at",
-                "count": 2157
+                "count": 2158
               },
               {
                 "value": "data",
-                "count": 2157
+                "count": 2158
               },
               {
                 "value": "hash",
-                "count": 2157
+                "count": 2158
               },
               {
                 "value": "user_id",
-                "count": 2157
+                "count": 2158
               },
               {
                 "value": "updated_at",
-                "count": 2035
+                "count": 2036
               },
               {
                 "value": "role",
-                "count": 1627
+                "count": 1628
               },
               {
                 "value": "topic",
@@ -53738,11 +54010,11 @@
               },
               {
                 "value": "kind",
-                "count": 71
+                "count": 72
               },
               {
                 "value": "parent_id",
-                "count": 60
+                "count": 61
               },
               {
                 "value": "escalation_id",
@@ -54211,7 +54483,7 @@
             "entries": [
               {
                 "value": "amendment",
-                "count": 55
+                "count": 56
               },
               {
                 "value": "sighting",
@@ -54921,7 +55193,7 @@
             ],
             "distinct_total": 105
           },
-          "parent_id_present": 60,
+          "parent_id_present": 61,
           "canonical_true": 12,
           "canonical_false": 0,
           "canonical_non_bool": 0,
@@ -54983,7 +55255,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 2141
+                "count": 2142
               },
               {
                 "value": "list",
@@ -55028,64 +55300,64 @@
           }
         },
         "procedural_knowledge": {
-          "records": 7996,
+          "records": 8046,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 7996
+                "count": 8046
               },
               {
                 "value": "created_at",
-                "count": 7996
+                "count": 8046
               },
               {
                 "value": "data",
-                "count": 7996
+                "count": 8046
               },
               {
                 "value": "hash",
-                "count": 7996
+                "count": 8046
               },
               {
                 "value": "user_id",
-                "count": 7996
+                "count": 8046
               },
               {
                 "value": "agent_id",
-                "count": 7990
+                "count": 8040
               },
               {
                 "value": "updated_at",
-                "count": 7923
+                "count": 7973
               },
               {
                 "value": "role",
-                "count": 7508
+                "count": 7558
               },
               {
                 "value": "topic",
-                "count": 1291
+                "count": 1300
               },
               {
                 "value": "task_id",
-                "count": 970
+                "count": 975
               },
               {
                 "value": "kind",
-                "count": 931
+                "count": 952
               },
               {
                 "value": "parent_id",
-                "count": 798
+                "count": 819
               },
               {
                 "value": "x_contested",
-                "count": 187
+                "count": 193
               },
               {
                 "value": "supersedes",
-                "count": 150
+                "count": 151
               },
               {
                 "value": "source",
@@ -55093,7 +55365,7 @@
               },
               {
                 "value": "x_contested_by_triage",
-                "count": 110
+                "count": 116
               },
               {
                 "value": "canonical",
@@ -55136,6 +55408,10 @@
                 "count": 21
               },
               {
+                "value": "x_superseded_by",
+                "count": 20
+              },
+              {
                 "value": "commit",
                 "count": 19
               },
@@ -55145,10 +55421,6 @@
               },
               {
                 "value": "related_tasks",
-                "count": 19
-              },
-              {
-                "value": "x_superseded_by",
                 "count": 19
               },
               {
@@ -56274,7 +56546,7 @@
             "entries": [
               {
                 "value": "amendment",
-                "count": 723
+                "count": 744
               },
               {
                 "value": "sighting",
@@ -56583,7 +56855,7 @@
             ],
             "distinct_total": 77
           },
-          "kind_missing": 7065,
+          "kind_missing": 7094,
           "source": {
             "entries": [
               {
@@ -57018,12 +57290,12 @@
             ],
             "distinct_total": 45
           },
-          "topic_present": 1291,
+          "topic_present": 1300,
           "topic": {
             "entries": [
               {
                 "value": "tree-sitter-reify-build-grammar",
-                "count": 34
+                "count": 35
               },
               {
                 "value": "harness-layout-gate-decision-rule",
@@ -57530,7 +57802,15 @@
                 "count": 2
               },
               {
+                "value": "tree-sitter-freshness-test-isolation",
+                "count": 2
+              },
+              {
                 "value": "unlimited-holder-lock-pins",
+                "count": 2
+              },
+              {
+                "value": "verify-executor-exit-codes",
                 "count": 2
               },
               {
@@ -57746,6 +58026,10 @@
                 "count": 1
               },
               {
+                "value": "canon-run-signal-propagation",
+                "count": 1
+              },
+              {
                 "value": "capability-manifest-dated-evidence",
                 "count": 1
               },
@@ -57767,6 +58051,10 @@
               },
               {
                 "value": "capability-manifest-yaml-validation",
+                "count": 1
+              },
+              {
+                "value": "cargo-build-script-run-eviction",
                 "count": 1
               },
               {
@@ -58523,6 +58811,10 @@
               },
               {
                 "value": "lost-review-state-recovery",
+                "count": 1
+              },
+              {
+                "value": "mcp-chunk-prose-idiom-gate",
                 "count": 1
               },
               {
@@ -59850,7 +60142,7 @@
                 "count": 1
               },
               {
-                "value": "tree-sitter-freshness-test-isolation",
+                "value": "trampoline-decode-ratchet-rows",
                 "count": 1
               },
               {
@@ -59959,6 +60251,10 @@
               },
               {
                 "value": "verify-heavy-exclusion-role-scope",
+                "count": 1
+              },
+              {
+                "value": "verify-infra-suite-wall-timeout",
                 "count": 1
               },
               {
@@ -60170,9 +60466,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 787
+            "distinct_total": 793
           },
-          "parent_id_present": 798,
+          "parent_id_present": 819,
           "canonical_true": 83,
           "canonical_false": 6,
           "canonical_non_bool": 0,
@@ -60518,11 +60814,11 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 7846
+                "count": 7895
               },
               {
                 "value": "list",
-                "count": 137
+                "count": 138
               },
               {
                 "value": "scalar",
@@ -60535,7 +60831,7 @@
             "entries": [
               {
                 "value": "full_uuid",
-                "count": 233
+                "count": 234
               },
               {
                 "value": "other",
@@ -60548,7 +60844,7 @@
             "entries": [
               {
                 "value": 1,
-                "count": 44
+                "count": 45
               },
               {
                 "value": 0,
@@ -61021,52 +61317,52 @@
     }
   },
   "grand_total": {
-    "records": 80448,
+    "records": 80787,
     "keys": {
       "entries": [
         {
           "value": "category",
-          "count": 80448
+          "count": 80787
         },
         {
           "value": "created_at",
-          "count": 80448
+          "count": 80787
         },
         {
           "value": "data",
-          "count": 80448
+          "count": 80787
         },
         {
           "value": "hash",
-          "count": 80448
+          "count": 80787
         },
         {
           "value": "user_id",
-          "count": 80448
+          "count": 80787
         },
         {
           "value": "updated_at",
-          "count": 76712
+          "count": 77051
         },
         {
           "value": "agent_id",
-          "count": 60362
+          "count": 60624
         },
         {
           "value": "role",
-          "count": 57730
+          "count": 58069
         },
         {
           "value": "task_id",
-          "count": 30623
+          "count": 30820
         },
         {
           "value": "source",
-          "count": 24212
+          "count": 24345
         },
         {
           "value": "transition",
-          "count": 21049
+          "count": 21126
         },
         {
           "value": "_causation_id",
@@ -61078,19 +61374,19 @@
         },
         {
           "value": "kind",
-          "count": 7935
+          "count": 8097
         },
         {
           "value": "stage2_suppress",
-          "count": 7147
+          "count": 7224
         },
         {
           "value": "echo_used_provenance",
-          "count": 6658
+          "count": 6734
         },
         {
           "value": "topic",
-          "count": 5747
+          "count": 5801
         },
         {
           "value": "run_id",
@@ -61098,7 +61394,7 @@
         },
         {
           "value": "parent_id",
-          "count": 4452
+          "count": 4558
         },
         {
           "value": "stage",
@@ -61106,11 +61402,11 @@
         },
         {
           "value": "x_contested",
-          "count": 1234
+          "count": 1266
         },
         {
           "value": "x_contested_by_triage",
-          "count": 817
+          "count": 849
         },
         {
           "value": "commit",
@@ -61122,7 +61418,7 @@
         },
         {
           "value": "supersedes",
-          "count": 514
+          "count": 515
         },
         {
           "value": "escalation_id",
@@ -61281,16 +61577,16 @@
           "count": 121
         },
         {
+          "value": "echo_suppressed_stale_description",
+          "count": 120
+        },
+        {
           "value": "prior_fact",
           "count": 120
         },
         {
           "value": "subject_task",
           "count": 120
-        },
-        {
-          "value": "echo_suppressed_stale_description",
-          "count": 119
         },
         {
           "value": "cycle_date",
@@ -61322,7 +61618,7 @@
         },
         {
           "value": "x_superseded_by",
-          "count": 92
+          "count": 93
         },
         {
           "value": "deletions",
@@ -61337,11 +61633,11 @@
           "count": 87
         },
         {
-          "value": "section",
-          "count": 84
+          "value": "unverified_claim",
+          "count": 85
         },
         {
-          "value": "unverified_claim",
+          "value": "section",
           "count": 84
         },
         {
@@ -65377,6 +65673,10 @@
           "count": 2
         },
         {
+          "value": "x_unlanded_path_note",
+          "count": 2
+        },
+        {
           "value": "x_verified_at",
           "count": 2
         },
@@ -69225,10 +69525,6 @@
           "count": 1
         },
         {
-          "value": "x_unlanded_path_note",
-          "count": 1
-        },
-        {
           "value": "zero_agent_invocations",
           "count": 1
         }
@@ -69239,7 +69535,7 @@
       "entries": [
         {
           "value": "amendment",
-          "count": 4131
+          "count": 4237
         },
         {
           "value": "cycle_summary",
@@ -69247,7 +69543,7 @@
         },
         {
           "value": "task_completion",
-          "count": 576
+          "count": 632
         },
         {
           "value": "sighting",
@@ -71172,16 +71468,16 @@
       ],
       "distinct_total": 483
     },
-    "kind_missing": 72513,
+    "kind_missing": 72690,
     "source": {
       "entries": [
         {
           "value": "targeted_reconciliation",
-          "count": 20736
+          "count": 20813
         },
         {
           "value": "orchestrator_completion",
-          "count": 2009
+          "count": 2065
         },
         {
           "value": "consolidation",
@@ -72214,7 +72510,7 @@
       "entries": [
         {
           "value": "targeted_reconciliation",
-          "count": 20713
+          "count": 20790
         },
         {
           "value": "orchestrator_completion",
@@ -73099,7 +73395,7 @@
       ],
       "distinct_total": 221
     },
-    "topic_present": 5747,
+    "topic_present": 5801,
     "topic": {
       "entries": [
         {
@@ -73108,7 +73404,7 @@
         },
         {
           "value": "dashboard-js-test-substrate",
-          "count": 68
+          "count": 70
         },
         {
           "value": "inline-suppression-ratchet",
@@ -73131,11 +73427,11 @@
           "count": 38
         },
         {
-          "value": "dashboard-redux-cache-buster",
-          "count": 37
+          "value": "tree-sitter-reify-build-grammar",
+          "count": 38
         },
         {
-          "value": "tree-sitter-reify-build-grammar",
+          "value": "dashboard-redux-cache-buster",
           "count": 37
         },
         {
@@ -73147,11 +73443,11 @@
           "count": 31
         },
         {
-          "value": "harness-layout-gate-decision-rule",
-          "count": 30
+          "value": "vacuous-test-guard",
+          "count": 31
         },
         {
-          "value": "vacuous-test-guard",
+          "value": "harness-layout-gate-decision-rule",
           "count": 30
         },
         {
@@ -73563,6 +73859,14 @@
           "count": 6
         },
         {
+          "value": "lock-charter-extension-allowlist",
+          "count": 6
+        },
+        {
+          "value": "loop-blocking-gate-allowlist",
+          "count": 6
+        },
+        {
           "value": "merge-rr-lock-stale-after-rerere-failure",
           "count": 6
         },
@@ -73615,6 +73919,10 @@
           "count": 5
         },
         {
+          "value": "dashboard-payload-budgets",
+          "count": 5
+        },
+        {
           "value": "dashboard-test-suite-blast-radius",
           "count": 5
         },
@@ -73644,10 +73952,6 @@
         },
         {
           "value": "head-limited-grep-truncates-the-decisive-hit",
-          "count": 5
-        },
-        {
-          "value": "loop-blocking-gate-allowlist",
           "count": 5
         },
         {
@@ -73732,10 +74036,6 @@
         },
         {
           "value": "completion-claim-gate-measurement",
-          "count": 4
-        },
-        {
-          "value": "dashboard-payload-budgets",
           "count": 4
         },
         {
@@ -73979,6 +74279,10 @@
           "count": 3
         },
         {
+          "value": "flake-debt-triage",
+          "count": 3
+        },
+        {
           "value": "fused-memory-clip-disclosure",
           "count": 3
         },
@@ -74028,10 +74332,6 @@
         },
         {
           "value": "local-repo-seeder-guard",
-          "count": 3
-        },
-        {
-          "value": "lock-charter-extension-allowlist",
           "count": 3
         },
         {
@@ -74163,6 +74463,10 @@
           "count": 3
         },
         {
+          "value": "rule-c-wall-clock-debt-budget",
+          "count": 3
+        },
+        {
           "value": "sample-manifest-verify-frame-bound",
           "count": 3
         },
@@ -74260,6 +74564,14 @@
         },
         {
           "value": "architect-plan-tools-recipe",
+          "count": 2
+        },
+        {
+          "value": "architect-plan-tools-recipe-single-home",
+          "count": 2
+        },
+        {
+          "value": "asyncio-bounded-cancel-wait",
           "count": 2
         },
         {
@@ -74400,6 +74712,10 @@
         },
         {
           "value": "curator-dedup-outage-2026-08",
+          "count": 2
+        },
+        {
+          "value": "curator-test-seams",
           "count": 2
         },
         {
@@ -74567,10 +74883,6 @@
           "count": 2
         },
         {
-          "value": "flake-debt-triage",
-          "count": 2
-        },
-        {
           "value": "flake-debt-write-triage-judge-live-timeout",
           "count": 2
         },
@@ -74607,6 +74919,10 @@
           "count": 2
         },
         {
+          "value": "fused-memory-real-store-test-seeding",
+          "count": 2
+        },
+        {
           "value": "fused-memory-test-config-isolation",
           "count": 2
         },
@@ -74628,6 +74944,10 @@
         },
         {
           "value": "git-build-hygiene",
+          "count": 2
+        },
+        {
+          "value": "git-index-lock-liveness",
           "count": 2
         },
         {
@@ -75079,10 +75399,6 @@
           "count": 2
         },
         {
-          "value": "rule-c-wall-clock-debt-budget",
-          "count": 2
-        },
-        {
           "value": "run-gui-sh-sidecar-provisioning-docs",
           "count": 2
         },
@@ -75215,6 +75531,14 @@
           "count": 2
         },
         {
+          "value": "tree-sitter-freshness-test-isolation",
+          "count": 2
+        },
+        {
+          "value": "tree-sitter-pipeline-suite-runtime",
+          "count": 2
+        },
+        {
           "value": "unit-liveness-predicates",
           "count": 2
         },
@@ -75232,6 +75556,10 @@
         },
         {
           "value": "verify-budget-census-test-layout",
+          "count": 2
+        },
+        {
+          "value": "verify-executor-exit-codes",
           "count": 2
         },
         {
@@ -75631,15 +75959,15 @@
           "count": 1
         },
         {
-          "value": "architect-plan-tools-recipe-single-home",
-          "count": 1
-        },
-        {
           "value": "architect-probe-merge",
           "count": 1
         },
         {
           "value": "architect-prototype-flip-measurement",
+          "count": 1
+        },
+        {
+          "value": "architect-redispatch-forensics",
           "count": 1
         },
         {
@@ -75995,6 +76323,10 @@
           "count": 1
         },
         {
+          "value": "canon-run-signal-propagation",
+          "count": 1
+        },
+        {
           "value": "canonical-memory-authoring-rules",
           "count": 1
         },
@@ -76044,6 +76376,10 @@
         },
         {
           "value": "caplog-deflake-injection",
+          "count": 1
+        },
+        {
+          "value": "cargo-build-script-run-eviction",
           "count": 1
         },
         {
@@ -76383,6 +76719,10 @@
           "count": 1
         },
         {
+          "value": "combine-audit-row-partition",
+          "count": 1
+        },
+        {
           "value": "commit-attribution-by-merge-marker-range",
           "count": 1
         },
@@ -76424,6 +76764,10 @@
         },
         {
           "value": "compile-perf-ab-measurement",
+          "count": 1
+        },
+        {
+          "value": "compile-side-import-visibility",
           "count": 1
         },
         {
@@ -76615,6 +76959,10 @@
           "count": 1
         },
         {
+          "value": "count-memories-by-metadata-prompt-spelling",
+          "count": 1
+        },
+        {
           "value": "cpsat-enumerable-domains",
           "count": 1
         },
@@ -76784,10 +77132,6 @@
         },
         {
           "value": "curator-sweep-wave2-session-summary",
-          "count": 1
-        },
-        {
-          "value": "curator-test-seams",
           "count": 1
         },
         {
@@ -78175,6 +78519,10 @@
           "count": 1
         },
         {
+          "value": "flake-debt-forensics",
+          "count": 1
+        },
+        {
           "value": "flake-debt-mem0-create-col-readtimeout",
           "count": 1
         },
@@ -78288,6 +78636,10 @@
         },
         {
           "value": "folded-escalation-filer-table",
+          "count": 1
+        },
+        {
+          "value": "followup-hold-waiting-dependent",
           "count": 1
         },
         {
@@ -78439,10 +78791,6 @@
           "count": 1
         },
         {
-          "value": "fused-memory-real-store-test-seeding",
-          "count": 1
-        },
-        {
           "value": "fused-memory-rebuild-test-layout",
           "count": 1
         },
@@ -78460,6 +78808,10 @@
         },
         {
           "value": "fused-memory-script-sys-path-bootstrap",
+          "count": 1
+        },
+        {
+          "value": "fused-memory-search-test-backend-mocks",
           "count": 1
         },
         {
@@ -78512,6 +78864,10 @@
         },
         {
           "value": "fused-memory-test-fixtures",
+          "count": 1
+        },
+        {
+          "value": "fused-memory-test-flakes",
           "count": 1
         },
         {
@@ -78708,10 +79064,6 @@
         },
         {
           "value": "git-hook-signal-handling",
-          "count": 1
-        },
-        {
-          "value": "git-index-lock-liveness",
           "count": 1
         },
         {
@@ -79091,6 +79443,10 @@
           "count": 1
         },
         {
+          "value": "harness-slot-lease",
+          "count": 1
+        },
+        {
           "value": "harness-split-mechanics",
           "count": 1
         },
@@ -79164,6 +79520,10 @@
         },
         {
           "value": "import-unit-stdlib-and-diagnostics",
+          "count": 1
+        },
+        {
+          "value": "index-lock-standoff-test-recipe",
           "count": 1
         },
         {
@@ -79467,6 +79827,10 @@
           "count": 1
         },
         {
+          "value": "landlock-proc-ptrace-gated-reads",
+          "count": 1
+        },
+        {
           "value": "landlock_var_tmp_full_suite_gotcha",
           "count": 1
         },
@@ -79675,7 +80039,15 @@
           "count": 1
         },
         {
+          "value": "lint-command-chain-tail",
+          "count": 1
+        },
+        {
           "value": "linux-mime-registration-testing",
+          "count": 1
+        },
+        {
+          "value": "live-gate-integration-tier",
           "count": 1
         },
         {
@@ -79748,6 +80120,10 @@
         },
         {
           "value": "lock-charter-extensionless-sweep",
+          "count": 1
+        },
+        {
+          "value": "lock-charter-extensionless-vector",
           "count": 1
         },
         {
@@ -79891,6 +80267,10 @@
           "count": 1
         },
         {
+          "value": "mcp-chunk-prose-idiom-gate",
+          "count": 1
+        },
+        {
           "value": "mcp-client-meta-rendering",
           "count": 1
         },
@@ -79924,6 +80304,10 @@
         },
         {
           "value": "mcp-language-chunk-registry",
+          "count": 1
+        },
+        {
+          "value": "mcp-lifecycle-session-leak",
           "count": 1
         },
         {
@@ -80083,6 +80467,10 @@
           "count": 1
         },
         {
+          "value": "mem0-search-item-shape",
+          "count": 1
+        },
+        {
           "value": "mem0-stage1-flag-marker-stale-uuids",
           "count": 1
         },
@@ -80191,6 +80579,10 @@
           "count": 1
         },
         {
+          "value": "memory-write-census",
+          "count": 1
+        },
+        {
           "value": "memory-write-path",
           "count": 1
         },
@@ -80240,6 +80632,10 @@
         },
         {
           "value": "merge-gate-evidence-sources",
+          "count": 1
+        },
+        {
+          "value": "merge-gate-history-census",
           "count": 1
         },
         {
@@ -80328,6 +80724,10 @@
         },
         {
           "value": "merge-lane-forensics",
+          "count": 1
+        },
+        {
+          "value": "merge-lane-fresh-dequeue-base",
           "count": 1
         },
         {
@@ -80471,6 +80871,10 @@
           "count": 1
         },
         {
+          "value": "merge-lane-rebased-head-resubmission-test-flake",
+          "count": 1
+        },
+        {
           "value": "merge-lane-remote-verify-abort-order",
           "count": 1
         },
@@ -80500,6 +80904,10 @@
         },
         {
           "value": "merge-lane-test-remote-verify-attribution",
+          "count": 1
+        },
+        {
+          "value": "merge-lane-test-scenes",
           "count": 1
         },
         {
@@ -83455,7 +83863,15 @@
           "count": 1
         },
         {
+          "value": "scheduler-claim-started-set",
+          "count": 1
+        },
+        {
           "value": "scheduler-continuity-probe-test-seam",
+          "count": 1
+        },
+        {
+          "value": "scheduler-dated-gate-dispatch",
           "count": 1
         },
         {
@@ -83576,6 +83992,10 @@
         },
         {
           "value": "sdk-client-test-double",
+          "count": 1
+        },
+        {
+          "value": "secret-env-name-rule",
           "count": 1
         },
         {
@@ -84439,6 +84859,10 @@
           "count": 1
         },
         {
+          "value": "t3-code-deep-links",
+          "count": 1
+        },
+        {
           "value": "t3-thread-wait-semantics",
           "count": 1
         },
@@ -84851,6 +85275,10 @@
           "count": 1
         },
         {
+          "value": "timing-dependence-lint",
+          "count": 1
+        },
+        {
           "value": "tmp-project-root-literal-census",
           "count": 1
         },
@@ -84955,6 +85383,10 @@
           "count": 1
         },
         {
+          "value": "trampoline-decode-ratchet-rows",
+          "count": 1
+        },
+        {
           "value": "transcript-archive-copy-primitive",
           "count": 1
         },
@@ -84967,10 +85399,6 @@
           "count": 1
         },
         {
-          "value": "tree-sitter-freshness-test-isolation",
-          "count": 1
-        },
-        {
           "value": "tree-sitter-generated-headers-transition",
           "count": 1
         },
@@ -84980,10 +85408,6 @@
         },
         {
           "value": "tree-sitter-grammar-byte-identity-sweep",
-          "count": 1
-        },
-        {
-          "value": "tree-sitter-pipeline-suite-runtime",
           "count": 1
         },
         {
@@ -85275,7 +85699,15 @@
           "count": 1
         },
         {
+          "value": "verify-cache-kill-switch",
+          "count": 1
+        },
+        {
           "value": "verify-cache-module-keys",
+          "count": 1
+        },
+        {
+          "value": "verify-cache-unit-outcomes",
           "count": 1
         },
         {
@@ -85344,6 +85776,10 @@
         },
         {
           "value": "verify-infra-contention",
+          "count": 1
+        },
+        {
+          "value": "verify-infra-suite-wall-timeout",
           "count": 1
         },
         {
@@ -86147,9 +86583,9 @@
           "count": 1
         }
       ],
-      "distinct_total": 3261
+      "distinct_total": 3296
     },
-    "parent_id_present": 4452,
+    "parent_id_present": 4558,
     "canonical_true": 207,
     "canonical_false": 51,
     "canonical_non_bool": 1,
@@ -86987,11 +87423,11 @@
       "entries": [
         {
           "value": "absent",
-          "count": 79934
+          "count": 80272
         },
         {
           "value": "list",
-          "count": 433
+          "count": 434
         },
         {
           "value": "scalar",
@@ -87004,7 +87440,7 @@
       "entries": [
         {
           "value": "full_uuid",
-          "count": 611
+          "count": 612
         },
         {
           "value": "other",
@@ -87021,7 +87457,7 @@
       "entries": [
         {
           "value": 1,
-          "count": 184
+          "count": 185
         },
         {
           "value": 0,
@@ -87076,12 +87512,12 @@
     }
   },
   "topic_coverage": {
-    "records": 80448,
-    "topic_present": 5747,
-    "topic_coverage_pct": 7.1437,
-    "distinct_topics": 3261,
+    "records": 80787,
+    "topic_present": 5801,
+    "topic_coverage_pct": 7.1806,
+    "distinct_topics": 3296,
     "topics_with_one_canonical": 207,
-    "topics_with_zero_canonical": 3059,
+    "topics_with_zero_canonical": 3094,
     "topics_with_multiple_canonical": 0,
     "multiple_canonical_topics": [],
     "canonical_uniqueness_enforced": false,
@@ -87109,7 +87545,7 @@
         "source": "task 3626 ([MILESTONE] memory_metadata.enforce flip gate)"
       }
     ],
-    "slug_conforming": 3104,
+    "slug_conforming": 3139,
     "slug_non_conforming": 157,
     "non_conforming_topics": [
       {
@@ -88158,7 +88594,7 @@
   "kind_registry_drift": {
     "registry_total": 336,
     "measured_distinct": 483,
-    "measured_records": 7935,
+    "measured_records": 8097,
     "registered_distinct": 317,
     "unregistered_distinct": 166,
     "unregistered_records": 333,
@@ -88852,31 +89288,31 @@
     ]
   },
   "coverage_trend": {
-    "baseline": "2026-11-21T05:00:47+00:00",
-    "baseline_reason": "compared against the most recent prior run (2026-11-21T05:00:47+00:00)",
+    "baseline": "2026-11-23T05:00:56+00:00",
+    "baseline_reason": "compared against the most recent prior run (2026-11-23T05:00:56+00:00)",
     "projects": {
       "dark_factory": {
         "status": "compared",
         "columns": {
           "records": {
-            "before": 38764,
-            "after": 39242,
-            "delta": 478
+            "before": 39242,
+            "after": 39480,
+            "delta": 238
           },
           "topic_present": {
-            "before": 3440,
-            "after": 3516,
-            "delta": 76
+            "before": 3516,
+            "after": 3559,
+            "delta": 43
           },
           "topic_coverage_pct": {
-            "before": 8.8742,
-            "after": 8.9598,
-            "delta": 0.0856
+            "before": 8.9598,
+            "after": 9.0147,
+            "delta": 0.0549
           },
           "distinct_topics": {
-            "before": 1837,
-            "after": 1900,
-            "delta": 63
+            "before": 1900,
+            "after": 1928,
+            "delta": 28
           },
           "topics_with_one_canonical": {
             "before": 85,
@@ -88884,9 +89320,9 @@
             "delta": 0
           },
           "topics_with_zero_canonical": {
-            "before": 1752,
-            "after": 1815,
-            "delta": 63
+            "before": 1815,
+            "after": 1843,
+            "delta": 28
           },
           "topics_with_multiple_canonical": {
             "before": 0,
@@ -88904,9 +89340,9 @@
             "delta": 0
           },
           "slug_conforming": {
-            "before": 1746,
-            "after": 1809,
-            "delta": 63
+            "before": 1809,
+            "after": 1837,
+            "delta": 28
           },
           "slug_non_conforming": {
             "before": 91,
@@ -88949,24 +89385,24 @@
         "status": "compared",
         "columns": {
           "records": {
-            "before": 41056,
-            "after": 41206,
-            "delta": 150
+            "before": 41206,
+            "after": 41307,
+            "delta": 101
           },
           "topic_present": {
-            "before": 2223,
-            "after": 2231,
-            "delta": 8
+            "before": 2231,
+            "after": 2242,
+            "delta": 11
           },
           "topic_coverage_pct": {
-            "before": 5.4146,
-            "after": 5.4143,
-            "delta": -0.0003
+            "before": 5.4143,
+            "after": 5.4277,
+            "delta": 0.0134
           },
           "distinct_topics": {
-            "before": 1358,
-            "after": 1366,
-            "delta": 8
+            "before": 1366,
+            "after": 1373,
+            "delta": 7
           },
           "topics_with_one_canonical": {
             "before": 122,
@@ -88974,9 +89410,9 @@
             "delta": 0
           },
           "topics_with_zero_canonical": {
-            "before": 1236,
-            "after": 1244,
-            "delta": 8
+            "before": 1244,
+            "after": 1251,
+            "delta": 7
           },
           "topics_with_multiple_canonical": {
             "before": 0,
@@ -88994,9 +89430,9 @@
             "delta": 0
           },
           "slug_conforming": {
-            "before": 1292,
-            "after": 1300,
-            "delta": 8
+            "before": 1300,
+            "after": 1307,
+            "delta": 7
           },
           "slug_non_conforming": {
             "before": 66,
@@ -89053,41 +89489,41 @@
     "projects": {
       "dark_factory": {
         "collection": "fused_dark_factory",
-        "collection_points": 39242,
-        "collection_points_before": 39242,
+        "collection_points": 39480,
+        "collection_points_before": 39480,
         "collection_points_interval": [
-          39242,
-          39242
+          39480,
+          39480
         ],
-        "counted": 39242,
-        "counted_recount": 39242,
+        "counted": 39480,
+        "counted_recount": 39480,
         "counted_interval": [
-          39242,
-          39242
+          39480,
+          39480
         ],
         "uncovered_points": 0,
         "complete": true,
         "categories": {
           "observations_and_summaries": {
-            "expected": 27204,
-            "recount": 27204,
-            "scrolled": 27204,
+            "expected": 27347,
+            "recount": 27347,
+            "scrolled": 27347,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "preferences_and_norms": {
-            "expected": 2433,
-            "recount": 2433,
-            "scrolled": 2433,
+            "expected": 2443,
+            "recount": 2443,
+            "scrolled": 2443,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "procedural_knowledge": {
-            "expected": 9581,
-            "recount": 9581,
-            "scrolled": 9581,
+            "expected": 9666,
+            "recount": 9666,
+            "scrolled": 9666,
             "delta": 0,
             "complete": true,
             "churn": false
@@ -89120,41 +89556,41 @@
       },
       "reify": {
         "collection": "fused_reify",
-        "collection_points": 41206,
-        "collection_points_before": 41206,
+        "collection_points": 41307,
+        "collection_points_before": 41307,
         "collection_points_interval": [
-          41206,
-          41206
+          41307,
+          41307
         ],
-        "counted": 41206,
-        "counted_recount": 41206,
+        "counted": 41307,
+        "counted_recount": 41307,
         "counted_interval": [
-          41206,
-          41206
+          41307,
+          41307
         ],
         "uncovered_points": 0,
         "complete": true,
         "categories": {
           "observations_and_summaries": {
-            "expected": 30972,
-            "recount": 30972,
-            "scrolled": 30972,
+            "expected": 31022,
+            "recount": 31022,
+            "scrolled": 31022,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "preferences_and_norms": {
-            "expected": 2157,
-            "recount": 2157,
-            "scrolled": 2157,
+            "expected": 2158,
+            "recount": 2158,
+            "scrolled": 2158,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "procedural_knowledge": {
-            "expected": 7996,
-            "recount": 7996,
-            "scrolled": 7996,
+            "expected": 8046,
+            "recount": 8046,
+            "scrolled": 8046,
             "delta": 0,
             "complete": true,
             "churn": false
