@@ -77,6 +77,7 @@ from fused_memory.server.write_triage import (
     JudgeUsage,
     TriageJudgeVerdict,
 )
+from fused_memory.services.plan_route import PlanRoute, PlanRouteSite
 from fused_memory.utils.clip_disclosure import TruncationFact, elide_text
 
 if TYPE_CHECKING:
@@ -877,6 +878,8 @@ class _JudgeRoute(NamedTuple):
     host: str | None
     url_from: str
     key_from: str
+    #: Whether the call rides the plan route's cap gate (task 9944).
+    via_plan_route: bool = False
 
 
 class _ProviderCredentials(NamedTuple):
@@ -921,11 +924,33 @@ def _announce_judge_route(route: _JudgeRoute) -> None:
     goes with nothing else to show for it. One line per change, not per call.
     """
     logger.info(
-        'write_triage judge route: %s at %s (base_url from %s), api_key from %s',
+        'write_triage judge route: %s at %s%s (base_url from %s), api_key from %s',
         route.provider,
         route.host or 'the SDK default endpoint',
+        ' via the plan route' if route.via_plan_route else '',
         route.url_from,
         route.key_from,
+    )
+
+
+def _on_the_plan_route(
+    creds: _ProviderCredentials, memory_service: Any, provider: str,
+) -> _ProviderCredentials:
+    """*creds* riding the plan route's gated client when their base_url is the plan proxy.
+
+    The anthropic arm is never gated. A memory_service without a real
+    :class:`PlanRoute` judges ungated, as it did before the route existed.
+    """
+    route = getattr(memory_service, 'plan_route', None)
+    base_url = creds.client_kwargs.get('base_url')
+    if provider == 'anthropic' or not isinstance(route, PlanRoute) or not base_url:
+        return creds
+    http_client = route.http_client_for(base_url, site=PlanRouteSite.WRITE_TRIAGE_JUDGE)
+    if http_client is None:
+        return creds
+    return creds._replace(
+        client_kwargs={**creds.client_kwargs, 'http_client': http_client},
+        route=creds.route._replace(via_plan_route=True),
     )
 
 
@@ -1042,7 +1067,9 @@ async def _call_llm(
             f'unknown judge provider {provider!r}; implemented arms are '
             f'{list(_KNOWN_PROVIDERS)}',
         )
-    creds = _provider_credentials(memory_service, provider)
+    creds = _on_the_plan_route(
+        _provider_credentials(memory_service, provider), memory_service, provider,
+    )
     _announce_judge_route(creds.route)
     if reasoning_effort is not None and not creds.serves_responses_api:
         why = (
