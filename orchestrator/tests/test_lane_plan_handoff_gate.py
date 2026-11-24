@@ -24,10 +24,12 @@ from _info_l0_router_fixtures import PASSED, TASK_ID, assignment, run_config
 from _workflow_helpers import (
     AgentStub,
     _build_workflow_with_escalation,
-    _derive_meta_root_like_production as _derive_meta_root_like_production,
     _init_repo,
     _make_git_ops,
     _make_resolving_steward,
+)
+from _workflow_helpers import (
+    _derive_meta_root_like_production as _derive_meta_root_like_production,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
