@@ -32,6 +32,8 @@ from typing import Any
 CannedResponse = tuple[int, dict[str, Any]] | tuple[int, dict[str, Any], Mapping[str, str]]
 """``(status, body)`` or ``(status, body, extra_headers)``."""
 
+_Canned = tuple[int, dict[str, Any], Mapping[str, str]]
+
 # Long enough to survive graphiti's OpenAIEmbedder, which TRUNCATES the vector
 # to embedding_dim — a short vector would surface as a length mismatch and be
 # misread as a plumbing bug.
@@ -131,7 +133,7 @@ class MockOpenAIServer:
         # ThreadingHTTPServer serves concurrently — guard the record list.
         self._lock = threading.Lock()
         self._requests: list[dict[str, Any]] = []
-        self._responses: dict[str, list[CannedResponse]] = {}
+        self._responses: dict[str, list[_Canned]] = {}
         self.chat_content = '{"ok": true}'
         self.chat_responder: Callable[[Any], str] | None = None
         """When set, each chat reply's content is computed from that request's JSON body."""
@@ -168,8 +170,11 @@ class MockOpenAIServer:
         """
         if not bodies:
             raise ValueError('a response sequence needs at least one (status, body) pair')
+        canned = [
+            (entry[0], entry[1], entry[2] if len(entry) == 3 else {}) for entry in bodies
+        ]
         with self._lock:
-            self._responses[path_suffix] = list(bodies)
+            self._responses[path_suffix] = canned
 
     # -- internals used by the handler --
 
@@ -177,7 +182,7 @@ class MockOpenAIServer:
         with self._lock:
             self._requests.append(entry)
 
-    def _canned(self, path: str) -> CannedResponse | None:
+    def _canned(self, path: str) -> _Canned | None:
         with self._lock:
             for suffix, sequence in self._responses.items():
                 if path.endswith(suffix):

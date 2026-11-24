@@ -17,7 +17,7 @@ source. On the plan route ``plan_cap_of`` reads any proxy 429 as that cap.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -170,7 +170,7 @@ def _body_markers(body: object) -> list[str]:
     return _markers(candidates)
 
 
-def _markers(candidates: list[object]) -> list[str]:
+def _markers(candidates: Sequence[object]) -> list[str]:
     return [
         str(value).lower()
         for value in candidates
