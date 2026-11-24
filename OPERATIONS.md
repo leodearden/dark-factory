@@ -813,8 +813,9 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
 §12:
 
 - `engagement`: reveals are disabled for the pass (δ entry (d)).
-- `inbox`: the inbox offset is held (δ entry (e)), and so are the defect
-  scan's `defect_scan_offset` and `pending_reports`.
+- `inbox`: the inbox offset is held (δ entry (e)), and so is the defect
+  scan's `defect_scan_offset`. `pending_reports` gains no new report, but it
+  still loses any report whose carrier appears.
 - `filer`: a `defect_reported` line older than `filer_grace_seconds`
   (`client-feed/src/client_feed/policy.py::Policy`, default 600) still has no
   non-deferred carrier. The reason names each such ref, and the report waits

@@ -244,6 +244,24 @@ class TestAnUnfiledReportIsLoud:
         assert [(f.ref, f.task_id) for f in root.filed()] == [(FIX, 6)]
         assert root.filed()[0].seq > root.last_heartbeat().watermark_seq
 
+    def test_it_clears_once_its_carrier_is_pending_while_the_inbox_is_unusable(
+        self, root: Root
+    ) -> None:
+        append_inbox(root.in_dir, reported(2, 1, at=T))
+        root.run(seconds(60))
+        held = root.cursor()
+        inbox = root.in_dir / INBOX_FILENAME
+        inbox.unlink()
+        inbox.mkdir()
+        root.tasks.add(6, updated_at=UPDATED, metadata=carrying(FIX))
+
+        report = root.run(seconds(GRACE + 1))
+
+        assert Source.INBOX in sources(report)
+        assert Source.FILER not in sources(report)
+        cursor = root.cursor()
+        assert (cursor.defect_scan_offset, cursor.pending_reports) == (held.defect_scan_offset, {})
+
     def test_it_is_still_named_while_the_carriers_cannot_be_read(self, root: Root) -> None:
         append_inbox(root.in_dir, reported(2, 1, at=T))
         tasks_db(root.policy.project_root).unlink()
