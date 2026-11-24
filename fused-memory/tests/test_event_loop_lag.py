@@ -241,6 +241,7 @@ class TestLoopLagMonitorMeasurement:
         would report ~interval on every sample. Host load can move neither.
         """
         interval = 0.1
+        whole_intervals = 5
         recorded: list[float] = []
         monkeypatch.setattr(
             server_main, '_loop_lag_iteration',
@@ -252,16 +253,18 @@ class TestLoopLagMonitorMeasurement:
             server_main._loop_lag_monitor(threshold_ms=10_000.0, interval=interval),
         )
         try:
-            await asyncio.sleep(interval * 5.5)
+            await asyncio.sleep(interval * (whole_intervals + 0.5))
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        assert len(recorded) == 5, f'expected one sample per whole interval; got {recorded}'
-        assert recorded == pytest.approx([0.0] * len(recorded), abs=1e-6), (
-            f'timers that fired exactly on time reported lag {recorded}ms against the '
-            f'{interval * 1000:.0f}ms interval — the sleep itself is being counted as lag'
+        assert len(recorded) == whole_intervals, (
+            f'expected one sample per whole interval; got {recorded}'
+        )
+        assert recorded == pytest.approx([0.0] * whole_intervals, abs=1e-6), (
+            f'on-time timers reported non-zero overshoot {recorded} (ms); '
+            f'~{interval * 1000:.0f} on each means the sleep is being counted'
         )
 
     @pytest.mark.asyncio
