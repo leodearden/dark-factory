@@ -11,7 +11,7 @@ import signal
 import socket
 import sys
 import threading
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
@@ -57,8 +57,12 @@ DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 # How long after asyncio.run() returns to wait before force-exiting.
 # The watchdog is armed AFTER asyncio.run() returns (not before) so that
 # long orchestration runs are never affected. After this deadline a diagnostic
-# dump is written to stderr and os._exit(137) fires.
+# dump is written to stderr and os._exit(137) fires. asyncio.run()'s own
+# teardown is bounded separately, by the teardown watchdog below.
 SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
+
+# Bounds asyncio.run()'s own teardown, which starts once the main coroutine has ended.
+TEARDOWN_WATCHDOG_TIMEOUT_SECS = 10
 
 # Bounded wait (task 2306 α) for acquiring the laptop persistent-worktree
 # merge-verify fcntl.flock (verify_cancel.acquire_merge_verify_flock) when
@@ -108,6 +112,7 @@ def _force_exit_after_delay(
     *,
     stream=None,
     _exit: 'Callable[[int], None] | None' = None,
+    phase: str = 'after asyncio.run() returned',
 ) -> 'WatchdogHandle':
     """Arm a daemon-thread watchdog that force-exits if not disarmed in time.
 
@@ -128,9 +133,10 @@ def _force_exit_after_delay(
     and ``thread: threading.Thread``).  Calling ``handle.disarm()`` (even
     multiple times) is safe and prevents the watchdog from firing.
     ``handle.thread`` is exposed for tests that want to ``join()`` after
-    assertions to guarantee the watchdog thread has exited; the orchestrator
-    intentionally never disarms so the watchdog guards interpreter shutdown
-    (atexit callbacks + ``threading._shutdown()`` joining non-daemon threads).
+    assertions to guarantee the watchdog thread has exited. The orchestrator
+    intentionally never disarms its post-run watchdog, so it guards interpreter
+    shutdown (atexit callbacks + ``threading._shutdown()`` joining non-daemon
+    threads). *phase* names the window being guarded in the dump header.
 
     The ``_exit`` parameter is an injectable exit callable (default
     ``os._exit``). Injecting a stub in tests means a leaked/late-firing daemon
@@ -155,7 +161,7 @@ def _force_exit_after_delay(
         try:
             import traceback
 
-            lines = ['SHUTDOWN WATCHDOG FIRED — process hung after asyncio.run() returned\n']
+            lines = [f'SHUTDOWN WATCHDOG FIRED — process hung {phase}\n']
             frames = sys._current_frames()
             for t in threading.enumerate():
                 frame = frames.get(t.ident) if t.ident is not None else None
@@ -185,6 +191,54 @@ def _force_exit_after_delay(
         _event.set()
 
     return WatchdogHandle(disarm=disarm, thread=thread)
+
+
+_T = TypeVar('_T')
+
+
+def _run_with_bounded_teardown(
+    main: Callable[[], Awaitable[_T]],
+    *,
+    teardown_secs: float,
+    _exit: Callable[[int], None] | None = None,
+) -> _T:
+    """``asyncio.run(main())``, force-exiting if asyncio.run's teardown hangs.
+
+    asyncio.run cancels every task left when *main* ends and waits on them with
+    no timeout, so one task that ignores its cancel would hold the process
+    forever (task 7247). The watchdog is armed only once *main* has ended and
+    is disarmed when asyncio.run returns.
+    """
+    armed: list[WatchdogHandle] = []
+
+    async def _main_then_arm() -> _T:
+        try:
+            return await main()
+        finally:
+            armed.append(_force_exit_after_delay(
+                teardown_secs, _exit=_exit, phase="in asyncio.run()'s teardown",
+            ))
+            _log_tasks_left_for_teardown()
+
+    try:
+        return asyncio.run(_main_then_arm())
+    finally:
+        for handle in armed:
+            handle.disarm()
+
+
+def _log_tasks_left_for_teardown() -> None:
+    """Name, at WARNING, every task asyncio.run()'s teardown will cancel and wait on.
+
+    The teardown watchdog's dump shows thread stacks only, so this line is what
+    names the task that ignored its cancel.
+    """
+    current = asyncio.current_task()
+    leftovers = sorted(t.get_name() for t in asyncio.all_tasks() if t is not current)
+    if leftovers:
+        logging.getLogger(__name__).warning(
+            "asyncio.run()'s teardown will cancel and wait on %d task(s): %s", len(leftovers), leftovers,
+        )
 
 
 def _make_cancel_handler(main_task, logger):
@@ -311,10 +365,11 @@ def run(prd: Path | None, config: OrchestratorConfig, dry_run: bool, delay: str 
         )
 
     try:
-        report = asyncio.run(_main())
+        report = _run_with_bounded_teardown(_main, teardown_secs=TEARDOWN_WATCHDOG_TIMEOUT_SECS)
     except asyncio.CancelledError:
         click.echo('Orchestrator cancelled', err=True)
-        # asyncio.run() has returned — arm the watchdog NOW to guard interpreter
+        # asyncio.run() has returned, its teardown bounded by the teardown
+        # watchdog and that watchdog disarmed — arm this one NOW to guard interpreter
         # shutdown (atexit callbacks + threading._shutdown() joining non-daemon
         # threads). The watchdog is intentionally NOT disarmed: if shutdown
         # completes cleanly, the daemon thread is killed with the process;
@@ -329,7 +384,9 @@ def run(prd: Path | None, config: OrchestratorConfig, dry_run: bool, delay: str 
 
     # asyncio.run() has returned and the report has been emitted — arm the watchdog
     # NOW to guard interpreter shutdown (atexit callbacks + threading._shutdown()
-    # joining non-daemon threads). Placed AFTER click.echo so user-visible work is
+    # joining non-daemon threads). asyncio.run()'s own teardown was bounded
+    # separately, by the teardown watchdog, which is disarmed before the report
+    # echo. Placed AFTER click.echo so user-visible work is
     # not covered by the timer; placed BEFORE the sys.exit(1) branch so both the
     # clean and blocked-exit paths are guarded — non-daemon threads from
     # harness.run() can linger regardless of whether tasks were blocked.
