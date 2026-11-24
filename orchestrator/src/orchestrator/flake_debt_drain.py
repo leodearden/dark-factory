@@ -79,6 +79,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DRAIN_INTERVAL_SECS: Final = 30.0
+RESOLUTION_INTERVAL_SECS: Final = 3600.0
 STALE_DUE_ESCALATION_SENTINEL: Final = '__flake_debt_due_stale__'
 STALE_DUE_ESCALATION_ROLE: Final = 'orchestrator-flake-debt-drain'
 
@@ -769,6 +770,14 @@ class ResolutionPassReport:
     resolved: int
     owner_unreadable: int
     stop: DrainStop | None
+
+    def event_data(self) -> dict[str, int | str | None]:
+        return {
+            'examined': self.examined,
+            'resolved': self.resolved,
+            'owner_unreadable': self.owner_unreadable,
+            'stop': None if self.stop is None else self.stop.value,
+        }
 
 
 class DebtResolutionSweep:

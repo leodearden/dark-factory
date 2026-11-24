@@ -259,6 +259,11 @@ class EventType(StrEnum):
     # measured_at: ISO-8601 str} — the suppressed pytest node-ids, the merge
     # commit whose verify was suppressed, and when the suppression was decided.
     merge_flake_suppressed = 'merge_flake_suppressed'
+    # One row per flake-debt resolution pass, zero-row passes included, so an hour
+    # with no row means the service is not running.  Producer:
+    # harness.py::Harness._run_flake_debt_resolution_pass; data:
+    # flake_debt_drain.py::ResolutionPassReport.event_data.
+    flake_debt_resolution_pass = 'flake_debt_resolution_pass'
     # One firing of Abort trigger 3 (no in-flight verify progress for a full
     # budget) in orchestrator/src/orchestrator/merge_lane/inflight_verify.py::
     # InflightVerifyRun._abort_no_progress, requeue and cap-out alike.

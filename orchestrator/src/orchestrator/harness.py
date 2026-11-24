@@ -132,7 +132,12 @@ from orchestrator.deterministic_runner import (
 from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, read_hold, router_owns
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
+from orchestrator.flake_debt_drain import (
+    DRAIN_INTERVAL_SECS,
+    RESOLUTION_INTERVAL_SECS,
+    DebtResolutionSweep,
+    run_drain_pass,
+)
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
@@ -2410,7 +2415,8 @@ class Harness:
         orphan-l0-reaper, terminal-status-watcher, watcher-supervisor,
         stranded-reconcile, main-tip-sweep, no-landings-breaker,
         deterministic-recon-sweep, warm-lane-gc, stale-service-restart,
-        merge-heartbeat, verify-admission-watch, flake-debt-drain.
+        merge-heartbeat, verify-admission-watch, flake-debt-drain,
+        flake-debt-resolution.
         loop-stall-monitor starts first so it watches every other service's
         whole life, and stops last (task 7366). escalation-server and
         merge-worker start next: the recovery block (which runs immediately
@@ -2420,9 +2426,10 @@ class Harness:
         seven sweeps are conditionally registered on their own
         ``config.X_enabled`` gate — ``BackgroundService`` itself has no
         ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
-        absent from the registry. The last four always run: they must keep
+        absent from the registry. The last five always run: they must keep
         their cadence whatever the dispatch loop is doing (task 5344; the
-        verify-admission watch, task 5628; the flake-debt drain, task 6934).
+        verify-admission watch, task 5628; the flake-debt drain, task 6934;
+        the flake-debt resolution sweep, task 8409).
         """
         if self._lifecycle is not None:
             return
@@ -2555,11 +2562,21 @@ class Harness:
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
         ))
-        drain_client = SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root)
+        ledger_client = SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root)
         registry.register(BackgroundService(
             name='flake-debt-drain',
-            pass_fn=functools.partial(self._run_flake_debt_drain_pass, drain_client),
+            pass_fn=functools.partial(self._run_flake_debt_drain_pass, ledger_client),
             interval_secs=DRAIN_INTERVAL_SECS,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
+        registry.register(BackgroundService(
+            name='flake-debt-resolution',
+            pass_fn=functools.partial(
+                self._run_flake_debt_resolution_pass, ledger_client, DebtResolutionSweep(),
+            ),
+            interval_secs=RESOLUTION_INTERVAL_SECS,
             backoff=sweep_backoff,
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
@@ -2584,6 +2601,23 @@ class Harness:
             escalation_queue=self._escalation_queue,
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
+
+    async def _run_flake_debt_resolution_pass(
+        self, task_client: SchedulerChronicFlakeTaskClient, sweep: DebtResolutionSweep,
+    ) -> None:
+        """One pass of the flake ledger's eager resolution sweep (plans/flake-ledger-prd.md
+        task θ, task 8409), recorded as one ``flake_debt_resolution_pass`` event."""
+        report = await sweep.run_pass(
+            ledger_db_path(Path(self.config.project_root)),
+            self.config.fused_memory.project_id,
+            task_client=task_client,
+        )
+        if self.event_store is not None:
+            await asyncio.to_thread(
+                self.event_store.emit,
+                EventType.flake_debt_resolution_pass,
+                data=report.event_data(),
+            )
 
     async def _run_verify_admission_watch_pass(self) -> None:
         """One tick of the task-verify admission watch on this process's gate.
