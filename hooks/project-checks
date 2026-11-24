@@ -294,7 +294,11 @@ else
         gate_stop_units
         exit "$1"
     }
-    gate_log_dir="$(mktemp -d)"
+    gate_log_dir="$(mktemp -d)" || {
+        echo "pre-commit: could not create the merge-gate unit log directory (mktemp rc=$?);"
+        echo "  refusing the commit rather than skipping the merge-gate checks."
+        exit 1
+    }
     trap 'rm -rf "$gate_log_dir"' EXIT
     trap 'gate_interrupted 130' INT
     trap 'gate_interrupted 143' TERM
