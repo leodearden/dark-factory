@@ -440,6 +440,33 @@ class TestPlanToolsLaunchMetaRoot:
         assert '--meta-root' not in cfg['args']
 
 
+class TestPlanToolsLaunchCallerRole:
+    """plan_tools_mcp_server(caller_role=...) names the role the launched
+    server serves, as an adjacent '--caller-role <role>' pair, on both launch
+    forms. It is attribution on markup records only (task 5055). The default,
+    None, emits no flag, so every other launch shape is unchanged."""
+
+    @pytest.mark.parametrize('python_executable', [None, '/venv/bin/python'], ids=['uv', 'direct'])
+    def test_the_role_follows_its_flag(self, python_executable):
+        args = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'),
+            python_executable=python_executable, caller_role='architect',
+        )['args']
+
+        idx = args.index('--caller-role')
+        assert args[idx:idx + 2] == ['--caller-role', 'architect']
+        assert args.count('--caller-role') == 1
+
+    @pytest.mark.parametrize('python_executable', [None, '/venv/bin/python'], ids=['uv', 'direct'])
+    def test_no_role_emits_no_flag(self, python_executable):
+        args = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'),
+            python_executable=python_executable,
+        )['args']
+
+        assert '--caller-role' not in args
+
+
 # ---------------------------------------------------------------------------
 # Step-1/Step-2 (task 2482, PRD mcp-verdict-servers-prd.md task β):
 # verdict_tools_mcp_server()
