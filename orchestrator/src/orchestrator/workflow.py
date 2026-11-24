@@ -16816,6 +16816,7 @@ class TaskWorkflow:
 
     async def _hand_off_lane_plan(self) -> WorkflowOutcome | None:
         """Hand the implementer a lane whose ``.task/plan.json`` reads this task's plan: relink once, else block."""
+        assert self.artifacts is not None
         fault = self.artifacts.lane_plan_fault()
         if fault is None:
             return None

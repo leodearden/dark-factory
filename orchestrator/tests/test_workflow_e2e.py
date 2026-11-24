@@ -5520,6 +5520,7 @@ class TestPlanDoneEarlyReturn:
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
         async def plan_written(*args, **kwargs):
+            assert workflow.artifacts is not None
             workflow.artifacts.write_plan(copy.deepcopy(PLAN))
             return WorkflowOutcome.PLANNED
 
