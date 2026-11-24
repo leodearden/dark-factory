@@ -777,7 +777,24 @@ class DebtResolutionSweep:
     It is the EAGER caller :func:`~orchestrator.flake_ledger.resolve_debt` names: each
     owned open row goes through that function, whose live read, done-only rule and
     compare-and-set stamp are the whole rule; the sweep adds only the caller.
+
+    It keeps one cursor, the last ``test_id`` a pass examined, and resumes after it, so
+    rows whose owners stay open cannot starve the rows behind them.  The cursor lives in
+    memory only: a restart starts again from the first row.
     """
+
+    def __init__(self) -> None:
+        self._after: str | None = None
+
+    def _next_window(self, rows: list[DebtRow]) -> tuple[list[DebtRow], bool]:
+        """The owned *rows* after the cursor in ``test_id`` order, one pass's worth, and
+        whether that window reaches the last of them."""
+        after = self._after
+        remaining = sorted(
+            (r for r in rows if r.owner_task_id and (after is None or r.test_id > after)),
+            key=lambda r: r.test_id,
+        )
+        return remaining[:_ITEMS_PER_PASS], len(remaining) <= _ITEMS_PER_PASS
 
     async def run_pass(
         self,
@@ -799,21 +816,25 @@ class DebtResolutionSweep:
         stop: DrainStop | None = None
         try:
             started = clock()
-            rows = await asyncio.to_thread(list_open_debt, db_path)
-            owned = sorted((r for r in rows if r.owner_task_id), key=lambda r: r.test_id)
-            for row in owned[:_ITEMS_PER_PASS]:
+            window, reaches_end = self._next_window(
+                await asyncio.to_thread(list_open_debt, db_path),
+            )
+            for row in window:
                 if clock() - started >= _PASS_BUDGET:
                     stop = DrainStop.BUDGET
                     break
                 client = _WatchedTaskClient(task_client)
                 closed = await resolve_debt(db_path, project_id, row.test_id, task_client=client)
                 examined += 1
+                self._after = row.test_id
                 if closed:
                     resolved += 1
                 if client.failed:
                     owner_unreadable += 1
                     stop = DrainStop.TASK_CLIENT_FAILED
                     break
+            if stop is None and reaches_end:
+                self._after = None
         except Exception:
             logger.warning('flake_debt_drain: the resolution pass failed', exc_info=True)
         logger.info(
