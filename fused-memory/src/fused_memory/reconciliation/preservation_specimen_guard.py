@@ -102,9 +102,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
 )
 
-# The scroll-row text reader, IMPORTED rather than re-spelled: it owns the
-# canonical raw-payload key fallback through ``_mem0_content``, and a second
-# copy would be one more place for the two to drift (INV-5).
+# The scroll-row text reader, IMPORTED rather than re-spelled: it reads the
+# canonical raw-payload key fallback through
+# ``utils/mem0_content_keys.py::mem0_payload_text``, and a second copy would be
+# one more place for the two to drift (INV-5).
 from fused_memory.services.memory_service import metadata_row_text
 
 if TYPE_CHECKING:

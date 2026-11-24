@@ -276,12 +276,10 @@ class TestSelectCanonicalPayload:
             ) is None, f'child-shaped {kind} must not be pinned'
 
     def test_child_kinds_matches_the_grouped_read_registry(self):
-        """Anti-drift pin on a DELIBERATE duplication.
+        """Anti-drift pin on a duplication that task 6720 removes.
 
-        server/grouped_read.py imports _MEM0_CONTENT_KEYS from
-        services/memory_service.py, so a services -> server import here would
-        close an import cycle. The constant is therefore restated locally; this
-        assertion is what stops the two copies drifting apart silently.
+        The constant is restated locally until then; this assertion is what
+        stops the two copies drifting apart silently.
         """
         from fused_memory.server.grouped_read import CHILD_KINDS
 
