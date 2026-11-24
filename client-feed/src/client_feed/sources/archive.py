@@ -167,7 +167,7 @@ _OUTCOME_TAGS: Final = {
 _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
 
 
-def _case_id(classname: str, name: str) -> str:
+def case_id(classname: str, name: str) -> str:
     """The one spelling of a junit case id as the feed carries it: `classname::name`, paths redacted."""
     return redact_paths(f'{classname}::{name}' if classname else name)
 
@@ -195,7 +195,7 @@ def _case(testcase: ET.Element) -> CaseResult:
     seconds = _seconds(testcase.get('time'))
     outcome, exception_type = _outcome(testcase)
     return CaseResult(
-        id=_case_id(testcase.get('classname', ''), testcase.get('name', '')),
+        id=case_id(testcase.get('classname', ''), testcase.get('name', '')),
         outcome=outcome,
         duration_ms=None if seconds is None else round(seconds * 1000),
         criterion=None,
