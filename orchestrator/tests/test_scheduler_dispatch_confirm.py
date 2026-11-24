@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -19,6 +20,7 @@ from shared.task_read import TaskAbsent, TaskFound, TaskRead, TaskReadFailed
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.overrides import OverrideStore
 from orchestrator.scheduler import Scheduler
 
 pytestmark = [
@@ -69,11 +71,16 @@ class _Rig:
     store: EventStore
 
 
-def _rig(tmp_path: Path) -> _Rig:
+def _rig(tmp_path: Path, *, pinned: tuple[str, ...] = ()) -> _Rig:
+    config = OrchestratorConfig(max_per_module=1)
+    overrides = OverrideStore(tmp_path / 'scheduler_overrides.db')
+    for task_id in pinned:
+        overrides.set_override(str(config.project_root), task_id, pinned=True)
     store = EventStore(tmp_path / 'runs.db', 'run-1')
     scheduler = Scheduler(
-        OrchestratorConfig(max_per_module=1),
+        config,
         store,
+        override_store=overrides,
         state_snapshot_path=tmp_path / 'scheduler_state.json',
         branch_work_reader=dict,
     )
@@ -99,9 +106,27 @@ def _skipped(rig: _Rig, task_id: str) -> bool:
     )
 
 
+def _open_pure_gate(tid: str) -> dict:
+    """A timed gate (orchestrator/timed_gates.py) whose dated milestone opened an hour ago."""
+    return {
+        'id': tid,
+        'title': f'Gate {tid}',
+        'status': 'pending',
+        'priority': 'low',
+        'dependencies': [],
+        'metadata': {
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            'milestone': {'mode': 'dated', 'at': (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
+        },
+    }
+
+
 A = make_task('A', 'high', ['a.py'])
 B = make_task('B', 'medium', ['a.py'])
 C = make_task('C', 'medium', ['c.py'])
+P = make_task('P', 'high', ['p.py'])
+T = _open_pure_gate('500')
 
 
 async def test_a_dependency_added_mid_tick_holds_the_winner_until_it_is_done(tmp_path):
@@ -180,3 +205,56 @@ async def test_an_unreadable_store_stops_dispatch_for_the_tick(tmp_path):
     second = await rig.scheduler.acquire_next()
 
     assert {first and first.task_id, second and second.task_id} == {'A', 'C'}
+
+
+async def test_a_pin_the_store_has_blocked_yields_to_an_unpinned_candidate(tmp_path):
+    rig = _rig(tmp_path, pinned=('P',))
+    _Board(rig.scheduler, snapshot=[P, C], rows=[_with(P, status='blocked'), C])
+
+    result = await rig.scheduler.acquire_next()
+
+    assert result is not None and result.task_id == 'C'
+    assert _holds_nothing(rig, 'P')
+    assert not _skipped(rig, 'P')
+
+
+async def test_a_pin_on_an_unreadable_store_stops_dispatch_for_the_tick(tmp_path):
+    rig = _rig(tmp_path, pinned=('P',))
+    board = _Board(rig.scheduler, snapshot=[P, C], rows=[P, C])
+    board.unreadable = True
+
+    assert await rig.scheduler.acquire_next() is None
+    assert board.read_task.await_count == 1
+    assert _holds_nothing(rig, 'P', 'C')
+
+
+async def test_a_timed_gate_that_gained_a_pending_dependency_is_not_dispatched(tmp_path):
+    rig = _rig(tmp_path)
+    _Board(
+        rig.scheduler,
+        snapshot=[T],
+        rows=[_with(T, dependencies=['9']), make_task('9', 'high', ['n.py'])],
+        statuses={'9': 'pending'},
+    )
+
+    assert await rig.scheduler.acquire_next() is None
+
+
+async def test_a_pin_dispatch_hands_out_the_store_s_row(tmp_path):
+    rig = _rig(tmp_path, pinned=('P',))
+    _Board(rig.scheduler, snapshot=[P, C], rows=[_stamped(P), C])
+
+    result = await rig.scheduler.acquire_next()
+
+    assert result is not None and result.task_id == 'P'
+    assert result.task['metadata']['gate_escalated_at'] == STAMP
+
+
+async def test_a_timed_gate_dispatch_hands_out_the_store_s_row(tmp_path):
+    rig = _rig(tmp_path)
+    _Board(rig.scheduler, snapshot=[T], rows=[_stamped(T)])
+
+    result = await rig.scheduler.acquire_next()
+
+    assert result is not None and result.task_id == T['id']
+    assert result.task['metadata']['gate_escalated_at'] == STAMP
