@@ -42,6 +42,7 @@ from nested_pytest_session import (
     arming_conftest,
     run_nested_pytest,
 )
+from shared.testing_own_time import OwnTimeClock
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import df_pytest_isolation
@@ -480,6 +481,11 @@ def _line_count(path: Path) -> Callable[[], int]:
     return progress
 
 
+# Enough reads of a still stall clock that the polls between them outlast a
+# 0.01s stall bound many times over on the wall clock.
+_STILL_CLOCK_READS_BEFORE_RELEASE = 10
+
+
 class TestRunInNewSessionWhileProgressing:
     """The must-not-hang bound counts only time in which the child made no progress."""
 
@@ -492,6 +498,7 @@ class TestRunInNewSessionWhileProgressing:
         result = run_in_new_session_while_progressing(
             ['bash', '-c', 'for i in 1 2 3 4 5 6 7 8; do echo x >> "$TICKS"; sleep 0.5; done; echo DONE'],
             progress=_line_count(ticks), stall_timeout=3, env=env,
+            stall_clock=OwnTimeClock,
         )
         elapsed = time.monotonic() - started
 
@@ -511,7 +518,7 @@ class TestRunInNewSessionWhileProgressing:
             with pytest.raises(subprocess.TimeoutExpired) as exc_info:
                 run_in_new_session_while_progressing(
                     ['bash', str(leaker)], progress=_pid_recorded(pidfile),
-                    stall_timeout=2, env=_leaker_env(pidfile),
+                    stall_timeout=2, env=_leaker_env(pidfile), stall_clock=OwnTimeClock,
                 )
             leaked_pid = read_leaked_pid(pidfile)
 
@@ -543,7 +550,7 @@ class TestRunInNewSessionWhileProgressing:
             with pytest.raises(RuntimeError, match='progress blew up'):
                 run_in_new_session_while_progressing(
                     ['bash', str(leaker)], progress=progress,
-                    stall_timeout=60, env=_leaker_env(pidfile),
+                    stall_timeout=60, env=_leaker_env(pidfile), stall_clock=OwnTimeClock,
                 )
             leaked_pid = read_leaked_pid(pidfile)
 
@@ -557,13 +564,74 @@ class TestRunInNewSessionWhileProgressing:
     def test_a_normal_exit_is_a_completed_process(self) -> None:
         result = run_in_new_session_while_progressing(
             ['bash', '-c', 'echo hi; echo boom >&2; exit 3'],
-            progress=lambda: 0, stall_timeout=30,
+            progress=lambda: 0, stall_timeout=30, stall_clock=OwnTimeClock,
         )
 
         assert isinstance(result, subprocess.CompletedProcess)
         assert result.returncode == 3
         assert result.stdout == 'hi\n'
         assert result.stderr == 'boom\n'
+
+    def test_the_stall_is_read_on_the_clock_made_for_the_spawned_child(
+        self, tmp_path: Path,
+    ) -> None:
+        """The injected clock never moves, and releases the child only on its
+        _STILL_CLOCK_READS_BEFORE_RELEASE-th read. The polls before that already
+        outlast the stall bound on the wall clock, so the child exits on its own
+        only if the bound is read on the injected clock alone. The child prints
+        its pid, which must be the one pid the clock was made for."""
+        go = tmp_path / 'go'
+        env = dict(os.environ)
+        env['GO'] = str(go)
+        clocked_pids: list[int] = []
+
+        def stall_clock(pid: int) -> Callable[[], float]:
+            clocked_pids.append(pid)
+            reads = 0
+
+            def still_clock() -> float:
+                nonlocal reads
+                reads += 1
+                if reads == _STILL_CLOCK_READS_BEFORE_RELEASE:
+                    go.touch()
+                return 0.0
+
+            return still_clock
+
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'echo $$; until [ -e "$GO" ]; do sleep 0.05; done; echo DONE'],
+            progress=lambda: 0, stall_timeout=0.01, env=env, stall_clock=stall_clock,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert len(clocked_pids) == 1, clocked_pids
+        assert result.returncode == 0
+        assert result.stdout == f'{clocked_pids[0]}\nDONE\n'
+
+    def test_a_raising_stall_clock_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+
+        def stall_clock(pid: int) -> Callable[[], float]:
+            read_leaked_pid(pidfile)
+            raise RuntimeError('stall clock blew up')
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='stall clock blew up'):
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=_pid_recorded(pidfile),
+                    stall_timeout=60, env=_leaker_env(pidfile), stall_clock=stall_clock,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the stall clock raised: '
+                'making the clock outside the guarded region left the process '
+                'group running.'
+            )
+        finally:
+            _reap(leaked_pid)
 
 
 class TestWaitProofGraceSecs:
