@@ -629,6 +629,13 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
+def _patch_unless_marked(monkeypatch, request, marker: str, target: str, hermetic: object) -> None:
+    """Install the *hermetic* default at *target* unless the test carries the opt-out *marker*."""
+    if request.node.get_closest_marker(marker):
+        return
+    monkeypatch.setattr(target, hermetic)
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_psi_reader(monkeypatch, request):
     """Default every Scheduler's PSI reader to a deterministic idle sample.
@@ -686,9 +693,10 @@ def _hermetic_psi_reader(monkeypatch, request):
     A test may instead reassign ``scheduler._read_psi_sample``
     post-construction, as the saturation tests do.
     """
-    if request.node.get_closest_marker('real_psi_reader'):
-        return
-    monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
+    _patch_unless_marked(
+        monkeypatch, request, 'real_psi_reader',
+        'orchestrator.scheduler.read_psi_sample', idle_psi_sample,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -701,9 +709,10 @@ def _hermetic_dispatch_row(monkeypatch, request):
     ``forbid_live_mcp``.  Same seam pattern as ``_hermetic_psi_reader`` above.
     A test marked ``real_dispatch_row_refresh`` keeps the real re-read.
     """
-    if request.node.get_closest_marker('real_dispatch_row_refresh'):
-        return
-    monkeypatch.setattr('orchestrator.scheduler.refresh_dispatch_row', unchanged_dispatch_row)
+    _patch_unless_marked(
+        monkeypatch, request, 'real_dispatch_row_refresh',
+        'orchestrator.scheduler.refresh_dispatch_row', unchanged_dispatch_row,
+    )
 
 
 @pytest.fixture(autouse=True)
