@@ -21,9 +21,9 @@ from shared.transcript_archive import archive_before_delete, resolve_archive_roo
 
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import (
-    _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
+    RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
 )
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
@@ -969,7 +969,7 @@ async def run_stage_via_cli(
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
             startup_grace_secs=config.stage_startup_grace_secs,
-            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             sandbox_wrap=sandbox_wrap,
             session_id=session_id,
             config_dir=config_dir,
