@@ -57,8 +57,9 @@ async def test_returns_the_store_row_and_its_dependency_statuses() -> None:
     assert fresh.task is not snapshot
     assert dict(fresh.dep_statuses) == {'9': 'pending'}
     assert store.status_requests == [dependency_ids(stored)]
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        fresh.task = snapshot  # type: ignore[misc]
+    for field in dataclasses.fields(fresh):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(fresh, field.name, snapshot)
 
 
 async def test_a_row_without_dependencies_reads_no_statuses() -> None:
