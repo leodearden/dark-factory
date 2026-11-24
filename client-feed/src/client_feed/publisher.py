@@ -518,13 +518,17 @@ def _advanced(
     tree: VisibleTree | None,
     inbox: InboxRead | None,
     reveals: RevealOutput | None,
+    acknowledgement: _Acknowledgement,
 ) -> Cursor:
     """Each source position past what this pass read, where its unit succeeded; head and line counts move with the tree.
 
     The inbox offset, reveals_head and added-line counts move with a reveal unit that ran; an inbox read holding no
-    request moves its offset alone.
+    request moves its offset alone. The defect scan's offset and pending reports move as the acknowledgement left them.
     """
-    update: dict[str, object] = {}
+    update: dict[str, object] = {
+        'defect_scan_offset': acknowledgement.defect_scan_offset,
+        'pending_reports': acknowledgement.pending_reports,
+    }
     if events_id is not None:
         update['events_id'] = events_id
     if tasks is not None:
@@ -547,8 +551,9 @@ def run_pass(
 ) -> PassReport:
     """Read every source, append what is news in the order tasks, stream, factory, branches, reveals, tree, PRDs, criteria, defects filed, heartbeat.
 
-    A source that cannot be read is named in the heartbeat's degraded, once however many units it failed, and holds
-    only its own cursor fields.
+    A source that cannot be read is named in the heartbeat's degraded, and holds only its own cursor fields. Units
+    that fail it with the same reason name it once; different reasons, such as two inbox tails at different offsets,
+    each name it.
     """
     root = policy.project_root
     cursor = out.cursor
@@ -621,12 +626,13 @@ def run_pass(
     ]
     events_id = None if store is None or stream is None else store.cursor
     advanced = _advanced(
-        cursor, events_id=events_id, tasks=tasks, tree=tree, inbox=inbox, reveals=reveals
-    ).model_copy(
-        update={
-            'defect_scan_offset': acknowledgement.defect_scan_offset,
-            'pending_reports': acknowledgement.pending_reports,
-        }
+        cursor,
+        events_id=events_id,
+        tasks=tasks,
+        tree=tree,
+        inbox=inbox,
+        reveals=reveals,
+        acknowledgement=acknowledgement,
     )
     out.commit(events, advanced)
     return PassReport(
