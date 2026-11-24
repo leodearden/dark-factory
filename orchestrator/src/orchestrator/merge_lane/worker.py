@@ -192,6 +192,7 @@ from orchestrator.merge_lane.speculation_controller import (
     LiveTip,
     PermitLedger,
     SpeculationController,
+    fresh_dequeue_offer,
 )
 from orchestrator.merge_lane.tip_relation import (
     TipRelation,
@@ -5157,10 +5158,10 @@ class SpeculativeMergeWorker:
         # verifier.  Read by _await_unadvanced_predecessor, which parks a train
         # behind it until it is finalized (verified + CAS-advanced) — see that
         # method for why parking spares the train a re-verify of its rebased
-        # tip — and by _merger_stack_tip, where a fresh dequeue stacks on its
-        # build while that build awaits dispatch.  Set at the post-put success
-        # site in _merger_loop; never explicitly cleared, because both readers
-        # skip a request whose Future is already done.
+        # tip — and by _merger_build_awaiting_dispatch, so a fresh dequeue
+        # stacks on its build while that build awaits dispatch.  Set at the
+        # post-put success site in _merger_loop; never explicitly cleared,
+        # because both readers skip a request whose Future is already done.
         self._last_merged_request: MergeRequest | None = None
         # δ/1720 one-strike registry — task_ids of members whose coalesce-formed
         # train derailed (MergeOutcome('blocked') on a train with train_id
@@ -6698,14 +6699,14 @@ class SpeculativeMergeWorker:
         held = [sha for sha in shas if self._speculation_controller.holds_base(sha)]
         if not held:
             return
-        live_tip = self._merger_live_tip(doomed)
+        live_tip = self._live_frozen_tip(doomed)
         for sha in held:
             self._speculation_controller.on_base_invalidated(sha, live_tip)
 
-    def _merger_live_tip(self, doomed: Collection[str] = ()) -> LiveTip | None:
-        """The frozen-prefix tip the §5.3 detector expects, which the merger may
-        stack on, with its owner, or None; *doomed* commits count as dead, and
-        it reads no main (plans/merge-lane-policy-prd.md D1)."""
+    def _live_frozen_tip(self, doomed: Collection[str] = ()) -> LiveTip | None:
+        """The frozen-prefix tip the §5.3 detector expects, with its owner,
+        while it is live, else None; *doomed* commits count as dead, and it
+        reads no main (plans/merge-lane-policy-prd.md D1)."""
         frontier = self._verify_frontier_entries()
         tip = choose_remerge_base(
             '', self._newest_frozen_commit() or '', {*self._dead_base_commits, *doomed}, frontier,
@@ -6717,21 +6718,27 @@ class SpeculativeMergeWorker:
             tip, next(e.item.request for e in frontier if entry_successor_base(e) == tip),
         )
 
-    def _merger_stack_tip(self) -> LiveTip | None:
-        """Where a fresh dequeue stacks: the merger's newest build while it
-        awaits dispatch, or None once that build's commit is dead, otherwise
-        the frozen-prefix tip from :meth:`_merger_live_tip`; it reads no main."""
+    def _fresh_dequeue_offer(self, req: MergeRequest) -> LiveTip | None:
+        """The base offered to a fresh dequeue of *req*: none for a train,
+        which skips the speculative pipeline, else :func:`fresh_dequeue_offer`'s."""
+        if isinstance(req, GroupMergeRequest):
+            return None
+        return fresh_dequeue_offer(
+            self._merger_build_awaiting_dispatch(), self._dead_base_commits,
+            self._live_frozen_tip(),
+        )
+
+    def _merger_build_awaiting_dispatch(self) -> LiveTip | None:
+        """The merger's newest build and its request, while that build awaits
+        dispatch; its commit may be empty or dead."""
         req = self._last_merged_request
         build = (
             self._live_items.get(req.request_id)
             if req is not None and not req.result.done() else None
         )
         if not isinstance(build, RealMergeItem):
-            return self._merger_live_tip()
-        commit = build.merge_result.merge_commit or ''
-        if not commit or commit in self._dead_base_commits:
             return None
-        return LiveTip(commit, build.request)
+        return LiveTip(build.merge_result.merge_commit or '', build.request)
 
     def _cascade_doomed_commits(self) -> frozenset[str]:
         """The commits :meth:`_verifier_loop`'s head-failure cascade tears down
@@ -10911,12 +10918,11 @@ class SpeculativeMergeWorker:
                     if req is None:
                         exited_via_sentinel = True
                         break  # shutdown sentinel
-                    # ATTACH to the pending base or the live frontier tip, else
+                    # ATTACH to the pending base or the offered base, else
                     # FALLBACK to main: see SpeculationController.on_dequeue.
-                    live_tip = (
-                        None if isinstance(req, GroupMergeRequest) else self._merger_stack_tip()
+                    attached = self._speculation_controller.on_dequeue(
+                        req, live_tip=self._fresh_dequeue_offer(req),
                     )
-                    attached = self._speculation_controller.on_dequeue(req, live_tip=live_tip)
                     if attached is not None:
                         logger.debug(
                             'Task %s: late arrival attaches to in-flight '

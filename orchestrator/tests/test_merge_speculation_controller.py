@@ -37,6 +37,7 @@ from orchestrator.merge_lane.speculation_controller import (
     LiveTip,
     PermitLedger,
     SpeculationController,
+    fresh_dequeue_offer,
 )
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
@@ -248,7 +249,7 @@ class TestOnDequeueAttachFallback:
         controller, ledger, _pred = await self._seeded_controller()
         # The merger holds no permit, and the depth-1 ledger's only slot stays
         # taken, so no free slot exists.
-        controller._permit = None
+        assert controller.on_transfer() is not None
         new_req = _make_pending_request('new')
 
         result = controller.on_dequeue(new_req, live_tip=None)
@@ -1223,3 +1224,40 @@ class TestOnDequeueStacksOnTheLiveTip:
         assert result is not None
         assert result.sha == 'h'
         assert controller.snapshot()['held_by_merger'] == 1
+
+
+# ---------------------------------------------------------------------------
+# task 10851: the base the worker offers a fresh dequeue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFreshDequeueOffer:
+    """``fresh_dequeue_offer(newest_build, dead, frozen_tip)`` offers the
+    merger's newest build awaiting dispatch, else the frozen-prefix tip, and
+    nothing while that build's commit is empty or dead."""
+
+    async def test_with_no_build_awaiting_dispatch_the_frozen_tip_is_offered(self) -> None:
+        frozen = _tip()
+
+        assert fresh_dequeue_offer(None, frozenset(), frozen) is frozen
+
+    async def test_with_no_build_and_no_live_frozen_tip_nothing_is_offered(self) -> None:
+        assert fresh_dequeue_offer(None, frozenset(), None) is None
+
+    async def test_a_live_build_is_offered_ahead_of_the_frozen_tip(self) -> None:
+        build = LiveTip('m', _make_pending_request('M'))
+
+        assert fresh_dequeue_offer(build, frozenset({'older-dead'}), _tip()) is build
+
+    async def test_a_dead_build_offers_nothing_though_the_frozen_tip_is_live(self) -> None:
+        build = LiveTip('m', _make_pending_request('M'))
+
+        assert fresh_dequeue_offer(build, frozenset({'m'}), _tip()) is None
+
+    async def test_a_build_with_no_commit_offers_nothing_though_the_frozen_tip_is_live(
+        self,
+    ) -> None:
+        build = LiveTip('', _make_pending_request('M'))
+
+        assert fresh_dequeue_offer(build, frozenset(), _tip()) is None

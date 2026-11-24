@@ -123,11 +123,13 @@ def alarm_verify_base_divergence(
             "older live tip, and a fresh dequeue stacked beside the merger's "
             'own build still waiting for a host (merge_lane/'
             'speculation_controller.py::SpeculationController.on_dequeue, '
-            'merge_lane/worker.py::SpeculativeMergeWorker::_merger_live_tip, '
-            'merge_lane/worker.py::SpeculativeMergeWorker::_merger_stack_tip).  '
-            'A new hit names a '
-            'path that still loses it, or a dequeue that found no free '
-            'speculation permit.  A recovery re-merge '
+            'merge_lane/worker.py::SpeculativeMergeWorker::_live_frozen_tip, '
+            'merge_lane/speculation_controller.py::fresh_dequeue_offer).  '
+            'A new hit names a path that still loses it, a dequeue that found '
+            'no free speculation permit, or a dequeue just after the '
+            "merger's newest build died: merge_lane/speculation_controller.py::"
+            'fresh_dequeue_offer offers no tip then, so it falls to main by '
+            'design.  A recovery re-merge '
             'that fell to main is exempt and the cached main is never read, '
             'so neither explains a hit; a reanchor_onto_dead_tip hit means a '
             're-anchored tip died or was vacated between re-merge and '

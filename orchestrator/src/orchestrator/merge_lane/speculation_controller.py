@@ -28,7 +28,8 @@ currently holds (or ``None``) rather than a bare boolean:
   still in-flight; the permit is RETAINED for a possible late-arrival
   ATTACH (task 1862) at the next dequeue.
 * ``on_dequeue`` — the base for a freshly dequeued request: ATTACH to the
-  pending base, else to the live frontier tip the caller passes, either with
+  pending base, else to the base the caller offers (the worker offers
+  :func:`fresh_dequeue_offer`'s choice), either with
   the held or a free permit (it never waits; the permit transfers to the
   verifier when the attached item is put); else FALLBACK to main, releasing
   any held permit.
@@ -89,7 +90,7 @@ before.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Container
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 from orchestrator.merge_lane.types import SpecPermit
@@ -279,12 +280,26 @@ def _same_commit(base: str | None, sha: str) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class LiveTip:
-    """A frontier merge commit the merger may stack on, and the request
-    whose in-flight verify owns it: a late arrival attaches only while that
-    owner is still in flight."""
+    """A merge commit the merger may stack on, and the request that owns it:
+    a frontier entry's verify, or the merger's own build awaiting dispatch.
+    A late arrival attaches only while that owner is still in flight."""
 
     sha: str
     owner: MergeRequest
+
+
+def fresh_dequeue_offer(
+    newest_build: LiveTip | None, dead: Container[str], frozen_tip: LiveTip | None,
+) -> LiveTip | None:
+    """The base offered to a fresh dequeue (task 10851): the merger's newest
+    build awaiting dispatch, else *frozen_tip*. A build whose commit is empty
+    or *dead* offers nothing, so the request never stacks beside it on an
+    older tip, where no dispatch-time check would re-merge it."""
+    if newest_build is None:
+        return frozen_tip
+    if not newest_build.sha or newest_build.sha in dead:
+        return None
+    return newest_build
 
 
 class SpeculationController:
@@ -429,8 +444,9 @@ class SpeculationController:
         """Choose the base a freshly dequeued request merges against, and return it.
 
         ATTACH to the pending base while its predecessor is in flight, else
-        to *live_tip*, the live frontier tip the caller passes, while its
-        owner is in flight (task 10851). Either keeps the held permit or
+        to *live_tip*, the base the caller offers (the worker offers
+        :func:`fresh_dequeue_offer`'s choice), while its owner is in flight
+        (task 10851). Either keeps the held permit or
         takes a free one without waiting; the permit transfers to the
         verifier when the attached item is put. With no such base or no free
         permit, FALLBACK: release any held permit and merge on main (None).
