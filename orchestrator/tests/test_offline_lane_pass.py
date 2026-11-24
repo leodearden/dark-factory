@@ -402,6 +402,19 @@ def test_without_a_wired_queue_the_audit_files_its_kill_switch_blocker_on_the_pr
     assert blocker.level == 2
 
 
+def test_a_wired_queue_is_the_one_the_audit_files_its_kill_switch_blocker_on(tmp_path):
+    _seed_leaks(tmp_path, ALPHA_KEY, BETA_KEY)
+    wired = EscalationQueue(tmp_path / 'other-escalations')
+    (hook,) = lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), wired)
+    assert isinstance(hook, VerifyCacheAuditHook)
+
+    asyncio.run(hook(AUDIT_COMMAND, HEAD1, Confirmed(ConfirmMode.INTERSECTED, (ALPHA_NODE, BETA_NODE), (), ()), ()))
+
+    (blocker,) = wired.get_by_task(AUDIT_ESCALATION_SENTINEL, status='pending')
+    assert blocker.level == 2
+    assert EscalationQueue(escalation_queue_dir(tmp_path)).get_by_task(AUDIT_ESCALATION_SENTINEL) == []
+
+
 @pytest.mark.asyncio
 async def test_an_unreadable_registry_costs_the_audit_pass_only_its_notes(tmp_path, caplog):
     db_path = registry.registry_db_path(tmp_path)
