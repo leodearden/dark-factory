@@ -1,8 +1,12 @@
 """Who holds a work tree's index.lock, and what is safe to tell an operator (task 5229).
 
-The scan tests use real processes in real repos: the property under test is
-what ``/proc`` says about them, so a fake process table would only restate the
-implementation.
+Which processes a scan LISTS is pinned with real processes in real repos:
+the property is what ``/proc`` says about them.  Whether a scan is CONFIRMED
+is pinned with a constructed proc root instead, because on the real ``/proc``
+it depends on the whole host: inside an agent's landlock sandbox the cwd of
+every process outside the sandbox's domain is unreadable (EACCES, measured
+2026-11-24), so a real scan there is unconfirmed whenever another agent's git
+happens to be running.  The scan's own children are always readable.
 """
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ from _git_fixtures import seed_repo
 from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
-from orchestrator.index_lock_liveness import scan_work_tree_git_processes
+from orchestrator.index_lock_liveness import GitProcessScan, scan_work_tree_git_processes
 
 
 def _env_fenced_at_parent_of(cwd: Path) -> dict[str, str]:
@@ -62,12 +66,20 @@ def _nested_worktree(repo: Path) -> Path:
     return nested
 
 
+def _proc_entry(proc_root: Path, pid: int, comm: str) -> Path:
+    """One pid in a constructed process table, its ``cwd`` NOT a link, so it cannot be read."""
+    entry = proc_root / str(pid)
+    entry.mkdir(parents=True)
+    (entry / 'comm').write_text(f'{comm}\n')
+    (entry / 'cwd').write_text('')
+    return entry
+
+
 class TestScanWorkTreeGitProcesses:
     def test_a_live_git_process_in_the_work_tree_is_reported_until_it_exits(self, tmp_path):
         repo = seed_repo(tmp_path / 'repo')
         with _waiting_on_stdin(['git', 'hash-object', '--stdin'], repo) as proc:
             scan = scan_work_tree_git_processes(repo)
-            assert scan.confirmed is True
             [process] = [p for p in scan.processes if p.pid == proc.pid]
             assert 'hash-object' in process.command
         assert proc.pid not in _pids(repo)
@@ -77,7 +89,6 @@ class TestScanWorkTreeGitProcesses:
         (repo / 'README.md').write_text('# dirtied so --only has a change\n')
         with commit_blocked_in_pre_commit_hook(repo, 'README.md') as git_pid:
             scan = scan_work_tree_git_processes(repo)
-            assert scan.confirmed is True
             [process] = [p for p in scan.processes if p.pid == git_pid]
             assert 'commit' in process.command
 
@@ -105,11 +116,22 @@ class TestScanWorkTreeGitProcesses:
     def test_a_non_git_process_in_the_work_tree_is_not_reported(self, tmp_path):
         repo = seed_repo(tmp_path / 'repo')
         with _waiting_on_stdin(['cat'], repo) as proc:
-            scan = scan_work_tree_git_processes(repo)
-            assert scan.confirmed is True
-            assert proc.pid not in {p.pid for p in scan.processes}
+            assert proc.pid not in _pids(repo)
 
     def test_an_unenumerable_proc_root_is_unknown_not_empty(self, tmp_path):
         scan = scan_work_tree_git_processes(tmp_path, proc_root=tmp_path / 'absent')
         assert scan.confirmed is False
         assert scan.processes == ()
+
+    def test_a_process_table_with_no_git_process_is_a_confirmed_empty_scan(self, tmp_path):
+        proc_root = tmp_path / 'proc'
+        proc_root.mkdir()
+        _proc_entry(proc_root, 4242, 'cat')
+        scan = scan_work_tree_git_processes(tmp_path, proc_root=proc_root)
+        assert scan == GitProcessScan((), confirmed=True)
+
+    def test_a_git_process_that_cannot_be_placed_makes_the_scan_unconfirmed(self, tmp_path):
+        proc_root = tmp_path / 'proc'
+        _proc_entry(proc_root, 4242, 'git')
+        scan = scan_work_tree_git_processes(tmp_path, proc_root=proc_root)
+        assert scan == GitProcessScan((), confirmed=False)
