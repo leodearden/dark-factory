@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pytest
 from _canned_mcp import CannedMCP, _raw_row
 
-from dashboard.data import task_lineage
+from dashboard.data import served_read, task_lineage
 from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.prd_attribution import (
     LINEAGE_METADATA_KEYS,
@@ -282,6 +282,28 @@ class TestAcquireLineage:
             )
         assert landed.state is DatumState.FRESH
         assert landed.as_of == T0
+        assert len(_projected_calls(canned)) == 1
+
+    async def test_a_read_that_outlives_its_request_wait_is_counted_and_joined(
+        self, dummy_client, dummy_config, monkeypatch,
+    ):
+        monkeypatch.setattr(task_lineage, 'LINEAGE_REQUEST_WAIT_SECONDS', 0.05)
+        canned = CannedMCP(_rows())
+        release = asyncio.Event()
+
+        async def held(client, url, tool, args, **kwargs):
+            await release.wait()
+            return await canned(client, url, tool, args, **kwargs)
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=held):
+            before = served_read.outlived_wait_count()
+            pending = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            assert pending.state is DatumState.UNKNOWN
+            assert served_read.outlived_wait_count() == before + 1
+            release.set()
+            await served_read.join_outlived_waits()
+            landed = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+        assert landed.state is DatumState.FRESH
         assert len(_projected_calls(canned)) == 1
 
     async def test_a_hung_read_ends_on_its_budget_and_frees_the_slot(
