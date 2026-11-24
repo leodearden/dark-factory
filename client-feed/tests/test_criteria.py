@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import yaml
 from _archive_files import junit_xml, passed, red, write_junit
+from _git_repo import Repo, make_repo
 
 from client_feed.contract import (
     CaseOutcome,
@@ -28,6 +29,7 @@ from client_feed.criteria import (
     join_criteria,
     parse_criteria,
     read_collection_map,
+    read_declared,
     verify_criteria,
 )
 
@@ -439,3 +441,65 @@ def test_a_malformed_archived_map_is_refused_relative_to_the_root(tmp_path: Path
     assert caught.value.problem is CriteriaProblem.INVALID_MAP
     assert str(collection_map_path(junit)) in str(caught.value)
     assert str(tmp_path) not in str(caught.value)
+
+
+# the declared criteria
+
+COMMITTED_AT = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Repo:
+    repo = make_repo(tmp_path / 'repo')
+    repo.write('README.md', 'a project\n')
+    return repo
+
+
+def _declared_refusal(repo: Repo, head: str, problem: CriteriaProblem) -> CriteriaError:
+    with pytest.raises(CriteriaError) as caught:
+        read_declared(repo.root, head)
+    assert caught.value.problem is problem
+    assert NAME in str(caught.value)
+    return caught.value
+
+
+def test_the_declaration_is_read_from_the_heads_git_objects(repo: Repo) -> None:
+    repo.write(NAME, EXEMPLAR.read_text())
+    head = repo.commit('declare', when=COMMITTED_AT)
+
+    assert read_declared(repo.root, head) == parse_criteria(EXEMPLAR.read_text(), name=NAME)
+
+
+def test_an_uncommitted_edit_is_not_seen(repo: Repo) -> None:
+    repo.write(NAME, EXEMPLAR.read_text())
+    head = repo.commit('declare', when=COMMITTED_AT)
+    repo.write(NAME, _criteria_text(criteria=[]))
+
+    assert [criterion.id for criterion in read_declared(repo.root, head)] == ['CF-1', 'CF-2']
+
+
+def test_a_head_without_the_file_declares_nothing(repo: Repo) -> None:
+    head = repo.commit('no criteria', when=COMMITTED_AT)
+    repo.write(NAME, EXEMPLAR.read_text())
+
+    assert read_declared(repo.root, head) == ()
+
+
+def test_a_committed_symlink_is_not_a_criteria_file(repo: Repo) -> None:
+    repo.write('elsewhere.yaml', EXEMPLAR.read_text())
+    repo.symlink(NAME, '../elsewhere.yaml')
+    head = repo.commit('symlink', when=COMMITTED_AT)
+
+    _declared_refusal(repo, head, CriteriaProblem.NOT_A_FILE)
+
+
+@pytest.mark.parametrize(
+    'content',
+    [_criteria_text(format=2).encode(), b'format: 1\ncriteria: []\n# \xff\xfe\n'],
+    ids=['invalid', 'not-utf-8'],
+)
+def test_committed_invalid_criteria_are_refused_by_name(repo: Repo, content: bytes) -> None:
+    repo.write(NAME, content)
+    head = repo.commit('invalid', when=COMMITTED_AT)
+
+    _declared_refusal(repo, head, CriteriaProblem.INVALID_CRITERIA)
