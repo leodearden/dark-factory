@@ -1028,6 +1028,8 @@ def _make_run_wf(
     wf._recover_if_already_merged = AsyncMock(return_value=None)  # type: ignore[method-assign]
     wf.config.simple_task_enabled = False
     # wf.plan is already set by _make_workflow → skips the planner entirely.
+    assert wf.artifacts is not None
+    wf.artifacts.write_plan(dict(wf.plan))
     wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
     wf._execute_verify_review_loop = AsyncMock(  # type: ignore[method-assign]
         return_value=WorkflowOutcome.DONE,
@@ -2553,6 +2555,7 @@ def _make_wip_conflict_workflow(*, task_id: str = '2282') -> TaskWorkflow:
     wf.worktree = Path('/tmp/fake-worktree-2282')
     wf.artifacts = MagicMock()
     wf.artifacts.read_iteration_log = MagicMock(return_value=([], []))
+    wf.artifacts.lane_plan_fault = MagicMock(return_value=None)
     wf.plan = {'task_id': task_id, 'steps': []}
     wf.initial_plan = {'task_id': task_id, 'steps': []}
 

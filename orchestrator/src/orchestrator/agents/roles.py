@@ -32,6 +32,7 @@ from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
+from orchestrator.agents.lane_task_guidance import LANE_TASK_LINKS_SECTION
 from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
@@ -644,12 +645,12 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 
 # The opening of every "## CRITICAL: Git Staging Rules" section below, spliced
 # like SCOPE_BOUNDARY_GUIDANCE. Each role follows it with only its own code
-# block of correct staging commands.
+# block of correct staging commands, and precedes that section with
+# LANE_TASK_LINKS_SECTION, the links this opening refers back to.
 _TASK_DIR_NEVER_COMMITTED = """\
-`.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
-`.task/iterations.jsonl` links into durable task storage that survives
-worktree resets, plus the Claude config dir. Those links are the only task
-state exposed here: `metadata.json` and the `reviews/` and `verdicts/`
+`.task/` inside this worktree is orchestrator state: the two links described
+under "The .task/ links", plus the Claude config dir. Those links are the only
+task state exposed here: `metadata.json` and the `reviews/` and `verdicts/`
 directories stay in orchestrator storage outside this worktree, so a read of
 them under `.task/` fails by design — the task details you need are in your
 briefing. `.task/` must NEVER be committed. It is gitignored at the repo root,
@@ -1016,7 +1017,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
-""" + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + LANE_TASK_LINKS_SECTION + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -1049,7 +1050,7 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 3. **Commit each step.** After completing a step, stage ONLY your code changes (not `.task/` files) and commit. Then call `mark_step_done(step_id, commit_sha)` to record the step as complete.
 4. **Stop at logical boundaries.** Don't exhaust your context trying to complete everything. Complete a logical chunk of steps, commit, mark done, and stop. The next iteration will continue from where you left off.
 5. **Never edit plan.json directly.** Use the `mark_step_done` MCP tool to update step status. Never change the plan structure, descriptions, or add new steps.
-
+""" + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -1099,7 +1100,7 @@ You will be given:
 2. **Minimal targeted fixes.** Fix only what's broken. Don't refactor or "improve" surrounding code.
 3. **Don't change test expectations** unless the test itself is wrong (testing the wrong behavior, not just failing).
 4. **Commit your fixes** with a descriptive message like "fix: resolve type error in X" or "fix: correct test assertion for Y".
-
+""" + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -1499,7 +1500,7 @@ which main has split into one file per entry under
 `git add -A orchestrator/tests`: it writes each entry as its file and deletes the
 array. Never `git rm` the array (that silently drops this branch's entries) and
 never keep it.
-
+""" + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -1888,7 +1889,7 @@ wording differs.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
 """ + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + STEWARD_GUARD_INTENT_RULE
-    + STEWARD_SUPPRESSION_RULES + """
+    + STEWARD_SUPPRESSION_RULES + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -2244,7 +2245,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + SIMPLE_TASK_WORKFLOW + """
+""" + BASH_CAPABLE_ROLE_PREAMBLE + SIMPLE_TASK_WORKFLOW + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
