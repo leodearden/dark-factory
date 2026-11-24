@@ -112,7 +112,7 @@ class DueFailure(StrEnum):
 
 
 class DrainStop(StrEnum):
-    """Why a pass ended before the items it read."""
+    """Why a pass, the drain's or the resolution sweep's, ended before the work it read."""
 
     TASK_CLIENT_FAILED = 'task_client_failed'
     BUDGET = 'budget'
@@ -787,15 +787,24 @@ class DebtResolutionSweep:
         task_client: FlakeLedgerTaskClient,
         clock: Callable[[], datetime] = _utc_now,
     ) -> ResolutionPassReport:
-        """One pass over the ledger at *db_path*.  ``resolved_at`` is stamped with the
-        ledger's own wall clock (§5.4), never *clock*.  Never raises; a cancellation
-        propagates."""
+        """One pass over the ledger at *db_path*: at most 50 owned rows in five minutes of
+        *clock*, stopping at the first unreadable owner (INV-4).  A missing task reads
+        back as an absence, so a failed read means fused-memory is failing, and each
+        further row would spend its own read budget on the same failure.
+
+        ``resolved_at`` is stamped with the ledger's own wall clock (§5.4), never *clock*.
+        Never raises; a cancellation propagates.
+        """
         examined = resolved = owner_unreadable = 0
         stop: DrainStop | None = None
         try:
+            started = clock()
             rows = await asyncio.to_thread(list_open_debt, db_path)
             owned = sorted((r for r in rows if r.owner_task_id), key=lambda r: r.test_id)
-            for row in owned:
+            for row in owned[:_ITEMS_PER_PASS]:
+                if clock() - started >= _PASS_BUDGET:
+                    stop = DrainStop.BUDGET
+                    break
                 client = _WatchedTaskClient(task_client)
                 closed = await resolve_debt(db_path, project_id, row.test_id, task_client=client)
                 examined += 1
@@ -803,6 +812,8 @@ class DebtResolutionSweep:
                     resolved += 1
                 if client.failed:
                     owner_unreadable += 1
+                    stop = DrainStop.TASK_CLIENT_FAILED
+                    break
         except Exception:
             logger.warning('flake_debt_drain: the resolution pass failed', exc_info=True)
         logger.info(
