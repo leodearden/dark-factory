@@ -7146,6 +7146,10 @@ class Scheduler:
         self._bound_pin_reservations(ctx, reservable)
         heads = 0
         for pin in queue:
+            if pin.task_id in self._dispatched:
+                # Started since the queue was built, while a pin's confirmation
+                # suspended this loop: not lock-blocked (invariant 11).
+                continue
             if ctx.psi_hold and not self._exempt_from_psi_hold(pin.task):
                 # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
                 # doesn't reduce host load, so a pinned candidate is deferred
@@ -7521,7 +7525,9 @@ class Scheduler:
             self._park_refusals.retain(str(t.get('id', '')) for t in ctx.candidates)
         # A task started since the ready list was built (by a claim that ran
         # while this pass was suspended) is neither claimed, counted as
-        # refused, nor passed over as the top (invariant 11).
+        # refused, nor passed over as the top (invariant 11).  It holds per
+        # iteration below too: confirming a winner (_confirm_claim) can
+        # suspend the scan.
         scored = [entry for entry in self._score_candidates(ctx) if entry[1] not in self._dispatched]
         if not scored:
             return TickOutcome(None)
@@ -7560,6 +7566,8 @@ class Scheduler:
         dropped: set[str] = set()
         try:
             for _score, task_id, task, pri in scored:
+                if task_id in self._dispatched:
+                    continue
                 if ctx.psi_hold and not self._exempt_from_psi_hold(task):
                     # Dispatch-admission gate (DA3): a per-candidate `continue`,
                     # so exempt candidates ranked behind this one (see
@@ -7620,8 +7628,8 @@ class Scheduler:
     def _bump_passed_over_top(
         self, top_id: str, top_modules: list[str], top_pri: str, *, dropped: Collection[str],
     ) -> None:
-        """Bump the scan's top as passed over, unless confirmation *dropped* it: then it was never dispatchable."""
-        if top_id in dropped:
+        """Bump the scan's top as passed over, unless confirmation *dropped* it or it was started meanwhile (invariant 11)."""
+        if top_id in dropped or top_id in self._dispatched:
             return
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
 
