@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from collections.abc import Awaitable, Callable, Coroutine, Hashable
+from collections.abc import Awaitable, Callable, Hashable
 from datetime import datetime
 from typing import Any, Generic, TypeVar
 
@@ -30,7 +30,7 @@ _outlived_wait_count = 0
 
 
 async def wait_shielded(
-    work: Coroutine[Any, Any, T], wait_seconds: float | None, *, what: str,
+    work: Awaitable[T], wait_seconds: float | None, *, what: str,
 ) -> T:
     """*work*'s outcome, waited on at most *wait_seconds*; past that ``TimeoutError``.
 
