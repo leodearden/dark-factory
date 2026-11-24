@@ -22,14 +22,18 @@ Two defects live here:
 
 This module owns the new coverage for both.  It reuses the real-git fixtures of
 :mod:`test_merge_verify_lease_guard` wholesale (the suite's cross-module-helper
-convention) and adds five shared helpers used by the classes below:
+convention) and adds shared helpers used by the classes below:
 
 * :func:`foreign_lane_lock_holder` — a GENUINELY foreign holder, since
   same-process fds are indistinguishable from the leak at kernel level;
 * :func:`leaked_lane_lock` — the B13 fault staged as an unregistered fd with no
   holder-pgid rendezvous, exactly what an orphaned acquire leaves behind;
-* :func:`wait_until` — a bounded async poll, so orphan-release callbacks settle
-  deterministically instead of behind a fixed sleep;
+* :func:`wait_until` — a bounded WALL-CLOCK poll, used by the stub-based unit
+  cases; a starved process can pass its deadline before the loop runs the
+  callback it waits on, so it is not a settle for an orphan release;
+* :func:`cancel_mid_acquire_and_settle` — the B12 end-to-end staging: cancel an
+  operation mid-acquire, then settle on the acquire it orphaned, which
+  :func:`other_pending_tasks` names, rather than on any clock;
 * :func:`require_lane_lock_holders` — a bounded-retry STRICT read of the kernel
   lock table, so "I could not tell" is never rendered as "nobody holds it";
 * :func:`lane_is_free` — the PRD's B12 signal: unheld AND unattributed to us,
@@ -381,9 +385,9 @@ async def wait_until(
 
     Returns ``True`` as soon as *predicate* holds, ``False`` once *timeout*
     elapses — deliberately NOT raising, so a caller can assert on the result
-    with its own message.  Used to settle orphan-release callbacks (which run
-    on the event loop, after the cancelling coroutine has already resumed)
-    without a fixed sleep that would either flake or waste wall clock.
+    with its own message.  *timeout* is host wall clock, so a starved process
+    can see it expire before the loop has run the callback *predicate* waits
+    on; settle an orphaned acquire with :func:`cancel_mid_acquire_and_settle`.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -394,10 +398,16 @@ async def wait_until(
         await asyncio.sleep(interval)
 
 
-def other_pending_tasks() -> set[asyncio.Task]:
-    """After a cancelled lane-lock acquire, names the acquire that cancellation left in flight."""
+def other_pending_tasks(*, excluding: set[asyncio.Task]) -> set[asyncio.Task]:
+    """After a cancelled lane-lock acquire, names the acquire that cancellation left in flight.
+
+    *excluding* is an :func:`asyncio.all_tasks` snapshot taken before the
+    operation started, so a task a fixture or plugin left running is never
+    mistaken for the orphan.
+    """
     current = asyncio.current_task()
-    return {t for t in asyncio.all_tasks() if t is not current and not t.done()}
+    pending = {t for t in asyncio.all_tasks() if t is not current and not t.done()}
+    return pending - excluding
 
 
 def wait_for_lane_lock_holder(
@@ -2791,10 +2801,17 @@ class TestContendedRaiseSurvivesALossyHolderRead:
 _SENTINEL_FD = 4242
 
 
-def _poll_counted_clock(step: float = 0.1) -> Callable[[], float]:
-    """A ``monotonic`` that advances *step* per read, i.e. per bounded-wait poll."""
+#: How far :func:`_poll_counted_clock` advances per read.  The real acquire reads
+#: its clock once for its deadline and once per failed poll, so a patched wait of
+#: ``_POLL_STEP * N`` is a budget of exactly N polls
+#: (``TestPollCountedClock`` pins that read pattern).
+_POLL_STEP = 0.1
+
+
+def _poll_counted_clock() -> Callable[[], float]:
+    """A ``monotonic`` that advances :data:`_POLL_STEP` per read, i.e. per bounded-wait poll."""
     reads = itertools.count()
-    return lambda: next(reads) * step
+    return lambda: next(reads) * _POLL_STEP
 
 
 async def cancel_mid_acquire_and_settle(
@@ -2842,6 +2859,7 @@ async def cancel_mid_acquire_and_settle(
     monkeypatch.setattr(git_ops_mod, 'acquire_merge_verify_flock', _watched)
 
     with foreign_lane_lock_holder(lock_path):
+        before = asyncio.all_tasks()
         task = asyncio.create_task(start())
         entered_wait = asyncio.ensure_future(entered.wait())
         done, _ = await asyncio.wait(
@@ -2858,7 +2876,7 @@ async def cancel_mid_acquire_and_settle(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        orphans = other_pending_tasks()
+        orphans = other_pending_tasks(excluding=before)
         assert len(orphans) <= 1, (
             f'the cancelled operation left more than one task in flight, so '
             f'there is no single acquire whose late win to settle; '
@@ -2875,6 +2893,29 @@ async def cancel_mid_acquire_and_settle(
             'happened, so this would prove nothing about a late win'
         )
     return won['fd']
+
+
+class TestPollCountedClock:
+    """The B12 end-to-end cases budget their acquire in polls, not seconds."""
+
+    def test_a_wait_of_n_poll_steps_allows_exactly_n_failed_polls(self, tmp_path: Path):
+        lock_path = lane_lock_path(tmp_path / 'lane')
+        sleeps: list[float] = []
+        with leaked_lane_lock(lock_path):
+            fd = acquire_merge_verify_flock(
+                lock_path,
+                _POLL_STEP * 5,
+                monotonic=_poll_counted_clock(),
+                sleep=sleeps.append,
+            )
+
+        assert fd is None, 'the lane was held throughout, so nothing could be won'
+        assert len(sleeps) + 1 == 5, (
+            f'a wait of _POLL_STEP * 5 must allow exactly 5 failed polls: the '
+            f'acquire no longer reads its clock once per poll, so every '
+            f'"_POLL_STEP * N" budget in this module now means something else; '
+            f'polls={len(sleeps) + 1}'
+        )
 
 
 @pytest.mark.asyncio
@@ -2987,6 +3028,7 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         running = obs['running']
         assert isinstance(running, threading.Event)
 
+        before = asyncio.all_tasks()
         task = asyncio.create_task(
             GitOps._acquire_lane_flock_off_thread(lane_lock_path(tmp_path / 'lane'), 5.0)
         )
@@ -3004,7 +3046,7 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        orphans = other_pending_tasks()
+        orphans = other_pending_tasks(excluding=before)
         assert len(orphans) == 1, (
             f'the cancellation must leave exactly the shielded acquire in '
             f'flight; pending={orphans!r}'
@@ -3159,10 +3201,10 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         """
         from orchestrator import git_ops as git_ops_mod
 
-        # A budget of 300 polls, far above the few that elapse before the
-        # handover, so the acquire cannot reach its deadline and return None —
-        # which would make the assertions below vacuously true.
-        monkeypatch.setattr(git_ops_mod, '_MERGE_VERIFY_LEASE_WAIT_SECS', 30.0)
+        # Far more polls than elapse before the handover, so the acquire cannot
+        # reach its deadline and return None — which would make the assertions
+        # below vacuously true.
+        monkeypatch.setattr(git_ops_mod, '_MERGE_VERIFY_LEASE_WAIT_SECS', _POLL_STEP * 300)
 
         git_ops = _git_ops(tmp_path)
         lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
@@ -3207,25 +3249,23 @@ class TestCancelledResetNeverOrphansTheLaneLock:
     @staticmethod
     def _watch_acquire(
         monkeypatch: pytest.MonkeyPatch,
-    ) -> tuple[threading.Event, dict[str, object]]:
+    ) -> tuple[threading.Event, dict[str, int]]:
         """Observe the REAL bounded-wait acquire without replacing it.
 
         Returns ``(polling, outcome)``: *polling* is set the moment the acquire
-        begins on its worker thread, and *outcome* collects ``fd`` (its return
-        value) and ``thread_id``.  Pass-through, not a stub.
+        begins, and *outcome* records the ``thread_id`` it began on.
+        Pass-through, not a stub.
         """
         from orchestrator import git_ops as git_ops_mod
 
         polling = threading.Event()
-        outcome: dict[str, object] = {}
+        outcome: dict[str, int] = {}
         real_acquire = git_ops_mod.acquire_merge_verify_flock
 
         def _watched(*args, **kwargs):
             outcome['thread_id'] = threading.get_ident()
             polling.set()
-            fd = real_acquire(*args, **kwargs)
-            outcome['fd'] = fd
-            return fd
+            return real_acquire(*args, **kwargs)
 
         monkeypatch.setattr(
             git_ops_mod, 'acquire_merge_verify_flock', _watched,
@@ -3249,10 +3289,10 @@ class TestCancelledResetNeverOrphansTheLaneLock:
         """
         from orchestrator import git_ops as git_ops_mod
 
-        # A budget of 100 polls: the acquire is provably STILL POLLING when the
+        # Enough polls that the acquire is provably STILL POLLING when the
         # cancellation lands — the whole point is a win that arrives after its
         # awaiter is gone, not a wait that expires first.
-        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 10)
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', _POLL_STEP * 100)
 
         commit_a = await _get_merge_commit(real_git_ops, 'b12-a', 'b12_a.py')
         await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
