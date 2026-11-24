@@ -1720,9 +1720,27 @@ def run_in_new_session_until(
     same stop, and every exit path stops the group -- including an exception
     raised by *condition* itself, which then propagates.
     """
+    return _run_in_new_session_until(
+        cmd, condition_for=lambda _pid: condition, timeout=timeout, env=env, cwd=cwd, text=text,
+    )
+
+
+def _run_in_new_session_until(
+    cmd: list[str],
+    *,
+    condition_for: Callable[[int], Callable[[], bool]],
+    timeout: float,
+    env: dict[str, str] | None,
+    cwd: str | os.PathLike[str] | None,
+    text: bool,
+) -> RunUntilOutcome:
+    """:func:`run_in_new_session_until` on the condition ``condition_for(pid)``
+    makes for the spawned child, made inside the region that stops the group on
+    any exception, so a factory that raises leaks nothing either."""
     p, pgid = _spawn_in_new_session(cmd, env=env, cwd=cwd, text=text)
     deadline = time.monotonic() + timeout
     try:
+        condition = condition_for(p.pid)
         while True:
             try:
                 out, err = p.communicate(timeout=_CONDITION_POLL_SLICE_SECS)
@@ -1750,35 +1768,34 @@ def run_in_new_session_while_progressing(
     *,
     progress: Callable[[], object],
     stall_timeout: float,
+    stall_clock: Callable[[int], Callable[[], float]],
     env: dict[str, str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
     text: bool = True,
 ) -> subprocess.CompletedProcess:
     """:func:`run_in_new_session` whose deadline counts only time WITHOUT progress.
 
-    The clock re-arms whenever *progress* returns a value unequal to its
-    previous one, so a slow child that is still advancing is never killed and
-    a stuck one is, *stall_timeout* seconds after its last change. *progress*
-    is called every ``_CONDITION_POLL_SLICE_SECS`` and must be cheap and safe
-    to call while the child runs.
+    The stall is measured on ``stall_clock(pid)``, made once for the spawned
+    child inside the region that stops the group on any exception. The bound
+    re-arms whenever *progress* returns a value unequal to its previous one, so
+    a slow child that is still advancing is never killed and a stuck one is,
+    *stall_timeout* clock seconds after its last change. *progress* is called
+    every ``_CONDITION_POLL_SLICE_SECS`` and must be cheap and safe to call
+    while the child runs.
+
+    Callers pass ``shared/src/shared/testing_own_time.py::OwnTimeClock``, the
+    child's own time, so time the child spends queued for a CPU on a loaded
+    host is never read as a stall. It is injected rather than imported because
+    of this module's stdlib-only import constraint (module docstring).
 
     Raises ``TimeoutExpired`` (``timeout == stall_timeout``, partial output
-    attached) on a stall; an exception from *progress* stops the group and
-    propagates.
+    attached) on a stall; an exception from *progress* or *stall_clock* stops
+    the group and propagates.
     """
-    last: object = object()
-    last_change = time.monotonic()
-
-    def stalled() -> bool:
-        nonlocal last, last_change
-        current = progress()
-        if current != last:
-            last, last_change = current, time.monotonic()
-            return False
-        return time.monotonic() - last_change >= stall_timeout
-
-    outcome = run_in_new_session_until(
-        cmd, condition=stalled, timeout=math.inf, env=env, cwd=cwd, text=text,
+    outcome = _run_in_new_session_until(
+        cmd,
+        condition_for=lambda pid: _stall_detector(progress, stall_clock(pid), stall_timeout),
+        timeout=math.inf, env=env, cwd=cwd, text=text,
     )
     if outcome.stopped_on_condition:
         raise subprocess.TimeoutExpired(
@@ -1786,6 +1803,25 @@ def run_in_new_session_while_progressing(
             output=outcome.completed.stdout, stderr=outcome.completed.stderr,
         )
     return outcome.completed
+
+
+def _stall_detector(
+    progress: Callable[[], object], clock: Callable[[], float], stall_timeout: float,
+) -> Callable[[], bool]:
+    """A condition that holds once *progress* has not changed for *stall_timeout*
+    seconds on *clock*."""
+    last: object = object()
+    last_change = clock()
+
+    def stalled() -> bool:
+        nonlocal last, last_change
+        current = progress()
+        if current != last:
+            last, last_change = current, clock()
+            return False
+        return clock() - last_change >= stall_timeout
+
+    return stalled
 
 
 def _spawn_in_new_session(
