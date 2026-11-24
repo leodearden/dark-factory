@@ -1808,6 +1808,7 @@
     "orchestrator/tests/test_merge_queue_equivalence.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_finalize_head_visibility.py": {"patch_targets": [], "private_reads": 14},
     "orchestrator/tests/test_merge_queue_flake_recorder.py": {"patch_targets": [], "private_reads": 11},
+    "orchestrator/tests/test_merge_queue_fresh_merge_on_live_tip.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_frozen_prefix.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_merge_queue_host_observability.py": {"patch_targets": [], "private_reads": 32},
     "orchestrator/tests/test_merge_queue_invariant_integration_gate.py": {"patch_targets": [], "private_reads": 0},
