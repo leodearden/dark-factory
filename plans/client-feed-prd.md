@@ -330,7 +330,8 @@ For a publisher configured with root R, output directory O and inbox directory I
 under O is a function of R's git objects, R's `.taskmaster/tasks/tasks.db` rows with `tag='master'`,
 R's `data/orchestrator/runs.db`, R's `data/escalations/` queue-root records, of which only `id`,
 `task_id`, `status`, `level` and `members` are read, R's `data/verify-logs/`, R's `acceptance/criteria.yaml`, the policy,
-and I's `inbox.jsonl` and `engagement.json`, filtered by the policy's visible set. It opens no other
+O's `criteria-staging.json` (written by `client-feed criteria-results`, §7.7), and I's `inbox.jsonl`
+and `engagement.json`, filtered by the policy's visible set. It opens no other
 path. It writes nowhere but O. The portal account reads O and nothing under R.
 
 The client defect filer is a separate process under its own invariant (§14.5); it widens nothing here.
@@ -727,7 +728,7 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
   - (b) `criteria_results{verify}` joins the newest verify run of a pass that has archived junits
     (`client-feed/src/client_feed/stream_events.py::VerifyReports`). Each junit report is joined
     with the collection map beside it at
-    `client-feed/src/client_feed/criteria.py::collection_map_path`, over every case read uncapped
+    `client-feed/src/client_feed/sources/collection_map.py::collection_map_path`, over every case read uncapped
     (`client-feed/src/client_feed/sources/archive.py::read_junit_cases`). So the outcomes never
     depend on the `test_results` case cap, and a case id in one report never borrows another
     report's binding. A run none of whose junits has a map records nothing. The event is emitted
@@ -745,8 +746,9 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     `client-feed criteria-results` (`client-feed/src/client_feed/cli.py::_run_criteria_results`)
     through `client-feed/src/client_feed/feed_io.py::write_atomically`, the same atomic, group-readable
     writer as `state.json`. The publisher reads it every pass and emits `criteria_results{staging}`
-    when it differs from the state. The CLI accepts `--run-kind staging` only. A malformed staging
-    file is `criteria` in `degraded` and does not hold the verify results.
+    when it differs from the state. The CLI accepts `--run-kind staging` only, and a staging file it
+    cannot write is a named refusal, exit 1. A malformed staging file is `criteria` in `degraded` and
+    does not hold the verify results.
   - (e) `test_results.cases[].criterion` stays null. Binding it from the same map is left to sit
     with ι's `cases[].defects`, which reads that map's `defects`
     (follow-up ticket tkt_0RXBYTA3ZE3K2KQSNATM2CZWS9).
