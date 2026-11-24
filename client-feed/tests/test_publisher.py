@@ -815,14 +815,40 @@ def _declare_criteria(project: Project, text: str | None = None) -> None:
     project.repo.commit('Declare the acceptance criteria', when=at(19))
 
 
-def _map_beside_the_archived_junit(project: Project) -> None:
-    """A defect-tests collection map binding test_a to C-1 and test_b to C-2."""
-    (junit,) = task_dir(project.root).glob('*.junit-*.xml.gz')
+def _bind(junit: Path) -> None:
+    """A defect-tests collection map beside `junit` binding test_a to C-1 and test_b to C-2."""
     collection_map = {
         'tests/test_a.py::test_a': {'defects': [], 'criterion': 'C-1'},
         'tests/test_a.py::test_b': {'defects': [], 'criterion': 'C-2'},
     }
     collection_map_path(junit).write_text(json.dumps(collection_map))
+
+
+def _map_beside_the_archived_junit(project: Project) -> None:
+    (junit,) = task_dir(project.root).glob('*.junit-*.xml.gz')
+    _bind(junit)
+
+
+def _task_9_verify_run_with_a_map(project: Project) -> None:
+    """Task 9's verify window [at(40), at(50)]: test_a red and test_b green, with a map beside its junit."""
+    write_plan(project.root, at(41), task_id=9)
+    write_summary(project.root, at(45), commands=RED_TEST, task_id=9)
+    junit = write_junit(
+        project.root,
+        at(45),
+        junit_xml(red('test_a', 'failure', 'AssertionError'), passed('test_b')),
+        task_id=9,
+    )
+    _bind(junit)
+    project.runs.emit('phase_enter', at=at(40), task_id=9, phase='verify')
+    project.runs.emit('phase_exit', at=at(50), task_id=9, phase='verify')
+
+
+TASK_9_RESULTS = (
+    CriterionResult(id='C-1', outcome=CriterionOutcome.FAILED, tests=('tests.test_a::test_a',)),
+    CriterionResult(id='C-2', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_b',)),
+    CriterionResult(id='C-3', outcome=CriterionOutcome.NOT_RUN, tests=()),
+)
 
 
 def _criteria_events(project: Project) -> list[CriteriaDeclared | CriteriaResults]:
@@ -948,3 +974,54 @@ def test_a_malformed_staging_file_is_named_criteria_and_the_verify_criteria_stil
         'criteria_results',
     ]
     assert _results_of(project, RunKind.STAGING) == []
+
+
+def test_of_two_tested_runs_in_one_pass_only_the_newest_is_joined(project: Project) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    _task_9_verify_run_with_a_map(project)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    (verify,) = _results_of(project, RunKind.VERIFY)
+    assert (verify.run_at, verify.results) == (at(50), TASK_9_RESULTS)
+    assert_valid(project)
+
+
+def test_a_malformed_archived_map_is_named_criteria_and_the_declaration_still_publishes(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    (junit,) = task_dir(project.root).glob('*.junit-*.xml.gz')
+    collection_map_path(junit).write_text('[]')
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert 'invalid_map' in report.degraded[0].reason
+    assert [event.type for event in _criteria_events(project)] == ['criteria_declared']
+    assert_valid(project)
+
+
+def test_a_new_verify_run_joins_the_states_declaration_while_the_criteria_file_is_invalid(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    first = len(feed(project))
+    project.repo.write(CRITERIA_RELPATH, 'format: 2\ncriteria: []\n')
+    project.repo.commit('Break the acceptance criteria', when=at(39))
+    _task_9_verify_run_with_a_map(project)
+
+    report = run_pass(project.policy, out, now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert CRITERIA_RELPATH in report.degraded[0].reason
+    (verify,) = [
+        line for line in feed(project)[first:] if isinstance(line, CriteriaDeclared | CriteriaResults)
+    ]
+    assert isinstance(verify, CriteriaResults)
+    assert (verify.run_kind, verify.run_at, verify.results) == (RunKind.VERIFY, at(50), TASK_9_RESULTS)
+    assert_valid(project)
