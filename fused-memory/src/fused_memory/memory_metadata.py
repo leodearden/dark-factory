@@ -108,6 +108,7 @@ __all__ = [
     'PARENT_ID_UNAVAILABLE_CODE',
     'ParentHasChildrenError',
     'RECONCILIATION_COMPLETION_ECHO_MARKER',
+    'RECONCILIATION_VERDICT_KEY',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
     'SUPERSEDED_BY_METADATA_KEY',
@@ -121,6 +122,7 @@ __all__ = [
     'is_completion_record',
     'is_orchestrator_completion_record',
     'is_reconciliation_completion_echo',
+    'is_reconciliation_verdict_note',
     'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
@@ -702,12 +704,14 @@ def is_orchestrator_completion_record(meta: Mapping[str, Any]) -> bool:
 
 
 #: The ``source`` reconciliation/targeted.py::TargetedReconciler stamps on its
-#: notes: the completion echo and the verification-verdict note.
+#: notes: the completion echo and the verification-verdict note. Both are
+#: registered completion records.
 TARGETED_RECONCILIATION_SOURCE = 'targeted_reconciliation'
 
 #: The metadata that marks reconciliation's completion echo, as against its
 #: verification-verdict note. TargetedReconciler._on_task_done's fast path
-#: stamps it and TargetedReconciler._delete_stale_completion_echoes filters on it.
+#: stamps it and TargetedReconciler._delete_stale_completion_echoes filters on
+#: it, so that sweep never deletes a verdict note.
 RECONCILIATION_COMPLETION_ECHO_MARKER: Mapping[str, str] = MappingProxyType({
     'source': TARGETED_RECONCILIATION_SOURCE,
     'transition': TaskStatus.DONE.value,
@@ -718,9 +722,23 @@ def is_reconciliation_completion_echo(meta: Mapping[str, Any]) -> bool:
     return all(meta.get(key) == value for key, value in RECONCILIATION_COMPLETION_ECHO_MARKER.items())
 
 
+#: The key under which TargetedReconciler._on_task_done's verification-verdict
+#: note records the verifier's verdict on its metadata.task_id's completion.
+RECONCILIATION_VERDICT_KEY = 'verification_verdict'
+
+
+def is_reconciliation_verdict_note(meta: Mapping[str, Any]) -> bool:
+    verdict = meta.get(RECONCILIATION_VERDICT_KEY)
+    return meta.get('source') == TARGETED_RECONCILIATION_SOURCE and isinstance(verdict, str) and bool(verdict)
+
+
 def is_completion_record(meta: Mapping[str, Any]) -> bool:
     """Is this a record ABOUT its metadata.task_id, as opposed to one merely written by that task?"""
-    return is_orchestrator_completion_record(meta) or is_reconciliation_completion_echo(meta)
+    return (
+        is_orchestrator_completion_record(meta)
+        or is_reconciliation_completion_echo(meta)
+        or is_reconciliation_verdict_note(meta)
+    )
 
 
 #: Union of every known layer, precomputed for the unknown-key scan.

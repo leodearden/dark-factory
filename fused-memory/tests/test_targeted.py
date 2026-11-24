@@ -4191,7 +4191,7 @@ async def test_on_task_done_completion_journal_has_echo_used_provenance(
             {'id': '361', 'metadata': {}},
             {
                 'content_startswith': (
-                    "Task 'Autopilot task' transitioned to done; "
+                    "Task 'Autopilot task' was marked finished; "
                     "completion not yet verified."
                 ),
                 'content_contains': [
@@ -4246,7 +4246,7 @@ async def test_on_task_done_unverified_completion_reframe(
     (targeted.py:409-500) after the task 2622 reframe: (1) no usable
     done_provenance and no authoritative memory -- the branch-3 fallback must
     no longer assert "completed" from the unverified description, instead
-    reframing to "transitioned to done; completion not yet verified" plus an
+    reframing to "was marked finished; completion not yet verified" plus an
     `echo_unverified_completion` flag; (2) verified done_provenance (branch 2,
     task 2049) is UNCHANGED -- still asserts "completed" with the landed
     outcome; (3) an authoritative resolution memory (branch 1, task 1984) is
