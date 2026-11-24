@@ -386,6 +386,12 @@ restored and named in `recovered_params`. `mcp_markup_unrepairable` refuses
 without one. Opt-out: `metadata={'allow_mcp_markup': True}` — load-bearing
 rather than theoretical, since this task's own description quotes every
 sentinel verbatim and this document could not otherwise be filed as a task.
+Send `metadata` as the FIRST argument, ahead of the string that carries the
+markup. A leak swallows only the parameters that follow the leaking one, so an
+override sent after it arrives inside the leaked value. The guard never honours
+an override found there, because finding it there proves the leak is real. It
+reports it as `override_swallowed: true` on the refusal and on the residue
+record, and its hint repeats the metadata-first remedy (task 5055).
 
 When this section was first written, the guard was task 3141's
 `fused_memory/server/markup_tripwire.py`, returning
