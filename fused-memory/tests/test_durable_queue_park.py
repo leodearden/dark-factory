@@ -12,6 +12,8 @@ import asyncio
 import contextlib
 import dataclasses
 import sqlite3
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
 
@@ -19,7 +21,7 @@ import pytest
 from _fm_polling import poll_until, poll_until_dead
 from _queued_write_fixtures import queued
 
-from fused_memory.services.durable_queue import DurableWriteQueue, ParkedWriteEvent
+from fused_memory.services.durable_queue import DurableWriteQueue, ParkDecision, ParkedWriteEvent
 from fused_memory.services.queued_writes import QueueCallback, QueuedWrite
 
 _MAX_ATTEMPTS = 3
@@ -35,12 +37,17 @@ class _RecordingParkPolicy:
     cleared: int = 0
     raise_on_parked: bool = False
     raise_on_cleared: bool = False
+    retry_at: Callable[[], float | None] = lambda: None
+    observe: Callable[[ParkedWriteEvent], None] = lambda event: None
 
-    def park_reason(self, exc: BaseException) -> str | None:
-        return 'test-park' if isinstance(exc, _Exhausted) else None
+    def park_decision(self, exc: BaseException) -> ParkDecision | None:
+        if not isinstance(exc, _Exhausted):
+            return None
+        return ParkDecision('test-park', retry_at=self.retry_at())
 
     async def on_parked(self, event: ParkedWriteEvent) -> None:
         self.parked.append(event)
+        self.observe(event)
         if self.raise_on_parked:
             raise RuntimeError('on_parked hook failed')
 
@@ -171,6 +178,56 @@ class TestParking:
             await poll_until(_status_is(tmp_path, healthy, 'completed'), timeout=10.0)
             assert _row(tmp_path, parked)['status'] == 'parked'
             assert len(policy.parked) == 1
+        finally:
+            await q.close()
+
+
+class TestTheProbeTimeAParkNames:
+    @pytest.mark.asyncio
+    async def test_a_named_probe_time_becomes_every_parked_rows_horizon(self, tmp_path):
+        probe_at = time.time() + 600.0
+        policy = _RecordingParkPolicy()
+        execute = AsyncMock(side_effect=_Exhausted('capped'))
+        q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
+        await q.initialize()
+        try:
+            first = await q.enqueue(_write('first', group_id='proj1'))
+            await poll_until(_status_is(tmp_path, first, 'parked'), timeout=10.0)
+            policy.retry_at = lambda: probe_at
+
+            second = await q.enqueue(_write('second', group_id='proj2'))
+            await poll_until(_status_is(tmp_path, second, 'parked'), timeout=10.0)
+
+            row = _row(tmp_path, second)
+            assert row['next_retry_at'] == probe_at
+            assert row['attempts'] == 0
+            assert _row(tmp_path, first)['next_retry_at'] == probe_at
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_probe_time_in_the_past_is_clamped_to_now(self, tmp_path):
+        retry_ats = iter([time.time() - 3600.0])
+        horizons: list[float] = []
+        policy = _RecordingParkPolicy(
+            retry_at=lambda: next(retry_ats, time.time() + 600.0),
+            observe=lambda event: horizons.append(_row(tmp_path, event.item_id)['next_retry_at']),
+        )
+        execute = AsyncMock(side_effect=_Exhausted('capped'))
+        q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
+        await q.initialize()
+        try:
+            before = time.time()
+            item_id = await q.enqueue(_write('clamped'))
+            await poll_until(
+                lambda: execute.await_count >= 2, timeout=10.0,
+                message='a row parked with a past probe time was not claimable at once',
+            )
+            await poll_until(lambda: len(horizons) >= 2, timeout=5.0)
+
+            assert before <= horizons[0] <= time.time()
+            assert _row(tmp_path, item_id)['status'] == 'parked'
+            assert _row(tmp_path, item_id)['attempts'] == 0
         finally:
             await q.close()
 
