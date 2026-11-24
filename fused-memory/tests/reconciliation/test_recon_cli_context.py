@@ -38,7 +38,6 @@ from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, Run
 from fused_memory.reconciliation import (
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
-    RECONCILIATION_WORK_CLASS,
 )
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
@@ -47,6 +46,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
 )
 from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.reserve_step_aside import RECONCILIATION_WORK_CLASS
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from reconciliation.stubbed_stage_cli import run_stage, run_stage_answered_by
 

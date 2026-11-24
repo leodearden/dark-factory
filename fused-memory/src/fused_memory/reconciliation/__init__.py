@@ -3,8 +3,6 @@
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from shared.account_reserve import WorkClass, WorkKind
-
 # Cap-wait sanity bound shared by the reconciliation stage runners (agent_loop, judge,
 # cli_stage_runner). A stage must finish inside its cycle: 1800 s lets a brief cap window
 # resolve in-band, where the 14-day default would stall the queue under a sustained cap.
@@ -19,6 +17,3 @@ RECONCILIATION_CLI_ENV_OVERRIDES: Mapping[str, str] = MappingProxyType({
     'DISABLE_AUTO_COMPACT': '1',  # compaction off
     'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',  # transcripts kept
 })
-
-# Every recon CLI call is background work (plans/allowance-reserve-by-account-prd.md §6.1, D13).
-RECONCILIATION_WORK_CLASS: WorkClass = WorkClass(kind=WorkKind.BACKGROUND, role='reconciliation')

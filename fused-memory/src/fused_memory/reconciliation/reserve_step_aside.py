@@ -19,9 +19,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from shared.account_reserve import ReserveRefusal
-
-from fused_memory.reconciliation import RECONCILIATION_WORK_CLASS
+from shared.account_reserve import ReserveRefusal, WorkClass, WorkKind
 
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
@@ -29,6 +27,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFERRAL_LOG_INTERVAL_SECS = 600.0
+
+# Every recon CLI call is background work (plans/allowance-reserve-by-account-prd.md §6.1, D13).
+RECONCILIATION_WORK_CLASS: WorkClass = WorkClass(kind=WorkKind.BACKGROUND, role='reconciliation')
 
 
 class StepAsideSite(StrEnum):

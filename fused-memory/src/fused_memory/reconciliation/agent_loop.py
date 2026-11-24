@@ -27,8 +27,8 @@ from fused_memory.reconciliation import (
     _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
-    RECONCILIATION_WORK_CLASS,
 )
+from fused_memory.reconciliation.reserve_step_aside import RECONCILIATION_WORK_CLASS
 
 logger = logging.getLogger(__name__)
 
