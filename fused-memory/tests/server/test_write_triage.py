@@ -22,7 +22,7 @@ import types
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from _fm_helpers import make_insufficient_quota_error
+from _fm_helpers import make_insufficient_quota_error, make_usage_limit_reached_error
 
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
 from fused_memory.models.memory import AddMemoryResponse, MemoryResult
@@ -2012,7 +2012,10 @@ class TestAFailOpenOnExhaustedCreditsSaysSo:
         pytest.importorskip('escalation')
 
         emit_triage_fail_open_storm_escalation(
-            str(tmp_path), {**_STORM, 'billing_exhausted_in_window': 9},
+            str(tmp_path), {
+                **_STORM, 'billing_exhausted_in_window': 9,
+                'billing_alarm_categories_in_window': ['provider_billing_exhausted'],
+            },
         )
 
         payload = _only_escalation(tmp_path)
@@ -2037,6 +2040,87 @@ class TestAFailOpenOnExhaustedCreditsSaysSo:
             f'{_FAIL_OPEN_STORM_WINDOW_SECONDS}s — write triage is failing open '
             '(see docs/prds/memory-write-path-convergence.md)'
         )
+
+
+class TestAFailOpenOnACappedPlanSaysSo:
+    """A fail-open storm behind a capped ChatGPT plan points at the plan's own L2 (task 9944)."""
+
+    _service = staticmethod(TestTriageWriteFailsOpen._service)
+    _fail_open_logs = staticmethod(TestTriageWriteFailsOpen._fail_open_logs)
+
+    @pytest.mark.asyncio
+    async def test_the_fail_open_line_names_the_plan_cap(self, caplog) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(side_effect=make_usage_limit_reached_error()))
+
+        with caplog.at_level(logging.DEBUG, logger=write_triage.logger.name):
+            await triage_write(service, content='c', project_id='p', counter=counter)
+
+        (logged,) = self._fail_open_logs(caplog)
+        assert 'cause=billing_exhausted:plan_cap' in logged.getMessage()
+
+    async def _storm(self, failures: list[BaseException]) -> dict:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        for failure in failures:
+            service = self._service(search=AsyncMock(side_effect=failure))
+            await triage_write(service, content='c', project_id='p', counter=counter)
+        storm = counter.drain_storm()
+        assert storm is not None, 'crossing the threshold must fire'
+        return storm
+
+    async def _filed_storm(self, tmp_path, failures: list[BaseException]) -> tuple[dict, dict]:
+        storm = await self._storm(failures)
+        emit_triage_fail_open_storm_escalation(str(tmp_path), storm)
+        return storm, _only_escalation(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_a_plan_cap_storm_names_the_plan_l2_and_not_the_credits_l2(
+        self, tmp_path,
+    ) -> None:
+        pytest.importorskip('escalation')
+
+        storm, payload = await self._filed_storm(
+            tmp_path, [make_usage_limit_reached_error()] * _FAIL_OPEN_STORM_THRESHOLD,
+        )
+
+        assert storm['billing_exhausted_in_window'] == _FAIL_OPEN_STORM_THRESHOLD
+        assert 'plan_route_capped' in payload['summary']
+        assert 'provider_billing_exhausted' not in f"{payload['summary']}\n{payload['detail']}"
+
+    @pytest.mark.asyncio
+    async def test_an_insufficient_quota_storm_still_names_the_credits_l2(
+        self, tmp_path,
+    ) -> None:
+        pytest.importorskip('escalation')
+
+        _, payload = await self._filed_storm(
+            tmp_path, [make_insufficient_quota_error()] * _FAIL_OPEN_STORM_THRESHOLD,
+        )
+
+        assert 'provider_billing_exhausted' in payload['summary']
+        assert 'plan_route_capped' not in f"{payload['summary']}\n{payload['detail']}"
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_storm_names_both_l2s_and_counts_every_billing_fail_open(
+        self, tmp_path,
+    ) -> None:
+        pytest.importorskip('escalation')
+        plan = _FAIL_OPEN_STORM_THRESHOLD // 2
+        credits = _FAIL_OPEN_STORM_THRESHOLD - plan
+
+        storm, payload = await self._filed_storm(
+            tmp_path,
+            [make_usage_limit_reached_error()] * plan
+            + [make_insufficient_quota_error()] * credits,
+        )
+
+        assert storm['billing_exhausted_in_window'] == _FAIL_OPEN_STORM_THRESHOLD
+        assert storm['billing_alarm_categories_in_window'] == [
+            'plan_route_capped', 'provider_billing_exhausted',
+        ]
+        assert 'plan_route_capped' in payload['summary']
+        assert 'provider_billing_exhausted' in payload['summary']
+        assert 'billing_alarm_categories_in_window=' in payload['detail']
 
 
 def _only_escalation(project_root) -> dict:
