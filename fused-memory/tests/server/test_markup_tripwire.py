@@ -34,7 +34,12 @@ from types import SimpleNamespace
 
 import pytest
 from shared import toolcall_markup
-from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING, OUTCOMES
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MARKUP_REFUSAL_CUSTODY_CAVEAT,
+    OUTCOMES,
+    residue_caller_lines,
+)
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
@@ -1098,3 +1103,57 @@ class TestTheResidueRecordRouting:
             f'must carry the ONE shared routing sentence, not a local copy: '
             f'{payload["detail"]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Whose call the residue record names, and what its custody proves (task 5055).
+# ---------------------------------------------------------------------------
+
+
+class TestTheResidueRecordNamesItsCaller:
+    """The filer renders the one shared caller rendering and the custody caveat."""
+
+    RAW_VALUE = (
+        'The memory the caller meant to write.' + toolcall_markup.closer_for('content')
+        + '\n' + toolcall_markup.CANONICAL_OPENER_PREFIX + '"not_a_parameter">stray'
+    )
+
+    def _filed_detail(self, tmp_path, record: dict) -> str:
+        pytest.importorskip('escalation')
+        esc_id = markup_tripwire.emit_markup_residue_escalation(
+            str(tmp_path), record, anchor_task_id='markup-residue',
+        )
+        assert esc_id is not None
+        [filed] = (tmp_path / 'data' / 'escalations').glob('esc-*.json')
+        payload = json.loads(filed.read_text())
+        assert payload['id'] == esc_id
+        return payload['detail']
+
+    def test_every_caller_line_the_record_carries_is_rendered(self, tmp_path):
+        record = {
+            'error_type': 'mcp_markup_unrepairable',
+            'tool': 'add_memory',
+            'field': 'content',
+            'subject_task_id': '7349',
+            'subject_agent_role': 'implementer',
+            'agent_id': 'claude-task-7349-implementer',
+            'project': 'dark_factory',
+            'override_swallowed': True,
+            'raw_value': self.RAW_VALUE,
+        }
+
+        detail = self._filed_detail(tmp_path, record)
+
+        missing = set(residue_caller_lines(record)) - set(detail.splitlines())
+        assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
+        assert MARKUP_REFUSAL_CUSTODY_CAVEAT in detail
+        assert 'only surviving copy' not in detail
+        assert self.RAW_VALUE in detail
+
+    def test_a_record_with_no_caller_keys_renders_each_as_None(self, tmp_path):
+        detail = self._filed_detail(
+            tmp_path, {'tool': 'add_memory', 'field': 'content', 'raw_value': 'bytes'},
+        )
+
+        missing = set(residue_caller_lines({})) - set(detail.splitlines())
+        assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
