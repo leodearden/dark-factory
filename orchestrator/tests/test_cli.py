@@ -17,6 +17,7 @@ import orchestrator.cli as cli_module
 import orchestrator.cli_config as cli_config
 from orchestrator.cli import (
     SHUTDOWN_WATCHDOG_TIMEOUT_SECS,
+    TEARDOWN_WATCHDOG_TIMEOUT_SECS,
     _force_exit_after_delay,
     _make_cancel_handler,
     _parse_duration,
@@ -1020,6 +1021,64 @@ class TestRunArmsWatchdog:
             'disarm() was called on the blocked>0 path — watchdog must remain armed to '
             'guard interpreter shutdown (threading._shutdown() joining non-daemon threads)'
         )
+
+
+class TestRunBoundsAsyncioTeardown:
+    """``run`` bounds asyncio.run()'s teardown, and disarms that watchdog before the
+    report echo, so the echo is never covered by a kill timer."""
+
+    def _invoke(self, monkeypatch, harness_run: AsyncMock):
+        events: list[tuple] = []
+
+        def fake_force_exit(timeout_secs, exit_code=137, **kwargs):
+            events.append(('arm', timeout_secs))
+            return cli_module.WatchdogHandle(
+                disarm=lambda: events.append(('disarm', timeout_secs)),
+                thread=MagicMock(spec=threading.Thread),
+            )
+
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
+        original_echo = cli_module.click.echo
+
+        def recording_echo(msg=None, **kwargs):
+            events.append(('echo', msg))
+            return original_echo(msg, **kwargs)
+
+        monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
+        fake_harness = MagicMock()
+        fake_harness.run = harness_run
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
+
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+        return result, events
+
+    def test_the_teardown_watchdog_is_disarmed_before_the_report_echo(self, monkeypatch):
+        report = MagicMock(blocked=0)
+        report.summary.return_value = 'ok'
+
+        result, events = self._invoke(monkeypatch, AsyncMock(return_value=report))
+
+        assert result.exit_code == 0, result.output
+        assert [e for e in events if e[0] != 'echo' or e == ('echo', 'ok')] == [
+            ('arm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
+            ('disarm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
+            ('echo', 'ok'),
+            ('arm', SHUTDOWN_WATCHDOG_TIMEOUT_SECS),
+        ]
+
+    def test_the_sigterm_path_bounds_the_teardown_too(self, monkeypatch):
+        result, events = self._invoke(
+            monkeypatch, AsyncMock(side_effect=asyncio.CancelledError()),
+        )
+
+        assert result.exit_code == 130, result.output
+        assert [e for e in events if e[0] != 'echo'] == [
+            ('arm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
+            ('disarm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
+            ('arm', SHUTDOWN_WATCHDOG_TIMEOUT_SECS),
+        ]
 
 
 class TestRunCapturesTheDeployedSha:
