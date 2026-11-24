@@ -18,6 +18,11 @@ it names its caller through the one shared rendering, ``residue_header_lines``,
 and states ``MARKUP_REFUSAL_CUSTODY_CAVEAT`` rather than claiming to hold the
 only copy.
 
+CUSTODY OF A DROP: on the FORWARD_REPAIR surfaces a swallowed value that cannot
+be typed is dropped from the forwarded call and filed instead. Nothing bounced
+that caller, so its record states ``MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT``
+beside ``MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT``, whichever sink filed it.
+
 Every envelope specimen is built from ``_markup_helpers``, never spelled raw;
 that module's header says why.
 """
@@ -38,6 +43,8 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     residue_header_lines,
 )
 from shared.project_layout import escalation_queue_dir
@@ -293,3 +300,34 @@ async def test_the_residue_states_what_its_custody_proves(
 
     assert MARKUP_REFUSAL_CUSTODY_CAVEAT in detail
     assert 'only surviving copy' not in detail
+
+
+UNRECOVERED = [
+    pytest.param(
+        VerdictTools, 'submit_review_verdict', 'summary', 'metadata', 'not a JSON object',
+        {'reviewer': REVIEWER_ROLE, 'verdict': 'PASS', 'issues': []},
+        id='verdict-tools.submit_review_verdict.metadata',
+    ),
+    pytest.param(
+        EscalationServer, 'escalate_info', 'detail', 'evidence', '[{"observation": "cut off',
+        ESCALATE_INFO_ARGUMENTS,
+        id='escalation.escalate_info.evidence',
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('surface', 'tool', 'field', 'sibling', 'sibling_value', 'sent'), UNRECOVERED,
+)
+async def test_a_dropped_value_states_what_its_custody_proves(
+    tmp_path, monkeypatch, surface, tool, field, sibling, sibling_value, sent,
+):
+    served = surface(tmp_path, monkeypatch)
+    async with Client(served.server) as client:
+        await client.call_tool(tool, {**sent, field: swallowing(field, sibling, sibling_value)})
+
+    [detail] = served.residue_details()
+    assert MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT in detail
+    assert MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT in detail
+    assert MARKUP_REFUSAL_CUSTODY_CAVEAT not in detail

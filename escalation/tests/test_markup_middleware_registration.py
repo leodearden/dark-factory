@@ -55,6 +55,7 @@ from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -1033,7 +1034,7 @@ class TestTheResidueProseMatchesItsKind:
     The sink receives ``mcp_markup_unrepairable`` (refused: nothing written,
     the caller was told, a retry may be coming) and
     ``mcp_markup_unrecovered_param`` (FORWARDED without the parameter and
-    nobody was told, so no retry is coming). The second kind's record is filed
+    nobody was bounced, so no retry is coming). The second kind's record is filed
     before the forwarded call runs, so whether that call then succeeded is not
     known to the sink. This server is the only registration site that produces
     the second kind, because ``_preserve_unrecovered`` is FORWARD_REPAIR-only.
@@ -1090,7 +1091,7 @@ class TestTheResidueProseMatchesItsKind:
         )
         assert 'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER' in residue.detail
         # And the half a reader acts on: nobody is coming back for this.
-        assert 'was NOT told' in residue.detail
+        assert MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT in residue.detail
         # The record does not contradict its own summary any more.
         assert 'forwarded WITHOUT it' in residue.summary
 
@@ -1117,7 +1118,7 @@ class TestTheResidueProseMatchesItsKind:
     async def test_the_forwarded_record_still_carries_the_dropped_value(
         self, tmp_path: Path
     ):
-        """It is the only surviving copy — the caller was never told to resend."""
+        """It is the only copy this boundary holds — nothing bounced the caller to resend."""
         residues = await self._residues(
             tmp_path,
             detail=_leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE),

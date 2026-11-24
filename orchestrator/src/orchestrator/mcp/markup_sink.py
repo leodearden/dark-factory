@@ -43,7 +43,9 @@ from shared.mcp_markup_middleware import (
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
     residue_header_lines,
 )
@@ -174,8 +176,8 @@ class MarkupSinkSpec:
     #: What the refusal COST, in one sentence, rendered only into a REFUSED
     #: residue record's body. Server-specific because the loss is: a refused
     #: plan-tools call writes nothing to plan.json, while a refused
-    #: verdict-tools call strands a review gate and destroys a reviewer's
-    #: findings list.
+    #: verdict-tools call leaves a review gate open until the reviewer
+    #: resends.
     refusal_consequence: str
 
     #: What an ACTIVE burst threatens if the guard is disabled, in one
@@ -343,9 +345,9 @@ def _residue_outcome(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
             'call WITHOUT the field named above. The value below was recovered '
             'from leaked tool-call envelope markup but could not be typed '
             "against that parameter's declared schema, so it was dropped rather "
-            'than passed through untyped. This record was filed before the call '
-            'ran, so whether it then succeeded is not known here; if it did, '
-            'whatever it wrote is missing this value.'
+            'than passed through untyped. '
+            + MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT + ' '
+            + MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT
         )
     return (
         f'This sink does not recognise the record kind {error_type!r}, so it '

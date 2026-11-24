@@ -723,6 +723,16 @@ MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT = (
     'this value.'
 )
 
+#: All a ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE`` residue record can say about
+#: custody of its payload. Unlike a refusal, nothing bounced the caller, and
+#: the drop rode only on the forwarded result's ``markup_repair`` meta.
+MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT = (
+    'Nothing bounced the caller: its call went through, and the drop was '
+    'reported only in the result metadata, which an agent may never read. Do '
+    'not wait on a resend of this value; the payload below is the only copy '
+    'this boundary holds.'
+)
+
 #: All a ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` residue record can say about
 #: custody of its payload. The guard refuses at the boundary and reads nothing
 #: back, so it knows the call wrote nothing and that its caller was told to
@@ -1742,7 +1752,8 @@ class MarkupGuardMiddleware(Middleware):
                 # A DISTINCT error_type from the refusal's, because the two
                 # differ in the one way that matters to whoever reads the queue:
                 # this call is FORWARDED, lossily, and no caller is bounced — so
-                # nobody is waiting on a retry, and nobody was told.
+                # nobody is waiting on a retry
+                # (MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT).
                 'error_type': MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
                 'category': _ESCALATION_CATEGORY,
                 'owner': _ESCALATION_OWNER,
@@ -1754,7 +1765,7 @@ class MarkupGuardMiddleware(Middleware):
                 'project': project,
                 # Same two axes as the refusal record carries, for the same
                 # reason: nobody was BOUNCED on this path, so the subject is
-                # the only route back to a caller that was never told.
+                # the only route back to a caller that was never bounced.
                 'subject_task_id': subject_task_id,
                 'subject_agent_role': subject_agent_role,
                 'override_swallowed': override_swallowed,
@@ -1766,7 +1777,7 @@ class MarkupGuardMiddleware(Middleware):
                 ),
                 'suggested_action': (
                     f'Recover the raw_value into {name}.{field} if it is still '
-                    'needed — the caller was not told it was dropped — then '
+                    'needed — nothing bounced the caller to resend it — then '
                     'chase the harness serialization leak that produced it.'
                 ),
             })

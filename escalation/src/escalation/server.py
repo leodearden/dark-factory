@@ -28,6 +28,7 @@ from shared.mcp_markup_middleware import (
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
@@ -1077,8 +1078,9 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
     produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
     REFUSED — nothing was written, and the caller was told, so a human may
     reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
-    means the call was FORWARDED without the parameter, and nobody was told: no
-    retry is coming, and whether the call then succeeded is unknown here
+    means the call was FORWARDED without the parameter, and nobody was bounced:
+    no retry is coming (``MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT``), and
+    whether the call then succeeded is unknown here
     (``MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT`` says why).  One
     hardcoded "the call was refused" sentence renders the second kind a record
     that contradicts its own summary three lines above, and the false half is
@@ -1107,9 +1109,8 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
             'was recovered from the leak but could not be typed against the '
             'parameter\'s declared schema, so it was dropped from the call '
             'rather than passed through untyped. '
-            f'{MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT} The caller was NOT '
-            'told the value was dropped, so do not wait on a resend of it. The '
-            'payload below is the only surviving copy of it.'
+            f'{MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT} '
+            f'{MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT}'
         )
     logger.warning(
         'markup guard: filing an unrecognised residue kind %r — the middleware '
