@@ -318,3 +318,29 @@ def read_staging(out_dir: Path) -> CriteriaRun | None:
         validate=CriteriaRun.model_validate_json,
         invalid=CriteriaProblem.INVALID_STAGING,
     )
+
+
+def _read_criteria_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding='utf-8')
+    except OSError as exc:
+        raise _unreadable(str(path), exc) from exc
+    except UnicodeDecodeError as exc:
+        raise CriteriaError(
+            problem=CriteriaProblem.UNREADABLE, name=str(path), detail=f'not UTF-8: {exc}'
+        ) from exc
+
+
+def staging_run(
+    *, junit: Path, collection_map: Path, criteria_file: Path, commit: str, now: datetime
+) -> CriteriaRun:
+    """A staging run's criteria: its junit report joined, through the collection map beside it, with the criteria file."""
+    declared = parse_criteria(_read_criteria_file(criteria_file), name=str(criteria_file))
+    cases = read_junit_cases(junit.parent, Path(junit.name))
+    read = read_collection_map(collection_map, name=str(collection_map))
+    if read is None:
+        raise CriteriaError(
+            problem=CriteriaProblem.UNREADABLE, name=str(collection_map), detail='no such file'
+        )
+    report = BoundReport(cases=cases, criteria=criterion_bindings(read))
+    return CriteriaRun(commit=commit, run_at=now, results=join_criteria(declared, [report]))

@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -76,8 +76,7 @@ def test_a_staging_run_is_written_and_printed(
     assert staged is not None
     assert CriteriaRun.model_validate_json(out) == staged
     assert staged.commit == COMMIT
-    assert staged.run_at.utcoffset() is not None
-    assert staged.run_at.utcoffset().total_seconds() == 0
+    assert staged.run_at.utcoffset() == timedelta(0)
     assert staged.results == (
         CriterionResult(id='CF-1', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_a',)),
         CriterionResult(id='CF-2', outcome=CriterionOutcome.NOT_RUN, tests=()),
