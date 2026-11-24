@@ -15749,6 +15749,7 @@ class TestAdvanceMainIndexLockStandoff:
         class _FakeAsyncio:
             def __init__(self, sleep) -> None:
                 self.sleep = sleep
+                self.to_thread = asyncio.to_thread
 
         try:
             with (

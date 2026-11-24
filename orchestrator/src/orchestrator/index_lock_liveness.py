@@ -156,7 +156,7 @@ class IndexLockDiagnosis:
         if self.verdict is IndexLockVerdict.LIVE_HOLDER:
             return (
                 f" It is held by a LIVE git process in project_root's work tree: "
-                f'{_describe(self.holders)}. A long pre-commit hook is normal, so this is '
+                f'{describe_holders(self.holders)}. A long pre-commit hook is normal, so this is '
                 f'NOT a crashed leftover and the lock must NOT be removed: wait for that '
                 f'process to exit, then re-submit the merge.'
             )
@@ -204,7 +204,8 @@ def _older_than(age_s: float | None, floor_s: float | None) -> bool:
     return age_s is not None and floor_s is not None and age_s > floor_s
 
 
-def _describe(holders: tuple[GitProcess, ...]) -> str:
+def describe_holders(holders: tuple[GitProcess, ...]) -> str:
+    """``pid N (`command`)`` for the first few *holders*, then how many more; '' for none."""
     named = ', '.join(
         f'pid {holder.pid} (`{holder.command}`)' for holder in holders[:_HOLDERS_DISPLAYED]
     )

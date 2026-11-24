@@ -80,6 +80,7 @@ from shared.proc_group import (
     scan_process_groups_under_path,
     snapshot_process_group,
 )
+from shared.process_identity import PROC_ROOT
 from shared.transcript_archive import archive_before_delete
 
 from orchestrator import branch_stack, rebase_recovery
@@ -103,6 +104,13 @@ from orchestrator.branch_stack import (
     rebase_own_delta,
 )
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
+from orchestrator.index_lock_liveness import (
+    GitProcessScan,
+    IndexLockVerdict,
+    describe_holders,
+    diagnose_index_lock,
+    scan_work_tree_git_processes,
+)
 from orchestrator.lane_attach import (
     HeadRelation,
     branch_tip,
@@ -282,24 +290,20 @@ MERGE_PARK_REF = 'refs/dark-factory/merge-park'
 _INDEX_LOCK_POLL_INTERVAL_S = 1.0
 _INDEX_LOCK_WARN_INTERVAL_S = 30.0
 
-# Floor (seconds) an index.lock's PRE-wait age must clear before it may be
-# treated as a crashed-git LEFTOVER rather than a live commit.  This repo's
-# documented pre-commit budget (CLAUDE.md instructs `timeout: 300000` for a
-# commit that stages Python), so a lock older than this outlived the longest
-# legitimate hook run.
+# Minimum first-observed age (seconds) of an index.lock that a COMPLETE holder
+# scan found unowned before it counts as a crashed-git LEFTOVER (tasks 3060 and
+# 5229).  It is NOT a bound on how long a pre-commit hook runs (a reify one runs
+# 10-60+ minutes): a live holder is decided by the scan, at any age, and this
+# floor only covers a holder that just exited or that the scan cannot see.
 #
-# Single source of truth for two collaborating call sites, deliberately
-# defined HERE because the import direction is merge_gates -> git_ops and
-# never the reverse:
-#   * `GitOps._await_index_lock_clear` short-circuits its stand-off once the
-#     pre-wait age clears max(grace, this) — waiting cannot change a verdict
-#     that is already "leftover", it only costs the SERIALIZED merge worker
-#     the whole grace per queued task.
-#   * `merge_gates._map_advance_failure` (which aliases this as
-#     `_STALE_LOCK_FLOOR_S`) uses the SAME bar to decide whether to offer the
-#     destructive `rm -f <lock>` recovery.
-# They must never drift: a short-circuit at a lower bar than the advice bar
-# would skip the wait and then NOT explain why.
+# Both consumers pass it to
+# orchestrator/src/orchestrator/index_lock_liveness.py::diagnose_index_lock, so
+# their verdicts cannot drift:
+#   * `GitOps._await_index_lock_clear` skips its stand-off only on
+#     CRASHED_LEFTOVER;
+#   * `merge_gates._map_advance_failure` (aliasing this as `_STALE_LOCK_FLOOR_S`)
+#     offers `rm -f <lock>` only on the same verdict.
+# Defined HERE because the import direction is merge_gates -> git_ops.
 _INDEX_LOCK_STALE_FLOOR_S = 300.0
 
 
@@ -3097,9 +3101,11 @@ class GitOps:
         warm_lane_pool_size: int = 0,
         merge_spec_warm_lane_pool_size: int = 0,
         transcript_archive: TranscriptArchiveConfig | None = None,
+        proc_root: Path = PROC_ROOT,
     ):
         self.config = config
         self.project_root = project_root
+        self.proc_root = proc_root
         # Teardown-archival backstop config (task 2786,
         # agent-transcript-archival-prd β).  None at the 3 non-dispatch
         # construction sites (cli/recover/evals) so the cleanup_worktree
@@ -15577,7 +15583,9 @@ class GitOps:
                 # for an hour-old crashed leftover.  The latter predates the
                 # wait and is the only one a staleness verdict may key on.
                 # 'grace_seconds' travels alongside so the downstream mapper
-                # stays a pure function of this dict.
+                # stays a pure function of this dict.  'holder_scan' is taken
+                # after the stand-off, so the reason names whoever holds the
+                # lock at the moment of deferral.
                 self._last_park_lock_info = {
                     'lock_path': str(lock_path),
                     'age_seconds': lock_age,
@@ -15585,6 +15593,7 @@ class GitOps:
                     'initial_age_seconds': initial_age,
                     'grace_seconds': grace_s,
                     'dirty_files': [],
+                    'holder_scan': await self._scan_index_lock_holders(),
                 }
                 return AdvanceOutcome('park_lock_contended')
 
@@ -15671,7 +15680,7 @@ class GitOps:
                         # therefore yields a NOT-stale verdict downstream,
                         # which is the correct answer for this shape: no
                         # destructive `rm -f` advice for a lock we watched
-                        # appear.
+                        # appear.  The holder scan names its owner.
                         self._last_park_lock_info = {
                             'lock_path': str(lock_path),
                             'age_seconds': lock_age,
@@ -15681,6 +15690,7 @@ class GitOps:
                                 self.config.merge_park_lock_grace_seconds,
                             ),
                             'dirty_files': sorted(dirty_tracked),
+                            'holder_scan': await self._scan_index_lock_holders(),
                         }
                         return AdvanceOutcome('park_lock_contended')
                     except MergeParkContentionError as e:
@@ -16197,10 +16207,9 @@ class GitOps:
     async def _index_lock_state(self) -> tuple[bool, float]:
         """Return ``(present, age_seconds)`` for project_root's index lock.
 
-        ``age_seconds`` is derived from the lock file's mtime and is what
-        distinguishes an in-flight pre-commit hook (young) from a crashed-git
-        leftover (older than the configured grace) in the operator-facing
-        reason.  Returns ``(False, 0.0)`` when absent; a ``stat`` race (the
+        ``age_seconds`` is derived from the lock file's mtime; it is the age
+        half of the crashed-leftover verdict, whose other half is the holder
+        scan (:meth:`_scan_index_lock_holders`).  Returns ``(False, 0.0)`` when absent; a ``stat`` race (the
         lock vanishing between ``exists`` and ``stat``) is treated as absent,
         which is the truth a moment later anyway.
         """
@@ -16213,6 +16222,12 @@ class GitOps:
             # Unreadable for some other reason — do not invent contention.
             return (False, 0.0)
         return (True, max(0.0, time.time() - mtime))
+
+    async def _scan_index_lock_holders(self) -> GitProcessScan:
+        """The live git processes in project_root's work tree, scanned off the event loop."""
+        return await asyncio.to_thread(
+            scan_work_tree_git_processes, self.project_root, proc_root=self.proc_root,
+        )
 
     async def _await_index_lock_clear(
         self, *, timeout_s: float, context: str,
@@ -16243,9 +16258,11 @@ class GitOps:
         Uses a MONOTONIC clock for the deadline so a wall-clock adjustment
         mid-wait cannot extend or truncate the budget.
 
-        An ALREADY-STALE lock (pre-wait age past
+        A PROVEN crashed-git leftover (no live git process in a complete
+        holder scan, and a pre-wait age past
         ``max(timeout_s, _INDEX_LOCK_STALE_FLOOR_S)``) short-circuits the wait
-        entirely — see the inline rationale below.
+        entirely — see the inline rationale below.  A held lock costs one
+        holder scan, off the event loop.
         """
         held, age = await self._index_lock_state()
         if not held:
@@ -16257,29 +16274,28 @@ class GitOps:
         initial_age = age
         lock_path = await self._index_lock_path()
 
-        # ── Already-stale short-circuit ──────────────────────────────
-        # Do not burn the grace on a lock downstream has already decided is a
-        # crashed-git leftover.  `merge_gates._map_advance_failure` renders
-        # its `rm -f` recovery advice from exactly this pre-wait age against
-        # exactly this threshold (_INDEX_LOCK_STALE_FLOOR_S, which it aliases
-        # as _STALE_LOCK_FLOOR_S), so once the bar is cleared no amount of
-        # waiting can change the verdict — it only costs the SERIALIZED merge
-        # worker the full grace for EVERY queued task until an operator clears
-        # the file, which is a slow-motion version of the stall this gate
-        # exists to remove.  The returned (False, 0.0, initial_age) drives the
-        # identical downstream verdict and advice, minus the dead wall-clock.
-        #
-        # Strictly `>` and keyed on the PRE-wait age, mirroring the mapper: a
-        # young lock (the ordinary docs-direct-commit-on-main window) always
-        # gets its full stand-off, which is the case the wait is FOR.
-        stale_floor = max(max(0.0, timeout_s), _INDEX_LOCK_STALE_FLOOR_S)
-        if initial_age > stale_floor:
+        # ── Proven-leftover short-circuit ────────────────────────────
+        # Waiting cannot clear a lock nobody holds; it only costs the
+        # SERIALIZED merge worker the full grace for EVERY queued task until an
+        # operator clears the file.  `merge_gates._map_advance_failure` renders
+        # its `rm -f` advice from the same diagnose_index_lock with the same
+        # floor, so the wait is skipped only when the reason then says why.
+        # Every other verdict gets the full stand-off: a live holder, however
+        # old its lock (the reify commit that looked an hour stale finished
+        # minutes after a 0s deferral), an unconfirmed scan, and a young lock.
+        diagnosis = diagnose_index_lock(
+            initial_age_s=initial_age,
+            grace_s=max(0.0, timeout_s),
+            stale_floor_s=_INDEX_LOCK_STALE_FLOOR_S,
+            scan=await self._scan_index_lock_holders(),
+        )
+        if diagnosis.verdict is IndexLockVerdict.CRASHED_LEFTOVER:
             logger.warning(
                 'Foreign git index lock in project_root is ALREADY %.0fs old '
-                '(past the %.0fs staleness floor) — skipping the stand-off, a '
-                'crashed-git leftover will not clear by waiting. lock=%s '
-                'context=%s',
-                initial_age, stale_floor, lock_path, context,
+                '(past the %.0fs staleness floor) and no live git process holds '
+                'it — skipping the stand-off, a crashed-git leftover will not '
+                'clear by waiting. lock=%s context=%s',
+                initial_age, diagnosis.stale_after_s, lock_path, context,
             )
             return (False, 0.0, initial_age)
 
@@ -16293,8 +16309,10 @@ class GitOps:
 
         logger.warning(
             'Foreign git index lock held in project_root — standing off for '
-            'up to %.0fs before giving up. lock=%s age=%.1fs context=%s',
-            max(0.0, timeout_s), lock_path, age, context,
+            'up to %.0fs before giving up. lock=%s age=%.1fs holders=%s '
+            'context=%s',
+            max(0.0, timeout_s), lock_path, age,
+            describe_holders(diagnosis.holders) or 'none visible', context,
         )
 
         while time.monotonic() < deadline:
