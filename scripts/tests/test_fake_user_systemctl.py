@@ -57,6 +57,7 @@ def bind_errno(port: int) -> int:
         try:
             probe.bind(("127.0.0.1", port))
         except OSError as refused:
+            assert refused.errno is not None, refused
             return refused.errno
     return 0
 

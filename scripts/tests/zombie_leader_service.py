@@ -19,6 +19,8 @@ import threading
 import time
 from pathlib import Path
 
+from shared.safe_io import atomic_write_text
+
 SYS_EXIT = {"x86_64": 60, "aarch64": 93}
 POLL_SECS = 0.01
 
@@ -30,9 +32,7 @@ def leader_state(pid: int) -> str:
 def serve(listener: socket.socket, ready: Path, release: Path) -> None:
     while leader_state(os.getpid()) != "Z":
         time.sleep(POLL_SECS)
-    staged = ready.with_name(f"{ready.name}.partial")
-    staged.write_text(str(listener.getsockname()[1]))
-    staged.replace(ready)
+    atomic_write_text(ready, str(listener.getsockname()[1]))
     while not release.exists():
         time.sleep(POLL_SECS)
 
