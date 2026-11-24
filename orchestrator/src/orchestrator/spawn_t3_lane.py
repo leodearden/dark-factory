@@ -460,6 +460,8 @@ class LaunchedThread:
     thread_id: str
     project_id: str | None
     run_id: str | None
+    model_selection: object
+    """The selection T3 answered it stored for the thread, as sent unless T3 normalised it."""
 
 
 _LOST_REPLY = frozenset({t3_mcp_client.TransportFault.UNREACHABLE, t3_mcp_client.TransportFault.PROTOCOL})
@@ -486,7 +488,9 @@ def _launch_outcome(reply: t3_mcp_client.CallResult, strategy: WorkspaceStrategy
     thread_id = reply.value.get('threadId')
     if not isinstance(thread_id, str) or not thread_id:
         return LaunchFailed('t3_thread_launch answered no threadId')
-    return LaunchedThread(thread_id, reply.value.get('projectId'), reply.value.get('runId'))
+    return LaunchedThread(
+        thread_id, reply.value.get('projectId'), reply.value.get('runId'), reply.value.get('modelSelection')
+    )
 
 
 def _stamp_launched_record(
@@ -592,6 +596,9 @@ def launch(
         return launched.verdict()
     if record_dir:
         _stamp_launched_record(record_dir, title, launched, client.environment_id, _usable_parent(parent))
+    held = spawn_effort.selection_effort(launched.model_selection)
+    if effort and held != effort.value:
+        return _verdict('effort-unconfirmed', thread_id=launched.thread_id, asked=effort.value, got=held)
     return _verdict(
         'started',
         thread_id=launched.thread_id,
