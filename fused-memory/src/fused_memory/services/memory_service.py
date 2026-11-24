@@ -2471,6 +2471,23 @@ class MemoryService:
             return queue_stats['counts'].get('parked', 0)
         return await self._count_parked_writes()
 
+    async def _plan_route_status(
+        self, queue_stats: object, project_id: str | None,
+    ) -> dict[str, Any]:
+        """get_status's plan_route field. A queue that cannot be counted costs
+        only ``parked_items`` (None), never the latch."""
+        try:
+            parked_items: int | None = await self._global_parked_count(queue_stats, project_id)
+        except Exception:
+            logger.warning(
+                'get_status: could not count parked writes; plan_route reports parked_items=None',
+                exc_info=True,
+            )
+            parked_items = None
+        return self.plan_route.state().to_status(
+            parked_items=parked_items, escalation_id=self._plan_cap_alarm.escalation_id(),
+        )
+
     def _graphiti_plan_route_client(self) -> httpx.AsyncClient | None:
         provider = self.config.llm.providers.openai
         if self.config.llm.provider != 'openai' or provider is None or not provider.api_url:
@@ -11550,13 +11567,7 @@ class MemoryService:
             except Exception as e:
                 status['queue'] = {'error': str(e)}
 
-        try:
-            status['plan_route'] = self.plan_route.state().to_status(
-                parked_items=await self._global_parked_count(status.get('queue'), project_id),
-                escalation_id=self._plan_cap_alarm.escalation_id(),
-            )
-        except Exception as e:
-            status['plan_route'] = {'error': str(e)}
+        status['plan_route'] = await self._plan_route_status(status.get('queue'), project_id)
 
         # Server uptime fields (informational; dashboard reads uptime_seconds as primary)
         status['started_at'] = self._started_at.isoformat()

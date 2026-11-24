@@ -279,6 +279,13 @@ test('planRouteText: a capped route with no known reset says so rather than inve
   );
 });
 
+test('planRouteText: a capped route whose parked writes could not be counted says so', () => {
+  assert.equal(
+    planRouteText({ ...CAPPED_ROUTE, parked_items: null }),
+    'plan route: CAPPED since 2026-10-03T11:40:00+00:00, resets 2026-10-03T16:00:00+00:00, unknown parked',
+  );
+});
+
 test('planRouteText: an ok route and an unconfigured one', () => {
   assert.equal(planRouteText(OK_ROUTE), 'plan route: ok');
   assert.equal(planRouteText({ ...OK_ROUTE, state: 'unconfigured' }), 'plan route: not configured');

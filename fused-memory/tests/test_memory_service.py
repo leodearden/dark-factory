@@ -43,6 +43,7 @@ from fused_memory.services.memory_service import (
     _serialize_temporal,
     metadata_row_text,
 )
+from fused_memory.services.plan_route import PlanRouteSnapshot, PlanRouteStateName
 from fused_memory.services.queued_writes import (
     QueueCallback,
     QueuedEpisodeWrite,
@@ -8283,6 +8284,30 @@ class TestGetStatusScoping:
         assert result['queue'] == fixed_stats, (
             f'queue section should equal get_stats output; got {result["queue"]}'
         )
+
+
+class TestGetStatusPlanRoute:
+    """get_status's plan_route reports the in-memory latch even when the queue cannot be counted."""
+
+    @pytest.mark.asyncio
+    async def test_a_queue_that_cannot_be_counted_costs_only_the_parked_count(self, service):
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        service.durable_queue.get_stats = AsyncMock(side_effect=RuntimeError('queue db is locked'))
+        capped_since = datetime(2026, 11, 24, 12, tzinfo=UTC)
+        service.plan_route.state = MagicMock(return_value=PlanRouteSnapshot(
+            state=PlanRouteStateName.CAPPED, proxy_host='127.0.0.1:8317',
+            capped_since=capped_since, resets_at=capped_since + timedelta(days=3),
+        ))
+
+        result = await service.get_status()
+
+        assert result['queue'] == {'error': 'queue db is locked'}
+        plan_route = result['plan_route']
+        assert plan_route['state'] == 'capped'
+        assert plan_route['capped_since'] == capped_since.isoformat()
+        assert plan_route['resets_at'] == (capped_since + timedelta(days=3)).isoformat()
+        assert plan_route['parked_items'] is None
 
 
 class TestGetStatusSurfacesFalkorServerSettings:

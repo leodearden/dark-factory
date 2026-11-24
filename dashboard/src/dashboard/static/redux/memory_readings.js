@@ -87,7 +87,7 @@ function planRouteText(route) {
   return (
     'plan route: CAPPED since ' + orUnknown(route.capped_since) +
     ', resets ' + orUnknown(route.resets_at) +
-    ', ' + route.parked_items + ' parked'
+    ', ' + orUnknown(route.parked_items) + ' parked'
   );
 }
 

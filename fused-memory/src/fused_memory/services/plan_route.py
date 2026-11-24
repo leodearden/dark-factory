@@ -78,7 +78,7 @@ class PlanRouteSnapshot:
         """The write-triage judge calls the cap failed open since it latched."""
         return self.affected_calls_by_site.get(PlanRouteSite.WRITE_TRIAGE_JUDGE, 0)
 
-    def to_status(self, *, parked_items: int, escalation_id: str | None) -> dict[str, Any]:
+    def to_status(self, *, parked_items: int | None, escalation_id: str | None) -> dict[str, Any]:
         return {
             'state': self.state.value,
             'proxy_host': self.proxy_host,
