@@ -8,7 +8,9 @@ of another origin or another project, is never selected.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+import sqlite3
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -77,22 +79,27 @@ class TasksRead:
     cursor: str | None
 
 
-def _metadata_text(path: str) -> str:
-    """The metadata string at `path`, NULL when metadata is not JSON or the value is not a string."""
+def _json_at(document: str, path: str, *, json_type: str, guard: str) -> str:
+    """The value at `path` in `document`, NULL unless `guard` holds and the value is of `json_type`."""
     return (
-        'CASE WHEN json_valid(metadata) THEN'
-        f" CASE WHEN json_type(metadata, '{path}') = 'text' THEN json_extract(metadata, '{path}') END"
+        f'CASE WHEN {guard} THEN'
+        f" CASE WHEN json_type({document}, '{path}') = '{json_type}' THEN json_extract({document}, '{path}') END"
         ' END'
     )
+
+
+def _metadata_at(path: str, *, json_type: str = 'text') -> str:
+    """The metadata value at `path`, NULL when metadata is not JSON or the value is not of `json_type`."""
+    return _json_at('metadata', path, json_type=json_type, guard='json_valid(metadata)')
 
 
 _UPDATED_AFTER: Final = 'tag = ? AND (? IS NULL OR updated_at > ?)'
 
 _TASKS_SQL: Final = (
     'SELECT id, title, status, updated_at,'
-    f" {_metadata_text('$.prd_path')},"
-    f" {_metadata_text('$.prd_task_label')},"
-    f" {_metadata_text('$.done_provenance.commit')}"
+    f" {_metadata_at('$.prd_path')},"
+    f" {_metadata_at('$.prd_task_label')},"
+    f" {_metadata_at('$.done_provenance.commit')}"
     f' FROM tasks WHERE {_UPDATED_AFTER} ORDER BY updated_at, id'
 )
 
@@ -211,17 +218,9 @@ class DefectCarrier:
 
 _PREFIXED: Final = 'substr(ref, 1, length(:prefix)) = :prefix'
 
-_DEFECTS_ARRAY: Final = (
-    'CASE WHEN json_valid(metadata) THEN'
-    " CASE WHEN json_type(metadata, '$.defects') = 'array' THEN json_extract(metadata, '$.defects') END"
-    ' END'
-)
+_DEFECTS_ARRAY: Final = _metadata_at('$.defects', json_type='array')
 
-_ENTRY_REF: Final = (
-    "CASE WHEN entry.type = 'object' THEN"
-    " CASE WHEN json_type(entry.value, '$.ref') = 'text' THEN json_extract(entry.value, '$.ref') END"
-    ' END'
-)
+_ENTRY_REF: Final = _json_at('entry.value', '$.ref', json_type='text', guard="entry.type = 'object'")
 
 _HELD_REFS_SQL: Final = (
     'SELECT id, status, ref FROM ('
@@ -230,14 +229,15 @@ _HELD_REFS_SQL: Final = (
     f') WHERE {_PREFIXED}'
 )
 
-_GATES_SQL: Final = (
-    f"SELECT id, ref FROM (SELECT id, {_metadata_text('$.x_client_defect_gate_for')} AS ref"
-    f' FROM tasks WHERE tag = :tag) WHERE {_PREFIXED}'
-)
+_AMONG_TASK_IDS: Final = 'IN (SELECT value FROM json_each(:task_ids))'
 
 _CARRIER_DEPENDENCIES_SQL: Final = (
-    'SELECT task_id, depends_on FROM dependencies'
-    f' WHERE tag = :tag AND task_id IN (SELECT id FROM ({_HELD_REFS_SQL}))'
+    f'SELECT task_id, depends_on FROM dependencies WHERE tag = :tag AND task_id {_AMONG_TASK_IDS}'
+)
+
+_GATES_SQL: Final = (
+    f"SELECT id, ref FROM (SELECT id, {_metadata_at('$.x_client_defect_gate_for')} AS ref"
+    f' FROM tasks WHERE tag = :tag AND id {_AMONG_TASK_IDS}) WHERE {_PREFIXED}'
 )
 
 
@@ -261,17 +261,29 @@ def _lowest_holders(
     return lowest
 
 
+def _by_task_id(
+    conn: sqlite3.Connection, sql: str, task_ids: Iterable[int], **params: str
+) -> list[tuple[Any, ...]]:
+    """The rows `sql` selects for `task_ids` of the pinned tag, bound as one JSON array however many ids."""
+    bound = {'tag': TASK_TAG, 'task_ids': json.dumps(sorted(set(task_ids))), **params}
+    return conn.execute(sql, bound).fetchall()
+
+
 def read_defect_carriers(root: Path, *, project_id: str) -> tuple[DefectCarrier, ...]:
     """Every client defect report of `project_id` some task carries, sorted by ref.
 
     Read in full every pass: a same-project add_dependency inserts the gate edge without bumping the
-    task's updated_at, so no updated_at cursor would see `gated` turn true.
+    task's updated_at, so no updated_at cursor would see `gated` turn true. Only the held refs scan
+    every task's metadata; the carriers' edges and their gates are looked up by task id.
     """
-    params = {'tag': TASK_TAG, 'prefix': portal_ref_prefix(project_id)}
+    prefix = portal_ref_prefix(project_id)
     with read_only(root, tasks_db(root), source=Source.TASKS) as conn:
-        held = conn.execute(_HELD_REFS_SQL, params).fetchall()
-        gate_for = dict(conn.execute(_GATES_SQL, params).fetchall())
-        depends_on = _grouped(conn.execute(_CARRIER_DEPENDENCIES_SQL, params).fetchall())
+        held = conn.execute(_HELD_REFS_SQL, {'tag': TASK_TAG, 'prefix': prefix}).fetchall()
+        lowest = _lowest_holders(held, project_id=project_id)
+        carriers = (task_id for task_id, _ in lowest.values())
+        depends_on = _grouped(_by_task_id(conn, _CARRIER_DEPENDENCIES_SQL, carriers))
+        dependencies = (dependency for edges in depends_on.values() for dependency in edges)
+        gate_for = dict(_by_task_id(conn, _GATES_SQL, dependencies, prefix=prefix))
     return tuple(
         DefectCarrier(
             ref=ref,
@@ -280,5 +292,5 @@ def read_defect_carriers(root: Path, *, project_id: str) -> tuple[DefectCarrier,
             task_id=task_id,
             gated=any(gate_for.get(dependency) == ref for dependency in depends_on.get(task_id, ())),
         )
-        for ref, (task_id, named) in sorted(_lowest_holders(held, project_id=project_id).items())
+        for ref, (task_id, named) in sorted(lowest.items())
     )
