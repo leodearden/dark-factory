@@ -16309,10 +16309,10 @@ class GitOps:
 
         logger.warning(
             'Foreign git index lock held in project_root — standing off for '
-            'up to %.0fs before giving up. lock=%s age=%.1fs holders=%s '
-            'context=%s',
-            max(0.0, timeout_s), lock_path, age,
-            describe_holders(diagnosis.holders) or 'none visible', context,
+            'up to %.0fs before giving up. lock=%s age=%.1fs verdict=%s '
+            'holders=[%s] context=%s',
+            max(0.0, timeout_s), lock_path, age, diagnosis.verdict,
+            describe_holders(diagnosis.holders), context,
         )
 
         while time.monotonic() < deadline:
