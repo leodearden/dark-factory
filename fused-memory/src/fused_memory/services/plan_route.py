@@ -29,7 +29,11 @@ import httpx
 import openai
 
 from fused_memory.config.schema import PlanRouteConfig
-from fused_memory.services.provider_billing import BillingExhaustion, plan_cap_of
+from fused_memory.services.provider_billing import (
+    GATE_ANSWER_TYPE,
+    BillingExhaustion,
+    plan_cap_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +170,10 @@ class PlanRoute:
     async def observe_cap(self, exhaustion: BillingExhaustion, *, site: str) -> None:
         """Take a cap that reached a caller by a path this route does not gate
         as a probe made outside the gate: it latches an uncapped route and
-        re-confirms a capped one whose probe is due."""
+        re-confirms a capped one whose probe is due. A cap the gate answered
+        itself is no evidence: the gate counted it when it answered."""
+        if exhaustion.answered_by_gate:
+            return
         now = self._clock()
         if self._capped_since is None:
             self._latch(exhaustion, resets_at=None, now=now, site=site)
@@ -292,7 +299,7 @@ class PlanRoute:
             httpx.codes.TOO_MANY_REQUESTS,
             headers={'x-should-retry': 'false'},
             json={'error': {
-                'code': 'usage_limit_reached', 'type': 'usage_limit_reached',
+                'code': 'usage_limit_reached', 'type': GATE_ANSWER_TYPE,
                 'message': message, 'provider_body': provider_body,
             }},
             request=request,

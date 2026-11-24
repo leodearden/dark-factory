@@ -64,6 +64,8 @@ _SOURCE_BY_EXHAUSTION_CODE: Mapping[str, BillingSource] = MappingProxyType({
 
 _PLAN_CAP_STATUS = 429
 
+GATE_ANSWER_TYPE = 'plan_route_gate_answer'
+
 _MAX_CHAIN_DEPTH = 8
 _PROVIDER_MESSAGE_CHARS = 300
 
@@ -74,6 +76,8 @@ class BillingExhaustion:
 
     ``code`` is the provider's marker that matched, e.g. ``insufficient_quota``.
     ``alarm_category`` is the escalation category of this source's L2 page.
+    ``answered_by_gate`` is true when the plan route's gate answered the call
+    itself (``GATE_ANSWER_TYPE``), so the route has already counted the cap.
     """
 
     source: BillingSource
@@ -83,6 +87,7 @@ class BillingExhaustion:
     code: str
     error_type: str
     provider_message: str
+    answered_by_gate: bool = False
 
 
 def classify_billing_exhaustion(exc: BaseException) -> BillingExhaustion | None:
@@ -204,11 +209,13 @@ def _carries_status(link: BaseException) -> bool:
 def _exhaustion(source: BillingSource, code: str, link: BaseException) -> BillingExhaustion:
     return exhaustion_of(
         source, code=code, error_type=type(link).__name__, provider_message=str(link),
+        answered_by_gate=GATE_ANSWER_TYPE in _structured_markers(link),
     )
 
 
 def exhaustion_of(
     source: BillingSource, *, code: str, error_type: str, provider_message: str,
+    answered_by_gate: bool = False,
 ) -> BillingExhaustion:
     """Build the exhaustion of *source*, its provider and key scope filled in."""
     facts = _FACTS_BY_SOURCE[source]
@@ -220,4 +227,5 @@ def exhaustion_of(
         code=code,
         error_type=error_type,
         provider_message=provider_message[:_PROVIDER_MESSAGE_CHARS],
+        answered_by_gate=answered_by_gate,
     )

@@ -500,3 +500,49 @@ class TestACapAnUngatedPathReports:
 
         assert route.state().state is PlanRouteStateName.UNCONFIGURED
         assert len(listener.named('recovered')) == 1
+
+
+class TestACapTheGateAnsweredItself:
+    """A refusal the gate answered locally is not evidence of a cap when it
+    reaches the park guard: the gate counted it when it answered."""
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_reported_after_the_probe_recovered_leaves_the_route_ok(
+        self, harness: _Harness,
+    ) -> None:
+        guard = PlanRouteParkGuard(harness.route)
+        harness.answer((429, _usage_limit_body()))
+        async with harness.client() as client:
+            await _assert_capped_call(client)
+            refusal = classify_billing_exhaustion(await _assert_capped_call(client))
+            assert refusal is not None
+            assert refusal.answered_by_gate
+            harness.clock.advance(_INTERVAL)
+            harness.answer((200, chat_completion_body('{"ok": true}')))
+            await _chat(client)
+
+        await guard.on_parked(refusal, site=_PARKED_SITE)
+
+        assert harness.route.state().state is PlanRouteStateName.OK
+        assert [called for called, _ in harness.listener.calls] == ['capped', 'recovered']
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_reported_once_the_probe_is_due_does_not_confirm(
+        self, harness: _Harness,
+    ) -> None:
+        guard = PlanRouteParkGuard(harness.route)
+        harness.answer((429, _usage_limit_body()))
+        async with harness.client() as client:
+            await _assert_capped_call(client)
+            refusal = classify_billing_exhaustion(await _assert_capped_call(client))
+        assert refusal is not None
+        probe_at = harness.route.state().next_probe_at
+        harness.clock.advance(_INTERVAL)
+
+        await guard.on_parked(refusal, site=_PARKED_SITE)
+
+        assert harness.listener.named('confirmed') == []
+        assert harness.route.state().next_probe_at == probe_at
+
+    def test_a_cap_the_proxy_reported_is_not_a_gate_answer(self) -> None:
+        assert not _plan_cap().answered_by_gate
