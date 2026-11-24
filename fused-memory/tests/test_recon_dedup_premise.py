@@ -58,25 +58,42 @@ def probe_config(mock_config):
     return reapable_config(mock_config)
 
 
-@pytest.fixture
-def recon_scope() -> Scope:
-    """The recon-stage scope every run of both probes shares."""
-    return Scope(
-        project_id='_test_recon_dedup',
-        agent_id='recon-stage-task_knowledge_sync',
-    )
+# One collection per probe: the two can run at once on different xdist workers,
+# and a write racing another worker's cold create of a shared collection can
+# answer 500 (task 11013).
+STUB_EMBEDDER_PROJECT = '_test_recon_dedup_stub'
+OPENAI_EMBEDDER_PROJECT = '_test_recon_dedup_openai'
+RUN_LABEL = 'task-2221-premise-probe'
+
+
+def _recon_scope(project_id: str) -> Scope:
+    return Scope(project_id=project_id, agent_id='recon-stage-task_knowledge_sync')
 
 
 @pytest.fixture
-def probe_run_id(recon_scope, probe_config):
-    yield from isolated_run(recon_scope, probe_config, 'task-2221-premise-probe')
+def stub_embedder_scope() -> Scope:
+    return _recon_scope(STUB_EMBEDDER_PROJECT)
 
 
-def test_the_recon_dedup_probe_collection_is_one_the_reaper_can_reclaim(
-    probe_config, recon_scope,
-):
-    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
-    assert_reapable(probe_collection(recon_scope, probe_config))
+@pytest.fixture
+def stub_embedder_run_id(stub_embedder_scope, probe_config):
+    yield from isolated_run(stub_embedder_scope, probe_config, RUN_LABEL)
+
+
+@pytest.fixture
+def openai_embedder_scope() -> Scope:
+    return _recon_scope(OPENAI_EMBEDDER_PROJECT)
+
+
+@pytest.fixture
+def openai_embedder_run_id(openai_embedder_scope, probe_config):
+    yield from isolated_run(openai_embedder_scope, probe_config, RUN_LABEL)
+
+
+def test_the_recon_dedup_probe_collections_are_ones_the_reaper_can_reclaim(probe_config):
+    """The probe collections outlive a run by design, so they must be ones the reaper deletes."""
+    for project_id in (STUB_EMBEDDER_PROJECT, OPENAI_EMBEDDER_PROJECT):
+        assert_reapable(probe_collection(_recon_scope(project_id), probe_config))
 
 
 async def _assert_all_writes_land_distinct(backend, scope, *, n: int, run_id: str) -> None:
@@ -117,7 +134,7 @@ async def _assert_all_writes_land_distinct(backend, scope, *, n: int, run_id: st
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_identical_infer_false_writes_all_land_distinct(
-    probe_config, recon_scope, probe_run_id, monkeypatch,
+    probe_config, stub_embedder_scope, stub_embedder_run_id, monkeypatch,
 ):
     """N byte-identical recon-stage infer=False writes must all land distinct.
 
@@ -128,9 +145,11 @@ async def test_identical_infer_false_writes_all_land_distinct(
     were true, at least one of these 8 writes would return zero results
     and/or fewer than 8 points would carry this run's run_id.
     """
-    backend = await build_stub_embedder_backend(recon_scope, probe_config, monkeypatch)
+    backend = await build_stub_embedder_backend(stub_embedder_scope, probe_config, monkeypatch)
     try:
-        await _assert_all_writes_land_distinct(backend, recon_scope, n=8, run_id=probe_run_id)
+        await _assert_all_writes_land_distinct(
+            backend, stub_embedder_scope, n=8, run_id=stub_embedder_run_id,
+        )
     finally:
         await backend.close()
 
@@ -141,7 +160,7 @@ async def test_identical_infer_false_writes_all_land_distinct(
 @pytest.mark.skipif(not os.environ.get('OPENAI_API_KEY'), reason='real embedder needs OPENAI_API_KEY')
 @pytest.mark.asyncio
 async def test_identical_writes_land_with_real_openai_embeddings(
-    probe_config, recon_scope, probe_run_id, monkeypatch,
+    probe_config, openai_embedder_scope, openai_embedder_run_id, monkeypatch,
 ):
     """Real-OpenAI-embedder confirmation: identical text still never dedups.
 
@@ -162,8 +181,10 @@ async def test_identical_writes_land_with_real_openai_embeddings(
     config = probe_config.model_copy(deep=True)
     # mock_config's api_key is a fake 'test-key'; None makes mem0 read OPENAI_API_KEY.
     config.embedder.providers.openai.api_key = None
-    backend = await build_live_backend(recon_scope, config, monkeypatch)
+    backend = await build_live_backend(openai_embedder_scope, config, monkeypatch)
     try:
-        await _assert_all_writes_land_distinct(backend, recon_scope, n=5, run_id=probe_run_id)
+        await _assert_all_writes_land_distinct(
+            backend, openai_embedder_scope, n=5, run_id=openai_embedder_run_id,
+        )
     finally:
         await backend.close()
