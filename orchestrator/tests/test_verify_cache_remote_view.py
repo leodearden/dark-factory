@@ -12,9 +12,32 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _verify_cache_fixtures import (
+    WORKSPACE_SEED,
+    cache_config,
+    cache_module,
+    clean_unscoped_gate,
+    clear_markers,
+    commit_edit,
+    entries_for,
+    head_of,
+    merge_pool,
+    module_legs,
+    module_units,
+    ran_legs,
+    record_run,
+    task_verify,
+    units_by_id,
+    use_real_legs,
+)
 from _verify_cache_units import record_entry, unit_key
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheConfig
+from orchestrator.event_store import EventStore
+from orchestrator.git_ops import GitOps
+from orchestrator.task_verify_run import run_task_verify_on_worktree
 from orchestrator.task_verify_spec import (
     build_task_verify_spec,
     spec_from_dict,
@@ -24,13 +47,15 @@ from orchestrator.task_verify_spec import (
 )
 from orchestrator.verify_cache import keys
 from orchestrator.verify_cache.modes import CacheMode
-from orchestrator.verify_cache.registry import Candidate, KillSwitch, PolicyState, Registry
+from orchestrator.verify_cache.registry import Candidate, Entry, KillSwitch, PolicyState, Registry
 from orchestrator.verify_cache.remote_view import ShippedView, planned_unit_ids, ship_view
-from orchestrator.verify_cache.replay import ExecutedModule
+from orchestrator.verify_cache.replay import CacheAccess, ExecutedModule
+from orchestrator.verify_evidence import UnitOutcome
 from orchestrator.verify_runner import (
     MergeVerifySpec,
     UnscopedTypecheckSpec,
     build_merge_verify_spec,
+    run_merge_verify_on_worktree,
     spec_from_json,
     spec_to_json,
 )
@@ -278,3 +303,165 @@ class TestTaskSpecCarriesTheView:
 
     def test_the_builder_ships_no_view(self):
         assert _task_spec(OrchestratorConfig()).verify_cache is None
+
+
+_HOST_ON = VerifyCacheConfig(task_mode=CacheMode.ON, merge_mode=CacheMode.ON)
+_TASK_FILES = ['alpha/src/alpha/__init__.py', 'beta/src/beta/__init__.py']
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    return seed_repo(tmp_path / 'repo', WORKSPACE_SEED)
+
+
+@pytest.fixture
+def markers(tmp_path: Path) -> Path:
+    return tmp_path / 'markers.txt'
+
+
+@pytest.fixture
+def modules(markers: Path) -> list[ModuleConfig]:
+    return [cache_module('alpha', markers), cache_module('beta', markers)]
+
+
+@pytest.fixture
+def registry(tmp_path: Path) -> Registry:
+    return Registry(tmp_path / 'verify_cache.db')
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> EventStore:
+    return EventStore(tmp_path / 'runs.db', run_id='r')
+
+
+@pytest.fixture
+def seam(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, markers: Path) -> None:
+    use_real_legs(tmp_path, monkeypatch, markers)
+
+
+async def _gate_code() -> str:
+    """The code identity a runner keys under: this gate checkout's HEAD, so both hosts' keys can be equal."""
+    code = (await CacheAccess.on_runner()).orchestrator_code
+    assert isinstance(code, str), code
+    return code
+
+
+async def _recorded_then_beta_edited(repo, modules, registry, store) -> dict[str, Entry]:
+    """Every unit's green recorded by a local merge gate at HEAD, then a beta-only commit."""
+    config = cache_config(repo, _BOTH_ON)
+    pool = merge_pool(repo, config, modules, registry, store, code=await _gate_code())
+    first = await pool.dispatch(head_of(repo), build_merge_verify_spec(config, modules, None))
+    assert first.passed, first.summary
+    recorded = await entries_for(registry, first)
+    commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+    return recorded
+
+
+async def _merge_spec_shipping(repo, modules, registry, modes: VerifyCacheConfig) -> MergeVerifySpec:
+    spec = build_merge_verify_spec(cache_config(repo, _BOTH_ON), modules, None)
+    view = await ship_view(registry, modes, 'merge', planned_unit_ids(spec.verify_commands), fits=lambda v: True)
+    return dataclasses.replace(spec, verify_cache=view)
+
+
+async def _on_the_runner(repo: Path, host_modes: VerifyCacheConfig, spec: MergeVerifySpec):
+    return await run_merge_verify_on_worktree(
+        repo, cache_config(repo, host_modes), spec, merge_sha=head_of(repo), run_unscoped=clean_unscoped_gate,
+    )
+
+
+@pytest.mark.usefixtures('seam')
+class TestTheRunnerDecidesAgainstTheShippedView:
+    @pytest.mark.asyncio
+    async def test_an_on_view_replays_alpha_and_reports_every_unit(self, repo, modules, registry, store, markers):
+        recorded = await _recorded_then_beta_edited(repo, modules, registry, store)
+        spec = await _merge_spec_shipping(repo, modules, registry, _BOTH_ON)
+        clear_markers(markers)
+
+        result = await _on_the_runner(repo, VerifyCacheConfig(), spec)
+
+        assert result.passed, result.summary
+        units = units_by_id(result)
+        for unit_id in module_units('alpha'):
+            assert units[unit_id].outcome is UnitOutcome.CACHE_HIT
+            assert units[unit_id].evidence_event_id == recorded[unit_id].evidence_event_id
+        assert {units[unit_id].outcome for unit_id in module_units('beta')} == {UnitOutcome.RAN_GREEN}
+        assert ran_legs(markers) == module_legs('beta')
+        assert result.cache_report is not None
+        reported = {unit.unit.unit: unit for unit in result.cache_report.units}
+        assert set(reported) == module_units('alpha') | module_units('beta')
+        assert all(unit.key is not None for unit in reported.values())
+        assert all(reported[unit_id].admission is not None and reported[unit_id].admission.admitted
+                   for unit_id in module_units('beta'))
+
+    @pytest.mark.asyncio
+    async def test_a_log_view_cannot_be_raised_by_the_runners_own_config(self, repo, modules, registry, store, markers):
+        await _recorded_then_beta_edited(repo, modules, registry, store)
+        spec = await _merge_spec_shipping(
+            repo, modules, registry, _BOTH_ON.model_copy(update={'remote_merge_mode': CacheMode.LOG}),
+        )
+        clear_markers(markers)
+
+        result = await _on_the_runner(repo, _HOST_ON, spec)
+
+        assert result.passed, result.summary
+        units = units_by_id(result)
+        assert {units[unit_id].outcome for unit_id in module_units('alpha')} == {UnitOutcome.WOULD_HIT}
+        assert ran_legs(markers) == module_legs('alpha') | module_legs('beta')
+
+    @pytest.mark.asyncio
+    async def test_no_view_settles_every_unit_unavailable_as_before(self, repo, modules, registry, store):
+        await _recorded_then_beta_edited(repo, modules, registry, store)
+        spec = build_merge_verify_spec(cache_config(repo, _BOTH_ON), modules, None)
+
+        result = await _on_the_runner(repo, _HOST_ON, spec)
+
+        assert result.passed, result.summary
+        assert result.units
+        for unit in result.units:
+            assert unit.outcome is UnitOutcome.UNAVAILABLE
+            assert unit.reason is not None and 'no_registry_on_runner' in unit.reason
+
+    @pytest.mark.asyncio
+    async def test_an_off_view_keys_nothing(self, repo, modules, registry, store):
+        await _recorded_then_beta_edited(repo, modules, registry, store)
+        spec = await _merge_spec_shipping(
+            repo, modules, registry, _BOTH_ON.model_copy(update={'remote_merge_mode': CacheMode.OFF}),
+        )
+
+        result = await _on_the_runner(repo, _HOST_ON, spec)
+
+        assert result.passed, result.summary
+        assert result.cache_mode is CacheMode.OFF
+        assert all(unit.key is None for unit in result.units or ())
+
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    @pytest.mark.asyncio
+    async def test_a_task_runner_replays_alpha_from_an_on_view(self, repo, modules, registry, markers):
+        config = cache_config(repo, _BOTH_ON)
+        (repo / '.task').mkdir()
+        access = CacheAccess(registry, await _gate_code())
+        recorded = await record_run(registry, await task_verify(repo, config, modules, access, _TASK_FILES))
+        assert module_units('alpha') <= set(recorded)
+        commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        tip = head_of(repo)
+        spec = build_task_verify_spec(
+            config, modules, _TASK_FILES, force_workspace=False, attempt_id=1, task_id='5653', tip_sha=tip,
+        )
+        view = await ship_view(registry, _BOTH_ON, 'task', planned_unit_ids(spec.verify_commands), fits=lambda v: True)
+        git_ops = GitOps(config.git, repo)
+        worktree = await git_ops.create_ephemeral_verify_worktree(tip)
+        clear_markers(markers)
+        try:
+            result = await run_task_verify_on_worktree(
+                worktree, cache_config(repo, VerifyCacheConfig()), dataclasses.replace(spec, verify_cache=view),
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(worktree)
+
+        assert result.passed, result.summary
+        units = units_by_id(result)
+        for unit_id in module_units('alpha'):
+            assert units[unit_id].outcome is UnitOutcome.CACHE_HIT
+            assert units[unit_id].evidence_event_id == recorded[unit_id].evidence_event_id
+        assert not {leg for leg in ran_legs(markers) if leg.startswith('alpha:')}
+        assert result.cache_report is not None
