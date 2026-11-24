@@ -13,15 +13,35 @@ The standing rule and its rationale live in
 from __future__ import annotations
 
 import pytest
-from _role_splice_contract import assert_brace_free, assert_nonempty, assert_opens_own_section
+from _role_splice_contract import (
+    SpliceContract,
+    assert_brace_free,
+    assert_nonempty,
+    assert_opens_own_section,
+)
 
 from orchestrator.agents.roles import (
     DEFECT_TEST_RULE,
     ESCALATION_LADDER_CORE,
+    FIXING_ROLE_PROMPT_BUILDERS,
+    ROLES,
     splice_defect_test_rule,
 )
 
 _SENTINEL = '\n## DEFECT-TEST-RULE-SENTINEL-7047\n'
+
+#: The roles that fix code (PRD decision 17). Editorial, not derived: ARCHITECT
+#: also runs the replan and IMPLEMENTER the amender.
+_FIXING_ROLES = frozenset({'architect', 'implementer', 'simple_task', 'debugger', 'steward'})
+
+_RULE_CONTRACT = SpliceContract(
+    constant_name='DEFECT_TEST_RULE',
+    constant=DEFECT_TEST_RULE,
+    roles=_FIXING_ROLES,
+    role_set_name='_FIXING_ROLES',
+    capability=lambda role: role.name in _FIXING_ROLES,
+    capability_description='fixing code (PRD decision 17)',
+)
 
 
 class TestDefectTestRuleShape:
@@ -81,3 +101,62 @@ class TestSpliceHelper:
         message = str(excinfo.value)
         assert 'ESCALATION_LADDER_CORE' in message
         assert str(count) in message
+
+
+class TestFixingRolePrompts:
+    """The wired half: the five fixing roles' prompts, over the live constants."""
+
+    def test_the_builder_mapping_covers_exactly_the_fixing_roles(self):
+        assert frozenset(FIXING_ROLE_PROMPT_BUILDERS) == _FIXING_ROLES
+        assert _FIXING_ROLES.issubset(ROLES)
+
+    @pytest.mark.parametrize('name', sorted(_FIXING_ROLES))
+    def test_the_builder_carries_only_the_rule_it_is_given(self, name):
+        # Identity, not wording: with the constant substituted, a hand-pasted
+        # copy of the rule inside a builder would survive and go red here.
+        built = FIXING_ROLE_PROMPT_BUILDERS[name](_SENTINEL)
+
+        assert built.count(_SENTINEL) == 1
+        assert DEFECT_TEST_RULE not in built
+
+    @pytest.mark.parametrize('name', sorted(_FIXING_ROLES))
+    def test_the_dispatched_prompt_is_the_builders_render(self, name):
+        # startswith, not ==: ARCHITECT and IMPLEMENTER get post-construction appends.
+        assert ROLES[name].system_prompt.startswith(
+            FIXING_ROLE_PROMPT_BUILDERS[name](DEFECT_TEST_RULE)
+        ), (
+            f'ROLES[{name!r}].system_prompt does not start with its '
+            'FIXING_ROLE_PROMPT_BUILDERS render. Construct the role with '
+            'system_prompt=<its builder>(DEFECT_TEST_RULE).'
+        )
+
+    @pytest.mark.parametrize('name', sorted(_FIXING_ROLES))
+    def test_the_rule_lands_immediately_before_the_escalation_section(self, name):
+        assert DEFECT_TEST_RULE + ESCALATION_LADDER_CORE in ROLES[name].system_prompt
+
+    # assert_role_set_matches_capability is not called: _FIXING_ROLES is an
+    # editorial set, so the check would compare it with itself.
+
+    def test_every_fixing_role_carries_the_rule(self):
+        _RULE_CONTRACT.assert_every_role_carries(
+            remedy=(
+                'Route the role\'s system prompt through splice_defect_test_rule '
+                'in its _<role>_system_prompt builder.'
+            ),
+        )
+
+    def test_the_rule_is_spliced_exactly_once(self):
+        # absent_ok=True leaves a missing splice to fail only the containment
+        # test above: one root cause, one failing test.
+        _RULE_CONTRACT.assert_spliced_exactly_once(
+            absent_ok=True,
+            remedy='Keep splice_defect_test_rule as the only site that adds DEFECT_TEST_RULE.',
+        )
+
+    def test_no_other_role_carries_the_rule(self):
+        _RULE_CONTRACT.assert_no_other_role_carries(
+            remedy=(
+                'Remove the splice. Only the roles that fix code carry the rule '
+                '(PRD decision 17); reviewers, the judge and the merger do not.'
+            ),
+        )
