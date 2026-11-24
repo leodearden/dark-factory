@@ -15,10 +15,9 @@ from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 
 from client_feed.cli import main
 from client_feed.contract import CriteriaResults, CriterionOutcome, CriterionResult, RunKind
-from client_feed.criteria import STAGING_FILENAME, CriteriaRun, read_staging
+from client_feed.criteria import STAGING_FILENAME, CriteriaRun, collection_map_path, read_staging
 from client_feed.feed_io import OutDir, read_feed_lines
 from client_feed.publisher import run_pass
-from client_feed.sources.collection_map import collection_map_path
 from client_feed.validate import validate_out_dir
 
 CLIENT_FEED = Path(__file__).resolve().parents[1]

@@ -54,7 +54,6 @@ from client_feed.policy import Policy
 from client_feed.redact import redact_paths
 from client_feed.reveals import Answer, RevealOutput, answered_in, reveal_events
 from client_feed.sources.archive import ArchiveReadError
-from client_feed.sources.collection_map import CollectionMapError
 from client_feed.sources.escalations import QUEUE_RELPATH, OpenEscalations, read_open_escalations
 from client_feed.sources.events import (
     FactoryStatus,
@@ -90,7 +89,6 @@ _FIXED_SOURCE_ERRORS: Final[Mapping[type[Exception], Source]] = MappingProxyType
         EngagementUnusable: Source.ENGAGEMENT,
         InboxUnusable: Source.INBOX,
         CriteriaError: Source.CRITERIA,
-        CollectionMapError: Source.CRITERIA,
     }
 )
 _SOURCE_ERRORS: Final = (StoreReadError, *_FIXED_SOURCE_ERRORS)

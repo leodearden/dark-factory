@@ -728,7 +728,7 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
   - (b) `criteria_results{verify}` joins the newest verify run of a pass that has archived junits
     (`client-feed/src/client_feed/stream_events.py::VerifyReports`). Each junit report is joined
     with the collection map beside it at
-    `client-feed/src/client_feed/sources/collection_map.py::collection_map_path`, over every case read uncapped
+    `client-feed/src/client_feed/criteria.py::collection_map_path`, over every case read uncapped
     (`client-feed/src/client_feed/sources/archive.py::read_junit_cases`). So the outcomes never
     depend on the `test_results` case cap, and a case id in one report never borrows another
     report's binding. A run none of whose junits has a map records nothing. The event is emitted

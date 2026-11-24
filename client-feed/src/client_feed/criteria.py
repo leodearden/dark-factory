@@ -1,17 +1,17 @@
-"""Acceptance criteria: the criteria file, its join with junit reports through their collection maps, and the criteria events (PRD §7.7)."""
+"""Acceptance criteria: the criteria file, the collection map, the junit join and the criteria events (PRD §7.7)."""
 
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, TypeAlias, TypeVar
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from client_feed.contract import (
     CaseOutcome,
@@ -31,16 +31,11 @@ from client_feed.contract import (
 from client_feed.envelope import Stamp, payload
 from client_feed.feed_io import FeedIoError, read_tail, write_atomically
 from client_feed.redact import redact_paths
-from client_feed.sources.archive import read_junit_cases
-from client_feed.sources.collection_map import (
-    CollectionMap,
-    case_entries,
-    collection_map_path,
-    read_collection_map,
-)
+from client_feed.sources.archive import case_id, read_junit_cases
 from client_feed.sources.git import EntryKind, blob_reader, path_entry
 
 CRITERIA_RELPATH: Final = 'acceptance/criteria.yaml'
+COLLECTION_MAP_SUFFIX: Final = '.tests.json'
 STAGING_FILENAME: Final = 'criteria-staging.json'
 
 _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
@@ -49,13 +44,14 @@ _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
 class CriteriaProblem(StrEnum):
     INVALID_CRITERIA = 'invalid_criteria'
     NOT_A_FILE = 'not_a_file'
+    INVALID_MAP = 'invalid_map'
     INVALID_STAGING = 'invalid_staging'
     UNREADABLE = 'unreadable'
     UNWRITABLE = 'unwritable'
 
 
 class CriteriaError(Exception):
-    """A criteria file or staging file the criteria join refuses to read, or a staging file it cannot write."""
+    """A criteria file, collection map or staging file the criteria join refuses to read, or a staging file it cannot write."""
 
     def __init__(self, *, problem: CriteriaProblem, name: str, detail: str) -> None:
         self.problem = problem
@@ -116,11 +112,66 @@ def _unreadable(name: str, exc: FeedIoError | OSError) -> CriteriaError:
     return CriteriaError(problem=CriteriaProblem.UNREADABLE, name=name, detail=detail)
 
 
+def collection_map_path(junit: Path) -> Path:
+    """The collection map the defect-tests plugin writes beside `junit`; client_feed's copy of orchestrator verify.py::collection_map_path, which it may not import."""
+    return junit.with_name(junit.name + COLLECTION_MAP_SUFFIX)
+
+
+class MapEntry(BaseModel):
+    """One collected test in the defect-tests collection map; `defects` is parsed here but read only by defect-tests ι."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    defects: tuple[str, ...]
+    criterion: str | None
+
+
+CollectionMap: TypeAlias = Mapping[str, MapEntry]
+_COLLECTION_MAP: Final = TypeAdapter(dict[str, MapEntry])
+
+
+_Read = TypeVar('_Read')
+
+
+def _read_json(
+    path: Path, *, name: str, validate: Callable[[bytes], _Read], invalid: CriteriaProblem
+) -> _Read | None:
+    """The JSON file at `path` validated, read through one fd that refuses a symlink; None when there is no file."""
+    try:
+        tail = read_tail(path, offset=0)
+    except (FeedIoError, OSError) as exc:
+        raise _unreadable(name, exc) from exc
+    if tail is None:
+        return None
+    try:
+        return validate(tail.data)
+    except ValidationError as exc:
+        raise CriteriaError(
+            problem=invalid, name=name, detail=first_error(exc, whole='<file>')
+        ) from exc
+
+
+def read_collection_map(path: Path, *, name: str) -> CollectionMap | None:
+    """The collection map at `path`, never through a symlink; None when the run recorded none."""
+    return _read_json(
+        path, name=name, validate=_COLLECTION_MAP.validate_json, invalid=CriteriaProblem.INVALID_MAP
+    )
+
+
+def _junit_address(nodeid: str) -> tuple[str, str]:
+    """The junit (classname, name) pytest records for `nodeid`; restates _pytest/junitxml.py::mangle_test_address."""
+    path, bracket, params = nodeid.partition('[')
+    names = path.split('::')
+    names[0] = names[0].replace('/', '.').removesuffix('.py')
+    names[-1] += bracket + params
+    return '.'.join(names[:-1]), names[-1]
+
+
 def criterion_bindings(collection_map: CollectionMap) -> dict[str, str]:
     """Each marked test's junit case id and the criterion it evidences."""
     return {
-        test: entry.criterion
-        for test, entry in case_entries(collection_map)
+        case_id(*_junit_address(nodeid)): entry.criterion
+        for nodeid, entry in collection_map.items()
         if entry.criterion is not None
     }
 
@@ -270,21 +321,13 @@ def write_staging(out_dir: Path, run: CriteriaRun) -> None:
 
 
 def read_staging(out_dir: Path) -> CriteriaRun | None:
-    """The staging run out_dir's staging file records, never read through a symlink; None when there is none."""
-    try:
-        tail = read_tail(out_dir / STAGING_FILENAME, offset=0)
-    except (FeedIoError, OSError) as exc:
-        raise _unreadable(STAGING_FILENAME, exc) from exc
-    if tail is None:
-        return None
-    try:
-        return CriteriaRun.model_validate_json(tail.data)
-    except ValidationError as exc:
-        raise CriteriaError(
-            problem=CriteriaProblem.INVALID_STAGING,
-            name=STAGING_FILENAME,
-            detail=first_error(exc, whole='<file>'),
-        ) from exc
+    """The staging run out_dir's staging file records; None when there is none."""
+    return _read_json(
+        out_dir / STAGING_FILENAME,
+        name=STAGING_FILENAME,
+        validate=CriteriaRun.model_validate_json,
+        invalid=CriteriaProblem.INVALID_STAGING,
+    )
 
 
 def _read_criteria_file(path: Path) -> bytes:

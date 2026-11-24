@@ -28,19 +28,12 @@ from client_feed.policy import (
 )
 from client_feed.publisher import publish, snapshot
 from client_feed.sources.archive import ArchiveReadError
-from client_feed.sources.collection_map import CollectionMapError
 from client_feed.sources.git import GitError
 from client_feed.sources.store import StoreReadError
 from client_feed.validate import validate_out_dir
 
 _REFUSALS: Final = (PolicyError, OutDirRefused, FeedIoError, FeedError)
-_STAGING_REFUSALS: Final = (
-    CriteriaError,
-    CollectionMapError,
-    ArchiveReadError,
-    OutDirRefused,
-    FeedIoError,
-)
+_STAGING_REFUSALS: Final = (CriteriaError, ArchiveReadError, OutDirRefused, FeedIoError)
 _COMMIT_SHA: Final = TypeAdapter(CommitSha)
 _STOP_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 _JOIN_POLL_SECS: Final = 1.0
