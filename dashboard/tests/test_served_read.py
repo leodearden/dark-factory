@@ -284,6 +284,36 @@ async def test_work_that_outlives_its_wait_and_then_answers_logs_nothing(caplog)
     assert not [record for record in caplog.records if record.name == served_read.__name__]
 
 
+async def test_a_wait_its_work_outlives_is_counted_and_joining_lands_the_work():
+    release = asyncio.Event()
+    landed: list[int] = []
+
+    async def walk() -> int:
+        await release.wait()
+        landed.append(7)
+        return 7
+
+    before = served_read.outlived_wait_count()
+    with pytest.raises(TimeoutError):
+        await wait_shielded(walk(), 0.01, what='the test walk')
+
+    assert served_read.outlived_wait_count() == before + 1
+    release.set()
+    await served_read.join_outlived_waits()
+    assert landed == [7]
+
+
+async def test_work_inside_its_wait_is_not_counted():
+    async def answers() -> int:
+        return 7
+
+    before = served_read.outlived_wait_count()
+
+    assert await wait_shielded(answers(), 1.0, what='the answer') == 7
+    assert served_read.outlived_wait_count() == before
+    await served_read.join_outlived_waits()
+
+
 async def test_a_served_read_that_fails_after_its_wait_is_logged_as_a_bug_naming_its_key(caplog):
     served = make([60.0])
     release = asyncio.Event()
