@@ -2961,13 +2961,12 @@ def test_spawn_model_env_precedes_raw_claude_args(tmp_path: pathlib.Path) -> Non
 
 
 def _spawn_capturing_argv(tmp_path: pathlib.Path, **inputs: str) -> list[str]:
-    """claude's argv for a wm-lane spawn with *inputs* set (every CLAUDE_SPAWN_EFFORT unset unless given)."""
+    """claude's argv for a wm-lane spawn with *inputs* set."""
     bin_dir = _make_bin_dir(tmp_path)
     capture_file = tmp_path / "captured_argv.txt"
     _write_fake_claude_capturing_argv(bin_dir, capture_file)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
-    env.pop("CLAUDE_SPAWN_EFFORT", None)
     env.update(inputs)
 
     result = _run_spawn(env, tmp_path)
