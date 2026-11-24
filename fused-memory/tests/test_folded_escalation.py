@@ -43,6 +43,7 @@ from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import (
     file_folded_escalation,
     pending_folded_escalations,
+    refresh_folded_escalation,
     resolve_folded_escalations,
 )
 from fused_memory.middleware.curation_deferral import DeferReason
@@ -578,6 +579,78 @@ class TestReadingAndResolvingUnderAnAnchor:
 
         with caplog.at_level(logging.DEBUG):
             assert call(str(tmp_path)) == []
+        assert [r.levelno for r in caplog.records if r.name == logger.name] == [
+            logging.WARNING,
+        ]
+
+
+def _refresh(project_root: str | None, escalation_id: str, **overrides) -> bool:
+    kwargs = {
+        'escalation_id': escalation_id,
+        'level': 2,
+        'summary': 's2',
+        'detail': 'd2',
+        'logger': logger,
+        'log_label': 'folded_escalation_test',
+    }
+    kwargs.update(overrides)
+    return refresh_folded_escalation(project_root, **kwargs)
+
+
+@_needs_escalation
+class TestRefreshingAFoldedRecordInPlace:
+    """A sustained condition folds into its one open record, counted (task 9944)."""
+
+    def test_a_pending_record_is_refreshed_and_counted(self, tmp_path):
+        filed = _emit(tmp_path, level=2)
+        assert filed is not None
+
+        assert _refresh(str(tmp_path), filed) is True
+
+        record = _every_record_by_id(tmp_path)[filed]
+        assert (record['summary'], record['detail'], record['dedupe_count']) == ('s2', 'd2', 1)
+        assert list(_every_record_by_id(tmp_path)) == [filed]
+
+    def test_an_unknown_id_is_not_refreshed(self, tmp_path):
+        _emit(tmp_path, level=2)
+
+        assert _refresh(str(tmp_path), 'esc-no-such-record') is False
+
+    def test_a_resolved_record_is_not_refreshed(self, tmp_path):
+        filed = _emit(tmp_path, level=2)
+        assert filed is not None
+        _resolve(str(tmp_path))
+
+        assert _refresh(str(tmp_path), filed) is False
+        assert _every_record_by_id(tmp_path)[filed]['status'] == 'resolved'
+
+    def test_a_record_at_another_level_is_not_refreshed(self, tmp_path):
+        filed = _emit(tmp_path, level=1)
+        assert filed is not None
+
+        assert _refresh(str(tmp_path), filed) is False
+        assert _every_record_by_id(tmp_path)[filed]['summary'] == 'a folded summary'
+
+    def test_a_none_root_is_not_refreshed(self, tmp_path):
+        assert _refresh(None, 'esc-anything') is False
+        assert not escalation_queue_dir(tmp_path).exists()
+
+    def test_an_invalid_root_never_raises(self, tmp_path):
+        not_a_directory = tmp_path / 'a-file'
+        not_a_directory.write_text('')
+
+        assert _refresh(str(not_a_directory), 'esc-anything') is False
+
+    def test_without_the_escalation_package_it_warns_on_the_callers_logger(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        filed = _emit(tmp_path, level=2)
+        assert filed is not None
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+        caplog.clear()
+
+        with caplog.at_level(logging.DEBUG):
+            assert _refresh(str(tmp_path), filed) is False
         assert [r.levelno for r in caplog.records if r.name == logger.name] == [
             logging.WARNING,
         ]
