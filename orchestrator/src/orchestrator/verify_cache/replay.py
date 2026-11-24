@@ -31,6 +31,7 @@ from orchestrator.verify_evidence import (
     UnitTier,
     VerifyUnit,
     module_leg_name,
+    module_unit_ids,
 )
 from orchestrator.verify_plan import VerifyPlan
 from orchestrator.verify_spec_shared import canonical_json
@@ -106,9 +107,7 @@ class ExecutedModule:
 
     def unit_ids(self) -> tuple[str, ...]:
         """The unit of every leg this module runs."""
-        return tuple(
-            module_leg_name(self.prefix, leg) for leg, attr in COMMAND_FIELD_BY_LEG.items() if getattr(self, attr)
-        )
+        return module_unit_ids(self.prefix, self)
 
 
 def executed_spec_hash(plan: Mapping | None, executed: Sequence[ExecutedModule]) -> str:

@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _verify_cache_units import record_entry, unit_key
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheConfig
 from orchestrator.verify_cache import keys
@@ -19,8 +20,6 @@ from orchestrator.verify_cache.registry import Candidate, KillSwitch, PolicyStat
 from orchestrator.verify_cache.remote_view import ShippedView, planned_unit_ids, ship_view
 from orchestrator.verify_cache.replay import ExecutedModule
 from orchestrator.verify_spec_shared import VerifyCommand
-
-from _verify_cache_units import record_entry, unit_key
 
 _NOW = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
 _ALPHA, _BETA = 'module:alpha:test', 'module:beta:test'
@@ -194,7 +193,7 @@ class TestPlannedUnitIds:
         )
 
     def test_it_names_units_as_the_replay_plan_does(self):
-        config = OrchestratorConfig(test_command='pytest', lint_command='ruff', type_check_command=None)
+        config = OrchestratorConfig(test_command='pytest', lint_command='ruff', type_check_command='')
         alpha = ModuleConfig(prefix='alpha', test_command='pytest', lint_command='ruff')
         global_command = VerifyCommand('', test_command='pytest', lint_command='ruff')
 
