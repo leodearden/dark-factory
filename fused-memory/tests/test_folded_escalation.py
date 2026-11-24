@@ -1456,14 +1456,14 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.services.mem0_retry_backlog_alarm import (
         ANCHOR_TASK_ID as MEM0_RETRY_BACKLOG_ANCHOR,
     )
-    from fused_memory.services.plan_cap_alarm import (
-        ANCHOR_TASK_ID as PLAN_CAP_ANCHOR,
-    )
     from fused_memory.services.memory_metadata_census import (
         _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
     )
     from fused_memory.services.memory_metadata_census import (
         writer_anchor_task_id,
+    )
+    from fused_memory.services.plan_cap_alarm import (
+        ANCHOR_TASK_ID as PLAN_CAP_ANCHOR,
     )
 
     return {

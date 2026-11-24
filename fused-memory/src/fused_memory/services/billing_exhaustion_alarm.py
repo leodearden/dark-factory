@@ -43,6 +43,7 @@ from fused_memory.services.provider_billing import (
     BillingExhaustion,
     BillingSource,
     alarm_category_of,
+    billing_evidence_lines,
     exhaustion_of,
 )
 
@@ -258,10 +259,6 @@ class BillingExhaustionAlarm:
             )
 
 
-def _one_line(text: str) -> str:
-    return ' '.join(text.split())
-
-
 def _summary(latched: BillingAlarmState) -> str:
     exhaustion = latched.exhaustion
     return (
@@ -283,14 +280,9 @@ def _suggested_action(exhaustion: BillingExhaustion) -> str:
 def _detail(latched: BillingAlarmState) -> str:
     exhaustion = latched.exhaustion
     return '\n'.join([
-        f'provider={exhaustion.provider}',
-        f'billing_source={exhaustion.source.value}',
-        f'key_scope={exhaustion.key_scope}',
-        f'code={exhaustion.code}',
+        *billing_evidence_lines(exhaustion),
         f'first_seen={latched.first_seen.isoformat()}',
         f'first_site={latched.first_site}',
-        f'error_type={exhaustion.error_type}',
-        f'provider_message={_one_line(exhaustion.provider_message)}',
         '',
         'Durable writes that hit this are parked, not dead-lettered: they drain '
         'by themselves, and this record resolves itself, on the first '

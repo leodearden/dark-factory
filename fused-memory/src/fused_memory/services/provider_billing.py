@@ -135,6 +135,18 @@ def alarm_category_of(source: BillingSource) -> str:
     return _FACTS_BY_SOURCE[source].alarm_category
 
 
+def billing_evidence_lines(exhaustion: BillingExhaustion) -> list[str]:
+    """The ``key=value`` evidence lines every billing page carries for *exhaustion*."""
+    return [
+        f'provider={exhaustion.provider}',
+        f'billing_source={exhaustion.source.value}',
+        f'key_scope={exhaustion.key_scope}',
+        f'code={exhaustion.code}',
+        f'error_type={exhaustion.error_type}',
+        f'provider_message={" ".join(exhaustion.provider_message.split())}',
+    ]
+
+
 def billing_source_of(exc: BaseException | None) -> str | None:
     """The ``BillingSource`` value *exc* reports exhausted, or None."""
     exhaustion = classify_billing_exhaustion(exc) if exc is not None else None

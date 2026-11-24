@@ -178,6 +178,7 @@ class TestRecovery:
     ) -> None:
         alarm = _alarm(lambda: str(tmp_path))
         await alarm.on_capped(_snapshot())
+        caplog.clear()
 
         with caplog.at_level(logging.WARNING, logger=_ALARM_LOGGER):
             await alarm.on_recovered(_recovered_snapshot())

@@ -67,8 +67,12 @@ class PlanRouteSnapshot:
     affected_calls_by_site: Mapping[PlanRouteSite, int] = field(default_factory=_no_affected_calls)
     exhaustion: BillingExhaustion | None = None
 
+    @property
+    def judge_fail_opens(self) -> int:
+        """The write-triage judge calls the cap failed open since it latched."""
+        return self.affected_calls_by_site.get(PlanRouteSite.WRITE_TRIAGE_JUDGE, 0)
+
     def to_status(self, *, parked_items: int, escalation_id: str | None) -> dict[str, Any]:
-        judge_calls = self.affected_calls_by_site.get(PlanRouteSite.WRITE_TRIAGE_JUDGE, 0)
         return {
             'state': self.state.value,
             'proxy_host': self.proxy_host,
@@ -76,7 +80,7 @@ class PlanRouteSnapshot:
             'resets_at': _iso(self.resets_at),
             'next_probe_at': _iso(self.next_probe_at),
             'parked_items': parked_items,
-            'judge_fail_opens_since_latch': judge_calls,
+            'judge_fail_opens_since_latch': self.judge_fail_opens,
             'escalation_id': escalation_id,
         }
 
