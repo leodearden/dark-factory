@@ -5153,13 +5153,14 @@ class SpeculativeMergeWorker:
         # The chain link _land_chain_prefix is landing across its awaits; still
         # LANE_BUFFERED to the registry, so cancel_request refuses it by id.
         self._landing_link_ids: frozenset[str] = frozenset()
-        # The most recent request whose merge commit was handed to the verifier
-        # and has NOT yet been finalized (verified + CAS-advanced).  Read ONLY by
-        # _await_unadvanced_predecessor, which parks a train behind it — see that
+        # The newest request whose merge commit the merger handed to the
+        # verifier.  Read by _await_unadvanced_predecessor, which parks a train
+        # behind it until it is finalized (verified + CAS-advanced) — see that
         # method for why parking spares the train a re-verify of its rebased
-        # tip.  Set at the post-put success site in _merger_loop; never
-        # explicitly cleared, because a finalized request's Future is already
-        # done and the wait is then a no-op.
+        # tip — and by _merger_stack_tip, where a fresh dequeue stacks on its
+        # build while that build awaits dispatch.  Set at the post-put success
+        # site in _merger_loop; never explicitly cleared, because both readers
+        # skip a request whose Future is already done.
         self._last_merged_request: MergeRequest | None = None
         # δ/1720 one-strike registry — task_ids of members whose coalesce-formed
         # train derailed (MergeOutcome('blocked') on a train with train_id
@@ -6715,6 +6716,22 @@ class SpeculativeMergeWorker:
         return LiveTip(
             tip, next(e.item.request for e in frontier if entry_successor_base(e) == tip),
         )
+
+    def _merger_stack_tip(self) -> LiveTip | None:
+        """Where a fresh dequeue stacks: the merger's newest build while it
+        awaits dispatch, or None once that build's commit is dead, otherwise
+        the frozen-prefix tip from :meth:`_merger_live_tip`; it reads no main."""
+        req = self._last_merged_request
+        build = (
+            self._live_items.get(req.request_id)
+            if req is not None and not req.result.done() else None
+        )
+        if not isinstance(build, RealMergeItem):
+            return self._merger_live_tip()
+        commit = build.merge_result.merge_commit or ''
+        if not commit or commit in self._dead_base_commits:
+            return None
+        return LiveTip(commit, build.request)
 
     def _cascade_doomed_commits(self) -> frozenset[str]:
         """The commits :meth:`_verifier_loop`'s head-failure cascade tears down
@@ -10897,7 +10914,7 @@ class SpeculativeMergeWorker:
                     # ATTACH to the pending base or the live frontier tip, else
                     # FALLBACK to main: see SpeculationController.on_dequeue.
                     live_tip = (
-                        None if isinstance(req, GroupMergeRequest) else self._merger_live_tip()
+                        None if isinstance(req, GroupMergeRequest) else self._merger_stack_tip()
                     )
                     attached = self._speculation_controller.on_dequeue(req, live_tip=live_tip)
                     if attached is not None:
