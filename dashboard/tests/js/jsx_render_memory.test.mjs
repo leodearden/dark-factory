@@ -74,6 +74,14 @@ function mountMemoryTab(harness, planRoute) {
   return line;
 }
 
+// A palette token as the window's CSSOM serialises it (jsdom rewrites 0.80 as
+// 0.8), so it compares with what an element's style reads back.
+function cssColour(window, token) {
+  const probe = window.document.createElement('span');
+  probe.style.color = window.DF_CHARTS.PALETTE[token];
+  return probe.style.color;
+}
+
 // The reading and tone the shared helpers give the seeded payload.
 function expectedLine(window) {
   const { planRoute, planRouteText, planRouteHealth } = window.DF_MEMORY_READINGS;
@@ -93,7 +101,7 @@ for (const [name, value, tone] of [['a capped', CAPPED_ROUTE, 'bad'], ['an ok', 
     assert.equal(line.textContent, window.DF_MEMORY_READINGS.planRouteText(expected.route.value));
     assert.equal(line.textContent, expected.text);
     assert.equal(expected.tone, tone);
-    assert.equal(line.style.color, window.DF_CHARTS.PALETTE[tone]);
+    assert.equal(line.style.color, cssColour(window, tone));
   });
 }
 
@@ -111,5 +119,5 @@ test('tabs.jsx::MemoryTab renders an unread plan route as a hole titled by its r
   assert.equal(line.textContent, expected.text);
   assert.equal(line.querySelector('span').getAttribute('title'), reason);
   assert.equal(expected.tone, 'warn');
-  assert.equal(line.style.color, window.DF_CHARTS.PALETTE.warn);
+  assert.equal(line.style.color, cssColour(window, 'warn'));
 });
