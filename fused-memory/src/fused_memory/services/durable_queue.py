@@ -853,7 +853,11 @@ class DurableWriteQueue:
         """Park *item*, attempts unchanged, and re-arm every parked row to one
         horizon, so the queue probes about once per worker per period rather
         than once per parked row. The decision's ``retry_at``, never earlier
-        than now, is that horizon when set."""
+        than now, is that horizon when set.
+
+        The horizon is the deciding failure's, whatever parked each other row:
+        rows parked for different reasons pull each other onto the latest
+        park's horizon, because a row does not record which reason parked it."""
         reason = decision.reason
         error_msg = f'parked ({reason}): {type(exc).__name__}: {exc}'
         now = self._clock()
