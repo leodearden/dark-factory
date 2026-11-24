@@ -351,9 +351,9 @@ DEFECT_TEST_RULE = """
 
 A defect is wrong runtime behaviour. A defect fix starts from a test that fails
 without the fix and passes with it: write that test first and watch it fail.
-When the defect is declared, mark that test `@pytest.mark.defect("<ref>")` with
-the defect's ref. A test carrying `@pytest.mark.defect` is a defect's
-reproducing test.
+In a pytest project, when the defect is declared, mark that test
+`@pytest.mark.defect("<ref>")` with the defect's ref. A test carrying
+`@pytest.mark.defect` is a defect's reproducing test.
 
 Never weaken a failing test (loosen or delete an assertion, skip it, mark it
 xfail, or delete the test) without stating in the commit message why the test,
@@ -2348,7 +2348,9 @@ ROLES = {
     'simple_task': SIMPLE_TASK,
 }
 
-# The roles that fix code, each mapped to its system prompt as a function of the defect-test rule (PRD decision 17); the sentinel guard drives it.
+# The roles that fix code, each mapped to the base of its system prompt as a function of the defect-test rule
+# (PRD decision 17); the sentinel guard drives it. ARCHITECT's and IMPLEMENTER's dispatched prompts are longer:
+# the `+= _FOLLOWUP_FILING_INSTRUCTIONS` appends above extend that base after construction.
 FIXING_ROLE_PROMPT_BUILDERS: Mapping[str, Callable[[str], str]] = MappingProxyType({
     ARCHITECT.name: _architect_system_prompt,
     IMPLEMENTER.name: _implementer_system_prompt,

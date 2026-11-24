@@ -427,9 +427,9 @@ from it and kept equal to it by `tests/scripts/test_defect_rule_mirror.py`.
 
 A defect is wrong runtime behaviour. A defect fix starts from a test that fails
 without the fix and passes with it: write that test first and watch it fail.
-When the defect is declared, mark that test `@pytest.mark.defect("<ref>")` with
-the defect's ref. A test carrying `@pytest.mark.defect` is a defect's
-reproducing test.
+In a pytest project, when the defect is declared, mark that test
+`@pytest.mark.defect("<ref>")` with the defect's ref. A test carrying
+`@pytest.mark.defect` is a defect's reproducing test.
 
 Never weaken a failing test (loosen or delete an assertion, skip it, mark it
 xfail, or delete the test) without stating in the commit message why the test,
