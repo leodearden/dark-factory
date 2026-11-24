@@ -1946,6 +1946,7 @@ class RemoteRunner:
         task_id: str,
         archive_root: Path | None,
         event_store: Any = None,
+        verify_cache: RemoteCache | None = None,
     ) -> VerifyResult:
         """Run a task-role verify of ``spec.tip_sha`` on the remote host (PRD §5.2).
 
@@ -1959,7 +1960,9 @@ class RemoteRunner:
 
         Raises RunnerUnavailable when the host produced no usable verdict.  A
         ``no_verdict`` first archives, with *archive_root*, what a red would
-        plus a ``.no-verdict-<stamp>.json`` record.
+        plus a ``.no-verdict-<stamp>.json`` record.  With *verify_cache* the
+        spec ships a view of the dispatcher's registry and the verdict is
+        settled against it, consuming nothing (:meth:`_settled`).
         """
         if task_id != spec.task_id:
             raise ValueError(
@@ -1970,9 +1973,18 @@ class RemoteRunner:
             _RemoteArchiveTarget(archive_root, task_id, spec.attempt_id, 'task')
             if archive_root is not None else None
         )
+        request_id = self._id_factory()
+        view = await self._shipped_view(
+            verify_cache, 'task', (*spec.verify_commands, spec.global_verify_command),
+            lambda shipped: self._verify_command(
+                'verify-task', spec.tip_sha, request_id,
+                task_spec_to_json(dataclasses.replace(spec, verify_cache=shipped)),
+            ),
+        )
+        spec = dataclasses.replace(spec, verify_cache=view)
         outcome = await self._dispatch(
             spec.tip_sha, 'verify-task', task_spec_to_json(spec),
-            request_id=self._id_factory(), archive=archive,
+            request_id=request_id, archive=archive,
             event_store=event_store, task_id=task_id,
         )
         archived: list[Path] = []
@@ -1987,11 +1999,12 @@ class RemoteRunner:
                     ),
                 )
                 archived = [pass_summary] if pass_summary is not None else []
-        return dataclasses.replace(
+        result = dataclasses.replace(
             outcome.result,
             worktree_log_paths=[],
             archive_log_paths=[str(path) for path in archived],
         )
+        return await self._settled(verify_cache, view, 'task', result, landing_sha=None)
 
     async def _push_main_mirror(self, *, task_id: str | None, event_store: Any) -> None:
         """Step 0 (best-effort): push main FIRST so the remote has a fresh view of it.

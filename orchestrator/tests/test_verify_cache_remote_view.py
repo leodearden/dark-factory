@@ -986,18 +986,24 @@ class TestARemoteTaskVerifyThroughTheRealRemoteRunner:
             assert units[unit_id].evidence_event_id == recorded[unit_id].evidence_event_id
         assert not {leg for leg in ran_legs(markers) if leg.startswith('alpha:')}
         assert result.cache_report is not None
-        assert result.cache_record == result.cache_report.record('task', _BOTH_ON.with_mode('task', CacheMode.ON))
+        record = result.cache_record
+        assert record == result.cache_report.record('task', _BOTH_ON.with_mode('task', CacheMode.ON))
         assert (await registry.summary()).consumed == 0
 
         row_id = store.emit(EventType.workflow_verify, task_id='9123', data={'runner': _LAPTOP, **verify_event_fields(result)})
+        assert record is not None
         outcome = await record_greens(
-            registry, result.cache_record, flake_suppressed=result.flake_suppression is not None,
+            registry, record, flake_suppressed=result.flake_suppression is not None,
             evidence=VerifyEvidenceRef(row_id, store.run_id, spec.tip_sha, result.passed),
         )
 
         assert isinstance(row_id, int)
-        assert module_units('beta') <= {entry.unit_id for entry in outcome.recorded}
-        assert not module_units('alpha') & {entry.unit_id for entry in outcome.recorded}
+        admitted = {
+            unit.unit.unit for unit in result.cache_report.units if unit.admission is not None and unit.admission.admitted
+        }
+        assert {'module:beta:lint', 'module:beta:type'} <= admitted
+        assert {entry.unit_id for entry in outcome.recorded} == admitted
+        assert not module_units('alpha') & admitted
         assert {entry.evidence_event_id for entry in outcome.recorded} == {row_id}
 
     @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
