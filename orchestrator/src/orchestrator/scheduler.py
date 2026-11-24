@@ -87,6 +87,7 @@ from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
 from orchestrator.deploy_state import awaits_scheduled_restart
+from orchestrator.dispatch_row import DispatchRefusal, FreshRow, refresh_dispatch_row
 from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
@@ -1208,6 +1209,14 @@ class _PinCandidate:
 
 
 @dataclass(frozen=True)
+class _ConfirmedClaim:
+    """A claimed winner the store confirmed: its current row and its dispatch-cooldown signal."""
+
+    task: dict
+    signal: str | None
+
+
+@dataclass(frozen=True)
 class _BackfillGrant:
     """The facts behind one EASY-backfill admission (task 3823 / PRD C7).
 
@@ -1976,6 +1985,12 @@ class Scheduler:
         # new constructor kwarg).  Signature: () -> PsiSample.
         self._read_psi_sample: Callable[[], PsiSample] = partial(
             read_psi_sample, project_id=config.fused_memory.project_id
+        )
+        # The store re-read of a claimed dispatch winner (task 11430):
+        # conftest's _hermetic_dispatch_row patches the module-level name
+        # before construction, exactly as it does read_psi_sample above.
+        self._refresh_dispatch_row: Callable[[dict], Awaitable[FreshRow | TaskAbsent | TaskReadFailed]] = partial(
+            refresh_dispatch_row, self
         )
         # Rate-limit timestamps (monotonic, via self._time_source) for the
         # dispatch-admission gate's WARNING streams — deliberately
@@ -4666,12 +4681,42 @@ class Scheduler:
         terminal_dep_records: dict[str, dict] | None = None,
         deferred_terminal_deps: Collection[str] = frozenset(),
     ) -> tuple[bool, str | None]:
-        """Check whether *task* passes all eligibility gates for dispatch.
+        """Whether *task* is a dispatch candidate: not started, and through :meth:`_passes_dispatch_gates`.
 
         Consolidates the duplicate gate logic that previously existed in both
         the scored-candidate loop and the pin-dispatch loop.  A single source
         of truth ensures that future gate additions (e.g. a new suppression
         signal) apply to every dispatch path automatically.
+        """
+        if tid in self._dispatched:
+            return False, None
+        return self._passes_dispatch_gates(
+            task, tid, status_map, tasks_by_id,
+            external_status_cache=external_status_cache,
+            external_resolver_failed=external_resolver_failed,
+            delivered_check_cache=delivered_check_cache,
+            terminal_dep_records=terminal_dep_records,
+            deferred_terminal_deps=deferred_terminal_deps,
+        )
+
+    def _passes_dispatch_gates(
+        self,
+        task: dict,
+        tid: str,
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None = None,
+        *,
+        external_status_cache: dict[str, str] | None = None,
+        external_resolver_failed: bool = False,
+        delivered_check_cache: dict[str, bool] | None = None,
+        terminal_dep_records: dict[str, dict] | None = None,
+        deferred_terminal_deps: Collection[str] = frozenset(),
+    ) -> tuple[bool, str | None]:
+        """Check whether *task* passes every dispatch gate but the started check.
+
+        Candidacy (:meth:`_eligible_for_dispatch`) and the confirmation of a
+        claimed winner (:meth:`_confirm_claim`, whose task is started by its
+        own claim) both decide through this one predicate.
 
         This method is a **pure predicate** — it has no side effects and may be
         called any number of times without surprise.  In particular it does *not*
@@ -4723,8 +4768,6 @@ class Scheduler:
         ``config.claimant_dispatch_gate_enabled``.
         """
         if task.get('status') != 'pending':
-            return False, None
-        if tid in self._dispatched:
             return False, None
         if self.config.claimant_dispatch_gate_enabled and has_live_claimant(
             task,
@@ -7442,11 +7485,17 @@ class Scheduler:
         ``TickOutcome(TaskAssignment)`` on a successful dispatch, or
         ``TickOutcome(None)`` once the loop is exhausted with no acquire
         (the top candidate's skip counter is bumped either way it is
-        passed over). When every candidate was started since the ready list
-        was built it returns ``TickOutcome(None)`` at once, bumping no skip
-        and writing no snapshot. Higher score wins; equal scores dispatch the
-        numerically smaller (older) id first, and non-numeric ids after every
-        numeric one, in string order.
+        passed over, unless confirmation dropped it). When every candidate
+        was started since the ready list was built it returns
+        ``TickOutcome(None)`` at once, bumping no skip and writing no
+        snapshot. Higher score wins; equal scores dispatch the numerically
+        smaller (older) id first, and non-numeric ids after every numeric
+        one, in string order.
+
+        The dispatched row is the store's row, re-read after the claim
+        (:meth:`_confirm_claim`): a winner the store no longer holds
+        dispatchable is dropped and the scan moves on, and an unreadable
+        store ends the tick with nothing dispatched.
         """
         self._poll_work_product()
         # A scoped tick's candidates are filtered (task 8480), so only an ANY
@@ -7491,6 +7540,7 @@ class Scheduler:
         # starvation watchdog's lock_refused gate.  PSI-deferred candidates
         # never tried, and a scan with no winner credits nobody.
         refused: list[str] = []
+        dropped: set[str] = set()
         try:
             for _score, task_id, task, pri in scored:
                 if ctx.psi_hold and not self._exempt_from_psi_hold(task):
@@ -7525,25 +7575,38 @@ class Scheduler:
                 if not acquired:
                     refused.append(task_id)
                     self._note_park_refusal(ctx, task_id, modules, pri)
-                if acquired:
-                    self._watchdog_state.note_scan(refused)
-                    # Settle the winner BEFORE bumping a passed-over top: the
-                    # winner's own park would otherwise block the top's install.
-                    await self._settle_dispatch(
-                        task_id, modules, tier=pri, signal=ctx.candidate_signals.get(task_id),
-                    )
-                    if task_id != top_id:
-                        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-                    if grant is not None:
-                        self._record_backfill_grant(grant)
-                    return await self._finish_dispatch(task_id, task, modules, tier=pri)
+                    continue
+                match await self._confirm_claim(ctx, task_id, task):
+                    case DispatchRefusal.UNREADABLE:
+                        return TickOutcome(None)
+                    case DispatchRefusal.NO_LONGER_DISPATCHABLE:
+                        # A grant that does not become a dispatch is discarded.
+                        dropped.add(task_id)
+                    case _ConfirmedClaim() as winner:
+                        self._watchdog_state.note_scan(refused)
+                        # Settle the winner BEFORE bumping a passed-over top: the
+                        # winner's own park would otherwise block the top's install.
+                        await self._settle_dispatch(task_id, modules, tier=pri, signal=winner.signal)
+                        if task_id != top_id:
+                            self._bump_passed_over_top(top_id, top_modules, top_pri, dropped=dropped)
+                        if grant is not None:
+                            self._record_backfill_grant(grant)
+                        return await self._finish_dispatch(task_id, winner.task, modules, tier=pri)
         finally:
             self._backfill_scan_cache = None
 
-        # Loop exhausted with no acquire — top candidate was also skipped.
-        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+        # Loop exhausted with no dispatch — top candidate was also skipped.
+        self._bump_passed_over_top(top_id, top_modules, top_pri, dropped=dropped)
         await self._write_snapshot_best_effort()
         return TickOutcome(None)
+
+    def _bump_passed_over_top(
+        self, top_id: str, top_modules: list[str], top_pri: str, *, dropped: Collection[str],
+    ) -> None:
+        """Bump the scan's top as passed over, unless confirmation *dropped* it: then it was never dispatchable."""
+        if top_id in dropped:
+            return
+        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
 
     def _claim(
         self, task_id: str, modules: list[str], *, admitted_parks: frozenset[str] = frozenset(),
@@ -7561,6 +7624,60 @@ class Scheduler:
         self._dispatched.add(task_id)
         self._restored_holds.discard(task_id)
         return True
+
+    def _unclaim(self, task_id: str) -> None:
+        """Undo a :meth:`_claim` that never became a dispatch: free its keys and its started mark.
+
+        Emits no lock event, since no ``lock_acquired`` was emitted for the
+        claim, and arms no cooldown.
+        """
+        self.lock_table.release(task_id)
+        self._dispatched.discard(task_id)
+
+    async def _confirm_claim(
+        self, ctx: TickContext, task_id: str, snapshot_row: dict,
+    ) -> _ConfirmedClaim | DispatchRefusal:
+        """Re-read a claimed winner from the store and re-run its dispatch gates on that row.
+
+        The tick's snapshot can be minutes old by the claim (task 11430), so
+        a write that landed since (a new dependency, a gate stamp, a status
+        change) must be seen before dispatch.  The fresh dependency statuses
+        overlay the tick's status map; every other gate input is the tick's.
+        A refused winner is unclaimed.
+        """
+        refreshed = await self._refresh_dispatch_row(snapshot_row)
+        if isinstance(refreshed, TaskReadFailed):
+            self._unclaim(task_id)
+            logger.warning(
+                'Task %s not dispatched: its row could not be re-read after the claim; '
+                'dispatching nothing more this tick: %.300s',
+                task_id, refreshed.reason,
+            )
+            return DispatchRefusal.UNREADABLE
+        if isinstance(refreshed, TaskAbsent):
+            self._unclaim(task_id)
+            logger.info('Task %s not dispatched: the store no longer holds it', task_id)
+            return DispatchRefusal.NO_LONGER_DISPATCHABLE
+        fresh = refreshed.task
+        passes, signal = False, None
+        if ctx.scope.admits(fresh):
+            passes, signal = self._passes_dispatch_gates(
+                fresh, task_id, {**ctx.status_map, **refreshed.dep_statuses}, ctx.tasks_by_id,
+                external_status_cache=ctx.external_cache,
+                external_resolver_failed=ctx.external_resolver_failed,
+                delivered_check_cache=ctx.delivered_check_cache,
+                terminal_dep_records=ctx.terminal_dep_records,
+                deferred_terminal_deps=ctx.deferred_terminal_deps,
+            )
+        if not passes:
+            self._unclaim(task_id)
+            logger.info(
+                'Task %s not dispatched: its re-read row no longer passes the dispatch gates '
+                '(status=%r, dependencies=%r, dependency statuses=%r)',
+                task_id, fresh.get('status'), fresh.get('dependencies'), dict(refreshed.dep_statuses),
+            )
+            return DispatchRefusal.NO_LONGER_DISPATCHABLE
+        return _ConfirmedClaim(fresh, signal)
 
     def _note_park_refusal(
         self, ctx: TickContext, task_id: str, modules: list[str], tier: str

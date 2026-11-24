@@ -2831,21 +2831,16 @@ class TestDispatchCooldownGate:
     async def test_signal_evaluated_once_per_dispatch_with_primed_cooldown(
         self, monkeypatch
     ):
-        """_dispatch_cooldown_signal is called at most once per task per acquire_next.
+        """_dispatch_cooldown_signal is evaluated once per gate pass and never again at the arm site.
 
         Scenario: ``_last_dispatch_at`` is primed (simulating a prior signal-bearing
         dispatch whose signal has since cleared).  The candidate task carries no
         cooldown markers so ``_dispatch_cooldown_signal`` returns ``None`` and the
-        gate is open.  The signal helper must be called exactly once (during the
-        filter loop) and its result reused at the arm site rather than re-evaluated.
-
-        Pre-fix this counter is 2:
-        - once inside ``_dispatch_cooldown_active`` (filter path, because
-          ``_last_dispatch_at`` is set and elapsed < cooldown window), and
-        - once at the arm site (``if self._dispatch_cooldown_signal(task) is not None``).
-
-        Post-fix the counter is 1 (filter only; arm site reads the cached value from
-        ``candidate_signals``).
+        gate is open.  The gates run twice per dispatch: once on the snapshot row
+        (candidacy) and once on the winner's re-read row after its claim (task
+        11430, ``Scheduler._confirm_claim``).  The arm site reuses the
+        confirmation's value, so the counter is 2; a re-evaluation at the arm
+        site would make it 3.
         """
         task = self._pending_task_with({'files': ['backend']})
         task_response = self._make_task_response(task)
@@ -2878,9 +2873,9 @@ class TestDispatchCooldownGate:
         assert result is not None and result.task_id == '99', (
             'Dispatch must succeed when cooldown window is primed but signal has cleared'
         )
-        assert counts[0] == 1, (
-            f'_dispatch_cooldown_signal must be called exactly once per dispatch '
-            f'(got {counts[0]}); pre-fix it is called twice (filter + arm)'
+        assert counts[0] == 2, (
+            f'_dispatch_cooldown_signal must be called once per gate pass (candidacy, '
+            f'confirmation) and not at the arm site (got {counts[0]})'
         )
 
 

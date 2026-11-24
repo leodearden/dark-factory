@@ -32,6 +32,7 @@ from shared.python_env import without_python_env_selection
 from shared.usage_gate import AccountState, UsageGate
 
 from orchestrator.config import ModuleConfig
+from orchestrator.dispatch_row import FreshRow
 
 if TYPE_CHECKING:
     from shared.prompt_artifact import PromptArtifactStore
@@ -1048,6 +1049,15 @@ def idle_psi_sample(*, project_id: str | None = None) -> PsiSample:
         io_some10=0.0,
         read_ok=True,
     )
+
+
+async def unchanged_dispatch_row(source: object, row: dict) -> FreshRow:
+    """The hermetic store re-read of a dispatch winner: no concurrent writer, so the row is unchanged.
+
+    Installed suite-wide by conftest's autouse ``_hermetic_dispatch_row`` in
+    place of ``orchestrator.dispatch_row.refresh_dispatch_row`` (task 11430).
+    """
+    return FreshRow(task=row, dep_statuses={})
 
 
 class HostDiskUsage(NamedTuple):

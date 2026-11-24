@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -9,7 +10,7 @@ from typing import Any, Protocol
 from shared.task_fields import dependency_ids
 from shared.task_read import TaskAbsent, TaskFound, TaskRead, TaskReadFailed
 
-__all__ = ['FreshRow', 'RowSource', 'refresh_dispatch_row']
+__all__ = ['DispatchRefusal', 'FreshRow', 'RowSource', 'refresh_dispatch_row']
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,13 @@ class FreshRow:
 
     task: dict[str, Any]
     dep_statuses: Mapping[str, str]
+
+
+class DispatchRefusal(enum.Enum):
+    """Why a claimed winner is not dispatched after all: the store dropped it, or could not be read."""
+
+    NO_LONGER_DISPATCHABLE = 'no_longer_dispatchable'
+    UNREADABLE = 'unreadable'
 
 
 class RowSource(Protocol):
