@@ -7654,12 +7654,13 @@ class Scheduler:
         """Undo a :meth:`_claim` that never became a dispatch: free its keys and its started mark.
 
         Emits no lock event, since no ``lock_acquired`` was emitted for the
-        claim, and arms no cooldown.  The keys go through ``release_subset``
-        because ``lock_table.release`` is reserved to :meth:`release`
-        (orchestrator/tests/test_lock_release_single_writer_guard.py), and
-        because undoing a claim must leave a successor relation in force.
+        claim, and arms no cooldown.  The keys go through
+        ``lock_table.withdraw_acquire``, which also drops a keyless gate's
+        entry and leaves a successor relation in force, since
+        ``lock_table.release`` is reserved to :meth:`release`
+        (orchestrator/tests/test_lock_release_single_writer_guard.py).
         """
-        self.lock_table.release_subset(task_id, sorted(self.lock_table.held_modules(task_id)))
+        self.lock_table.withdraw_acquire(task_id)
         self._dispatched.discard(task_id)
 
     async def _confirm_claim(
