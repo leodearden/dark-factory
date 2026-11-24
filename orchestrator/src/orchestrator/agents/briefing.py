@@ -18,6 +18,7 @@ from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.branch_history_guidance import BRANCH_HISTORY_HEADING
+from orchestrator.agents.defect_briefing import format_declared_defects
 from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
 from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
 from orchestrator.agents.memory_recall import MemoryRecall
@@ -1911,6 +1912,8 @@ A prior block-time investigation concluded the following; verify against the cur
 
         Then appends ``metadata.followup_items`` via :func:`_format_followup_items`, also exempt
         from ``include_files=False``: the items are the task's charter, not a footprint guess.
+        Declared defects are appended too via :func:`format_declared_defects` and, like follow-up
+        items, are exempt from ``include_files=False`` because they are the task's charter.
         """
         metadata = task.get('metadata') or {}
         lines = []
@@ -1935,5 +1938,6 @@ A prior block-time investigation concluded the following; verify against the cur
             body,
             _format_delivered_checks(declared_checks(metadata)),
             _format_followup_items(metadata.get(FOLLOWUP_ITEMS_METADATA_KEY)),
+            format_declared_defects(metadata),
         )
         return '\n\n'.join(block for block in blocks if block)

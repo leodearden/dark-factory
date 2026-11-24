@@ -21,7 +21,6 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
-from orchestrator.agents.defect_briefing import DECLARED_DEFECTS_HEADING, format_declared_defects
 from shared.defects import (
     DEFECTS_METADATA_KEY,
     DefectDeclaration,
@@ -32,6 +31,7 @@ from shared.defects import (
 )
 
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.defect_briefing import DECLARED_DEFECTS_HEADING, format_declared_defects
 from orchestrator.agents.roles import DEFECT_TEST_RULE
 from orchestrator.agents.steward_digest import EarlierAttempts
 
