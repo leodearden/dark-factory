@@ -10894,32 +10894,19 @@ class SpeculativeMergeWorker:
                     if req is None:
                         exited_via_sentinel = True
                         break  # shutdown sentinel
-                    # ATTACH or FALLBACK: decide whether this fresh dequeue is a
-                    # late arrival that can attach to the in-flight predecessor's
-                    # merge commit (task 1862), delegated to the controller.
-                    #
-                    # ATTACH — all four conditions must hold:
-                    #   (a) pending_spec_base: predecessor's commit was recorded
-                    #   (b) held_by_merger: speculation permit is still held
-                    #   (c) pending_predecessor: predecessor request is known
-                    #   (d) predecessor still in-flight (result future not done)
-                    #
-                    # On ATTACH: spec_base = pending_spec_base so this late
-                    # arrival merges against main+A, not plain main.  The
-                    # retained permit transfers to the verifier item on drain.
-                    #
-                    # On FALLBACK (any condition fails): release the held permit
-                    # if present and merge non-speculatively against actual main.
-                    _pending_predecessor = self._speculation_controller.pending_predecessor
-                    attached_base = self._speculation_controller.on_dequeue(req)
-                    if attached_base is not None:
-                        assert _pending_predecessor is not None
+                    # ATTACH to the pending base or the live frontier tip, else
+                    # FALLBACK to main: see SpeculationController.on_dequeue.
+                    live_tip = (
+                        None if isinstance(req, GroupMergeRequest) else self._merger_live_tip()
+                    )
+                    attached = self._speculation_controller.on_dequeue(req, live_tip=live_tip)
+                    if attached is not None:
                         logger.debug(
                             'Task %s: late arrival attaches to in-flight '
                             'predecessor %s (spec_base=%s)',
                             req.task_id,
-                            _pending_predecessor.task_id,
-                            attached_base[:8],
+                            attached.owner.task_id,
+                            attached.sha[:8],
                         )
 
                 # MQ-invariants eta (task 1992): arm the request-liveness ledger

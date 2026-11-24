@@ -27,10 +27,11 @@ currently holds (or ``None``) rather than a bare boolean:
 * ``on_lookahead_pending`` — nothing pickable yet but the predecessor is
   still in-flight; the permit is RETAINED for a possible late-arrival
   ATTACH (task 1862) at the next dequeue.
-* ``on_dequeue`` — the ATTACH/FALLBACK four-condition decision for a
-  freshly dequeued request: ATTACH retains the permit (it transfers to the
-  verifier when the attached item is put); FALLBACK releases it
-  immediately.
+* ``on_dequeue`` — the base for a freshly dequeued request: ATTACH to the
+  pending base, else to the live frontier tip the caller passes, either with
+  the held or a free permit (it never waits; the permit transfers to the
+  verifier when the attached item is put); else FALLBACK to main, releasing
+  any held permit.
 * ``on_transfer`` — the merger has handed a speculative item to the
   verifier via ``_verifier_queue.put()``; the verifier now owns the permit,
   so this clears ``held_by_merger`` (drops the controller's own reference)
@@ -398,10 +399,9 @@ class SpeculationController:
         * ``pending_spec_base`` with a still-in-flight predecessor — a
           late-arrival ATTACH is armed (task 1862) and the very next dequeue
           may attach to the predecessor's merge commit. The drained-predecessor
-          relaxation mirrors :meth:`on_dequeue`'s condition (d): once the
-          predecessor's result Future is done, ``on_dequeue`` would take the
-          FALLBACK branch anyway, so the pending state is vestigial and must
-          not keep the gate shut.
+          relaxation mirrors :meth:`on_dequeue`: once the predecessor's result
+          Future is done, ``on_dequeue`` would not attach to the pending base,
+          so the pending state is vestigial and must not keep the gate shut.
         """
         if self.prefetched is not None:
             return False
@@ -425,49 +425,45 @@ class SpeculationController:
         """
         return self.spec_base if self.spec_base is not None else actual_main
 
-    def on_dequeue(self, req: MergeRequest) -> str | None:
-        """Decide ATTACH vs FALLBACK for a freshly dequeued request.
+    def on_dequeue(self, req: MergeRequest, *, live_tip: LiveTip | None) -> LiveTip | None:
+        """Choose the base a freshly dequeued request merges against, and return it.
 
-        ATTACH — all four conditions hold: ``pending_spec_base`` is
-        recorded, a permit is held, ``pending_predecessor`` is known, and
-        the predecessor is still in-flight (its result Future is not yet
-        done). The held permit is RETAINED — it transfers to the verifier
-        when the attached item is eventually put via ``on_transfer`` — and
-        ``spec_base`` becomes the predecessor's recorded commit so this
-        late arrival merges against it instead of plain main.
-
-        FALLBACK — any condition fails: release the held permit (if any)
-        and merge against plain main (``spec_base`` cleared to None).
-
-        Either way, ``pending_spec_base``/``pending_predecessor`` are
-        cleared — consumed by ATTACH or dropped by FALLBACK. Mirrors
-        ``_merger_loop``'s ATTACH/FALLBACK decision (task 1862).
-
-        ``req`` (the freshly dequeued request) does not affect the
-        decision itself — it is accepted for call-site symmetry with the
-        original loop-local logic and future extension (e.g. logging).
+        ATTACH to the pending base while its predecessor is in flight, else
+        to *live_tip*, the live frontier tip the caller passes, while its
+        owner is in flight (task 10851). Either keeps the held permit or
+        takes a free one without waiting; the permit transfers to the
+        verifier when the attached item is put. With no such base or no free
+        permit, FALLBACK: release any held permit and merge on main (None).
+        Either way the pending base is consumed. *req* does not affect the
+        decision.
         """
-        if (
-            self.pending_spec_base is not None
-            and self._permit is not None
-            and self.pending_predecessor is not None
-            and not self.pending_predecessor.result.done()
-        ):
-            self.spec_base = self.pending_spec_base  # ATTACH
-        else:
-            # FALLBACK — release retained permit (if any); a redundant
-            # release is avoided by this `if self._permit is not None`
-            # guard, and independently by the ledger's own idempotent
-            # release (see module docstring's double-release tolerance
-            # note).
-            if self._permit is not None:
-                self._ledger.release(self._permit)
-                self._permit = None
-            self.spec_base = None
-        # Clear pending locals — consumed by ATTACH or dropped by FALLBACK.
+        base = self._attachable_base(live_tip)
         self.pending_spec_base = None
         self.pending_predecessor = None
-        return self.spec_base
+        if base is not None and self._hold_permit():
+            self.spec_base = base.sha
+            return base
+        self._release_held()
+        self.spec_base = None
+        return None
+
+    def _attachable_base(self, live_tip: LiveTip | None) -> LiveTip | None:
+        """The pending base, else *live_tip*: the first whose owner is still in flight."""
+        pending = (
+            LiveTip(self.pending_spec_base, self.pending_predecessor)
+            if self.pending_spec_base is not None and self.pending_predecessor is not None
+            else None
+        )
+        return next(
+            (tip for tip in (pending, live_tip) if tip is not None and not tip.owner.result.done()),
+            None,
+        )
+
+    def _hold_permit(self) -> bool:
+        """Keep the held permit, else take a free slot now; never waits."""
+        if self._permit is None:
+            self._permit = self._ledger.try_acquire()
+        return self._permit is not None
 
     async def acquire_for_lookahead(self) -> None:
         """Acquire one speculation permit before peeking for a look-ahead item.
