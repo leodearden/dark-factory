@@ -234,7 +234,9 @@ from orchestrator.service_restart import (
     schedule_detached_systemd_restart,
 )
 from orchestrator.slot_lease import (
+    LendingRule,
     SlotLease,
+    SlotLendingError,
     SuspendedTask,
     culprit,
     suspended_slot_tasks,
@@ -3124,7 +3126,9 @@ class Harness:
                         'slot: every general run slot is held',
                         assignment.task_id,
                     )
-                self._launch_slot(assignment, sem, task_reports)
+                self._launch_slot(
+                    assignment, SlotLease(assignment.task_id, self.scheduler, sem), task_reports,
+                )
 
             self._compute_tallies(task_reports)
 
@@ -10118,9 +10122,9 @@ class Harness:
             )
 
     async def _run_slot(
-        self, assignment, sem: asyncio.Semaphore
+        self, assignment, lease: SlotLease
     ) -> TaskReport | None:
-        """Run a single workflow slot."""
+        """Run a single workflow slot on *lease*."""
         report = None
         # Hoisted (task 3172) so the `except asyncio.CancelledError` handler can
         # read the live phase defensively: a cancel landing during slot SETUP
@@ -10132,7 +10136,6 @@ class Harness:
         # preventing the rapid re-block loop where reconciliation immediately
         # re-dispatches the task before it can make progress.
         arm_requeue_cooldown = False
-        lease = SlotLease(assignment.task_id, self.scheduler, sem)
         self._slot_lease_registry()[assignment.task_id] = lease
         try:
             logger.info(
@@ -14775,9 +14778,9 @@ class Harness:
             await asyncio.sleep(self.config.idle_poll_secs)
 
     def _launch_slot(
-        self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
+        self, assignment, lease: SlotLease, task_reports: list[TaskReport],
     ) -> asyncio.Task:
-        """Start the slot task for *assignment*, whose *sem* permit is already held."""
+        """Start the slot task for *assignment*, running on *lease*, which holds its permit or borrows one."""
         self._task_modules[assignment.task_id] = list(assignment.modules)
         # Register escalation wake-event BEFORE create_task so Fix #1a
         # (_on_escalation_resolved orphan-flip gate) sees task_id in
@@ -14789,7 +14792,7 @@ class Harness:
         # for, so a reject that brings the task back re-announces.
         self._landing_rejects.release(assignment.task_id)
         task = asyncio.create_task(
-            self._run_slot(assignment, sem),
+            self._run_slot(assignment, lease),
             name=f'workflow-{assignment.task_id}',
         )
         self._live_tasks.add(task)
@@ -14816,7 +14819,35 @@ class Harness:
                 if self._escalation_events.get(tid) is ev else None
             )
         )
+        # Backstop for a slot that never released its lease: cancelled before
+        # its first step, or its finally raised first.  Otherwise a no-op.
+        task.add_done_callback(lambda _t, lease=lease: lease.release(requeued=False))
         return task
+
+    def _launch_borrowing_slot(
+        self, assignment, lender_task_id: str, task_reports: list[TaskReport],
+    ) -> asyncio.Task:
+        """Start *assignment*'s slot on a permit borrowed from *lender_task_id*'s live slot.
+
+        Synchronous, so a caller can make it part of one uninterrupted claim
+        step.  Rules: ``plans/early-start-on-predecessor-branch-prd.md``
+        section 5.3 "Slot".
+        """
+        leases = self._slot_lease_registry()
+        lender = leases.get(lender_task_id)
+        if lender is None:
+            raise SlotLendingError(
+                LendingRule.NO_LIVE_SLOT, lender_task_id=lender_task_id, borrower_task_id=assignment.task_id,
+            )
+        if assignment.task_id in leases:
+            raise SlotLendingError(
+                LendingRule.BORROWER_HAS_SLOT, lender_task_id=lender_task_id, borrower_task_id=assignment.task_id,
+            )
+        slot = self._launch_slot(assignment, lender.lend(assignment.task_id), task_reports)
+        logger.info(
+            'task %s launched on a slot borrowed from task %s', assignment.task_id, lender_task_id,
+        )
+        return slot
 
     def _slot_lease_registry(self) -> dict[str, SlotLease]:
         """The slot-lease registry, lazily created when absent (``_cancel_causes``'s idiom)."""

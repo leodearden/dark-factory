@@ -59,6 +59,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow_types import (
     CancellationScope,
     TerminalReport,
@@ -1237,7 +1238,7 @@ class TestHarnessSyntheticCancelRetirement:
             mock_wf.run = _wedge
             mock_wf_cls.return_value = mock_wf
 
-            wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+            wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
 
             # Poll until _run_slot registers itself in _workflow_slot_tasks.
             # task 3307: monotonic-deadline poll (house idiom, e.g.

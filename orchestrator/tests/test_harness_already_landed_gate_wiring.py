@@ -61,6 +61,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_landing_evidence,
 )
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 
 _HARNESS_SRC_PATH = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'harness.py'
 
@@ -2640,7 +2641,7 @@ class TestAlreadyLandedGateAncestryRejectEmission:
 
         slot = h._launch_slot(
             TaskAssignment(task_id='42', task={'id': '42'}, modules=[]),
-            asyncio.Semaphore(0), [],
+            SlotLease('42', h.scheduler, asyncio.Semaphore(0)), [],
         )
         slot.cancel()
         await asyncio.gather(slot, return_exceptions=True)

@@ -30,6 +30,7 @@ from orchestrator.harness import Harness, HarnessReport, TaskReport
 from orchestrator.run_slots import DispatchScope
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.service_restart import StaleServiceRestartCoordinator
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 _TICK = 0.01
@@ -40,8 +41,8 @@ _UNIT = 'orchestrator-parked-test.service'
 class _Slots:
     """Stand-in slot runner: each slot ends when the test opens its gate.
 
-    Mirrors ``Harness._run_slot``'s contract: it releases the semaphore on
-    exit and turns a cancel into a synthetic CANCELLED report.
+    Mirrors ``Harness._run_slot``'s contract: it releases its lease on exit
+    and turns a cancel into a synthetic CANCELLED report.
     """
 
     def __init__(self) -> None:
@@ -54,7 +55,7 @@ class _Slots:
         for gate in self.gates.values():
             gate.set()
 
-    async def run(self, assignment: TaskAssignment, sem: asyncio.Semaphore) -> TaskReport:
+    async def run(self, assignment: TaskAssignment, lease: SlotLease) -> TaskReport:
         tid = assignment.task_id
         if self._all_open:
             self.gates[tid].set()
@@ -65,7 +66,7 @@ class _Slots:
             return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.CANCELLED)
         finally:
             self.finished.add(tid)
-            sem.release()
+            lease.release(requeued=False)
 
 
 class _Dispatch:

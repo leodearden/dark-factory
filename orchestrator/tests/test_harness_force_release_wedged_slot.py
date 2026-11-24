@@ -30,6 +30,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow_types import CancellationScope, WorkflowCancelled, WorkflowOutcome
 
 TID = '42'
@@ -123,7 +124,7 @@ class _Rig:
     def launch(self, sem: asyncio.Semaphore) -> asyncio.Task:
         """Dispatch a slot for TID the way the harness's dispatch loop does."""
         assignment = TaskAssignment(task_id=TID, task={'id': TID, 'title': 'wedged'}, modules=['lib'])
-        slot = self.harness._launch_slot(assignment, sem, self.reports)
+        slot = self.harness._launch_slot(assignment, SlotLease(assignment.task_id, self.harness.scheduler, sem), self.reports)
         self.slots.append(slot)
         return slot
 
