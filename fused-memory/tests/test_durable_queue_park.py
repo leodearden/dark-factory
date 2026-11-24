@@ -25,6 +25,8 @@ from fused_memory.services.durable_queue import DurableWriteQueue, ParkDecision,
 from fused_memory.services.queued_writes import QueueCallback, QueuedWrite
 
 _MAX_ATTEMPTS = 3
+_PROBE_AHEAD_SECONDS = 600.0
+_PROBE_BEHIND_SECONDS = 3600.0
 
 
 class _Exhausted(Exception):
@@ -185,18 +187,18 @@ class TestParking:
 class TestTheProbeTimeAParkNames:
     @pytest.mark.asyncio
     async def test_a_named_probe_time_becomes_every_parked_rows_horizon(self, tmp_path):
-        probe_at = time.time() + 600.0
+        probe_at = time.time() + _PROBE_AHEAD_SECONDS
         policy = _RecordingParkPolicy()
         execute = AsyncMock(side_effect=_Exhausted('capped'))
         q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
         await q.initialize()
         try:
             first = await q.enqueue(_write('first', group_id='proj1'))
-            await poll_until(_status_is(tmp_path, first, 'parked'), timeout=10.0)
+            await poll_until(_status_is(tmp_path, first, 'parked'))
             policy.retry_at = lambda: probe_at
 
             second = await q.enqueue(_write('second', group_id='proj2'))
-            await poll_until(_status_is(tmp_path, second, 'parked'), timeout=10.0)
+            await poll_until(_status_is(tmp_path, second, 'parked'))
 
             row = _row(tmp_path, second)
             assert row['next_retry_at'] == probe_at
@@ -207,10 +209,10 @@ class TestTheProbeTimeAParkNames:
 
     @pytest.mark.asyncio
     async def test_a_probe_time_in_the_past_is_clamped_to_now(self, tmp_path):
-        retry_ats = iter([time.time() - 3600.0])
+        retry_ats = iter([time.time() - _PROBE_BEHIND_SECONDS])
         horizons: list[float] = []
         policy = _RecordingParkPolicy(
-            retry_at=lambda: next(retry_ats, time.time() + 600.0),
+            retry_at=lambda: next(retry_ats, time.time() + _PROBE_AHEAD_SECONDS),
             observe=lambda event: horizons.append(_row(tmp_path, event.item_id)['next_retry_at']),
         )
         execute = AsyncMock(side_effect=_Exhausted('capped'))
@@ -220,10 +222,10 @@ class TestTheProbeTimeAParkNames:
             before = time.time()
             item_id = await q.enqueue(_write('clamped'))
             await poll_until(
-                lambda: execute.await_count >= 2, timeout=10.0,
+                lambda: execute.await_count >= 2,
                 message='a row parked with a past probe time was not claimable at once',
             )
-            await poll_until(lambda: len(horizons) >= 2, timeout=5.0)
+            await poll_until(lambda: len(horizons) >= 2)
 
             assert before <= horizons[0] <= time.time()
             assert _row(tmp_path, item_id)['status'] == 'parked'

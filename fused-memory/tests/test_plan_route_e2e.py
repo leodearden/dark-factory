@@ -170,6 +170,7 @@ class TestGraphitisLLMRidesThePlanRoute:
 
 
 _PROBE_INTERVAL_SECONDS = 1.0
+_SETTLE_SECONDS = 20 * _PROBE_INTERVAL_SECONDS
 _CAPPED = 'plan_route_capped'
 
 
@@ -274,7 +275,7 @@ class TestACappedPlanThroughMemoryService:
             )
 
             assert response.stores_queued == [SourceStore.graphiti]
-            await poll_until(lambda: _parked(svc), timeout=20.0, message='nothing parked')
+            await poll_until(lambda: _parked(svc), timeout=_SETTLE_SECONDS, message='nothing parked')
             assert endpoints.api_llm_requests() == []
 
             capped = (await svc.get_status())['plan_route']
@@ -292,7 +293,7 @@ class TestACappedPlanThroughMemoryService:
 
             root = _primary_root(svc)
             [page] = await poll_until(
-                lambda: _capped_records(root) or None, timeout=20.0,
+                lambda: _capped_records(root) or None, timeout=_SETTLE_SECONDS,
                 message='no plan_route_capped page was filed',
             )
             assert page['level'] == 2
@@ -303,14 +304,14 @@ class TestACappedPlanThroughMemoryService:
             [confirmed] = await poll_until(
                 lambda: [r for r in _capped_records(root) if r['dedupe_count'] > filed_count]
                 or None,
-                timeout=20.0, message='a re-probe did not refresh the page',
+                timeout=_SETTLE_SECONDS, message='a re-probe did not refresh the page',
             )
             assert confirmed['id'] == page['id']
             assert len(_capped_records(root)) == 1
 
             endpoints.uncap()
             await poll_until(
-                lambda: _drained(svc), timeout=20.0, message='the parked write never drained',
+                lambda: _drained(svc), timeout=_SETTLE_SECONDS, message='the parked write never drained',
             )
             assert (await svc.get_status())['plan_route']['state'] == 'ok'
             assert [r['status'] for r in _capped_records(root)] == ['pending']
