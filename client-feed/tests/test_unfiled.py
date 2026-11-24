@@ -4,18 +4,9 @@ from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _defects import reported, ruled
 
-from client_feed.contract import (
-    DefectReported,
-    DefectRuled,
-    Degradation,
-    InboxLine,
-    Restated,
-    Restater,
-    RevealRequested,
-    RulingKind,
-    Source,
-)
+from client_feed.contract import Degradation, InboxLine, RevealRequested, Source
 from client_feed.defect_ref import portal_ref
 from client_feed.unfiled import still_unfiled, unfiled_degradation
 
@@ -26,24 +17,6 @@ GRACE = 600
 
 def at(seconds: float) -> datetime:
     return EPOCH + timedelta(seconds=seconds)
-
-
-def reported(block: int, report: int, *, seconds: float = 0, seq: int = 1) -> DefectReported:
-    return DefectReported(
-        seq=seq,
-        at=at(seconds),
-        block=block,
-        report=report,
-        criterion_id='C-1',
-        restater=Restater(prompt_version='restate-v1'),
-        outcome=Restated(observed='o', expected='e', steps=('s',)),
-    )
-
-
-def ruled(block: int, report: int, *, seconds: float = 0, seq: int = 2) -> DefectRuled:
-    return DefectRuled(
-        seq=seq, at=at(seconds), block=block, report=report, kind=RulingKind.NOT_A_DEFECT
-    )
 
 
 def requested(path: str = 'src/a.py', *, seq: int = 3) -> RevealRequested:
@@ -64,33 +37,33 @@ OTHER_REF = portal_ref(PROJECT, 3, 4)
 
 class TestStillUnfiled:
     def test_a_report_with_no_carrier_waits_from_when_it_was_reported(self) -> None:
-        line = reported(2, 1, seconds=30)
+        line = reported(2, 1, at=at(30))
 
         assert unfiled({}, line) == {REF: line.at}
 
     def test_a_held_report_keeps_its_first_time_when_it_is_read_again(self) -> None:
-        assert unfiled({REF: at(0)}, reported(2, 1, seconds=90)) == {REF: at(0)}
+        assert unfiled({REF: at(0)}, reported(2, 1, at=at(90))) == {REF: at(0)}
 
     def test_a_filed_ref_is_dropped_whether_held_or_newly_read(self) -> None:
         held = {REF: at(0)}
 
-        assert unfiled(held, reported(3, 4, seconds=5), filed={REF, OTHER_REF}) == {}
+        assert unfiled(held, reported(3, 4, at=at(5)), filed={REF, OTHER_REF}) == {}
 
     def test_unreadable_carriers_drop_nothing(self) -> None:
         held = {REF: at(0)}
 
-        assert unfiled(held, reported(3, 4, seconds=5), filed=None) == {
+        assert unfiled(held, reported(3, 4, at=at(5)), filed=None) == {
             REF: at(0),
             OTHER_REF: at(5),
         }
 
     def test_a_ruling_drops_a_held_report(self) -> None:
-        assert unfiled({REF: at(0), OTHER_REF: at(1)}, ruled(2, 1, seconds=9)) == {
+        assert unfiled({REF: at(0), OTHER_REF: at(1)}, ruled(2, 1, at=at(9))) == {
             OTHER_REF: at(1)
         }
 
     def test_a_ruling_drops_a_report_read_earlier_in_the_same_lines(self) -> None:
-        lines = (reported(2, 1, seconds=3, seq=1), ruled(2, 1, seconds=4, seq=2))
+        lines = (reported(2, 1, at=at(3), seq=1), ruled(2, 1, at=at(4), seq=2))
 
         assert unfiled({}, *lines, filed=None) == {}
 
@@ -107,7 +80,7 @@ class TestStillUnfiled:
     def test_the_held_map_is_never_mutated(self) -> None:
         held = {REF: at(0)}
 
-        unfiled(held, reported(3, 4), ruled(2, 1))
+        unfiled(held, reported(3, 4, at=at(0)), ruled(2, 1, at=at(0)))
 
         assert held == {REF: at(0)}
 

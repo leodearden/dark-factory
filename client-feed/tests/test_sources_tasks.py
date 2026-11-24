@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _defects import carrier_for, carrying, declared, gate_for
 from _stores import EscalationQueueDir, RunsDb, TasksDb
 from shared.project_layout import tasks_db
 
@@ -343,40 +344,17 @@ class TestStore:
         assert tasks.path.read_bytes() == before
 
 
+PROJECT = 'acme'
 FIX = 'portal:acme:2:1'
 FOREIGN_REFS = ('review:7:0123456789ab', 'followup:7:abc123', 'portal:other-client:2:1')
 
 
-def declared(ref: object, *, origin: str = 'client') -> dict[str, object]:
-    """One metadata.defects entry as declare_defect writes it."""
-    return {
-        'ref': ref,
-        'origin': origin,
-        'summary': 'SECRET-SUMMARY',
-        'declared_at': '2026-11-01T00:00:00+00:00',
-        'declared_by': 'client-defect-filer',
-        'status': 'open',
-        'sightings': 1,
-    }
-
-
-def carrying(*refs: str) -> dict[str, object]:
-    return {'defects': [declared(ref) for ref in refs]}
-
-
-def gate_for(ref: str) -> dict[str, object]:
-    return {'source': 'client-defect-filer', 'x_client_defect_gate_for': ref}
-
-
 def carriers_of(root: Path) -> tuple[DefectCarrier, ...]:
-    return read_defect_carriers(root, project_id='acme')
+    return read_defect_carriers(root, project_id=PROJECT)
 
 
 def carrier(task_id: int, *, ref: str = FIX, gated: bool = False) -> DefectCarrier:
-    _, _, block, report = ref.split(':')
-    return DefectCarrier(
-        ref=ref, block=int(block), report=int(report), task_id=task_id, gated=gated
-    )
+    return carrier_for(ref, project_id=PROJECT, task_id=task_id, gated=gated)
 
 
 class TestDefectCarriers:

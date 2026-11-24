@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _defects import carrier_for
 
 from client_feed.contract import (
     FEED_VERSION,
@@ -466,8 +467,7 @@ def test_an_unchanged_budget_or_a_state_without_a_tree_emits_nothing() -> None:
 
 
 def defect_carrier(ref: str = 'portal:acme:2:1', *, task_id: int = 6, gated: bool = False) -> DefectCarrier:
-    _, _, block, report = ref.split(':')
-    return DefectCarrier(ref=ref, block=int(block), report=int(report), task_id=task_id, gated=gated)
+    return carrier_for(ref, project_id=PROJECT, task_id=task_id, gated=gated)
 
 
 def filed(carrier: DefectCarrier, seq: int, *, when: datetime = NOW) -> DefectFiled:

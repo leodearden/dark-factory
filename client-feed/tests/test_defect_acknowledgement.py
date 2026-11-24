@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import Final
 
 import pytest
 import yaml
+from _defects import add_dependency, carrying, declared, gate_for, reported, ruled
 from _in_dir import append_inbox, write_engagement
 from _publisher_pass import REVEALABLE_PATH, inbox_offset, reveal_answers, reveal_policy
 from _stores import TasksDb
@@ -22,15 +22,10 @@ from client_feed.contract import (
     INBOX_FILENAME,
     STATE_FILENAME,
     DefectFiled,
-    DefectReported,
-    DefectRuled,
     Degradation,
     FiledDefect,
     Heartbeat,
-    Restated,
-    Restater,
     RevealRequested,
-    RulingKind,
     Source,
     parse_state,
 )
@@ -98,56 +93,6 @@ def root(tmp_path: Path) -> Root:
     return make_root(tmp_path)
 
 
-def reported(block: int, report: int, *, at: datetime, seq: int = 1) -> DefectReported:
-    return DefectReported(
-        seq=seq,
-        at=at,
-        block=block,
-        report=report,
-        criterion_id='C-1',
-        restater=Restater(prompt_version='restate-v1'),
-        outcome=Restated(observed='o', expected='e', steps=('s',)),
-    )
-
-
-def ruled(block: int, report: int, *, at: datetime, seq: int) -> DefectRuled:
-    return DefectRuled(seq=seq, at=at, block=block, report=report, kind=RulingKind.NOT_COVERED)
-
-
-def declared(ref: str, *, origin: str = 'client') -> dict[str, object]:
-    """One metadata.defects entry as declare_defect writes it."""
-    return {
-        'ref': ref,
-        'origin': origin,
-        'summary': 'SECRET-SUMMARY',
-        'declared_at': '2026-10-21T11:00:00+00:00',
-        'declared_by': 'client-defect-filer',
-        'status': 'open',
-        'sightings': 1,
-    }
-
-
-def carrying(ref: str) -> dict[str, object]:
-    return {'defects': [declared(ref)]}
-
-
-def gate_for(ref: str) -> dict[str, object]:
-    return {'source': 'client-defect-filer', 'x_client_defect_gate_for': ref}
-
-
-def add_edge(tasks: TasksDb, task_id: int, depends_on: int) -> None:
-    """An edge inserted as fused-memory's same-project add_dependency inserts it: the task's updated_at untouched."""
-    conn = sqlite3.connect(tasks.path)
-    try:
-        conn.execute(
-            'INSERT INTO dependencies (tag, task_id, depends_on) VALUES (?, ?, ?)',
-            ('master', task_id, depends_on),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def sources(report: PassReport) -> list[Source]:
     return [degradation.source for degradation in report.degraded]
 
@@ -170,7 +115,7 @@ class TestACarrierIsFiled:
         root.tasks.add(6, updated_at=UPDATED, metadata=carrying(FIX))
         root.run(T)
         root.tasks.add(5, updated_at=LATER, metadata=gate_for(FIX))
-        add_edge(root.tasks, 6, 5)
+        add_dependency(root.tasks, 6, 5)
 
         root.run(seconds(60), rescan_tasks=False)
 
