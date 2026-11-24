@@ -36,10 +36,12 @@ from _boundary_payloads import (
     prd_lanes_family,
     prd_tree,
     prd_view_family,
+    render_prds_settled,
 )
 from _canned_mcp import CannedMCP, is_metadata_projection
 from _prd_lanes_tree import prd_key
 from _prd_tree import PRD_A
+from _served_reads import forget_escalation_corpus
 from fastapi.testclient import TestClient
 from shared.task_statuses import TaskStatus
 
@@ -249,7 +251,9 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
 # --- the request-wide reads are bounded and guarded -------------------------
 
 _REQUEST_READS_WAIT = 0.5
-"""Short, yet long enough for the run-ledger walk the same wait bounds."""
+"""Short, so a held corpus walk's wait ends quickly. It bounds the run-ledger walk too, which a
+cold open can outlast, so a test that needs that walk answered settles its reads first
+(:func:`render_prds_settled`)."""
 _COLD_POOL_WARM_UP = 2.0
 """Past twice :data:`_REQUEST_READS_WAIT`, so a render issued as soon as the first one's wait expired
 still waits out its own before the pool is warm."""
@@ -275,7 +279,13 @@ def _serve_a_held_corpus_walk(
     render: Callable[[datetime], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The /prds body served while the corpus walk is held, and the view once it has landed."""
+    """The /prds body served while the corpus walk is held, and the view once it has landed.
+
+    Every other input lands first, so the corpus walk is the only read the held render can miss.
+    """
+    landed = render_prds_settled(client, T0)['PRD_CONTENTION'][ROOT]
+    assert landed['state'] == 'fresh', landed['reason']
+    forget_escalation_corpus()
     walk = escalation_corpus.walk_corpus
     answered = threading.Event()
 
