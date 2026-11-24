@@ -191,6 +191,8 @@ class TestWriteMergeHeartbeatFailOpen:
             await harness._write_merge_heartbeat()  # must not raise
 
         assert 'merge heartbeat write failed' in caplog.text
+        assert "ORCH_UNIT was ''" in caplog.text
+        assert 'orchestrator-dark-factory.service' in caplog.text
         assert not fleet_dir.exists(), (
             f'{fleet_dir} exists, so the refusal ran AFTER filesystem work had '
             'already begun. write_heartbeat must reject a blank unit name before '

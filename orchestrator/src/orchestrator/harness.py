@@ -13053,8 +13053,8 @@ class Harness:
         Fail-open: any exception (state read or disk write) is swallowed and
         logged.
         """
+        unit = os.environ.get('ORCH_UNIT', '')
         try:
-            unit = os.environ.get('ORCH_UNIT', '')
             reading = await self._drain_participant.on_heartbeat_pass()
             queue_empty = self._merge_queue.empty()
             if reading.depth is None:
@@ -13076,7 +13076,11 @@ class Harness:
             await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
         except Exception:
             logger.warning(
-                'merge heartbeat write failed; continuing (fail-open)',
+                'merge heartbeat write failed; continuing (fail-open). If the error '
+                'names a blank or malformed unit name: ORCH_UNIT was %r, but it must '
+                "be this orchestrator's systemd unit, e.g. "
+                'orchestrator-dark-factory.service; set it on that unit.',
+                unit,
                 exc_info=True,
             )
 
