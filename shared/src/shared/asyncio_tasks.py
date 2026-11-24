@@ -115,15 +115,15 @@ async def cancel_bounded(
 ) -> bool:
     """Cancel *task* and wait a bounded time for it to end; True iff it ended.
 
-    The cancel policy is :func:`_cancel_twice`'s, with a window of
-    *grace_secs*. A task that outlives both windows is handed to
+    The cancel policy is :func:`_cancel_twice`'s, with both windows
+    *grace_secs* long. A task that outlives both windows is handed to
     :func:`track_task` with *registries*, so it stays referenced until it ends,
     and False is returned.
 
     Never raises the task's own exception; it is consumed, as
     :func:`track_task` consumes it.
     """
-    if not await _cancel_twice({task}, window_secs=grace_secs):
+    if not await _cancel_twice({task}, first_window_secs=grace_secs, second_window_secs=grace_secs):
         return True
     track_task(task, *registries)
     return False
@@ -136,18 +136,26 @@ async def cancel_all_within(
 ) -> set[asyncio.Task]:
     """Cancel every task and wait at most *timeout_secs* in all; return those still running.
 
-    The cancel policy is :func:`_cancel_twice`'s, each window half of
-    *timeout_secs*. Unlike ``wait_for(gather(...))``, a task that survives
-    both cancels cannot extend the wait. The returned tasks are neither
-    cancelled again nor awaited: the caller decides what becomes of them, for
-    example :func:`track_task`. The exceptions of the tasks that ended are
-    consumed.
+    The cancel policy is :func:`_cancel_twice`'s. The first window is two
+    thirds of *timeout_secs* and the second the remaining third: the second
+    cancel is the fallback for a task that absorbed the first, so it should not
+    cut short a task still honestly unwinding from the first, for instance
+    still killing its subprocess. Unlike ``wait_for(gather(...))``, a task that
+    survives both cancels cannot extend the wait. The returned tasks are
+    neither cancelled again nor awaited: the caller decides what becomes of
+    them, for example :func:`track_task`. The exceptions of the tasks that
+    ended are consumed.
     """
-    return await _cancel_twice(tasks, window_secs=timeout_secs / 2)
+    first_window_secs = timeout_secs * 2 / 3
+    return await _cancel_twice(
+        tasks, first_window_secs=first_window_secs, second_window_secs=timeout_secs - first_window_secs,
+    )
 
 
-async def _cancel_twice(tasks: Collection[asyncio.Task], *, window_secs: float) -> set[asyncio.Task]:
-    """Cancel *tasks*, wait *window_secs*, then do the same once more for those still running.
+async def _cancel_twice(
+    tasks: Collection[asyncio.Task], *, first_window_secs: float, second_window_secs: float,
+) -> set[asyncio.Task]:
+    """Cancel *tasks* and wait *first_window_secs*; cancel those still running and wait *second_window_secs*.
 
     A task can survive one ``cancel()``: an inner ``except CancelledError``
     that awaits again, or asyncio's subprocess transport cancelled between
@@ -156,7 +164,7 @@ async def _cancel_twice(tasks: Collection[asyncio.Task], *, window_secs: float) 
     ended are consumed.
     """
     pending = set(tasks)
-    for _attempt in range(2):
+    for window_secs in (first_window_secs, second_window_secs):
         if not pending:
             break
         for task in pending:
