@@ -2148,10 +2148,6 @@ async def write_suppression_record(
             project_id=project_id,
             causation_id=causation_id,
             _source=STAGE1_FLAG_SUPPRESSION_KIND,
-            declared_referents=[
-                {'kind': 'task', 'id': component}
-                for component in _decompose_suppression_task_id(tid)
-            ],
         )
     except Exception:
         logger.debug(
