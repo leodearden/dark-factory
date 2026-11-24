@@ -42,6 +42,7 @@ from orchestrator import (
     session_reaper,
     session_records,
     session_registry,
+    spawn_effort,
     spawn_t3_provider,
     t3_mcp_client,
 )
@@ -435,12 +436,14 @@ def _launch_arguments(
     message: str,
     model: str | None,
     instance_id: str,
+    effort: spawn_effort.EffortLevel | None,
     *,
     skip_permissions: bool,
     strategy: WorkspaceStrategy,
     request_id: str,
 ) -> dict[str, Any]:
-    model_selection = {'modelSelection': {'instanceId': instance_id, 'model': model}} if model else {}
+    options = {'options': [spawn_effort.effort_option(effort)]} if effort else {}
+    model_selection = {'modelSelection': {'instanceId': instance_id, 'model': model, **options}} if model else {}
     return {
         'projectId': project.project_id,
         'title': title,
@@ -457,6 +460,8 @@ class LaunchedThread:
     thread_id: str
     project_id: str | None
     run_id: str | None
+    held_effort: str | None
+    """The effort of the selection T3 answered it stored for the thread; None when it names none."""
 
 
 _LOST_REPLY = frozenset({t3_mcp_client.TransportFault.UNREACHABLE, t3_mcp_client.TransportFault.PROTOCOL})
@@ -483,7 +488,12 @@ def _launch_outcome(reply: t3_mcp_client.CallResult, strategy: WorkspaceStrategy
     thread_id = reply.value.get('threadId')
     if not isinstance(thread_id, str) or not thread_id:
         return LaunchFailed('t3_thread_launch answered no threadId')
-    return LaunchedThread(thread_id, reply.value.get('projectId'), reply.value.get('runId'))
+    return LaunchedThread(
+        thread_id,
+        reply.value.get('projectId'),
+        reply.value.get('runId'),
+        spawn_effort.selection_effort(reply.value.get('modelSelection')),
+    )
 
 
 def _stamp_launched_record(
@@ -547,6 +557,30 @@ def _provider_verdict(choice: spawn_t3_provider.ProviderChoice) -> str:
     return _verdict('instance', **named)
 
 
+def _unoffered_effort(
+    client: t3_mcp_client.T3McpClient, instance_id: str, model: str, effort: spawn_effort.EffortLevel
+) -> LaunchFailed | None:
+    """Why T3's catalogue rules *effort* out for *model*; None when it is offered, or T3 lists no answer.
+
+    ``t3_thread_launch`` validates no option, and at run time T3 swaps a
+    level the model does not offer for the model's default.
+    """
+    reply = client.call('orchestrator_capabilities', {'search': model}, read_timeout=CALL_TIMEOUT_SECS)
+    if not isinstance(reply, t3_mcp_client.ToolOk):
+        logger.warning(f'effort {effort} is unverified before launch: {_incomplete("orchestrator_capabilities", reply).detail}')
+        return None
+    offered = spawn_effort.offered_levels(reply.value, instance_id, model)
+    if offered is None:
+        logger.warning(f'effort {effort} is unverified before launch: T3 lists no effort for {model} on {instance_id}')
+        return None
+    if effort.value in offered:
+        return None
+    levels = ', '.join(spawn_effort.in_level_order(offered))
+    return LaunchFailed(
+        f'T3 offers effort {levels} for model {model} on instance {instance_id}, not {effort} (orchestrator_capabilities)'
+    )
+
+
 def launch(
     cwd: str,
     title: str,
@@ -557,8 +591,11 @@ def launch(
     *,
     provider: str | None = None,
     parent: str | None = None,
+    effort: spawn_effort.EffortLevel | None = None,
     skip_permissions: bool,
 ) -> str:
+    if effort and not model:
+        return _verdict('refused', reason='effort-needs-model', detail='T3 takes options only inside modelSelection')
     client = _connect(env, t3_mcp_client.CliCodeSource())
     if isinstance(client, NoLauncher):
         return client.verdict()
@@ -568,6 +605,9 @@ def launch(
     choice = _provider_for(project, provider, env)
     if model and choice.enabled is False:
         return _provider_verdict(choice)
+    unoffered = _unoffered_effort(client, choice.instance_id, model, effort) if model and effort else None
+    if unoffered is not None:
+        return unoffered.verdict()
 
     _sweep_listed_threads(client, routine=False)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
@@ -578,6 +618,7 @@ def launch(
         message,
         model,
         choice.instance_id,
+        effort,
         skip_permissions=skip_permissions,
         strategy=strategy,
         request_id=str(uuid.uuid4()),
@@ -587,6 +628,8 @@ def launch(
         return launched.verdict()
     if record_dir:
         _stamp_launched_record(record_dir, title, launched, client.environment_id, _usable_parent(parent))
+    if effort and launched.held_effort != effort.value:
+        return _verdict('effort-unconfirmed', thread_id=launched.thread_id, asked=effort.value, got=launched.held_effort)
     return _verdict(
         'started',
         thread_id=launched.thread_id,
@@ -1201,6 +1244,9 @@ def _build_parser() -> argparse.ArgumentParser:
     launch_p.add_argument('--record', required=True, help="record dir, '' when none")
     launch_p.add_argument('--model', default=None)
     launch_p.add_argument('--provider', default=None, help='explicit provider instance id')
+    launch_p.add_argument(
+        '--effort', default=None, type=spawn_effort.EffortLevel, choices=list(spawn_effort.EffortLevel)
+    )
     launch_p.add_argument('--parent', default=None, help="the spawner's record slug")
     launch_p.add_argument('--skip-permissions', action='store_true', help='full-access; approval-required without it')
 
@@ -1244,6 +1290,7 @@ def _dispatch(args: argparse.Namespace) -> str:
             os.environ,
             provider=args.provider,
             parent=args.parent,
+            effort=args.effort,
             skip_permissions=args.skip_permissions,
         )
     if args.verb == 'provider':

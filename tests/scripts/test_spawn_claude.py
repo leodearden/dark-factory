@@ -59,6 +59,7 @@ from orchestrator import (
     session_reaper,
     session_records,
     session_registry,  # pyright: ignore[reportAttributeAccessIssue]
+    spawn_effort,
 )
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -2949,6 +2950,147 @@ def test_spawn_model_env_precedes_raw_claude_args(tmp_path: pathlib.Path) -> Non
     assert argv[model_idxs[0] + 1] == "haiku", f"got: {argv!r}"
     assert argv[model_idxs[1] + 1] == "opus", f"got: {argv!r}"
     assert model_idxs[0] < model_idxs[1], f"got: {argv!r}"
+
+
+# ===========================================================================
+# CLAUDE_SPAWN_EFFORT: the reasoning effort, `claude --effort <level>`
+# ===========================================================================
+# The script keeps its own copy of the closed level set so the wm lane can
+# reject a bad value without python3; parametrizing over
+# spawn_effort.EffortLevel holds the two copies in lockstep.
+
+
+def _spawn_capturing_argv(tmp_path: pathlib.Path, **inputs: str) -> list[str]:
+    """claude's argv for a wm-lane spawn with *inputs* set."""
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_argv.txt"
+    _write_fake_claude_capturing_argv(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env.update(inputs)
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    return _read_argv(capture_file)
+
+
+@pytest.mark.parametrize("level", list(spawn_effort.EffortLevel))
+def test_spawn_effort_env_adds_effort_flag(tmp_path: pathlib.Path, level: spawn_effort.EffortLevel) -> None:
+    argv = _spawn_capturing_argv(tmp_path, CLAUDE_SPAWN_EFFORT=level.value)
+
+    assert argv[:-1] == ["--effort", level.value], f"got: {argv!r}"
+    assert argv[-1].startswith("test prompt"), f"got: {argv!r}"
+
+
+def test_spawn_effort_flag_sits_between_the_model_and_raw_claude_args(tmp_path: pathlib.Path) -> None:
+    argv = _spawn_capturing_argv(
+        tmp_path, CLAUDE_SPAWN_MODEL="haiku", CLAUDE_SPAWN_EFFORT="xhigh", CLAUDE_SPAWN_CLAUDE_ARGS="--verbose"
+    )
+
+    assert argv[:-1] == ["--model", "haiku", "--effort", "xhigh", "--verbose"], f"got: {argv!r}"
+
+
+@pytest.mark.parametrize("inputs", [{}, {"CLAUDE_SPAWN_EFFORT": ""}], ids=["unset", "empty"])
+def test_spawn_unset_or_empty_effort_adds_no_effort_flag(tmp_path: pathlib.Path, inputs: dict[str, str]) -> None:
+    argv = _spawn_capturing_argv(tmp_path, **inputs)
+
+    assert "--effort" not in argv, f"got: {argv!r}"
+
+
+@pytest.mark.parametrize("backend", ["wm", "tmux"])
+def test_spawn_effort_reaches_claude_but_not_the_childs_environment(tmp_path: pathlib.Path, backend: str) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    env_file = tmp_path / "captured_env.bin"
+    argv_file = tmp_path / "captured_argv.bin"
+    tmux_used = tmp_path / "tmux_used"
+    _write_fake_claude_dumping_full_env(bin_dir, env_file, argv_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    _write_fake_tmux(bin_dir, tmux_used)
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = backend
+    if backend == "tmux":
+        env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    env["CLAUDE_SPAWN_EFFORT"] = "xhigh"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert tmux_used.exists() is (backend == "tmux")
+    argv = _read_argv(argv_file)
+    assert argv[:-1] == ["--effort", "xhigh"], f"got: {argv!r}"
+    assert "CLAUDE_SPAWN_EFFORT" not in _read_spawn_namespace(env_file)
+
+
+@pytest.mark.parametrize("value", ["turbo", "XHIGH", "x-high"])
+@pytest.mark.parametrize("backend", ["wm", "tmux", "t3"])
+def test_unknown_effort_is_bad_usage_on_every_lane(t3_lane: _T3Lane, backend: str, value: str) -> None:
+    tmux_used = t3_lane.tmp_path / "tmux_used"
+    _write_fake_tmux(t3_lane.bin_dir, tmux_used)
+    t3_lane.env["CLAUDE_SPAWN_BACKEND"] = backend
+    t3_lane.env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    t3_lane.env["CLAUDE_SPAWN_EFFORT"] = value
+
+    result = t3_lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 2, f"stderr: {stderr}"
+    assert f"CLAUDE_SPAWN_EFFORT='{value}'" in stderr
+    assert not t3_lane.records(), "bad usage must write no session record"
+    assert not t3_lane.calls(), "bad usage must precede every T3 call"
+    assert not t3_lane.emulator_marker.exists() and not tmux_used.exists()
+
+
+def _t3_sibling_with_effort(lane: _T3Lane, effort: str, model: str | None = "fable") -> _T3Lane:
+    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    lane.env["CLAUDE_SPAWN_EFFORT"] = effort
+    lane.env.pop("CLAUDE_SPAWN_MODEL", None)
+    if model is not None:
+        lane.env["CLAUDE_SPAWN_MODEL"] = model
+    return lane
+
+
+def test_t3_lane_sends_the_effort_inside_the_model_selection(t3_lane: _T3Lane) -> None:
+    lane = _t3_sibling_with_effort(t3_lane, "xhigh")
+
+    result = lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    (launch,) = lane.started_threads()
+    assert launch["modelSelection"] == {
+        "instanceId": "claudeAgent", "model": "fable", "options": [{"id": "effort", "value": "xhigh"}],
+    }
+
+
+def test_t3_lane_refuses_an_effort_without_a_model_and_writes_no_record(t3_lane: _T3Lane) -> None:
+    lane = _t3_sibling_with_effort(t3_lane, "xhigh", model=None)
+
+    result = lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 145, f"stderr: {stderr}"
+    assert "CLAUDE_SPAWN_EFFORT" in stderr and "CLAUDE_SPAWN_MODEL" in stderr
+    assert not lane.records(), "a refused effort must precede the launching record"
+    assert not lane.started_threads()
+
+
+def test_t3_lane_fails_loudly_naming_a_running_thread_that_lacks_the_effort(t3_lane: _T3Lane) -> None:
+    lane = _t3_sibling_with_effort(t3_lane, "xhigh")
+
+    def launch_dropping_the_options(arguments: Mapping[str, Any]) -> ToolSuccess:
+        reply = lane.answer_launch(arguments)
+        selection = {key: value for key, value in reply.value["modelSelection"].items() if key != "options"}
+        return ToolSuccess({**reply.value, "modelSelection": selection})
+
+    lane.server.tool_replies["t3_thread_launch"] = launch_dropping_the_options
+
+    result = lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 127, f"stderr: {stderr}"
+    assert _T3_THREAD_ID in stderr and "'xhigh'" in stderr and "'none'" in stderr, stderr
+    assert lane.record_dir() in stderr
+    assert lane.record().status == session_records.Status.RUNNING
 
 
 # ===========================================================================
