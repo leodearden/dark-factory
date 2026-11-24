@@ -24,9 +24,9 @@ from shared.cli_invoke import (
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation import (
-    _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
+    RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
 )
 
 logger = logging.getLogger(__name__)
@@ -365,7 +365,7 @@ class AgentLoop:
             max_turns=_AGENT_CLI_MAX_TURNS,
             timeout_seconds=float(self.config.agent_cli_timeout_seconds),
             cwd=self.cwd,
-            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
         # Counted before the failure guard: a failed or refused result still
         # reached the model and was billed.
