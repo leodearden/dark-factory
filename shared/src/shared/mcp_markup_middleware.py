@@ -1261,9 +1261,9 @@ class MarkupGuardMiddleware(Middleware):
         """
         param, value, properties, fix = live.param, live.value, live.properties, live.fix
         pattern = detect_for(value, param, tuple(properties)) or live.pattern
-        # Computed ONCE and threaded to every publication, like the quoting
-        # census below: the refusal, the bounce and the residue record must
-        # agree about whether the leak swallowed the caller's override.
+        # Computed once per path, before any publication, so the refusal, the
+        # bounce and the residue record agree: the scan is the only source when
+        # nothing validated, and the validated recovery joins it once repaired.
         override_swallowed = swallowed_markup_override(value)
 
         # All three emissions sit SIDE BY SIDE, and every one of them runs
@@ -1291,6 +1291,9 @@ class MarkupGuardMiddleware(Middleware):
                 name, identity, subject,
                 param, value, pattern, storm, override_swallowed,
             )
+        override_swallowed = override_swallowed or markup_override_requested(
+            fix.recovered.get('metadata'),
+        )
 
         # THE CENSUS IS TAKEN HERE, ABOVE THE COERCION, AND THAT ORDER IS THE
         # WHOLE POINT (task 4502). ``fix.recovered`` is the VERBATIM map: every
@@ -1374,12 +1377,10 @@ class MarkupGuardMiddleware(Middleware):
                 name: value for name, value in coerced.items()
                 if name not in unrecovered
             }
-        # A swallowed override is reported, never honoured (PRD D13), so the
-        # metadata it rode in on is restored WITHOUT it — on both tiers, here
-        # at the one point that shapes what either tier hands on. Otherwise
-        # the verbatim resubmission ``_REJECT_HINT`` prescribes would carry the
-        # flag past this guard for every value in it.
-        if override_swallowed and 'metadata' in coerced:
+        # A swallowed override is never honoured (PRD D13). Recovered metadata
+        # was swallowed by definition, since repair() recovers only names the
+        # caller did not supply (B9), so the strip never consults the scan.
+        if 'metadata' in coerced:
             coerced['metadata'] = strip_markup_override(coerced['metadata'])
         fix = fix._replace(recovered=coerced)
 
