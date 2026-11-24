@@ -1758,17 +1758,23 @@ The reason's last sentence comes from a holder check on the lock
 (`orchestrator/src/orchestrator/index_lock_liveness.py::diagnose_index_lock`),
 which has three outcomes:
 
-- **A live git process holds it.** The merge worker looks for processes
-  named `git` whose cwd is in `project_root`'s own work tree (nested
-  worktrees excluded), and the reason names each one by pid and command:
+- **A live git process may hold it.** The merge worker looks for
+  processes named `git` whose cwd is in `project_root`'s own work tree
+  (nested worktrees excluded) **and** which started before the lock was
+  last written, and the reason names each one by pid and command:
 
-  > … It is held by a LIVE git process in project_root's work tree:
-  > pid 728900 (`git commit --only plans/x.md -m …`). A long pre-commit
-  > hook is normal, so this is NOT a crashed leftover and the lock must
-  > NOT be removed: wait for that process to exit, then re-submit the
-  > merge.
+  > … A live git process that started before the lock was written is
+  > running in project_root's work tree and may hold it: pid 728900
+  > (`git commit --only plans/x.md -m …`). A long pre-commit hook is
+  > normal, so do NOT remove the lock: wait for that process to exit,
+  > then re-submit the merge.
 
-  That holds **whatever the lock's age**. A reify pre-commit runs
+  A `git` that started *after* the lock was written cannot have created
+  it and is ignored. The common case is the merge worker's own read-only
+  `git cherry` / `git log` children, which sit in `project_root` much of
+  the time; they never mask a crashed leftover.
+
+  A listed process holds the lock **whatever the lock's age**. A reify pre-commit runs
   `verify.sh` for 10-60+ minutes, so a lock an hour old with a live
   holder is a healthy commit, not a crash (task 5229). Wait and
   re-submit; never `rm -f` it.
@@ -1802,13 +1808,17 @@ the lockfile's descriptor before it runs hooks, so for the whole of a
 pre-commit hook **no process has `index.lock` open**, and those tools
 report nobody for a perfectly live commit. Look for the `git` process
 itself: the pid the reason names, or any `git` whose cwd is
-`project_root`. Removing a live commit's index lock corrupts that
+`project_root`. A candidate must also have started before the lock's
+mtime: compare `ps -o lstart= -p <pid>` with `stat -c %y <lock>`. Removing a live commit's index lock corrupts that
 in-flight commit, which is also why `advance_main` never removes the lock
 itself.
 
 A proven crashed leftover **skips the wait entirely**: it is reported
 immediately, with the same `rm -f` sentence, and its reason reads
-`waited 0s`, which is correct, not a mis-report. Waiting cannot clear a
+`waited 0s`, which is correct, not a mis-report. That reason is rendered
+from the same scan that skipped the wait, so a `git` that appears a moment
+later cannot turn it into "wait for that process". After a full wait, the
+reason instead names whoever held the lock at the deadline. Waiting cannot clear a
 lock nobody holds, and the merge worker is serialized, so burning the
 full grace on every queued task until you clear the file would just be a
 slow-motion version of the stall this whole mechanism removes. A lock
