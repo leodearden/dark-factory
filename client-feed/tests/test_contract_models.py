@@ -432,12 +432,36 @@ def test_criteria_declared_accepts_an_empty_declaration() -> None:
         {'id': ''},
         {'statement': ''},
         {'capability': ''},
+        {'id': 'C:12'},
+        {'id': 'a b'},
+        {'id': '-a'},
+        {'id': 'x' * 65},
     ],
-    ids=['unknown-kind', 'escaping-prd', 'absolute-prd', 'empty-id', 'empty-statement', 'empty-capability'],
+    ids=[
+        'unknown-kind',
+        'escaping-prd',
+        'absolute-prd',
+        'empty-id',
+        'empty-statement',
+        'empty-capability',
+        'colon-id',
+        'spaced-id',
+        'leading-dash-id',
+        'overlong-id',
+    ],
 )
 def test_a_criterion_refuses_a_bad_field(override: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         contract.Criterion.model_validate({**PAYLOADS['criteria_declared']['criteria'][0], **override})
+
+
+@pytest.mark.parametrize('criterion_id', ['C-12', 'a', '0', 'A.b_c-1', 'x' * 64])
+def test_a_criterion_id_is_a_criterion_id(criterion_id: str) -> None:
+    assert TypeAdapter(contract.CriterionId).validate_python(criterion_id) == criterion_id
+    criterion = contract.Criterion.model_validate(
+        {**PAYLOADS['criteria_declared']['criteria'][0], 'id': criterion_id}
+    )
+    assert criterion.id == criterion_id
 
 
 TOKEN_TYPES = ['CriterionId', 'Token']
