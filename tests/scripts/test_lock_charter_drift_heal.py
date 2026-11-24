@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import copy
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -46,7 +46,7 @@ def _hermetic_env(monkeypatch):
 class FakeTaskStore:
     """The four fused-memory tools the router may call, over one in-memory task table."""
 
-    def __init__(self, tasks: list[Mapping[str, Any]] = ()) -> None:
+    def __init__(self, tasks: Sequence[Mapping[str, Any]] = ()) -> None:
         self.tasks: dict[str, dict[str, Any]] = {str(t['id']): copy.deepcopy(dict(t)) for t in tasks}
         self.held: set[str] = set()
         self.fail_submit = False
@@ -100,7 +100,7 @@ class FakeTaskStore:
 class FakeEscalationServer:
     """``get_pending_escalations`` and ``escalate_info`` over one in-memory queue."""
 
-    def __init__(self, pending_slots: list[str] = ()) -> None:
+    def __init__(self, pending_slots: Sequence[str] = ()) -> None:
         self.pending = [{'id': f'esc-{n}', 'task_id': slot} for n, slot in enumerate(pending_slots)]
         self.calls: list[tuple[str, dict[str, Any]]] = []
 

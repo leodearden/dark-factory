@@ -35,25 +35,24 @@ script — the two vectors are identical, and ``classify hooks/project-checks``
 returns ACCEPT, not REJECT.  So this change CONVERGED the seam rather than
 opening one; no reify follow-up is owed.
 
-The extension-half Tier-2 drift guard
-(``test_extension_drift_guard_vs_reify_script``) compares
-``sorted(FILE_EXTENSIONS)`` against ``--list-extensions``, i.e. an EXTENSION
-vector only, and is structurally blind to this frozenset.  That gap is closed
-by its extension-less sibling (``test_extensionless_drift_guard_vs_reify_script``),
-which pins this vector against ``--list-extensionless``.
+WHAT IS ACTUALLY ENFORCED, precisely, and where:
 
-WHAT IS ACTUALLY ENFORCED, precisely — the Tier-1 guards compare each Python
-copy against a literal in its OWN test file, so they cannot see the other two
-copies; only the Tier-2 guards reach across a source boundary.  Both vectors
-are therefore pinned against the bash emitters from BOTH sides — α in
-``tests/repo_guards/test_lock_charter_reify_parity.py`` and γ in
-``fused-memory/tests/test_lock_charter_guard.py`` — and α↔γ agreement follows
-transitively (α == bash and γ == bash ⇒ α == γ).  That two-sided arrangement is
-what makes three-way α/γ/bash agreement ENFORCED rather than merely asserted in
-prose; a single-sided Tier-2 would NOT, because an edit changing one Python copy
-together with its own local literal would pass every guard in that package.
-The Tier-2 guards hard-fail (never skip) when the reify script is present but
-its emitter is gone, so the enforcement cannot silently retire itself.
+  * Tier 1, on the gate: each Python copy against a literal in its OWN test
+    file (``shared/tests/test_locking.py`` and
+    ``fused-memory/tests/test_lock_charter_guard.py``).  These cannot see the
+    other copies.
+  * α == γ, on the gate:
+    ``fused-memory/tests/test_lock_charter_guard.py::test_gamma_vectors_match_shared_locking``
+    compares fused-memory's copy with this one directly, so an edit to one
+    Python copy plus its own literal cannot pass alone.  Both copies are
+    committed in this repo, so the verdict depends only on the commit.
+  * α/γ == bash, OFF the gate: ``scripts/check_lock_charter_drift.py``
+    compares both vectors with reify's ``--list-extensions`` and
+    ``--list-extensionless``, and sweeps reify's tracked corpus, nightly via
+    ``lock-charter-drift-check.timer``.  A drift files one heal task
+    (``OPERATIONS.md`` section 9a).  It used to be an in-suite guard, which
+    let a reify-only commit red every dark-factory merge (task 11623).  It has
+    no skip state: a missing reify checkout is reported as loudly as drift.
 """
 
 from __future__ import annotations
@@ -209,9 +208,10 @@ FILE_EXTENSIONS: frozenset[str] = frozenset(
 # CROSS-PROJECT SCOPE — the limitation this enumeration knowingly accepts, and
 # the reason the admission rule above is stricter than it looks.  Members are
 # matched as BARE FINAL SEGMENTS and several are generic: `cargo`, `Dockerfile`,
-# `LICENSE`, `pre-commit`.  The collision guard that bounds this risk
-# (test_no_canonical_name_is_also_a_directory) sweeps only the dark-factory and
-# reify checkouts — but this predicate governs lock charters for EVERY project
+# `LICENSE`, `pre-commit`.  The collision checks that bound this risk
+# (test_no_canonical_name_is_also_a_directory on the gate for dark-factory, and
+# scripts/check_lock_charter_drift.py::check_extensionless nightly for reify)
+# sweep only those two checkouts — but this predicate governs lock charters for EVERY project
 # the orchestrator targets.  In a third project containing `tools/cargo/` or
 # `docker/Dockerfile/` as a real DIRECTORY, that directory now classifies as a
 # FILE: directory_locks stops rejecting it and derive_modules RETAINS it,
@@ -224,9 +224,10 @@ FILE_EXTENSIONS: frozenset[str] = frozenset(
 #
 # Drift guard (this shared copy): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
 # Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
-# Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
-#   sweeps both repos' tracked corpora, so a newly tracked extension-less file
-#   surfaces as a red test rather than as another LockCharterViolation incident.
+# Self-audit: test_every_tracked_extensionless_file_is_allowlisted sweeps this
+#   repo's tracked corpus on the gate, and check_extensionless sweeps reify's
+#   nightly, so a newly tracked extension-less file surfaces as a red test or a
+#   heal task rather than as another LockCharterViolation incident.
 # ---------------------------------------------------------------------------
 
 EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset(
