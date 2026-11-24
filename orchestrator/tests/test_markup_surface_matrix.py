@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import pytest
+from _git_checkouts import main_checkout_with_lane
 from _markup_helpers import closer, param_opener
 from _markup_sink_rig import seed_plan
 from escalation.queue import EscalationQueue
@@ -117,13 +118,18 @@ class Surface(Protocol):
 
 
 class PlanTools:
-    """plan-tools as a ``--caller-role`` launch serves it, filing into a tmp main checkout."""
+    """plan-tools as a ``--caller-role`` launch serves it in a task lane of a real git checkout.
+
+    plan-tools resolves the queue it files into from git, so the lane's main
+    checkout is where its residue lands.
+    """
 
     _DESTINATION = {'add_design_decision': 'design_decisions', 'add_reuse_item': 'reuse'}
 
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.artifacts, self.root = seeded_checkout(tmp_path)
-        monkeypatch.setattr(plan_tools, '_markup_project_root', lambda _worktree: self.root)
+    def __init__(self, tmp_path: Path) -> None:
+        checkout, lane = main_checkout_with_lane(tmp_path)
+        self.artifacts = seeded_plan(lane)
+        self.root = checkout.resolve()
         self.server = plan_tools.server_from_argv([
             '--worktree', str(self.artifacts.worktree),
             '--caller-role', CALLER_ROLE,
@@ -147,8 +153,10 @@ class PlanTools:
 class VerdictTools:
     """verdict-tools serving a reviewer, filing into a tmp main checkout."""
 
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.artifacts, self.root = seeded_checkout(tmp_path)
+    def __init__(self, tmp_path: Path) -> None:
+        self.artifacts = seeded_plan(tmp_path / 'worktree')
+        self.root = tmp_path / 'main'
+        self.root.mkdir()
         self.server = verdict_tools.create_server(
             self.artifacts, REVIEWER_ROLE, resolve_project_root=lambda _worktree: self.root,
         )
@@ -172,7 +180,7 @@ class EscalationServer:
 
     _ADDRESSES_A_RECORD = frozenset({'stamp_triage', 'resolve_issue'})
 
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(self, tmp_path: Path) -> None:
         self.queue = EscalationQueue(tmp_path / 'esc')
         self.server = create_escalation_server(self.queue, startup_sweep=False)
 
@@ -192,16 +200,13 @@ class EscalationServer:
         return [esc.detail for esc in self.queue.get_pending() if esc.category == RESIDUE_CATEGORY]
 
 
-def seeded_checkout(tmp_path: Path) -> tuple[TaskArtifacts, Path]:
-    """A task worktree holding a plan for ``PLAN_TASK_ID``, beside its main checkout."""
-    worktree = tmp_path / 'worktree'
-    root = tmp_path / 'main'
-    worktree.mkdir()
-    root.mkdir()
+def seeded_plan(worktree: Path) -> TaskArtifacts:
+    """*worktree*'s task artifacts, holding a plan for ``PLAN_TASK_ID``."""
+    worktree.mkdir(exist_ok=True)
     artifacts = TaskArtifacts(worktree)
     artifacts.init(PLAN_TASK_ID, 'Test task', 'A test')
     seed_plan(artifacts, PLAN_TASK_ID)
-    return artifacts, root
+    return artifacts
 
 
 ACCEPTANCE = [
@@ -240,9 +245,9 @@ ACCEPTANCE = [
     ('surface', 'tool', 'field', 'sibling', 'sibling_value', 'sent'), ACCEPTANCE,
 )
 async def test_a_repairable_leak_lands_clean(
-    tmp_path, monkeypatch, surface, tool, field, sibling, sibling_value, sent,
+    tmp_path, surface, tool, field, sibling, sibling_value, sent,
 ):
-    stored = await surface(tmp_path, monkeypatch).deliver(
+    stored = await surface(tmp_path).deliver(
         tool, {**sent, field: swallowing(field, sibling, sibling_value)},
     )
 
@@ -282,9 +287,9 @@ async def refused_residue(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('surface', 'tool', 'field', 'sent', 'subject'), ATTRIBUTION)
 async def test_the_residue_names_its_caller(
-    tmp_path, monkeypatch, surface, tool, field, sent, subject,
+    tmp_path, surface, tool, field, sent, subject,
 ):
-    detail = await refused_residue(surface(tmp_path, monkeypatch), tool, field, sent)
+    detail = await refused_residue(surface(tmp_path), tool, field, sent)
 
     caller = {'agent_id': None, 'project': None, 'override_swallowed': False, **subject}
     missing = set(residue_header_lines(caller)) - set(detail.splitlines())
@@ -294,9 +299,9 @@ async def test_the_residue_names_its_caller(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('surface', 'tool', 'field', 'sent', 'subject'), ATTRIBUTION)
 async def test_the_residue_states_what_its_custody_proves(
-    tmp_path, monkeypatch, surface, tool, field, sent, subject,
+    tmp_path, surface, tool, field, sent, subject,
 ):
-    detail = await refused_residue(surface(tmp_path, monkeypatch), tool, field, sent)
+    detail = await refused_residue(surface(tmp_path), tool, field, sent)
 
     assert MARKUP_REFUSAL_CUSTODY_CAVEAT in detail
     assert 'only surviving copy' not in detail
@@ -321,9 +326,9 @@ UNRECOVERED = [
     ('surface', 'tool', 'field', 'sibling', 'sibling_value', 'sent'), UNRECOVERED,
 )
 async def test_a_dropped_value_states_what_its_custody_proves(
-    tmp_path, monkeypatch, surface, tool, field, sibling, sibling_value, sent,
+    tmp_path, surface, tool, field, sibling, sibling_value, sent,
 ):
-    served = surface(tmp_path, monkeypatch)
+    served = surface(tmp_path)
     async with Client(served.server) as client:
         await client.call_tool(tool, {**sent, field: swallowing(field, sibling, sibling_value)})
 

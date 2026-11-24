@@ -247,7 +247,9 @@ class TestResidueHeaderLines:
         assert RESIDUE_CALLER_KEYS == ('subject_task_id', 'subject_agent_role', 'agent_id', 'project')
 
     def test_the_header_is_the_caller_then_the_leak(self):
-        assert RESIDUE_HEADER_KEYS == (*RESIDUE_CALLER_KEYS, 'override_swallowed')
+        assert RESIDUE_HEADER_KEYS == (
+            'subject_task_id', 'subject_agent_role', 'agent_id', 'project', 'override_swallowed',
+        )
 
     def test_one_key_equals_repr_line_per_key_in_order(self):
         record = {
