@@ -32,7 +32,14 @@ from _verify_cache_fixtures import (
     units_by_id,
     use_real_legs,
 )
-from _verify_cache_units import record_entry, unit_key
+from _verify_cache_units import (
+    clean_leg,
+    ran_unit,
+    record_entry,
+    unit_decision,
+    unit_key,
+    verify_result,
+)
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheConfig
 from orchestrator.event_store import EventStore
@@ -46,11 +53,18 @@ from orchestrator.task_verify_spec import (
     task_spec_to_json,
 )
 from orchestrator.verify_cache import keys
-from orchestrator.verify_cache.modes import CacheMode
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole
+from orchestrator.verify_cache.policy import Decision
+from orchestrator.verify_cache.recorder import CacheReport, LegRun, UnbackedReplay, report_of
 from orchestrator.verify_cache.registry import Candidate, Entry, KillSwitch, PolicyState, Registry
-from orchestrator.verify_cache.remote_view import ShippedView, planned_unit_ids, ship_view
-from orchestrator.verify_cache.replay import CacheAccess, ExecutedModule
-from orchestrator.verify_evidence import UnitOutcome
+from orchestrator.verify_cache.remote_view import (
+    RemoteCache,
+    ShippedView,
+    planned_unit_ids,
+    ship_view,
+)
+from orchestrator.verify_cache.replay import CacheAccess, ExecutedModule, ReplayPlan
+from orchestrator.verify_evidence import Leg, UnitOutcome, UnitTier
 from orchestrator.verify_runner import (
     MergeVerifySpec,
     UnscopedTypecheckSpec,
@@ -465,3 +479,147 @@ class TestTheRunnerDecidesAgainstTheShippedView:
             assert units[unit_id].evidence_event_id == recorded[unit_id].evidence_event_id
         assert not {leg for leg in ran_legs(markers) if leg.startswith('alpha:')}
         assert result.cache_report is not None
+
+
+_ALPHA_LINT = 'module:alpha:lint'
+
+
+@dataclasses.dataclass(frozen=True)
+class _RunnerResult:
+    """What a runner hands back: its verdict's units and its report, beside the view it decided against."""
+
+    view: ShippedView
+    units: tuple
+    report: CacheReport | None
+    replayed: dict[str, Entry]
+
+
+async def _runner_replayed(registry: Registry, role: VerifyRole, *, replays: bool = True) -> _RunnerResult:
+    """A runner's green under an ON view: alpha's test and lint replay the greens the
+    dispatcher shipped (or run, unless *replays*), and beta's test runs clean."""
+    keys_ = {unit_id: unit_key(unit_id) for unit_id in (_ALPHA, _ALPHA_LINT, _BETA)}
+    replayed = {
+        unit_id: await record_entry(registry, keys_[unit_id], evidence=evidence)
+        for evidence, unit_id in enumerate((_ALPHA, _ALPHA_LINT), start=5)
+    }
+    view = ShippedView(CacheMode.ON, None, None, tuple(entry.candidate for entry in replayed.values()), False)
+    hit = Decision.HIT if replays else Decision.MISS
+    replay = ReplayPlan(
+        role=role, modes=VerifyCacheConfig().with_mode(role, CacheMode.ON),
+        tree=unit_decision(Decision.MISS, key=unit_key('tree', tier=UnitTier.TREE)),
+        modules={
+            **{unit_id: unit_decision(hit, entry.candidate, key=keys_[unit_id]) for unit_id, entry in replayed.items()},
+            _BETA: unit_decision(Decision.MISS, key=keys_[_BETA]),
+        },
+    )
+    ran = (_BETA,) if replays else (_ALPHA, _ALPHA_LINT, _BETA)
+    units, record = replay.settle(
+        tuple(ran_unit(unit_id) for unit_id in ran),
+        tuple(LegRun(unit_id, clean_leg(Leg.LINT if unit_id == _ALPHA_LINT else Leg.TEST)) for unit_id in ran),
+    )
+    result = verify_result(units=units, cache_report=report_of(record, flake_suppressed=False))
+    assert result.units is not None
+    return _RunnerResult(view, result.units, result.cache_report, replayed)
+
+
+def _garbled(tmp_path: Path) -> Registry:
+    db_path = tmp_path / 'garbled.db'
+    db_path.write_bytes(b'garbage, not sqlite' * 64)
+    return Registry(db_path)
+
+
+class TestTheDispatcherSettlesWhatTheRunnerReports:
+    @pytest.mark.asyncio
+    async def test_a_merge_landing_consumes_every_replayed_entry(self, registry):
+        ran = await _runner_replayed(registry, 'merge')
+
+        settled = await RemoteCache(registry, _BOTH_ON).settle(ran.view, 'merge', ran.units, ran.report, landing_sha='land-1')
+
+        assert settled.outcome.backs_every_hit, settled.outcome.reason
+        assert set(await registry.consumed_for('land-1')) == set(ran.replayed.values())
+
+    @pytest.mark.asyncio
+    async def test_a_task_verify_checks_backing_and_consumes_nothing(self, registry):
+        ran = await _runner_replayed(registry, 'task')
+
+        settled = await RemoteCache(registry, _BOTH_ON).settle(ran.view, 'task', ran.units, ran.report, landing_sha=None)
+
+        assert settled.outcome.backs_every_hit, settled.outcome.reason
+        assert settled.outcome.consumed == ()
+
+    @pytest.mark.asyncio
+    async def test_an_entry_evicted_after_shipping_is_unbacked_by_unit_and_key(self, registry):
+        ran = await _runner_replayed(registry, 'merge')
+        evicted = ran.replayed[_ALPHA_LINT]
+        await registry.evict_key(evicted.key, 'test eviction')
+
+        settled = await RemoteCache(registry, _BOTH_ON).settle(ran.view, 'merge', ran.units, ran.report, landing_sha='land-1')
+
+        assert settled.outcome.unbacked == (UnbackedReplay(_ALPHA_LINT, (_ALPHA_LINT, evicted.key)),)
+        assert _ALPHA_LINT in settled.outcome.reason and evicted.key in settled.outcome.reason
+        assert await registry.consumed_for('land-1') == ()
+
+    @pytest.mark.asyncio
+    async def test_a_replay_under_a_log_view_is_unbacked_whatever_the_registry_holds(self, registry):
+        ran = await _runner_replayed(registry, 'merge')
+        logged = dataclasses.replace(ran.view, mode=CacheMode.LOG)
+
+        settled = await RemoteCache(registry, _BOTH_ON).settle(logged, 'merge', ran.units, ran.report, landing_sha='land-1')
+
+        assert {unbacked.unit_id for unbacked in settled.outcome.unbacked} == {_ALPHA, _ALPHA_LINT}
+        assert await registry.consumed_for('land-1') == ()
+
+    @pytest.mark.asyncio
+    async def test_a_garbled_registry_is_an_outcome_not_an_exception(self, registry, tmp_path):
+        ran = await _runner_replayed(registry, 'merge')
+
+        settled = await RemoteCache(_garbled(tmp_path), _BOTH_ON).settle(
+            ran.view, 'merge', ran.units, ran.report, landing_sha='land-1',
+        )
+
+        assert settled.outcome.error is not None
+        assert not settled.outcome.backs_every_hit
+
+    @pytest.mark.asyncio
+    async def test_the_settled_record_is_the_report_under_the_mode_the_dispatcher_shipped(self, registry):
+        ran = await _runner_replayed(registry, 'merge', replays=False)
+        logged = dataclasses.replace(ran.view, mode=CacheMode.LOG)
+        assert ran.report is not None
+
+        settled = await RemoteCache(registry, _BOTH_ON).settle(logged, 'merge', ran.units, ran.report, landing_sha='land-1')
+
+        assert settled.record == ran.report.record('merge', _BOTH_ON.with_mode('merge', CacheMode.LOG))
+        assert settled.record is not None and settled.record.modes.mode_for('merge') is CacheMode.LOG
+        assert settled.outcome.backs_every_hit
+
+    @pytest.mark.asyncio
+    async def test_no_report_and_no_replay_settles_no_record(self, registry):
+        ran = await _runner_replayed(registry, 'merge', replays=False)
+
+        settled = await RemoteCache(registry, _BOTH_ON).settle(ran.view, 'merge', ran.units, None, landing_sha='land-1')
+
+        assert settled.record is None
+        assert settled.outcome.backs_every_hit
+
+    @pytest.mark.asyncio
+    async def test_a_replay_without_a_report_is_unbacked(self, registry):
+        ran = await _runner_replayed(registry, 'merge')
+
+        settled = await RemoteCache(registry, _BOTH_ON).settle(ran.view, 'merge', ran.units, None, landing_sha='land-1')
+
+        assert set(settled.outcome.unbacked) == {UnbackedReplay(_ALPHA, None), UnbackedReplay(_ALPHA_LINT, None)}
+        assert await registry.consumed_for('land-1') == ()
+
+    @pytest.mark.asyncio
+    async def test_no_shipped_view_records_nothing_and_backs_no_replay(self, registry):
+        ran = await _runner_replayed(registry, 'merge')
+
+        settled = await RemoteCache(registry, _BOTH_ON).settle(None, 'merge', ran.units, ran.report, landing_sha='land-1')
+
+        assert settled.record is None
+        assert {unbacked.unit_id for unbacked in settled.outcome.unbacked} == {_ALPHA, _ALPHA_LINT}
+        assert await registry.consumed_for('land-1') == ()
+
+    def test_a_dispatcher_without_a_registry_settles_nothing_remotely(self, registry):
+        assert RemoteCache.of(None, _BOTH_ON) is None
+        assert RemoteCache.of(registry, _BOTH_ON) == RemoteCache(registry, _BOTH_ON)
