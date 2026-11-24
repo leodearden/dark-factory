@@ -1499,7 +1499,7 @@ class VerifyCacheConfig(BaseModel):
     merge_mode: CacheMode = CacheMode.OFF
     remote_task_mode: CacheMode = CacheMode.OFF
     remote_merge_mode: CacheMode = CacheMode.OFF
-    remote_candidates_per_unit: int = Field(16, ge=1)
+    remote_candidates_per_unit: int = Field(default=16, ge=1)
 
     def mode_for(self, role: VerifyRole) -> CacheMode:
         """*role*'s mode; the cache has no background role, so that is always OFF.
