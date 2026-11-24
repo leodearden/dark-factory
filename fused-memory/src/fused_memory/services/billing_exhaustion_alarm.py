@@ -41,6 +41,7 @@ from fused_memory.services.durable_queue import ParkedWriteEvent
 from fused_memory.services.provider_billing import (
     BillingExhaustion,
     BillingSource,
+    alarm_category_of,
     classify_billing_exhaustion,
     exhaustion_of,
 )
@@ -49,10 +50,10 @@ logger = logging.getLogger(__name__)
 
 ANCHOR_TASK_ID = 'provider-billing-exhausted'
 _AGENT_ROLE = 'harness-fused-memory-billing-guard'
-_CATEGORY = 'provider_billing_exhausted'
-_LOG_LABEL = 'provider_billing_exhausted'
 #: The anchor is per billing source, so a re-latched record names its source.
 _SOURCE = BillingSource.API_KEY_CREDITS
+_CATEGORY = alarm_category_of(_SOURCE)
+_LOG_LABEL = 'provider_billing_exhausted'
 _UNKNOWN = 'unknown'
 
 #: Sets two cadences. An exhaustion this soon after a recovery waits it out,
