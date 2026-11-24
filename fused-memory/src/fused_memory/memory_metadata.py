@@ -705,7 +705,7 @@ def is_orchestrator_completion_record(meta: Mapping[str, Any]) -> bool:
 
 #: The ``source`` reconciliation/targeted.py::TargetedReconciler stamps on its
 #: notes: the completion echo and the verification-verdict note. Both are
-#: registered completion records.
+#: records about their metadata.task_id, which :func:`is_completion_record` accepts.
 TARGETED_RECONCILIATION_SOURCE = 'targeted_reconciliation'
 
 #: The metadata that marks reconciliation's completion echo, as against its
@@ -733,7 +733,11 @@ def is_reconciliation_verdict_note(meta: Mapping[str, Any]) -> bool:
 
 
 def is_completion_record(meta: Mapping[str, Any]) -> bool:
-    """Is this a record ABOUT its metadata.task_id, as opposed to one merely written by that task?"""
+    """Is this a record ABOUT its metadata.task_id, as opposed to one merely written by that task?
+
+    Being about the task is not saying it completed: a verification-verdict note
+    whose verdict is 'contradicted' counts too.
+    """
     return (
         is_orchestrator_completion_record(meta)
         or is_reconciliation_completion_echo(meta)
