@@ -803,6 +803,7 @@ class _MemoryServiceArchive:
             metadata=dict(metadata),
             _source=ARCHIVE_SOURCE,
             defer_transient_mem0_failure=False,
+            declared_referents=[{'kind': 'task', 'id': metadata['task_id']}],
         )
         if response.mem0_write_state is Mem0WriteState.LANDED:
             return response.memory_ids[0]
