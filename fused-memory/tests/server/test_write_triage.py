@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import types
+from collections.abc import Sequence
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -2059,7 +2060,7 @@ class TestAFailOpenOnACappedPlanSaysSo:
         (logged,) = self._fail_open_logs(caplog)
         assert 'cause=billing_exhausted:plan_cap' in logged.getMessage()
 
-    async def _storm(self, failures: list[BaseException]) -> dict:
+    async def _storm(self, failures: Sequence[BaseException]) -> dict:
         counter = TriageFailOpenCounter(time_provider=_Clock())
         for failure in failures:
             service = self._service(search=AsyncMock(side_effect=failure))
@@ -2068,7 +2069,7 @@ class TestAFailOpenOnACappedPlanSaysSo:
         assert storm is not None, 'crossing the threshold must fire'
         return storm
 
-    async def _filed_storm(self, tmp_path, failures: list[BaseException]) -> tuple[dict, dict]:
+    async def _filed_storm(self, tmp_path, failures: Sequence[BaseException]) -> tuple[dict, dict]:
         storm = await self._storm(failures)
         emit_triage_fail_open_storm_escalation(str(tmp_path), storm)
         return storm, _only_escalation(tmp_path)
