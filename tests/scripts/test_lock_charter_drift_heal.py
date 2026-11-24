@@ -31,6 +31,9 @@ import pytest
 from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS
 from shared.task_statuses import ACTIVE
 from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 11, 24, 1, 45, tzinfo=UTC)
 REPO_ROOT = Path(__file__).resolve().parents[2]
