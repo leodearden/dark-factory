@@ -45,3 +45,33 @@ def test_the_bare_decision_text_would_have_its_declaration_rejected() -> None:
 
     assert block is not None
     assert block['error_type'] == 'DeclaredReferentConflictRejected', block
+
+
+#: Task numbers of each shape the orchestrator declares: one digit, a leading
+#: zero, today's width, and a long run that a length cap would catch.
+_DECLARED_IDS = ('7', '0132', '4102', '123456789012')
+#: Ids the orchestrator declares nothing for.
+_UNDECLARED_IDS = {'eval-run': 't', 'suffixed': '4102a', 'arabic-indic-digits': '٤١٠٢', 'empty': ''}
+_NEUTRAL_DECISION = {'decision': 'Key the sweep on metadata', 'rationale': _RATIONALE}
+
+
+@pytest.mark.parametrize('task_id', _DECLARED_IDS)
+def test_every_task_number_the_note_declares_passes_the_gate(task_id: str) -> None:
+    """The orchestrator's task-number test must accept nothing the gate refuses: a refused note is lost unlogged."""
+    fields = decision_note_fields(task_id, _NEUTRAL_DECISION)
+
+    assert fields['entities'] == [{'kind': 'task', 'id': task_id}]
+    assert entities_gate(fields['entities'], content=fields['content'], group_id=_PROJECT_ID) is None
+
+
+@pytest.mark.parametrize('task_id', _UNDECLARED_IDS.values(), ids=_UNDECLARED_IDS)
+def test_the_gate_refuses_a_declaration_of_an_id_the_note_omits(task_id: str) -> None:
+    """Premise for omitting the declaration: declaring the id would get the note refused."""
+    fields = decision_note_fields(task_id, _NEUTRAL_DECISION)
+    block = entities_gate(
+        [{'kind': 'task', 'id': task_id}], content=fields['content'], group_id=_PROJECT_ID,
+    )
+
+    assert 'entities' not in fields
+    assert block is not None
+    assert block['error_type'] == 'ValidationError', block
