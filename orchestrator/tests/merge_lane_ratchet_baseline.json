@@ -130,7 +130,7 @@
     "orchestrator/src/orchestrator/merge_lane/train_selection.py": {"cognitive": 19, "function_local_imports": 0, "lines": 65, "prose_lines": 28, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/types.py": {"cognitive": 97, "function_local_imports": 0, "lines": 2487, "prose_lines": 1185, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/unmeasured_delivery.py": {"cognitive": 54, "function_local_imports": 0, "lines": 388, "prose_lines": 17, "reexport_names": 0},
-    "orchestrator/src/orchestrator/merge_lane/verify_base_detector.py": {"cognitive": 8, "function_local_imports": 0, "lines": 135, "prose_lines": 22, "reexport_names": 0},
+    "orchestrator/src/orchestrator/merge_lane/verify_base_detector.py": {"cognitive": 8, "function_local_imports": 0, "lines": 145, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/verify_cancellation.py": {"cognitive": 14, "function_local_imports": 0, "lines": 131, "prose_lines": 31, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/verify_cross_check.py": {"cognitive": 17, "function_local_imports": 0, "lines": 335, "prose_lines": 83, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/verify_dispatch.py": {"cognitive": 38, "function_local_imports": 0, "lines": 642, "prose_lines": 127, "reexport_names": 0},
