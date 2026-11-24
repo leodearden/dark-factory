@@ -1,4 +1,4 @@
-"""Contract of shared/src/shared/testing_code_writer_contract.py: status words, write sites, census verdict, test existence."""
+"""Contract of shared/src/shared/testing_code_writer_contract.py: status words, write sites, census verdict, test existence, census rows."""
 
 from __future__ import annotations
 
@@ -11,9 +11,13 @@ import pytest
 from shared.task_statuses import TaskStatus
 from shared.testing_code_writer_contract import (
     MCP_TOOL_CALLERS,
+    TESTED_DISPOSITIONS,
     WRITE_TOOLS,
+    CensusRow,
     CensusVerdict,
+    Disposition,
     WriteSite,
+    census_row_problems,
     judge_census,
     missing_tests,
     task_status_words_in,
@@ -227,3 +231,49 @@ def test_node_ids_naming_an_absent_file_or_function_are_missing(tmp_path: Path) 
         'pkg/test_mod.py::TestMissing::test_member',
     )
     assert missing_tests(('pkg/test_mod.py::test_top', *absent), tmp_path) == absent
+
+
+# ---------------------------------------------------------------------------
+# census rows
+# ---------------------------------------------------------------------------
+
+_PRESENT_TEST = 'pkg/test_mod.py::test_top'
+
+
+def test_only_code_writers_and_model_prose_need_a_test() -> None:
+    assert {Disposition.CODE_WRITER, Disposition.MODEL_PROSE} == TESTED_DISPOSITIONS
+
+
+def test_the_census_row_is_frozen() -> None:
+    row = CensusRow(count=1, disposition=Disposition.RELAY, reason='relays a caller')
+    with pytest.raises(AttributeError):
+        row.count = 2  # type: ignore[misc]
+
+
+def test_a_census_of_well_formed_rows_has_no_problems(tmp_path: Path) -> None:
+    _write_tests_tree(tmp_path)
+    census = {
+        _KEY: CensusRow(1, Disposition.CODE_WRITER, 'writes a note', tests=(_PRESENT_TEST,)),
+        _OTHER_KEY: CensusRow(1, Disposition.STORE_LAYER, 'the store'),
+        ('c.py', 'h', 'add_memory'): CensusRow(1, Disposition.RETIRING, 'deleted by task 10087'),
+    }
+    assert census_row_problems(census, tmp_path) == ()
+
+
+@pytest.mark.parametrize('disposition', sorted(TESTED_DISPOSITIONS))
+def test_a_tested_disposition_naming_no_test_is_a_problem(tmp_path: Path, disposition: Disposition) -> None:
+    [problem] = census_row_problems({_KEY: CensusRow(1, disposition, 'writes a note')}, tmp_path)
+    assert problem.key == _KEY
+
+
+def test_a_row_naming_a_test_that_does_not_exist_is_a_problem(tmp_path: Path) -> None:
+    _write_tests_tree(tmp_path)
+    row = CensusRow(1, Disposition.MODEL_PROSE, 'forwards prose', tests=(_PRESENT_TEST, 'pkg/test_mod.py::test_gone'))
+    [problem] = census_row_problems({_KEY: row}, tmp_path)
+    assert problem.key == _KEY
+    assert 'pkg/test_mod.py::test_gone' in str(problem)
+
+
+def test_a_retiring_row_must_name_the_task_that_retires_it(tmp_path: Path) -> None:
+    [problem] = census_row_problems({_KEY: CensusRow(1, Disposition.RETIRING, 'goes away soon')}, tmp_path)
+    assert problem.key == _KEY
