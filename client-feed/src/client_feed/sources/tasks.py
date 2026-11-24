@@ -1,6 +1,9 @@
-"""The task store's allowlisted projection, and the rule for whom an unfinished task waits on.
+"""The task store's allowlisted projection, the rule for whom an unfinished task waits on, and the carriers of this project's client defect reports.
 
 Only the allowlisted columns and metadata keys are selected; the rest of a task never enters the process.
+The carrier read adds exactly the two fields of plans/client-feed-prd.md §14.3: each `metadata.defects[].ref`
+and `metadata.x_client_defect_gate_for` that begins with this project's portal ref prefix. Every other ref,
+of another origin or another project, is never selected.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from pydantic import TypeAdapter, ValidationError
 from shared.project_layout import tasks_db
 
 from client_feed.contract import CommitSha, RepoPath, Source, TaskStatus, WaitingOn
+from client_feed.defect_ref import PortalReport, parse_portal_ref, portal_ref_prefix
 from client_feed.redact import redact_paths
 from client_feed.sources.escalations import OpenEscalations
 from client_feed.sources.store import read_only
@@ -191,4 +195,90 @@ def read_tasks(root: Path, *, since: str | None, escalations: OpenEscalations) -
         rows=tuple(item for item in projected if isinstance(item, TaskRow)),
         skipped=tuple(item for item in projected if isinstance(item, SkippedTask)),
         cursor=_cursor(rows, projected, since),
+    )
+
+
+@dataclass(frozen=True)
+class DefectCarrier:
+    """The task carrying a client defect report of this project, and whether a human gate holds it."""
+
+    ref: str
+    block: int
+    report: int
+    task_id: int
+    gated: bool
+
+
+_PREFIXED: Final = 'substr(ref, 1, length(:prefix)) = :prefix'
+
+_DEFECTS_ARRAY: Final = (
+    'CASE WHEN json_valid(metadata) THEN'
+    " CASE WHEN json_type(metadata, '$.defects') = 'array' THEN json_extract(metadata, '$.defects') END"
+    ' END'
+)
+
+_ENTRY_REF: Final = (
+    "CASE WHEN entry.type = 'object' THEN"
+    " CASE WHEN json_type(entry.value, '$.ref') = 'text' THEN json_extract(entry.value, '$.ref') END"
+    ' END'
+)
+
+_HELD_REFS_SQL: Final = (
+    'SELECT id, status, ref FROM ('
+    f'SELECT tasks.id AS id, tasks.status AS status, {_ENTRY_REF} AS ref'
+    f' FROM tasks, json_each({_DEFECTS_ARRAY}) AS entry WHERE tasks.tag = :tag'
+    f') WHERE {_PREFIXED}'
+)
+
+_GATES_SQL: Final = (
+    f"SELECT id, ref FROM (SELECT id, {_metadata_text('$.x_client_defect_gate_for')} AS ref"
+    f' FROM tasks WHERE tag = :tag) WHERE {_PREFIXED}'
+)
+
+_CARRIER_DEPENDENCIES_SQL: Final = (
+    'SELECT task_id, depends_on FROM dependencies'
+    f' WHERE tag = :tag AND task_id IN (SELECT id FROM ({_HELD_REFS_SQL}))'
+)
+
+
+def _carries(status: str) -> bool:
+    """A task carries its reports in any status but deferred; an unknown status carries nothing."""
+    try:
+        return TaskStatus(status) is not TaskStatus.DEFERRED
+    except ValueError:
+        return False
+
+
+def _lowest_holders(
+    held: list[tuple[int, str, str]], *, project_id: str
+) -> dict[str, tuple[int, PortalReport]]:
+    """Each ref of `project_id` a carrying task holds, with the lowest such task id: the first filing."""
+    lowest: dict[str, tuple[int, PortalReport]] = {}
+    for task_id, status, ref in held:
+        named = parse_portal_ref(ref, project_id=project_id)
+        if named is not None and _carries(status):
+            lowest[ref] = min(lowest.get(ref, (task_id, named)), (task_id, named))
+    return lowest
+
+
+def read_defect_carriers(root: Path, *, project_id: str) -> tuple[DefectCarrier, ...]:
+    """Every client defect report of `project_id` some task carries, sorted by ref.
+
+    Read in full every pass: a same-project add_dependency inserts the gate edge without bumping the
+    task's updated_at, so no updated_at cursor would see `gated` turn true.
+    """
+    params = {'tag': TASK_TAG, 'prefix': portal_ref_prefix(project_id)}
+    with read_only(root, tasks_db(root), source=Source.TASKS) as conn:
+        held = conn.execute(_HELD_REFS_SQL, params).fetchall()
+        gate_for = dict(conn.execute(_GATES_SQL, params).fetchall())
+        depends_on = _grouped(conn.execute(_CARRIER_DEPENDENCIES_SQL, params).fetchall())
+    return tuple(
+        DefectCarrier(
+            ref=ref,
+            block=named.block,
+            report=named.report,
+            task_id=task_id,
+            gated=any(gate_for.get(dependency) == ref for dependency in depends_on.get(task_id, ())),
+        )
+        for ref, (task_id, named) in sorted(_lowest_holders(held, project_id=project_id).items())
     )
