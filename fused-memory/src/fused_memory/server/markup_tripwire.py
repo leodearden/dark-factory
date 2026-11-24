@@ -55,7 +55,11 @@ import ast
 import logging
 from typing import Any
 
-from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MARKUP_REFUSAL_CUSTODY_CAVEAT,
+    residue_caller_lines,
+)
 
 # markup_override_requested / strip_markup_override are RE-EXPORTS, not local
 # callers: server/tools.py imports both from this module (the write-path guards
@@ -474,7 +478,8 @@ def emit_markup_residue_escalation(
     A TRANSLATOR, not a second escalation vocabulary (INV-5). The middleware
     already emits an escalation-SHAPED record — ``category``, ``level``,
     ``summary``, ``suggested_action``, plus the flat ``tool``/``field``/
-    ``matched_pattern``/``agent_id``/``project``/``raw_value`` fields — because
+    ``matched_pattern``/``raw_value`` fields and the caller fields
+    ``residue_caller_lines`` renders — because
     the record has to survive being routed to whichever queue a host server
     happens to own. This function moves those fields onto an
     :class:`escalation.models.Escalation` and writes it; it authors no prose of
@@ -483,9 +488,8 @@ def emit_markup_residue_escalation(
     DELIBERATELY NOT DEDUPED, which is the one place it diverges from
     :func:`emit_markup_storm_escalation`. That filer collapses a running leak
     into one open record because every burst summary says the same thing. Here
-    each record is the ONLY surviving copy of a DIFFERENT caller payload, so
-    folding two together would destroy data — the exact loss this record exists
-    to prevent. Volume during a burst is what the storm record is for: it
+    each record holds a DIFFERENT caller's payload, so folding two together
+    would destroy one of them. Volume during a burst is what the storm record is for: it
     summarises the incident once, while these hold the individual payloads.
 
     NEVER raises, for the same reason as its sibling: the refusal is already
@@ -494,11 +498,10 @@ def emit_markup_residue_escalation(
     """
     raw_value = record.get('raw_value')
     detail = '\n'.join([
+        *residue_caller_lines(record),
         f'tool={record.get("tool")!r}',
         f'field={record.get("field")!r}',
         f'matched_pattern={record.get("matched_pattern")!r}',
-        f'agent_id={record.get("agent_id")!r}',
-        f'project={record.get("project")!r}',
         f'owner={record.get("owner")!r}',
         '',
         'The MCP boundary markup guard REFUSED this call: the argument below '
@@ -507,10 +510,11 @@ def emit_markup_residue_escalation(
         'Guessing a boundary would silently drop whatever arguments hide in the '
         'residue.',
         '',
-        'The caller was told its payload is preserved here, so this record is '
-        'the only surviving copy: recover it for the caller if it is still '
-        'needed, then chase the harness serialization leak that produced it '
-        f'and {MARKUP_RECURRENCE_ROUTING}.',
+        MARKUP_REFUSAL_CUSTODY_CAVEAT,
+        '',
+        'Recover the payload below for the caller if it is still needed, then '
+        'chase the harness serialization leak that produced it and '
+        f'{MARKUP_RECURRENCE_ROUTING}.',
         '',
         'raw_value (VERBATIM, the caller\'s own bytes):',
         str(raw_value),

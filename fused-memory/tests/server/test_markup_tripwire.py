@@ -1013,9 +1013,8 @@ class TestDelegatesToTheSharedHelper:
     def test_the_residue_filer_opts_OUT_of_dedupe_and_forwards_the_record(
         self, tmp_path, monkeypatch,
     ):
-        """Each residue record is the only surviving copy of a DIFFERENT caller
-        payload, so folding two together would destroy the data the record
-        exists to preserve."""
+        """Each residue record holds a DIFFERENT caller's payload, so folding
+        two together would destroy one of them."""
         seen: dict = {}
 
         def _spy(project_root, **kwargs):
