@@ -791,10 +791,20 @@ def _render_batch_prompt(
 CuratorInvoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
 
 
+EmbedderRefusal = openai.BadRequestError
+
+
 class CorpusEmbedder(Protocol):
     """What the corpus needs of an embedder; graphiti_core's OpenAIEmbedder satisfies it."""
 
-    async def create(self, input_data: str) -> list[float]: ...
+    async def create(self, input_data: str) -> list[float]:
+        """Embed *input_data*.
+
+        Raise :data:`EmbedderRefusal` for an input that will never embed: the
+        candidate is then curated over its other streams. Any other exception
+        is an outage, and a candidate with no stream left defers CORPUS_FAILED.
+        """
+        ...
 
 
 class TaskCurator:
@@ -3207,8 +3217,8 @@ class _StreamReads:
 
     attempted: list[str] = field(default_factory=list)
     unavailable: list[str] = field(default_factory=list)
-    # The subset of ``unavailable`` whose read raised openai.BadRequestError:
-    # a refusal of this candidate's input, which a retry will not change.
+    # The subset of ``unavailable`` whose read raised EmbedderRefusal: a
+    # refusal of this candidate's input, which a retry will not change.
     refused: list[str] = field(default_factory=list)
 
     async def read(self, stream: str, read: Awaitable[_T], fallback: _T) -> _T:
@@ -3216,7 +3226,7 @@ class _StreamReads:
         self.attempted.append(stream)
         try:
             return await read
-        except openai.BadRequestError as exc:
+        except EmbedderRefusal as exc:
             logger.warning(
                 "task_curator: corpus stream %s refused this candidate's input, "
                 'which a retry will not change: %s',

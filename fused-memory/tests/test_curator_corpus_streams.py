@@ -206,13 +206,6 @@ def _windowed_embedder() -> _WindowedEmbedder:
     return _WindowedEmbedder(make_config().embedder.dimensions)
 
 
-class _RefusingEmbedder:
-    """An embedder that answers every input with the 400 a deterministic refusal gets."""
-
-    async def create(self, input_data: str) -> list[float]:
-        raise _embedder_refusal()
-
-
 class _FailingEmbedder:
     """An embedder whose every call raises *exc*."""
 
@@ -811,9 +804,10 @@ async def test_an_over_long_fileless_submission_resolves_created(tmp_path):
         single=_creating_and_recording(prompts),
         batch=tripwire('one candidate must take the single spec'),
     )
+    embedder = _windowed_embedder()
     async with (
         _open_stack(
-            tmp_path / 'project', SqliteTaskBackend, invoke=invoke, embedder=_windowed_embedder(),
+            tmp_path / 'project', SqliteTaskBackend, invoke=invoke, embedder=embedder,
         ) as stack,
         _interceptor_over(stack, tmp_path) as (interceptor, _store),
     ):
@@ -821,15 +815,15 @@ async def test_an_over_long_fileless_submission_resolves_created(tmp_path):
             stack.root, title='Sweep transcript secrets', description=_OVER_THE_WINDOW,
         )
 
-        answer = await asyncio.wait_for(
-            interceptor.resolve_ticket(
-                submitted['ticket'], stack.root, timeout_seconds=_RESOLVE_DEADLINE_SECONDS,
-            ),
-            timeout=_RESOLVE_DEADLINE_SECONDS + 5,
+        answer = await interceptor.resolve_ticket(
+            submitted['ticket'], stack.root, timeout_seconds=_RESOLVE_DEADLINE_SECONDS,
         )
 
     assert answer['status'] == TicketStatus.CREATED
-    assert len(prompts) == 1
+    [prompt] = prompts
+    assert _EMBEDDING_UNAVAILABLE not in prompt.splitlines()
+    assert embedder.inputs
+    assert all(len(text.encode('utf-8')) <= EMBEDDING_INPUT_MAX_BYTES for text in embedder.inputs)
 
 
 @pytest.mark.asyncio
@@ -858,7 +852,7 @@ async def test_a_refused_embedding_is_curated_over_the_remaining_streams_not_def
         batch=tripwire('one candidate must take the single spec'),
     )
     async with _open_stack(
-        tmp_path / 'project', SqliteTaskBackend, invoke=invoke, embedder=_RefusingEmbedder(),
+        tmp_path / 'project', SqliteTaskBackend, invoke=invoke, embedder=_FailingEmbedder(_embedder_refusal()),
     ) as stack:
         prepared = await stack.curator.prepare_candidate(CandidateTask(title='t'), 'p', stack.root)
         [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
@@ -879,7 +873,7 @@ async def test_a_refused_embedding_is_curated_over_the_remaining_streams_not_def
 @pytest.mark.asyncio
 async def test_a_refused_embedding_with_a_failed_module_read_still_defers(tmp_path):
     async with _open_stack(
-        tmp_path / 'project', _ModuleReadFailsBackend, embedder=_RefusingEmbedder(),
+        tmp_path / 'project', _ModuleReadFailsBackend, embedder=_FailingEmbedder(_embedder_refusal()),
     ) as stack:
         prepared = await stack.curator.prepare_candidate(
             CandidateTask(title='t', files_to_modify=[_CANDIDATE_FILE]), 'p', stack.root,
