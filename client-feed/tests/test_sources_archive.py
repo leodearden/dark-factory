@@ -38,6 +38,7 @@ from client_feed.sources.archive import (
     ArchiveProblem,
     ArchiveReadError,
     read_archived_run,
+    read_junit_cases,
 )
 
 BASE = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
@@ -506,3 +507,56 @@ def test_a_collection_map_beside_a_junit_is_never_read_as_a_run_file(tmp_path: P
 
     assert run.legs == NOT_RECORDED
     assert run.tests is None
+
+
+UNCAPPED = junit_xml(passed('test_a'), passed('test_b'), red('test_c', 'failure'))
+
+
+def test_the_junit_case_reader_returns_every_case_in_report_order(tmp_path: Path) -> None:
+    write_plan(tmp_path, at(0))
+    junit = write_junit(tmp_path, at(1), UNCAPPED)
+
+    cases = read_junit_cases(tmp_path, junit.relative_to(tmp_path))
+    capped = read(tmp_path, at(60), max_cases=1).tests
+
+    assert [(case.id, case.outcome) for case in cases] == [
+        ('tests.test_a::test_a', CaseOutcome.PASSED),
+        ('tests.test_a::test_b', CaseOutcome.PASSED),
+        ('tests.test_a::test_c', CaseOutcome.FAILED),
+    ]
+    assert capped is not None
+    assert [case.id for case in capped.cases] == ['tests.test_a::test_c']
+    assert {case.id for case in cases} == case_ids(read(tmp_path, at(60)))
+
+
+def test_the_junit_case_reader_reads_a_plain_xml_report(tmp_path: Path) -> None:
+    junit = write_junit(tmp_path, at(1), UNCAPPED)
+    (tmp_path / 'r.xml').write_bytes(UNCAPPED)
+
+    plain = read_junit_cases(tmp_path, Path('r.xml'))
+
+    assert plain == read_junit_cases(tmp_path, junit.relative_to(tmp_path))
+
+
+def _junit_cases_error(tmp_path: Path, relpath: Path) -> ArchiveReadError:
+    with pytest.raises(ArchiveReadError) as caught:
+        read_junit_cases(tmp_path, relpath)
+    return caught.value
+
+
+def test_a_malformed_plain_junit_is_refused_by_name(tmp_path: Path) -> None:
+    path = task_dir(tmp_path) / 'attempt-1.alpha.junit.xml'
+    path.write_bytes(b'<testsuites><testsuite>')
+
+    error = _junit_cases_error(tmp_path, path.relative_to(tmp_path))
+
+    _assert_names_the_file(error, tmp_path, ArchiveProblem.MALFORMED_JUNIT)
+
+
+def test_a_gz_junit_that_is_not_gzip_is_refused_by_name(tmp_path: Path) -> None:
+    path = write_junit(tmp_path, at(1), b'')
+    path.write_bytes(b'<testsuite/> but not gzip')
+
+    error = _junit_cases_error(tmp_path, path.relative_to(tmp_path))
+
+    _assert_names_the_file(error, tmp_path, ArchiveProblem.UNREADABLE)
