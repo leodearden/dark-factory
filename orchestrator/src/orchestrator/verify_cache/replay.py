@@ -22,7 +22,7 @@ from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult, Unavailable
 from orchestrator.verify_cache.recorder import CacheRecord, LegRun, RecordedUnit
-from orchestrator.verify_cache.registry import Entry, Registry, registry_db_path
+from orchestrator.verify_cache.registry import Candidate, Entry, Registry, registry_db_path
 from orchestrator.verify_evidence import (
     COMMAND_FIELD_BY_LEG,
     GREEN_OUTCOMES,
@@ -145,18 +145,18 @@ class ReplayPlan:
         """The legs of module *prefix* that replay a recorded green instead of running."""
         return frozenset(self._hits(prefix))
 
-    def replayed(self, prefix: str | None) -> tuple[tuple[str, Entry], ...]:
+    def replayed(self, prefix: str | None) -> tuple[tuple[str, Entry | Candidate], ...]:
         """Each unit of module *prefix* that replays a recorded green, with the entry it replays."""
         return tuple(self._hits(prefix).values())
 
     @property
-    def tree_replayed(self) -> tuple[tuple[str, Entry], ...]:
+    def tree_replayed(self) -> tuple[tuple[str, Entry | Candidate], ...]:
         """The tree unit and the entry it replays, when the whole tree replays."""
         entry = self.tree.decision.entry
         return ((keys.TREE_UNIT_ID, entry),) if self.tree_hit and entry is not None else ()
 
-    def _hits(self, prefix: str | None) -> dict[Leg, tuple[str, Entry]]:
-        hits: dict[Leg, tuple[str, Entry]] = {}
+    def _hits(self, prefix: str | None) -> dict[Leg, tuple[str, Entry | Candidate]]:
+        hits: dict[Leg, tuple[str, Entry | Candidate]] = {}
         for leg in Leg:
             unit_id = module_leg_name(prefix, leg)
             decided = self.modules.get(unit_id)

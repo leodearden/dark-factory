@@ -12,7 +12,7 @@ from orchestrator.verify_cache import policy
 from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import Admission, LegResult
-from orchestrator.verify_cache.registry import Entry, Registry
+from orchestrator.verify_cache.registry import Candidate, Entry, Registry
 from orchestrator.verify_evidence import UnitOutcome, VerifyUnit
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ class RecordedUnit:
     unit: VerifyUnit
     key: UnitKey | None
     leg: LegResult | None
-    entry: Entry | None
+    entry: Entry | Candidate | None
 
 
 @dataclass(frozen=True)
@@ -120,9 +120,11 @@ async def consume_replayed(registry: Registry, record: CacheRecord, *, landing_s
     hits = [unit for unit in (*record.units, *_tree_of(record)) if unit.unit.outcome is UnitOutcome.CACHE_HIT]
     if not hits:
         return ConsumeOutcome((), (), None, 'no replayed unit to consume')
-    cited = {(entry.unit_id, entry.key): entry for unit in hits if (entry := unit.entry) is not None}
+    cited = dict.fromkeys((entry.unit_id, entry.key) for unit in hits if (entry := unit.entry) is not None)
     try:
-        live = (await registry.view([_entry_key(entry) for entry in cited.values()])).entries
+        live = {
+            pair: entry for pair, entry in (await registry.view_of(cited)).entries.items() if isinstance(entry, Entry)
+        }
         unbacked = tuple(
             unit.unit.unit for unit in hits if unit.entry is None or (unit.entry.unit_id, unit.entry.key) not in live
         )
@@ -169,7 +171,3 @@ def _tree_admission(
 
 def _tree_of(record: CacheRecord) -> tuple[RecordedUnit, ...]:
     return () if record.tree is None else (record.tree,)
-
-
-def _entry_key(entry: Entry) -> UnitKey:
-    return UnitKey(entry.unit_id, entry.tier, entry.key, entry.spec_hash, entry.inputs)

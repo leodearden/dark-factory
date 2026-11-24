@@ -11,7 +11,7 @@ from enum import StrEnum
 from orchestrator.config import VerifyCacheConfig
 from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
-from orchestrator.verify_cache.registry import Entry, Registry, RegistryView
+from orchestrator.verify_cache.registry import Candidate, Entry, Registry, RegistryView
 from orchestrator.verify_evidence import Leg
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ class CacheDecision:
     """One unit's decision, the entry it would replay (HIT and WOULD_HIT only), and why."""
 
     decision: Decision
-    entry: Entry | None
+    entry: Entry | Candidate | None
     reason: str
 
     def __post_init__(self) -> None:
@@ -50,12 +50,15 @@ class Unavailable:
     reason: str
 
 
-async def consult(registry: Registry | None, keys: Sequence[UnitKey]) -> RegistryView | Unavailable:
-    """One batched registry read for a verify's *keys*; never raises (I2)."""
-    if registry is None:
+async def consult(source: Registry | RegistryView | None, keys: Sequence[UnitKey]) -> RegistryView | Unavailable:
+    """One batched registry read for a verify's *keys*, or the view a remote
+    verify was shipped, answered as is; never raises (I2)."""
+    if source is None:
         return Unavailable('no registry on this host (no_registry_on_runner)')
+    if isinstance(source, RegistryView):
+        return source
     try:
-        return await registry.view(keys)
+        return await source.view(keys)
     except Exception as exc:
         logger.warning('verify_cache.consult unavailable: %s: %s', type(exc).__name__, exc)
         return Unavailable(f'{type(exc).__name__}: {exc}')
@@ -127,7 +130,8 @@ def _decide(
         )
     entry = view.entries.get((key.unit_id, key.key))
     if entry is None:
-        return _miss(f'no recorded green for {key.unit_id} at key {key.key}')
+        unshipped = '; the shipped view was truncated, so an unshipped green may exist' if view.truncated else ''
+        return _miss(f'no recorded green for {key.unit_id} at key {key.key}{unshipped}')
     replay = f'the green of {entry.unit_id} at key {entry.key} (evidence event {entry.evidence_event_id})'
     if mode is CacheMode.ON:
         return CacheDecision(Decision.HIT, entry, f'replaying {replay}')

@@ -81,7 +81,7 @@ from orchestrator.verify_admission_record import (
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import LegResult
 from orchestrator.verify_cache.recorder import CacheRecord, LegRun
-from orchestrator.verify_cache.registry import Entry
+from orchestrator.verify_cache.registry import Candidate, Entry
 from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, plan_replay
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
@@ -4186,7 +4186,7 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
     )
 
 
-def _replay_hint(replayed: Iterable[tuple[str, Entry]]) -> str:
+def _replay_hint(replayed: Iterable[tuple[str, Entry | Candidate]]) -> str:
     """Name each replayed unit's entry and evidence event (I1)."""
     return '; '.join(
         f'replayed {unit_id} from entry {entry.entry_id} (evidence event {entry.evidence_event_id})'
@@ -4194,7 +4194,7 @@ def _replay_hint(replayed: Iterable[tuple[str, Entry]]) -> str:
     )
 
 
-def _cache_hit_result(replay: ReplayPlan, replayed: Iterable[tuple[str, Entry]]) -> 'VerifyResult':
+def _cache_hit_result(replay: ReplayPlan, replayed: Iterable[tuple[str, Entry | Candidate]]) -> 'VerifyResult':
     """The verdict of units that replay recorded greens: a pass that ran nothing, never readable as a run (I1)."""
     return VerifyResult(
         passed=True,
