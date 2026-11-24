@@ -18,6 +18,7 @@ from shared.testing_code_writer_contract import (
     CensusVerdict,
     Disposition,
     WriteSite,
+    census_failure_message,
     census_row_problems,
     judge_census,
     missing_tests,
@@ -121,10 +122,16 @@ def test_an_mcp_caller_passing_a_write_tool_literal_is_a_site_named_by_the_tool(
     )
 
 
-def test_an_mcp_caller_passing_a_module_level_tool_constant_is_a_site() -> None:
-    source = """
-    WRITE_TOOL = 'update_memory'
+@pytest.mark.parametrize('declaration', [
+    pytest.param("WRITE_TOOL = 'update_memory'", id='plain'),
+    pytest.param("WRITE_TOOL: Final = 'update_memory'", id='final'),
+    pytest.param("WRITE_TOOL: str = 'update_memory'", id='typed'),
+])
+def test_an_mcp_caller_passing_a_module_level_tool_constant_is_a_site(declaration: str) -> None:
+    source = f"""
+    {declaration}
     READ_TOOL = 'search'
+    UNSET_TOOL: str
 
     class Store:
         async def heal(self, arguments):
@@ -190,6 +197,20 @@ def test_the_census_verdict_is_frozen() -> None:
     field = 'unlisted'
     with pytest.raises(dataclasses.FrozenInstanceError):
         setattr(verdict, field, (_KEY,))
+
+
+def test_an_agreeing_verdict_has_no_failure_message() -> None:
+    verdict = judge_census([_SITE], {_KEY: 1})
+    assert verdict.agrees
+    assert census_failure_message(verdict, Path('pkg/src')) == ''
+
+
+def test_the_failure_message_names_the_root_each_unlisted_site_and_each_stale_row() -> None:
+    verdict = judge_census([_SITE], {_OTHER_KEY: 1})
+    message = census_failure_message(verdict, Path('pkg/src'))
+    assert not verdict.agrees
+    assert f'under pkg/src that CENSUS does not list: {[_KEY]}' in message
+    assert f'CENSUS rows with fewer sites than listed: {[_OTHER_KEY]}' in message
 
 
 # ---------------------------------------------------------------------------

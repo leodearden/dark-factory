@@ -26,6 +26,7 @@ __all__ = [
     'Disposition',
     'RowProblem',
     'WriteSite',
+    'census_failure_message',
     'census_row_problems',
     'judge_census',
     'missing_tests',
@@ -75,14 +76,16 @@ def _callee_name(func: ast.expr) -> str | None:
 def _module_str_constants(tree: ast.Module) -> dict[str, str]:
     constants: dict[str, str] = {}
     for stmt in tree.body:
-        if (
-            isinstance(stmt, ast.Assign)
-            and isinstance(stmt.value, ast.Constant)
-            and isinstance(stmt.value.value, str)
-        ):
-            for target in stmt.targets:
+        if isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets, value = [stmt.target], stmt.value
+        else:
+            continue
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            for target in targets:
                 if isinstance(target, ast.Name):
-                    constants[target.id] = stmt.value.value
+                    constants[target.id] = value.value
     return constants
 
 
@@ -151,6 +154,10 @@ class CensusVerdict:
     unlisted: tuple[CensusKey, ...]
     stale: tuple[CensusKey, ...]
 
+    @property
+    def agrees(self) -> bool:
+        return not (self.unlisted or self.stale)
+
 
 def judge_census(found: Iterable[WriteSite], listed: Mapping[CensusKey, int]) -> CensusVerdict:
     """Compare the write sites found with the census's expected count per key."""
@@ -160,6 +167,20 @@ def judge_census(found: Iterable[WriteSite], listed: Mapping[CensusKey, int]) ->
         unlisted=tuple(key for key in keys if found_counts[key] > listed.get(key, 0)),
         stale=tuple(key for key in keys if listed.get(key, 0) > found_counts[key]),
     )
+
+
+def census_failure_message(verdict: CensusVerdict, src_root: Path) -> str:
+    """What a census test over ``src_root`` reports for ``verdict``: its unlisted sites, then its stale rows; '' when it agrees."""
+    lines: list[str] = []
+    if verdict.unlisted:
+        lines.append(
+            f'write sites under {src_root} that CENSUS does not list: {list(verdict.unlisted)}. '
+            'List each with its count, disposition and reason; a CODE_WRITER or MODEL_PROSE row '
+            "also names the behaviour test, in the writer's own module test file, that holds it to C5."
+        )
+    if verdict.stale:
+        lines.append(f'CENSUS rows with fewer sites than listed: {list(verdict.stale)}')
+    return '\n'.join(lines)
 
 
 def _defines_test(tree: ast.Module, chain: list[str]) -> bool:
@@ -176,19 +197,34 @@ def _defines_test(tree: ast.Module, chain: list[str]) -> bool:
     )
 
 
+class _TestModules:
+    """The test files under one root, each read and parsed at most once."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._parsed: dict[str, ast.Module | None] = {}
+
+    def _module(self, file_part: str) -> ast.Module | None:
+        if file_part not in self._parsed:
+            path = self.root / file_part
+            self._parsed[file_part] = ast.parse(path.read_text(encoding='utf-8')) if path.is_file() else None
+        return self._parsed[file_part]
+
+    def _defines(self, node_id: str) -> bool:
+        file_part, *chain = node_id.split('::')
+        tree = self._module(file_part) if chain else None
+        if tree is None:
+            return False
+        chain[-1] = chain[-1].split('[', 1)[0]
+        return _defines_test(tree, chain)
+
+    def missing(self, node_ids: Iterable[str]) -> tuple[str, ...]:
+        return tuple(node_id for node_id in node_ids if not self._defines(node_id))
+
+
 def missing_tests(node_ids: Iterable[str], tests_root: Path) -> tuple[str, ...]:
     """The pytest node ids, relative to ``tests_root``, whose file or test function does not exist."""
-    missing: list[str] = []
-    for node_id in node_ids:
-        file_part, *chain = node_id.split('::')
-        path = tests_root / file_part
-        if not chain or not path.is_file():
-            missing.append(node_id)
-            continue
-        chain[-1] = chain[-1].split('[', 1)[0]
-        if not _defines_test(ast.parse(path.read_text(encoding='utf-8')), chain):
-            missing.append(node_id)
-    return tuple(missing)
+    return _TestModules(tests_root).missing(node_ids)
 
 
 class Disposition(enum.StrEnum):
@@ -229,13 +265,13 @@ class RowProblem:
         return f'{self.key}: {self.issue}'
 
 
-def _row_issues(row: CensusRow, tests_root: Path) -> list[str]:
+def _row_issues(row: CensusRow, tests: _TestModules) -> list[str]:
     issues: list[str] = []
     if row.disposition in TESTED_DISPOSITIONS:
         if not row.tests:
             issues.append(f'a {row.disposition} row names no test')
-        if missing := missing_tests(row.tests, tests_root):
-            issues.append(f'names tests that do not exist under {tests_root}: {list(missing)}')
+        if missing := tests.missing(row.tests):
+            issues.append(f'names tests that do not exist under {tests.root}: {list(missing)}')
     if row.disposition is Disposition.RETIRING and not _NAMES_A_TASK.search(row.reason):
         issues.append("a retiring row's reason names no retiring 'task N'")
     return issues
@@ -243,8 +279,9 @@ def _row_issues(row: CensusRow, tests_root: Path) -> list[str]:
 
 def census_row_problems(census: Mapping[CensusKey, CensusRow], tests_root: Path) -> tuple[RowProblem, ...]:
     """Every rule a row breaks: a tested disposition names existing tests, and a retiring row names its retiring task."""
+    tests = _TestModules(tests_root)
     return tuple(
         RowProblem(key, issue)
         for key, row in census.items()
-        for issue in _row_issues(row, tests_root)
+        for issue in _row_issues(row, tests)
     )

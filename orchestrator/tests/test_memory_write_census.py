@@ -31,6 +31,7 @@ from shared.testing_code_writer_contract import (
     CensusRow,
     Disposition,
     WriteSite,
+    census_failure_message,
     census_row_problems,
     judge_census,
     write_sites,
@@ -92,12 +93,7 @@ def _listed_counts() -> dict[CensusKey, int]:
 def test_every_write_site_is_listed(tree_pass: TreePass) -> None:
     verdict = judge_census(_found(tree_pass, ANALYSIS), _listed_counts())
 
-    assert verdict.unlisted == (), (
-        f'write sites under {ORCHESTRATOR_SRC_DIR} that CENSUS does not list: {list(verdict.unlisted)}. '
-        'List each with its count, disposition and reason; a CODE_WRITER or MODEL_PROSE row '
-        "also names the behaviour test, in the writer's own module test file, that holds it to C5."
-    )
-    assert verdict.stale == (), f'CENSUS rows with fewer sites than listed: {list(verdict.stale)}'
+    assert verdict.agrees, census_failure_message(verdict, ORCHESTRATOR_SRC_DIR)
 
 
 def test_every_row_keeps_the_census_rules() -> None:
