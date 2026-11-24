@@ -291,17 +291,35 @@ class TestRestoredHoldEndsWithItsRequest:
         assert _TID not in _held(scheduler)
         block_write.assert_not_awaited()
 
-    async def test_a_worker_shutdown_outcome_keeps_the_hold(self, tmp_path: Path) -> None:
+    async def test_a_worker_shutdown_outcome_while_the_harness_drains_keeps_the_hold(
+        self, tmp_path: Path,
+    ) -> None:
         h, scheduler, store = _scene(tmp_path)
         _stub_routing_writes(scheduler)
         request = _request()
         await recover_requests(h, request)
+        h._draining = True
 
         request.result.set_result(MERGE_WORKER_SHUTDOWN_OUTCOME)
         await drain_background_tasks(h)
 
         assert _held(scheduler)[_TID] == _keys(h, _FILES)
         assert _event_data(store, 'lock_released', _TID) == []
+
+    async def test_a_worker_shutdown_outcome_mid_run_releases_the_hold(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, _store = _scene(tmp_path)
+        block_write = _stub_routing_writes(scheduler)
+        request = _request()
+        await recover_requests(h, request)
+
+        request.result.set_result(MERGE_WORKER_SHUTDOWN_OUTCOME)
+        await drain_background_tasks(h)
+
+        assert _TID not in _held(scheduler)
+        assert not scheduler.is_actively_held(_TID)
+        block_write.assert_not_awaited()
 
     async def test_a_task_dispatched_since_the_restore_keeps_its_workflows_locks(
         self, tmp_path: Path,

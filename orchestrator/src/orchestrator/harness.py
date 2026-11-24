@@ -13673,6 +13673,7 @@ class Harness:
             merge_halt=self._merge_worker,
             event_store=self.event_store,
             holds=holds,
+            stopping=lambda: self._draining,
         ).adopt(requests, schedule=self._schedule_coro_threadsafe)
         await holds.restore(requests)
         logger.info(

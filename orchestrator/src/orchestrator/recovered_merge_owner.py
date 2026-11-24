@@ -125,8 +125,11 @@ class RecoveredMergeOwner:
     - Transient (``superseded``): left to the stranded sweep.
     - Durable or unclassified failure: blocks the task and files one L1 under its block category.
     - Restored hold: the file hold *holds* restored for the task at start-up
-      (task 10093) ends after the outcome is routed, for every outcome but the
-      worker's shutdown, and on a cancelled future.
+      (task 10093) ends after the outcome is routed, and on a cancelled future.
+      Only the worker's shutdown outcome while *stopping* says the process is
+      stopping leaves it held, for the next start to restore; mid-run, that
+      outcome comes from a merger loop that restarts without re-reading the
+      journal, so the hold ends and the stranded sweep can re-pend the task.
 
     The merge worker's shutdown outcome is not terminal: the journal keeps the
     request and the next start restores and re-adopts it, so it is left alone.
@@ -138,6 +141,7 @@ class RecoveredMergeOwner:
     merge_halt: MergeHaltControl | None
     event_store: EventStore | None = None
     holds: RecoveredMergeHolds | None = None
+    stopping: Callable[[], bool] = lambda: False
 
     def adopt(self, requests: Iterable[RecoveredRequest], *, schedule: ScheduleCoro) -> None:
         for request in requests:
@@ -187,7 +191,7 @@ class RecoveredMergeOwner:
                 'Recovered merge request %s for task %s finished %s: %s',
                 request.request_id, request.task_id, outcome.status, settled.value,
             )
-        if settled is not Settled.WORKER_SHUTDOWN:
+        if settled is not Settled.WORKER_SHUTDOWN or not self.stopping():
             self._release_hold(request)
         return settled
 
