@@ -485,7 +485,9 @@ class TestParkedLoop:
         slots.absorbs_one_cancel = {'1'}
         h = _harness(tmp_path, dispatch, slots)
         _shrink_shutdown_drains(h, monkeypatch)
-        h.mcp.stop = AsyncMock(side_effect=lambda: slots.events.append('mcp.stop'))  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            h.mcp, 'stop', AsyncMock(side_effect=lambda: slots.events.append('mcp.stop')),
+        )
         main = asyncio.current_task()
         assert main is not None
 
