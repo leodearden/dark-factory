@@ -99,6 +99,7 @@ from orchestrator.verify_cache.recorder import (
     record_greens,
 )
 from orchestrator.verify_cache.registry import Registry
+from orchestrator.verify_cache.remote_view import ShippedView
 from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
@@ -380,6 +381,9 @@ class MergeVerifySpec:
                           read by verify.py::_merge_config_only_diff_forces_full_gate
                           (task 7465). None (a pre-7465 spec) keeps the host's
                           own globs; a carried value, () included, replaces them.
+    verify_cache        : the dispatcher's registry view (A5), merge-deciding like
+                          the task-2822 profile; set only by
+                          RemoteRunner.run_merge_verify. None runs every unit.
 
     Note
     ----
@@ -414,6 +418,7 @@ class MergeVerifySpec:
     scope_cargo: bool | None = None
     # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
     merge_config_only_full_gate_globs: tuple[str, ...] | None = None
+    verify_cache: ShippedView | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -437,6 +442,7 @@ class MergeVerifySpec:
                 if self.merge_config_only_full_gate_globs is not None
                 else None
             ),
+            "verify_cache": self.verify_cache.to_wire() if self.verify_cache is not None else None,
         }
 
     @classmethod
@@ -446,6 +452,7 @@ class MergeVerifySpec:
         # default to None — same d.get idiom as merge_verify_workspace/breadth.
         _gvc = d.get("global_verify_command")
         _globs = d.get("merge_config_only_full_gate_globs")
+        _view = d.get("verify_cache")
         return cls(
             verify_commands=tuple(VerifyCommand.from_dict(vc) for vc in d["verify_commands"]),
             unscoped_typecheck=UnscopedTypecheckSpec.from_dict(d["unscoped_typecheck"]),
@@ -463,6 +470,7 @@ class MergeVerifySpec:
             verify_cold_preprovision_command=d.get("verify_cold_preprovision_command", ""),
             scope_cargo=d.get("scope_cargo"),
             merge_config_only_full_gate_globs=tuple(_globs) if _globs is not None else None,
+            verify_cache=ShippedView.from_wire(_view) if _view is not None else None,
         )
 
 

@@ -74,6 +74,7 @@ class TestShape:
             'attempt_id',
             'task_id',
             'tip_sha',
+            'verify_cache',
         }
 
     def test_is_frozen(self):
