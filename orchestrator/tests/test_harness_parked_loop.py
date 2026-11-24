@@ -47,7 +47,9 @@ class _Slots:
     Mirrors ``Harness._run_slot``'s contract: it releases its lease on exit
     and turns a cancel into a synthetic CANCELLED report.  A slot whose id is
     in ``immune`` ignores every cancel and every gate, ``open_all``'s
-    included, until ``immune_release`` is set.
+    included, until ``immune_release`` is set.  A slot whose id is in
+    ``absorbs_one_cancel`` ignores its gate and its first cancel, noting
+    ``'slot <id> absorbed a cancel'`` in ``events``, and ends on the next.
     """
 
     def __init__(self) -> None:
@@ -56,6 +58,8 @@ class _Slots:
         self.finished: set[str] = set()
         self.immune: set[str] = set()
         self.immune_release = asyncio.Event()
+        self.absorbs_one_cancel: set[str] = set()
+        self.events: list[str] = []
         self._all_open = False
 
     def open_all(self) -> None:
@@ -72,9 +76,12 @@ class _Slots:
             if tid in self.immune:
                 await _ignore_cancels_until(self.immune_release)
                 return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.CANCELLED)
+            if tid in self.absorbs_one_cancel:
+                await _absorb_one_cancel(lambda: self.events.append(f'slot {tid} absorbed a cancel'))
             await self.gates[tid].wait()
             return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.DONE)
         except asyncio.CancelledError:
+            self.events.append(f'slot {tid} unwound')
             return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.CANCELLED)
         finally:
             self.finished.add(tid)
@@ -103,6 +110,14 @@ class _HangGuard:
     def cancel(self) -> None:
         if self._handle is not None:
             self._handle.cancel()
+
+
+async def _absorb_one_cancel(on_absorbed: Callable[[], None]) -> None:
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        on_absorbed()
+    await asyncio.Event().wait()
 
 
 async def _ignore_cancels_until(release: asyncio.Event) -> None:
@@ -460,6 +475,31 @@ class TestParkedLoop:
             slots.immune_release.set()
             if immune_slots:
                 await asyncio.wait(immune_slots)
+
+    async def test_slot_surviving_one_cancel_unwinds_in_the_workflow_drain(
+        self, tmp_path: Path, fleet_dir: Path,
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.ERROR, logger='orchestrator.harness')
+        dispatch, slots = _Dispatch(['1', '2']), _Slots()
+        slots.absorbs_one_cancel = {'1'}
+        h = _harness(tmp_path, dispatch, slots)
+        _shrink_shutdown_drains(h, monkeypatch)
+        h.mcp.stop.side_effect = lambda: slots.events.append('mcp.stop')
+        main = asyncio.current_task()
+        assert main is not None
+
+        async def sigterm_while_parked() -> None:
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            main.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await _run_driven(h, slots, sigterm_while_parked)
+
+        assert slots.events == ['slot 1 absorbed a cancel', 'slot 1 unwound', 'mcp.stop']
+        assert _harness_errors_naming(caplog, 'workflow-1') == []
+        outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
+        assert outcomes == {'1': WorkflowOutcome.CANCELLED}
 
     async def test_polite_restart_waits_for_the_dispatch_loop(
         self, tmp_path: Path, fleet_dir: Path,

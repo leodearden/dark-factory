@@ -3267,7 +3267,7 @@ class Harness:
     _SHUTDOWN_STRAGGLER_DRAIN_SECS: float = 5.0
 
     async def _sweep_straggler_tasks(self) -> None:
-        """Cancel every other live task once; never wait past ``_SHUTDOWN_STRAGGLER_DRAIN_SECS``."""
+        """Cancel every other live task; never wait past ``_SHUTDOWN_STRAGGLER_DRAIN_SECS``."""
         current = asyncio.current_task()
         stragglers = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
         if not stragglers:

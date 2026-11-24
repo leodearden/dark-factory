@@ -359,6 +359,15 @@ class TestCancelAllWithin:
         assert first.cancelled()
         assert second.cancelled()
 
+    async def test_a_task_that_survives_one_cancel_is_ended_by_the_second_and_not_returned(self):
+        survivor = asyncio.create_task(_survives_cancels(1, asyncio.Event()))
+        sibling = asyncio.create_task(_survives_cancels(0, asyncio.Event()))
+        await asyncio.sleep(0)
+
+        assert await cancel_all_within([survivor, sibling], timeout_secs=1.0) == set()
+        assert survivor.cancelled()
+        assert sibling.cancelled()
+
     async def test_a_cancel_immune_task_does_not_extend_the_wait_and_is_returned_still_running(self):
         release = asyncio.Event()
         sibling = asyncio.create_task(_survives_cancels(0, asyncio.Event()))
