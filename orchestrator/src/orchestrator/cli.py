@@ -218,12 +218,27 @@ def _run_with_bounded_teardown(
             armed.append(_force_exit_after_delay(
                 teardown_secs, _exit=_exit, phase="in asyncio.run()'s teardown",
             ))
+            _log_tasks_left_for_teardown()
 
     try:
         return asyncio.run(_main_then_arm())
     finally:
         for handle in armed:
             handle.disarm()
+
+
+def _log_tasks_left_for_teardown() -> None:
+    """Name, at WARNING, every task asyncio.run()'s teardown will cancel and wait on.
+
+    The teardown watchdog's dump shows thread stacks only, so this line is what
+    names the task that ignored its cancel.
+    """
+    current = asyncio.current_task()
+    leftovers = sorted(t.get_name() for t in asyncio.all_tasks() if t is not current)
+    if leftovers:
+        logging.getLogger(__name__).warning(
+            "asyncio.run()'s teardown will cancel and wait on %d task(s): %s", len(leftovers), leftovers,
+        )
 
 
 def _make_cancel_handler(main_task, logger):

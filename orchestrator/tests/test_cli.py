@@ -608,6 +608,30 @@ class TestRunWithBoundedTeardown:
         assert result == 'report'
         assert armed_during_main == [set()], 'the teardown watchdog was armed before main ended'
 
+    def test_the_tasks_left_for_the_teardown_are_named(self, caplog):
+        caplog.set_level(logging.WARNING, logger='orchestrator.cli')
+        leftovers: list[asyncio.Task] = []
+
+        async def main():
+            leftovers.append(asyncio.create_task(asyncio.sleep(3600), name='late-leftover'))
+            return 'report'
+
+        cli_module._run_with_bounded_teardown(main, teardown_secs=3600, _exit=lambda _code: None)
+
+        assert [r.getMessage() for r in caplog.records if 'late-leftover' in r.getMessage()], (
+            'a task left for the teardown must be named before the teardown waits on it'
+        )
+
+    def test_nothing_is_logged_when_no_task_is_left(self, caplog):
+        caplog.set_level(logging.WARNING, logger='orchestrator.cli')
+
+        async def main():
+            return 'report'
+
+        cli_module._run_with_bounded_teardown(main, teardown_secs=3600, _exit=lambda _code: None)
+
+        assert [r for r in caplog.records if r.name == 'orchestrator.cli'] == []
+
     def test_a_clean_teardown_disarms_the_watchdog(self):
         exits: list[int] = []
         leftovers: list[asyncio.Task] = []
