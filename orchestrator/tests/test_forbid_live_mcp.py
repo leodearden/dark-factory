@@ -15,7 +15,6 @@ import pytest
 from _live_mcp_guard import assert_no_live_attempts
 from shared.mcp_session import McpSession
 
-import orchestrator.mcp_lifecycle
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
 
@@ -26,8 +25,7 @@ _REAL_CALL = McpSession.call
 
 
 @pytest.fixture
-def bare_scheduler(tmp_path, monkeypatch) -> Scheduler:
-    monkeypatch.setattr(orchestrator.mcp_lifecycle, '_session', None)
+def bare_scheduler(tmp_path) -> Scheduler:
     return Scheduler(OrchestratorConfig(project_root=tmp_path))
 
 

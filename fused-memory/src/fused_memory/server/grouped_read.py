@@ -53,14 +53,9 @@ from fused_memory.config.schema import WriteTriageConfig
 from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX, SUPERSEDED_BY_METADATA_KEY
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult, mem0_hit_attribution
-
-# The canonical 'data' → 'memory' → 'content' payload-key fallback that turns
-# a raw Qdrant payload into its text.  IMPORTED rather than re-declared: the
-# search path and the point-id path already disagree about which key holds
-# the text, and a third private copy would be a fourth place to drift (INV-5).
-from fused_memory.services.memory_service import _MEM0_CONTENT_KEYS
 from fused_memory.utils.async_utils import gather_collect
 from fused_memory.utils.clip_disclosure import elide_text
+from fused_memory.utils.mem0_content_keys import mem0_payload_text
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Iterable, Mapping, Sequence
@@ -218,15 +213,6 @@ def is_contested_child(meta: Mapping[str, Any] | None) -> bool:
     return bool((meta or {}).get(CONTESTED_METADATA_KEY))
 
 
-def _child_text(payload: Mapping[str, Any]) -> str:
-    """First non-empty string among the canonical mem0 content keys."""
-    for key in _MEM0_CONTENT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ''
-
-
 def amendment_text(text: str, cap: int = DEFAULT_AMENDMENT_TEXT_CHARS) -> str:
     """What a reader of the parent sees of an amendment: *text* up to *cap*, a cut marked and counted."""
     return elide_text(text, cap, field='content').text
@@ -265,7 +251,7 @@ def _amendment_entry(row: Mapping[str, Any], amendment_text_chars: int) -> dict[
     payload = row.get('metadata') or {}
     entry = {
         'id': row.get('id'),
-        'content': amendment_text(_child_text(payload), amendment_text_chars),
+        'content': amendment_text(mem0_payload_text(payload), amendment_text_chars),
         'created_at': row.get('created_at'),
         'kind': payload.get('kind', AMENDMENT_KIND),
     }
@@ -422,8 +408,7 @@ def child_parent_id(meta: Mapping[str, Any] | None) -> str | None:
 
     Modules that ask "is this Mem0 record a child, and of what?" call this
     rather than restating the rule. One copy remains:
-    ``services/topic_anchor.py::_is_child_shaped``, kept because importing this
-    module from ``services`` would close an import cycle. That copy is
+    ``services/topic_anchor.py::_is_child_shaped``. That copy is
     stricter: it answers "not a child" for a non-``str`` ``kind``, where this
     function raises ``TypeError`` on an unhashable one, so swapping it for a
     call to this function must keep that guard. Task 6720 moves this function

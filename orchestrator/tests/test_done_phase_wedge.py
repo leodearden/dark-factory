@@ -33,6 +33,7 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import WorkflowState
 
@@ -140,7 +141,7 @@ async def _hard_cancel_a_slot_wedged_after_done(
     sem = asyncio.Semaphore(0)
 
     with patch('orchestrator.harness.build_workflow', return_value=workflow):
-        slot = asyncio.create_task(harness._run_slot(assignment, sem), name=f'workflow-{TID}')
+        slot = asyncio.create_task(harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem)), name=f'workflow-{TID}')
         await wait_responsive(
             wedging_scheduler.cancel_absorbed.wait(), timeout=BARRIER,
             label='DONE-phase cleanup wedges on the heartbeat',

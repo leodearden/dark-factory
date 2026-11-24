@@ -22,7 +22,7 @@ from dashboard.data.memory import (
     plan_route_datum,
     write_queue_datum,
 )
-from dashboard.data.merge_queue import MergeAttempts, TrainThroughput
+from dashboard.data.merge_queue import MergeAttempts, TrainThroughput, trailing_landing_rates
 from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.project_labels import ProjectLabels
@@ -755,9 +755,12 @@ _MQ_MEASURED_QUEUE = {
     'runs_db_present': True,
     'speculative': _mq_read({'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}),
     'recent_total': _mq_read(0),
-    'depth_timeseries': _mq_read({'labels': [], 'values': [], 'bucket_minutes': 15}),
+    'depth_timeseries': _mq_read({'labels': [], 'values': []}),
     'attempts': _mq_read(MergeAttempts()),
     'train_throughput': _mq_read(_MQ_ZERO_THROUGHPUT),
+    'landing_rate': _mq_read({
+        'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }),
 }
 """The queue fields the route resolves for every project: here, a measured empty queue."""
 
@@ -778,14 +781,14 @@ def test_shape_merge_queue_relabels_and_renames_depth():
             'recent': [_mq_titled('17')],
             'active': [],
             **_MQ_MEASURED_QUEUE,
-            'depth_timeseries': _mq_read({'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}),
+            'depth_timeseries': _mq_read({'labels': [0, 1], 'values': [3, 4]}),
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     assert 'dark-factory' in body['MERGE_QUEUE']
     section = body['MERGE_QUEUE']['dark-factory']
     assert section['depth']['state'] == 'fresh'
-    assert section['depth']['value'] == {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}
+    assert section['depth']['value'] == {'labels': [0, 1], 'values': [3, 4]}
     assert _task_ids(section['recent']) == ['17']
     # Default: no halt_status passed → offline fallback per project.
     assert section['halt'] == {'offline': True}
@@ -793,24 +796,65 @@ def test_shape_merge_queue_relabels_and_renames_depth():
 
 def test_shape_merge_queue_trims_the_depths_leading_zero_buckets():
     """Leading empty buckets are dropped; an interior zero is an activity gap and stays."""
-    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 3, 0, 4], 'bucket_minutes': 15}
+    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 3, 0, 4]}
 
     depth = _shaped(depth_timeseries=_mq_read(series))['depth']
 
-    assert depth['value'] == {'labels': ['b', 'c', 'd'], 'values': [3, 0, 4], 'bucket_minutes': 15}
-
-
-def test_shape_merge_queue_serves_no_width_for_a_depth_that_names_none():
-    """A depth series without bucket_minutes serves None for it, never a guessed width."""
-    depth = _shaped(depth_timeseries=_mq_read({'labels': [], 'values': []}))['depth']
-
-    assert depth['value'] == {'labels': [], 'values': [], 'bucket_minutes': None}
+    assert depth['value'] == {'labels': ['b', 'c', 'd'], 'values': [3, 0, 4]}
 
 
 def test_shape_merge_queue_serves_an_unread_depth_as_unknown():
     unread = unknown_datum('the merge_attempt depth series could not be read from runs.db', 30)
 
     assert _shaped(depth_timeseries=unread)['depth'] == unread.to_wire()
+
+
+def test_shape_merge_queue_serves_the_landing_rate_with_leading_zero_points_trimmed():
+    """Leading zero points are dropped; an interior zero is a measured lull and stays."""
+    series = {
+        'labels': ['a', 'b', 'c', 'd'], 'values': [0, 2.0, 0, 1.5],
+        'trailing_minutes': 1440, 'window_mean_per_day': 0.5,
+    }
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert rate['state'] == 'fresh'
+    assert rate['value'] == {
+        'labels': ['b', 'c', 'd'], 'values': [2.0, 0, 1.5],
+        'trailing_minutes': 1440, 'window_mean_per_day': 0.5,
+    }
+
+
+def test_shape_merge_queue_serves_a_trimmed_landing_rates_window_mean_as_landings_per_window_day():
+    """The served mean counts the whole window, not the points left after the leading-zero trim."""
+    now = MQ_SERVED_AT
+    series = trailing_landing_rates(
+        [now - timedelta(hours=49), now - timedelta(hours=1)], now=now, hours=168,
+    )
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert len(rate['value']['labels']) < len(series['labels'])
+    assert rate['value']['window_mean_per_day'] == pytest.approx(2 / 7)
+
+
+def test_shape_merge_queue_serves_a_never_landed_window_as_a_measured_empty_rate():
+    series = {
+        'labels': ['a', 'b'], 'values': [0, 0], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert rate['state'] == 'fresh'
+    assert rate['value'] == {
+        'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }
+
+
+def test_shape_merge_queue_serves_an_unread_landing_rate_as_unknown():
+    unread = unknown_datum('the landings could not be read from runs.db: OperationalError: boom', 30)
+
+    assert _shaped(landing_rate=unread)['landing_rate'] == unread.to_wire()
 
 
 def test_shape_merge_queue_carries_the_recent_window_total():
@@ -2298,9 +2342,12 @@ class TestShapeMergeQueueServedDatums:
         ('speculative', 'speculative',
          {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}),
         ('recent_total', 'recent_total', 0),
-        ('depth_timeseries', 'depth', {'labels': [], 'values': [], 'bucket_minutes': 15}),
+        ('depth_timeseries', 'depth', {'labels': [], 'values': []}),
         ('attempts', 'attempts', MergeAttempts()),
         ('train_throughput', 'train_throughput', {}),
+        ('landing_rate', 'landing_rate', {
+            'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+        }),
     ])
     def test_a_bare_value_is_a_wiring_bug(self, raw_key, wire_name, bare):
         with pytest.raises(DatumContractError) as excinfo:

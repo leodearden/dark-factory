@@ -92,8 +92,16 @@ from orchestrator.agents.write_set import (
     compute_write_set,
     ensure_claude_fleet_dir,
 )
+from orchestrator.architect_phase_verdict import (
+    clear_exit_reports,
+    find_plan_exit_conflict,
+    is_confirmed,
+    newly_confirmed,
+    read_exit_reports,
+)
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    Plan,
     ReviewAggregation,
     ReviewsRootMissing,
     TaskArtifacts,
@@ -112,6 +120,7 @@ from orchestrator.branch_stack import (
 from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
+from orchestrator.decision_note import decision_note_fields
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
@@ -5851,6 +5860,47 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.PLANNED
 
+    async def _architect_prompt_unless_confirmed(
+        self, build_prompt: PromptBuilder, plan_before_invoke: Plan | None,
+    ) -> str | None:
+        """The architect's prompt, or None once the plan on disk carries a confirmation *plan_before_invoke* did not."""
+        assert self.artifacts is not None
+        plan = self.artifacts.peek_plan_model()
+        if newly_confirmed(plan, plan_before_invoke):
+            logger.warning(
+                'Task %s: the architect confirmed its plan (_finalized_at %s, was %s) '
+                'before its run ended; declining the re-dispatch (task 6814)',
+                self.task_id, plan.lifecycle.confirmed_at,
+                plan_before_invoke.lifecycle.confirmed_at if plan_before_invoke else None,
+            )
+            return None
+        return await build_prompt()
+
+    async def _hold_on_plan_exit_conflict(self, plan_before_phase: Plan | None) -> WorkflowOutcome | None:
+        """Block behind one L1 when this phase both confirmed a plan and wrote exit reports; None when it did not."""
+        assert self.artifacts is not None
+        conflict = find_plan_exit_conflict(
+            self.artifacts.peek_plan_model(), plan_before_phase, read_exit_reports(self.artifacts),
+        )
+        if conflict is None:
+            return None
+        logger.error(
+            'Task %s: the architect phase confirmed a plan and also wrote exit report(s) %s',
+            self.task_id, [report.value for report in conflict.reports],
+        )
+        await self._stop_and_clear_steward()
+        outcome = await self._mark_blocked(
+            conflict.summary(),
+            detail=conflict.detail(),
+            escalate_to_human=True,
+            category='design_concern',
+            dry_run_spawn=DryRunSpawn.NEVER,
+        )
+        # Cleared only once the escalation is filed, so a raising
+        # _mark_blocked leaves the evidence for the next attempt.
+        clear_exit_reports(self.artifacts, conflict.reports)
+        return outcome
+
     async def _run_architect_for_plan(
         self, build_prompt: PromptBuilder,
     ) -> WorkflowOutcome | None:
@@ -5870,12 +5920,20 @@ class TaskWorkflow:
                     self.task_id, status='pending', level=0,
                 )
             }
+        plan_before_phase = self.artifacts.peek_plan_model()
 
         result: AgentResult | None = None
         rebase_retry_used = False
         for _outer_attempt in range(2):  # at most one rebase-retry round-trip
             for attempt in range(2):
-                result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
+                result = await self._invoke(
+                    ARCHITECT,
+                    partial(
+                        self._architect_prompt_unless_confirmed, build_prompt,
+                        self.artifacts.peek_plan_model(),
+                    ),
+                    self.worktree,
+                )
 
                 if not result.success:
                     cls = classify_agent_failure(result)
@@ -5884,15 +5942,14 @@ class TaskWorkflow:
                     # otherwise cut off).  A plan carrying ``_finalized_at`` was
                     # explicitly declared complete, so it is safe to use despite
                     # the run-level failure — the same validation gates below
-                    # still apply.  Without the marker the plan is an unfinished
-                    # partial; block and let the next session's completion pass
-                    # finish it.
-                    salvaged = self.artifacts.read_plan()
-                    if (
-                        salvaged
-                        and salvaged.get('_finalized_at')
-                        and salvaged.get('steps')
-                    ):
+                    # still apply.  A re-dispatch declined by
+                    # _architect_prompt_unless_confirmed lands here too, since
+                    # newly_confirmed implies is_confirmed.  Without the marker
+                    # the plan is an unfinished partial; block and let the next
+                    # session's completion pass finish it.
+                    salvaged_plan = self.artifacts.read_plan_model()
+                    salvaged = salvaged_plan.to_json() if salvaged_plan is not None else {}
+                    if is_confirmed(salvaged_plan):
                         logger.warning(
                             'Task %s: architect run failed (%s) but a finalized '
                             'plan (%d steps) is on disk — salvaging instead of '
@@ -5988,7 +6045,10 @@ class TaskWorkflow:
             # merge submit (less decisive than already_done's clean DONE — the
             # work is on the BRANCH, not main — but more decisive than a
             # re-looping blocking_dependency); blocking_dependency may re-loop
-            # the architect.
+            # the architect.  A plan confirmed in this same phase turns any of
+            # them into a conflict, held for a ruling before routing (task 6814).
+            if outcome := await self._hold_on_plan_exit_conflict(plan_before_phase):
+                return outcome
             verdict = await self._route_task_verdict_report()
             if verdict is not None:
                 return verdict
@@ -8790,9 +8850,7 @@ class TaskWorkflow:
         reason = str(report.get('reason') or '').strip()
         evidence = str(report.get('evidence') or '')
 
-        if self._steward:
-            await self._steward.stop()
-            self._steward = None
+        await self._stop_and_clear_steward()
 
         self.artifacts.clear_unactionable_task()
 
@@ -8842,9 +8900,7 @@ class TaskWorkflow:
         evidence = str(report.get('evidence') or '')
         proposed_resolution = str(report.get('proposed_resolution') or '')
 
-        if self._steward:
-            await self._steward.stop()
-            self._steward = None
+        await self._stop_and_clear_steward()
 
         if not premise:
             result = await self._mark_blocked(
@@ -18696,7 +18752,11 @@ class TaskWorkflow:
             logger.warning(f'Failed to write completion to memory: {e}')
 
     async def _write_decisions_to_memory(self) -> None:
-        """Write plan design decisions to fused-memory."""
+        """Write plan design decisions to fused-memory, each declaring this task.
+
+        The content and declaration come from
+        orchestrator/src/orchestrator/decision_note.py::decision_note_fields.
+        """
         decisions = self.plan.get('design_decisions', [])
         if not decisions:
             return
@@ -18710,7 +18770,7 @@ class TaskWorkflow:
                         self.mcp.url,
                         'add_memory',
                         {
-                            'content': f"Decision: {decision['decision']}\nRationale: {decision['rationale']}",
+                            **decision_note_fields(self.task_id, decision),
                             'category': 'decisions_and_rationale',
                             'project_id': self.config.fused_memory.project_id,
                             'agent_id': f'orchestrator-task-{self.task_id}',
@@ -19089,7 +19149,7 @@ class TaskWorkflow:
         await a cancelled loop that can never publish; it also drops this
         steward's cost from the report ``harness.py::_run_slot`` reads off
         ``workflow._steward``.  A failing ``stop()`` is suppressed: it must not
-        turn a park or a cleared gate into a workflow crash.
+        turn a park, a cleared gate or an L1 block into a workflow crash.
         """
         if self._steward is not None:
             with contextlib.suppress(Exception):

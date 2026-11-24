@@ -79,7 +79,8 @@ async def _cluster(server: FastMCP) -> tuple[str, str]:
 
 async def _closed(server: FastMCP, l2_id: str) -> None:
     resolved = await _resolved(
-        server, escalation_id=l2_id, resolution='decided', action='close_only'
+        server, escalation_id=l2_id, resolution='decided', action='close_only',
+        resolution_class='actionable',
     )
     assert resolved['status'] in {'resolved', 'dismissed'}
 

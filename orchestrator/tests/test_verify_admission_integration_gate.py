@@ -67,8 +67,14 @@ import pytest
 from _orch_helpers import ADMISSION_TEST_CMD, admission_leg_for_cmd, admission_module_config
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.defect_tests_config import DefectTestsConfig, DefectTestsMode
 from orchestrator.verify import run_full_verification, run_verification
 from orchestrator.verify_admission_gate import gate_for
+from orchestrator.verify_cmd import parse_config_command, render, with_defect_plugin
+
+#: The configured test command as the test leg runs it: the default defect
+#: mode (shadow) adds ``-p _df_defect_plugin``.
+INJECTED_TEST_CMD = render(with_defect_plugin(parse_config_command(ADMISSION_TEST_CMD)))
 
 # ---------------------------------------------------------------------------
 # Configurable spy for orchestrator.verify._run_cmd
@@ -320,7 +326,7 @@ class TestMergeNeverBlocks:
                 expected_cmd = (
                     shlex.join(['nice', '-n', '5'])
                     + ' /bin/bash -c '
-                    + shlex.quote(ADMISSION_TEST_CMD)
+                    + shlex.quote(INJECTED_TEST_CMD)
                 )
                 assert merge_call['cmd'] == expected_cmd, (
                     f'expected the merge test leg wrapped with the nice -n 5 '
@@ -444,7 +450,7 @@ class TestSweepYieldsAndInterleaves:
         expected_background_cmd = (
             shlex.join(['nice', '-n', '19', 'ionice', '-c3'])
             + ' /bin/bash -c '
-            + shlex.quote(ADMISSION_TEST_CMD)
+            + shlex.quote(INJECTED_TEST_CMD)
         )
         assert all(c['cmd'] == expected_background_cmd for c in background_test_calls), (
             f'expected both sweep subproject test legs wrapped with the '
@@ -680,6 +686,7 @@ class TestFailOpen:
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
             verify_admission_enabled=False,
+            defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
         )
         worktree = tmp_path / 'wt'
         worktree.mkdir()
@@ -756,7 +763,7 @@ class TestFailOpen:
         expected_cmd = (
             shlex.join(['nice', '-n', '15', 'ionice', '-c2', '-n7'])
             + ' /bin/bash -c '
-            + shlex.quote(ADMISSION_TEST_CMD)
+            + shlex.quote(INJECTED_TEST_CMD)
         )
         assert test_calls[0]['cmd'] == expected_cmd, (
             f'expected the task nice-tier wrap to still apply even though '

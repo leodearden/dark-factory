@@ -18,7 +18,7 @@ Sentinel literals use the ``\\x3c`` escape for ``<`` (task 3083 plan pre-1).
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -69,7 +69,7 @@ class TestScanMemoryContentTool:
             needles=None,
             filters=None,
             exhaustive=False,
-            limit=None,
+            limit=1000,
         )
 
     @pytest.mark.asyncio
@@ -144,6 +144,72 @@ class TestScanMemoryContentTool:
         await server._tool_manager.call_tool('scan_memory_content', {'project_id': _PROJECT_ID})
 
         assert mock_service.scan_memory_content.call_args.kwargs['needles'] is None
+
+    @pytest.mark.asyncio
+    async def test_an_omitted_limit_walks_at_most_1000_records(self):
+        """The same default as get_memories_by_metadata: it bounds the walk,
+        and so the number of matches, since matches <= walked <= limit."""
+        mock_service = AsyncMock()
+        mock_service.scan_memory_content = AsyncMock(return_value=_EMPTY_RESULT)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'scan_memory_content', {'project_id': _PROJECT_ID}
+        )
+
+        assert mock_service.scan_memory_content.call_args.kwargs['limit'] == 1000
+        assert result['limit'] == 1000
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_null_limit_walks_to_the_end(self):
+        mock_service = AsyncMock()
+        mock_service.scan_memory_content = AsyncMock(return_value=_EMPTY_RESULT)
+        server = create_mcp_server(mock_service)
+
+        await server._tool_manager.call_tool(
+            'scan_memory_content', {'project_id': _PROJECT_ID, 'limit': None}
+        )
+
+        assert mock_service.scan_memory_content.call_args.kwargs['limit'] is None
+
+    @pytest.mark.asyncio
+    async def test_a_match_echoes_its_metadata_without_the_text_keys(self):
+        """The text is already in ``excerpt``, and get_memory_by_id returns
+        the full body, so echoing it again in ``metadata`` is pure bulk."""
+        service_match = {
+            'id': 'mem-1',
+            'created_at': '2026-07-27T00:00:00Z',
+            'matched_fragments': ['needle'],
+            'excerpt': 'a needle in prose',
+            'metadata': {
+                'data': 'a needle in prose ' * 500,
+                'memory': 'm',
+                'content': 'c',
+                'category': 'procedural_knowledge',
+                'agent_id': 'a',
+                'created_at': '2026-07-27T00:00:00Z',
+            },
+        }
+        service_result = {'matches': [service_match], 'scanned': 1, 'truncated': False}
+        mock_service = AsyncMock()
+        mock_service.scan_memory_content = AsyncMock(return_value=service_result)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'scan_memory_content', {'project_id': _PROJECT_ID, 'needles': ['needle']}
+        )
+
+        [match] = result['matches']
+        assert match['metadata'] == {
+            'category': 'procedural_knowledge',
+            'agent_id': 'a',
+            'created_at': '2026-07-27T00:00:00Z',
+        }
+        for key in ('id', 'created_at', 'matched_fragments', 'excerpt'):
+            assert match[key] == service_match[key], key
+        assert set(service_match['metadata']) == {
+            'data', 'memory', 'content', 'category', 'agent_id', 'created_at',
+        }, 'the service result must not be mutated'
 
     @pytest.mark.asyncio
     async def test_invalid_project_id_returns_validation_error_without_calling_service(self):
@@ -236,3 +302,59 @@ class TestScanMemoryContentTimeoutSurfaces:
         assert 'error' in result, f'Expected an error dict, got: {result!r}'
         assert result.get('error_type') == 'TimeoutError', f'got: {result!r}'
         assert result.get('matches') != [], 'a timed-out scan must not look clean'
+
+
+class TestScanMemoryContentReportsCustomNeedles:
+    """Real MemoryService + real Mem0Backend, patching ONLY _get_async_qdrant.
+
+    The task 4857 acceptance regression: a record containing a caller's needle
+    came back as the silent ``matches == [] and truncated is False`` shape,
+    because every hit was re-verified with the tool-call-leak detector.  A
+    mocked service cannot see that defect, so the backend runs for real here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_record_containing_the_needle_is_reported(self, mock_config):
+        service = MemoryService(mock_config)
+        service.mem0 = Mem0Backend(mock_config)
+        server = create_mcp_server(service)
+
+        point = MagicMock()
+        point.id = 'prose-1'
+        point.payload = {'data': 'The repo has no JS test runner configured.'}
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(
+            service.mem0, '_get_async_qdrant', AsyncMock(return_value=mock_client)
+        ):
+            result = await server._tool_manager.call_tool(
+                'scan_memory_content',
+                {'project_id': _PROJECT_ID, 'needles': ['no JS test runner']},
+            )
+
+        assert 'error' not in result, f'Unexpected error: {result!r}'
+        assert not (result['matches'] == [] and result['truncated'] is False), (
+            f'a present needle came back as a clean, complete scan: {result!r}'
+        )
+        assert [m['id'] for m in result['matches']] == ['prose-1']
+
+    @pytest.mark.asyncio
+    async def test_an_empty_string_needle_is_a_structured_error(self, mock_config):
+        """'' is in every record, so it would echo the whole walked population."""
+        service = MemoryService(mock_config)
+        service.mem0 = Mem0Backend(mock_config)
+        server = create_mcp_server(service)
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(
+            service.mem0, '_get_async_qdrant', AsyncMock(return_value=mock_client)
+        ):
+            result = await server._tool_manager.call_tool(
+                'scan_memory_content', {'project_id': _PROJECT_ID, 'needles': ['']}
+            )
+
+        assert result.get('error_type') == 'ValueError', f'got: {result!r}'
+        assert 'matches' not in result
+        mock_client.scroll.assert_not_awaited()

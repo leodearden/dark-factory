@@ -47,6 +47,7 @@ from orchestrator.harness import Harness, TaskReport
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
 from orchestrator.merge_lane.worker import _classify_branch_presence
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.warm_lane_pool import LaneState
 from orchestrator.workflow import WorkflowOutcome
 
@@ -304,7 +305,7 @@ async def _run_synthetic_hard_cancel_slot(
             modules=[],
         )
         sem = asyncio.Semaphore(1)
-        return await harness._run_slot(assignment, sem)
+        return await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
 
 # ===========================================================================

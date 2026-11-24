@@ -1,0 +1,30 @@
+{
+  "task_id": "8562",
+  "reason": "Net-additive tests for task 8562 (plans/instruments-honesty-prd.md decision 8): a level-2 close must carry a resolution_class, so step-5 pins that every in-process level-2 closer the harness owns stamps one. Each new test drives the same private seam its class already exists to test, and no source measure rises. test_harness_no_landings_breaker.py +1 is the harness._run_no_landings_breaker_pass call in test_resume_classifies_a_parked_info_escalation. test_harness_warm_lane_wiring.py +3 are _promote_warm_base_hard_down_l2, _WARM_BASE_HARD_DOWN_SENTINEL and _resolve_warm_base_hard_down in test_resolve_classifies_the_l2_close (TestWarmBaseHardDownFilingDedupResolve). test_pool_storage_guard.py +3 are _file_pool_storage_absent_escalation, _POOL_STORAGE_ABSENT_SENTINEL and _resolve_pool_storage_absent_escalation in test_resolve_classifies_a_parked_record, the seams TestPoolStorageAbsentEscalationHelperAndResolver names in its docstring.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_no_landings_breaker.py",
+      "baseline": 23,
+      "current": 24
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_warm_lane_wiring.py",
+      "baseline": 124,
+      "current": 127
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_pool_storage_guard.py",
+      "baseline": 50,
+      "current": 53
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6118,
+      "current": 6125
+    }
+  ]
+}

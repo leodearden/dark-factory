@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from _code_writer_links import assert_writes_c5
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.models.memory import AddMemoryResponse
@@ -1851,6 +1852,24 @@ class TestWriteSuppressionRecord:
             _source='stage1_flag_suppression',
         )
         assert result.memory_ids == ['mirror-id']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'task_id', ['42', '2405,540'], ids=['single', 'composite'],
+    )
+    async def test_the_mirror_declares_no_task_link(self, ledger_memory_service, task_id):
+        """C5: the mirror's ids may name other projects' tasks, so it links none and names no status."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='autopilot_video', task_id=task_id,
+        )
+
+        assert_writes_c5(
+            ledger_memory_service.add_memory.call_args.kwargs,
+            project_id='autopilot_video',
+            subject=None,
+        )
 
     @pytest.mark.asyncio
     async def test_passes_causation_id_when_provided(self, ledger_memory_service):

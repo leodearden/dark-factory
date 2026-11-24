@@ -30,9 +30,10 @@ const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProje
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
-  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, projectDepth, totalHint,
+  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, totalHint,
+  projectLandingRate, landingRateCaption, landingRateReading,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText, planRoute, planRouteText, planRouteHealth } = window.DF_MEMORY_READINGS;
 // The one health -> tone mapping the Overview's rows read too — system_health.js.
@@ -952,8 +953,8 @@ function MergeTab({ projectFilter }) {
         const speculative = projectSpeculative(DF, pid);
         const windowTotal = recentTotal(DF, pid);
         const attempts = projectAttempts(DF, pid);
-        const depth = projectDepth(DF, pid);
-        const depthSeries = depth.value;
+        const landingRate = projectLandingRate(DF, pid);
+        const rates = landingRate.value;
         const tried = attempts.value;
         const summary = (
           <>
@@ -969,9 +970,8 @@ function MergeTab({ projectFilter }) {
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
               <div className="grid cols-12 stack-narrow" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
-                  <DatumPanelHead title={`Merge attempts · ${depthBucketCaption(depthSeries)}`} datum={depth}
-                      reading={series => `peak ${Math.max(0, ...series.values)}/bucket`} />
-                  {depthSeries && <div className="panel-body"><LC labels={depthSeries.labels.map(String)} series={[{ values: depthSeries.values, color: CP.accent }]} height={180} countAxis formatX={window.DF_SHELL.fmtDateTime} /></div>}
+                  <DatumPanelHead title={`Throughput · ${landingRateCaption(rates)}`} datum={landingRate} reading={landingRateReading} />
+                  {rates && rates.values.length > 0 && <div className="panel-body"><LC labels={rates.labels.map(String)} series={[{ values: rates.values, color: CP.accent }]} height={180} formatX={window.DF_SHELL.fmtDateTime} /></div>}
                 </div>
 
                 <div className="col-span-5 panel">

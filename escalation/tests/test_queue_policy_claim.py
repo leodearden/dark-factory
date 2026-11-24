@@ -122,7 +122,7 @@ class TestClaimPolicyClass:
     def test_archived_record_is_refused_and_not_resurrected(self, tmp_path: Path) -> None:
         queue = EscalationQueue(tmp_path / 'esc')
         seeded = _seed_pending(queue)
-        queue.resolve(seeded.id, 'Fixed')
+        queue.resolve(seeded.id, 'Fixed', resolution_class='actionable')
 
         result = queue.claim_policy_class(
             seeded.id, policy_class='found_on_main', claimed_by=_EXECUTOR,

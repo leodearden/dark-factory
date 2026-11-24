@@ -8,9 +8,8 @@ No clock read: every instant is the caller's injected *now*. The TTL is
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
-from collections.abc import Awaitable, Callable, Coroutine, Hashable
+from collections.abc import Awaitable, Callable, Hashable
 from datetime import datetime
 from typing import Any, Generic, TypeVar
 
@@ -25,11 +24,13 @@ K = TypeVar('K', bound=Hashable)
 V = TypeVar('V')
 T = TypeVar('T')
 
-_OUTLIVED_WAITS: set[asyncio.Task[Any]] = set()
+_OUTLIVED_WAITS: dict[asyncio.Task[Any], str] = {}
+"""Each work item still in flight past its caller's wait, held here until it ends, by what it reads."""
+_unanswered_wait_count = 0
 
 
 async def wait_shielded(
-    work: Coroutine[Any, Any, T], wait_seconds: float | None, *, what: str,
+    work: Awaitable[T], wait_seconds: float | None, *, what: str,
 ) -> T:
     """*work*'s outcome, waited on at most *wait_seconds*; past that ``TimeoutError``.
 
@@ -37,12 +38,56 @@ async def wait_shielded(
     lands for the next caller. Nobody is left to receive a failure it then
     ends in, so that failure is logged as a BUG naming *what*.
     """
+    global _unanswered_wait_count
     task = asyncio.ensure_future(work)
+    deadline = asyncio.timeout(wait_seconds)
     try:
-        return await asyncio.wait_for(asyncio.shield(task), wait_seconds)
+        async with deadline:
+            return await asyncio.shield(task)
     finally:
+        if deadline.expired() or not task.done():
+            _unanswered_wait_count += 1
         if not task.done():
-            track_task(task, _OUTLIVED_WAITS, on_done=functools.partial(_log_late_failure, what))
+            _hold_outlived(task, what)
+
+
+def _hold_outlived(task: asyncio.Task[Any], what: str) -> None:
+    """Hold *task* until it ends, named by *what*; work that several waits outlived is held once."""
+    if task in _OUTLIVED_WAITS:
+        return
+    _OUTLIVED_WAITS[task] = what
+    track_task(task, on_done=_release_outlived)
+
+
+def _release_outlived(task: asyncio.Task[Any]) -> None:
+    _log_late_failure(_OUTLIVED_WAITS.pop(task), task)
+
+
+def unanswered_wait_count() -> int:
+    """How many waits in this process did not answer their caller with their work's outcome.
+
+    A wait goes unanswered when its deadline expired, or its caller stopped
+    waiting, before its work ended. The count only grows.
+    """
+    return _unanswered_wait_count
+
+
+async def join_outlived_waits() -> tuple[str, ...]:
+    """What each work item it joined reads: every one on the running loop still in flight past
+    its caller's wait, awaited to its end.
+
+    They are logged before the join, so a join that never ends names the work it is waiting on.
+    """
+    loop = asyncio.get_running_loop()
+    in_flight = {
+        task: what for task, what in list(_OUTLIVED_WAITS.items()) if task.get_loop() is loop
+    }
+    if not in_flight:
+        return ()
+    joined = tuple(sorted(in_flight.values()))
+    logger.warning("joining work still in flight past its callers' waits: %s", '; '.join(joined))
+    await asyncio.wait(in_flight)
+    return joined
 
 
 def _log_late_failure(what: str, task: asyncio.Task[Any]) -> None:

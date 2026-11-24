@@ -134,6 +134,7 @@ async def test_empty_census_self_heals_pending_l2(tmp_path: Path):
     resolved = queue.get(esc_id)
     assert resolved is not None
     assert resolved.status == 'resolved'
+    assert resolved.resolution_class is not None, 'a level-2 close must be classified'
 
 
 @pytest.mark.usefixtures("code_default_config")

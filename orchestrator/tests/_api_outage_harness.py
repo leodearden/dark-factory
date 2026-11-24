@@ -48,6 +48,7 @@ from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.git_ops import WarmLaneReseedContaminated
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import RequeueRecord, Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 from orchestrator.workflow import build_workflow as real_build_workflow
 
@@ -542,7 +543,9 @@ class _Simulation:
         calls_before = self.cli.calls(task_id)
         slot = asyncio.Semaphore(1)
         await slot.acquire()
-        report = await self.harness._run_slot(_assignment(task_id), slot)
+        report = await self.harness._run_slot(
+            _assignment(task_id), SlotLease(task_id, self.harness.scheduler, slot),
+        )
         assert report is not None, f'task {task_id}: _run_slot returned no report'
         record = DispatchRecord(
             task_id=task_id,

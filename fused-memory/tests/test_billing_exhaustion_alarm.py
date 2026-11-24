@@ -273,7 +273,9 @@ class TestRestart:
 def _close(tmp_path, page_id: str) -> None:
     from escalation.queue import EscalationQueue
 
-    EscalationQueue(escalation_queue_dir(tmp_path)).resolve(page_id, 'acknowledged, topping up')
+    EscalationQueue(escalation_queue_dir(tmp_path)).resolve(
+        page_id, 'acknowledged, topping up', resolution_class='actionable',
+    )
 
 
 @contextlib.contextmanager

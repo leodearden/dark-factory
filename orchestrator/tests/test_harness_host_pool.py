@@ -31,6 +31,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfi
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.task_verify_dispatch import TaskVerifyDispatcher
 from orchestrator.verify_admission_gate import AdmissionPlan
 
@@ -237,7 +238,7 @@ class TestRunSlotInjectsTheDispatcher:
                 await asyncio.sleep(3600)
 
             build.return_value.run = wedge
-            slot = asyncio.create_task(harness._run_slot(assignment, asyncio.Semaphore(0)))
+            slot = asyncio.create_task(harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, asyncio.Semaphore(0))))
             try:
                 await until(lambda: build.called, what='the slot to build its workflow')
                 assert build.call_args.kwargs['task_verify'] is harness._task_verify_dispatcher

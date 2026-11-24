@@ -561,6 +561,48 @@ class TestEscalationDeliveredCheckOwnerField:
         assert restored.delivered_check_owner is None
 
 
+class TestEscalationRuledByHumanField:
+    """Escalation carries the caller's human-ruling assertion (plans/instruments-honesty-prd.md decision 9).
+
+    Same additive zero-migration contract as `delivered_check_owner`.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-8562-0001',
+            'task_id': '8562',
+            'agent_role': 'orchestrator',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'test escalation for ruled_by_human',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_default_is_none_and_surfaces_in_to_dict(self):
+        esc = self._make_base_esc()
+        assert esc.ruled_by_human is None
+        assert esc.to_dict()['ruled_by_human'] is None
+
+    @pytest.mark.parametrize('flag', [True, False])
+    def test_round_trip_via_to_dict_from_dict_keeps_the_bool(self, flag):
+        esc = self._make_base_esc(ruled_by_human=flag)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.ruled_by_human is flag
+
+    @pytest.mark.parametrize('flag', [True, False])
+    def test_round_trip_via_to_json_from_json_keeps_the_bool(self, flag):
+        esc = self._make_base_esc(ruled_by_human=flag)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.ruled_by_human is flag
+        assert restored.to_json() == esc.to_json()
+
+    def test_legacy_json_without_the_key_deserialises_to_none(self):
+        payload = self._make_base_esc().to_dict()
+        del payload['ruled_by_human']
+        restored = Escalation.from_json(json.dumps(payload))
+        assert restored.ruled_by_human is None
+
 
 class TestReviewDueField:
     """Escalation carries the human gate's review_due payload (PRD

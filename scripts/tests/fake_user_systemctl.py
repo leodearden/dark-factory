@@ -3,13 +3,17 @@
 It really runs a service: `start` and `restart` read the unit file the
 installer wrote under $HOME/.config/systemd/user, apply its Environment= and
 EnvironmentFile= lines, and spawn its one-line ExecStart= in a new session.
-Every invocation's argv is appended as a JSON list to
-$FAKE_SYSTEMD_STATE/systemctl.log; a service's pid is kept in
-$FAKE_SYSTEMD_STATE/<unit>.pid and an enabled unit leaves <unit>.enabled.
+Every invocation's argv, a service's pid and output, and a marker for each
+enabled unit are kept under $FAKE_SYSTEMD_STATE, laid out by
+fake_user_systemctl_state.py.
+A service counts as running until every thread of its process has exited, as
+systemd's stop waits for the unit's cgroup to empty;
+$FAKE_SYSTEMD_STOP_DEADLINE_SECS (default 5) bounds that wait.
 A timer is active exactly when it is enabled.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
@@ -19,31 +23,62 @@ import sys
 import time
 from pathlib import Path
 
+from shared.testing_own_time import state_letter
+
+# Sibling import that survives `python -I`, which leaves this directory off sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from fake_user_systemctl_state import calls_log, enabled_marker, log_file, pid_file, unit_pid
+finally:
+    del sys.path[0]
+
 STATE = Path(os.environ["FAKE_SYSTEMD_STATE"])
 UNIT_DIR = Path(os.environ["HOME"]) / ".config" / "systemd" / "user"
+EXITED_STATES = {"Z", "X"}
+STOP_DEADLINE_SECS = float(os.environ.get("FAKE_SYSTEMD_STOP_DEADLINE_SECS", "5"))
+
+
+def task_state(stat: Path) -> str:
+    """The state letter in one /proc stat file; X once the task has gone."""
+    try:
+        return state_letter(stat.read_text())
+    except OSError:
+        return "X"
 
 
 def live_pid(unit: str) -> int:
+    """The unit's pid while any thread of its process still runs, else 0."""
     try:
-        pid = int((STATE / f"{unit}.pid").read_text())
-        stat = Path(f"/proc/{pid}/stat").read_text()
+        pid = unit_pid(STATE, unit)
+        tasks = list(Path(f"/proc/{pid}/task").iterdir())
     except (OSError, ValueError):
         return 0
-    return 0 if stat.rsplit(")", 1)[1].split()[0] == "Z" else pid
+    running = any(task_state(task / "stat") not in EXITED_STATES for task in tasks)
+    return pid if running else 0
 
 
 def is_enabled(unit: str) -> bool:
-    return (STATE / f"{unit}.enabled").exists()
+    return enabled_marker(STATE, unit).exists()
 
 
-def stop(unit: str) -> None:
+def stop(unit: str) -> bool:
+    """SIGKILL the unit's process group; True once every thread of it has exited."""
     pid = live_pid(unit)
     if not pid:
-        return
-    os.killpg(pid, signal.SIGKILL)
-    deadline = time.monotonic() + 5
+        return True
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pid, signal.SIGKILL)
+    deadline = time.monotonic() + STOP_DEADLINE_SECS
     while live_pid(unit) and time.monotonic() < deadline:
         time.sleep(0.05)
+    if live_pid(unit):
+        print(
+            f"fake systemctl: {unit} (pid {pid}) still running"
+            f" {STOP_DEADLINE_SECS:g}s after SIGKILL",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def start(unit: str) -> int:
@@ -66,7 +101,7 @@ def start(unit: str) -> int:
     if not command:
         print(f"{unit} has no ExecStart=", file=sys.stderr)
         return 1
-    with (STATE / f"{unit}.log").open("ab") as out:
+    with log_file(STATE, unit).open("ab") as out:
         proc = subprocess.Popen(
             command,
             env=env,
@@ -75,7 +110,7 @@ def start(unit: str) -> int:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    (STATE / f"{unit}.pid").write_text(str(proc.pid))
+    pid_file(STATE, unit).write_text(str(proc.pid))
     return 0
 
 
@@ -84,7 +119,7 @@ def enable(units: list[str], now: bool) -> int:
         if not (UNIT_DIR / unit).is_file():
             print(f"Unit file {unit} does not exist.", file=sys.stderr)
             return 1
-        (STATE / f"{unit}.enabled").touch()
+        enabled_marker(STATE, unit).touch()
         if now and start(unit):
             return 1
     return 0
@@ -108,7 +143,7 @@ def show(rest: list[str]) -> int:
 
 def main(argv: list[str]) -> int:
     STATE.mkdir(parents=True, exist_ok=True)
-    with (STATE / "systemctl.log").open("a") as log:
+    with calls_log(STATE).open("a") as log:
         log.write(json.dumps(argv) + "\n")
     if argv[:1] != ["--user"]:
         print("fake systemctl: only --user is supported", file=sys.stderr)
@@ -123,13 +158,11 @@ def main(argv: list[str]) -> int:
     if command == "start":
         return max((start(unit) for unit in units), default=0)
     if command == "restart":
-        for unit in units:
-            stop(unit)
+        if not all([stop(unit) for unit in units]):
+            return 1
         return max((start(unit) for unit in units), default=0)
     if command == "stop":
-        for unit in units:
-            stop(unit)
-        return 0
+        return 0 if all([stop(unit) for unit in units]) else 1
     if command == "is-active":
         unit = units[-1]
         active = live_pid(unit) > 0 if unit.endswith(".service") else is_enabled(unit)

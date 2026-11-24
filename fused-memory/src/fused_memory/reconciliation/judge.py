@@ -47,6 +47,7 @@ from fused_memory.reconciliation import (
 )
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
+from fused_memory.reconciliation.reserve_step_aside import RECONCILIATION_WORK_CLASS
 
 logger = logging.getLogger(__name__)
 
@@ -774,6 +775,7 @@ Review this run and provide your verdict as JSON.
                 setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
                 env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+                work_class=RECONCILIATION_WORK_CLASS,
             )
         except AllAccountsCappedException as e:
             # Cap-wait exhaustion (all accounts capped past the 1800s recon

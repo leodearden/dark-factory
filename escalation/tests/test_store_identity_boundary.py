@@ -245,7 +245,7 @@ async def test_b6_history_answers_what_pending_cannot(
     reify_server: FastMCP, queue: EscalationQueue,
 ) -> None:
     gate = _file(queue, TASK, level=2, agent_role='deterministic')
-    queue.resolve(gate.id, 'Human reviewed the gate')
+    queue.resolve(gate.id, 'Human reviewed the gate', resolution_class='actionable')
     assert len(list(queue.queue_dir.glob(f'archive/*/{gate.id}.json'))) == 1
 
     async with Client(reify_server) as client:

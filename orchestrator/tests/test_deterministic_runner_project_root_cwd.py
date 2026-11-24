@@ -332,7 +332,10 @@ class TestSelfTargetRefusesUnrunnableScript:
         assert "action='resume' marks the task done without one" in esc.detail, esc.detail
         assert f'restart {own_unit} by hand before resuming' in esc.detail, esc.detail
         _write_self_restart_script(project_root, 0o755)
-        queue.resolve(esc.id, 'script reinstalled, unit restarted by hand', resolved_by='human')
+        queue.resolve(
+            esc.id, 'script reinstalled, unit restarted by hand', resolved_by='human',
+            resolution_class='actionable',
+        )
 
         scheduler = _scheduler(task, project_root)
         runner = DeterministicRunner(
@@ -637,7 +640,9 @@ class TestRefusedBeforeDoneIsANamedInfraIssue:
         )
         assert await runner.run(_assignment(refused_task)) == WorkflowOutcome.BLOCKED
         [esc] = queue.get_by_task('9117', status='pending')
-        queue.resolve(esc.id, 'cwd fixed via update_task', resolved_by='human')
+        queue.resolve(
+            esc.id, 'cwd fixed via update_task', resolved_by='human', resolution_class='actionable',
+        )
 
         fixed_task = _task('9117', fixed)
         scheduler = _scheduler(fixed_task, project_root)

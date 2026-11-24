@@ -131,7 +131,7 @@ def test_pending_l2_with_the_same_root_cause_dedups(queue, event_store):
 def test_refiles_once_a_human_resolved_the_pending_one(queue):
     first = _file(queue)
     assert first is not None
-    queue.resolve(first.id, 'investigated')
+    queue.resolve(first.id, 'investigated', resolution_class='actionable')
 
     second = _file(queue)
 

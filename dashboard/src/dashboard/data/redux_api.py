@@ -38,7 +38,7 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.label_spans import label_spans
-from dashboard.data.merge_queue import DepthSeries, MergeAttempts
+from dashboard.data.merge_queue import LandingRateSeries, MergeAttempts
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
@@ -528,17 +528,24 @@ def _shape_attempts(attempts: MergeAttempts) -> dict[str, Any]:
     return {'outcomes': _shape_outcomes(attempts.outcome_chart()), 'latency': attempts.latency()}
 
 
-def _shape_depth(series: DepthSeries) -> dict[str, Any]:
-    """Serve a depth series as ``{labels, values, bucket_minutes}``, leading zero buckets trimmed.
+def _shape_depth(series: ChartData) -> dict[str, Any]:
+    """Serve a depth series as ``{labels, values}``, leading zero buckets trimmed."""
+    trimmed = trim_leading_zero_buckets(series)
+    return {'labels': list(trimmed['labels']), 'values': list(trimmed['values'])}
 
-    ``bucket_minutes`` is the width in minutes each bucket spans, None when
-    the series names no width.
+
+def _shape_landing_rate(series: LandingRateSeries) -> dict[str, Any]:
+    """Serve a landing rate as ``{labels, values, trailing_minutes, window_mean_per_day}``.
+
+    Leading zero points are trimmed; the window mean is the one the series
+    counted over its whole window, served as it is.
     """
     trimmed = trim_leading_zero_buckets(series)
     return {
         'labels': list(trimmed['labels']),
         'values': list(trimmed['values']),
-        'bucket_minutes': series.get('bucket_minutes'),
+        'trailing_minutes': series['trailing_minutes'],
+        'window_mean_per_day': series['window_mean_per_day'],
     }
 
 
@@ -565,14 +572,15 @@ def shape_merge_queue(
     project out of the client's multi-project in-queue totals),
     ``runs_db_present`` (false keeps the project out of the client's runs.db
     totals), ``active_spark``, ``halt``, ``train_events``,
-    ``train_throughput``. ``depth``, ``attempts``, ``in_queue``,
-    ``speculative``, ``recent_total``, ``train_throughput``,
-    ``live_probe_configured`` and ``runs_db_present`` are required: the
-    route resolves them for every project.
+    ``train_throughput``, ``landing_rate`` (landings per day, its value
+    shaped by :func:`_shape_landing_rate`). ``depth``, ``attempts``,
+    ``in_queue``, ``speculative``, ``recent_total``, ``train_throughput``,
+    ``landing_rate``, ``live_probe_configured`` and ``runs_db_present`` are
+    required: the route resolves them for every project.
 
     ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
-    ``train_throughput`` and every ``recent``/``active`` row's ``title`` are
-    Datums the route resolved, each aged to *served_at*, validated against it
+    ``train_throughput``, ``landing_rate`` and every ``recent``/``active``
+    row's ``title`` are Datums the route resolved, each aged to *served_at*, validated against it
     and rendered to the wire. A field that is not a Datum, or a Datum that
     breaks its contract there, is a wiring or shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
@@ -620,6 +628,9 @@ def shape_merge_queue(
             'train_events': [dict(e) for e in (data.get('train_events') or [])],
             'train_throughput': _served(
                 data.get('train_throughput'), f'{label}.train_throughput', project=dict,
+            ),
+            'landing_rate': _served(
+                data.get('landing_rate'), f'{label}.landing_rate', project=_shape_landing_rate,
             ),
             # ι=1894: live retries-per-landing + drift-at-detection metrics
             'metrics': dict(data.get('live_metrics') or {}),

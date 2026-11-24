@@ -344,7 +344,7 @@ def resolve_folded_escalations(
     resolved: list[str] = []
     for esc in pending:
         try:
-            queue.resolve(esc.id, resolution, resolved_by=agent_role)
+            queue.resolve(esc.id, resolution, resolved_by=agent_role, resolution_class='benign')
         except Exception:
             logger.exception('%s: failed to resolve %s', log_label, esc.id)
             continue

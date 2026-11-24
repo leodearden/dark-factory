@@ -163,6 +163,7 @@ from orchestrator.task_picture import TaskPicture
 from orchestrator.task_priority import TaskPriority
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 from orchestrator.time_sources import resolve_monotonic_time_source, resolve_wall_time_source
+from orchestrator.timed_gates import timed_gates
 from orchestrator.work_product import (
     BranchWork,
     WorkProductProbe,
@@ -1166,6 +1167,10 @@ class TickContext:
     dispatch_deferred_emitted: bool = False
     scope: DispatchScope = DispatchScope.ANY
 
+    def tier_of(self, task_id: str, task: dict) -> str:
+        """*task_id*'s tier this tick: its effective priority, else its own ``priority`` coerced."""
+        return self.effective_priorities.get(task_id, coerce_tier(task.get('priority')))
+
 
 # Sentinel a `_phase_*` method returns to mean "proceed to the next phase in
 # `Scheduler._TICK_PHASE_ORDER`".  A bare `TaskAssignment | None` return
@@ -1420,6 +1425,7 @@ class Scheduler:
         'empty_candidate_gate',
         'psi_gate',
         'select_pins',
+        'select_timed_gates',
         'select_scored',
     )
 
@@ -1550,6 +1556,9 @@ class Scheduler:
         self._backfill_scan_cache: _BackfillScanCache | None = None
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
+        # Tasks whose locks are a hold restore_hold took and no dispatch has
+        # superseded since; _claim and release end the mark, so it never returns.
+        self._restored_holds: set[str] = set()
         # Task 2408 mechanism 2: attribute-injected by the Harness right
         # after it constructs its EscalationQueue (harness.py, mirroring the
         # review_checkpoint.escalation_queue injection one line above that
@@ -4662,13 +4671,13 @@ class Scheduler:
         Consolidates the duplicate gate logic that previously existed in both
         the scored-candidate loop and the pin-dispatch loop.  A single source
         of truth ensures that future gate additions (e.g. a new suppression
-        signal) apply to both dispatch paths automatically.
+        signal) apply to every dispatch path automatically.
 
         This method is a **pure predicate** — it has no side effects and may be
         called any number of times without surprise.  In particular it does *not*
         remove expired entries from ``self._requeue_until``; that bookkeeping is
         the responsibility of :meth:`_gc_expired_cooldowns`, which is called
-        once per tick from :meth:`acquire_next` before either candidate loop.
+        once per tick from :meth:`acquire_next` before any dispatch loop.
 
         *tasks_by_id* is forwarded to :meth:`_deps_satisfied` to enable the
         intra-train merge-deferred allowance (PRD § 9.3).  When ``None``
@@ -4808,7 +4817,7 @@ class Scheduler:
         """End *task_id*'s fairness episode because it just dispatched (task 5308).
 
         THE single place a dispatch settles fairness state, called for EVERY
-        dispatch — pin loop and scored loop, top or not: the skip count,
+        dispatch — pin, timed-gate and scored loops, top or not: the skip count,
         blocked-install streak, ``pin_blocked`` episode (task 6040) and
         ``park_refused`` episode (task 6328) are dropped, and the task's own parks are
         consumed (``reservation_used``, plus ``reservation_restored`` for each
@@ -5625,8 +5634,8 @@ class Scheduler:
         Writes: ``ctx.terminal_dep_records`` (task 2692, δ/ε follow-up),
         ``self._terminal_dep_record_cache``.
         Runs immediately after ``backfill_dep_status`` (so ``status_map`` is
-        already populated) and before ``delivered_check_gate`` and both
-        candidate-dispatch loops — all of which consult
+        already populated) and before ``delivered_check_gate`` and the
+        dispatch loops — all of which consult
         ``ctx.terminal_dep_records`` as an additive fallback source for the
         delivered-check and scheduled-deploy arms of ``_deps_satisfied`` and
         for ``_compute_delivered_check_cache``.
@@ -5881,7 +5890,7 @@ class Scheduler:
         the owner's skip count goes with it. Runs after
         ``external_dep_policy`` and ``delivered_check_gate``, so the
         dependency arm sees this tick's caches, and before ``reserve_now``
-        and the dispatch loops, so neither builds on a dead park. Always
+        and the dispatch loops, so none builds on a dead park. Always
         continues.
         """
         for owner in self._expire_parks(partial(self._park_hold_refusal, ctx)):
@@ -6729,9 +6738,7 @@ class Scheduler:
                 continue
             r_task = ctx.tasks_by_id[rid]
             r_modules = self._get_modules(r_task)
-            r_tier = ctx.effective_priorities.get(
-                rid, coerce_tier(r_task.get('priority'))
-            )
+            r_tier = ctx.tier_of(rid, r_task)
             # Consume the flag BEFORE installing parks.  The opposite order
             # risks a duplicate reserve_now_consumed event if the clear
             # fails after a successful install, whereas a re-run install
@@ -6846,8 +6853,10 @@ class Scheduler:
         ``ctx.candidates``, ``ctx.candidate_signals``. Filters to pending
         tasks whose deps are all done and that aren't dispatched or in
         their post-requeue cooldown window. ``_eligible_for_dispatch``
-        (UNCHANGED) encapsulates all gates so the pin-dispatch loop below
-        uses the same logic (single source of truth). A task ``ctx.scope``
+        (UNCHANGED) encapsulates all gates; the pin-dispatch loop calls it
+        too, and the timed-gate and scored loops read these candidates, so
+        every dispatch path applies the same gates (single source of
+        truth). A task ``ctx.scope``
         does not admit is dropped first. Always continues.
         """
         candidates: list[dict] = []
@@ -6883,9 +6892,9 @@ class Scheduler:
         """Landed-outbox consult-before-dispatch gate.
 
         Reads: ``ctx.candidates``. Writes: ``ctx.gated_ids``. Consulted
-        once per candidate here, BEFORE the starvation watchdog / pin loop
-        / scored loop, so a single ``gated_ids`` set is honored by both
-        dispatch paths. A gated task's merge already landed on main and is
+        once per candidate here, BEFORE the starvation watchdog and every
+        dispatch loop, so a single ``gated_ids`` set is honored by all of
+        them. A gated task's merge already landed on main and is
         being driven to done inline by the injected hook.
         ``ctx.candidates`` is left unfiltered: ``_phase_already_landed_gate``
         consults the same list and then filters by the union.
@@ -6911,8 +6920,8 @@ class Scheduler:
         """
         # Already-landed pre-dispatch gate (task 2313) — consulted immediately
         # after the landed-outbox gate and unioned into the SAME gated_ids
-        # set, so both the scored candidate filter below and the pin loop
-        # honor a single source of truth (mirrors the _consult_landed_outbox
+        # set, so the candidate filter below (read by the timed-gate and
+        # scored loops) and the pin loop honor a single source of truth (mirrors the _consult_landed_outbox
         # / gated_ids pattern verbatim). Catches out-of-band landings
         # (ancestry / merge-marker / content-equivalence) that never passed
         # through this orchestrator's own merge queue.
@@ -6960,8 +6969,8 @@ class Scheduler:
         docs/prds/dispatch-admission-load-cap.md).
 
         Reads: none on ctx. Writes: ``ctx.psi_hold``. Computed ONCE per
-        tick, before both the pinned and scored dispatch loops, so a single
-        hold decision governs both (DA-D5 parity) and ``len(self._dispatched)``
+        tick, before every dispatch loop (pinned, timed-gate, scored), so a
+        single hold decision governs all three (DA-D5 parity) and ``len(self._dispatched)``
         is read before this tick's own dispatch can mutate it (stable floor
         comparison). Runs after the empty-candidate short-circuit so an idle
         tick never pays for a PSI read. Always continues.
@@ -7014,10 +7023,9 @@ class Scheduler:
         heavy candidate skipped this tick.
 
         Per-tick dedup lives on ``ctx.dispatch_deferred_emitted`` (promoted
-        from a ``nonlocal`` closure variable so ``_phase_select_pins`` and
-        ``_phase_select_scored`` — two separate phase methods — share the
-        SAME once-per-tick decision/event, exactly as the two loops did
-        when they were one method body).
+        from a ``nonlocal`` closure variable so ``_phase_select_pins``,
+        ``_phase_select_timed_gates`` and ``_phase_select_scored`` — separate
+        phase methods — share the SAME once-per-tick decision/event).
         """
         if ctx.dispatch_deferred_emitted:
             return
@@ -7075,7 +7083,7 @@ class Scheduler:
         (:meth:`_note_pin_blocked`).  With ``pin_reservations_enabled`` off, a
         blocked pin neither reserves nor reports, as before task 6040.
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
-        else ``_CONTINUE`` to fall through to the scored loop.
+        else ``_CONTINUE`` to fall through to the timed-gate and scored loops.
 
         A tick restricted to a scope other than ANY skips this phase, so it
         neither dispatches a pin the scope does not admit nor releases pin
@@ -7097,15 +7105,18 @@ class Scheduler:
                 # doesn't reduce host load, so a pinned candidate is deferred
                 # exactly like a scored one (see `_exempt_from_psi_hold`).
                 # ctx.psi_hold and _note_heavy_deferral are the SAME
-                # once-per-tick decision/helper the scored loop uses below,
-                # so both loops share one hold and one event.
+                # once-per-tick decision/helper the timed-gate and scored
+                # loops use, so every loop shares one hold and one event.
                 self._note_heavy_deferral(ctx, ctx.psi_hold, pin.task_id)
                 if self.lock_table.reservation_source(pin.task_id) is ReservationSource.PIN:
                     heads += 1
                 continue
             modules = self._get_modules(pin.task)
             if self._claim(pin.task_id, modules):
-                return await self._dispatch_pin(pin, modules)
+                await self._settle_dispatch(
+                    pin.task_id, modules, tier=pin.tier, signal=pin.signal,
+                )
+                return await self._finish_dispatch(pin.task_id, pin.task, modules, tier=pin.tier)
             if not self.config.pin_reservations_enabled:
                 continue
             is_head = (
@@ -7122,6 +7133,32 @@ class Scheduler:
                     skip_count=self._skip_count.get(pin.task_id, 0),
                 )
                 self._bound_pin_reservations(ctx, reservable)
+        return _CONTINUE
+
+    async def _phase_select_timed_gates(self, ctx: TickContext) -> object:
+        """Dispatch the oldest open timed gate (orchestrator/timed_gates.py) ahead of scoring.
+
+        Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
+        ``ctx.candidate_signals``, ``ctx.psi_hold``.  Every candidate already
+        passed :meth:`_eligible_for_dispatch`, so each one's milestone is open.
+        The PSI hold applies through :meth:`_exempt_from_psi_hold`, as in the
+        pin and scored loops; a timed gate is deterministic, so today it is
+        exempt (DA-D4) and holds no module lock.  Runs after the pins, so an
+        operator pin still goes first.  Ends the tick only when it dispatches;
+        otherwise returns ``_CONTINUE``.
+        """
+        for task in timed_gates(ctx.candidates):
+            tid = str(task.get('id', ''))
+            if ctx.psi_hold and not self._exempt_from_psi_hold(task):
+                self._note_heavy_deferral(ctx, ctx.psi_hold, tid)
+                continue
+            modules = self._get_modules(task)
+            if self._claim(tid, modules):
+                tier = ctx.tier_of(tid, task)
+                await self._settle_dispatch(
+                    tid, modules, tier=tier, signal=ctx.candidate_signals.get(tid),
+                )
+                return await self._finish_dispatch(tid, task, modules, tier=tier)
         return _CONTINUE
 
     def _note_pin_blocked(
@@ -7225,7 +7262,7 @@ class Scheduler:
         if not candidate:
             return
         task = ctx.tasks_by_id[task_id]
-        tier = ctx.effective_priorities.get(task_id, coerce_tier(task.get('priority')))
+        tier = ctx.tier_of(task_id, task)
         skip_count = self._skip_count.get(task_id, 0)
         if skip_count < self.config.fairness.skip_threshold_for(tier):
             return
@@ -7282,38 +7319,51 @@ class Scheduler:
                 task_id=tid,
                 task=task,
                 pin_order=row.pin_order if row.pin_order is not None else 0,
-                tier=ctx.effective_priorities.get(tid, coerce_tier(task.get('priority'))),
+                tier=ctx.tier_of(tid, task),
                 signal=signal,
             ))
         return sorted(queue, key=lambda pin: pin.pin_order)
 
-    async def _dispatch_pin(self, pin: _PinCandidate, modules: list[str]) -> TickOutcome:
-        """Book a pin whose :meth:`_claim` just succeeded, and end the tick."""
+    async def _settle_dispatch(
+        self, task_id: str, modules: list[str], *, tier: str, signal: str | None,
+    ) -> None:
+        """First half of every dispatch: settle *task_id*'s per-task state once its :meth:`_claim` succeeded.
+
+        Every dispatch path (pin, timed gate, scored) calls this and then
+        :meth:`_finish_dispatch`; the scored path runs its own top bump and
+        backfill-grant record in between.
+        """
         # Starvation-watchdog settle (tasks 1880, 3821), wrapped so a
         # failure can NEVER abort a successful dispatch (PROPERTY 1).
         try:
-            await self._settle_starvation_on_dispatch(pin.task_id)
+            await self._settle_starvation_on_dispatch(task_id)
         except Exception:
             logger.warning(
-                'Starvation watchdog resolve for pin_tid=%s raised — '
+                'Starvation watchdog resolve for task_id=%s raised — '
                 'dispatch continues normally',
-                pin.task_id,
+                task_id,
                 exc_info=True,
             )
-        if pin.signal is not None:
-            self._last_dispatch_at[pin.task_id] = self._time_source()
-        self._dispatched_priority[pin.task_id] = pin.tier
-        self._settle_fairness_on_dispatch(pin.task_id, modules, pin.tier)
+        # Arm the cooldown gate only for signal-bearing dispatches.  A steward
+        # signal that arrives after a signal-free dispatch does not
+        # retroactively suppress re-dispatch, which bounds _last_dispatch_at.
+        if signal is not None:
+            self._last_dispatch_at[task_id] = self._time_source()
+        self._dispatched_priority[task_id] = tier
+        self._settle_fairness_on_dispatch(task_id, modules, tier)
+
+    async def _finish_dispatch(
+        self, task_id: str, task: dict, modules: list[str], *, tier: str,
+    ) -> TickOutcome:
+        """Second half of every dispatch: announce it, snapshot, and end the tick."""
         self._emit_lock_event(
             EventType.lock_acquired,
-            task_id=pin.task_id,
+            task_id=task_id,
             modules=modules,
-            priority=pin.tier,
+            priority=tier,
         )
         await self._write_snapshot_best_effort()
-        return TickOutcome(TaskAssignment(
-            task_id=pin.task_id, task=pin.task, modules=modules
-        ))
+        return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
 
     def _note_anchor_coverage(self, task_ids: list[str], readings: list[AnchorReading]) -> bool:
         """Run the tick's arming gate and deliver its verdict: the event, then any L1."""
@@ -7365,7 +7415,7 @@ class Scheduler:
 
         scored: list[tuple[float, str, dict, str]] = []
         for tid, t, reading in zip(task_ids, ctx.candidates, readings, strict=True):
-            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
+            pri = ctx.tier_of(tid, t)
             transitive = ctx.transitive_counts.get(tid, 0)
             if armed:
                 score = self._compute_score(
@@ -7477,42 +7527,16 @@ class Scheduler:
                     self._note_park_refusal(ctx, task_id, modules, pri)
                 if acquired:
                     self._watchdog_state.note_scan(refused)
-                    # Starvation-watchdog settle (tasks 1880, 3821): resolve any
-                    # open watchdog escalation and forget the task's watchdog
-                    # inputs.  Wrapped so a failure can NEVER abort a successful
-                    # dispatch (PROPERTY 1).
-                    try:
-                        await self._settle_starvation_on_dispatch(task_id)
-                    except Exception:
-                        logger.warning(
-                            'Starvation watchdog resolve for task_id=%s raised — '
-                            'dispatch continues normally',
-                            task_id,
-                            exc_info=True,
-                        )
-                    # arm cooldown gate — only for signal-bearing dispatches.
-                    # Steward signals that arrive *after* a signal-free dispatch
-                    # will not retroactively suppress re-dispatch; the gate is
-                    # intentionally scoped to tasks that were already flagged
-                    # when first picked up (bounded _last_dispatch_at size).
-                    if ctx.candidate_signals.get(task_id) is not None:
-                        self._last_dispatch_at[task_id] = self._time_source()
-                    self._dispatched_priority[task_id] = pri
                     # Settle the winner BEFORE bumping a passed-over top: the
                     # winner's own park would otherwise block the top's install.
-                    self._settle_fairness_on_dispatch(task_id, modules, pri)
+                    await self._settle_dispatch(
+                        task_id, modules, tier=pri, signal=ctx.candidate_signals.get(task_id),
+                    )
                     if task_id != top_id:
                         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
                     if grant is not None:
                         self._record_backfill_grant(grant)
-                    self._emit_lock_event(
-                        EventType.lock_acquired,
-                        task_id=task_id,
-                        modules=modules,
-                        priority=pri,
-                    )
-                    await self._write_snapshot_best_effort()
-                    return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
+                    return await self._finish_dispatch(task_id, task, modules, tier=pri)
         finally:
             self._backfill_scan_cache = None
 
@@ -7535,6 +7559,7 @@ class Scheduler:
         if not self.lock_table.try_acquire(task_id, modules, admitted_parks=admitted_parks):
             return False
         self._dispatched.add(task_id)
+        self._restored_holds.discard(task_id)
         return True
 
     def _note_park_refusal(
@@ -7601,9 +7626,10 @@ class Scheduler:
     async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
-        Dispatch order is determined by ``_score_candidates()``: tier base is
-        dominant, age + CPM (+ continuity) bonuses order tasks within a tier,
-        and per-tier slot caps reserve headroom for higher-value work.
+        Pinned tasks dispatch first, then timed gates
+        (orchestrator/timed_gates.py), then candidates in
+        ``_score_candidates()`` order: tier base is dominant, and age + CPM
+        (+ continuity) bonuses order tasks within a tier.
 
         A *scope* other than ANY restricts this tick's dispatch to the tasks
         the scope admits (the harness passes MAIN_HEALTH_FIX when only the
@@ -8166,6 +8192,40 @@ class Scheduler:
             )
         return result
 
+    def restore_hold(
+        self, task_id: str, modules: list[str], *, reason: str,
+    ) -> UncontestedAcquisition:
+        """Re-take, for a task no workflow runs, every free key of *modules*; name the rest.
+
+        Unlike :meth:`acquire_uncontested` it writes no module cache (a partial
+        set cached there would under-lock a later dispatch), status or park.
+        Synchronous, so a caller's check and this acquire cannot interleave.
+        The hold stays restored until a release of the task or a dispatch of
+        it ends that for good (:meth:`holds_restored`). The caller is
+        ``orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds``.
+        """
+        result = self.lock_table.acquire_uncontested(task_id, modules)
+        if result.acquired:
+            self._restored_holds.add(task_id)
+            self._emit_lock_event(
+                EventType.lock_acquired,
+                task_id=task_id,
+                modules=list(result.acquired),
+                reason=reason,
+            )
+        return result
+
+    def holds_restored(self, tid: str) -> bool:
+        """True while *tid*'s locks are the hold :meth:`restore_hold` took; a dispatch ends it for good."""
+        return tid in self._restored_holds
+
+    def release_restored_hold(self, task_id: str) -> bool:
+        """End *task_id*'s restored hold through :meth:`release`; False, releasing nothing, once superseded."""
+        if task_id not in self._restored_holds:
+            return False
+        self.release(task_id)
+        return True
+
     def acquire_as_successor(
         self, task_id: str, modules: list[str], *, predecessor: str, priority: str,
     ) -> bool:
@@ -8478,6 +8538,7 @@ class Scheduler:
         """
         self._dispatched.discard(task_id)
         self._dispatched_priority.pop(task_id, None)
+        self._restored_holds.discard(task_id)
         # Consume this task's pending transient-cooldown stamp (task 3317 /
         # PRD contract C3).  UNCONDITIONAL and ahead of the `requeued` branch:
         # the cap-exhaust path records a transient requeue and then releases

@@ -144,7 +144,6 @@ class TestClassifyRecord:
         as fallbacks — judged identically to the existing dedup sweep."""
         for key in ('data', 'memory', 'content'):
             assert _mod.classify_record({key: _TAIL_LEAK}) == 'repairable_tail', key
-        assert _mod._CONTENT_KEYS == ('data', 'memory', 'content')
 
 
 class TestRepairContent:

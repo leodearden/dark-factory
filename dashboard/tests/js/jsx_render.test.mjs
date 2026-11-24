@@ -434,14 +434,14 @@ for (const { pinned, pins } of PINNING_TILE_FIXTURES) {
   });
 }
 
-// ── Decision 5: the depth chart's bucket width (merge_queue.js::depthBucketCaption) ──
-// The panel names the width the server counted the series at; a series that
-// names none names no width.
+// ── The throughput panel's trailing window (merge_queue.js::landingRateCaption) ──
+// The panel names the trailing window the server counted each point over; a
+// rate that names none names no window.
 
-for (const bucketMinutes of [60, null]) {
-  test(`tabs.jsx::MergeTab titles its depth panel with depthBucketCaption for bucket_minutes ${bucketMinutes}`, t => {
+for (const trailingMinutes of [1440, 10080, null]) {
+  test(`tabs.jsx::MergeTab titles its throughput panel with landingRateCaption for trailing_minutes ${trailingMinutes}`, t => {
     const harness = openWindow(t);
-    const block = mergeQueueBlock({ bucketMinutes });
+    const block = mergeQueueBlock({ bucketMinutes: 60, trailingMinutes });
     seedDashboardData(harness.window, {
       MERGE_QUEUE: { [PROJECT]: block },
       __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
@@ -450,9 +450,9 @@ for (const bucketMinutes of [60, null]) {
 
     const titles = [...container.querySelectorAll('.panel-head > .title')]
       .map(title => title.textContent)
-      .filter(text => text.startsWith('Merge attempts'));
-    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth.value);
-    assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
+      .filter(text => text.startsWith('Throughput'));
+    const caption = harness.window.DF_MERGE_QUEUE.landingRateCaption(block.landing_rate.value);
+    assert.deepEqual(titles, [`Throughput · ${caption}`]);
   });
 }
 
@@ -492,7 +492,7 @@ test('tabs.jsx::MergeTab renders an unread runs.db as unknown, never as measured
   const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
   assert.ok(pips.includes(`${datumView(projectAttempts(DF, PROJECT)).text} attempts`), JSON.stringify(pips));
   assert.ok(!pips.some(text => text.startsWith('0 attempts')), `an unread project reads a measured 0: ${JSON.stringify(pips)}`);
-  for (const prefix of ['Outcomes', 'Merge attempts']) {
+  for (const prefix of ['Outcomes', 'Throughput']) {
     assert.equal(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws a chart over an unread window`);
   }
 });
@@ -504,7 +504,7 @@ test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount'
   const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
   assert.equal(count, 5);
   assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
-  for (const prefix of ['Outcomes', 'Merge attempts']) {
+  for (const prefix of ['Outcomes', 'Throughput']) {
     assert.notEqual(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws no chart over a measured window`);
   }
 });
@@ -560,16 +560,22 @@ function panelMeta(container, prefix) {
   return panelTitled(container, prefix).querySelector('.panel-head > .meta').textContent;
 }
 
-// The depth series' first bucket is counted whole (test_merge_queue_data.py::test_first_bucket_includes_events_before_cutoff), so its sum is not the window's attempt count; attemptCount is the only one.
-for (const values of [[1], [2, 0, 3]]) {
-  test(`tabs.jsx::MergeTab reads the depth panel as the series' per-bucket peak over ${JSON.stringify(values)}`, t => {
-    const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: values.length }), values);
-    const { container } = mountMergeTab(t, block);
+// The throughput panel reads its served rate (merge_queue.js::landingRateReading):
+// a window with no landings is a measured zero, read as one and drawn as nothing.
+test('tabs.jsx::MergeTab reads a window with no landings as a measured zero and draws no chart', t => {
+  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, rates: [] }));
 
-    const meta = panelMeta(container, 'Merge attempts');
-    assert.ok(meta.startsWith(`peak ${Math.max(0, ...values)}/bucket`), meta);
-  });
-}
+  const meta = panelMeta(container, 'Throughput');
+  assert.ok(meta.startsWith('0/day · no landings in this window'), meta);
+  assert.equal(panelTitled(container, 'Throughput').querySelector('svg'), null);
+});
+
+test('tabs.jsx::MergeTab reads the throughput panel as the newest rate and the served window mean', t => {
+  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, rates: [2, 3], meanPerDay: 2 / 7 }));
+
+  const meta = panelMeta(container, 'Throughput');
+  assert.ok(meta.startsWith('now 3/day · mean 0.29/day'), meta);
+});
 
 test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth series sums to', t => {
   const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: 3, outcomes: { done: 1 } }), [1, 0, 1]);
@@ -581,9 +587,9 @@ test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth se
   const outcomes = panelMeta(container, 'Outcomes');
   assert.ok(outcomes.startsWith(`${count} merges`), outcomes);
   assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
-  const depth = panelMeta(container, 'Merge attempts');
-  assert.doesNotMatch(depth, /\battempts\b/);
-  assert.doesNotMatch(depth, /\bmerges\b/);
+  const throughput = panelMeta(container, 'Throughput');
+  assert.doesNotMatch(throughput, /\battempts\b/);
+  assert.doesNotMatch(throughput, /\bmerges\b/);
 });
 
 // ── A project's Merge-tab layout: one row of number cards, then each table on its own row ──

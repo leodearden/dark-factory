@@ -2877,6 +2877,7 @@ class TestResolveWatcherOutageL2:
             f'Expected status="resolved"; got {resolved.status!r}'
         )
         assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
+        assert resolved.resolution_class is not None, 'a level-2 close must be classified'
 
     def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
         """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
@@ -3929,7 +3930,7 @@ class TestWatcherHasActionableL1:
             return resolve(self, escalation_id, *args, **kwargs)
 
         with patch.object(EscalationQueue, 'resolve', resolve_missing_the_member):
-            queue.resolve(l2_id, 'human answered the cluster')
+            queue.resolve(l2_id, 'human answered the cluster', resolution_class='actionable')
 
         l2, l1 = queue.get(l2_id), queue.get(l1_id)
         assert l2 is not None and l2.status == 'resolved'

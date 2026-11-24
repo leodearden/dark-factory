@@ -16,7 +16,7 @@ verify_cache: never
 # pytest_collection_finish, and every xdist worker collects every item, so each
 # worker would pay that parse (CONTRIBUTING.md §2).
 test_command: "uv run --project shared pytest tests/repo_guards/ --tb=short -q --timeout=300"
-lint_command: "uv run --project shared ruff check tests/repo_guards/ && python3 tests/scripts/raw_envelope_literal_guard.py tests/repo_guards"
+lint_command: "uv run --project shared ruff check tests/repo_guards/ && python3 tests/scripts/raw_envelope_literal_guard.py tests/repo_guards && uv run --project shared python tests/scripts/git_history_census.py tests/repo_guards"
 type_check_command: "uv run --project shared pyright tests/repo_guards/"
 
 # PER-MODULE VERIFY BUDGET. MEASUREMENT PROVENANCE: the VERBATIM test_command

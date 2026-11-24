@@ -13,6 +13,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _clip_assertions import assert_elided
+from _code_writer_links import assert_writes_c5
 from _count_call_spelling import non_keyword_count_calls
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_git_repos import init_ab_commit_repo, init_merge_history_repo
@@ -4784,6 +4785,15 @@ class TestCliStageRunnerCapWaitSanityBound:
         )
 
         assert _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == 1800.0
+
+    def test_public_name_mirrors_private_name(self):
+        """(c) The public name RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable and the private name is an alias of it (task 9494; the alias goes in task 9501)."""
+        from fused_memory.reconciliation import (
+            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+        )
+
+        assert _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
     @pytest.mark.asyncio
     async def test_run_stage_via_cli_forwards_cap_wait_sanity_secs(self, tmp_path):
@@ -10317,6 +10327,10 @@ class TestTrackFlagPersistence:
 
         assert result == {'flag-A': 3}  # 2 prior + 1 (this cycle)
         memory_service.add_memory.assert_awaited_once()
+        # C5: a flag marker has no subject task, and names no task status.
+        assert_writes_c5(
+            memory_service.add_memory.await_args.kwargs, project_id='reify', subject=None,
+        )
 
     @pytest.mark.asyncio
     async def test_count_called_with_metadata_filter_for_flag_id(self):
@@ -10460,6 +10474,8 @@ class TestWriteEscalationMarkers:
         assert meta.get('source') == 'stage2_escalation_marker'
         assert meta.get('flag_id') == 'flag-Y'
         assert meta.get('run_id') == 'run-7'
+        # C5: a flag marker has no subject task, and names no task status.
+        assert_writes_c5(call.kwargs, project_id='proj', subject=None)
 
     @pytest.mark.asyncio
     async def test_write_failure_logs_warning_does_not_raise(self, caplog):

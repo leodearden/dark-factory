@@ -13,6 +13,7 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from _code_writer_links import assert_writes_c5, structural_task_links, subject_task
 from _fm_helpers import LoopFreedomProbe
 from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -33,6 +34,7 @@ from shared.testing import make_gate_mock
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.memory_metadata import RECONCILIATION_COMPLETION_ECHO_MARKER
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     EventSource,
@@ -11596,6 +11598,36 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
         )
 
     @pytest.mark.asyncio
+    async def test_a_replayed_completion_echo_keeps_its_task_link(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """C5: a deferred completion echo replays verbatim and still links its task."""
+        mock_memory_service.search = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        content = "Task 'Wire the census' completed. Added the census module"
+        await event_buffer.defer_write(
+            'test-project',
+            content,
+            'observations_and_summaries',
+            {
+                **RECONCILIATION_COMPLETION_ECHO_MARKER,
+                'task_id': '4102',
+                '_deferred': True,
+                '_causation_id': 'run-1',
+            },
+            agent_id='targeted-reconciliation',
+        )
+
+        await harness._replay_deferred_writes(ProjectId('test-project'))
+
+        mock_memory_service.add_memory.assert_awaited_once()
+        replayed = mock_memory_service.add_memory.call_args.kwargs
+        assert replayed['content'] == content
+        assert structural_task_links(replayed, project_id='test-project') == {
+            subject_task('test-project', '4102'),
+        }
+
+    @pytest.mark.asyncio
     async def test_no_transition_bypasses_dedup(
         self, journal, event_buffer, mock_memory_service
     ):
@@ -18535,11 +18567,44 @@ class TestHarnessReconcileStatusCorrection:
         )
 
         # The functionally meaningful census fields must survive removal of
-        # the citation. (Deliberately not locking the surrounding prose here
-        # — that would make the test brittle to harmless rephrasing.)
-        assert 'done=' in content
-        assert 'total=' in content
-        assert 'active=' in content
+        # the citation, as structured metadata rather than prose (C5).
+        metadata = harness.memory.add_memory.call_args.kwargs['metadata']
+        assert metadata['task_count_done'] == 2
+        assert metadata['task_count_total'] == 5
+        assert metadata['active_tasks'] == [3, 4, 5]
+
+    @pytest.mark.asyncio
+    async def test_superseding_write_names_no_task_status(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """C5: the census record has no subject task, so it links none, and its
+        text names no task status; the counts live only in its metadata."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        cached_memory = {
+            'id': 'stale-memory-id',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 1,
+                'task_count_total': 3,
+                'active_tasks': [2, 3],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        await harness._reconcile_status_correction(
+            'test-project', {'1': 'done', '2': 'done', '3': 'pending'}
+        )
+
+        written = harness.memory.add_memory.call_args.kwargs
+        assert_writes_c5(written, project_id='test-project', subject=None)
+        assert written['metadata']['kind'] == 'project_status_correction'
+        assert written['metadata']['supersedes'] == ['stale-memory-id']
+        assert written['metadata']['task_count_done'] == 2
+        assert written['metadata']['task_count_total'] == 3
+        assert written['metadata']['active_tasks'] == [3]
 
     @pytest.mark.asyncio
     async def test_query_exception_fails_open(

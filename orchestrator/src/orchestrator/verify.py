@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 from shared.asyncio_tasks import gather_unwound
 from shared.cgroup_slice import project_slice_name
+from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
@@ -115,6 +116,7 @@ from orchestrator.verify_cmd import (
     applied_worker_count,
     apply_pytest_numprocesses,
     cargo_scope,
+    carries_defect_plugin,
     govern_cpu,
     parse_config_command,
     render,
@@ -123,6 +125,7 @@ from orchestrator.verify_cmd import (
     serial_pytest,
     split_and_chain_segments,
     split_chain_tail,
+    with_defect_plugin,
     with_junitxml,
     with_pytest_timeout,
 )
@@ -2659,6 +2662,32 @@ def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
     return render(rewritten)
 
 
+def _with_defect_plugin_str(cmd: str | None) -> str | None:
+    """Inject ``-p _df_defect_plugin`` into a structured ``pytest`` command, via VerifyCmd.
+
+    The string-level parse -> ``with_defect_plugin`` -> identity -> render
+    wrapper, shaped like ``_with_junitxml_str``: an untouched command comes
+    back BYTE-identical. A raw-retained pytest chain is the one suppression
+    logged at INFO (plans/defect-tests-prd.md B22), because that leg loses a
+    named capability. An OPAQUE, non-pytest or already-injected command was
+    never going to gain the plugin here, so it is not logged.
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = with_defect_plugin(parsed)
+    if rewritten is parsed:
+        if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
+            logger.info(
+                'defect plugin injection suppressed: %s is a raw-retained pytest '
+                'command, so no collection map is written for this leg, and its '
+                'defect proof and keep-check record unsupported',
+                cmd,
+            )
+        return cmd
+    return render(rewritten)
+
+
 def _tool_for_cmd(cmd: str | None) -> ToolKind:
     """Resolve *cmd*'s ``ToolKind`` for ``classify_failure`` dispatch (task δ).
 
@@ -3418,8 +3447,24 @@ class _JunitReportPlan:
         return owned
 
 
+COLLECTION_MAP_SUFFIX = '.tests.json'
+
+
+def collection_map_path(report: Path) -> Path:
+    """The defect-test collection map beside a junit *report*: its full file name plus ``.tests.json``.
+
+    The orchestrator's single home of the map's name, for a live junit
+    (``r.xml.tests.json``) and an archived one
+    (``attempt-1.pkg.junit-<stamp>.xml.gz.tests.json``) alike. The plugin
+    ``shared/src/shared/_pytest_inject/_df_defect_plugin.py`` holds the
+    writer's own copy, because it can import nothing; their agreement is
+    proven end to end in ``orchestrator/tests/test_verify_defect_injection.py``.
+    """
+    return report.with_name(report.name + COLLECTION_MAP_SUFFIX)
+
+
 def _clear_junit_report(junit_path: Path) -> None:
-    """Remove any report left at *junit_path* by an earlier pytest invocation.
+    """Remove any report, and its collection map, left at *junit_path* by an earlier pytest invocation.
 
     Belongs immediately before each test-leg run that injects ``--junitxml``,
     NOT where the path is computed: pytest is invoked 1..N times inside one
@@ -3431,13 +3476,16 @@ def _clear_junit_report(junit_path: Path) -> None:
 
     Siting it at the write also means a leg with no test command clears
     nothing, so a type-only gate cannot delete a report it could never write.
+
+    The sibling collection map goes with it, so a run that writes no map (mode
+    off, or a crash) never leaves a predecessor's map beside a fresh junit, to
+    be archived as this run's.
     """
-    try:
-        junit_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning(
-            '_clear_junit_report: could not remove %s: %s', junit_path, exc,
-        )
+    for path in (junit_path, collection_map_path(junit_path)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning('_clear_junit_report: could not remove %s: %s', path, exc)
 
 
 def _write_run_log(
@@ -3675,6 +3723,12 @@ def _archive_junit_report(
     *segment_label* names one segment of a segmented task leg (task 5671),
     whose segments each write their own report; omitted, the name is the
     per-leg one.
+
+    The cost and the attributing kinds both archive the report's collection
+    map the same way: copied uncompressed to ``collection_map_path(dest)``, so
+    a reader holding the archived junit's path (client-feed task 6972, the
+    defect-test consumers) derives the map from it. No map, no copy; a failed
+    copy warns and still returns the archived report.
     """
     dest: Path | None = None
     try:
@@ -3698,7 +3752,18 @@ def _archive_junit_report(
             junit_path, dest, exc_info=True,
         )
         return None
+    _archive_collection_map(collection_map_path(junit_path), collection_map_path(dest))
     return dest
+
+
+def _archive_collection_map(live_map: Path, archived_map: Path) -> None:
+    try:
+        if live_map.is_file():
+            shutil.copyfile(live_map, archived_map)
+    except OSError as exc:  # observability may not fail a verify
+        logger.warning(
+            '_archive_junit_report: could not archive %s → %s: %s', live_map, archived_map, exc,
+        )
 
 
 def _write_json_artifact(path: Path, payload: dict, caller: str) -> 'Path | None':
@@ -5551,6 +5616,7 @@ def _target_subprocess_env(
     extra: dict[str, str] | None,
     *,
     worktree: Path | None = None,
+    defect_plugin: bool = False,
 ) -> dict[str, str]:
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
@@ -5583,6 +5649,12 @@ def _target_subprocess_env(
     aimed at a pyproject declaring no ``[tool.ruff]`` it silently falls back to
     ruff's built-in defaults — a false green.  See pyproject.toml's
     ``[tool.ruff]`` decision block.)
+
+    When *defect_plugin* is set (a test leg injecting ``-p _df_defect_plugin``),
+    ``DEFECT_PLUGIN_DIR`` is MERGED into ``PYTHONPATH`` after the overlay, never
+    assigned: appended last, once, so a caller's own ``PYTHONPATH`` survives, and
+    the directory holds only the plugin module, so it shadows nothing
+    (plans/defect-tests-prd.md decision 19, B21).
     """
     env = {
         k: v
@@ -5602,7 +5674,18 @@ def _target_subprocess_env(
         env['RUFF_CACHE_DIR'] = str(Path(worktree) / '.ruff_cache')
     if extra:
         env.update(extra)
+    if defect_plugin:
+        env['PYTHONPATH'] = _pythonpath_with_plugin_dir(env.get('PYTHONPATH'))
     return env
+
+
+def _pythonpath_with_plugin_dir(pythonpath: str | None) -> str:
+    plugin_dir = str(DEFECT_PLUGIN_DIR)
+    if not pythonpath:
+        return plugin_dir
+    if plugin_dir in pythonpath.split(os.pathsep):
+        return pythonpath
+    return f'{pythonpath}{os.pathsep}{plugin_dir}'
 
 
 # ``ruff check --show-settings`` prints ``Settings path: "<abs path>"`` as its
@@ -6151,6 +6234,17 @@ class _ClockKw(TypedDict, total=False):
     clock_stop: ClockStopConfig | None
 
 
+class _DefectPluginKw(TypedDict, total=False):
+    """Keyword arguments for the defect-plugin PYTHONPATH merge in ``_run_cmd``."""
+
+    defect_plugin: bool
+
+
+def _defect_plugin_kw(cmd: str) -> _DefectPluginKw:
+    """Ask ``_run_cmd`` for the PYTHONPATH merge exactly when *cmd* carries ``-p _df_defect_plugin``."""
+    return {'defect_plugin': True} if carries_defect_plugin(parse_config_command(cmd)) else {}
+
+
 def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
     """Return 'stop', 'heartbeat', or 'start' if *line*, after stripping leading
     whitespace, STARTS WITH the respective configured marker string; else None.
@@ -6399,6 +6493,7 @@ async def _run_cmd(
     cpu_weight: int | None = None,
     memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
+    defect_plugin: bool = False,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
@@ -6497,7 +6592,9 @@ async def _run_cmd(
     # Pinned by test_verify_ruff_config_boundary.py::
     # test_segmented_chain_anchors_each_segment_at_its_own_cwd — kept on one
     # line so the name greps.
-    subprocess_env: dict[str, str] = _target_subprocess_env(env, worktree=cwd)
+    subprocess_env: dict[str, str] = _target_subprocess_env(
+        env, worktree=cwd, defect_plugin=defect_plugin,
+    )
 
     proc = None
     pgid: int | None = None
@@ -7888,6 +7985,12 @@ async def run_verification(
             if segment_chained_test and label is LegSlot.TEST
             else None
         )
+        # Offers each command of this leg the `-p` pair (decision 19). The
+        # PYTHONPATH merge follows from the command the offer produced
+        # (`_defect_plugin_kw`), so a command the mutator leaves alone
+        # (raw-retained, OPAQUE, not pytest) gets neither half.
+        inject_defect_plugin = label is LegSlot.TEST and config.defect_tests.injects_plugin
+        _plugin_kw: _DefectPluginKw = {}
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
         # the 'test' leg, only when it runs as one command and the junit plan
         # above gave it a path. _with_junitxml_str keeps the
@@ -7908,6 +8011,12 @@ async def run_verification(
             _clear_junit_report(junit.leg_path)
             cmd = _with_junitxml_str(cmd, str(junit.leg_path))
             assert cmd is not None  # None only when the input is None; guarded above
+        # After the junitxml injection and before the `-n` cap and the
+        # governance wrap, for the same opaque-after-governance reason.
+        if inject_defect_plugin and chain_segments is None:
+            cmd = _with_defect_plugin_str(cmd)
+            assert cmd is not None  # None only when the input is None; guarded above
+            _plugin_kw = _defect_plugin_kw(cmd)
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
         # gated by the shared.verify_admission flock semaphore + role nice
         # tier; lint/type ride alongside within the same verify, ungated.
@@ -8107,6 +8216,11 @@ async def run_verification(
                         _clear_junit_report(segment_report)
                         reported = _with_junitxml_str(segment_cmd, str(segment_report))
                         assert reported is not None  # None only for a None input
+                    segment_plugin_kw: _DefectPluginKw = {}
+                    if inject_defect_plugin:
+                        reported = _with_defect_plugin_str(reported)
+                        assert reported is not None  # None only for a None input
+                        segment_plugin_kw = _defect_plugin_kw(reported)
                     capped = reported
                     if pytest_n_capped:
                         capped = _with_pytest_numprocesses_str(
@@ -8136,6 +8250,7 @@ async def run_verification(
                         ),
                         **_scope_kw,
                         **_clock_kw,
+                        **segment_plugin_kw,
                     )
 
                 rc, out, timed_out_flag, segment_dicts = await _run_segmented(
@@ -8165,6 +8280,7 @@ async def run_verification(
                     log_path=_stream_log_path(label, current_attempt),
                     **_scope_kw,
                     **_clock_kw,
+                    **_plugin_kw,
                 )
                 rc, out, timed_out_flag = outcome
                 scope_launch_refused = isinstance(outcome, ScopeLaunchRefused)

@@ -217,6 +217,7 @@ class TestResolveIssueRelatedPending:
 
         response = await call_resolve_issue(
             server, escalation_id=l2_a.id, resolution='ruled', action='resume',
+            resolution_class='actionable',
         )
 
         assert response['status'] == 'resolved'

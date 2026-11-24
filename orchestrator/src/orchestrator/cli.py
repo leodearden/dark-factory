@@ -485,7 +485,8 @@ def verify_cache_enable_cmd(reason: str, config: OrchestratorConfig):
     try:
         resolved = resolve_ended_blockers(
             EscalationQueue(queue_dir), policy, now,
-            resolved_by='interactive', resolution=f'Verify cache re-enabled by the operator: {policy.reason}',
+            resolved_by='interactive', resolution_class='actionable',
+            resolution=f'Verify cache re-enabled by the operator: {policy.reason}',
         )
     except OSError as e:
         click.echo(

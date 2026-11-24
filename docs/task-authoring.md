@@ -1319,12 +1319,16 @@ path.
 
 `metadata.milestone` is an orthogonal, time-based dispatch gate — **not**
 a new `task_kind`. Setting it holds a task out of dispatch until its time
-trigger fires; once fired, the task dispatches through its normal path
-unchanged. It is allowed on **both** `normal` and `deterministic` tasks
-(orthogonal to `task_kind`), so it can gate a normal LLM-agent task, a
-deterministic predicate check (below), or a pure human gate (a `dated`
-milestone on a deterministic task with `always_escalates=True` and no
-`before_done`).
+trigger fires. Once it fires, a deterministic predicate
+(`before_done.kind='predicate'`) or pure gate carrying it dispatches ahead
+of the tier-scored queue, whatever its `priority` (task 11330;
+`orchestrator/src/orchestrator/timed_gates.py::is_timed_gate`). Any other
+milestone task (a normal task, or a deploy) dispatches through its normal
+tier-scored path unchanged. A milestone is allowed on **both** `normal` and
+`deterministic` tasks (orthogonal to `task_kind`), so it can gate a normal
+LLM-agent task, a deterministic predicate check (below), or a pure human
+gate (a `dated` milestone on a deterministic task with
+`always_escalates=True` and no `before_done`).
 
 Two time modes:
 

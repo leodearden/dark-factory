@@ -384,7 +384,7 @@ class TestFilePersistentDivergenceAlarm:
     def test_realarms_after_a_human_resolves_while_divergence_persists(self, queue):
         first = self._file(queue, [_PERSISTENT])
         assert first is not None
-        queue.resolve(first.id, 'investigated')
+        queue.resolve(first.id, 'investigated', resolution_class='actionable')
 
         second = self._file(queue, [_PERSISTENT])
 

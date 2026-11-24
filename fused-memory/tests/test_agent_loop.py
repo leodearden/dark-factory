@@ -987,7 +987,7 @@ async def _run_cli(agent: AgentLoop, result: AgentResult, payload: str = 'payloa
 async def test_cli_run_is_one_invocation_returning_the_terminal_payload():
     from pathlib import Path
 
-    from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+    from fused_memory.reconciliation import RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
     config = _make_cli_config()
     agent = _cli_agent(config=config)
@@ -1008,7 +1008,7 @@ async def test_cli_run_is_one_invocation_returning_the_terminal_payload():
     assert kwargs['strict_mcp_config'] is True
     assert kwargs['model'] == config.agent_llm_model
     assert kwargs['timeout_seconds'] == float(config.agent_cli_timeout_seconds)
-    assert kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+    assert kwargs['cap_wait_sanity_secs'] == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
     assert kwargs['cwd'] == Path(config.explore_codebase_root)
     assert not kwargs.get('resume_session_id')
     assert not kwargs.get('resume_delivers_prompt')
