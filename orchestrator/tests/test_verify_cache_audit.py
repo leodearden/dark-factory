@@ -16,6 +16,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 from escalation.categories import EscalationCategory
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
@@ -354,12 +355,25 @@ def _reproduced(*nodes: str) -> Confirmed:
     return Confirmed(ConfirmMode.INTERSECTED, nodes, (), ())
 
 
+class _RefusingQueue(EscalationQueue):
+    """A real escalation queue whose submit fails like a read-only store while *refusing* is set."""
+
+    refusing: bool = True
+
+    def submit(self, escalation: Escalation) -> str:
+        if self.refusing:
+            raise OSError('escalation queue is read-only')
+        return super().submit(escalation)
+
+
 class _Hooked:
     """The step-7 fixture registry behind a real VerifyCacheAuditHook and a real escalation queue."""
 
-    def __init__(self, tmp_path: Path, *, with_queue: bool = True) -> None:
+    def __init__(self, tmp_path: Path, *, with_queue: bool = True, queue: EscalationQueue | None = None) -> None:
         self.seeded = _Seeded(tmp_path / 'verify_cache.db')
-        self.queue = EscalationQueue(tmp_path / 'escalations') if with_queue else None
+        if queue is None:
+            queue = EscalationQueue(tmp_path / 'escalations')
+        self.queue = queue if with_queue else None
         self.hook = audit_hook.VerifyCacheAuditHook(self.seeded.registry, self.queue, now=lambda: self.seeded.now)
 
     def call(self, outcome, *, command: str = AUDIT_COMMAND, head: str = HEAD):
@@ -481,6 +495,46 @@ class TestAuditHook:
         hooked.seeded.fresh_leak_source(KA, LATER_HEAD)
 
         hooked.call(_reproduced(ALPHA_NODE), head=LATER_HEAD)
+
+        assert hooked.pending() == []
+        assert hooked.queue is not None
+        resolved = hooked.queue.get(blocker.id)
+        assert resolved is not None and resolved.status == 'resolved'
+        assert f'kill switch expired at {until.isoformat()}' in (resolved.resolution or ''), resolved.resolution
+
+    def test_a_failed_trip_filing_is_retried_by_the_next_reproduced_red_though_it_attributes_nothing(self, tmp_path):
+        queue = _RefusingQueue(tmp_path / 'escalations')
+        hooked = _Hooked(tmp_path, queue=queue)
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+        until = hooked.seeded.policy().disabled_until
+        assert until is not None
+        assert hooked.seeded.policy().is_disabled(hooked.seeded.now)
+        assert hooked.pending() == []
+
+        queue.refusing = False
+        hooked.seeded.advance(timedelta(hours=1))
+
+        assert hooked.call(_reproduced(GAMMA_NODE), head=LATER_HEAD) == ()
+
+        [blocker] = hooked.pending()
+        assert (blocker.level, blocker.severity) == (2, 'critical')
+        assert blocker.task_id == audit_hook.AUDIT_ESCALATION_SENTINEL
+        assert until.isoformat() in blocker.summary, blocker.summary
+        for unit in ('module:alpha:test', 'module:beta:test'):
+            assert unit in blocker.detail, blocker.detail
+
+        hooked.call(_reproduced(GAMMA_NODE), head=LATER_HEAD)
+
+        assert [esc.id for esc in hooked.pending()] == [blocker.id]
+
+    def test_an_expired_disables_blocker_is_resolved_by_an_unattributable_red(self, hooked):
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+        [blocker] = hooked.pending()
+        until = hooked.seeded.policy().disabled_until
+        assert until is not None
+        hooked.seeded.now = until + timedelta(days=1)
+
+        assert hooked.call(_reproduced(GAMMA_NODE), head=LATER_HEAD) == ()
 
         assert hooked.pending() == []
         assert hooked.queue is not None
