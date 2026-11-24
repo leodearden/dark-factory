@@ -485,6 +485,28 @@ class TestTheWriteTriageJudgeRidesThePlanRoute:
         assert status['judge_fail_opens_since_latch'] == 2
 
     @pytest.mark.asyncio
+    async def test_an_effort_the_arm_cannot_send_raises_before_any_gated_client_is_built(
+        self, endpoints: _Endpoints, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cfg = _judge_config(endpoints)
+        object.__setattr__(cfg.llm, 'client_class', 'openai_generic')
+        object.__setattr__(cfg.write_triage, 'judge_reasoning_effort', 'low')
+        route = endpoints.route()
+        gated_clients: list[str] = []
+
+        def no_gated_client(base_url: str, *, site: PlanRouteSite) -> None:
+            gated_clients.append(base_url)
+
+        monkeypatch.setattr(route, 'http_client_for', no_gated_client)
+        service = types.SimpleNamespace(config=cfg, plan_route=route)
+
+        with pytest.raises(ValueError, match='judge_reasoning_effort'):
+            await _judge(service)
+
+        assert gated_clients == []
+        assert endpoints.proxy.requests == []
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('plan_route', ['absent', 'not_a_plan_route'])
     async def test_a_service_without_a_plan_route_judges_ungated(
         self, endpoints: _Endpoints, plan_route: str,

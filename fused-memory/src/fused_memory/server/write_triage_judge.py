@@ -1067,10 +1067,7 @@ async def _call_llm(
             f'unknown judge provider {provider!r}; implemented arms are '
             f'{list(_KNOWN_PROVIDERS)}',
         )
-    creds = _on_the_plan_route(
-        _provider_credentials(memory_service, provider), memory_service, provider,
-    )
-    _announce_judge_route(creds.route)
+    creds = _provider_credentials(memory_service, provider)
     if reasoning_effort is not None and not creds.serves_responses_api:
         why = (
             'the anthropic arm has no reasoning-effort parameter'
@@ -1083,6 +1080,8 @@ async def _call_llm(
             f'sent: {why}. Set it to null for this arm, or judge on an endpoint '
             'that serves the Responses API.',
         )
+    creds = _on_the_plan_route(creds, memory_service, provider)
+    _announce_judge_route(creds.route)
     if provider == 'anthropic':
         return await _call_anthropic(creds, model=model, prompt=prompt, timeout=timeout)
     if creds.serves_responses_api:
