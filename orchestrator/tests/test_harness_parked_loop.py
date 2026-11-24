@@ -38,9 +38,7 @@ _TICK = 0.01
 _FORCE_FIRE_AFTER_SECS = 900.0
 _UNIT = 'orchestrator-parked-test.service'
 _SHUTDOWN_DRAIN_SECS = 0.2
-# Frees a cancel-immune task if shutdown would otherwise wait on it forever.
-# A timer handle, not a Task, so run()'s straggler sweep cannot cancel it.
-_HANG_GUARD_SECS = 10.0
+_HANG_GUARD_SECS = 60.0
 
 
 class _Slots:
@@ -81,6 +79,30 @@ class _Slots:
         finally:
             self.finished.add(tid)
             lease.release(requeued=False)
+
+
+class _HangGuard:
+    """Frees a cancel-immune task if shutdown would otherwise wait on it forever.
+
+    Armed at the cancel, so its budget bounds the shutdown alone.  A timer
+    handle, not a Task, so run()'s straggler sweep cannot cancel it.
+    """
+
+    def __init__(self, release: asyncio.Event) -> None:
+        self._release = release
+        self._handle: asyncio.TimerHandle | None = None
+        self.fired = False
+
+    def arm(self) -> None:
+        self._handle = asyncio.get_running_loop().call_later(_HANG_GUARD_SECS, self._fire)
+
+    def _fire(self) -> None:
+        self.fired = True
+        self._release.set()
+
+    def cancel(self) -> None:
+        if self._handle is not None:
+            self._handle.cancel()
 
 
 async def _ignore_cancels_until(release: asyncio.Event) -> None:
@@ -374,7 +396,7 @@ class TestParkedLoop:
         h = _harness(tmp_path, dispatch, slots)
         _shrink_shutdown_drains(h, monkeypatch)
         release = asyncio.Event()
-        guard = asyncio.get_running_loop().call_later(_HANG_GUARD_SECS, release.set)
+        guard = _HangGuard(release)
         main = asyncio.current_task()
         assert main is not None
         bystanders: list[asyncio.Task] = []
@@ -383,12 +405,14 @@ class TestParkedLoop:
             await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
             bystanders.append(asyncio.create_task(_ignore_cancels_until(release), name='immune-bystander'))
             await asyncio.sleep(0)
+            guard.arm()
             main.cancel()
 
         try:
             with pytest.raises(asyncio.CancelledError):
                 await _run_driven(h, slots, sigterm_beside_an_immune_bystander)
 
+            assert not guard.fired, 'shutdown waited on the cancel-immune bystander until the hang guard freed it'
             [bystander] = bystanders
             assert not bystander.done(), 'shutdown must not wait for a task that ignores its cancel'
             assert _harness_errors_naming(caplog, 'immune-bystander')
@@ -409,7 +433,7 @@ class TestParkedLoop:
         slots.immune = {'1'}
         h = _harness(tmp_path, dispatch, slots, max_concurrent_tasks=2)
         _shrink_shutdown_drains(h, monkeypatch)
-        guard = asyncio.get_running_loop().call_later(_HANG_GUARD_SECS, slots.immune_release.set)
+        guard = _HangGuard(slots.immune_release)
         main = asyncio.current_task()
         assert main is not None
         immune_slots: list[asyncio.Task] = []
@@ -417,12 +441,14 @@ class TestParkedLoop:
         async def sigterm_with_both_slots_running() -> None:
             await _until(lambda: {'1', '2'} <= slots.started, 'slots 1 and 2 running')
             immune_slots.append(next(t for t in asyncio.all_tasks() if t.get_name() == 'workflow-1'))
+            guard.arm()
             main.cancel()
 
         try:
             with pytest.raises(asyncio.CancelledError):
                 await _run_driven(h, slots, sigterm_with_both_slots_running)
 
+            assert not guard.fired, 'shutdown waited on the cancel-immune slot until the hang guard freed it'
             [immune_slot] = immune_slots
             assert not immune_slot.done(), 'shutdown must not wait for a slot that ignores its cancel'
             assert immune_slot not in h._live_tasks
