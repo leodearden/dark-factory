@@ -53,7 +53,7 @@ from orchestrator.git_ops import (
     _git_stderr_is_unresolved_ref,
     _run,
 )
-from orchestrator.index_lock_liveness import GitProcessScan
+from orchestrator.index_lock_liveness import GitProcess, GitProcessScan
 from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
 from orchestrator.quarantine_provenance import NOT_RELOCATED
 
@@ -15539,6 +15539,97 @@ class TestAdvanceMainIndexLockStandoff:
             'a git process that started after the lock must not turn a crashed '
             f'leftover into a stand-off; got waited={waited!r}'
         )
+
+    async def test_a_skipped_standoff_reports_the_scan_it_decided_on(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        git_ops.proc_root = empty_proc_table(tmp_path)
+        lock_path = _index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
+        try:
+            result = await git_ops._await_index_lock_clear(
+                timeout_s=1.0, context='skipped-standoff-scan',
+            )
+        finally:
+            lock_path.unlink()
+
+        assert result.cleared is False
+        assert result.waited_s == 0.0
+        assert result.holder_scan == GitProcessScan((), confirmed=True)
+
+    async def test_a_timed_out_standoff_reports_a_scan_taken_at_its_deadline(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        lock_path = _index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
+        git_ops.proc_root = _table_holding_one_git_process(
+            tmp_path, git_ops.project_root,
+            command=_HOLDER_COMMAND, started_at=lock_path.stat().st_mtime - 60,
+        )
+        try:
+            timed_out = await git_ops._await_index_lock_clear(
+                timeout_s=1.0, context='timed-out-standoff-scan',
+            )
+        finally:
+            lock_path.unlink()
+        unheld = await git_ops._await_index_lock_clear(
+            timeout_s=1.0, context='no-lock-standoff-scan',
+        )
+
+        assert timed_out.cleared is False
+        assert timed_out.waited_s > 0.0
+        assert timed_out.holder_scan is not None
+        assert [process.pid for process in timed_out.holder_scan.processes] == [_HOLDER_PID]
+        assert unheld.cleared is True
+        assert unheld.holder_scan is None
+
+    async def test_a_short_circuited_deferral_keeps_the_rm_f_advice_when_a_git_process_appears_later(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """The stand-off and the reason must judge the SAME scan.  A git
+        process that shows up after the scan that skipped the wait would
+        otherwise pair "waited 0s" with "wait for that process to exit"."""
+        merge_result = await self._make_merge(
+            git_ops, 'lock-one-scan', 'lock_one_scan.py',
+        )
+        git_ops.config.merge_park_lock_grace_seconds = 0
+        git_ops.proc_root = empty_proc_table(tmp_path)
+        lock_path = _index_lock_written_ago(git_ops.project_root, _REIFY_LOCK_AGE_S)
+        real_scan = git_ops._scan_index_lock_holders
+        late_arrival = GitProcessScan(
+            (GitProcess(4_000_000, _LATER_READER_COMMAND),), confirmed=True,
+        )
+        scans_taken: list[int] = []
+
+        async def first_scan_real_then_a_late_arrival() -> GitProcessScan:
+            scans_taken.append(1)
+            return await real_scan() if len(scans_taken) == 1 else late_arrival
+
+        try:
+            with patch.object(
+                git_ops, '_scan_index_lock_holders',
+                side_effect=first_scan_real_then_a_late_arrival,
+            ):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+        info = git_ops._last_park_lock_info
+        assert info['waited_seconds'] == 0.0
+        assert info['holder_scan'] == GitProcessScan((), confirmed=True)
+        reason = await _park_lock_reason(git_ops, merge_result.merge_commit)
+        assert f'rm -f {lock_path}' in reason, (
+            f'the reason must come from the scan that skipped the wait; got {reason!r}'
+        )
+        assert '4000000' not in reason
 
     async def test_an_old_lock_with_an_unconfirmed_scan_is_still_waited_on(
         self, git_ops: GitOps, tmp_path: Path,
