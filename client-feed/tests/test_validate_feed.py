@@ -1,9 +1,11 @@
 """validate-feed on the committed boundary fixtures (PRD B4, B5) and on altered copies of them.
 
 The fixtures are what the portal repo vendors. feed-v1/state.json is the fold of feed-v1/feed.jsonl at
-seq 28; feed-v1-foreign-project/state.json is the fold of that feed's lines 1 and 3. Regenerate feed-v1's
-only after a deliberate feed change, from client-feed/:
+seq 28; feed-v1-foreign-project/state.json is the fold of that feed's lines 1 and 3. feed-v1.1 is the 1.1
+fixture the portal vendors in its ξ1: two passes acknowledging client defect reports, its state.json the
+fold of its feed at seq 5. Regenerate a state.json only after a deliberate feed change, from client-feed/:
 uv run python -c "from pathlib import Path; from client_feed.contract import parse_feed_line as p, split_jsonl; from client_feed.fold import fold; d = Path('tests/fixtures/feed-v1'); d.joinpath('state.json').write_text(fold([p(t, line_no=i) for i, t in enumerate(split_jsonl(d.joinpath('feed.jsonl').read_text()), 1)], project_id='demo-client', upto_seq=28).model_dump_json(indent=2) + '\\n')"
+uv run python -c "from pathlib import Path; from client_feed.contract import parse_feed_line as p, split_jsonl; from client_feed.fold import fold; d = Path('tests/fixtures/feed-v1.1'); d.joinpath('state.json').write_text(fold([p(t, line_no=i) for i, t in enumerate(split_jsonl(d.joinpath('feed.jsonl').read_text()), 1)], project_id='demo-client', upto_seq=5).model_dump_json(indent=2) + '\\n')"
 """
 
 import json
