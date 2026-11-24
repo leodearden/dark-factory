@@ -29,7 +29,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 try:
     import check_lock_charter_drift as drift
@@ -68,7 +67,6 @@ FUSED_MEMORY_URL_ENV = 'FUSED_MEMORY_MCP_URL'
 FUSED_MEMORY_TIMEOUT_SECS = 120
 ESCALATION_TIMEOUT_SECS = 30
 
-Report = Mapping[str, Any]
 ToolCall = Callable[[str, dict[str, object]], Mapping[str, object]]
 """One MCP tool call: tool name and arguments in, the tool's reply out."""
 
@@ -123,61 +121,22 @@ def _call(port: ToolCall, tool: str, args: dict[str, object]) -> Mapping[str, ob
 # The heal task's brief.
 
 
-@dataclass(frozen=True)
-class _Drifted:
-    """One drifted name: its part's label, the name, and a witness path when the corpus supplied one."""
-
-    label: str
-    name: str
-    witness: str | None = None
-
-    def text(self) -> str:
-        return self.name if self.witness is None else f'{self.name} (e.g. {self.witness})'
+def _shown(drifted: drift.Drifted) -> str:
+    return drifted.name if drifted.witness is None else f'{drifted.name} (e.g. {drifted.witness})'
 
 
-_VECTOR_LABELS = (('extensions', 'extensions'), ('extensionless', 'extension-less names'))
-
-
-def _by_direction(report: Report) -> tuple[list[_Drifted], list[_Drifted]]:
-    """``(only_in_reify, only_in_dark_factory)`` across every part of *report*."""
-    parts = report.get('parts', {})
-    vectors = parts.get('vectors', {}).get('vectors', {})
-    extensionless = parts.get('extensionless', {})
-    only_in_reify: list[_Drifted] = []
-    only_in_dark_factory: list[_Drifted] = []
-    for key, label in _VECTOR_LABELS:
-        diff = vectors.get(key, {})
-        only_in_reify += [_Drifted(f'{label} reify declares', n) for n in diff.get('only_in_reify', [])]
-        only_in_dark_factory += [
-            _Drifted(f'{label} reify no longer declares', n) for n in diff.get('only_in_dark_factory', [])
-        ]
-    only_in_reify += [
-        _Drifted('tracked extensions the predicate rejects', ext, path)
-        for ext, path in sorted(parts.get('corpus', {}).get('findings', {}).items())
-    ]
-    only_in_reify += [
-        _Drifted('tracked extension-less names the predicate rejects', name, path)
-        for name, path in sorted(extensionless.get('findings', {}).items())
-    ]
-    only_in_dark_factory += [
-        _Drifted('allowlisted names that are directories in reify', name, path)
-        for name, path in sorted(extensionless.get('collisions', {}).items())
-    ]
-    return only_in_reify, only_in_dark_factory
-
-
-def _section(heading: str, drifted: list[_Drifted]) -> list[str]:
+def _section(heading: str, drifted: list[drift.Drifted]) -> list[str]:
     if not drifted:
         return []
-    labels = dict.fromkeys(d.label for d in drifted)
+    kinds = dict.fromkeys(d.kind for d in drifted)
     return [heading] + [
-        f'  - {label}: ' + ', '.join(d.text() for d in drifted if d.label == label) for label in labels
+        f'  - {kind}: ' + ', '.join(_shown(d) for d in drifted if d.kind == kind) for kind in kinds
     ]
 
 
-def heal_brief(report: Report) -> tuple[str, str]:
+def heal_brief(report: drift.Report) -> tuple[str, str]:
     """The heal task's ``(title, description)`` for a drift *report*."""
-    only_in_reify, only_in_dark_factory = _by_direction(report)
+    only_in_reify, only_in_dark_factory = drift.drifted_by_direction(report)
     names = sorted({d.name for d in only_in_reify + only_in_dark_factory})
     title = elide_at_word(
         'Mirror reify lock-charter drift into dark-factory: ' + (', '.join(names) or 'see description'),
@@ -210,27 +169,18 @@ def heal_brief(report: Report) -> tuple[str, str]:
 # The three routes.
 
 
-def _committed(ports: Ports, project_root: str, task_id: str) -> str | None:
-    """Release *task_id* from its planning hold: ``None`` when released, else the refusal.
+def _commit_refusal(ports: Ports, project_root: str, task_id: str) -> str | None:
+    """Release *task_id* from its planning hold: the refusal, or ``None`` once released.
 
     A refusal is a hold someone else stamped (fused-memory releases only its
-    own planning hold), so it is reported, never retried around.
+    own planning hold), so it is reported, never retried around.  One id per
+    call, so fused-memory answers it at top level, not in a ``results`` list.
     """
     args: dict[str, object] = {'project_root': project_root, 'task_ids': task_id, 'target_status': 'pending'}
     reply = _reply(ports.fused_memory, 'commit_planning', args)
     if reply.get('success') is True:
         return None
-    per_id = reply.get('results')
-    reasons = sorted({r for r in map(_refusal_reason, per_id if isinstance(per_id, list) else []) if r})
-    return f'commit_planning refused: {", ".join(reasons) if reasons else reply.get("error", reply)}'
-
-
-def _refusal_reason(one: object) -> str | None:
-    """The ``reason_code`` (else ``error``) of one refused id in a ``commit_planning`` reply."""
-    result = one.get('result') if isinstance(one, Mapping) else None
-    if not isinstance(result, Mapping) or result.get('success'):
-        return None
-    return str(result.get('reason_code') or result.get('error'))
+    return f'commit_planning refused: {reply.get("reason_code") or reply.get("error") or dict(reply)!r}'
 
 
 def _open_owner(ports: Ports, project_root: str) -> tuple[str, str] | None:
@@ -251,13 +201,13 @@ def _open_owner(ports: Ports, project_root: str) -> tuple[str, str] | None:
     return str(first['task_id']), str(first['status'])
 
 
-def ensure_heal_task(report: Report, ports: Ports, *, project_root: Path) -> RouteResult:
+def ensure_heal_task(report: drift.Report, ports: Ports, *, project_root: Path) -> RouteResult:
     """Adopt the open heal task, or file and commit one: never a second open owner."""
     root = str(project_root)
     owner = _open_owner(ports, root)
     if owner is not None:
         task_id, status = owner
-        note = _committed(ports, root, task_id) if status == TaskStatus.DEFERRED else None
+        note = _commit_refusal(ports, root, task_id) if status == TaskStatus.DEFERRED else None
         return RouteResult(Outcome.ADOPTED, task_id, note)
     title, description = heal_brief(report)
     args: dict[str, object] = {
@@ -274,29 +224,26 @@ def ensure_heal_task(report: Report, ports: Ports, *, project_root: Path) -> Rou
     task_id = submitted.get('task_id')
     if not isinstance(task_id, str) or not task_id:
         raise RouteFailure(f'submit_task answered {submitted!r}, naming no task')
-    return RouteResult(Outcome.FILED, task_id, _committed(ports, root, task_id))
+    return RouteResult(Outcome.FILED, task_id, _commit_refusal(ports, root, task_id))
 
 
-def _pending_slots(escalation: ToolCall) -> frozenset[str]:
-    records = _call(escalation, 'get_pending_escalations', {'compact': True}).get('result')
+def _unavailable_is_pending(escalation: ToolCall) -> bool:
+    args: dict[str, object] = {'task_id': UNAVAILABLE_SLOT, 'compact': True}
+    records = _call(escalation, 'get_pending_escalations', args).get('result')
     if not isinstance(records, list):
         raise RouteFailure(f'get_pending_escalations answered {records!r}, not a result list')
-    slots = []
-    for record in records:
-        slot = record.get('task_id') if isinstance(record, Mapping) else None
-        if not isinstance(slot, str):
-            raise RouteFailure(f'get_pending_escalations answered a record with no str task_id: {record!r}')
-        slots.append(slot)
-    return frozenset(slots)
+    return bool(records)
 
 
 def _unavailable_summary() -> str:
     return 'Nightly reify lock-charter drift check could not look: nothing was compared'
 
 
-def escalate_unavailable(report: Report, ports: Ports, *, now: datetime, reify_repo: str | None) -> RouteResult:
+def escalate_unavailable(
+    report: drift.Report, ports: Ports, *, now: datetime, reify_repo: str | None,
+) -> RouteResult:
     """Raise "could not look" as loudly as drift: one ``escalate_info``, unless one is pending."""
-    if UNAVAILABLE_SLOT in _pending_slots(ports.escalation):
+    if _unavailable_is_pending(ports.escalation):
         return RouteResult(Outcome.ESCALATION_PENDING)
     sibling = reify_repo or 'the reify checkout REIFY_ROOT or discovery resolves'
     args: dict[str, object] = {
@@ -321,7 +268,7 @@ def escalate_unavailable(report: Report, ports: Ports, *, now: datetime, reify_r
 
 
 def route(
-    report: Report, ports: Ports, *, project_root: Path, now: datetime, reify_repo: str | None = None,
+    report: drift.Report, ports: Ports, *, project_root: Path, now: datetime, reify_repo: str | None = None,
 ) -> RouteResult:
     """Deliver *report* to its owner.  Raises `RouteFailure` when it could not."""
     match report['exit_code']:
@@ -334,7 +281,7 @@ def route(
     raise RouteFailure(f'the reconciliation reported exit code {report["exit_code"]!r}, which is not 0, 1 or 2')
 
 
-def dry_run_text(report: Report) -> str:
+def dry_run_text(report: drift.Report) -> str:
     """What `route` would deliver for *report*, for an operator; calls nothing."""
     match report['exit_code']:
         case drift.EXIT_DRIFT:

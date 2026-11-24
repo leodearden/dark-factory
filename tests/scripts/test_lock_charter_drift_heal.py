@@ -47,7 +47,7 @@ def _hermetic_env(monkeypatch):
 
 
 class FakeTaskStore:
-    """The four fused-memory tools the router may call, over one in-memory task table."""
+    """The three fused-memory tools the router may call, over one in-memory task table."""
 
     def __init__(self, tasks: Sequence[Mapping[str, Any]] = ()) -> None:
         self.tasks: dict[str, dict[str, Any]] = {str(t['id']): copy.deepcopy(dict(t)) for t in tasks}
@@ -83,21 +83,20 @@ class FakeTaskStore:
         return {'task_id': task_id, 'status': status, 'planning_mode': bool(arguments.get('planning_mode'))}
 
     def _commit_planning(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        results = []
-        for task_id in str(arguments['task_ids']).split(','):
-            if task_id in self.held:
-                results.append({'task_id': task_id, 'result': {
-                    'success': False, 'error': 'deferral_invalid', 'task_id': task_id,
-                    'reason_code': 'not_planning_hold', 'field': 'deferral.kind',
-                    'value': 'until_condition', 'hint': 'a human hold is not released by commit_planning',
-                }})
-            else:
-                self.tasks[task_id]['status'] = 'pending'
-                results.append({'task_id': task_id, 'result': {'success': True}})
-        return {'success': all(r['result']['success'] for r in results), 'results': results}
+        """One id, answered at top level as fused-memory answers a comma-free ``task_ids``.
 
-    def _get_task(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        return copy.deepcopy(self.tasks[str(arguments['id'])])
+        A human hold is refused in ``DeferralInvalidRefusal.to_error_dict``'s
+        shape (``fused_memory.middleware.deferral_gate``).
+        """
+        task_id = str(arguments['task_ids'])
+        if task_id in self.held:
+            return {
+                'success': False, 'error': 'deferral_invalid', 'task_id': task_id,
+                'reason_code': 'not_planning_hold', 'field': 'deferral.kind',
+                'value': 'until_condition', 'hint': 'a human hold is not released by commit_planning',
+            }
+        self.tasks[task_id]['status'] = 'pending'
+        return {'success': True}
 
 
 class FakeEscalationServer:
@@ -113,7 +112,8 @@ class FakeEscalationServer:
     def answer(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         self.calls.append((tool, copy.deepcopy(dict(arguments))))
         if tool == 'get_pending_escalations':
-            return {'result': copy.deepcopy(self.pending)}
+            slot = arguments.get('task_id')
+            return {'result': [copy.deepcopy(r) for r in self.pending if slot is None or r.get('task_id') == slot]}
         if tool == 'escalate_info':
             record = {'id': f'esc-{len(self.pending)}', 'task_id': arguments['task_id']}
             self.pending.append(record)
@@ -291,6 +291,8 @@ class TestOkAndUnavailable:
 
         result = heal.route(report, ports, project_root=_project_root(tmp_path), now=NOW)
 
+        (lookup,) = queue.calls_to('get_pending_escalations')
+        assert lookup['task_id'] == heal.UNAVAILABLE_SLOT
         (filed,) = queue.calls_to('escalate_info')
         assert filed['task_id'] == heal.UNAVAILABLE_SLOT
         assert filed['agent_role'] == heal.AGENT_ROLE
@@ -309,6 +311,17 @@ class TestOkAndUnavailable:
         assert queue.calls_to('escalate_info') == []
         assert result.outcome is heal.Outcome.ESCALATION_PENDING
         assert 'escalation already pending' in result.line()
+
+    def test_another_slots_pending_record_neither_suppresses_nor_fails_the_escalation(
+        self, tmp_path, monkeypatch, queue, ports,
+    ):
+        queue.pending.append({'id': 'esc-other', 'task_id': 'some-other-task', 'shape': ['unexpected']})
+        queue.pending.append({'id': 'esc-no-slot'})
+
+        result = heal.route(_unavailable_report(tmp_path, monkeypatch), ports, project_root=_project_root(tmp_path), now=NOW)
+
+        assert len(queue.calls_to('escalate_info')) == 1
+        assert result.outcome is heal.Outcome.ESCALATED
 
 
 class TestMain:
