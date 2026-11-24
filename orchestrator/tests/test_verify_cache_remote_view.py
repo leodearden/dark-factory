@@ -9,6 +9,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import shutil
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -54,16 +55,25 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.task_verify_run import run_task_verify_on_worktree
 from orchestrator.task_verify_spec import (
+    TaskVerifySpec,
     build_task_verify_spec,
     spec_from_dict,
     spec_to_dict,
     task_spec_from_json,
     task_spec_to_json,
 )
+from orchestrator.verify import VerifyResult
 from orchestrator.verify_cache import keys
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import Decision
-from orchestrator.verify_cache.recorder import CacheReport, LegRun, UnbackedReplay, report_of
+from orchestrator.verify_cache.recorder import (
+    CacheReport,
+    LegRun,
+    UnbackedReplay,
+    VerifyEvidenceRef,
+    record_greens,
+    report_of,
+)
 from orchestrator.verify_cache.registry import Candidate, Entry, KillSwitch, PolicyState, Registry
 from orchestrator.verify_cache.remote_view import (
     RemoteCache,
@@ -72,7 +82,7 @@ from orchestrator.verify_cache.remote_view import (
     ship_view,
 )
 from orchestrator.verify_cache.replay import CacheAccess, ExecutedModule, ReplayPlan
-from orchestrator.verify_evidence import Leg, UnitOutcome, UnitTier
+from orchestrator.verify_evidence import Leg, UnitOutcome, UnitTier, verify_event_fields
 from orchestrator.verify_runner import (
     MergeVerifySpec,
     RemoteRunner,
@@ -652,13 +662,18 @@ def _flag(words: Sequence[str], flag: str) -> str:
 
 def _shipped_view(command: str) -> ShippedView | None:
     """The view the remote verify *command* carries in its ``--spec``."""
-    return spec_from_json(_flag(gate_argv(command), '--spec')).verify_cache
+    words = gate_argv(command)
+    spec_json = _flag(words, '--spec')
+    if words[0] == 'verify-task':
+        return task_spec_from_json(spec_json).verify_cache
+    return spec_from_json(spec_json).verify_cache
 
 
 class _Laptop:
     """Host R: a second checkout of the seeded repo that answers RemoteRunner's verify ssh
-    with the real runner entry, in-process, under its own host *modes*. Every push it is
-    sent succeeds; *before_answer* runs after R has decided and before its verdict returns."""
+    with the real runner entry of its subcommand, in-process, under its own host *modes*.
+    Every push it is sent succeeds; *before_answer* runs after R has decided and before
+    its verdict returns."""
 
     def __init__(self, checkout: Path, modes: VerifyCacheConfig) -> None:
         self.checkout = checkout
@@ -675,16 +690,22 @@ class _Laptop:
         assert argv[0] == 'ssh', argv
         self.commands.append(argv[-1])
         words = gate_argv(argv[-1])
-        assert words[0] == 'verify-merge', words
         sha = _flag(words, '--sha')
         workspace_git(self.checkout, 'checkout', '-q', '--detach', sha)
-        result = await run_merge_verify_on_worktree(
-            self.checkout, cache_config(self.checkout, self.modes), spec_from_json(_flag(words, '--spec')),
-            merge_sha=sha, run_unscoped=clean_unscoped_gate,
-        )
+        result = await self._verify(words[0], sha, _flag(words, '--spec'))
         if self.before_answer is not None:
             await self.before_answer()
         return (0, result_to_json(result), '')
+
+    async def _verify(self, subcommand: str, sha: str, spec_json: str) -> VerifyResult:
+        config = cache_config(self.checkout, self.modes)
+        if subcommand == 'verify-task':
+            shutil.rmtree(self.checkout / '.task', ignore_errors=True)
+            return await run_task_verify_on_worktree(self.checkout, config, task_spec_from_json(spec_json))
+        assert subcommand == 'verify-merge', subcommand
+        return await run_merge_verify_on_worktree(
+            self.checkout, config, spec_from_json(spec_json), merge_sha=sha, run_unscoped=clean_unscoped_gate,
+        )
 
 
 @pytest.fixture
@@ -925,3 +946,80 @@ class TestTheShippedCommandFitsOneArgument:
         assert len(command.encode()) <= _MAX_ARG_STRLEN
         assert view.truncated is True
         assert 0 < len(view.candidates) < 30 * 2000
+
+
+async def _task_green_recorded_then_beta_edited(
+    repo: Path, modules: list[ModuleConfig], registry: Registry,
+) -> tuple[dict[str, Entry], TaskVerifySpec]:
+    """Every unit's green recorded by a local task verify, then a beta-only commit and the spec of its tip."""
+    config = cache_config(repo, _BOTH_ON)
+    (repo / '.task').mkdir()
+    access = CacheAccess(registry, await _gate_code())
+    recorded = await record_run(registry, await task_verify(repo, config, modules, access, _TASK_FILES))
+    assert module_units('alpha') <= set(recorded)
+    commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+    spec = build_task_verify_spec(
+        config, modules, _TASK_FILES, force_workspace=False, attempt_id=1, task_id='9123', tip_sha=head_of(repo),
+    )
+    return recorded, spec
+
+
+@pytest.mark.usefixtures('seam')
+class TestARemoteTaskVerifyThroughTheRealRemoteRunner:
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    @pytest.mark.asyncio
+    async def test_alpha_replays_remotely_and_the_dispatcher_records_the_admitted_greens(
+        self, repo, modules, registry, store, laptop_checkout, markers,
+    ):
+        recorded, spec = await _task_green_recorded_then_beta_edited(repo, modules, registry)
+        runner = _Laptop(laptop_checkout, VerifyCacheConfig()).runner(repo)
+        clear_markers(markers)
+
+        result = await runner.run_task_verify(
+            spec, task_id='9123', archive_root=None, verify_cache=RemoteCache(registry, _BOTH_ON),
+        )
+
+        assert result.passed, result.summary
+        units = units_by_id(result)
+        for unit_id in module_units('alpha'):
+            assert units[unit_id].outcome is UnitOutcome.CACHE_HIT
+            assert units[unit_id].evidence_event_id == recorded[unit_id].evidence_event_id
+        assert not {leg for leg in ran_legs(markers) if leg.startswith('alpha:')}
+        assert result.cache_report is not None
+        assert result.cache_record == result.cache_report.record('task', _BOTH_ON.with_mode('task', CacheMode.ON))
+        assert (await registry.summary()).consumed == 0
+
+        row_id = store.emit(EventType.workflow_verify, task_id='9123', data={'runner': _LAPTOP, **verify_event_fields(result)})
+        outcome = await record_greens(
+            registry, result.cache_record, flake_suppressed=result.flake_suppression is not None,
+            evidence=VerifyEvidenceRef(row_id, store.run_id, spec.tip_sha, result.passed),
+        )
+
+        assert isinstance(row_id, int)
+        assert module_units('beta') <= {entry.unit_id for entry in outcome.recorded}
+        assert not module_units('alpha') & {entry.unit_id for entry in outcome.recorded}
+        assert {entry.evidence_event_id for entry in outcome.recorded} == {row_id}
+
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    @pytest.mark.asyncio
+    async def test_a_green_evicted_between_ship_and_answer_is_no_verdict(
+        self, repo, modules, registry, laptop_checkout,
+    ):
+        recorded, spec = await _task_green_recorded_then_beta_edited(repo, modules, registry)
+        evicted = recorded[_ALPHA]
+        laptop = _Laptop(laptop_checkout, VerifyCacheConfig())
+
+        async def evict() -> None:
+            await registry.evict_key(evicted.key, 'evicted between ship and answer')
+
+        laptop.before_answer = evict
+
+        with pytest.raises(RunnerUnavailable) as raised:
+            await laptop.runner(repo).run_task_verify(
+                spec, task_id='9123', archive_root=None, verify_cache=RemoteCache(registry, _BOTH_ON),
+            )
+
+        assert raised.value.kind == 'no_verdict'
+        assert _ALPHA in str(raised.value) and evicted.key in str(raised.value)
+        shipped = _shipped_view(laptop.commands[0])
+        assert shipped is not None and evicted.candidate in shipped.candidates

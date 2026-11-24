@@ -38,9 +38,16 @@ from _verify_artifact_fixtures import (
     registry_config,
 )
 from _verify_cache_fixtures import TEST_CODE
+from _verify_cache_units import record_entry, unit_key
 
 from orchestrator import task_verify_dispatch
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, apply_reload
+from orchestrator.config import (
+    GitConfig,
+    ModuleConfig,
+    OrchestratorConfig,
+    VerifyCacheConfig,
+    apply_reload,
+)
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.task_verify_dispatch import (
@@ -57,6 +64,7 @@ from orchestrator.task_verify_spec import (
 )
 from orchestrator.verify import VerifyInfraError, VerifyResult, run_scoped_verification
 from orchestrator.verify_admission_gate import AdmissionPlan
+from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_cache.registry import Registry
 from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
@@ -593,6 +601,42 @@ class TestLocalArmsJoinTheTaskCache:
         await h.call()
 
         assert h.local.caches == [None]
+
+
+@pytest.mark.asyncio
+class TestTheRemoteArmShipsAViewOfTheTaskCache:
+    """Task 9123 (A5): the remote leg ships a view of the dispatcher's own cache, and none outside it."""
+
+    async def test_a_dispatcher_in_the_cache_ships_its_registrys_greens_under_the_configs_mode(
+        self, tmp_path: Path,
+    ) -> None:
+        access = _access(tmp_path)
+        assert access.registry is not None
+        green = await record_entry(access.registry, unit_key('module:orchestrator:test'))
+        config = OrchestratorConfig(
+            git=GitConfig(main_branch='main'), verify_env_probes=[],
+            verify_cache=VerifyCacheConfig(task_mode=CacheMode.ON, remote_task_mode=CacheMode.ON),
+        )
+        h = _harness(
+            tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))),
+            verify_cache=access, config=config,
+        )
+
+        await h.call()
+
+        assert h.only_sidecar()['reason'] == 'remote'
+        view = _sent_spec(h.transport).verify_cache
+        assert view is not None
+        assert view.mode is CacheMode.ON
+        assert green.candidate in view.candidates
+
+    async def test_a_dispatcher_outside_the_cache_ships_no_view(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))))
+
+        await h.call()
+
+        assert h.only_sidecar()['reason'] == 'remote'
+        assert _sent_spec(h.transport).verify_cache is None
 
 
 # ---------------------------------------------------------------------------
