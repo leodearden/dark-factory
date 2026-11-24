@@ -503,12 +503,16 @@ async def _runner_replayed(registry: Registry, role: VerifyRole, *, replays: boo
         for evidence, unit_id in enumerate((_ALPHA, _ALPHA_LINT), start=5)
     }
     view = ShippedView(CacheMode.ON, None, None, tuple(entry.candidate for entry in replayed.values()), False)
-    hit = Decision.HIT if replays else Decision.MISS
+    def decided(unit_id: str, entry: Entry):
+        if replays:
+            return unit_decision(Decision.HIT, entry.candidate, key=keys_[unit_id])
+        return unit_decision(Decision.MISS, key=keys_[unit_id])
+
     replay = ReplayPlan(
         role=role, modes=VerifyCacheConfig().with_mode(role, CacheMode.ON),
         tree=unit_decision(Decision.MISS, key=unit_key('tree', tier=UnitTier.TREE)),
         modules={
-            **{unit_id: unit_decision(hit, entry.candidate, key=keys_[unit_id]) for unit_id, entry in replayed.items()},
+            **{unit_id: decided(unit_id, entry) for unit_id, entry in replayed.items()},
             _BETA: unit_decision(Decision.MISS, key=keys_[_BETA]),
         },
     )

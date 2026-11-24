@@ -14,9 +14,16 @@ from typing import Any
 from orchestrator.config import VerifyCacheConfig
 from orchestrator.verify_cache.keys import TREE_UNIT_ID
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
+from orchestrator.verify_cache.recorder import (
+    CacheRecord,
+    CacheReport,
+    ConsumeOutcome,
+    UnbackedReplay,
+    consume_replayed,
+)
 from orchestrator.verify_cache.registry import Candidate, KillSwitch, Registry, RegistryView
 from orchestrator.verify_cache.wire import optional_field, typed_field, wire_fields
-from orchestrator.verify_evidence import module_unit_ids
+from orchestrator.verify_evidence import UnitOutcome, VerifyUnit, module_unit_ids
 from orchestrator.verify_spec_shared import VerifyCommand
 
 logger = logging.getLogger(__name__)
@@ -106,6 +113,85 @@ async def ship_view(
     if fits(view):
         return view
     return _at_depth(mode, switch, by_unit, _deepest_fitting(mode, switch, by_unit, deepest, fits), truncated=True)
+
+
+@dataclass(frozen=True)
+class RemoteSettlement:
+    """What a remote verify leaves its dispatcher: the record its greens are recorded
+    from (None when there is none to record), and whether a live entry backs every replay."""
+
+    record: CacheRecord | None
+    outcome: ConsumeOutcome
+
+
+@dataclass(frozen=True)
+class RemoteCache:
+    """The dispatcher's half of a remote verify's cache: it ships a view of *registry*
+    under *modes*, and settles what the runner reports against the live registry."""
+
+    registry: Registry
+    modes: VerifyCacheConfig
+
+    @classmethod
+    def of(cls, registry: Registry | None, modes: VerifyCacheConfig) -> RemoteCache | None:
+        return None if registry is None else cls(registry, modes)
+
+    async def ship(
+        self, role: VerifyRole, unit_ids: Sequence[str], *, fits: Callable[[ShippedView], bool],
+    ) -> ShippedView | None:
+        return await ship_view(self.registry, self.modes, role, unit_ids, fits=fits)
+
+    async def settle(
+        self,
+        view: ShippedView | None,
+        role: VerifyRole,
+        units: Sequence[VerifyUnit] | None,
+        report: CacheReport | None,
+        *,
+        landing_sha: str | None,
+    ) -> RemoteSettlement:
+        """Back every replay among *units* against the live registry, consuming the backing
+        entries for *landing_sha* when there is one (I6), and rebuild the record of *report*
+        under the mode *view* shipped. Never raises; the caller maps the outcome to a verdict."""
+        record = None if view is None or report is None else report.record(role, self.modes.with_mode(role, view.mode))
+        claimed = _claimed_replays(units, report)
+        refused = _refused(view, role, claimed)
+        if refused is not None:
+            return RemoteSettlement(record, refused)
+        if record is None:
+            return RemoteSettlement(None, ConsumeOutcome((), (), None, 'no replayed unit to consume'))
+        return RemoteSettlement(record, await consume_replayed(self.registry, record, landing_sha=landing_sha))
+
+
+def _claimed_replays(units: Sequence[VerifyUnit] | None, report: CacheReport | None) -> tuple[UnbackedReplay, ...]:
+    """Each unit the verdict replays, with the entry the runner's report cites for it."""
+    reported = {} if report is None else {
+        unit.unit.unit: unit for unit in (*report.units, *(() if report.tree is None else (report.tree,)))
+    }
+
+    def cited(unit_id: str) -> tuple[str, str] | None:
+        unit = reported.get(unit_id)
+        if unit is None or unit.unit.outcome is not UnitOutcome.CACHE_HIT or unit.entry is None:
+            return None
+        return (unit.entry.unit_id, unit.entry.key)
+
+    return tuple(
+        UnbackedReplay(unit.unit, cited(unit.unit)) for unit in units or () if unit.outcome is UnitOutcome.CACHE_HIT
+    )
+
+
+def _refused(view: ShippedView | None, role: VerifyRole, claimed: Sequence[UnbackedReplay]) -> ConsumeOutcome | None:
+    """Why no replay among *claimed* can be backed, whatever the registry holds; None when each may be."""
+    if not claimed:
+        return None
+    if view is None:
+        return ConsumeOutcome.refused(claimed, f'no view was shipped to the {role} verify, so it could replay nothing')
+    if view.mode is not CacheMode.ON:
+        return ConsumeOutcome.refused(claimed, f'the {role} view was shipped in {view.mode} mode, which replays nothing')
+    uncited = [replay for replay in claimed if replay.cited is None]
+    if uncited:
+        return ConsumeOutcome.refused(uncited, 'the runner reported no recorded green for the replay of')
+    return None
 
 
 def _deepest_fitting(

@@ -27,6 +27,7 @@ from orchestrator.verify_cache.recorder import (
     CacheReport,
     LegRun,
     ReportedUnit,
+    UnbackedReplay,
     VerifyEvidenceRef,
     consume_replayed,
     record_greens,
@@ -207,7 +208,9 @@ class TestConsumeReplayed:
         outcome = await consume_replayed(registry, record, landing_sha='land-1')
 
         assert not outcome.backs_every_hit
-        assert outcome.unbacked == ('module:alpha:lint',)
+        evicted = entries['module:alpha:lint']
+        assert outcome.unbacked == (UnbackedReplay('module:alpha:lint', ('module:alpha:lint', evicted.key)),)
+        assert evicted.key in outcome.reason
         assert await registry.consumed_for('land-1') == ()
 
     @pytest.mark.asyncio

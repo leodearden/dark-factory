@@ -11,7 +11,7 @@ from orchestrator.verify import VerifyResult
 from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult
-from orchestrator.verify_cache.registry import Entry, Registry
+from orchestrator.verify_cache.registry import Candidate, Entry, Registry
 from orchestrator.verify_cache.replay import ReplayPlan, UnitDecision
 from orchestrator.verify_evidence import Leg, UnitTier, VerifyUnit, module_leg_unit
 
@@ -24,7 +24,9 @@ def unit_key(unit_id: str, *, tier: UnitTier = UnitTier.MODULE, token: str = 'a'
     return UnitKey.of(unit_id, tier, spec, [('spec', spec), ('tree:x', token)])
 
 
-def unit_decision(decision: Decision, entry: Entry | None = None, *, key: UnitKey | None = None) -> UnitDecision:
+def unit_decision(
+    decision: Decision, entry: Entry | Candidate | None = None, *, key: UnitKey | None = None,
+) -> UnitDecision:
     return UnitDecision(key, CacheDecision(decision, entry, f'{decision} because the test said so'))
 
 

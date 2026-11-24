@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from orchestrator.config import VerifyCacheConfig
 from orchestrator.verify_cache import policy
@@ -110,14 +111,31 @@ class RecordOutcome:
     reason: str
 
 
+class UnbackedReplay(NamedTuple):
+    """A replayed unit no live entry backs, and the ``(unit_id, key)`` of the entry it cited; None when it cited none."""
+
+    unit_id: str
+    cited: tuple[str, str] | None
+
+    def described(self) -> str:
+        if self.cited is None:
+            return f'{self.unit_id} (cited no entry)'
+        return f'{self.unit_id} (cited {self.cited[0]} key {self.cited[1]})'
+
+
 @dataclass(frozen=True)
 class ConsumeOutcome:
     """The entries consumed for a landing, the replayed units no live entry backs, and any registry error."""
 
     consumed: tuple[Entry, ...]
-    unbacked: tuple[str, ...]
+    unbacked: tuple[UnbackedReplay, ...]
     error: str | None
     reason: str
+
+    @classmethod
+    def refused(cls, unbacked: Sequence[UnbackedReplay], why: str) -> ConsumeOutcome:
+        """Nothing consumed, because *why* holds for each of *unbacked*."""
+        return cls((), tuple(unbacked), None, f'{why}: {", ".join(replay.described() for replay in unbacked)}')
 
     @property
     def backs_every_hit(self) -> bool:
@@ -176,28 +194,33 @@ async def record_greens(
     return RecordOutcome(recorded, f'recorded {len(recorded)}; refused [{refused}]; tree: {tree.reason}')
 
 
-async def consume_replayed(registry: Registry, record: CacheRecord, *, landing_sha: str) -> ConsumeOutcome:
-    """Write the live entry of every replayed unit of *record* as consumed for *landing_sha* (I6); never raises."""
+async def consume_replayed(registry: Registry, record: CacheRecord, *, landing_sha: str | None) -> ConsumeOutcome:
+    """Check that a live entry backs every replayed unit of *record*, and write those entries
+    as consumed for *landing_sha* (I6); with no landing, only check. Never raises."""
     hits = [unit for unit in (*record.units, *_tree_of(record)) if unit.unit.outcome is UnitOutcome.CACHE_HIT]
     if not hits:
         return ConsumeOutcome((), (), None, 'no replayed unit to consume')
-    cited = dict.fromkeys((entry.unit_id, entry.key) for unit in hits if (entry := unit.entry) is not None)
+    cited = dict.fromkeys(pair for unit in hits if (pair := _cited(unit)) is not None)
     try:
         live = {
             pair: entry for pair, entry in (await registry.view_of(cited)).entries.items() if isinstance(entry, Entry)
         }
-        unbacked = tuple(
-            unit.unit.unit for unit in hits if unit.entry is None or (unit.entry.unit_id, unit.entry.key) not in live
-        )
+        unbacked = [UnbackedReplay(unit.unit.unit, _cited(unit)) for unit in hits if _cited(unit) not in live]
         if unbacked:
-            return ConsumeOutcome((), unbacked, None, f'no live entry backs the replay of {", ".join(unbacked)}')
-        consumed = tuple(live[cited_key] for cited_key in cited)
-        await registry.consume(landing_sha, consumed)
+            return ConsumeOutcome.refused(unbacked, 'no live entry backs the replay of')
+        backing = tuple(live[pair] for pair in cited)
+        if landing_sha is None:
+            return ConsumeOutcome((), (), None, f'{len(backing)} live entries back every replay; no landing consumes them')
+        await registry.consume(landing_sha, backing)
     except Exception as exc:
         logger.warning('verify_cache.consume_replayed failed: %s: %s', type(exc).__name__, exc)
         error = f'{type(exc).__name__}: {exc}'
         return ConsumeOutcome((), (), error, f'registry unreadable: {error}')
-    return ConsumeOutcome(consumed, (), None, f'consumed {len(consumed)} entries for {landing_sha}')
+    return ConsumeOutcome(backing, (), None, f'consumed {len(backing)} entries for {landing_sha}')
+
+
+def _cited(unit: RecordedUnit) -> tuple[str, str] | None:
+    return None if unit.entry is None else (unit.entry.unit_id, unit.entry.key)
 
 
 def _admission(record: CacheRecord, unit: RecordedUnit, *, flake_suppressed: bool) -> Admission:
