@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 from _census_helpers import census_lines
+from _code_writer_links import assert_writes_c5, subject_task
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
@@ -19,6 +20,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.memory_metadata import is_completion_record
+from fused_memory.middleware.recall_annotation import Binding, bind_tasks
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
@@ -7955,3 +7957,137 @@ class TestStaleStatusSnapshotTransitionTrigger:
         assert rows[0]['detail']['task_id'] == '1'
         assert rows[0]['detail']['invalidated'] == 1
         assert rows[0]['detail']['candidate_edges'] == 1
+
+
+# ---------------------------------------------------------------------------
+# C5 (plans/live-task-facts-at-recall-prd.md): the two notes _on_task_done
+# writes link their task structurally and name no task status. Fixture text is
+# status-neutral, so any status word found came from a template.
+# ---------------------------------------------------------------------------
+
+
+class TestDoneNotesLinkTheirTask:
+    PROJECT = 'test-project'
+    TASK_ID = '4102'
+    TASK_BEFORE = {
+        'id': '4102', 'title': 'Wire the census',
+        'description': 'Adds a census of memory writers', 'details': 'One row per write site',
+    }
+    SUBJECT = subject_task(PROJECT, TASK_ID)
+
+    async def _reconcile_done(self, reconciler) -> dict:
+        return await reconciler.reconcile_task(
+            task_id=self.TASK_ID, transition='done', project_id=self.PROJECT,
+            project_root='/tmp/test', task_before=self.TASK_BEFORE,
+        )
+
+    @staticmethod
+    def _writes(mock_memory_service, marker_key: str) -> list[dict]:
+        return [
+            call.kwargs for call in mock_memory_service.add_memory.call_args_list
+            if marker_key in (call.kwargs.get('metadata') or {})
+        ]
+
+    @staticmethod
+    def _verifier_says(reconciler, verdict: VerificationVerdict) -> None:
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=verdict, confidence=0.9,
+            evidence=[{'file_path': 'census.py', 'snippet': 'CENSUS = {}'}],
+            summary='The census table lives in census.py',
+        ))
+
+    @pytest.mark.asyncio
+    async def test_the_echo_with_provenance_links_its_task(
+        self, reconciler, mock_memory_service, mock_taskmaster,
+    ):
+        mock_taskmaster.get_task = AsyncMock(return_value={
+            'id': self.TASK_ID,
+            'metadata': {'done_provenance': {'note': 'Added the census module', 'commit': 'abc1234'}},
+        })
+
+        await self._reconcile_done(reconciler)
+
+        (echo,) = self._writes(mock_memory_service, 'transition')
+        assert echo['metadata']['echo_used_provenance'] is True
+        assert_writes_c5(echo, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    async def test_the_unverified_fallback_echo_links_its_task(self, reconciler, mock_memory_service):
+        await self._reconcile_done(reconciler)
+
+        (echo,) = self._writes(mock_memory_service, 'transition')
+        assert echo['metadata']['echo_unverified_completion'] is True
+        assert 'not yet verified' in echo['content']
+        assert_writes_c5(echo, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    async def test_the_echo_beside_authoritative_memory_links_its_task(
+        self, reconciler, mock_memory_service,
+    ):
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            {'id': '959b8497', 'metadata': {'task_id': self.TASK_ID, 'supersedes': ['cd09e261']}},
+        ])
+
+        await self._reconcile_done(reconciler)
+
+        (echo,) = self._writes(mock_memory_service, 'transition')
+        assert echo['metadata']['echo_suppressed_stale_description'] is True
+        assert_writes_c5(echo, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_echo_keeps_its_link(
+        self, reconciler, mock_memory_service, mock_taskmaster, mock_event_buffer,
+    ):
+        mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+        mock_taskmaster.get_task = AsyncMock(return_value={
+            'id': self.TASK_ID, 'metadata': {'done_provenance': {'note': 'Added the census module'}},
+        })
+
+        await self._reconcile_done(reconciler)
+
+        mock_memory_service.add_memory.assert_not_called()
+        deferred = [
+            call.kwargs for call in mock_event_buffer.defer_write.call_args_list
+            if 'transition' in (call.kwargs.get('metadata') or {})
+        ]
+        (echo,) = deferred
+        assert echo['metadata']['_deferred'] is True
+        assert_writes_c5(echo, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'verdict', [VerificationVerdict.confirmed, VerificationVerdict.contradicted],
+    )
+    async def test_the_verdict_note_links_its_task(
+        self, reconciler, mock_memory_service, mock_taskmaster, verdict, tmp_path,
+    ):
+        self._verifier_says(reconciler, verdict)
+        mock_taskmaster.get_task = AsyncMock(return_value={
+            'id': self.TASK_ID, 'metadata': {'done_provenance': {'note': 'Added the census module'}},
+        })
+
+        await reconciler.reconcile_task(
+            task_id=self.TASK_ID, transition='done', project_id=self.PROJECT,
+            project_root=str(tmp_path), task_before=self.TASK_BEFORE,
+        )
+
+        (note,) = self._writes(mock_memory_service, 'verification_verdict')
+        assert note['metadata']['verification_verdict'] == verdict
+        assert_writes_c5(note, project_id=self.PROJECT, subject=self.SUBJECT)
+
+    @pytest.mark.asyncio
+    async def test_a_real_done_transition_echo_binds_its_task_structurally(
+        self, reconciler, mock_memory_service,
+    ):
+        """B3: what reconcile_task(..., 'done') writes, recalled, binds the task STRUCTURAL."""
+        await self._reconcile_done(reconciler)
+
+        (echo,) = self._writes(mock_memory_service, 'transition')
+        recalled = MemoryResult(
+            id='echo-1', content=echo['content'], source_store=SourceStore.mem0,
+            metadata=echo['metadata'],
+        )
+        bindings = bind_tasks([recalled], project_id=self.PROJECT, known_projects={})
+        assert [(bound.ref, bound.binding) for bound in bindings.tasks] == [
+            (self.SUBJECT, Binding.STRUCTURAL),
+        ]
