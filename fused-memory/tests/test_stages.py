@@ -4767,39 +4767,30 @@ class TestRunStageCapHandling:
 
 
 # ---------------------------------------------------------------------------
-# _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS: canonical minutes-scale override
+# RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS: canonical minutes-scale override
 # forwarded to invoke_with_cap_retry (task 1401); single value pin lives here.
 # ---------------------------------------------------------------------------
 
 
 class TestCliStageRunnerCapWaitSanityBound:
-    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is the single canonical constant
+    """RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is the single canonical constant
     imported by all three stage runners and forwarded to invoke_with_cap_retry;
     prevents stalling the reconciliation queue under cap."""
 
     def test_constant_importable_and_minutes_scale(self):
-        """(a) _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable from
+        """(a) RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable from
         fused_memory.reconciliation and pinned to the documented 30-min policy."""
         from fused_memory.reconciliation import (
-            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
-        )
-
-        assert _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == 1800.0
-
-    def test_public_name_mirrors_private_name(self):
-        """(c) The public name RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable and the private name is an alias of it (task 9494; the alias goes in task 9501)."""
-        from fused_memory.reconciliation import (
-            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
 
-        assert _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+        assert RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == 1800.0
 
     @pytest.mark.asyncio
     async def test_run_stage_via_cli_forwards_cap_wait_sanity_secs(self, tmp_path):
-        """(b) run_stage_via_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
+        """(b) run_stage_via_cli forwards cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
         from fused_memory.reconciliation import (
-            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
 
         config = ReconciliationConfig(
@@ -4822,7 +4813,7 @@ class TestCliStageRunnerCapWaitSanityBound:
                 config=config,
                 mcp_config={'mcpServers': {}},
             )
-        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 
 # ---------------------------------------------------------------------------
