@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +14,7 @@ from typing import Any
 from escalation.models import Escalation
 from shared.briefing_queries import BriefingScope
 from shared.declared_checks import DeclaredChecks, declared_checks
-from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, FollowupItem, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.branch_history_guidance import BRANCH_HISTORY_HEADING
@@ -22,6 +22,7 @@ from orchestrator.agents.defect_briefing import format_declared_defects
 from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
 from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
 from orchestrator.agents.memory_recall import MemoryRecall
+from orchestrator.agents.metadata_list_block import MetadataListBlock
 from orchestrator.agents.review_briefing import (
     ReviewSubject,
     amendment_scope_section,
@@ -414,7 +415,20 @@ def _delivered_check_field(check: dict, name: str) -> str:
     return f'{name}: {", ".join(str(v) for v in items) or _DELIVERED_CHECK_LIST_FIELDS[name]}'
 
 
-_FOLLOWUP_ITEMS_HEADING = f'## Follow-up Items (metadata.{FOLLOWUP_ITEMS_METADATA_KEY})'
+_FOLLOWUP_ITEMS_BLOCK = MetadataListBlock(
+    title='Follow-up Items',
+    key=FOLLOWUP_ITEMS_METADATA_KEY,
+    contents='observations',
+    intro=(
+        'Each numbered item is one observation this task was filed to address; the plan must '
+        'cover every one.'
+    ),
+)
+
+
+def _numbered_followup_items(items: Sequence[FollowupItem]) -> Iterable[str]:
+    for number, item in enumerate(items, start=1):
+        yield f'{number}. {item.summary} — files: {", ".join(item.files)} (observed in task {item.origin_task})'
 
 
 def _format_followup_items(raw: object) -> str:
@@ -422,32 +436,7 @@ def _format_followup_items(raw: object) -> str:
 
     Fails open like :func:`_format_delivered_checks`: '' when absent, malformed entries counted visibly.
     """
-    if not raw:
-        return ''
-    if not isinstance(raw, list):
-        return (
-            f'{_FOLLOWUP_ITEMS_HEADING}\n\n'
-            f'⚠ `metadata.{FOLLOWUP_ITEMS_METADATA_KEY}` is malformed (a {type(raw).__name__}, not a '
-            'list), so its observations cannot be shown here; read them from the task record.'
-        )
-    items = [item for item in map(parse_item, raw) if item is not None]
-    lines = [
-        f'{number}. {item.summary} — files: {", ".join(item.files)} (observed in task {item.origin_task})'
-        for number, item in enumerate(items, start=1)
-    ]
-    malformed = len(raw) - len(items)
-    if malformed:
-        noun = 'entry' if malformed == 1 else 'entries'
-        lines.append(
-            f'⚠ {malformed} malformed {noun} on `metadata.{FOLLOWUP_ITEMS_METADATA_KEY}` could not be '
-            'rendered here; read the full list from the task record.'
-        )
-    numbered = '\n'.join(lines)
-    return (
-        f'{_FOLLOWUP_ITEMS_HEADING}\n\n'
-        'Each numbered item is one observation this task was filed to address; the plan must '
-        f'cover every one.\n\n{numbered}'
-    )
+    return _FOLLOWUP_ITEMS_BLOCK.render(raw, parse_item, _numbered_followup_items)
 
 
 def _caller_agent_id(task_id: str | None, role: str) -> str:
@@ -1913,7 +1902,8 @@ A prior block-time investigation concluded the following; verify against the cur
         Then appends ``metadata.followup_items`` via :func:`_format_followup_items`, also exempt
         from ``include_files=False``: the items are the task's charter, not a footprint guess.
         Declared defects are appended too via :func:`format_declared_defects` and, like follow-up
-        items, are exempt from ``include_files=False`` because they are the task's charter.
+        items, are exempt from ``include_files=False`` because they are the task's charter. The
+        context-complete reviewer's task block is rendered here as well, so it lists them too.
         """
         metadata = task.get('metadata') or {}
         lines = []
