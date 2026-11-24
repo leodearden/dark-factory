@@ -704,6 +704,18 @@ def _only(rows: list[dict], metric_id: str) -> dict:
     return matches[0]
 
 
+def _verdict_entry(rows: list[dict], metric_id: str, item: str | None = None) -> dict:
+    """The single entry in *metric_id*'s ``verdicts`` judging *item* (``None``: the metric itself)."""
+    matches = [entry for entry in _only(rows, metric_id)['verdicts'] if entry.get('item') == item]
+    assert len(matches) == 1, f'expected exactly one {metric_id!r} verdict for item {item!r}, got {len(matches)}'
+    return matches[0]
+
+
+def _all_verdicts(rows: list[dict]) -> list[dict]:
+    """Every verdict entry across *rows*, in payload order."""
+    return [entry for row in rows for entry in row['verdicts']]
+
+
 # An oversized metric_id, shared by the three duplicate-index tests below
 # (`duplicate_limits_verdict`, `duplicate_metric_id`, `duplicate_verdict_entry`):
 # each is `isinstance(metric_id, str)`-guarded but never length-guarded, so a
@@ -810,10 +822,10 @@ class TestLimitsProvenance:
 
         rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
-        alarmed_in_limits = _only(rows, 'canonical-in-top-5')
+        alarmed_in_limits = _verdict_entry(rows, 'canonical-in-top-5')
         assert 'verdict' in alarmed_in_limits, 'the verdict column must exist even when empty'
         assert alarmed_in_limits['verdict'] is None
-        for row in rows:
+        for row in [*rows, *_all_verdicts(rows)]:
             assert 'status' not in row
             assert 'p_value' not in row
             assert 'alarms' not in row
@@ -953,12 +965,12 @@ class TestVerdicts:
 
         rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
-        assert _only(rows, 'canonical-in-top-5')['verdict'] == 'alarm'
-        assert _only(rows, 'dangling-pointers')['verdict'] == 'no_alarm'
-        assert _only(rows, 'search-latency-p50-ms')['verdict'] == 'insufficient_data'
-        assert _only(rows, 'topic-canonical-present')['verdict'] == 'grandfathered'
+        assert _verdict_entry(rows, 'canonical-in-top-5')['verdict'] == 'alarm'
+        assert _verdict_entry(rows, 'dangling-pointers')['verdict'] == 'no_alarm'
+        assert _verdict_entry(rows, 'search-latency-p50-ms')['verdict'] == 'insufficient_data'
+        assert _verdict_entry(rows, 'topic-canonical-present', 't-recon-watcher-triage')['verdict'] == 'grandfathered'
         # Nothing was translated on the way through.
-        assert {row['verdict'] for row in rows if row['verdict']} == set(_VERDICT_VALUES)
+        assert {entry['verdict'] for entry in _all_verdicts(rows) if entry['verdict']} == set(_VERDICT_VALUES)
 
     def test_verdict_fields_land_on_the_matching_row(self, tmp_path: Path) -> None:
         from dashboard.data.memory_evals import build_memory_evals
@@ -968,7 +980,7 @@ class TestVerdicts:
         rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
         alarmed = _only(rows, 'canonical-in-top-5')
-        assert alarmed['fingerprint'] == 'fp-canonical-alarm'
+        assert _verdict_entry(rows, 'canonical-in-top-5')['fingerprint'] == 'fp-canonical-alarm'
         assert alarmed['limit_ref'] == 'alpha=0.002777777777777778'
         assert alarmed['run_stamp'] == _VERDICT_RUN
         # Two distinct sources, two distinct fields: `value` is what the
@@ -976,11 +988,11 @@ class TestVerdicts:
         assert alarmed['value'] == 0.4
         assert alarmed['current_value'] == 0.5
 
-        grandfathered = _only(rows, 'topic-canonical-present')
+        (grandfathered,) = _only(rows, 'topic-canonical-present')['verdicts']
         assert grandfathered['item'] == 't-recon-watcher-triage'
         # An entry with no `item` leaves the field empty rather than borrowing
         # the previous entry's.
-        assert alarmed['item'] is None
+        assert _verdict_entry(rows, 'canonical-in-top-5')['item'] is None
 
     def test_metric_with_no_entry_has_no_verdict(self, tmp_path: Path) -> None:
         """Absent means absent — never defaulted to ``no_alarm``."""
@@ -988,10 +1000,11 @@ class TestVerdicts:
 
         root, esc_dir = _verdicts_tree(tmp_path)
 
-        unjudged = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'unjudged-metric')
+        rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
+        unjudged = _only(rows, 'unjudged-metric')
 
-        assert unjudged['verdict'] is None
-        assert unjudged['fingerprint'] is None
+        assert _verdict_entry(rows, 'unjudged-metric')['verdict'] is None
+        assert _verdict_entry(rows, 'unjudged-metric')['fingerprint'] is None
         assert unjudged['limit_ref'] is None
         assert unjudged['value'] is None
 
@@ -1064,7 +1077,7 @@ class TestVerdicts:
         issue = payload['issues'][0]
         assert issue['kind'] == 'missing_verdicts'
         assert issue['path'] == str(root / 'verdicts-current.json')
-        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+        assert all(entry['verdict'] is None for entry in _all_verdicts(payload['evals'][0]['metrics']))
 
     def test_misplaced_per_eval_verdicts_is_named_never_used(self, tmp_path: Path) -> None:
         """No silent fallback to the wrong location — drift stays visible."""
@@ -1079,7 +1092,7 @@ class TestVerdicts:
         assert issue['kind'] == 'missing_verdicts'
         assert str(root / 'eval-a' / 'verdicts-current.json') in issue['detail']
         # Named, not read.
-        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+        assert all(entry['verdict'] is None for entry in _all_verdicts(payload['evals'][0]['metrics']))
 
 
 # ---------------------------------------------------------------------------
@@ -1258,7 +1271,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'alarmed-open')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['parity'] == 'alarmed_open'
         assert set(row['escalation']) == _ESCALATION_KEYS
@@ -1288,7 +1301,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'recovered-open')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'recovered-open')
 
         assert row['verdict'] == 'no_alarm'
         assert row['parity'] == 'recovered_open'
@@ -1308,7 +1321,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'insufficient-open')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'insufficient-open')
 
         assert row['verdict'] == 'insufficient_data'
         assert row['parity'] == 'insufficient_data_open'
@@ -1320,7 +1333,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'insufficient-metric')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'insufficient-metric')
 
         assert row['verdict'] == 'insufficient_data'
         assert row['parity'] == 'insufficient_data'
@@ -1334,7 +1347,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'grandfathered-open')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'grandfathered-open')
 
         assert row['verdict'] == 'grandfathered'
         assert row['parity'] == 'grandfathered_open'
@@ -1352,7 +1365,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'grandfathered-metric')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'grandfathered-metric')
 
         assert row['verdict'] == 'grandfathered'
         assert row['parity'] == 'grandfathered'
@@ -1363,7 +1376,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'alarmed-unlinked')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'alarmed-unlinked')
 
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
@@ -1383,13 +1396,13 @@ class TestEscalationJoin:
         root, esc_dir = _join_tree(tmp_path)
         rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
-        assert _only(rows, 'clear-metric')['verdict'] == 'no_alarm'
-        assert _only(rows, 'clear-metric')['parity'] == 'clear'
-        assert _only(rows, 'clear-metric')['escalation'] is None
+        assert _verdict_entry(rows, 'clear-metric')['verdict'] == 'no_alarm'
+        assert _verdict_entry(rows, 'clear-metric')['parity'] == 'clear'
+        assert _verdict_entry(rows, 'clear-metric')['escalation'] is None
         # No verdict entry at all: not an alarm, but not "clear" either.
-        assert _only(rows, 'unjudged-metric')['verdict'] is None
-        assert _only(rows, 'unjudged-metric')['parity'] == 'unjudged'
-        assert _only(rows, 'unjudged-metric')['escalation'] is None
+        assert _verdict_entry(rows, 'unjudged-metric')['verdict'] is None
+        assert _verdict_entry(rows, 'unjudged-metric')['parity'] == 'unjudged'
+        assert _verdict_entry(rows, 'unjudged-metric')['escalation'] is None
 
     def test_fingerprinted_entry_with_no_verdict_is_unjudged_open(self, tmp_path: Path) -> None:
         """A link with no judgement behind it must not claim a recovery.
@@ -1405,7 +1418,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _unjudged_open_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'unjudged-open')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'unjudged-open')
 
         assert row['verdict'] is None
         assert row['parity'] == 'unjudged_open'
@@ -1419,7 +1432,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'wrong-category')
+        row = _verdict_entry(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'wrong-category')
 
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
@@ -1460,7 +1473,7 @@ class TestEscalationJoin:
         )
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
@@ -1485,7 +1498,7 @@ class TestEscalationJoin:
         )
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'recovered-open')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'recovered-open')
 
         assert row['escalation'] is None
         assert row['parity'] == 'clear'
@@ -1505,7 +1518,7 @@ class TestEscalationJoin:
         (esc_dir / 'esc-alarmed-open.json').write_text(json.dumps(body))
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['parity'] == 'alarmed_open'
         assert row['escalation']['id'] == 'esc-alarmed-open'
@@ -1534,7 +1547,7 @@ class TestEscalationJoin:
         assert not EscalationView.QUEUE_PENDING.admits(record)
 
         payload = build_memory_evals(root, corpus, _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
@@ -1563,7 +1576,7 @@ class TestEscalationJoin:
         )
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')
 
         # Not joined: unknown openness must not be rendered as open.
         assert row['escalation'] is None
@@ -1601,7 +1614,7 @@ class TestEscalationJoin:
         )
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
@@ -1658,7 +1671,7 @@ class TestEscalationJoin:
         assert unmatched['esc-bad-fingerprint']['reason'] == 'no_fingerprint'
         assert set(unmatched['esc-no-fingerprint']) == _UNMATCHED_KEYS
         # The joinable records are untouched by the new path.
-        assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
+        assert _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
         assert unmatched['esc-unmatched']['reason'] == 'no_matching_verdict'
 
     def test_a_queue_file_that_is_not_an_object_is_an_unreadable_file(self, tmp_path: Path) -> None:
@@ -1686,7 +1699,7 @@ class TestEscalationJoin:
         assert 'malformed_escalation_record' not in {i['kind'] for i in payload['issues']}
         assert set(payload) == _PAYLOAD_KEYS
         # The discard does not poison the rest of the join.
-        assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
+        assert _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
         unmatched_ids = [e['id'] for e in payload['unmatched_escalations']]
         assert 'esc-unmatched' in unmatched_ids
         assert 'esc-list' not in unmatched_ids
@@ -1712,7 +1725,7 @@ class TestEscalationJoin:
         assert [(i['kind'], i['path']) for i in payload['issues']] == [
             ('unreadable_escalation_file', str(path)),
         ]
-        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
 
@@ -1768,7 +1781,7 @@ class TestEscalationJoin:
 
         payload = build_memory_evals(root, corpus, _RECON_QUEUE)
 
-        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'alarmed-open')
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
         assert 'esc-alarmed-open' not in [e['id'] for e in payload['unmatched_escalations']]
@@ -1937,7 +1950,7 @@ class TestUnknownVerdict:
         root, esc_dir = _unknown_verdict_tree(tmp_path, 'improved', linked=False)
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'drifted-metric')
 
         assert row['parity'] == 'unknown_verdict'
         # The reader NAMES the value it cannot render; it never rewrites it.
@@ -1960,7 +1973,7 @@ class TestUnknownVerdict:
         root, esc_dir = _unknown_verdict_tree(tmp_path, 'improved', linked=True)
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'drifted-metric')
 
         assert row['parity'] == 'unknown_verdict_open'
         assert row['verdict'] == 'improved'
@@ -1979,7 +1992,7 @@ class TestUnknownVerdict:
         root, esc_dir = _unknown_verdict_tree(tmp_path, {}, linked=False)
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
-        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'drifted-metric')
 
         assert row['parity'] == 'unknown_verdict'
         # Passed through verbatim, exactly as a recognised value would be.
@@ -2002,7 +2015,7 @@ class TestUnknownVerdict:
 
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
-        assert _only(payload['evals'][0]['metrics'], 'unjudged-metric')['parity'] == 'unjudged'
+        assert _verdict_entry(payload['evals'][0]['metrics'], 'unjudged-metric')['parity'] == 'unjudged'
         assert [i for i in payload['issues'] if i['kind'] == 'unknown_verdict'] == []
 
     def test_oversized_verdict_is_capped_in_the_detail(self, tmp_path: Path) -> None:
@@ -2066,10 +2079,10 @@ class TestParityVocabularyIsClosedAndExported:
         ]
 
         observed = {
-            metric['parity']
+            entry['parity']
             for root, esc_dir in trees
             for row in build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals']
-            for metric in row['metrics']
+            for entry in _all_verdicts(row['metrics'])
         }
 
         from dashboard.data import memory_evals
@@ -2223,12 +2236,12 @@ class TestStormCollapseModelled:
         rows = payload['evals'][0]['metrics']
 
         for metric_id in ('storm-a', 'storm-b'):
-            row = _only(rows, metric_id)
+            row = _verdict_entry(rows, metric_id)
             assert row['verdict'] == 'alarm'
             assert row['escalation'] is None
             assert row['parity'] == 'storm_collapsed'
         # A quiet metric is still quiet during a storm.
-        assert _only(rows, 'quiet-metric')['parity'] == 'clear'
+        assert _verdict_entry(rows, 'quiet-metric')['parity'] == 'clear'
 
         # Suppressed is not unexplained.  The per-metric escalation is still
         # OPEN (per-metric filings from earlier runs stay pending across a
@@ -2267,9 +2280,9 @@ class TestStormCollapseModelled:
 
         assert payload['evals'][0]['storm_escape'] is None
         rows = payload['evals'][0]['metrics']
-        assert _only(rows, 'storm-a')['parity'] == 'alarmed_open'
-        assert _only(rows, 'storm-a')['escalation']['id'] == 'esc-storm-a'
-        assert _only(rows, 'storm-b')['parity'] == 'alarmed_unlinked'
+        assert _verdict_entry(rows, 'storm-a')['parity'] == 'alarmed_open'
+        assert _verdict_entry(rows, 'storm-a')['escalation']['id'] == 'esc-storm-a'
+        assert _verdict_entry(rows, 'storm-b')['parity'] == 'alarmed_unlinked'
 
     def test_absent_storm_block_is_none(self, tmp_path: Path) -> None:
         from dashboard.data.memory_evals import build_memory_evals
@@ -2279,7 +2292,7 @@ class TestStormCollapseModelled:
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['evals'][0]['storm_escape'] is None
-        assert _only(payload['evals'][0]['metrics'], 'storm-a')['parity'] == 'alarmed_unlinked'
+        assert _verdict_entry(payload['evals'][0]['metrics'], 'storm-a')['parity'] == 'alarmed_unlinked'
 
 
 # ---------------------------------------------------------------------------
@@ -2515,7 +2528,7 @@ class TestStalenessAndDegradedStates:
         assert payload['issues'][0]['kind'] == 'unreadable_verdicts'
         assert payload['issues'][0]['path'] == str(bad)
         # An unreadable verdict artifact must not read as "nothing alarmed".
-        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+        assert all(entry['verdict'] is None for entry in _all_verdicts(payload['evals'][0]['metrics']))
 
     def test_top_level_list_is_malformed_metrics(self, tmp_path: Path) -> None:
         from dashboard.data.memory_evals import build_memory_evals
@@ -2577,7 +2590,7 @@ class TestStalenessAndDegradedStates:
 
         # Absent, never defaulted to 'no_alarm' — the promise the comment at the
         # unreadable-verdicts handler already made.
-        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+        assert all(entry['verdict'] is None for entry in _all_verdicts(payload['evals'][0]['metrics']))
 
         # The exact confusion the reviewer reproduced: a broken verdicts file
         # must not read as "nothing alarmed".
@@ -2613,7 +2626,7 @@ class TestStalenessAndDegradedStates:
         assert malformed[0]['path'] == str(bad)
         assert 'dict' in malformed[0]['detail']
 
-        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+        assert all(entry['verdict'] is None for entry in _all_verdicts(payload['evals'][0]['metrics']))
         # The whole point: distinguishable from the healthy tree.
         assert healthy['issue_count'] == 0
         assert payload['issue_count'] == len(payload['issues']) > 0
@@ -2652,7 +2665,7 @@ class TestStalenessAndDegradedStates:
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # The good sibling is still read — the bad element is skipped, not the file.
-        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
+        assert _verdict_entry(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'malformed_verdict_entry'
@@ -2687,7 +2700,7 @@ class TestStalenessAndDegradedStates:
         payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # The keyable sibling is still read — bad records cost only themselves.
-        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
+        assert _verdict_entry(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
 
         assert payload['issue_count'] == len(payload['issues'])
         unidentified = [i for i in payload['issues'] if i['kind'] == 'unidentified_verdicts']
@@ -3065,7 +3078,7 @@ class TestStalenessAndDegradedStates:
         assert issue['path'] == str(root / 'verdicts-current.json')
         # First wins — and it is the verdict AND the fingerprint (hence the
         # escalation link) that array order would otherwise have chosen.
-        row = _only(payload['evals'][0]['metrics'], 'dangling-pointers')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'dangling-pointers')
         assert row['verdict'] == 'alarm'
         assert row['fingerprint'] == 'a' * 32
 
@@ -3093,7 +3106,7 @@ class TestStalenessAndDegradedStates:
         # The docstring's claim above -- only the detail is bounded, the
         # surviving row's own identity is not -- pinned, not just asserted.
         row = _only(payload['evals'][0]['metrics'], _HUGE_METRIC_ID)
-        assert row['verdict'] == 'alarm'
+        assert _verdict_entry(payload['evals'][0]['metrics'], _HUGE_METRIC_ID)['verdict'] == 'alarm'
         assert row['current_value'] == 4.0
 
     def test_two_escalations_sharing_a_fingerprint_are_named(self, tmp_path: Path) -> None:
@@ -3409,7 +3422,7 @@ class TestVerdictEvalIdLengthIsBounded:
         assert [i['eval_id'] for i in orphans] == [at_limit_eval]
 
         # Bad records cost only themselves.
-        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
+        assert _verdict_entry(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
         assert payload['issue_count'] == len(payload['issues'])
 
 
@@ -4133,12 +4146,12 @@ class TestMemoryEvalsEndpoint:
         assert by_id['canonical-in-top-5']['rule_kind'] == 'proportion'
 
         # Verdict + the fingerprint-matched escalation, all the way to the UI.
-        alarmed = by_id['dangling-pointers']
+        alarmed = _verdict_entry(row['metrics'], 'dangling-pointers', 'node-7')
         assert alarmed['verdict'] == 'alarm'
         assert alarmed['fingerprint'] == _ROUTE_FINGERPRINT
         assert alarmed['escalation']['id'] == 'esc-eval-1'
         assert alarmed['parity'] == 'alarmed_open'
-        assert by_id['canonical-in-top-5']['parity'] == 'clear'
+        assert _verdict_entry(row['metrics'], 'canonical-in-top-5')['parity'] == 'clear'
         assert payload['unmatched_escalations'] == []
 
     def test_escalation_queue_is_the_reconciliation_subsection_escalations_serves(
@@ -4217,7 +4230,7 @@ class TestMemoryEvalsEndpoint:
         escalation_corpus._corpus_cache_clear()
 
         pre = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
-        assert _only(pre['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_open'
+        assert _verdict_entry(pre['evals'][0]['metrics'], 'dangling-pointers', 'node-7')['parity'] == 'alarmed_open'
         assert pre['issue_count'] == 0
 
         _corrupt(config.reconciliation_escalations_dir / 'esc-eval-1.json')
@@ -4230,7 +4243,7 @@ class TestMemoryEvalsEndpoint:
         payload = resp.json()['MEMORY_EVALS']
         # The eval section still renders in full; only the join is lost.
         assert payload['evals'][0]['run_stamps'] == list(_ROUTE_RUNS)
-        row = _only(payload['evals'][0]['metrics'], 'dangling-pointers')
+        row = _verdict_entry(payload['evals'][0]['metrics'], 'dangling-pointers', 'node-7')
         assert row['escalation'] is None
         # Degraded to unlinked — never silently re-rendered as still-linked.
         assert row['parity'] == 'alarmed_unlinked'
@@ -4267,12 +4280,12 @@ class TestMemoryEvalsEndpoint:
         fresh_tab = _served_subsection(client, fresh_walk['escalation_queue'])
         escalation_corpus._corpus_cache_clear()
 
-        assert _only(cached_walk['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_open'
+        assert _verdict_entry(cached_walk['evals'][0]['metrics'], 'dangling-pointers', 'node-7')['parity'] == 'alarmed_open'
         assert cached_walk['issue_count'] == 0
         assert [row['id'] for row in cached_tab['escalations']] == ['esc-eval-1']
         assert cached_tab['skipped'] == []
 
-        assert _only(fresh_walk['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_unlinked'
+        assert _verdict_entry(fresh_walk['evals'][0]['metrics'], 'dangling-pointers', 'node-7')['parity'] == 'alarmed_unlinked'
         assert 'unreadable_escalation_file' in {i['kind'] for i in fresh_walk['issues']}
         assert fresh_tab['escalations'] == []
         assert [skip['path'] for skip in fresh_tab['skipped']] == [str(corrupted)]
@@ -4297,7 +4310,7 @@ class TestMemoryEvalsEndpoint:
         assert resp.status_code == 200
         payload = resp.json()['MEMORY_EVALS']
         assert payload['evals'][0]['run_stamps'] == list(_ROUTE_RUNS)
-        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_unlinked'
+        assert _verdict_entry(payload['evals'][0]['metrics'], 'dangling-pointers', 'node-7')['parity'] == 'alarmed_unlinked'
         (issue,) = payload['issues']
         assert issue['kind'] == 'unreadable_escalations'
         assert 'OSError: queue volume went away' in issue['detail']
@@ -4660,9 +4673,10 @@ class TestCommittedExemplarBoundary:
         # and never the healthy ``clear`` badge either: nothing judged these.
         for row in payload['evals']:
             for metric in row['metrics']:
-                assert metric['verdict'] is None, (row['eval_id'], metric['metric_id'])
-                assert metric['escalation'] is None
-                assert metric['parity'] == 'unjudged'
+                (entry,) = metric['verdicts']
+                assert entry['verdict'] is None, (row['eval_id'], metric['metric_id'])
+                assert entry['escalation'] is None
+                assert entry['parity'] == 'unjudged'
             assert row['storm_escape'] is None
 
     def test_negative_exemplars_split_rendering_from_producer_validation(self, tmp_path: Path) -> None:

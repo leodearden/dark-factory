@@ -692,6 +692,8 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
+    # Read-only existence lookup for dependency_discovered and workflow_slot_wedged (task 10426)
+    'mcp__fused-memory__search_tasks',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
     # Convert-to-tracked-work filing (task 3726): submit_task files the
@@ -2975,7 +2977,7 @@ class Harness:
             # in a consistent post-startup state.
             self.scheduler.finish_startup()
             journal.clear()
-            startup_completed_at = datetime.now(UTC)
+            startup_completed_at = self._stamp_startup_completed()
 
             statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
@@ -3184,8 +3186,7 @@ class Harness:
             if self._run_store and self._run_id:
                 try:
                     self._run_store.finish_run(
-                        self._run_id, self.report,
-                        startup_completed_at=startup_completed_at, exit_reason=exit_reason,
+                        self._run_id, self.report, exit_reason=exit_reason,
                     )
                 except Exception as e:
                     logger.warning(f'Failed to finalize run metrics: {e}')
@@ -12189,6 +12190,19 @@ class Harness:
                 await self._tag_task_modules()
             except Exception as tag_err:
                 logger.warning(f'Post-review module tagging failed: {tag_err}')
+
+    def _stamp_startup_completed(self) -> datetime:
+        """Record on this run's runs row that startup finished; return the instant."""
+        at = datetime.now(UTC)
+        if self._run_store is not None and self._run_id is not None:
+            try:
+                self._run_store.mark_startup_completed(self._run_id, at)
+            except Exception:
+                logger.warning(
+                    'Failed to record startup completion for run %s', self._run_id,
+                    exc_info=True,
+                )
+        return at
 
     def _checkpoint_stores(self) -> None:
         """Run WAL TRUNCATE checkpoint on each SQLite store — best-effort.

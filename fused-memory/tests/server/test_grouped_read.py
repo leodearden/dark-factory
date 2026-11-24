@@ -1504,6 +1504,21 @@ class TestPromotedParentMetadataShape:
             f'from it, got {promoted!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_promoted_parent_carries_writer_task_and_scope(self):
+        record = self._raw_record()
+        record['metadata'].update({'agent_id': 'claude-task-7', 'task_id': '3137'})
+        service = _stub_service(_two_amendments_three_sightings(), parents={_CANONICAL_ID: record})
+
+        promoted = (
+            await group_search_results(service, _PROJECT_ID, [_child_result(_AMEND_1, 0.77)])
+        )[0]
+
+        assert promoted['id'] == _CANONICAL_ID
+        assert (promoted['agent_id'], promoted['task_id'], promoted['project_id']) == (
+            'claude-task-7', '3137', 'dark_factory',
+        )
+
 
 class TestFanOutIsBounded:
     """The hot read path must not burst one Qdrant request per hit, unbounded.

@@ -19,6 +19,7 @@ import fcntl
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -355,10 +356,12 @@ def test_gate_identity_cli_fails_without_a_checkout(monkeypatch):
 
 # Fake `uv sync`: "builds" a gate binary that answers gate-identity with its own
 # checkout's HEAD.  $FAKE_UV_LOG counts builds; $FAKE_UV_BROKEN builds a binary
-# that fails; $FAKE_UV_SLEEP widens the race window.
+# that fails; $FAKE_UV_EXIT fails the sync itself with that status;
+# $FAKE_UV_SLEEP widens the race window.
 _FAKE_UV = r'''#!/usr/bin/env bash
 set -eu
 echo "uv $*" >> "$FAKE_UV_LOG"
+[[ -z ${FAKE_UV_EXIT:-} ]] || exit "$FAKE_UV_EXIT"
 sleep "${FAKE_UV_SLEEP:-0}"
 mkdir -p .venv/bin
 if [[ -n ${FAKE_UV_BROKEN:-} ]]; then
@@ -576,6 +579,96 @@ def test_every_ensure_refreshes_the_gate_dir_mtime(remote: _Remote):
 def test_the_build_lock_file_is_left_in_place(remote: _Remote):
     assert remote.ensure().returncode == 0
     assert (remote.root / f'.build-{remote.sha}.lock').is_file()
+
+
+@pytest.mark.parametrize(('failure_env', 'status'), [
+    pytest.param({'FAKE_UV_BROKEN': '1'}, 70, id='handshake-die'),
+    pytest.param({'FAKE_UV_EXIT': '1'}, 1, id='build-set-e-abort'),
+])
+def test_a_failed_ensure_unlinks_its_build_lock(
+    remote: _Remote, failure_env: dict[str, str], status: int,
+):
+    result = remote.ensure(**failure_env)
+
+    assert result.returncode == status, result.stderr
+    assert remote.gate.exists(), 'the clone runs only under the lock, so this run held it'
+    assert not (remote.root / f'.build-{remote.sha}.lock').exists()
+
+
+def _path_with_fake_flock(bindir: Path, script: str, path: str) -> str:
+    """*path* behind a *bindir* holding a ``flock`` that runs *script*."""
+    bindir.mkdir()
+    (bindir / 'flock').write_text(script)
+    (bindir / 'flock').chmod(0o755)
+    return f'{bindir}:{path}'
+
+
+def test_an_ensure_that_times_out_on_the_build_lock_leaves_it_in_place(
+    remote: _Remote, tmp_path: Path,
+):
+    """Only the run holding the lock unlinks it, never one that failed to take it."""
+    path = _path_with_fake_flock(tmp_path / 'flockbin', '#!/usr/bin/env bash\nexit 1\n', remote.env['PATH'])
+    remote.root.mkdir(parents=True)
+    lock_path = remote.root / f'.build-{remote.sha}.lock'
+    with lock_path.open('w') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        result = remote.ensure(PATH=path)
+
+        assert result.returncode == 75, result.stderr
+        assert lock_path.exists()
+        assert os.fstat(held.fileno()).st_ino == lock_path.stat().st_ino
+
+
+def _a_child_flock_waits_on(parent: int, handle: typing.IO[str]) -> bool:
+    """Whether a child of *parent* is blocked in flock on the file *handle* has open.
+
+    A waiter row reads ``<id>: -> FLOCK <mode> <access> <pid> <maj:min:inode> ...``.
+    Its device is the superblock's, which can differ from st_dev, so only the
+    inode is matched; the parent keeps another process's waiter from matching.
+    """
+    inode = f':{os.fstat(handle.fileno()).st_ino}'
+    for line in Path('/proc/locks').read_text().splitlines():
+        match line.split():
+            case [_, '->', 'FLOCK', _, _, pid, file_id, *_] if file_id.endswith(inode):
+                waiter = read_stat_fields(Path('/proc', pid), skip_malformed=True)
+                if waiter is not None and waiter.ppid == parent:
+                    return True
+    return False
+
+
+_ENSURE_EXIT_CEILING_SECS = 60
+
+
+def test_an_ensure_whose_lock_file_is_replaced_while_it_waits_locks_the_new_file(remote: _Remote):
+    """A holder may unlink the lock: winning a file no longer at the lock path is no lock."""
+    remote.root.mkdir(parents=True)
+    lock = remote.root / f'.build-{remote.sha}.lock'
+    handles = [lock.open('w')]
+    fcntl.flock(handles[0], fcntl.LOCK_EX)
+    proc = remote.popen()
+    try:
+        first = handles[0]
+        assert _holds_within(lambda: _a_child_flock_waits_on(proc.pid, first), 30)
+
+        lock.unlink()
+        second = lock.open('w')
+        handles.append(second)
+        fcntl.flock(second, fcntl.LOCK_EX)
+        first.close()
+
+        assert _holds_within(lambda: _a_child_flock_waits_on(proc.pid, second), 10)
+        assert remote.builds() == 0
+
+        second.close()
+        _, stderr = proc.communicate(timeout=_ENSURE_EXIT_CEILING_SECS)
+        assert proc.returncode == 0, stderr
+        assert remote.builds() == 1
+    finally:
+        for handle in handles:
+            handle.close()
+        proc.kill()
+        proc.communicate(timeout=_ENSURE_EXIT_CEILING_SECS)
 
 
 def test_ensure_never_exits_with_the_ssh_transport_status(remote: _Remote):
@@ -1526,10 +1619,52 @@ def test_the_reaper_leaves_an_unmarked_root_alone(gate_root: Path):
 def test_the_reaper_skips_a_sha_whose_build_lock_is_held(gate_root: Path):
     sha = '4' * 40
     idle = _dir(gate_root, sha, days=30)
-    with open(gate_root / f'.build-{sha}.lock', 'w') as lock:
+    lock_path = gate_root / f'.build-{sha}.lock'
+    with open(lock_path, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         assert _reap(gate_root).returncode == 0
+        assert lock_path.exists()
+        assert os.fstat(lock.fileno()).st_ino == lock_path.stat().st_ino
     assert idle.exists()
+
+
+def test_a_reaped_sha_leaves_no_build_lock(gate_root: Path):
+    sha = '1' * 40
+    idle = _dir(gate_root, sha, days=8)
+    lock = gate_root / f'.build-{sha}.lock'
+    lock.touch()
+
+    result = _reap(gate_root)
+
+    assert result.returncode == 0, result.stderr
+    assert not idle.exists()
+    assert not lock.exists()
+
+
+# A `flock` that replaces the file on the fd it is handed (its last argument)
+# before locking it: the reaper's open-to-flock window, held open.
+_REPLACING_FLOCK = r"""#!/usr/bin/env bash
+path=$(readlink "/proc/$$/fd/${!#}")
+unlink "$path"
+: > "$path"
+exec "$REAL_FLOCK" "$@"
+"""
+
+
+def test_a_reaper_whose_lock_file_was_replaced_before_it_locked_reaps_nothing(
+    gate_root: Path, tmp_path: Path,
+):
+    sha = '5' * 40
+    idle = _dir(gate_root, sha, days=30)
+    path = _path_with_fake_flock(tmp_path / 'flockbin', _REPLACING_FLOCK, os.environ['PATH'])
+    real_flock = shutil.which('flock')
+    assert real_flock is not None
+
+    result = _reap(gate_root, PATH=path, REAL_FLOCK=real_flock)
+
+    assert result.returncode == 0, result.stderr
+    assert idle.exists()
+    assert (gate_root / f'.build-{sha}.lock').exists()
 
 
 def test_the_reaper_rejects_a_relative_root(gate_root: Path):

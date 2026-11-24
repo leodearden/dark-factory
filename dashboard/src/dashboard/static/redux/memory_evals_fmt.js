@@ -285,9 +285,9 @@ const VERDICT_BASES = {
   'grandfathered':     { base: 'grandfathered',     cls: 'badge info' },
   'insufficient_data': { base: 'insufficient_data', cls: 'badge muted' },
 };
-function verdictBadge(metric) {
-  const verdict = metric.verdict;
-  const parity = metric.parity;
+function verdictBadge(entry) {
+  const verdict = entry.verdict;
+  const parity = entry.parity;
 
   // The plain verdict label is computed FIRST, so that no parity branch below
   // can discard it.
@@ -384,6 +384,19 @@ function verdictBadge(metric) {
   return { cls: cls, label: base };
 }
 
+// A metric row's `verdicts`, split by what each entry judges.  `own` holds the
+// item-less entries, which judge the metric as a whole (its window verdict, or
+// the unjudged placeholder of a metric nothing judged); `items` holds one entry
+// per tripwire item.  Payload order is kept in both, and the payload's list is
+// never mutated.
+function splitVerdicts(verdicts) {
+  const all = verdicts || [];
+  return {
+    own: all.filter(entry => entry.item == null),
+    items: all.filter(entry => entry.item != null),
+  };
+}
+
 const MEMORY_EVALS_FMT_API = {
   dash,
   ageText,
@@ -391,6 +404,7 @@ const MEMORY_EVALS_FMT_API = {
   unmatchedReasonText,
   chartForKind,
   verdictBadge,
+  splitVerdicts,
   // BOTH badge vocabularies are EXPORTED, not merely used: the node suite
   // enumerates its verdict×parity matrix off these tables so a state the
   // producer adds is covered the moment it lands here, rather than off a

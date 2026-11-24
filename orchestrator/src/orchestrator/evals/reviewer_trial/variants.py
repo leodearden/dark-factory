@@ -60,9 +60,6 @@ def campaign_arms(
 # Trial reviewer role builder
 # ---------------------------------------------------------------------------
 
-_JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
-
-
 def build_trial_reviewer_role(
     spec_in: ReviewerSpec, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
 ) -> AgentRole:
@@ -71,14 +68,13 @@ def build_trial_reviewer_role(
     The system prompt, verdict-tools transport, harness version and
     ``reviewer_<name>`` identity are production's, so the trial measures the
     prompt production dispatches; the verdict-tools server checks the emitted
-    ``reviewer`` field against ``role.name``. The trial adds jcodemunch to the
-    read-only tools and takes model and budget from the spec; the runner
-    passes ``spec_in.effort`` itself, since AgentRole has no effort field.
+    ``reviewer`` field against ``role.name``. The trial takes model and budget
+    from the spec; the runner passes ``spec_in.effort`` itself, since
+    AgentRole has no effort field.
     """
     role = build_reviewer_role(spec_in.name, spec_in.specialization, briefing)
     return dataclasses.replace(
         role,
-        allowed_tools=[*role.allowed_tools, *_JCODEMUNCH_TOOLS],
         disallowed_tools=['Edit', 'Write'],
         default_model=spec_in.model,
         default_budget=spec_in.budget,

@@ -59,8 +59,9 @@ def _iter_memory_eval_escalations(
 
     THREE reach paths, which is the whole set the JSX can navigate from:
 
-    * ``evals[i].metrics[j].escalation``  — a metric row's per-metric link
-      (`memory_evals.py` `_build_eval`, via `_escalation_projection`)
+    * ``evals[i].metrics[j].verdicts[k].escalation`` — a verdict entry's
+      per-fingerprint link (`memory_evals.py` `_verdict_fields`, via
+      `_escalation_projection`)
     * ``storm_escape.escalation``         — the run-scoped aggregate filing
     * ``unmatched_escalations[k]``        — open escalations no metric row
       claims (via `_unmatched_projection`, which delegates to the same
@@ -76,12 +77,16 @@ def _iter_memory_eval_escalations(
         for metric in ev.get('metrics') or []:
             if not isinstance(metric, dict):
                 continue
-            escalation = metric.get('escalation')
-            if isinstance(escalation, dict):
-                yield (
-                    f'evals[{eval_id!r}].metrics[{metric.get("metric_id")!r}].escalation',
-                    escalation,
-                )
+            for verdict in metric.get('verdicts') or []:
+                if not isinstance(verdict, dict):
+                    continue
+                escalation = verdict.get('escalation')
+                if isinstance(escalation, dict):
+                    yield (
+                        f'evals[{eval_id!r}].metrics[{metric.get("metric_id")!r}]'
+                        f'.verdicts[{verdict.get("item")!r}].escalation',
+                        escalation,
+                    )
 
     storm = memory_evals_payload.get('storm_escape')
     if isinstance(storm, dict):
@@ -549,8 +554,8 @@ def test_the_id_space_check_scopes_by_queue(tmp_path: Path) -> None:
 # MEASURED against the real producer, not assumed: a TRIGGERED storm escape
 # suppresses every per-metric link program-wide.  `memory_evals.py::_join_escalation`
 # links a row only when `storm is None`; otherwise the fingerprint goes to
-# `_RowClaims.suppressed` and the row renders `parity='storm_collapsed'` with
-# `escalation: None`.  So `evals[i].metrics[j].escalation` and
+# `_RowClaims.suppressed` and the verdict entry renders `parity='storm_collapsed'` with
+# `escalation: None`.  So `evals[i].metrics[j].verdicts[k].escalation` and
 # `storm_escape.escalation` can never BOTH be populated in one payload — they
 # are alternatives by design, since the storm exists precisely to collapse the
 # per-metric links into one aggregate filing.

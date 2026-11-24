@@ -95,7 +95,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
     'test_suffix_conflict_tracker.py',
-    'test_task_runtime.py',
     'test_train_integration.py',
     'test_verify_events_units.py',  # debt: task 11025
     'test_verify_phase_rebase.py',

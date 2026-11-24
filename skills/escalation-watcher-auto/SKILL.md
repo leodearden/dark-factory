@@ -52,7 +52,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 ### Root-cause classes and where they surface
 
-**Infra** — fused-memory/Neo4j/Qdrant/jobserver down, disk full:
+**Infra** — fused-memory, FalkorDB, Qdrant or the jobserver down, or disk full:
 - Signature: burst of `infra_issue` and/or MCP-error escalations across **unrelated tasks** in short succession
 - You are read-only: you can *hypothesize* infra from these symptoms but cannot probe host health (no `df`, `systemctl`, `docker` — all blocked). The case where infra kills the auto-watcher itself is covered by the supervisor failsafe.
 
@@ -62,7 +62,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 **Design** — PRD mis-decomposition / wrong architecture → sibling tasks of the same PRD all stalling:
 - Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
-- RCA tool: fused-memory `get_tasks` to identify parent task, `search` for related design decisions
+- RCA tool: fused-memory `get_task` on each escalated task to compare its `metadata.prd_path` and its `dependencies` (a task record has no parent field), `search_tasks` on the PRD title for siblings that have not escalated, `search` for related design decisions
 
 **Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
 - Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
@@ -79,7 +79,7 @@ Deepen RCA when you observe **any** of the following signals:
 
 - **Repeated failures on the same module or merge** — two or more `task_failure` escalations referencing the same file path or recent commit
 - **Burst of infra symptoms** — three or more `infra_issue` or MCP-error escalations in one drain cycle, especially from unrelated tasks
-- **Sibling tasks of one PRD all stalling** — multiple escalations whose task IDs share the same parent task (check via `mcp__fused-memory__get_tasks`)
+- **Sibling tasks of one PRD all stalling** — multiple escalations whose tasks share one `metadata.prd_path` or depend on the same task (check via `mcp__fused-memory__get_task` on each escalated task, reading `metadata.prd_path` and `dependencies`, since a task record has no parent field; then `mcp__fused-memory__search_tasks` on the PRD title for siblings that have not escalated)
 - **Same category + overlapping summaries** from distinct tasks with no obvious individual root cause
 
 Without these signals, log the escalation category and summary, apply the routing table (step 5), and move on.
@@ -97,7 +97,8 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `Bash(git status ...)` | Working-tree state at the project root |
 | `python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py` | List and count one task's `runs.db` events before a `root_cause`/`evidence` narrative joins them (read-only). Advisory entry: not in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`; it runs because the rotation's `bypassPermissions` mode admits Bash, as `scripts/watcher-rearm.sh` does |
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
-| `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
+| `mcp__fused-memory__get_tasks` | Filtered task list — pass `statuses`, `fields` and `page_size`, and page with `offset` until `pagination.has_more` is false before treating a miss as absence; never call it bare (it returns every task in the store). Use it only on a filter narrow enough to page through: whether a task for X already exists is a `search_tasks` question |
+| `mcp__fused-memory__search_tasks` | Semantic search over filed tasks, each hit carrying its current `status`: the existence check for "is there already a task for X". Its corpus excludes deferred and uncommitted tasks |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
 | `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
 | `mcp__escalation__get_task_escalation_history` | Every escalation ever filed for one task, archive included, as a `{task_id, count, level_filter, escalations}` envelope. It has no `compact`, so the drain's cross-check keeps `get_task_escalations(compact=True)` ([Draining pending escalations](#draining-pending-escalations)) |
@@ -108,7 +109,7 @@ The filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_t
 
 **MCP tool names are per-server.** The `mcp__<server>__` prefix names the server that owns a tool.
 
-- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` — the escalation server has no `get_task`. This rotation's escalation reads return escalation records, not task records: `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`), `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), `mcp__escalation__get_task_escalation_history` (the same set as a self-describing envelope) and `mcp__escalation__get_escalation` (one record by id, archive included).
+- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` / `mcp__fused-memory__search_tasks` — the escalation server has no `get_task`. This rotation's escalation reads return escalation records, not task records: `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`), `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), `mcp__escalation__get_task_escalation_history` (the same set as a self-describing envelope) and `mcp__escalation__get_escalation` (one record by id, archive included).
 - **Reading one full escalation record.** Call `mcp__escalation__get_escalation(escalation_id=<id>)`. It is archive-inclusive and returns the full `Escalation.to_dict()` (`escalation/src/escalation/models.py`), which carries every field, including `detail` and `pin_declared_reason`. If `get_escalation` is missing from your toolset or the call is refused (an orchestrator not yet restarted onto the task-3176 grant can still list the tool but deny it), fall back to a non-compact `mcp__escalation__get_pending_escalations(task_id=<its task_id>)` — or `mcp__escalation__get_task_escalations(task_id=<its task_id>)` to include the archive — and pick the row by `id`; those full rows are the same shape. Trying `get_escalation` first is safe: [Graceful Degradation](#graceful-degradation)'s never-a-trial-call rule guards the tools whose call mutates state, and this one is a read.
 - **Tools the server lists but this rotation is not granted.** The escalation server's MCP instructions (`escalation/src/escalation/server_instructions.py`) describe what the SERVER offers. Of the reads it lists, this rotation is not granted `get_task_runtime_state`; it is also not granted `declare_pin` (see [Declared pins](#declared-pins-a-close-can-be-refused-declared_pin_refused)) or any merge-queue mutator ([Hard Constraints](#hard-constraints--never-violate)). The rotation's contract is to call only what `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` lists (see [Headless-mode permission gotchas](#headless-mode-permission-gotchas-credit-external-pr-4)).
 
@@ -125,7 +126,7 @@ The top-level rotation runs on sonnet (task 2629) to keep the common case — me
 ### Hypothesis formation
 
 A hypothesis is a **stable, human-readable string** you will pass as `root_cause` to `promote_to_l2`. It should be specific enough to deduplicate (the server uses it as a dedup key) but not so specific that it prevents the L2 from evolving as more members are added:
-- Good: `"bad-merge-to-main-breaks-scheduler-imports"`, `"neo4j-connectivity-outage"`, `"prd-decomposition-scope-overlap-in-reconciler"`
+- Good: `"bad-merge-to-main-breaks-scheduler-imports"`, `"falkordb-connectivity-outage"`, `"prd-decomposition-scope-overlap-in-reconciler"`
 - Too vague: `"infra"`, `"failure"`
 - Too specific: `"task-42-import-error-line-17-of-reconciler.py"` (won't match task-43's variant)
 
@@ -730,7 +731,7 @@ These categories require only admin-level MCP operations. Dispatch them directly
 
 Agent discovered it needs to touch files beyond its assigned scope.
 
-**This category is split, and only one half is autonomous.** Path-guard synthetic-anchor records (no real task) are closed autonomously by the branch immediately below. Every **real-task** `scope_violation` is a **judgement-class** item that you `promote_to_l2` — no mechanism exists for you to deliver a scope widening, so resolving one autonomously would re-pend it into an escalate/resume loop. The steps further below trace that; do not treat this heading's "handle and resolve" framing as licence to resume one.
+**This category is split.** Path-guard synthetic-anchor records (no real task) are closed autonomously by the branch immediately below. A real-task `scope_violation` is resumed with a file-level `granted_files` grant only when the request is a clean widening of what the task already does, and promoted to L2 otherwise; "Any other `scope_violation`" below gives both tests. Do not read this heading's "handle and resolve" framing as licence to resume anything that is not a clean file-level widening.
 
 ##### Path-guard synthetic-anchor audit records (no real task — close, do not resume)
 
@@ -838,8 +839,24 @@ Agent found it depends on work that isn't done yet.
 
 1. Check if the prerequisite is an **existing incomplete task** in fused-memory:
    ```
-   mcp__fused-memory__get_tasks(project_root=<project_root>)
+   mcp__fused-memory__search_tasks(project_root=<project_root>, query="<the prerequisite, in the agent's words>")
    ```
+   Then `mcp__fused-memory__get_task` on each candidate whose `status` is not `done` or `cancelled`, to confirm it is the prerequisite. A `deferred` prerequisite is invisible here: the `search_tasks` corpus excludes deferred tasks.
+
+   If the existence check cannot run — `search_tasks` is missing from your toolset, the call is refused (an orchestrator not yet restarted onto the task-10426 grant can still list the tool but deny it), or it returns an `error` payload — that is not "no match", and step 3 does not apply. Do not fall back to paging `get_tasks`: each page is bounded, but the incomplete set is thousands of rows, and reading them all would spend the rotation's context on one record. Promote instead, saying the existence check could not run, never that no task exists:
+   ```python
+   mcp__escalation__promote_to_l2(
+     task_id=<task_id>,
+     agent_role="escalation-watcher-auto",
+     member_ids=[<escalation_id>],
+     root_cause="dependency-check-unavailable:" + <dep_description_slug>,
+     evidence=<the refusal or error text, verbatim>,
+     options=["A: re-run the existence check after the orchestrator restarts onto the search_tasks grant", "B: link the prerequisite by hand (add_dependency), creating it first if it does not exist", "C: something else"],
+     summary="dependency_discovered — existence check unavailable for: " + <dep_description>,
+     category="dependency_discovered",
+   )
+   ```
+   Add to digest: `PROMOTED (L2): dependency_discovered — <task_id> — existence check unavailable: <error>`
 2. **If a matching incomplete task exists:**
    ```
    mcp__fused-memory__add_dependency(id=<task_id>, depends_on=<dep_id>, project_root=<project_root>)
@@ -1208,7 +1225,7 @@ mcp__escalation__promote_to_l2(
   task_id=<task_id or "infra">,
   agent_role="escalation-watcher-auto",
   member_ids=[<esc_id>, ...],
-  root_cause="infra-outage:<symptom-slug>",  # e.g. "infra-outage:neo4j-connection-refused"
+  root_cause="infra-outage:<symptom-slug>",  # e.g. "infra-outage:falkordb-connection-refused"
   evidence=<summary + any burst pattern observed>,
   options=["A: restart the affected service", "B: investigate logs/connectivity", "C: pause orchestration until resolved", "D: something else"],
   summary="Infrastructure issue: " + <summary>,
@@ -1463,7 +1480,7 @@ Feature-detect **once at startup** (step 2 in the Main Loop) by checking whether
 |-----------|-----------|
 | All present | Full mode: every L1 ends resolved, filed-and-resolved or promoted ([Terminal dispositions](#terminal-dispositions--never-park)). |
 | Filing pair **absent** | Promote every item you would have filed, with its content verbatim in `evidence`. The tree stays total. |
-| `promote_to_l2` **absent** | A misconfiguration: a defect state, not a mode to run in. Autonomous dispatch and file-and-resolve continue. Items whose only disposition is promotion — real-task `scope_violation` included, since a resume delivers nothing and re-escalates — cannot be dispositioned: leave them pending and UNSTAMPED, so the first rotation with `promote_to_l2` back reassesses them at once. |
+| `promote_to_l2` **absent** | A misconfiguration: a defect state, not a mode to run in. Autonomous dispatch and file-and-resolve continue. Items whose only disposition is promotion — a real-task `scope_violation` that is not a clean file-level widening included — cannot be dispositioned: leave them pending and UNSTAMPED, so the first rotation with `promote_to_l2` back reassesses them at once. |
 
 Nothing durable records the items the `promote_to_l2`-absent state leaves pending. The digest is this rotation's final chat message and no component reads it, so it is not a fallback. What an operator sees is the symptom: `orchestrator/src/orchestrator/harness.py::Harness._watcher_has_actionable_l1` keeps re-arming rotations on them.
 
@@ -1545,7 +1562,7 @@ Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <too
 - PENDING: task_failure — task-12 — verify exhausted after 3 attempts
     Proposal: Blocked because import error in test. To unblock: fix import in tests/test_foo.py line 42. Confidence: high. [risk: low]
 - PENDING: design_concern — task-88 — architectural question about X
-- PENDING (urgent): infra_issue — N/A — Neo4j connection refused
+- PENDING (urgent): infra_issue — N/A — FalkorDB connection refused
 - PENDING: dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
 ```
 

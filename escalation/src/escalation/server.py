@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypeVar, assert_never, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
@@ -34,7 +34,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
-from shared.merge_state import MergeReason, MergeState
+from shared.merge_state import CANCEL_STATES, MergeReason, MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.uuid_prefix_guard import (
@@ -1295,6 +1295,26 @@ def _render_store_identity_block(identity: StoreIdentity) -> str:
         'does not exist. To ask whether an escalation was EVER filed for a task\n'
         '(including resolved/archived), use get_task_escalation_history.'
     )
+
+
+_CANCEL_STATES_PLACEHOLDER = '{CANCEL_STATES}'
+_CANCEL_STATES_WIRE_LIST = ' | '.join(
+    f"'{state}'" for state in MergeState if state in CANCEL_STATES
+)
+
+_Fn = TypeVar('_Fn', bound=Callable[..., Any])
+
+
+def _render_cancel_states(fn: _Fn) -> _Fn:
+    """Write the CANCEL_STATES wire list into *fn*'s docstring, before FastMCP reads it.
+
+    ``str.replace``, never ``str.format``: the docstring holds other braces.
+    """
+    doc = fn.__doc__ or ''
+    if _CANCEL_STATES_PLACEHOLDER not in doc:
+        raise ValueError(f'{fn.__qualname__}: no {_CANCEL_STATES_PLACEHOLDER} in its docstring')
+    fn.__doc__ = doc.replace(_CANCEL_STATES_PLACEHOLDER, _CANCEL_STATES_WIRE_LIST)
+    return fn
 
 
 def create_server(
@@ -5850,6 +5870,7 @@ def create_server(
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
     @mcp.tool()
+    @_render_cancel_states
     async def merge_cancel(request_id: str) -> dict[str, Any]:
         """Cancel an in-flight merge request by its request_id.
 
@@ -5863,16 +5884,8 @@ def create_server(
                                 state verbatim, including its deliberate
                                 forward-compatible passthrough of an unmapped worker
                                 state (escalation/src/escalation/server.py::_map_live_state).
-                                merge-state-vocab:begin partition=CANCEL_STATES
-                                'queued' | 'verifying' | 'gate' | 'finalizing' |
-                                'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' |
-                                'no_record' | 'stale_record' | 'journaled' | 'unknown'
-                                merge-state-vocab:end
-                                Source of truth: shared/src/shared/merge_state.py::CANCEL_STATES.
-                                The span above is machine-pinned to it by
-                                scripts/tests/test_merge_state_vocabulary_consistency.py
-                                (the CONTRIBUTING.md lint-command-mirror convention) — edit
-                                the partition, not this list.
+                                {CANCEL_STATES}
+                                Rendered at import from shared/src/shared/merge_state.py::CANCEL_STATES.
             reason    (str|None) — None on success; non-None string on every other path.
             code      (str)   — the lane's refusal, a MergeCancelRefusal value
                                 ('not_live' | 'finalize_window' | 'train_cancel_unsupported').

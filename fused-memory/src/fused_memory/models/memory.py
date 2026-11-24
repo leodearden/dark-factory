@@ -1,7 +1,8 @@
 """Response and result models for the fused memory system."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
+from typing import Any, TypedDict
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -49,12 +50,57 @@ class MemoryResult(BaseModel):
     # but the UTC offset is not guaranteed. Graphiti hits: EntityEdge.created_at, the edge's
     # BIRTH, not its last edit. None when the store supplies no stamp.
     created_at: str | None = None
+    # Writer identity and the project scope the record is STORED under; None when the store
+    # recorded none. project_id is read off the record, never copied from the query, and is
+    # not metadata['project_id']: that key is a writer-supplied ORIGIN tag, one of
+    # server/grouped_read.py::ORIGIN_PROJECT_TAG_KEYS. The two are never merged.
+    agent_id: str | None = None
+    task_id: str | None = None
+    project_id: str | None = None
     # COMPUTED RETRIEVAL STATE, not stored metadata: never round-trips to a store, and is
     # never read back off a payload. True means this result was PROMOTED into the returned
     # window by the topic pin (services/topic_anchor.py, task 3111) rather than by its own
     # rank, so `relevance_score` is not meaningful for it. Always present in model_dump()
     # so consumers can read it unconditionally.
     topic_anchored: bool = False
+
+
+class HitAttribution(TypedDict):
+    """The MemoryResult kwargs naming who wrote a hit, for which task, under which scope."""
+
+    agent_id: str | None
+    task_id: str | None
+    project_id: str | None
+
+
+def _non_empty_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _stored_task_id(value: object) -> str | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return _non_empty_str(value)
+
+
+def mem0_hit_attribution(managed: Mapping[str, Any], custom: Mapping[str, Any]) -> HitAttribution:
+    """Attribution of a mem0 record: ``managed`` is mem0's processed search item or the managed half from backends/mem0_client.py::split_managed_metadata.
+
+    project_id inverts models/scope.py::Scope.mem0_user_id, which stores the project id verbatim as user_id.
+    """
+    return HitAttribution(
+        agent_id=_non_empty_str(managed.get('agent_id')),
+        task_id=_stored_task_id(custom.get('task_id')),
+        project_id=_non_empty_str(managed.get('user_id')),
+    )
+
+
+def graphiti_hit_attribution(group_id: object) -> HitAttribution:
+    """Attribution of a Graphiti edge from its ``group_id`` partition; the graph stores no writer.
+
+    project_id inverts models/scope.py::Scope.graphiti_group_id, which partitions by the project id verbatim.
+    """
+    return HitAttribution(agent_id=None, task_id=None, project_id=_non_empty_str(group_id))
 
 
 class AddEpisodeResponse(BaseModel):

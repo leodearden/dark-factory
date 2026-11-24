@@ -8073,11 +8073,11 @@ class TestCheckPlanFilesTouchedInBranch:
     async def test_dot_slash_prefixed_root_file_is_satisfied(
         self, git_ops: GitOps,
     ):
-        """Exact 4099 repro: declare './.jcodemunch.jsonc' when the branch
-        touched '.jcodemunch.jsonc' → gate must pass (not_touched == []).
+        """4099 repro shape: declare './.tool-config.jsonc' when the branch
+        touched '.tool-config.jsonc' → gate must pass (not_touched == []).
 
         RED before fix: literal membership check misses because
-        './.jcodemunch.jsonc' != '.jcodemunch.jsonc', and the blob-type
+        './.tool-config.jsonc' != '.tool-config.jsonc', and the blob-type
         ls-tree result has no ' tree ' so the entry falls through to
         not_touched.
         """
@@ -8085,13 +8085,13 @@ class TestCheckPlanFilesTouchedInBranch:
         rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
         assert rc == 0
         base = base_out.strip()
-        (wt / '.jcodemunch.jsonc').write_text('{"a": 1}\n')
-        await git_ops.commit(wt, 'Add .jcodemunch.jsonc')
+        (wt / '.tool-config.jsonc').write_text('{"a": 1}\n')
+        await git_ops.commit(wt, 'Add .tool-config.jsonc')
         rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
         head = head_out.strip()
 
         result = await _check_plan_files_touched_in_branch(
-            ['./.jcodemunch.jsonc'], base, head, git_ops,
+            ['./.tool-config.jsonc'], base, head, git_ops,
             task_id='dot-slash-root',
         )
         assert result.not_touched == []

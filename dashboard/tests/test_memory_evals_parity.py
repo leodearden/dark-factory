@@ -12,7 +12,7 @@ The join under test is whole-string equality between a verdict entry's
 ``dedupe_fingerprint``.  The fingerprint identity is
 ``(eval_id, metric_id, item | window)``
 (``shared/tests/fixtures/memory_eval_verdicts/README.md`` §"Entry granularity"),
-so a tripwire contributes one row per item.
+so a tripwire's metric row carries one ``verdicts`` entry per item.
 
 Artifact-only, like ``test_memory_evals_data.py``: exemplar fingerprints are
 read with ``json.loads``, never through ``shared.memory_eval_*``.
@@ -77,7 +77,13 @@ def _file(config: DashboardConfig, esc_id: str, fingerprint: str, **kw: Any) -> 
 
 
 def _rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    return [row for card in payload['evals'] for row in card['metrics']]
+    """Every verdict entry in *payload*, each annotated with its metric row's ``metric_id``."""
+    return [
+        {'metric_id': metric['metric_id'], **entry}
+        for card in payload['evals']
+        for metric in card['metrics']
+        for entry in metric['verdicts']
+    ]
 
 
 def _row(payload: dict[str, Any], metric_id: str, item: str | None = None) -> dict[str, Any]:
@@ -110,8 +116,8 @@ def _assert_both_directions(payload: dict[str, Any], filed: dict[str, str], *, s
     rows = _rows(payload)
     for row in rows:
         if row['escalation'] is not None:
-            assert row['escalation']['dedupe_fingerprint'] == row['fingerprint'], row
-        if row['verdict'] != 'alarm' or row['fingerprint'] not in by_fingerprint:
+            assert row['escalation']['dedupe_fingerprint'] == row.get('fingerprint'), row
+        if row['verdict'] != 'alarm' or row.get('fingerprint') not in by_fingerprint:
             continue
         if storm:
             assert row['escalation'] is None, row

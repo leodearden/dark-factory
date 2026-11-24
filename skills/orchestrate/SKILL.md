@@ -192,7 +192,7 @@ Then set dependencies:
 add_dependency(id="2", depends_on="1", project_root="$TARGET_PROJECT")
 ```
 
-After all tasks are written, verify with `get_tasks(project_root="$TARGET_PROJECT")` and show the user the final state.
+After all tasks are written, verify with one `get_task(id=..., project_root="$TARGET_PROJECT")` per task just filed and show the user the final state.
 
 ### 5. Proceed to execution
 
@@ -219,7 +219,7 @@ Before launching, verify:
 
 2. **Environment** — `OPENAI_API_KEY` must be set (used for embeddings). The orchestrator's Claude agents authenticate via OAuth (Max subscription), not an API key — `ANTHROPIC_API_KEY` is **not** required.
 
-3. **Tasks exist** — verify with `get_tasks(project_root="$TARGET_PROJECT")`. If the task tree is empty, go to [Decompose PRD](#decompose-prd) first. Confirm the returned tasks actually belong to the target project — if you see dark-factory task titles when the user is in reify, your `project_root` is wrong; go fix step 3 above before launching.
+3. **Tasks exist** — verify with `get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "blocked"], fields=["title", "status"], page_size=20)`. If the task tree is empty, go to [Decompose PRD](#decompose-prd) first. Confirm the returned tasks actually belong to the target project — if you see dark-factory task titles when the user is in reify, your `project_root` is wrong; go fix step 3 above before launching.
 
 ### Launch
 
@@ -389,7 +389,7 @@ See `OPERATIONS.md` §"Config reload vs restart" for the tier summary, and `plan
 
 ## Model Routing
 
-The orchestrator resolves `(model, effort, budget_usd, max_turns)` for every LLM invocation through a layered resolver (`routing.resolve_route`). See `CLAUDE.md`'s "Model Routing" section for the `routing.*` config block, the closed match/set vocabulary, and the layered precedence — this section covers the operator-facing CLI and how to read what was actually decided.
+The orchestrator resolves `(model, effort, budget_usd, max_turns)` for every LLM invocation through a layered resolver (`routing.resolve_route`). See OPERATIONS.md §7 "Model routing" for the `routing.*` config block, the closed match/set vocabulary, and the layered precedence — this section covers the operator-facing CLI and how to read what was actually decided.
 
 ### Probing model availability
 
@@ -433,7 +433,7 @@ Today's per-invocation routing visibility: every resolved invocation emits a `ro
 
 ### Reading scoped cap-hit / failover cost events
 
-`cap_hit`, `near_cap`, and `failover` account events (fired by the `UsageGate`, see CLAUDE.md's "Model-scoped account caps") land in the `account_events` table of `data/orchestrator/runs.db` — the same SQLite file the `CostStore` shares with `EventStore`/`RunStore`. Each row's `details` column is a JSON blob:
+`cap_hit`, `near_cap`, and `failover` account events (fired by the `UsageGate`, see OPERATIONS.md §7, subsection "Model-scoped account caps (`usage_cap.scoped_cap_models`)") land in the `account_events` table of `data/orchestrator/runs.db` — the same SQLite file the `CostStore` shares with `EventStore`/`RunStore`. Each row's `details` column is a JSON blob:
 
 ```bash
 sqlite3 data/orchestrator/runs.db \
@@ -469,9 +469,11 @@ This queries the fused-memory task tree and displays each task's status and modu
 You can also query tasks directly via fused-memory MCP tools for more detail. Always pass `project_root="$TARGET_PROJECT"` — passing dark-factory's path here will return the wrong project's tasks:
 
 ```
-get_tasks(project_root="$TARGET_PROJECT")
+get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "blocked"], fields=["title", "status"], page_size=20)
 get_task(id="4", project_root="$TARGET_PROJECT")
 ```
+
+Never call `get_tasks` with only `project_root`: it returns every task in the store, far more than a session can read. For ids and statuses alone, use `get_statuses(project_root="$TARGET_PROJECT", page_size=500)`, advancing `offset` by `pagination.page_size` until `pagination.has_more` is false, or pass `ids=[...]` for known tasks. A bare `get_statuses` is unbounded too, and `page_size` must stay at or below 2000.
 
 If the returned tasks don't look like the project the user is in (e.g. you see dark-factory titles when the user is in reify), your `project_root` is wrong — re-run step 1 of "identify the target project" before continuing.
 
@@ -499,7 +501,7 @@ Tasks block at specific workflow stages. The approach depends on where it got st
 |-------|---------|------------|
 | **PLAN** | "architect failed" or no `plan.json` | Task description may be too vague. Update the task with more detail via `update_task`, reset to pending, and re-run. |
 | **EXECUTE** | "Execution iterations exhausted" | Implementer couldn't complete all plan steps in 10 iterations. Check `iterations.jsonl` for where it got stuck. May need to simplify the task or split it. |
-| **VERIFY** | "Verification attempts exhausted" | Tests/lint/typecheck fail persistently. Check the worktree for the actual failures: `cd <worktree> && pytest` / `ruff check` / `pyright`. Fix manually or update the task. **Caveat**: verification currently runs repo-wide commands by default — pre-existing errors in unrelated modules can block tasks. Check whether the failures are in the task's own modules or elsewhere. |
+| **VERIFY** | "Verification attempts exhausted" | Tests/lint/typecheck fail persistently. Check the worktree for the actual failures: `cd <worktree> && pytest` / `ruff check` / `pyright`. Fix manually or update the task. Verification runs the target's test, lint and type-check commands, scoped per subproject where a module `orchestrator.yaml` overrides them; a repo-wide command can still fail on errors in unrelated modules, so check whether the failures are in the task's own modules. If verify and a hand-run import disagree about code the task just wrote, trust verify (it reads the worktree's own tree) and see the `AttributeError` row of OPERATIONS.md Troubleshooting. |
 | **REVIEW** | "Review cycles exhausted" with blocking issues | Reviewers found design problems the architect couldn't resolve in 2 replan cycles. Read `.task/reviews/*.json` for the specific issues. May need architectural guidance written to memory. |
 | **MERGE** | "Merge conflicts" / "Post-merge verification failed" | Another task modified the same code. Check `git log --oneline main` for recent merges. May need to rebase the task branch manually. |
 | **MERGE (halted)** | "Merge queue halted" / `wip_conflict`, `unmerged_state`, or `stash_failed` escalation blocking all other merges / merge outcomes `wip_halted`, `done_wip_recovery`, `wip_recovery_no_advance`, `unmerged_state`, `stash_failed` | Exactly one escalation owns the halt (tracked on the merge worker as `_halt_owner_esc_id`). Resolve **that specific escalation** via `/escalation-watcher` or `mcp__escalation__resolve_issue` to un-halt the queue. For `wip_conflict`, check the recovery branch named in the detail (`wip/recovery-<task>-<ts>`); for `unmerged_state`, inspect `project_root` with `git status` and resolve UU/AA/DD markers; for `stash_failed`, inspect and commit `project_root`'s uncommitted WIP — do NOT use `git stash` (CLAUDE.md forbids it in any dark-factory checkout; `refs/stash` is shared across worktrees and the merge worker's advance path consumes the same stack, incident 13674d3c68). Do NOT manually toggle the halt flag — ownership is the single source of truth. |
@@ -577,8 +579,10 @@ If tasks already exist from a prior session, first assess their state before re-
 ### 1. Audit the task tree
 
 ```
-get_tasks(project_root="$TARGET_PROJECT")
+get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "blocked"], fields=["title", "status", "dependencies"], page_size=200, offset=0)
 ```
+
+Page through the whole open set: advance `offset` by `pagination.page_size` until `pagination.has_more` is false. A task or dependency edge on a page you did not read is not missing.
 
 Review the task tree to understand the current state. **Do not change the status of existing tasks** — they may have been set by the user or another session. If a task's status looks wrong, ask the user before changing it.
 
@@ -598,35 +602,9 @@ The config file is selected via `--config <path>` or `ORCH_CONFIG_PATH=<path>` �
 
 YAML values in the loaded config support `${VAR_NAME}` and `${VAR_NAME:default}` environment variable expansion.
 
-### Core settings
+### Core settings and per-role settings
 
-| Setting | config.yaml | What it controls |
-|---------|-------------|-----------------|
-| `max_concurrent_tasks` | 24 | Parallel task workflows |
-| `max_per_module` | 1 | Tasks per code module (serialization) |
-| `max_execute_iterations` | 10 | Implementer retries before blocking |
-| `max_verify_attempts` | 5 | Debug-fix cycles before blocking |
-| `max_review_cycles` | 2 | Review-replan loops before blocking |
-| `lock_depth` | 4 | Module path depth for lock normalization (projects commonly override; lower = coarser locks) |
-| `test_command` | pytest | Verification test runner |
-| `lint_command` | ruff check ... | Verification linter |
-| `type_check_command` | pyright (per-package) | Verification type checker |
-| `escalation.port` | 8102 | Escalation MCP server port |
-| `escalation.queue_dir` | data/escalations | Escalation queue directory |
-| `sandbox.enabled` | false | Enable bwrap filesystem sandbox |
-
-### Per-role settings
-
-Each role has model, budget, max turns, reasoning effort, and backend:
-
-| Role | Model | Budget | Turns | Effort | Backend |
-|------|-------|--------|-------|--------|---------|
-| architect | opus | $5 | 50 | max | claude |
-| implementer | sonnet | $10 | 80 | max | claude |
-| debugger | sonnet | $5 | 50 | max | claude |
-| reviewer | sonnet | $2 | 30 | medium | claude |
-| merger | opus | $5 | 50 | max | claude |
-| module_tagger | (sonnet) | ($2) | (30) | medium | claude |
+Values are not copied here, because they drift. Shipped defaults live in `orchestrator/src/orchestrator/defaults.yaml`, deep-merged under the target project's `dark-factory-orchestrator.yaml`, which overrides them. Read the target's file for the values in force: concurrency, lock depth, per-role model, effort, budget and max turns, escalation port, and the verify commands. OPERATIONS.md §7 "Model routing" explains how a role's model and effort are finally resolved.
 
 ### Module overrides
 
@@ -636,22 +614,8 @@ Subprojects can override verification commands by placing an `orchestrator.yaml`
 
 The `usage_cap` section configures automatic failover between Max subscription accounts when usage caps are hit. Accounts are tried in order; when one is capped, the orchestrator switches to the next and starts a background probe to detect when the capped account resets.
 
-`usage_cap.scoped_cap_models: list[str]` (default `['claude-fable-5']`) adds a **model-scoped** cap dimension on top of that per-account failover: a cap hit while running a listed model caps only that account's scope for that model — the account keeps serving general (non-listed-model) work untouched — and a general cap-hit always caps the whole account (every scope). `scoped_cap_models: []` is the kill switch, disabling scope tracking entirely. See CLAUDE.md's "Model-scoped account caps" (under "Model Routing") for the full scope semantics and how they interact with the `resolve_route` fail-safe check.
+`usage_cap.scoped_cap_models: list[str]` (default `['claude-fable-5']`) adds a **model-scoped** cap dimension on top of that per-account failover: a cap hit while running a listed model caps only that account's scope for that model — the account keeps serving general (non-listed-model) work untouched — and a general cap-hit always caps the whole account (every scope). `scoped_cap_models: []` is the kill switch, disabling scope tracking entirely. See OPERATIONS.md §7, subsection "Model-scoped account caps (`usage_cap.scoped_cap_models`)", for the full scope semantics and how they interact with the `resolve_route` fail-safe check.
 
 `usage_cap.*`, including `scoped_cap_models`, is **restart-tier** — it is not in `RELOADABLE_FIELDS`, so `mcp__escalation__reload_config` won't apply a change to it; see "Reload Config (vs Restart)" above.
 
 Override via YAML file (`--config`) or environment variables (`ORCH_MAX_CONCURRENT_TASKS=5`, `ORCH_MODELS__ARCHITECT=sonnet`).
-
----
-
-## Known Issues & Workarounds
-
-These are active issues that may affect orchestrator runs. Check the task tree for fix status.
-
-### Verification runs repo-wide (task 45)
-
-The verify step runs `ruff check`, `pyright`, and `pytest` with repo-wide scope by default. Pre-existing lint/type errors in modules outside a task's scope cause verification to fail even when the task's own code is clean. **Workaround**: ensure main is clean before starting a run (`ruff check && pyright` should pass). Module-scoped verification is planned but not yet implemented.
-
-### Worktree imports resolve from main tree (task 46)
-
-Worktrees share the main tree's `.venv`. Python imports resolve from the installed (main) package, not the worktree's modified source. New methods or changed signatures in worktree code fail at test time with `AttributeError` or assertion mismatches. **Workaround**: if a task blocks at verify with import errors for code it just wrote, manually verify the code is correct, merge to main, and confirm tests pass post-merge.

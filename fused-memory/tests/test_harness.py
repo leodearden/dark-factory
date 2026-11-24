@@ -2098,8 +2098,7 @@ class TestStage1CycleSummaryRemediationBackstop:
         remediation driver. The finally-block backstop must still fire and
         stamp the breadcrumb even though _run_remediation_pass completes
         normally instead of raising, and even though this except branch
-        builds a differently-shaped `_error` record (`'deferred': True`, no
-        `error_type` of a raising exception)."""
+        writes the deferral variant of the `_error` record (`'deferred': True`)."""
         import json
 
         from shared.cli_invoke import AllAccountsCappedException
@@ -5401,14 +5400,19 @@ def _remediation_pass_under_test(harness):
     )
 
 
-def _assert_run_failure_record(err, *, error_type, failed_stage, message, errorname, errorcode):
+def _assert_run_failure_record(
+    err, *, error_type, failed_stage, message, errorname, errorcode, message_in_traceback=True,
+):
     """Every key is read by indexing, so a missing sqlite key fails even when
-    the expected value is None."""
+    the expected value is None. A driver that records its own message instead
+    of the exception's passes message_in_traceback=False."""
     assert err['error_type'] == error_type
+    assert err['error_message'] == message
     assert err['failed_stage'] == failed_stage
     assert err['traceback'], 'the failure record must carry the traceback'
     assert error_type in err['traceback']
-    assert message in err['traceback']
+    if message_in_traceback:
+        assert message in err['traceback']
     assert err['sqlite_errorname'] == errorname
     assert err['sqlite_errorcode'] == errorcode
 
@@ -5551,13 +5555,85 @@ async def test_remediation_pass_cancellation_terminalises_row_as_failed(
 
     row = await _settled_remediation_row(journal)
     assert row.status == 'failed'
-    err = row.stage_reports['_error']
-    assert err['error_type'] == 'CancelledError'
-    assert err['failed_stage'] == 'task_knowledge_sync'
-    assert err['traceback']
-    assert err['sqlite_errorname'] is None
+    _assert_run_failure_record(
+        row.stage_reports['_error'],
+        error_type='CancelledError', failed_stage='task_knowledge_sync',
+        message='Remediation pass cancelled (shutdown, timeout or external cancellation)',
+        message_in_traceback=False, errorname=None, errorcode=None,
+    )
     assert 'memory_consolidator' in row.stage_reports
     assert row.id not in {r.id for r in await journal.get_running_runs()}
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_cancellation_records_traceback_and_sqlite_classification(
+    journal, event_buffer, mock_memory_service,
+):
+    """A cancelled full cycle records the same failure evidence as the
+    remediation pass, traceback and sqlite classification included."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await event_buffer.push(_make_event())
+    stage_entered = asyncio.Event()
+    harness.stages[0].run = _stalling_stage_run(stage_entered)
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    outer_task = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer_task, stage_entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == 'full'
+    assert row.status == 'failed'
+    _assert_run_failure_record(
+        row.stage_reports['_error'],
+        error_type='CancelledError', failed_stage='memory_consolidator',
+        message='Run cancelled (timeout or external cancellation)',
+        message_in_traceback=False, errorname=None, errorcode=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('drive', 'run_type'),
+    [
+        pytest.param(
+            lambda harness: harness.run_full_cycle('test-project', 'buffer_size:1'), 'full',
+            id='full_cycle',
+        ),
+        pytest.param(_remediation_pass_under_test, 'remediation', id='remediation_pass'),
+    ],
+)
+async def test_all_accounts_capped_deferral_records_traceback_and_sqlite_classification(
+    journal, event_buffer, mock_memory_service, drive, run_type,
+):
+    """An AllAccountsCapped deferral, in either driver, records the same
+    classified failure evidence as any other run-ending exception, plus its
+    ``deferred`` marker."""
+    from shared.cli_invoke import AllAccountsCappedException
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await event_buffer.push(_make_event())
+    harness.stages[0].run = _raising_stage_run(
+        lambda: AllAccountsCappedException(retries=3, elapsed_secs=1.0, label='stage'),
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await drive(harness)
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == run_type
+    assert row.status == 'failed'
+    err = row.stage_reports['_error']
+    assert err['deferred'] is True
+    _assert_run_failure_record(
+        err,
+        error_type='AllAccountsCappedException', failed_stage='memory_consolidator',
+        message='stage: all accounts capped after 3 retries (1.0s elapsed)',
+        errorname=None, errorcode=None,
+    )
 
 
 @pytest.mark.asyncio

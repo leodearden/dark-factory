@@ -3300,6 +3300,26 @@ class TestWatcherAllowedTools:
                 f'(task 3726); current list: {_WATCHER_DISALLOWED_TOOLS}'
             )
 
+    def test_task_search_is_granted(self) -> None:
+        """search_tasks must be allowed, and not disallowed.
+
+        SKILL.md's existence checks (dependency_discovered step 1 and the
+        workflow_slot_wedged disposition) call search_tasks, and an MCP tool
+        not named in --allowed-tools is permission-denied, so a refused
+        lookup would be read as 'no matching task' (task 10426).
+        """
+        tool = 'mcp__fused-memory__search_tasks'
+        assert tool in _WATCHER_ALLOWED_TOOLS, (
+            f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the existence checks '
+            "in SKILL.md can tell 'no matching task' from a refused call "
+            f'(task 10426); current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        assert tool not in _WATCHER_DISALLOWED_TOOLS, (
+            f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
+            'turn every existence check into a false "no matching task" '
+            f'(task 10426); current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
     def test_skill_tool_is_denied(self) -> None:
         """The bare 'Skill' tool is denied, and never pre-granted.
 
@@ -3475,6 +3495,7 @@ _READ_ONLY_GRANTED_MCP_TOOLS = frozenset({
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
+    'mcp__fused-memory__search_tasks',
 })
 _TIER1_BULLET = '- **Tier-1 admin actions ONLY.**'
 

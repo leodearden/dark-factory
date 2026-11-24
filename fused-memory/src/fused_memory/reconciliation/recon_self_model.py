@@ -635,7 +635,7 @@ def render_cycle_summary_section() -> str:
         'ledger row, so that case is decided under `## Carry-Forward '
         'Missing-Summary Findings` instead.\n\n'
         'The summary is deterministically findable by a metadata-keyed lookup — '
-        f"count_memories_by_metadata(project_id, {{'kind': '{CYCLE_SUMMARY_KIND}', "
+        f"count_memories_by_metadata(project_id=..., filters={{'kind': '{CYCLE_SUMMARY_KIND}', "
         "'run_id': <run_id>, 'stage': <stage_name>}) — which downstream stages "
         'use as a second verification path instead of relying on semantic search '
         'alone. The stage key in this lookup is REQUIRED: both Stage 1 and '

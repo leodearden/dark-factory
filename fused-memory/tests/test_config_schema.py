@@ -1482,6 +1482,59 @@ class TestConsolidationAutoConfig:
         assert cfg.max_auto_per_cycle == 0
         assert cfg.max_gate_filings_per_cycle == 0
 
+    # --- the adjudicator's leaves (plans/consolidation-adjudicator-prd.md K7) ---
+
+    def test_adjudicator_leaf_defaults(self):
+        cfg = ConsolidationAutoConfig()
+        assert cfg.max_adjudications_per_cycle == 6
+        assert cfg.adjudicator_model == 'gpt-6.1-sol'
+        assert cfg.adjudicator_reasoning_effort == 'low'
+        assert cfg.adjudicator_timeout_seconds == 60
+        assert cfg.adjudicator_field_chars == 4000
+        assert cfg.adjudicator_member_max == 8
+        assert cfg.outcome_retention_days == 90
+        assert cfg.memo_days == 30
+
+    def test_gate_filing_cap_survives_until_the_executor_stops_reading_it(self):
+        """K7 retires max_gate_filings_per_cycle together with the executor
+        code that reads it (task γ), not in the change that adds the new
+        leaves."""
+        assert 'max_gate_filings_per_cycle' in ConsolidationAutoConfig.model_fields
+
+    @pytest.mark.parametrize(
+        ('leaf', 'value'),
+        [
+            ('max_adjudications_per_cycle', -1),
+            ('adjudicator_timeout_seconds', 0),
+            ('adjudicator_field_chars', 0),
+            ('outcome_retention_days', 0),
+            ('memo_days', 0),
+            ('adjudicator_model', ''),
+            ('adjudicator_reasoning_effort', 'extreme'),
+        ],
+    )
+    def test_adjudicator_leaf_out_of_bounds_rejected(self, leaf, value):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(**{leaf: value})
+
+    def test_adjudicator_reasoning_effort_none_accepted_for_a_non_reasoning_model(self):
+        cfg = ConsolidationAutoConfig(adjudicator_reasoning_effort=None)
+        assert cfg.adjudicator_reasoning_effort is None
+
+    def test_zero_adjudications_per_cycle_accepted_as_an_off_switch(self):
+        assert ConsolidationAutoConfig(max_adjudications_per_cycle=0).max_adjudications_per_cycle == 0
+
+    def test_adjudicator_member_max_below_member_min_rejected_naming_both(self):
+        with pytest.raises(ValidationError) as excinfo:
+            ConsolidationAutoConfig(member_min=4, adjudicator_member_max=3)
+        message = str(excinfo.value)
+        assert 'member_min (4)' in message
+        assert 'adjudicator_member_max (3)' in message
+
+    def test_adjudicator_member_max_equal_to_member_min_accepted(self):
+        cfg = ConsolidationAutoConfig(member_min=3, adjudicator_member_max=3)
+        assert (cfg.member_min, cfg.adjudicator_member_max) == (3, 3)
+
     # --- wired onto FusedMemoryConfig as a top-level section ---
 
     def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):

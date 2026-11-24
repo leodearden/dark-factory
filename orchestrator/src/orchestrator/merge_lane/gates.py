@@ -399,7 +399,8 @@ class PlanFilesTouchedResult:
             entry is untouched is told by the fields below: a stale path
             (``missing_from_tree``) or a change a rebase dropped
             (``dropped_by_rebase``) is not under-delivery; an entry in
-            neither is.
+            neither class is unexplained by the gate, not proven
+            under-delivery.
         missing_from_tree: Declared entries that do NOT exist in the branch
             tree at ``branch_head`` and for which no rename resolved.
             ALWAYS a subset of ``not_touched`` (a stale entry is reported in
@@ -464,8 +465,9 @@ which is the human-judgement case the gate was built for)."""
 PLAN_FILES_NOT_TOUCHED_REASON_PREFIX = 'Plan files not touched by branch'
 """Prefix of the ``MergeOutcome.reason`` string emitted by the pre-merge
 Decision-1 check.  When the architect declared specific plan files but
-the branch's history (``base..HEAD``) doesn't touch them, the implementation
-hasn't actually delivered against the plan — short-circuit straight to L1
+the branch's own-work range (``base..HEAD``) does not touch them, the gate
+reports that as a measurement, not a verdict on why (see
+:func:`plan_files_not_touched_reason`) — short-circuit straight to L1
 without involving the steward (mutating plan.json to silence the gate
 would defeat its purpose)."""
 
@@ -500,7 +502,15 @@ def _unwritten_clause(entries: list[str]) -> str:
     return (
         f'The architect declared these files but no commit on the branch '
         f'touched them: {", ".join(entries)}.  '
-        f'Implementation has not delivered against the plan.  '
+        'That is what was measured; it does not establish why.  '
+        'Two common causes: the declared work is missing, or the file was '
+        'correctly declared and legitimately needed no change.  '
+        "To tell them apart, check whether each file relates textually to the "
+        "task's subject, whether the branch touched sibling files in the same "
+        'directory, whether the declared path still exists at branch HEAD, and '
+        "whether the branch's own commits are already ancestors of main "
+        '(git merge-base --is-ancestor <commit> main), meaning the work '
+        'already landed.  '
     )
 
 

@@ -172,6 +172,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
     LandingVerdict,
     file_unattributed_landing_escalation,
+    is_valid_sha_40,
     validate_landing_evidence,
     validate_reported_landing,
 )
@@ -7931,10 +7932,12 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation, in three parts. **Reachability**: ``commit`` must be
-        non-empty and reachable from main — ``git merge-base --is-ancestor``
-        returns false for both unknown SHAs and SHAs not on main, so that
-        single check covers both. **Attribution** (task 4704): reachability
+        Validation, in three parts. **Reachability**: ``commit`` must be a
+        full 40-character lowercase hex sha (``is_valid_sha_40``; anything
+        else is a malformed report and never reaches git) and reachable from
+        main, read through ``GitOps.is_ancestor_checked``. A git error there
+        is reported as reachability left unanswered, never as not-reachable.
+        **Attribution** (task 4704): reachability
         proves only that the commit EXISTS on main, so the report is
         corroborated against the task's own declared ``metadata.files`` /
         ``delivered_checks`` and the commit's effect must survive at main
@@ -7982,17 +7985,35 @@ class TaskWorkflow:
                 detail=json.dumps(report, indent=2)[:2000],
                 merge_phase=merge_phase,
             )
+        if not is_valid_sha_40(commit):
+            return await self._mark_blocked(
+                f'Architect wrote malformed already_done.json (commit '
+                f'{commit[:60]!r} is not a full 40-character lowercase hex '
+                f'commit sha)',
+                detail=json.dumps(report, indent=2)[:2000],
+                merge_phase=merge_phase,
+            )
 
         main_sha = await self.git_ops.get_main_sha()
-        on_main = await self.git_ops.is_ancestor(commit, main_sha)
+        on_main = await self.git_ops.is_ancestor_checked(commit, main_sha)
+        reachability_detail = (
+            f'commit: {commit}\nmain_sha: {main_sha}\nevidence: {evidence}'
+        )[:2000]
+        if on_main is None:
+            return await self._mark_blocked(
+                f'Architect reported task already done at {commit[:12]} '
+                f'but git could not answer whether that commit is reachable '
+                f'from main (merge-base --is-ancestor errored; usually the '
+                f'sha is not a commit in this repository, otherwise a git '
+                f'failure), so reachability was never established',
+                detail=reachability_detail,
+                merge_phase=merge_phase,
+            )
         if not on_main:
             return await self._mark_blocked(
                 f'Architect reported task already done at {commit[:12]} '
                 f'but commit is not reachable from main',
-                detail=(
-                    f'commit: {commit}\nmain_sha: {main_sha}\n'
-                    f'evidence: {evidence}'
-                )[:2000],
+                detail=reachability_detail,
                 merge_phase=merge_phase,
             )
 

@@ -15,7 +15,6 @@ from typing import Any
 
 import anyio
 import httpx
-from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.mcp_envelope import (  # noqa: F401 — re-exported for agents/memory_recall.py  # debt: task 7688
     tool_error_text,
     tool_text_blocks,
@@ -69,8 +68,6 @@ def apply_mcp_startup_env(
 # task venvs.  Skipping the implicit pre-run sync (--no-sync) and lockfile
 # re-resolution (--frozen) eliminates the resolve/build stall that caused the
 # 0-turn MCP-startup wedge under load (reify esc-4415-240, esc-4437-123).
-# This is the plan_tools analog of the jcodemunch "don't re-resolve/rebuild
-# per launch" durable fix.
 _PLAN_TOOLS_FAST_START_FLAGS: tuple[str, ...] = ('--no-sync', '--frozen')
 
 
@@ -729,7 +726,6 @@ class McpLifecycle:
                     'type': 'http',
                     'url': f'{self.config.url}/mcp',
                 },
-                'jcodemunch': jcodemunch_server_config(),
             },
         }
         if escalation_url:
