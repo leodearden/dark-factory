@@ -493,21 +493,30 @@ class TestRunInNewSessionWhileProgressing:
         ticks = tmp_path / 'ticks'
         env = dict(os.environ)
         env['TICKS'] = str(ticks)
+        readings: list[float] = []
 
-        started = time.monotonic()
+        def recorded_own_time(pid: int) -> Callable[[], float]:
+            clock = OwnTimeClock(pid)
+
+            def read() -> float:
+                readings.append(clock())
+                return readings[-1]
+
+            return read
+
         result = run_in_new_session_while_progressing(
             ['bash', '-c', 'for i in 1 2 3 4 5 6 7 8; do echo x >> "$TICKS"; sleep 0.5; done; echo DONE'],
             progress=_line_count(ticks), stall_timeout=3, env=env,
-            stall_clock=OwnTimeClock,
+            stall_clock=recorded_own_time,
         )
-        elapsed = time.monotonic() - started
 
         assert isinstance(result, subprocess.CompletedProcess)
         assert result.returncode == 0
         assert result.stdout == 'DONE\n'
-        assert elapsed >= 3, (
-            f'the run took {elapsed:.1f}s, inside its own 3s stall bound, so it '
-            'never needed the bound re-armed and proves nothing about progress.'
+        assert max(readings) >= 3, (
+            f'the child ran {max(readings):.1f}s of its own time, inside its own 3s '
+            'stall bound, so it never needed the bound re-armed and proves nothing '
+            'about progress.'
         )
 
     def test_a_stalled_child_is_stopped_with_its_whole_group(self, tmp_path: Path) -> None:
