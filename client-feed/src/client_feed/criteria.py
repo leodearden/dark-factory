@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Literal, TypeAlias
+from typing import Final, Literal, TypeAlias, TypeVar
 
 import yaml
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -29,13 +29,14 @@ from client_feed.contract import (
     _first_error,
 )
 from client_feed.envelope import Stamp, payload
-from client_feed.feed_io import FeedIoError, read_tail
+from client_feed.feed_io import FeedIoError, read_tail, write_atomically
 from client_feed.redact import redact_paths
 from client_feed.sources.archive import case_id, read_junit_cases
 from client_feed.sources.git import EntryKind, blob_reader, path_entry
 
 CRITERIA_RELPATH: Final = 'acceptance/criteria.yaml'
 COLLECTION_MAP_SUFFIX: Final = '.tests.json'
+STAGING_FILENAME: Final = 'criteria-staging.json'
 
 _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
 
@@ -128,8 +129,13 @@ CollectionMap: TypeAlias = Mapping[str, MapEntry]
 _COLLECTION_MAP: Final = TypeAdapter(dict[str, MapEntry])
 
 
-def read_collection_map(path: Path, *, name: str) -> CollectionMap | None:
-    """The collection map at `path`, never through a symlink; None when the run recorded none."""
+_Read = TypeVar('_Read')
+
+
+def _read_json(
+    path: Path, *, name: str, validate: Callable[[bytes], _Read], invalid: CriteriaProblem
+) -> _Read | None:
+    """The JSON file at `path` validated, read through one fd that refuses a symlink; None when there is no file."""
     try:
         tail = read_tail(path, offset=0)
     except (FeedIoError, OSError) as exc:
@@ -137,11 +143,16 @@ def read_collection_map(path: Path, *, name: str) -> CollectionMap | None:
     if tail is None:
         return None
     try:
-        return _COLLECTION_MAP.validate_json(tail.data)
+        return validate(tail.data)
     except ValidationError as exc:
-        raise CriteriaError(
-            problem=CriteriaProblem.INVALID_MAP, name=name, detail=_first_error(exc)
-        ) from exc
+        raise CriteriaError(problem=invalid, name=name, detail=_first_error(exc)) from exc
+
+
+def read_collection_map(path: Path, *, name: str) -> CollectionMap | None:
+    """The collection map at `path`, never through a symlink; None when the run recorded none."""
+    return _read_json(
+        path, name=name, validate=_COLLECTION_MAP.validate_json, invalid=CriteriaProblem.INVALID_MAP
+    )
 
 
 def _junit_address(nodeid: str) -> tuple[str, str]:
@@ -292,3 +303,18 @@ def results_event(
     if recorded is not None and payload(recorded) == said:
         return None
     return CriteriaResults(**stamp(run.run_at), **said)
+
+
+def write_staging(out_dir: Path, run: CriteriaRun) -> None:
+    """Replace out_dir's staging file by `run`, atomically and never through a symlink."""
+    write_atomically(out_dir, STAGING_FILENAME, run.model_dump_json())
+
+
+def read_staging(out_dir: Path) -> CriteriaRun | None:
+    """The staging run out_dir's staging file records; None when there is none."""
+    return _read_json(
+        out_dir / STAGING_FILENAME,
+        name=STAGING_FILENAME,
+        validate=CriteriaRun.model_validate_json,
+        invalid=CriteriaProblem.INVALID_STAGING,
+    )
