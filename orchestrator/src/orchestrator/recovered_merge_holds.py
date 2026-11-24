@@ -56,8 +56,8 @@ class HoldTasks(Protocol):
     def restore_hold(
         self, task_id: str, modules: list[str], /, *, reason: str,
     ) -> UncontestedAcquisition: ...
-    def release(self, task_id: str, /) -> None: ...
-    def is_dispatched(self, tid: str, /) -> bool: ...
+    def holds_restored(self, tid: str, /) -> bool: ...
+    def release_restored_hold(self, task_id: str, /) -> bool: ...
     async def flush_state_snapshot(self) -> None: ...
 
 
@@ -73,19 +73,18 @@ class RecoveredMergeHolds:
         self._restored: dict[str, str] = {}
 
     def holds(self, task_id: str, request_id: str) -> bool:
-        """True while *task_id*'s locks are this request's restored hold and no workflow was dispatched for it."""
+        """True while *task_id*'s locks are this request's restored hold, never again once it was dispatched."""
         return (
             self._restored.get(task_id) == request_id
-            and not self._tasks.is_dispatched(task_id)
+            and self._tasks.holds_restored(task_id)
         )
 
     def release(self, task_id: str, request_id: str) -> None:
-        """End this request's restored hold; a task dispatched since keeps its workflow's locks."""
+        """End this request's restored hold; a task dispatched since keeps whatever its workflows left."""
         if self._restored.get(task_id) != request_id:
             return
         del self._restored[task_id]
-        if not self._tasks.is_dispatched(task_id):
-            self._tasks.release(task_id)
+        self._tasks.release_restored_hold(task_id)
 
     async def restore(self, requests: Iterable[RestorableRequest]) -> None:
         """Re-take each in-progress task's journalled files for its unfinished request.

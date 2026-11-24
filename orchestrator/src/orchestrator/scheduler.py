@@ -1550,6 +1550,9 @@ class Scheduler:
         self._backfill_scan_cache: _BackfillScanCache | None = None
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
+        # Tasks whose locks are a hold restore_hold took and no dispatch has
+        # superseded since; _claim and release end the mark, so it never returns.
+        self._restored_holds: set[str] = set()
         # Task 2408 mechanism 2: attribute-injected by the Harness right
         # after it constructs its EscalationQueue (harness.py, mirroring the
         # review_checkpoint.escalation_queue injection one line above that
@@ -7535,6 +7538,7 @@ class Scheduler:
         if not self.lock_table.try_acquire(task_id, modules, admitted_parks=admitted_parks):
             return False
         self._dispatched.add(task_id)
+        self._restored_holds.discard(task_id)
         return True
 
     def _note_park_refusal(
@@ -8174,11 +8178,13 @@ class Scheduler:
         Unlike :meth:`acquire_uncontested` it writes no module cache (a partial
         set cached there would under-lock a later dispatch), status or park.
         Synchronous, so a caller's check and this acquire cannot interleave.
-        The caller is
+        The hold stays restored until a release of the task or a dispatch of
+        it ends that for good (:meth:`holds_restored`). The caller is
         ``orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds``.
         """
         result = self.lock_table.acquire_uncontested(task_id, modules)
         if result.acquired:
+            self._restored_holds.add(task_id)
             self._emit_lock_event(
                 EventType.lock_acquired,
                 task_id=task_id,
@@ -8186,6 +8192,17 @@ class Scheduler:
                 reason=reason,
             )
         return result
+
+    def holds_restored(self, tid: str) -> bool:
+        """True while *tid*'s locks are the hold :meth:`restore_hold` took; a dispatch ends it for good."""
+        return tid in self._restored_holds
+
+    def release_restored_hold(self, task_id: str) -> bool:
+        """End *task_id*'s restored hold through :meth:`release`; False, releasing nothing, once superseded."""
+        if task_id not in self._restored_holds:
+            return False
+        self.release(task_id)
+        return True
 
     def acquire_as_successor(
         self, task_id: str, modules: list[str], *, predecessor: str, priority: str,
@@ -8499,6 +8516,7 @@ class Scheduler:
         """
         self._dispatched.discard(task_id)
         self._dispatched_priority.pop(task_id, None)
+        self._restored_holds.discard(task_id)
         # Consume this task's pending transient-cooldown stamp (task 3317 /
         # PRD contract C3).  UNCONDITIONAL and ahead of the `requeued` branch:
         # the cap-exhaust path records a transient requeue and then releases

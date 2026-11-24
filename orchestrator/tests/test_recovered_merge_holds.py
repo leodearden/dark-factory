@@ -35,6 +35,7 @@ from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.module_charter import derive_modules
+from orchestrator.pin_reservation import PinOrder
 from orchestrator.recovered_merge_holds import LockRestoreReason
 from orchestrator.scheduler import Scheduler
 
@@ -320,3 +321,25 @@ class TestRestoredHoldEndsWithItsRequest:
         await drain_background_tasks(h)
         block_write.assert_not_awaited()
         assert _TID in _held(scheduler)
+
+    async def test_a_dispatch_supersedes_the_restored_hold_for_good(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, _store = _scene(tmp_path)
+        block_write = _stub_routing_writes(scheduler)
+        request = _request()
+        await recover_requests(h, request)
+        scheduler.get_tasks = AsyncMock(return_value=[make_task(_TID, 'high', _FILES)])
+        scheduler.finish_startup()
+        assignment = await scheduler.acquire_next()
+        assert assignment is not None
+        assert assignment.task_id == _TID
+        scheduler.note_workflow_cancelled(_TID)
+        scheduler.release(_TID)
+        scheduler.lock_table.install_parks(_TID, ['pin/mod'], PinOrder(1))
+
+        request.result.set_exception(RuntimeError('verify host lost'))
+        await drain_background_tasks(h)
+
+        block_write.assert_not_awaited()
+        assert _TID in scheduler.get_state_snapshot().pin_reservations
