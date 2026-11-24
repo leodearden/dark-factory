@@ -15,6 +15,7 @@ from client_feed.contract import (
     FeedError,
     FeedLine,
     FeedState,
+    FiledDefect,
     InFlightTask,
     RevealedFile,
     parse_feed_line,
@@ -237,6 +238,12 @@ def declared(seq: int, *criteria: tuple[str, str]) -> FeedLine:
     )
 
 
+def filed(seq: int, ref: str, block: int, report: int, task_id: int, gated: bool) -> FeedLine:
+    return line(
+        'defect_filed', seq, ref=ref, block=block, report=report, task_id=task_id, gated=gated
+    )
+
+
 def unknown(seq: int) -> FeedLine:
     return line('future_minor_event', seq, feed_version='1.1', payload={'n': seq})
 
@@ -278,6 +285,9 @@ def mixed_feed() -> list[FeedLine]:
         tree(32, OTHER_SHA),
         declared(33, ('C-2', 'Two'), ('C-1', 'Old')),
         declared(34, ('C-1', 'New'), ('C-3', 'Three')),
+        filed(35, 'portal:p:2:1', 2, 1, 6, False),
+        filed(36, 'portal:p:3:1', 3, 1, 8, True),
+        filed(37, 'portal:p:2:1', 2, 1, 6, True),
     ]
 
 
@@ -299,6 +309,7 @@ def empty_state(project_id: str = 'p') -> FeedState:
         revealed=(),
         criteria={},
         criteria_declared={},
+        defects_filed={},
         recent=(),
     )
 
@@ -452,6 +463,22 @@ def test_declared_criteria_are_keyed_by_id_and_the_last_declaration_wins() -> No
     assert state.criteria_declared == {criterion.id: criterion for criterion in last.criteria}
     cleared = fold([first, refused(2), last, declared(4)], project_id='p')
     assert cleared.criteria_declared == {}
+
+
+def test_a_defect_filing_is_keyed_by_ref_and_a_later_filing_of_the_ref_replaces_it() -> None:
+    first = filed(1, 'portal:p:3:1', 3, 1, 8, False)
+    state = fold([first], project_id='p')
+    assert state.defects_filed == {
+        'portal:p:3:1': FiledDefect(block=3, report=1, task_id=8, gated=False)
+    }
+    other, between = filed(2, 'portal:p:2:4', 2, 4, 9, False), refused(3)
+    again = filed(4, 'portal:p:3:1', 3, 1, 8, True)
+    state = fold([first, other, between, again], project_id='p')
+    assert list(state.defects_filed) == ['portal:p:2:4', 'portal:p:3:1']
+    assert state.defects_filed['portal:p:3:1'] == FiledDefect(
+        block=3, report=1, task_id=8, gated=True
+    )
+    assert state.recent == (other, between, again)
 
 
 def test_snapshots_keep_the_latest() -> None:

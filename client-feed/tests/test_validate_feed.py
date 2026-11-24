@@ -81,9 +81,10 @@ def test_every_fixture_line_parses() -> None:
     assert len(feed_lines(FEED_V1)) == len(feed_texts(FEED_V1)) == 31
 
 
-def test_the_fixture_carries_every_known_type_and_one_unknown() -> None:
+def test_the_fixture_carries_every_known_type_but_the_one_1_1_added_and_one_unknown() -> None:
     lines = feed_lines(FEED_V1)
-    assert {ln.type for ln in lines if not isinstance(ln, EventHeader)} == set(EVENT_MODELS)
+    known = {ln.type for ln in lines if not isinstance(ln, EventHeader)}
+    assert known == set(EVENT_MODELS) - {'defect_filed'}
     assert sum(isinstance(ln, EventHeader) for ln in lines) == 1
 
 
