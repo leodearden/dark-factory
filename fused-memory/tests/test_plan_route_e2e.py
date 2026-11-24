@@ -283,13 +283,6 @@ async def _parked(svc: MemoryService) -> dict | None:
     return counts if counts.get('parked', 0) >= 1 else None
 
 
-async def _parked_again(svc: MemoryService) -> dict | None:
-    """_parked, polled after a probe the gate refused inside the write. The read
-    queues behind the park on the queue's one connection, so it returns only
-    after the park's on_parked has read the clock."""
-    return await _parked(svc)
-
-
 async def _drained(svc: MemoryService) -> dict | None:
     counts = await _counts(svc)
     return counts if counts.get('completed', 0) >= 1 and not counts.get('parked') else None
@@ -362,7 +355,7 @@ class TestACappedPlanThroughMemoryService:
             )
             assert confirmed['id'] == page['id']
             assert _ONE_WRITE_WAITING in confirmed['detail'].splitlines()
-            await poll_until(lambda: _parked_again(svc), message='the failed probe did not re-park')
+            await poll_until(lambda: _parked(svc), message='the failed probe did not re-park')
             assert _parked_row(tmp_path)['next_retry_at'] == clock() + _interval(svc)
             assert _proxy_chats(endpoints) == 2
             assert len(_capped_records(root)) == 1
