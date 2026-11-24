@@ -233,16 +233,28 @@ class ParkedWriteEvent:
     exc: BaseException
 
 
+@dataclass(frozen=True)
+class ParkDecision:
+    """Why a failure parks its row, and when parked rows next re-probe.
+
+    ``retry_at`` is an epoch time; None keeps the queue's own horizon.
+    """
+
+    reason: str
+    retry_at: float | None = None
+
+
 class ParkPolicy(Protocol):
     """Names the failures that clear only when a human acts, so they PARK.
 
-    A parked row never dead-letters. It is re-probed every
+    A parked row never dead-letters. It is re-probed at the decision's
+    ``retry_at`` when the policy names one, else every
     ``retry_max_delay_seconds``, and a parked row that completes unparks
     every other. Both hooks run after the commit and outside the semaphore,
     and a raising hook is logged and swallowed, as ``on_dead_letter`` is.
     """
 
-    def park_reason(self, exc: BaseException) -> str | None: ...
+    def park_decision(self, exc: BaseException) -> ParkDecision | None: ...
 
     async def on_parked(self, event: ParkedWriteEvent) -> None: ...
 
@@ -560,11 +572,11 @@ class DurableWriteQueue:
                 terminal = ('completed', None)
                 landed_after_park = item.status == 'parked'
             except Exception as exc:
-                reason = self._park_reason(exc, executed=executed)
-                if reason is None:
+                decision = self._park_decision(exc, executed=executed)
+                if decision is None:
                     terminal = await self._handle_failure(item, exc, executed=executed)
                 else:
-                    parked = await self._park(item, exc, reason)
+                    parked = await self._park(item, exc, decision)
 
         if parked is not None:
             await self._notify_parked(parked)
@@ -815,8 +827,8 @@ class DurableWriteQueue:
             return (FailureClass.TRANSIENT, self._transient_max_attempts)
         return (FailureClass.NORMAL, item.max_attempts)
 
-    def _park_reason(self, exc: Exception, *, executed: bool) -> str | None:
-        """Why *exc* parks its item, or None to retry or dead-letter it.
+    def _park_decision(self, exc: Exception, *, executed: bool) -> ParkDecision | None:
+        """How *exc* parks its item, or None to retry or dead-letter it.
 
         A write that already LANDED never parks: a probe re-runs it, so an
         unbounded park would duplicate it every period, where the retry path
@@ -825,17 +837,27 @@ class DurableWriteQueue:
         if self._park_policy is None or executed or isinstance(exc, QueueDecodeError):
             return None
         try:
-            return self._park_policy.park_reason(exc)
+            return self._park_policy.park_decision(exc)
         except Exception:
-            logger.warning('park_policy.park_reason failed; not parking', exc_info=True)
+            logger.warning('park_policy.park_decision failed; not parking', exc_info=True)
             return None
 
-    async def _park(self, item: QueueItem, exc: Exception, reason: str) -> ParkedWriteEvent:
+    async def _park(
+        self, item: QueueItem, exc: Exception, decision: ParkDecision,
+    ) -> ParkedWriteEvent:
         """Park *item*, attempts unchanged, and re-arm every parked row to one
         horizon, so the queue probes about once per worker per period rather
-        than once per parked row."""
+        than once per parked row. The decision's ``retry_at``, never earlier
+        than now, is that horizon when set."""
+        reason = decision.reason
         error_msg = f'parked ({reason}): {type(exc).__name__}: {exc}'
-        horizon = time.time() + self._retry_max_delay_seconds
+        now = time.time()
+        if decision.retry_at is not None:
+            horizon = max(decision.retry_at, now)
+            horizon_source = "the park policy's probe time"
+        else:
+            horizon = now + self._retry_max_delay_seconds
+            horizon_source = 'retry_max_delay_seconds'
         async with self._require_access().write() as db:
             await db.execute(
                 "UPDATE write_queue SET status = 'parked', next_retry_at = ?, error = ? "
@@ -847,8 +869,8 @@ class DurableWriteQueue:
                 (horizon,),
             )
         logger.info(
-            'Item %d (%s, group_id=%s) parked, re-probe in %.1fs [%s]: %s',
-            item.id, item.operation, item.group_id, self._retry_max_delay_seconds,
+            'Item %d (%s, group_id=%s) parked, re-probe in %.1fs (%s) [%s]: %s',
+            item.id, item.operation, item.group_id, horizon - now, horizon_source,
             FailureClass.PARKED, error_msg,
         )
         return ParkedWriteEvent(

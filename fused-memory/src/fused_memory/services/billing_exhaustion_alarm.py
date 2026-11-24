@@ -37,7 +37,7 @@ from fused_memory.middleware._folded_escalation import (
     pending_folded_escalations,
     resolve_folded_escalations,
 )
-from fused_memory.services.durable_queue import ParkedWriteEvent
+from fused_memory.services.durable_queue import ParkDecision, ParkedWriteEvent
 from fused_memory.services.provider_billing import (
     BillingExhaustion,
     BillingSource,
@@ -305,11 +305,13 @@ class BillingParkPolicy:
     def __init__(self, alarm: BillingExhaustionAlarm) -> None:
         self._alarm = alarm
 
-    def park_reason(self, exc: BaseException) -> str | None:
+    def park_decision(self, exc: BaseException) -> ParkDecision | None:
         exhaustion = classify_billing_exhaustion(exc)
         if exhaustion is None:
             return None
-        return f'{exhaustion.provider} {exhaustion.source.value} exhausted ({exhaustion.code})'
+        return ParkDecision(
+            f'{exhaustion.provider} {exhaustion.source.value} exhausted ({exhaustion.code})',
+        )
 
     async def on_parked(self, event: ParkedWriteEvent) -> None:
         exhaustion = classify_billing_exhaustion(event.exc)
