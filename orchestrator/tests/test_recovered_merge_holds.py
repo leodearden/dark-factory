@@ -10,21 +10,24 @@ module: it reads harness privates, which the merge-lane ratchet
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from _landed_rows import record_landing
 from _orch_helpers import HermeticMcpSession
 from _park_test_helpers import make_task
 from _startup_harness import (
-    harness_with_real_merge_worker,
+    MERGE_WORKER_SHUTDOWN_OUTCOME,
+    drain_background_tasks,
     journal_merge_request,
     merge_lane_harness_factory,
+    recover_requests,
+    recovered_request,
+    start_real_merge_worker,
 )
 from escalation.queue import EscalationQueue
 
@@ -56,9 +59,11 @@ def _scheduler(config: OrchestratorConfig, store: EventStore, *, status: str) ->
     return scheduler
 
 
-def _scene(tmp_path: Path, *, status: str = 'in-progress') -> _Scene:
-    """Step 1c0a's harness over a real Scheduler."""
-    h = merge_lane_harness_factory(tmp_path)()
+def _scene(
+    tmp_path: Path, *, status: str = 'in-progress', real_steps: frozenset[str] = frozenset(),
+) -> _Scene:
+    """Step 1c0a's harness over a real Scheduler built from the harness's own config."""
+    h = merge_lane_harness_factory(tmp_path, real_steps=real_steps)()
     store = EventStore(tmp_path / 'runs.db', 'run-test')
     scheduler = _scheduler(h.config, store, status=status)
     h.scheduler = scheduler
@@ -66,14 +71,13 @@ def _scene(tmp_path: Path, *, status: str = 'in-progress') -> _Scene:
     return _Scene(h, scheduler, store)
 
 
-async def _scene_with_real_merge_worker(tmp_path: Path) -> _Scene:
+async def _scene_with_real_merge_worker(
+    tmp_path: Path, *, real_steps: frozenset[str] = frozenset(),
+) -> _Scene:
     """Step 1c0a's harness over a real Scheduler, holding a real merge worker."""
-    make = merge_lane_harness_factory(tmp_path)
-    store = EventStore(tmp_path / 'runs.db', 'run-test')
-    scheduler = _scheduler(make().config, store, status='in-progress')
-    h = await harness_with_real_merge_worker(make, scheduler)
-    h.event_store = store
-    return _Scene(h, scheduler, store)
+    scene = _scene(tmp_path, real_steps=real_steps)
+    await start_real_merge_worker(scene.harness, scene.scheduler)
+    return scene
 
 
 def _keys(h: Harness, files: list[str], task_id: str = _TID) -> tuple[str, ...]:
@@ -136,26 +140,8 @@ class TestRestoreAtStartup:
         assert _event_data(store, 'lock_acquired', _TID) == []
 
 
-def _fake_request(task_id: str = _TID, files: list[str] = _FILES) -> SimpleNamespace:
-    return SimpleNamespace(
-        task_id=task_id, request_id=f'mr-recovered-{task_id}',
-        branch=SimpleNamespace(bare_id=task_id), task_files=list(files),
-        result=asyncio.get_running_loop().create_future(),
-    )
-
-
-async def _recover(h: Harness, *requests: SimpleNamespace) -> dict:
-    report = {
-        'recovered': len(requests), 'dropped': 0, 'coalesced': 0,
-        'requests': list(requests), 'journal_corrupt': False,
-    }
-    with patch('orchestrator.harness.recover_pending_merges', AsyncMock(return_value=report)):
-        return await h._recover_pending_merges()
-
-
-async def _drain(h: Harness) -> None:
-    await asyncio.sleep(0)
-    await asyncio.gather(*h._background_tasks)
+def _request() -> SimpleNamespace:
+    return recovered_request(_TID, task_files=list(_FILES))
 
 
 def _stub_routing_writes(scheduler: Scheduler) -> AsyncMock:
@@ -207,7 +193,7 @@ class TestRestoreToleratesWhatItCannotTake:
     ) -> None:
         h, scheduler, store = _scene(tmp_path)
         _stub_routing_writes(scheduler)
-        request = _fake_request()
+        request = _request()
 
         def finalize_then_answer(ids=None):
             request.result.set_result(_VERIFY_RED)
@@ -215,11 +201,11 @@ class TestRestoreToleratesWhatItCannotTake:
 
         scheduler.get_statuses = AsyncMock(side_effect=finalize_then_answer)
 
-        await _recover(h, request)
+        await recover_requests(h, request)
 
         assert _TID not in _held(scheduler)
         assert _event_data(store, 'lock_acquired', _TID) == []
-        await _drain(h)
+        await drain_background_tasks(h)
 
     @pytest.mark.parametrize('failure', ['error_result', 'raises'])
     async def test_an_unreadable_task_store_restores_nothing_and_does_not_raise(
@@ -237,14 +223,6 @@ class TestRestoreToleratesWhatItCannotTake:
 
         assert [r.task_id for r in report['requests']] == [_TID]
         assert _held(scheduler) == {}
-
-
-# Spelled out: importing the lane's constant would make this file lane-importing.
-_WORKER_SHUTDOWN = SimpleNamespace(
-    status='blocked', reason='Merge worker shutting down',
-    block_category=SimpleNamespace(value='merge_error'),
-    failure_category=None, failure_cause_hint=None,
-)
 
 
 def _recording_hold(scheduler: Scheduler, seen: list) -> AsyncMock:
@@ -267,12 +245,12 @@ class TestRestoredHoldEndsWithItsRequest:
         scheduler.get_task = AsyncMock(return_value={'metadata': {}})
         held_at_done: list = []
         scheduler.mark_done = _recording_hold(scheduler, held_at_done)
-        request = _fake_request()
-        await _recover(h, request)
+        request = _request()
+        await recover_requests(h, request)
         keys = _keys(h, _FILES)
 
         request.result.set_result(SimpleNamespace(status='done', merge_sha=main_sha, reason=''))
-        await _drain(h)
+        await drain_background_tasks(h)
 
         scheduler.mark_done.assert_awaited_once_with(_TID, kind='merged', sha=main_sha)
         assert held_at_done == [keys]
@@ -288,11 +266,11 @@ class TestRestoredHoldEndsWithItsRequest:
         scheduler.get_status = AsyncMock(return_value='in-progress')
         held_at_block: list = []
         scheduler.clear_claim_then_set_status = _recording_hold(scheduler, held_at_block)
-        request = _fake_request()
-        await _recover(h, request)
+        request = _request()
+        await recover_requests(h, request)
 
         request.result.set_exception(RuntimeError('verify host lost'))
-        await _drain(h)
+        await drain_background_tasks(h)
 
         scheduler.clear_claim_then_set_status.assert_awaited_once_with(_TID, 'blocked')
         assert held_at_block == [_keys(h, _FILES)]
@@ -303,11 +281,11 @@ class TestRestoredHoldEndsWithItsRequest:
     async def test_an_operator_cancel_releases_the_files(self, tmp_path: Path) -> None:
         h, scheduler, _store = _scene(tmp_path)
         block_write = _stub_routing_writes(scheduler)
-        request = _fake_request()
-        await _recover(h, request)
+        request = _request()
+        await recover_requests(h, request)
 
         request.result.cancel()
-        await _drain(h)
+        await drain_background_tasks(h)
 
         assert _TID not in _held(scheduler)
         block_write.assert_not_awaited()
@@ -315,11 +293,11 @@ class TestRestoredHoldEndsWithItsRequest:
     async def test_a_worker_shutdown_outcome_keeps_the_hold(self, tmp_path: Path) -> None:
         h, scheduler, store = _scene(tmp_path)
         _stub_routing_writes(scheduler)
-        request = _fake_request()
-        await _recover(h, request)
+        request = _request()
+        await recover_requests(h, request)
 
-        request.result.set_result(_WORKER_SHUTDOWN)
-        await _drain(h)
+        request.result.set_result(MERGE_WORKER_SHUTDOWN_OUTCOME)
+        await drain_background_tasks(h)
 
         assert _held(scheduler)[_TID] == _keys(h, _FILES)
         assert _event_data(store, 'lock_released', _TID) == []
@@ -329,8 +307,8 @@ class TestRestoredHoldEndsWithItsRequest:
     ) -> None:
         h, scheduler, _store = _scene(tmp_path)
         block_write = _stub_routing_writes(scheduler)
-        request = _fake_request()
-        await _recover(h, request)
+        request = _request()
+        await recover_requests(h, request)
         scheduler.get_tasks = AsyncMock(return_value=[make_task(_TID, 'high', _FILES)])
         scheduler.finish_startup()
 
@@ -339,6 +317,6 @@ class TestRestoredHoldEndsWithItsRequest:
         assert assignment is not None
         assert assignment.task_id == _TID
         request.result.set_exception(RuntimeError('verify host lost'))
-        await _drain(h)
+        await drain_background_tasks(h)
         block_write.assert_not_awaited()
         assert _TID in _held(scheduler)

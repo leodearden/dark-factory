@@ -25,17 +25,19 @@ from _orch_helpers import (
     wire_scheduler_liveness_mock,
 )
 from _startup_harness import (
+    MERGE_WORKER_SHUTDOWN_OUTCOME,
+    drain_background_tasks,
     harness_with_real_merge_worker,
     journal_merge_request,
     merge_lane_harness_factory,
+    recover_requests,
+    recovered_request,
 )
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
 
 _TID = '40'
-# Spelled out: importing the lane's constant would make this file lane-importing.
-_LANE_SHUTDOWN_REASON = 'Merge worker shutting down'
 
 
 def _stale_claimed_row() -> dict:
@@ -140,38 +142,17 @@ class TestRecoveredRequestOwnsItsTask:
         assert len(_pending_writes(scheduler_double)) == (0 if recovered else 1)
 
 
-def _recovered_request() -> SimpleNamespace:
-    return SimpleNamespace(
-        task_id=_TID, request_id='mr-recovered', branch=SimpleNamespace(bare_id=_TID),
-        task_files=None, result=asyncio.get_running_loop().create_future(),
-    )
-
-
-async def _recover(h: Harness, request: SimpleNamespace) -> None:
-    report = {
-        'recovered': 1, 'dropped': 0, 'coalesced': 0, 'requests': [request],
-        'journal_corrupt': False,
-    }
-    with patch('orchestrator.harness.recover_pending_merges', AsyncMock(return_value=report)):
-        await h._recover_pending_merges()
-
-
-async def _drain(h: Harness) -> None:
-    await asyncio.sleep(0)
-    await asyncio.gather(*h._background_tasks)
-
-
 @pytest.mark.asyncio
 class TestRecoveredRequestOutcomeHasAnOwner:
     async def test_failed_recovered_request_blocks_the_task_with_an_l1(
         self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
     ) -> None:
         harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
-        request = _recovered_request()
-        await _recover(harness, request)
+        request = recovered_request(_TID)
+        await recover_requests(harness, request)
 
         request.result.set_exception(RuntimeError('verify host lost'))
-        await _drain(harness)
+        await drain_background_tasks(harness)
 
         scheduler_double.set_task_status.assert_any_await(_TID, 'blocked')
         assert _pending_writes(scheduler_double) == []
@@ -190,11 +171,11 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         assert outbox is not None
         main_sha = await harness.git_ops.get_main_sha()
         record_landing(outbox, _TID, advanced_sha=main_sha)
-        request = _recovered_request()
-        await _recover(harness, request)
+        request = recovered_request(_TID)
+        await recover_requests(harness, request)
 
         request.result.set_result(SimpleNamespace(status='done', merge_sha=main_sha, reason=''))
-        await _drain(harness)
+        await drain_background_tasks(harness)
 
         scheduler_double.mark_done.assert_awaited_once_with(_TID, kind='merged', sha=main_sha)
         assert outbox.lookup(_TID) is None
@@ -209,14 +190,14 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         worker = harness._merge_worker
         assert worker is not None
         worker.halt_for_wip('park of the main checkout failed')
-        request = _recovered_request()
-        await _recover(harness, request)
+        request = recovered_request(_TID)
+        await recover_requests(harness, request)
 
         request.result.set_result(SimpleNamespace(
             status='stash_failed', reason='park failed', dirty_files=['README.md'],
             recovery_branch=None, overlap_files=None, merge_sha=None,
         ))
-        await _drain(harness)
+        await drain_background_tasks(harness)
 
         assert harness._escalation_queue is not None
         [esc] = harness._escalation_queue.get_by_task(_TID, status='pending', level=1)
@@ -235,23 +216,19 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
     ) -> None:
         harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
-        first = _recovered_request()
-        await _recover(harness, first)
+        first = recovered_request(_TID)
+        await recover_requests(harness, first)
 
-        first.result.set_result(SimpleNamespace(
-            status='blocked', reason=_LANE_SHUTDOWN_REASON,
-            block_category=SimpleNamespace(value='merge_error'),
-            failure_category=None, failure_cause_hint=None,
-        ))
-        await _drain(harness)
+        first.result.set_result(MERGE_WORKER_SHUTDOWN_OUTCOME)
+        await drain_background_tasks(harness)
 
         assert _blocked_writes(scheduler_double) == []
         assert harness._escalation_queue.get_by_task(_TID, status='pending', level=1) == []
 
-        second = _recovered_request()
-        await _recover(harness, second)
+        second = recovered_request(_TID)
+        await recover_requests(harness, second)
         second.result.set_exception(RuntimeError('verify host lost'))
-        await _drain(harness)
+        await drain_background_tasks(harness)
 
         assert len(_blocked_writes(scheduler_double)) == 1
         [esc] = harness._escalation_queue.get_by_task(_TID, status='pending', level=1)
