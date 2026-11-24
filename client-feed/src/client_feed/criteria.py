@@ -26,6 +26,7 @@ from client_feed.contract import (
 )
 from client_feed.feed_io import FeedIoError, read_tail
 from client_feed.sources.archive import case_id, read_junit_cases
+from client_feed.sources.git import EntryKind, blob_reader, path_entry
 
 CRITERIA_RELPATH: Final = 'acceptance/criteria.yaml'
 COLLECTION_MAP_SUFFIX: Final = '.tests.json'
@@ -76,6 +77,26 @@ def parse_criteria(text: str, *, name: str) -> tuple[Criterion, ...]:
         return CriteriaFile.model_validate(document).criteria
     except ValidationError as exc:
         raise _invalid_criteria(name, _first_error(exc)) from exc
+
+
+def read_declared(root: Path, head: str) -> tuple[Criterion, ...]:
+    """The criteria acceptance/criteria.yaml declares at `head`, read from git objects, never the working tree; () when it holds none."""
+    entry = path_entry(root, head, CRITERIA_RELPATH)
+    if entry is None:
+        return ()
+    if entry.kind is not EntryKind.FILE:
+        raise CriteriaError(
+            problem=CriteriaProblem.NOT_A_FILE,
+            name=CRITERIA_RELPATH,
+            detail=f'the commit holds a {entry.kind} there, not a file',
+        )
+    with blob_reader(root) as read:
+        content = read(entry.object_sha)
+    try:
+        text = content.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise _invalid_criteria(CRITERIA_RELPATH, f'not UTF-8: {exc}') from exc
+    return parse_criteria(text, name=CRITERIA_RELPATH)
 
 
 def _unreadable(name: str, exc: FeedIoError | OSError) -> CriteriaError:
