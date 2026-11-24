@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import dataclasses
 import sqlite3
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
@@ -28,6 +27,7 @@ from fused_memory.services.queued_writes import QueueCallback, QueuedWrite
 _MAX_ATTEMPTS = 3
 _PROBE_AHEAD_SECONDS = 600.0
 _PROBE_BEHIND_SECONDS = 3600.0
+_CLOCK_START = 1_800_000_000.0
 
 
 class _Exhausted(Exception):
@@ -188,10 +188,11 @@ class TestParking:
 class TestTheProbeTimeAParkNames:
     @pytest.mark.asyncio
     async def test_a_named_probe_time_becomes_every_parked_rows_horizon(self, tmp_path):
-        probe_at = time.time() + _PROBE_AHEAD_SECONDS
+        clock = FakeClock(start=_CLOCK_START)
+        probe_at = clock() + _PROBE_AHEAD_SECONDS
         policy = _RecordingParkPolicy()
         execute = AsyncMock(side_effect=_Exhausted('capped'))
-        q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
+        q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
         await q.initialize()
         try:
             first = await q.enqueue(_write('first', group_id='proj1'))
@@ -210,17 +211,17 @@ class TestTheProbeTimeAParkNames:
 
     @pytest.mark.asyncio
     async def test_a_probe_time_in_the_past_is_clamped_to_now(self, tmp_path):
-        retry_ats = iter([time.time() - _PROBE_BEHIND_SECONDS])
+        clock = FakeClock(start=_CLOCK_START)
+        retry_ats = iter([clock() - _PROBE_BEHIND_SECONDS])
         horizons: list[float] = []
         policy = _RecordingParkPolicy(
-            retry_at=lambda: next(retry_ats, time.time() + _PROBE_AHEAD_SECONDS),
+            retry_at=lambda: next(retry_ats, clock() + _PROBE_AHEAD_SECONDS),
             observe=lambda event: horizons.append(_row(tmp_path, event.item_id)['next_retry_at']),
         )
         execute = AsyncMock(side_effect=_Exhausted('capped'))
-        q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
+        q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
         await q.initialize()
         try:
-            before = time.time()
             item_id = await q.enqueue(_write('clamped'))
             await poll_until(
                 lambda: execute.await_count >= 2,
@@ -228,7 +229,7 @@ class TestTheProbeTimeAParkNames:
             )
             await poll_until(lambda: len(horizons) >= 2)
 
-            assert before <= horizons[0] <= time.time()
+            assert horizons == [_CLOCK_START, _CLOCK_START + _PROBE_AHEAD_SECONDS]
             assert _row(tmp_path, item_id)['status'] == 'parked'
             assert _row(tmp_path, item_id)['attempts'] == 0
         finally:
@@ -238,7 +239,7 @@ class TestTheProbeTimeAParkNames:
 class TestTheQueuesClock:
     @pytest.mark.asyncio
     async def test_parking_and_landing_follow_the_injected_clock(self, tmp_path):
-        start = 1_800_000_000.0
+        start = _CLOCK_START
         clock = FakeClock(start=start)
         policy = _RecordingParkPolicy(retry_at=lambda: clock() + _PROBE_AHEAD_SECONDS)
         execute = AsyncMock(side_effect=[_Exhausted('capped'), None])
