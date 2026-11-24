@@ -7,6 +7,7 @@ module, and registered as such in ``shared/tests/test_pure_stdlib_leaves.py``.
 from __future__ import annotations
 
 import ast
+import enum
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -17,10 +18,15 @@ from shared.task_statuses import TaskStatus
 
 __all__ = [
     'MCP_TOOL_CALLERS',
+    'TESTED_DISPOSITIONS',
     'WRITE_TOOLS',
     'CensusKey',
+    'CensusRow',
     'CensusVerdict',
+    'Disposition',
+    'RowProblem',
     'WriteSite',
+    'census_row_problems',
     'judge_census',
     'missing_tests',
     'task_status_words_in',
@@ -183,3 +189,62 @@ def missing_tests(node_ids: Iterable[str], tests_root: Path) -> tuple[str, ...]:
         if not _defines_test(ast.parse(path.read_text(encoding='utf-8')), chain):
             missing.append(node_id)
     return tuple(missing)
+
+
+class Disposition(enum.StrEnum):
+    """What a write site writes, which decides what its census row must carry."""
+
+    CODE_WRITER = 'code_writer'
+    MODEL_PROSE = 'model_prose'
+    RELAY = 'relay'
+    METADATA_ONLY = 'metadata_only'
+    STORE_LAYER = 'store_layer'
+    RETIRING = 'retiring'
+
+
+#: Dispositions whose text this code writes or forwards, so a behaviour test must hold the site to C5.
+TESTED_DISPOSITIONS: frozenset[Disposition] = frozenset({Disposition.CODE_WRITER, Disposition.MODEL_PROSE})
+
+_NAMES_A_TASK = re.compile(r'\btask \d+\b')
+
+
+@dataclass(frozen=True)
+class CensusRow:
+    """One census entry: how many sites the key has, what they write, why, and the tests that hold them to C5."""
+
+    count: int
+    disposition: Disposition
+    reason: str
+    tests: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RowProblem:
+    """A census row that breaks a census rule."""
+
+    key: CensusKey
+    issue: str
+
+    def __str__(self) -> str:
+        return f'{self.key}: {self.issue}'
+
+
+def _row_issues(row: CensusRow, tests_root: Path) -> list[str]:
+    issues: list[str] = []
+    if row.disposition in TESTED_DISPOSITIONS:
+        if not row.tests:
+            issues.append(f'a {row.disposition} row names no test')
+        if missing := missing_tests(row.tests, tests_root):
+            issues.append(f'names tests that do not exist under {tests_root}: {list(missing)}')
+    if row.disposition is Disposition.RETIRING and not _NAMES_A_TASK.search(row.reason):
+        issues.append("a retiring row's reason names no retiring 'task N'")
+    return issues
+
+
+def census_row_problems(census: Mapping[CensusKey, CensusRow], tests_root: Path) -> tuple[RowProblem, ...]:
+    """Every rule a row breaks: a tested disposition names existing tests, and a retiring row names its retiring task."""
+    return tuple(
+        RowProblem(key, issue)
+        for key, row in census.items()
+        for issue in _row_issues(row, tests_root)
+    )

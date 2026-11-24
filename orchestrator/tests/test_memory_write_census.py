@@ -29,6 +29,7 @@ from shared.testing_code_writer_contract import (
     WRITE_TOOLS,
     CensusKey,
     CensusRow,
+    Disposition,
     WriteSite,
     census_row_problems,
     judge_census,
@@ -42,7 +43,25 @@ pytestmark = [
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
 ]
 
-CENSUS: dict[CensusKey, CensusRow] = {}
+_WRITERS = 'test_workflow_memory_writers.py'
+
+CENSUS: dict[CensusKey, CensusRow] = {
+    ('workflow.py', 'TaskWorkflow._write_completion_to_memory', 'add_memory'): CensusRow(
+        1, Disposition.CODE_WRITER, 'the completion record, carrying the registered completion_record_metadata',
+        tests=(f'{_WRITERS}::TestCompletionRecord::test_it_carries_the_registered_marker_and_names_no_status',),
+    ),
+    ('workflow.py', 'TaskWorkflow._write_decisions_to_memory', 'add_memory'): CensusRow(
+        1, Disposition.MODEL_PROSE, "forwards the architect's decisions, each declaring and naming its task",
+        tests=(
+            f'{_WRITERS}::TestDecisionNotes::test_each_note_declares_its_task_and_names_it',
+            f'{_WRITERS}::TestDecisionNotes::test_a_non_numeric_task_id_declares_nothing',
+        ),
+    ),
+    ('workflow.py', 'TaskWorkflow._write_suggestions_to_memory', 'add_memory'): CensusRow(
+        1, Disposition.MODEL_PROSE, "forwards reviewer suggestions as conventions; they have no subject task",
+        tests=(f'{_WRITERS}::TestSuggestionNotes::test_they_forward_the_reviewers_prose_and_declare_no_task',),
+    ),
+}
 
 
 def _write_sites_relative_to(root: Path) -> Callable[[ParsedModule], tuple[WriteSite, ...]]:
