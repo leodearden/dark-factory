@@ -915,7 +915,7 @@ class TestEffortVet:
 
         word, fields = verdict_tokens(line)
         assert word == 'launch-failed'
-        assert all(name in fields['detail'] for name in ('low', 'medium', 'high', 'claude-haiku-4-5', 'claude-proxy'))
+        assert all(name in fields['detail'] for name in ('low', 'medium', 'high', model, 'claude-proxy'))
         assert t3.tool_calls('t3_thread_launch') == []
         assert [call.get('search') for call in t3.tool_calls('orchestrator_capabilities')] == [model]
 

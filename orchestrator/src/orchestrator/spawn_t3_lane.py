@@ -554,6 +554,30 @@ def _provider_verdict(choice: spawn_t3_provider.ProviderChoice) -> str:
     return _verdict('instance', **named)
 
 
+def _unoffered_effort(
+    client: t3_mcp_client.T3McpClient, instance_id: str, model: str, effort: spawn_effort.EffortLevel
+) -> LaunchFailed | None:
+    """Why T3's catalogue rules *effort* out for *model*; None when it is offered, or T3 lists no answer.
+
+    ``t3_thread_launch`` validates no option, and at run time T3 swaps a
+    level the model does not offer for the model's default.
+    """
+    reply = client.call('orchestrator_capabilities', {'search': model}, read_timeout=CALL_TIMEOUT_SECS)
+    if not isinstance(reply, t3_mcp_client.ToolOk):
+        logger.warning(f'effort {effort} is unverified before launch: {_incomplete("orchestrator_capabilities", reply).detail}')
+        return None
+    offered = spawn_effort.offered_levels(reply.value, instance_id, model)
+    if offered is None:
+        logger.warning(f'effort {effort} is unverified before launch: T3 lists no effort for {model} on {instance_id}')
+        return None
+    if effort.value in offered:
+        return None
+    levels = ', '.join(spawn_effort.in_level_order(offered))
+    return LaunchFailed(
+        f'T3 offers effort {levels} for model {model} on instance {instance_id}, not {effort} (orchestrator_capabilities)'
+    )
+
+
 def launch(
     cwd: str,
     title: str,
@@ -567,6 +591,8 @@ def launch(
     effort: spawn_effort.EffortLevel | None = None,
     skip_permissions: bool,
 ) -> str:
+    if effort and not model:
+        return LaunchFailed('an effort needs a model: T3 takes options only inside modelSelection').verdict()
     client = _connect(env, t3_mcp_client.CliCodeSource())
     if isinstance(client, NoLauncher):
         return client.verdict()
@@ -576,6 +602,9 @@ def launch(
     choice = _provider_for(project, provider, env)
     if model and choice.enabled is False:
         return _provider_verdict(choice)
+    unoffered = _unoffered_effort(client, choice.instance_id, model, effort) if model and effort else None
+    if unoffered is not None:
+        return unoffered.verdict()
 
     _sweep_listed_threads(client, routine=False)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
