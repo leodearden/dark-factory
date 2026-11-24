@@ -48,6 +48,7 @@ from typing import Any, Concatenate, ParamSpec, TypeVar
 from fastmcp import FastMCP
 from shared.markup_override_param import accepts_markup_override
 from shared.mcp_markup_middleware import (
+    HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
 )
@@ -1539,14 +1540,18 @@ def _markup_fact_sink(
 
 def create_server(
     artifacts: TaskArtifacts, granted_tools: frozenset[str] | None = None,
+    caller_role: str | None = None,
 ) -> FastMCP:
     """Create the plan-tools MCP server.
 
     *granted_tools* ``None`` registers every tool. Otherwise only the granted
     names stay registered, so an ungranted tool neither lists nor dispatches;
     a granted name this server does not register raises ``ValueError``.
+
+    *caller_role* names the role this server serves on its markup records;
+    ``None`` leaves them attributed from each call's arguments alone.
     """
-    mcp, registered = _server_with_every_tool(artifacts)
+    mcp, registered = _server_with_every_tool(artifacts, caller_role)
     if granted_tools is not None:
         unknown = sorted(granted_tools - registered)
         if unknown:
@@ -1558,7 +1563,9 @@ def create_server(
     return mcp
 
 
-def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozenset[str]]:
+def _server_with_every_tool(
+    artifacts: TaskArtifacts, caller_role: str | None = None,
+) -> tuple[FastMCP, frozenset[str]]:
     mcp = FastMCP('plan-tools')
     registered: list[str] = []
 
@@ -1583,6 +1590,8 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
     #   orchestrator/mcp/plan_markup_stamp.py's docstring.
     # * The one journal both sinks share:
     #   orchestrator/src/orchestrator/mcp/markup_sink.py::make_escalation_sink.
+    # * The caller role, named by the launch because no tool here declares
+    #   one: shared/src/shared/mcp_markup_middleware.py::HostAttribution.
     journal = _markup_fact_journal(artifacts)
     mcp.add_middleware(
         MarkupGuardMiddleware(
@@ -1590,6 +1599,10 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
             exempt_tools=frozenset(),
             escalation_sink=_markup_escalation_sink(artifacts, journal),
             fact_sink=_markup_fact_sink(artifacts, journal),
+            host_attribution=(
+                None if caller_role is None
+                else lambda: HostAttribution(agent_role=caller_role)
+            ),
         )
     )
     mcp.add_middleware(MissingArgumentMiddleware())
@@ -2182,7 +2195,9 @@ def server_from_argv(argv: list[str] | None = None) -> FastMCP:
     plans/plan-deviation-recording-prd.md D14.
     """
     args = _cli_parser().parse_args(argv)
-    mcp, registered = _server_with_every_tool(_artifacts_from_namespace(args))
+    mcp, registered = _server_with_every_tool(
+        _artifacts_from_namespace(args), args.caller_role,
+    )
     granted: frozenset[str] = frozenset(args.grant or ())
     if not (args.grants_enforced or granted):
         logger.warning(
@@ -2232,6 +2247,13 @@ def _cli_parser() -> argparse.ArgumentParser:
         help=(
             'Expose only the --grant tools, so none when no grant is given. '
             'Every launcher from task 7717 on passes it.'
+        ),
+    )
+    parser.add_argument(
+        '--caller-role', default=None,
+        help=(
+            'Attribution only: the role this server serves, named on its '
+            'markup records. Optional, because older launchers pass none.'
         ),
     )
     return parser
