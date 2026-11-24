@@ -1,0 +1,18 @@
+{
+  "task_id": "10851",
+  "reason": "fresh dequeue offered the merger's newest undispatched build (review of task 10851)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1469,
+      "current": 1475
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5282,
+      "current": 5288
+    }
+  ]
+}

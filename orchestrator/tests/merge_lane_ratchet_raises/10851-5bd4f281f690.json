@@ -1,0 +1,30 @@
+{
+  "task_id": "10851",
+  "reason": "net-additive fix: a fresh dequeue stacks on the live frontier tip (on_dequeue live-tip arm and the merger loop passing the tip, trains excepted)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/speculation_controller.py",
+      "baseline": 28,
+      "current": 31
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1465,
+      "current": 1468
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_merger_loop",
+      "baseline": 79,
+      "current": 82
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5275,
+      "current": 5281
+    }
+  ]
+}
