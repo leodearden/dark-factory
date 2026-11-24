@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import itertools
 import os
 import re
 import signal
@@ -48,7 +49,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -184,8 +185,10 @@ _FOREIGN_HOLDER_KILL_WAIT_SECS = 5.0
 #: NOT pinned by a regex scan of the two modules, deliberately: the two
 #: CANCELLATION consumers (``test_cancelled_merge_verify_lease_leaves_the_lane_free``,
 #: ``test_cancelled_reset_leaves_the_lane_free_and_the_tree_untouched``) set
-#: deliberately LONGER waits inside the same ``with`` block so the cancellation
-#: lands mid-acquire, and never reach the contended raise or its settle at all.
+#: deliberately LONGER waits, which :func:`cancel_mid_acquire_and_settle` counts
+#: in polls inside its own ``with`` block, so the cancellation lands mid-acquire;
+#: they never reach the contended raise or its settle at all, and assert
+#: :func:`lane_is_free` once after the orphaned acquire settles.
 #: A scan cannot tell those apart from a raise-driving consumer, so it would be
 #: red on correct code.
 _SHORTENED_ACQUIRE_WAIT_SECS = 1.0
@@ -205,9 +208,9 @@ _CEILING_FRACTION = 0.6
 #: spawn-latency class (_FOREIGN_HOLDER_*_SECS): this retries a procfs read,
 #: which either succeeds within microseconds or is structurally broken (a
 #: deleted lock file, a host with no /proc/locks), so a longer bound only
-#: delays a certain failure rather than buying safety margin.  It must also
-#: stay well inside the 10.0s `wait_until` timeout at both B12 call sites, or
-#: a single poll iteration would consume the whole outer wait.
+#: delays a certain failure rather than buying safety margin.  Both B12 call
+#: sites assert :func:`lane_is_free` once, after the orphaned acquire settles,
+#: so this bound is the whole retry budget of their one read.
 _LANE_LOCK_STRICT_READ_SECS = 2.0
 
 
@@ -543,7 +546,8 @@ def lane_is_free(
 
     *strict_read_timeout* forwards to :func:`require_lane_lock_holders` and
     defaults to the full transient-absorber bound, which is what both B12 call
-    sites get.  It exists for the tests below that stage a DETERMINISTICALLY
+    sites get: each asserts this once, after its orphaned acquire settles.  It
+    exists for the tests below that stage a DETERMINISTICALLY
     unreadable read — a permanently-unlinked lock file, an injected reader that
     always raises — where the retry is guaranteed to exhaust and the absorber
     budget therefore buys nothing but ~2s of full-suite wall clock per case.
@@ -702,8 +706,8 @@ class TestRequireLaneLockHolders:
     def test_no_cost_on_the_happy_path(self):
         """A readable table on the FIRST read must cost exactly one read.
 
-        `lane_is_free` is called from inside a `wait_until` poll loop at both
-        B12 call sites, so anything this helper spends is paid once per poll.
+        `lane_is_free` is asserted once, after the orphaned acquire settles, at
+        both B12 call sites, and every call pays whatever this helper spends.
         Pinning that the strict read is free in the normal case is what keeps
         the fix from taxing every healthy run.
         """
@@ -1194,9 +1198,9 @@ class TestSettledLaneLockHolderRead:
 # B is the defect in its sharpest form and needs no mocks: os.stat fails so the
 # attribution read yields [], then the probe's O_CREAT mints a FRESH inode and
 # succeeds — so both halves answer about an inode that is NOT the one being
-# held.  Wrapped in `wait_until` at the two B12 call sites, one such poll
-# short-circuits the wait and the leak assertion passes green while the lane is
-# genuinely orphaned.
+# held.  The two B12 call sites assert `lane_is_free` once, after the orphaned
+# acquire settles, so one such read passes the leak assertion green while the
+# lane is genuinely orphaned.
 #
 # C does NOT change today's return value (the probe already catches it), which
 # is exactly why its case below asserts on a RAISE and not on `is False` — see
@@ -1220,8 +1224,8 @@ class TestLaneIsFreeNeverPassesOnAnUnknownRead:
         Measured today: this returns ``True``. ``os.stat`` fails on the
         unlinked path so the attribution read yields ``[]``, and the probe's
         ``O_CREAT`` then mints a fresh inode and acquires it happily. Both
-        halves pass vacuously, and the ``wait_until`` wrapper at the two B12
-        call sites short-circuits green on the first such poll — a leaked lane
+        halves pass vacuously, and the one-shot ``lane_is_free`` assert at the
+        two B12 call sites passes green on such a read — a leaked lane
         reported clean, strictly worse than the red task 3598 removed.
 
         The second assertion — that the lock file is still ABSENT afterwards —
@@ -2787,6 +2791,72 @@ class TestContendedRaiseSurvivesALossyHolderRead:
 _SENTINEL_FD = 4242
 
 
+def _poll_counted_clock(step: float = 0.1) -> Callable[[], float]:
+    """A ``monotonic`` that advances *step* per read, i.e. per bounded-wait poll."""
+    reads = itertools.count()
+    return lambda: next(reads) * step
+
+
+async def cancel_mid_acquire_and_settle(
+    lock_path: Path,
+    start: Callable[[], Coroutine[object, object, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> int | None:
+    """Stage a B12 cancellation and return what the orphaned acquire won.
+
+    *start* begins an operation that takes the lane lock through the real,
+    poll-counted acquire while a foreign process holds it.  It is cancelled
+    mid-acquire, the holder is released, and this returns only after the
+    orphaned acquire's completion has been handled on the loop, so its
+    release callback has already run.
+    """
+    from orchestrator import git_ops as git_ops_mod
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    won: dict[str, int | None] = {}
+    real = git_ops_mod.acquire_merge_verify_flock
+
+    def _watched(path: Path, wait_secs: float, **kw) -> int | None:
+        loop.call_soon_threadsafe(entered.set)
+        fd = real(path, wait_secs, monotonic=_poll_counted_clock(), **kw)
+        won['fd'] = fd
+        return fd
+
+    monkeypatch.setattr(git_ops_mod, 'acquire_merge_verify_flock', _watched)
+
+    with foreign_lane_lock_holder(lock_path):
+        task = asyncio.create_task(start())
+        entered_wait = asyncio.ensure_future(entered.wait())
+        done, _ = await asyncio.wait(
+            {task, entered_wait}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if entered_wait not in done:
+            entered_wait.cancel()
+            raised = None if task.cancelled() else task.exception()
+            pytest.fail(
+                f'the operation finished before ever entering its bounded-wait '
+                f'acquire, so cancelling it would prove nothing about a late '
+                f'win; raised={raised!r}'
+            )
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        orphans = other_pending_tasks()
+        assert len(orphans) == 1, (
+            f'the cancelled operation left no single acquire in flight, so '
+            f'there is no late win to settle; pending={orphans!r}'
+        )
+
+    await asyncio.gather(*orphans)
+    if 'fd' not in won:
+        pytest.fail(
+            'the orphaned acquire settled without returning — no handover '
+            'happened, so this would prove nothing about a late win'
+        )
+    return won['fd']
+
+
 @pytest.mark.asyncio
 class TestCancelledAcquireNeverOrphansTheLaneLock:
     """B12 — the shared acquire seam (`GitOps._acquire_lane_flock_off_thread`).
@@ -3114,8 +3184,7 @@ class TestCancelledResetNeverOrphansTheLaneLock:
 
         Returns ``(polling, outcome)``: *polling* is set the moment the acquire
         begins on its worker thread, and *outcome* collects ``fd`` (its return
-        value) and ``thread_id``.  Pass-through, not a stub — the lock handover
-        below has to be a genuine kernel acquisition or it proves nothing.
+        value) and ``thread_id``.  Pass-through, not a stub.
         """
         from orchestrator import git_ops as git_ops_mod
 
