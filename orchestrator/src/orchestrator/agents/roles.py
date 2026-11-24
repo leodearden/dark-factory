@@ -1,7 +1,9 @@
 """Agent role definitions — system prompts and tool configurations per stage."""
 
 import textwrap
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Literal
 
 from shared.followup_items import (
@@ -959,9 +961,8 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 """
 
 
-ARCHITECT = AgentRole(
-    name='architect',
-    system_prompt="""\
+def _architect_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
 """ + BASH_CAPABLE_ROLE_PREAMBLE + ARCHITECT_PLAN_TOOLS_RECIPE + """
 ## Rules
@@ -1044,7 +1045,12 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
-""" + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS, defect_test_rule)
+
+
+ARCHITECT = AgentRole(
+    name='architect',
+    system_prompt=_architect_system_prompt(DEFECT_TEST_RULE),
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -1058,9 +1064,8 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 IMPLEMENTER_DEVIATION_DOCTRINE = render_deviation_doctrine(_RECORD_STEP_DEVIATION)
 
 
-IMPLEMENTER = AgentRole(
-    name='implementer',
-    system_prompt="""\
+def _implementer_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Session Startup Protocol
@@ -1097,7 +1102,12 @@ The workflow for each step is:
 
 - Run tests frequently to verify your work.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""" + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS, defect_test_rule)
+
+
+IMPLEMENTER = AgentRole(
+    name='implementer',
+    system_prompt=_implementer_system_prompt(DEFECT_TEST_RULE),
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -1108,9 +1118,8 @@ The workflow for each step is:
 )
 
 
-DEBUGGER = AgentRole(
-    name='debugger',
-    system_prompt="""\
+def _debugger_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a debugger. You fix test, lint, and type-check failures.
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
@@ -1140,7 +1149,12 @@ git add -- .
 
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS, defect_test_rule)
+
+
+DEBUGGER = AgentRole(
+    name='debugger',
+    system_prompt=_debugger_system_prompt(DEFECT_TEST_RULE),
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -1812,9 +1826,9 @@ _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__set_task_status',
 ]
 
-STEWARD = AgentRole(
-    name='steward',
-    system_prompt="""\
+
+def _steward_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a task steward — an autonomous escalation handler with a persistent session.
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
@@ -2049,7 +2063,12 @@ convert it into a task candidate and then close it:
       ticket id (or the created/combined task id) so the same note is not swept
       again on a later session. An info-note that describes NO actionable work
       is left as-is — only work-describing notes become candidates.
-""" + ESCALATION_LADDER_CORE,
+""" + ESCALATION_LADDER_CORE, defect_test_rule)
+
+
+STEWARD = AgentRole(
+    name='steward',
+    system_prompt=_steward_system_prompt(DEFECT_TEST_RULE),
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,
@@ -2263,9 +2282,8 @@ dispatch.
 """
 
 
-SIMPLE_TASK = AgentRole(
-    name='simple_task',
-    system_prompt="""\
+def _simple_task_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a SIMPLE_TASK agent. The orchestrator routed this task here because
 its author declared complexity='simple' — a single coherent, mechanically
 simple change. A simple task may be high-priority and may span several
@@ -2280,7 +2298,12 @@ single explore-then-plan-then-implement session.
 git add path/to/file.py
 git add -- .
 ```
-""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS, defect_test_rule)
+
+
+SIMPLE_TASK = AgentRole(
+    name='simple_task',
+    system_prompt=_simple_task_system_prompt(DEFECT_TEST_RULE),
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
         *_ESCALATION_TOOLS,
@@ -2324,3 +2347,12 @@ ROLES = {
     'judge': JUDGE,
     'simple_task': SIMPLE_TASK,
 }
+
+# The roles that fix code, each mapped to its system prompt as a function of the defect-test rule (PRD decision 17); the sentinel guard drives it.
+FIXING_ROLE_PROMPT_BUILDERS: Mapping[str, Callable[[str], str]] = MappingProxyType({
+    ARCHITECT.name: _architect_system_prompt,
+    IMPLEMENTER.name: _implementer_system_prompt,
+    SIMPLE_TASK.name: _simple_task_system_prompt,
+    DEBUGGER.name: _debugger_system_prompt,
+    STEWARD.name: _steward_system_prompt,
+})
