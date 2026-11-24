@@ -712,10 +712,11 @@ def _json_object(text: str, *, line_no: int | None) -> dict[str, Any]:
     return value
 
 
-def _first_error(exc: ValidationError) -> str:
+def first_error(exc: ValidationError, *, whole: str) -> str:
+    """A validation failure's first error at its location, `whole` standing for the location of the value itself."""
     errors = exc.errors()
     first = errors[0]
-    location = '.'.join(str(part) for part in first['loc']) or '<record>'
+    location = '.'.join(str(part) for part in first['loc']) or whole
     more = f' (and {len(errors) - 1} more)' if len(errors) > 1 else ''
     return f'{location}: {first["msg"]}{more}'
 
@@ -726,7 +727,7 @@ def _validated(
     try:
         return validate(value)
     except ValidationError as exc:
-        raise ContractViolation(line_no=line_no, detail=_first_error(exc)) from exc
+        raise ContractViolation(line_no=line_no, detail=first_error(exc, whole='<record>')) from exc
 
 
 def _require_supported_major(header: EventHeader, *, line_no: int) -> None:

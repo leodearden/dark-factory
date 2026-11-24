@@ -1,17 +1,17 @@
-"""Acceptance criteria: the criteria file, the collection map, the junit join and the criteria events (PRD §7.7)."""
+"""Acceptance criteria: the criteria file, its join with junit reports through their collection maps, and the criteria events (PRD §7.7)."""
 
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Literal, TypeAlias, TypeVar
+from typing import Final, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from client_feed.contract import (
     CaseOutcome,
@@ -26,16 +26,21 @@ from client_feed.contract import (
     RunKind,
     UniqueCriteria,
     UtcTimestamp,
-    _first_error,
+    first_error,
 )
 from client_feed.envelope import Stamp, payload
 from client_feed.feed_io import FeedIoError, read_tail, write_atomically
 from client_feed.redact import redact_paths
-from client_feed.sources.archive import case_id, read_junit_cases
+from client_feed.sources.archive import read_junit_cases
+from client_feed.sources.collection_map import (
+    CollectionMap,
+    case_entries,
+    collection_map_path,
+    read_collection_map,
+)
 from client_feed.sources.git import EntryKind, blob_reader, path_entry
 
 CRITERIA_RELPATH: Final = 'acceptance/criteria.yaml'
-COLLECTION_MAP_SUFFIX: Final = '.tests.json'
 STAGING_FILENAME: Final = 'criteria-staging.json'
 
 _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
@@ -44,13 +49,13 @@ _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
 class CriteriaProblem(StrEnum):
     INVALID_CRITERIA = 'invalid_criteria'
     NOT_A_FILE = 'not_a_file'
-    INVALID_MAP = 'invalid_map'
     INVALID_STAGING = 'invalid_staging'
     UNREADABLE = 'unreadable'
+    UNWRITABLE = 'unwritable'
 
 
 class CriteriaError(Exception):
-    """A criteria file, collection map or staging file the criteria join refuses to read."""
+    """A criteria file or staging file the criteria join refuses to read, or a staging file it cannot write."""
 
     def __init__(self, *, problem: CriteriaProblem, name: str, detail: str) -> None:
         self.problem = problem
@@ -72,8 +77,12 @@ def _invalid_criteria(name: str, detail: str) -> CriteriaError:
     return CriteriaError(problem=CriteriaProblem.INVALID_CRITERIA, name=name, detail=detail)
 
 
-def parse_criteria(text: str, *, name: str) -> tuple[Criterion, ...]:
-    """The criteria a criteria file's text declares, in file order; `name` is the file named in a refusal."""
+def parse_criteria(content: bytes, *, name: str) -> tuple[Criterion, ...]:
+    """The criteria a criteria file's bytes declare, in file order; `name` is the file named in a refusal."""
+    try:
+        text = content.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise _invalid_criteria(name, f'not UTF-8: {exc}') from exc
     try:
         document = yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -83,7 +92,7 @@ def parse_criteria(text: str, *, name: str) -> tuple[Criterion, ...]:
     try:
         return CriteriaFile.model_validate(document).criteria
     except ValidationError as exc:
-        raise _invalid_criteria(name, _first_error(exc)) from exc
+        raise _invalid_criteria(name, first_error(exc, whole='<file>')) from exc
 
 
 def read_declared(root: Path, head: str) -> tuple[Criterion, ...]:
@@ -99,11 +108,7 @@ def read_declared(root: Path, head: str) -> tuple[Criterion, ...]:
         )
     with blob_reader(root) as read:
         content = read(entry.object_sha)
-    try:
-        text = content.decode('utf-8')
-    except UnicodeDecodeError as exc:
-        raise _invalid_criteria(CRITERIA_RELPATH, f'not UTF-8: {exc}') from exc
-    return parse_criteria(text, name=CRITERIA_RELPATH)
+    return parse_criteria(content, name=CRITERIA_RELPATH)
 
 
 def _unreadable(name: str, exc: FeedIoError | OSError) -> CriteriaError:
@@ -111,64 +116,11 @@ def _unreadable(name: str, exc: FeedIoError | OSError) -> CriteriaError:
     return CriteriaError(problem=CriteriaProblem.UNREADABLE, name=name, detail=detail)
 
 
-def collection_map_path(junit: Path) -> Path:
-    """The collection map the defect-tests plugin writes beside `junit`; client_feed's copy of orchestrator verify.py::collection_map_path, which it may not import."""
-    return junit.with_name(junit.name + COLLECTION_MAP_SUFFIX)
-
-
-class MapEntry(BaseModel):
-    """One collected test in the defect-tests collection map; `defects` is parsed here but read only by defect-tests ι."""
-
-    model_config = ConfigDict(frozen=True, extra='forbid')
-
-    defects: tuple[str, ...]
-    criterion: str | None
-
-
-CollectionMap: TypeAlias = Mapping[str, MapEntry]
-_COLLECTION_MAP: Final = TypeAdapter(dict[str, MapEntry])
-
-
-_Read = TypeVar('_Read')
-
-
-def _read_json(
-    path: Path, *, name: str, validate: Callable[[bytes], _Read], invalid: CriteriaProblem
-) -> _Read | None:
-    """The JSON file at `path` validated, read through one fd that refuses a symlink; None when there is no file."""
-    try:
-        tail = read_tail(path, offset=0)
-    except (FeedIoError, OSError) as exc:
-        raise _unreadable(name, exc) from exc
-    if tail is None:
-        return None
-    try:
-        return validate(tail.data)
-    except ValidationError as exc:
-        raise CriteriaError(problem=invalid, name=name, detail=_first_error(exc)) from exc
-
-
-def read_collection_map(path: Path, *, name: str) -> CollectionMap | None:
-    """The collection map at `path`, never through a symlink; None when the run recorded none."""
-    return _read_json(
-        path, name=name, validate=_COLLECTION_MAP.validate_json, invalid=CriteriaProblem.INVALID_MAP
-    )
-
-
-def _junit_address(nodeid: str) -> tuple[str, str]:
-    """The junit (classname, name) pytest records for `nodeid`; restates _pytest/junitxml.py::mangle_test_address."""
-    path, bracket, params = nodeid.partition('[')
-    names = path.split('::')
-    names[0] = names[0].replace('/', '.').removesuffix('.py')
-    names[-1] += bracket + params
-    return '.'.join(names[:-1]), names[-1]
-
-
 def criterion_bindings(collection_map: CollectionMap) -> dict[str, str]:
     """Each marked test's junit case id and the criterion it evidences."""
     return {
-        case_id(*_junit_address(nodeid)): entry.criterion
-        for nodeid, entry in collection_map.items()
+        test: entry.criterion
+        for test, entry in case_entries(collection_map)
         if entry.criterion is not None
     }
 
@@ -307,28 +259,39 @@ def results_event(
 
 def write_staging(out_dir: Path, run: CriteriaRun) -> None:
     """Replace out_dir's staging file by `run`, atomically and never through a symlink."""
-    write_atomically(out_dir, STAGING_FILENAME, run.model_dump_json())
+    try:
+        write_atomically(out_dir, STAGING_FILENAME, run.model_dump_json())
+    except OSError as exc:
+        raise CriteriaError(
+            problem=CriteriaProblem.UNWRITABLE,
+            name=STAGING_FILENAME,
+            detail=exc.strerror or type(exc).__name__,
+        ) from exc
 
 
 def read_staging(out_dir: Path) -> CriteriaRun | None:
-    """The staging run out_dir's staging file records; None when there is none."""
-    return _read_json(
-        out_dir / STAGING_FILENAME,
-        name=STAGING_FILENAME,
-        validate=CriteriaRun.model_validate_json,
-        invalid=CriteriaProblem.INVALID_STAGING,
-    )
-
-
-def _read_criteria_file(path: Path) -> str:
+    """The staging run out_dir's staging file records, never read through a symlink; None when there is none."""
     try:
-        return path.read_text(encoding='utf-8')
+        tail = read_tail(out_dir / STAGING_FILENAME, offset=0)
+    except (FeedIoError, OSError) as exc:
+        raise _unreadable(STAGING_FILENAME, exc) from exc
+    if tail is None:
+        return None
+    try:
+        return CriteriaRun.model_validate_json(tail.data)
+    except ValidationError as exc:
+        raise CriteriaError(
+            problem=CriteriaProblem.INVALID_STAGING,
+            name=STAGING_FILENAME,
+            detail=first_error(exc, whole='<file>'),
+        ) from exc
+
+
+def _read_criteria_file(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
     except OSError as exc:
         raise _unreadable(str(path), exc) from exc
-    except UnicodeDecodeError as exc:
-        raise CriteriaError(
-            problem=CriteriaProblem.UNREADABLE, name=str(path), detail=f'not UTF-8: {exc}'
-        ) from exc
 
 
 def staging_run(

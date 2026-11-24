@@ -53,13 +53,7 @@ from client_feed.contract import (
     WaitingOn,
     parse_state,
 )
-from client_feed.criteria import (
-    CRITERIA_RELPATH,
-    STAGING_FILENAME,
-    CriteriaRun,
-    collection_map_path,
-    write_staging,
-)
+from client_feed.criteria import CRITERIA_RELPATH, STAGING_FILENAME, CriteriaRun, write_staging
 from client_feed.feed_io import CURSOR_FILENAME, Cursor, OutDir, read_feed_lines
 from client_feed.fold import fold
 from client_feed.policy import Policy
@@ -70,6 +64,7 @@ from client_feed.publisher import (
     publish,
     run_pass,
 )
+from client_feed.sources.collection_map import collection_map_path
 from client_feed.validate import validate_out_dir
 
 PROJECT = 'acme'

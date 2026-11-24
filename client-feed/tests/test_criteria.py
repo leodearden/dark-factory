@@ -1,4 +1,4 @@
-"""Acceptance criteria: the criteria file, the collection map, the junit join and the criteria events (PRD §7.7)."""
+"""Acceptance criteria: the criteria file, the junit join through the collection map, and the criteria events (PRD §7.7)."""
 
 import json
 import os
@@ -30,13 +30,10 @@ from client_feed.criteria import (
     CriteriaError,
     CriteriaProblem,
     CriteriaRun,
-    MapEntry,
-    collection_map_path,
     criterion_bindings,
     declared_event,
     join_criteria,
     parse_criteria,
-    read_collection_map,
     read_declared,
     read_staging,
     results_event,
@@ -46,6 +43,12 @@ from client_feed.criteria import (
 from client_feed.envelope import Stamp
 from client_feed.feed_io import FeedIoError, FeedIoProblem
 from client_feed.fold import fold
+from client_feed.sources.collection_map import (
+    CollectionMapError,
+    MapEntry,
+    MapProblem,
+    collection_map_path,
+)
 
 EXEMPLAR = Path(__file__).parent / 'fixtures' / 'acceptance' / 'criteria.yaml'
 NAME = 'acceptance/criteria.yaml'
@@ -59,13 +62,13 @@ CRITERION: dict[str, Any] = {
 }
 
 
-def _criteria_text(**overrides: Any) -> str:
-    return yaml.safe_dump({'format': 1, 'criteria': [CRITERION], **overrides})
+def _criteria_text(**overrides: Any) -> bytes:
+    return yaml.safe_dump({'format': 1, 'criteria': [CRITERION], **overrides}).encode()
 
 
-def _refusal(text: str) -> CriteriaError:
+def _refusal(content: bytes) -> CriteriaError:
     with pytest.raises(CriteriaError) as caught:
-        parse_criteria(text, name=NAME)
+        parse_criteria(content, name=NAME)
     assert caught.value.problem is CriteriaProblem.INVALID_CRITERIA
     assert NAME in str(caught.value)
     return caught.value
@@ -75,7 +78,7 @@ def _refusal(text: str) -> CriteriaError:
 
 
 def test_the_exemplar_declares_its_criteria_in_file_order() -> None:
-    criteria = parse_criteria(EXEMPLAR.read_text(), name=NAME)
+    criteria = parse_criteria(EXEMPLAR.read_bytes(), name=NAME)
 
     assert all(isinstance(criterion, Criterion) for criterion in criteria)
     assert [criterion.id for criterion in criteria] == ['CF-1', 'CF-2']
@@ -91,16 +94,17 @@ def test_an_empty_declaration_parses_to_no_criteria() -> None:
 
 
 @pytest.mark.parametrize(
-    'text',
+    'content',
     [
         _criteria_text(format=2),
-        yaml.safe_dump({'criteria': [CRITERION]}),
+        yaml.safe_dump({'criteria': [CRITERION]}).encode(),
         _criteria_text(owner='leo'),
         _criteria_text(criteria=[{**CRITERION, 'id': 'C:12'}]),
         _criteria_text(criteria=[{**CRITERION, 'kind': 'maybe'}]),
         _criteria_text(criteria=[{**CRITERION, 'prd': '../x.md'}]),
-        yaml.safe_dump([CRITERION]),
-        '{format: 1, criteria: [',
+        yaml.safe_dump([CRITERION]).encode(),
+        b'{format: 1, criteria: [',
+        b'format: 1\ncriteria: []\n# \xff\xfe\n',
     ],
     ids=[
         'format-2',
@@ -111,10 +115,11 @@ def test_an_empty_declaration_parses_to_no_criteria() -> None:
         'escaping-prd',
         'not-a-mapping',
         'not-yaml',
+        'not-utf-8',
     ],
 )
-def test_an_invalid_criteria_file_is_refused_by_name(text: str) -> None:
-    _refusal(text)
+def test_an_invalid_criteria_file_is_refused_by_name(content: bytes) -> None:
+    _refusal(content)
 
 
 def test_a_duplicate_id_is_refused_naming_the_id() -> None:
@@ -125,107 +130,16 @@ def test_a_duplicate_id_is_refused_naming_the_id() -> None:
     assert 'C-1' in str(refusal)
 
 
-# the collection map
-
-MAP_NAME = 'r.xml.tests.json'
+# the criterion bindings
 
 
-def _write_map(tmp_path: Path, content: Any) -> Path:
-    path = tmp_path / MAP_NAME
-    path.write_text(json.dumps(content))
-    return path
-
-
-def _map_refusal(path: Path, problem: CriteriaProblem) -> CriteriaError:
-    with pytest.raises(CriteriaError) as caught:
-        read_collection_map(path, name=MAP_NAME)
-    assert caught.value.problem is problem
-    assert MAP_NAME in str(caught.value)
-    return caught.value
-
-
-@pytest.mark.parametrize(
-    ('junit', 'expected'),
-    [
-        (
-            Path('d/attempt-1.alpha.junit-20261001T100000_000000Z.xml.gz'),
-            Path('d/attempt-1.alpha.junit-20261001T100000_000000Z.xml.gz.tests.json'),
-        ),
-        (Path('r.xml'), Path('r.xml.tests.json')),
-    ],
-)
-def test_the_map_sits_beside_its_junit(junit: Path, expected: Path) -> None:
-    assert collection_map_path(junit) == expected
-
-
-def test_a_missing_map_is_not_recorded(tmp_path: Path) -> None:
-    assert read_collection_map(tmp_path / MAP_NAME, name=MAP_NAME) is None
-
-
-def test_an_empty_map_marks_nothing(tmp_path: Path) -> None:
-    collection_map = read_collection_map(_write_map(tmp_path, {}), name=MAP_NAME)
-
-    assert collection_map is not None
-    assert dict(collection_map) == {}
-    assert criterion_bindings(collection_map) == {}
-
-
-def test_bindings_are_keyed_by_the_junit_case_id(tmp_path: Path) -> None:
-    content = {
-        'tests/sub/test_shapes.py::test_plain': {'defects': [], 'criterion': 'C-1'},
-        'tests/sub/test_shapes.py::TestGroup::test_method': {'defects': [], 'criterion': 'C-2'},
-        'tests/sub/test_shapes.py::test_param[a::b]': {'defects': [], 'criterion': 'C-3'},
-        'tests/sub/test_shapes.py::test_param[x/y]': {'defects': ['df-1'], 'criterion': 'C-3'},
-        'tests/sub/test_shapes.py::test_unbound': {'defects': ['df-2'], 'criterion': None},
-    }
-    collection_map = read_collection_map(_write_map(tmp_path, content), name=MAP_NAME)
-    assert collection_map is not None
-
-    assert criterion_bindings(collection_map) == {
-        'tests.sub.test_shapes::test_plain': 'C-1',
-        'tests.sub.test_shapes.TestGroup::test_method': 'C-2',
-        'tests.sub.test_shapes::test_param[a::b]': 'C-3',
-        'tests.sub.test_shapes::test_param[x/y]': 'C-3',
+def test_only_a_marked_test_binds_and_it_binds_by_case_id() -> None:
+    collection_map = {
+        'tests/sub/test_shapes.py::TestGroup::test_method': MapEntry(defects=(), criterion='C-1'),
+        'tests/sub/test_shapes.py::test_unbound': MapEntry(defects=('df-1',), criterion=None),
     }
 
-
-def test_no_raw_path_is_ever_a_binding_key(tmp_path: Path) -> None:
-    content = {
-        'tests/sub/test_shapes.py::test_param[/home/u/secret/x]': {
-            'defects': [],
-            'criterion': 'C-1',
-        },
-    }
-    collection_map = read_collection_map(_write_map(tmp_path, content), name=MAP_NAME)
-    assert collection_map is not None
-
-    assert criterion_bindings(collection_map) == {'tests.sub.test_shapes::test_param[[path]]': 'C-1'}
-
-
-@pytest.mark.parametrize(
-    'text',
-    [
-        '{"tests/test_a.py::test_a": ',
-        '[]',
-        json.dumps({'tests/test_a.py::test_a': {'criterion': 'C-1'}}),
-        json.dumps({'tests/test_a.py::test_a': {'defects': [], 'criterion': 'C-1', 'kind': 'x'}}),
-        json.dumps({'tests/test_a.py::test_a': {'defects': [], 'criterion': 7}}),
-    ],
-    ids=['not-json', 'a-list', 'missing-defects', 'extra-key', 'numeric-criterion'],
-)
-def test_a_malformed_map_is_refused_by_name(tmp_path: Path, text: str) -> None:
-    path = tmp_path / MAP_NAME
-    path.write_text(text)
-
-    _map_refusal(path, CriteriaProblem.INVALID_MAP)
-
-
-def test_a_symlinked_map_is_refused_and_never_followed(tmp_path: Path) -> None:
-    target = tmp_path / 'elsewhere.json'
-    target.write_text(json.dumps({'tests/test_a.py::test_a': {'defects': [], 'criterion': 'C-1'}}))
-    (tmp_path / MAP_NAME).symlink_to(target)
-
-    _map_refusal(tmp_path / MAP_NAME, CriteriaProblem.UNREADABLE)
+    assert criterion_bindings(collection_map) == {'tests.sub.test_shapes.TestGroup::test_method': 'C-1'}
 
 
 # the join
@@ -449,10 +363,10 @@ def test_a_malformed_archived_map_is_refused_relative_to_the_root(tmp_path: Path
     junit = _archived_junit(tmp_path, junit_xml(passed('test_a')), minute=1, qualifiers='alpha')
     (tmp_path / collection_map_path(junit)).write_text('[]')
 
-    with pytest.raises(CriteriaError) as caught:
+    with pytest.raises(CollectionMapError) as caught:
         _verify(tmp_path, [junit])
 
-    assert caught.value.problem is CriteriaProblem.INVALID_MAP
+    assert caught.value.problem is MapProblem.INVALID_MAP
     assert str(collection_map_path(junit)) in str(caught.value)
     assert str(tmp_path) not in str(caught.value)
 
@@ -481,7 +395,7 @@ def test_the_declaration_is_read_from_the_heads_git_objects(repo: Repo) -> None:
     repo.write(NAME, EXEMPLAR.read_text())
     head = repo.commit('declare', when=COMMITTED_AT)
 
-    assert read_declared(repo.root, head) == parse_criteria(EXEMPLAR.read_text(), name=NAME)
+    assert read_declared(repo.root, head) == parse_criteria(EXEMPLAR.read_bytes(), name=NAME)
 
 
 def test_an_uncommitted_edit_is_not_seen(repo: Repo) -> None:
@@ -509,7 +423,7 @@ def test_a_committed_symlink_is_not_a_criteria_file(repo: Repo) -> None:
 
 @pytest.mark.parametrize(
     'content',
-    [_criteria_text(format=2).encode(), b'format: 1\ncriteria: []\n# \xff\xfe\n'],
+    [_criteria_text(format=2), b'format: 1\ncriteria: []\n# \xff\xfe\n'],
     ids=['invalid', 'not-utf-8'],
 )
 def test_committed_invalid_criteria_are_refused_by_name(repo: Repo, content: bytes) -> None:
@@ -692,6 +606,20 @@ def test_a_malformed_staging_file_is_refused_by_name(tmp_path: Path, text: str) 
     (tmp_path / STAGING_FILENAME).write_text(text)
 
     _staging_refusal(tmp_path, CriteriaProblem.INVALID_STAGING)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root writes into a read-only directory')
+def test_a_staging_file_that_cannot_be_written_is_refused_by_name(tmp_path: Path) -> None:
+    tmp_path.chmod(0o500)
+    try:
+        with pytest.raises(CriteriaError) as caught:
+            write_staging(tmp_path, RUN)
+    finally:
+        tmp_path.chmod(0o700)
+
+    assert caught.value.problem is CriteriaProblem.UNWRITABLE
+    assert STAGING_FILENAME in str(caught.value)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_a_symlinked_staging_file_is_neither_read_nor_replaced(tmp_path: Path) -> None:

@@ -15,9 +15,10 @@ from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 
 from client_feed.cli import main
 from client_feed.contract import CriteriaResults, CriterionOutcome, CriterionResult, RunKind
-from client_feed.criteria import STAGING_FILENAME, CriteriaRun, collection_map_path, read_staging
+from client_feed.criteria import STAGING_FILENAME, CriteriaRun, read_staging
 from client_feed.feed_io import OutDir, read_feed_lines
 from client_feed.publisher import run_pass
+from client_feed.sources.collection_map import collection_map_path
 from client_feed.validate import validate_out_dir
 
 CLIENT_FEED = Path(__file__).resolve().parents[1]
@@ -102,15 +103,33 @@ def test_a_missing_map_is_refused(
     _assert_refused(capsys, _staging_argv(junit, collection_map, out_dir), out_dir, 'unreadable')
 
 
+@pytest.mark.parametrize(
+    'content', [b'format: 2\ncriteria: []\n', b'format: 1\ncriteria: []\n# \xff\xfe\n'],
+    ids=['format-2', 'not-utf-8'],
+)
 def test_invalid_criteria_are_refused(
-    tmp_path: Path, out_dir: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, out_dir: Path, capsys: pytest.CaptureFixture[str], content: bytes
 ) -> None:
     junit, collection_map = _junit_and_map(tmp_path)
     criteria = tmp_path / 'criteria.yaml'
-    criteria.write_text('format: 2\ncriteria: []\n')
+    criteria.write_bytes(content)
     argv = _staging_argv(junit, collection_map, out_dir, **{'--criteria': str(criteria)})
 
     _assert_refused(capsys, argv, out_dir, 'invalid_criteria')
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root writes into a read-only directory')
+def test_an_out_dir_the_staging_file_cannot_be_written_into_is_refused(
+    tmp_path: Path, out_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    junit, collection_map = _junit_and_map(tmp_path)
+    out_dir.chmod(0o500)
+    try:
+        _assert_refused(
+            capsys, _staging_argv(junit, collection_map, out_dir), out_dir, 'unwritable'
+        )
+    finally:
+        out_dir.chmod(0o700)
 
 
 def test_a_malformed_junit_is_refused(
