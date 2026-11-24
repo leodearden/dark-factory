@@ -80,7 +80,7 @@ from orchestrator.verify_admission_record import (
 )
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import LegResult
-from orchestrator.verify_cache.recorder import CacheRecord, LegRun
+from orchestrator.verify_cache.recorder import CacheRecord, CacheReport, LegRun
 from orchestrator.verify_cache.registry import Candidate, Entry
 from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, plan_replay
 from orchestrator.verify_categories import (
@@ -5314,6 +5314,8 @@ class VerifyResult:
     # Task 5653: what this verdict leaves for the verify-result cache. Off-wire:
     # a runner's record is not shipped, and it never enters equality.
     cache_record: CacheRecord | None = remote_gate.off_wire_field(default=None, compare=False)
+    # The runner's report of its units for the dispatcher's recorder, on the wire (task 9123).
+    cache_report: CacheReport | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(

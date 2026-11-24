@@ -243,7 +243,7 @@ async def _runner_record(registry: Registry, *, refused_leg: bool = False) -> tu
     """A settled record as a runner leaves it: alpha's test ran clean, alpha's lint
     replayed a recorded green, and beta's test ran (timed out when *refused_leg*)."""
     keys_ = {unit_id: unit_key(unit_id) for unit_id in (_RAN, _REPLAYED, _REFUSED)}
-    replayed = (await record_entry(registry, keys_[_REPLAYED], evidence=5)).candidate
+    replayed = await record_entry(registry, keys_[_REPLAYED], evidence=5)
     replay = merge_replay({
         _RAN: unit_decision(Decision.MISS, key=keys_[_RAN]),
         _REPLAYED: unit_decision(Decision.HIT, replayed, key=keys_[_REPLAYED]),
@@ -270,26 +270,27 @@ class TestReportOf:
 
         units = _reported(report)
         assert set(units) == {_RAN, _REPLAYED, _REFUSED}
-        assert units[_RAN].key == keys_[_RAN]
-        assert units[_RAN].admission is not None and units[_RAN].admission.admitted
-        assert units[_RAN].entry is None
-        assert units[_REPLAYED].unit.outcome is UnitOutcome.CACHE_HIT
-        assert units[_REPLAYED].admission == Admission(False, 'a replay is not new evidence')
-        assert units[_REPLAYED].entry is not None and units[_REPLAYED].entry.evidence_event_id == 5
+        ran, replayed = units[_RAN], units[_REPLAYED]
+        assert ran.key == keys_[_RAN]
+        assert ran.admission is not None and ran.admission.admitted
+        assert ran.entry is None
+        assert replayed.unit.outcome is UnitOutcome.CACHE_HIT
+        assert replayed.admission == Admission(False, 'a replay is not new evidence')
+        assert replayed.entry is not None and replayed.entry.evidence_event_id == 5
         assert report.tree is not None and record.tree is not None
         assert (report.tree.unit, report.tree.key) == (record.tree.unit, record.tree.key)
 
     @pytest.mark.asyncio
     async def test_a_would_hit_unit_cites_the_green_it_would_have_replayed(self, registry):
         key = unit_key(_RAN)
-        candidate = (await record_entry(registry, key, evidence=6)).candidate
-        replay = merge_replay({_RAN: unit_decision(Decision.WOULD_HIT, candidate, key=key)}, modes=MERGE_LOG)
+        entry = await record_entry(registry, key, evidence=6)
+        replay = merge_replay({_RAN: unit_decision(Decision.WOULD_HIT, entry, key=key)}, modes=MERGE_LOG)
         _units, record = replay.settle((ran_unit(_RAN),), (LegRun(_RAN, clean_leg(Leg.TEST)),))
 
         reported = _reported(report_of(record, flake_suppressed=False))[_RAN]
 
         assert reported.unit.outcome is UnitOutcome.WOULD_HIT
-        assert reported.entry == candidate
+        assert reported.entry == entry.candidate
         assert reported.admission is not None and reported.admission.admitted
 
     @pytest.mark.asyncio

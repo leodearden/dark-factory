@@ -95,6 +95,7 @@ from orchestrator.verify import (
 from orchestrator.verify_cache.recorder import (
     CacheRecord,
     VerifyEvidenceRef,
+    cache_report_from_wire,
     consume_replayed,
     record_greens,
 )
@@ -490,8 +491,8 @@ def result_to_dict(vr: VerifyResult) -> dict:
     asymmetry is entirely on the READ side; see :func:`result_from_dict`.
 
     Off-wire fields (``remote_gate.wire_fields``) are left out, never walked: a
-    runner's cache record is shipped and recorded only after gamma2 (task 9123)
-    keys ``toolchain.runner``.
+    runner's ``cache_record`` stays on its host, and what it reports to the
+    dispatcher's recorder is the wire field ``cache_report`` (task 9123).
     """
     shipped = {f.name for f in wire_fields(VerifyResult)}
     off_wire = [f.name for f in dataclasses.fields(vr) if f.name not in shipped]
@@ -535,6 +536,9 @@ def result_from_dict(d: dict) -> VerifyResult:
         if raw is not None:
             # Shallow COPY — never mutate the caller's dict, which it may still inspect.
             d = {**d, 'flake_suppression': flake_ledger.flake_suppression_from_wire(raw)}
+        raw_report = d.get('cache_report')
+        if raw_report is not None:
+            d = {**d, 'cache_report': cache_report_from_wire(raw_report)}
     return VerifyResult(**d)
 
 

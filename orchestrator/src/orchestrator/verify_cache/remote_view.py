@@ -15,13 +15,13 @@ from orchestrator.config import VerifyCacheConfig
 from orchestrator.verify_cache.keys import TREE_UNIT_ID
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.registry import Candidate, KillSwitch, Registry, RegistryView
+from orchestrator.verify_cache.wire import optional_field, typed_field, wire_fields
 from orchestrator.verify_evidence import module_unit_ids
 from orchestrator.verify_spec_shared import VerifyCommand
 
 logger = logging.getLogger(__name__)
 
 _VIEW_FIELDS = frozenset({'mode', 'disabled_until', 'disabled_reason', 'candidates', 'truncated'})
-_CANDIDATE_FIELDS = frozenset({'unit_id', 'key', 'entry_id', 'evidence_event_id'})
 
 
 @dataclass(frozen=True)
@@ -51,30 +51,24 @@ class ShippedView:
             'mode': self.mode.value,
             'disabled_until': None if self.disabled_until is None else self.disabled_until.isoformat(),
             'disabled_reason': self.disabled_reason,
-            'candidates': [
-                {
-                    'unit_id': candidate.unit_id, 'key': candidate.key,
-                    'entry_id': candidate.entry_id, 'evidence_event_id': candidate.evidence_event_id,
-                }
-                for candidate in self.candidates
-            ],
+            'candidates': [candidate.to_wire() for candidate in self.candidates],
             'truncated': self.truncated,
         }
 
     @classmethod
     def from_wire(cls, raw: object) -> ShippedView:
         """The view *raw* encodes; TypeError or ValueError naming the field it breaks."""
-        fields = _exact_fields(raw, _VIEW_FIELDS, 'ShippedView')
-        disabled_until = _typed(fields, 'disabled_until', str, 'ShippedView', optional=True)
+        fields = wire_fields(raw, _VIEW_FIELDS, 'ShippedView')
+        disabled_until = optional_field(fields, 'disabled_until', str, 'ShippedView')
         return cls(
-            mode=_mode(_typed(fields, 'mode', str, 'ShippedView')),
+            mode=_mode(typed_field(fields, 'mode', str, 'ShippedView')),
             disabled_until=None if disabled_until is None else _aware(disabled_until),
-            disabled_reason=_typed(fields, 'disabled_reason', str, 'ShippedView', optional=True),
+            disabled_reason=optional_field(fields, 'disabled_reason', str, 'ShippedView'),
             candidates=tuple(
-                _candidate_from_wire(item, f'ShippedView.candidates[{index}]')
-                for index, item in enumerate(_typed(fields, 'candidates', list, 'ShippedView'))
+                Candidate.from_wire(item, where=f'ShippedView.candidates[{index}]')
+                for index, item in enumerate(typed_field(fields, 'candidates', list, 'ShippedView'))
             ),
-            truncated=_typed(fields, 'truncated', bool, 'ShippedView'),
+            truncated=typed_field(fields, 'truncated', bool, 'ShippedView'),
         )
 
 
@@ -138,35 +132,6 @@ def _at_depth(
 ) -> ShippedView:
     candidates = tuple(candidate for greens in by_unit.values() for candidate in greens[:depth])
     return ShippedView(mode, switch.disabled_until, switch.reason, candidates, truncated)
-
-
-def _candidate_from_wire(raw: object, where: str) -> Candidate:
-    fields = _exact_fields(raw, _CANDIDATE_FIELDS, where)
-    return Candidate(
-        unit_id=_typed(fields, 'unit_id', str, where),
-        key=_typed(fields, 'key', str, where),
-        entry_id=_typed(fields, 'entry_id', int, where),
-        evidence_event_id=_typed(fields, 'evidence_event_id', int, where),
-    )
-
-
-def _exact_fields(raw: object, expected: frozenset[str], where: str) -> Mapping[str, object]:
-    if not isinstance(raw, dict):
-        raise TypeError(f'{where} must be a JSON object, got {type(raw).__name__}')
-    if set(raw) != expected:
-        raise TypeError(
-            f'{where} keys: missing {sorted(expected - set(raw))}, unexpected {sorted(set(raw) - expected)}',
-        )
-    return raw
-
-
-def _typed(fields: Mapping[str, object], name: str, kind: type, where: str, *, optional: bool = False) -> Any:
-    value = fields[name]
-    if value is None and optional:
-        return None
-    if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
-        raise TypeError(f'{where}.{name} must be {kind.__name__}, got {type(value).__name__} {value!r}')
-    return value
 
 
 def _mode(value: str) -> CacheMode:

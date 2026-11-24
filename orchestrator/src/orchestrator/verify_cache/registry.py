@@ -18,6 +18,7 @@ from shared.project_layout import orchestrator_data_dir
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from orchestrator.verify_cache.keys import UnitKey
+from orchestrator.verify_cache.wire import typed_field, wire_fields
 from orchestrator.verify_evidence import UnitTier
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,26 @@ class Candidate:
     key: str
     entry_id: int
     evidence_event_id: int
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            'unit_id': self.unit_id, 'key': self.key,
+            'entry_id': self.entry_id, 'evidence_event_id': self.evidence_event_id,
+        }
+
+    @classmethod
+    def from_wire(cls, raw: object, *, where: str = 'Candidate') -> Candidate:
+        """The candidate *raw* encodes; TypeError naming the field it breaks."""
+        fields = wire_fields(raw, _CANDIDATE_FIELDS, where)
+        return cls(
+            unit_id=typed_field(fields, 'unit_id', str, where),
+            key=typed_field(fields, 'key', str, where),
+            entry_id=typed_field(fields, 'entry_id', int, where),
+            evidence_event_id=typed_field(fields, 'evidence_event_id', int, where),
+        )
+
+
+_CANDIDATE_FIELDS = frozenset({'unit_id', 'key', 'entry_id', 'evidence_event_id'})
 
 
 @dataclass(frozen=True)
