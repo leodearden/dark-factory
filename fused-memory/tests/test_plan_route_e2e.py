@@ -11,9 +11,9 @@ import contextlib
 import json
 import sqlite3
 import types
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -32,6 +32,7 @@ from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitE
 from graphiti_core.prompts.models import Message
 from pydantic import BaseModel
 from shared.project_layout import escalation_queue_dir
+from shared.testing_fake_clock import FakeClock
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_server_settings import FalkorServerSettings
@@ -169,12 +170,13 @@ class TestGraphitisLLMRidesThePlanRoute:
         assert endpoints.api_llm_requests() == []
 
 
-_PROBE_INTERVAL_SECONDS = 1.0
-_SETTLE_SECONDS = 20 * _PROBE_INTERVAL_SECONDS
+_CLOCK_START = datetime(2026, 11, 24, 12, 0, tzinfo=UTC).timestamp()
 _CAPPED = 'plan_route_capped'
 
+_GraphitiStandIn = Callable[[MemoryService], Awaitable[None]]
 
-async def _extract_on_the_plan_route(svc: MemoryService, *_args: Any, **_kwargs: Any) -> None:
+
+async def _extract_on_the_plan_route(svc: MemoryService) -> None:
     """Stands in for graphiti's add_episode: one extraction call on the plan route."""
     provider = svc.config.llm.providers.openai
     assert provider is not None and provider.api_url is not None
@@ -186,29 +188,39 @@ async def _extract_on_the_plan_route(svc: MemoryService, *_args: Any, **_kwargs:
         await http_client.aclose()
 
 
+async def _extract_off_the_plan_route(svc: MemoryService) -> None:
+    """Stands in for a plan call some site forgot to gate: the same proxy, no gated client."""
+    provider = svc.config.llm.providers.openai
+    assert provider is not None and provider.api_url is not None
+    async with openai.AsyncOpenAI(
+        base_url=provider.api_url, api_key='plan-key', max_retries=0,
+    ) as client:
+        await client.chat.completions.create(
+            model='mock-model', messages=[{'role': 'user', 'content': 'Alice knows Bob.'}],
+        )
+
+
 @asynccontextmanager
 async def _routed_service(
-    config: FusedMemoryConfig, tmp_path: Path, endpoints: _Endpoints,
+    config: FusedMemoryConfig, tmp_path: Path, endpoints: _Endpoints, *,
+    clock: FakeClock, graphiti_stand_in: _GraphitiStandIn,
 ) -> AsyncIterator[MemoryService]:
-    """A MemoryService over a real queue and journal whose graphiti rides the plan route."""
+    """A MemoryService over a real queue and journal on *clock*, whose graphiti
+    calls the plan proxy through *graphiti_stand_in*."""
     from fused_memory.services.write_journal import WriteJournal
 
     routed = endpoints.config()
     config.llm = routed.llm
     config.embedder = routed.embedder
-    config.plan_route = PlanRouteConfig(
-        proxy_url=endpoints.proxy.base_url, probe_interval_seconds=_PROBE_INTERVAL_SECONDS,
-    )
-    svc = mock_memory_backends(MemoryService(config))
+    config.plan_route = PlanRouteConfig(proxy_url=endpoints.proxy.base_url)
+    svc = mock_memory_backends(MemoryService(config, queue_clock=clock))
     graphiti_initialize = AsyncMock()
     svc.graphiti.initialize = graphiti_initialize
     svc.graphiti.list_graphs = AsyncMock(return_value=[])
     svc.graphiti.read_server_settings = AsyncMock(return_value=FalkorServerSettings(
         expected_graph_timeout_ms=30000, graph_timeout_ms=30000, appendonly='yes',
     ))
-    svc.graphiti.add_episode = lambda *args, **kwargs: _extract_on_the_plan_route(
-        svc, *args, **kwargs,
-    )
+    svc.graphiti.add_episode = lambda *_args, **_kwargs: graphiti_stand_in(svc)
     await svc.initialize()
     journal = WriteJournal(tmp_path / 'wj_plan_route')
     await journal.initialize()
@@ -223,6 +235,10 @@ async def _routed_service(
         await close_wrapped_sdk_clients([injected.kwargs.get('llm_client') if injected else None])
 
 
+def _interval(svc: MemoryService) -> float:
+    return svc.config.plan_route.probe_interval_seconds
+
+
 def _primary_root(svc: MemoryService) -> Path:
     root = configured_primary_root(svc.config.taskmaster)
     assert root, 'the test config must pin a primary project root'
@@ -234,10 +250,23 @@ def _capped_records(root: Path) -> list[dict]:
     return [r for r in records if r['category'] == _CAPPED]
 
 
+def _refreshed(root: Path, page: dict) -> list[dict] | None:
+    return [r for r in _capped_records(root) if r['dedupe_count'] > page['dedupe_count']] or None
+
+
 def _queue_rows(tmp_path: Path) -> list[dict]:
     with contextlib.closing(sqlite3.connect(tmp_path / 'queue' / 'write_queue.db')) as conn:
         conn.row_factory = sqlite3.Row
         return [dict(row) for row in conn.execute('SELECT * FROM write_queue')]
+
+
+def _parked_row(tmp_path: Path) -> dict:
+    [parked] = [row for row in _queue_rows(tmp_path) if row['status'] == 'parked']
+    return parked
+
+
+def _proxy_chats(endpoints: _Endpoints) -> int:
+    return len(endpoints.proxy.requests_to(_CHAT))
 
 
 async def _counts(svc: MemoryService) -> dict:
@@ -255,6 +284,19 @@ async def _drained(svc: MemoryService) -> dict | None:
     return counts if counts.get('completed', 0) >= 1 and not counts.get('parked') else None
 
 
+async def _recovered_and_drained(svc: MemoryService) -> bool:
+    state = (await svc.get_status())['plan_route']['state']
+    return state == 'ok' and await _drained(svc) is not None
+
+
+async def _add_a_graphiti_write(svc: MemoryService) -> None:
+    response = await svc.add_memory(
+        content='Leo decided the plan route parks capped writes',
+        category='decisions_and_rationale', project_id='main',
+    )
+    assert response.stores_queued == [SourceStore.graphiti]
+
+
 def _epoch(iso: str) -> float:
     return datetime.fromisoformat(iso).timestamp()
 
@@ -268,52 +310,89 @@ class TestACappedPlanThroughMemoryService:
         self, mock_config: FusedMemoryConfig, tmp_path: Path, endpoints: _Endpoints,
     ) -> None:
         endpoints.cap()
-        async with _routed_service(mock_config, tmp_path, endpoints) as svc:
-            response = await svc.add_memory(
-                content='Leo decided the plan route parks capped writes',
-                category='decisions_and_rationale', project_id='main',
-            )
+        clock = FakeClock(start=_CLOCK_START)
+        async with _routed_service(
+            mock_config, tmp_path, endpoints,
+            clock=clock, graphiti_stand_in=_extract_on_the_plan_route,
+        ) as svc:
+            await _add_a_graphiti_write(svc)
 
-            assert response.stores_queued == [SourceStore.graphiti]
-            await poll_until(lambda: _parked(svc), timeout=_SETTLE_SECONDS, message='nothing parked')
+            await poll_until(lambda: _parked(svc), message='nothing parked')
             assert endpoints.api_llm_requests() == []
 
             capped = (await svc.get_status())['plan_route']
             assert capped['state'] == 'capped'
-            assert capped['capped_since'] is not None
             assert capped['parked_items'] >= 1
-            [parked] = [row for row in _queue_rows(tmp_path) if row['status'] == 'parked']
-            assert parked['next_retry_at'] >= (
-                _epoch(capped['capped_since']) + _PROBE_INTERVAL_SECONDS - 0.01
-            )
+            parked = _parked_row(tmp_path)
+            assert parked['next_retry_at'] == _epoch(capped['capped_since']) + _interval(svc)
             assert parked['attempts'] == 0
             assert (await _counts(svc)).get('dead', 0) == 0
             assert svc.durable_queue is not None
             assert await svc.durable_queue.get_dead_items() == []
+            assert _proxy_chats(endpoints) == 1
 
             root = _primary_root(svc)
             [page] = await poll_until(
-                lambda: _capped_records(root) or None, timeout=_SETTLE_SECONDS,
-                message='no plan_route_capped page was filed',
+                lambda: _capped_records(root) or None, message='no plan_route_capped page was filed',
             )
             assert page['level'] == 2
             assert page['severity'] == 'blocking'
             assert capped['escalation_id'] == page['id']
 
-            filed_count = page['dedupe_count']
+            clock.advance(_interval(svc))
             [confirmed] = await poll_until(
-                lambda: [r for r in _capped_records(root) if r['dedupe_count'] > filed_count]
-                or None,
-                timeout=_SETTLE_SECONDS, message='a re-probe did not refresh the page',
+                lambda: _refreshed(root, page), message='a re-probe did not refresh the page',
             )
             assert confirmed['id'] == page['id']
+            assert _proxy_chats(endpoints) == 2
             assert len(_capped_records(root)) == 1
 
             endpoints.uncap()
-            await poll_until(
-                lambda: _drained(svc), timeout=_SETTLE_SECONDS, message='the parked write never drained',
-            )
+            clock.advance(_interval(svc))
+            await poll_until(lambda: _drained(svc), message='the parked write never drained')
+
             assert (await svc.get_status())['plan_route']['state'] == 'ok'
+            assert _proxy_chats(endpoints) == 3
+            assert [r['status'] for r in _capped_records(root)] == ['pending']
+            assert endpoints.api_llm_requests() == []
+
+    @pytest.mark.asyncio
+    async def test_an_ungated_cap_reprobes_once_per_period_and_clears_when_its_write_lands(
+        self, mock_config: FusedMemoryConfig, tmp_path: Path, endpoints: _Endpoints,
+    ) -> None:
+        endpoints.cap()
+        clock = FakeClock(start=_CLOCK_START)
+        async with _routed_service(
+            mock_config, tmp_path, endpoints,
+            clock=clock, graphiti_stand_in=_extract_off_the_plan_route,
+        ) as svc:
+            await _add_a_graphiti_write(svc)
+
+            await poll_until(lambda: _parked(svc), message='nothing parked')
+            root = _primary_root(svc)
+            [page] = await poll_until(
+                lambda: _capped_records(root) or None, message='no plan_route_capped page was filed',
+            )
+            assert page['level'] == 2
+            assert _parked_row(tmp_path)['next_retry_at'] == _CLOCK_START + _interval(svc)
+            assert (await svc.get_status())['plan_route']['state'] == 'capped'
+
+            clock.advance(_interval(svc))
+            await poll_until(
+                lambda: _refreshed(root, page), message='a due ungated cap did not refresh the page',
+            )
+
+            assert _parked_row(tmp_path)['next_retry_at'] == clock() + _interval(svc)
+            assert _proxy_chats(endpoints) == 2
+
+            endpoints.uncap()
+            clock.advance(_interval(svc))
+            await poll_until(
+                lambda: _recovered_and_drained(svc),
+                message='the landed write did not drain the queue and clear the route',
+            )
+
+            assert _proxy_chats(endpoints) == 3
             assert [r['status'] for r in _capped_records(root)] == ['pending']
             assert endpoints.api_llm_requests() == []
 
