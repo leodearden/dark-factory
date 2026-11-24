@@ -599,6 +599,7 @@ class TestRunArchitectEval:
                 token for name in sorted(ARCHITECT.plan_tools_grants)
                 for token in ('--grant', name)
             ],
+            '--caller-role', ARCHITECT.name,
         ]
 
 
