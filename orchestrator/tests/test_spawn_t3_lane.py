@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import ANY
+from urllib.parse import unquote
 
 import pytest
 from _fake_t3_server import (
@@ -250,6 +251,12 @@ def run_verb(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
     assert rc == 0, out
     assert out.count('\n') == 1, out
     return out.strip()
+
+
+def verdict_tokens(line: str) -> tuple[str, dict[str, str]]:
+    """A verdict line's status word and its decoded ``key=value`` tokens."""
+    word, *tokens = line.split()
+    return word, {key: unquote(value) for key, _, value in (token.partition('=') for token in tokens)}
 
 
 def spawn_record(env: Env, slug: str = 'unblock-df-7489-4242') -> str:
@@ -642,6 +649,52 @@ class TestLaunch:
 
         assert exited.value.code == 2
         assert t3.tool_calls('t3_thread_launch') == []
+
+    @pytest.mark.parametrize(
+        ('reply', 'got'),
+        [
+            (
+                ToolSuccess({
+                    **THREAD_LAUNCH_JSON,
+                    'modelSelection': {
+                        'instanceId': 'claude-proxy', 'model': 'fable', 'options': [{'id': 'effort', 'value': 'high'}],
+                    },
+                }),
+                'high',
+            ),
+            (ToolSuccess(THREAD_LAUNCH_JSON), 'none'),
+        ],
+        ids=['another-effort', 'no-options'],
+    )
+    def test_a_thread_launched_without_the_asked_effort_is_effort_unconfirmed_and_still_stamped(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        reply: ToolSuccess, got: str,
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        t3.tool_replies['t3_thread_launch'] = reply
+        record_dir = spawn_record(env)
+
+        line = launch_line(capsys, tmp_path, env.project, '--model', 'fable', '--effort', 'xhigh', record=record_dir)
+
+        word, fields = verdict_tokens(line)
+        assert (word, fields['thread_id'], fields['asked'], fields['got']) == (
+            'effort-unconfirmed', THREAD_ID, 'xhigh', got
+        )
+        record = session_records.read_record(Path(record_dir).name, root=env.fleet)
+        assert record.status == session_records.Status.RUNNING
+        assert record.display is not None and record.display.t3_thread_id == THREAD_ID
+
+    def test_a_thread_launched_with_the_asked_effort_is_started(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        t3.tool_replies['t3_thread_launch'] = echoing_launch()
+
+        line = launch_line(
+            capsys, tmp_path, env.project, '--model', 'fable', '--effort', 'xhigh', record=spawn_record(env)
+        )
+
+        assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
 
     def test_a_disabled_explicit_instance_is_refused_before_any_start(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
