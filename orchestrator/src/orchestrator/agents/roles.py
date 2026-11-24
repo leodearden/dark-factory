@@ -32,6 +32,7 @@ from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
+from orchestrator.agents.lane_task_guidance import LANE_TASK_LINKS_GUIDANCE
 from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
@@ -645,12 +646,11 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 # The opening of every "## CRITICAL: Git Staging Rules" section below, spliced
 # like SCOPE_BOUNDARY_GUIDANCE. Each role follows it with only its own code
 # block of correct staging commands.
-_TASK_DIR_NEVER_COMMITTED = """\
-`.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
-`.task/iterations.jsonl` links into durable task storage that survives
-worktree resets, plus the Claude config dir. Those links are the only task
-state exposed here: `metadata.json` and the `reviews/` and `verdicts/`
-directories stay in orchestrator storage outside this worktree, so a read of
+_TASK_DIR_NEVER_COMMITTED = LANE_TASK_LINKS_GUIDANCE + """
+`.task/` inside this worktree is orchestrator state: those two links, plus the
+Claude config dir. Those links are the only task state exposed here:
+`metadata.json` and the `reviews/` and `verdicts/` directories stay in
+orchestrator storage outside this worktree, so a read of
 them under `.task/` fails by design — the task details you need are in your
 briefing. `.task/` must NEVER be committed. It is gitignored at the repo root,
 so an ordinary staging command already excludes it — no exclusion pathspec is
@@ -1016,7 +1016,10 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
-""" + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+
+## The .task/ links
+
+""" + LANE_TASK_LINKS_GUIDANCE + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
