@@ -255,7 +255,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_event_queue.py': 16,
     'fused-memory/tests/test_harness.py': 16,
     'fused-memory/tests/arm_harness/test_usage_tap.py': 12,
-    'fused-memory/tests/test_event_loop_lag.py': 12,
+    'fused-memory/tests/test_event_loop_lag.py': 11,
     'fused-memory/tests/test_ticket_worker.py': 11,
     'fused-memory/tests/test_sqlite_watchdog.py': 10,
     'fused-memory/tests/test_billing_exhaustion_e2e.py': 10,
