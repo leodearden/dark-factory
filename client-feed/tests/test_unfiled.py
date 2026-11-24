@@ -4,7 +4,6 @@ from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from client_feed.unfiled import still_unfiled, unfiled_degradation
 
 from client_feed.contract import (
     DefectReported,
@@ -18,6 +17,7 @@ from client_feed.contract import (
     Source,
 )
 from client_feed.defect_ref import portal_ref
+from client_feed.unfiled import still_unfiled, unfiled_degradation
 
 PROJECT = 'acme'
 EPOCH = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)

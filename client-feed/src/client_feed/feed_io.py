@@ -28,6 +28,7 @@ from client_feed.contract import (
     FeedState,
     NonNegativeInt,
     UnsupportedFeedVersion,
+    UtcTimestamp,
     feed_major,
     parse_feed_line,
     parse_state,
@@ -65,6 +66,8 @@ class Cursor(BaseModel):
     line_counts: LineCounts | None = None
     reveals_head: CommitSha | None = None
     added_line_counts: AddedLineCounts | None = None
+    defect_scan_offset: NonNegativeInt = 0
+    pending_reports: dict[str, UtcTimestamp] = {}
 
 
 class FeedIoProblem(StrEnum):
