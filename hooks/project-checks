@@ -246,6 +246,10 @@ fi
 # the whole process group of every unit it has not yet collected, orphaned
 # descendants included even once the unit's own shell has exited, and ignores
 # further INT, TERM and HUP while it does. The unit logs go on any exit.
+# No command substitution runs while those traps are armed: bash drops a
+# trapped SIGINT that lands while it reaps one whose child then exits normally
+# (tests/scripts/test_project_checks_merge_gate_parity.py::test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_launched_unit),
+# so every unit's log is named by its index in one directory made beforehand.
 GATE_SLOTS=4
 gate_start=$SECONDS
 staged="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --no-renames --name-only --diff-filter=ACMRD)" || {
@@ -264,7 +268,6 @@ if [ -z "$listing" ]; then
 else
     gate_units=()
     gate_commands=()
-    gate_logs=()
     gate_pids=()
     gate_collected=0
     gate_failed=false
@@ -282,7 +285,7 @@ else
             echo "  ok ${gate_units[$i]}"
         else
             echo "pre-commit: ${gate_units[$i]} FAILED (rc=$unit_rc): ${gate_commands[$i]}"
-            tail -n 60 "${gate_logs[$i]}"
+            tail -n 60 "$gate_log_dir/$i.log"
             gate_failed=true
         fi
     }
@@ -291,7 +294,8 @@ else
         gate_stop_units
         exit "$1"
     }
-    trap 'rm -f "${gate_logs[@]}"' EXIT
+    gate_log_dir="$(mktemp -d)"
+    trap 'rm -rf "$gate_log_dir"' EXIT
     trap 'gate_interrupted 130' INT
     trap 'gate_interrupted 143' TERM
     trap 'gate_interrupted 129' HUP
@@ -299,13 +303,12 @@ else
         if [ "$((${#gate_pids[@]} - gate_collected))" -ge "$GATE_SLOTS" ]; then
             gate_collect_next
         fi
-        log="$(mktemp)"
+        log="$gate_log_dir/${#gate_pids[@]}.log"
         echo "  running $unit: $command"
         (cd "$ROOT" && exec setsid -w bash -c "$command") < /dev/null > "$log" 2>&1 &
         gate_pids+=("$!")
         gate_units+=("$unit")
         gate_commands+=("$command")
-        gate_logs+=("$log")
     done <<< "$listing"
     while [ "$gate_collected" -lt "${#gate_pids[@]}" ]; do
         gate_collect_next
