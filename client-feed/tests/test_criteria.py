@@ -13,10 +13,15 @@ from _git_repo import Repo, make_repo
 from client_feed.contract import (
     CaseOutcome,
     CaseResult,
+    CriteriaDeclared,
+    CriteriaResults,
     Criterion,
     CriterionKind,
     CriterionOutcome,
     CriterionResult,
+    FeedEvent,
+    FeedState,
+    RunKind,
 )
 from client_feed.criteria import (
     BoundReport,
@@ -26,12 +31,16 @@ from client_feed.criteria import (
     MapEntry,
     collection_map_path,
     criterion_bindings,
+    declared_event,
     join_criteria,
     parse_criteria,
     read_collection_map,
     read_declared,
+    results_event,
     verify_criteria,
 )
+from client_feed.envelope import Stamp
+from client_feed.fold import fold
 
 EXEMPLAR = Path(__file__).parent / 'fixtures' / 'acceptance' / 'criteria.yaml'
 NAME = 'acceptance/criteria.yaml'
@@ -503,3 +512,128 @@ def test_committed_invalid_criteria_are_refused_by_name(repo: Repo, content: byt
     head = repo.commit('invalid', when=COMMITTED_AT)
 
     _declared_refusal(repo, head, CriteriaProblem.INVALID_CRITERIA)
+
+
+# the criteria events
+
+PROJECT = 'acme'
+NOW = datetime(2026, 10, 1, 11, 0, tzinfo=UTC)
+RESULTS = (
+    CriterionResult(id='C-1', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_a',)),
+    CriterionResult(id='C-2', outcome=CriterionOutcome.NOT_RUN, tests=()),
+)
+RUN = CriteriaRun(commit=SHA, run_at=RUN_AT, results=RESULTS)
+
+
+def _state(*events: FeedEvent) -> FeedState:
+    return fold(events, project_id=PROJECT)
+
+
+def _stamp(first_seq: int = 10) -> Stamp:
+    return Stamp(project_id=PROJECT, first_seq=first_seq)
+
+
+def _declaration(criteria: tuple[Criterion, ...]) -> CriteriaDeclared:
+    return CriteriaDeclared(**_stamp(1)(COMMITTED_AT), criteria=criteria)
+
+
+def _recorded(kind: RunKind, run: CriteriaRun) -> CriteriaResults:
+    return CriteriaResults(**_stamp(2)(run.run_at), run_kind=kind, **dict(run))
+
+
+def test_a_first_declaration_is_emitted_at_now() -> None:
+    event = declared_event(DECLARED, state=_state(), stamp=_stamp(), now=NOW)
+
+    assert event == CriteriaDeclared(**_stamp()(NOW), criteria=DECLARED)
+
+
+def test_a_declaration_is_emitted_with_its_paths_redacted() -> None:
+    leaky = Criterion.model_validate(
+        {
+            **CRITERION,
+            'statement': 'Read from /home/leo/x every pass.',
+            'capability': 'Ledger at /srv/data/ledger',
+        }
+    )
+
+    event = declared_event((leaky,), state=_state(), stamp=_stamp(), now=NOW)
+
+    assert event is not None
+    (criterion,) = event.criteria
+    assert (criterion.statement, criterion.capability) == (
+        'Read from [path] every pass.',
+        'Ledger at [path]',
+    )
+
+
+def test_a_changed_declaration_replaces_the_states() -> None:
+    state = _state(_declaration(DECLARED[:2]))
+
+    event = declared_event(DECLARED, state=state, stamp=_stamp(), now=NOW)
+
+    assert event is not None
+    assert event.criteria == DECLARED
+
+
+def test_the_states_own_declaration_in_any_order_is_not_emitted_again() -> None:
+    state = _state(_declaration(DECLARED))
+
+    assert declared_event(DECLARED[::-1], state=state, stamp=_stamp(), now=NOW) is None
+
+
+def test_a_removed_declaration_is_emitted_empty() -> None:
+    state = _state(_declaration(DECLARED))
+
+    event = declared_event((), state=state, stamp=_stamp(), now=NOW)
+
+    assert event is not None
+    assert event.criteria == ()
+
+
+def test_no_declaration_over_none_emits_nothing() -> None:
+    assert declared_event((), state=_state(), stamp=_stamp(), now=NOW) is None
+
+
+def test_a_run_is_emitted_at_its_run_at() -> None:
+    event = results_event(RunKind.VERIFY, RUN, state=_state(), stamp=_stamp())
+
+    assert event == CriteriaResults(
+        **_stamp()(RUN_AT), run_kind=RunKind.VERIFY, commit=SHA, run_at=RUN_AT, results=RESULTS
+    )
+
+
+def test_a_run_the_state_already_says_is_not_emitted_again() -> None:
+    state = _state(_recorded(RunKind.VERIFY, RUN))
+
+    assert results_event(RunKind.VERIFY, RUN, state=state, stamp=_stamp()) is None
+
+
+def test_a_later_run_with_the_same_results_is_emitted() -> None:
+    state = _state(_recorded(RunKind.VERIFY, RUN))
+    later = RUN.model_copy(update={'run_at': NOW})
+
+    event = results_event(RunKind.VERIFY, later, state=state, stamp=_stamp())
+
+    assert event is not None
+    assert (event.at, event.run_at, event.results) == (NOW, NOW, RESULTS)
+
+
+def test_a_staging_run_never_compares_against_the_verify_record() -> None:
+    state = _state(_recorded(RunKind.VERIFY, RUN))
+
+    event = results_event(RunKind.STAGING, RUN, state=state, stamp=_stamp())
+
+    assert event is not None
+    assert event.run_kind is RunKind.STAGING
+
+
+def test_an_unemitted_event_spends_no_seq() -> None:
+    state = _state(_declaration(DECLARED), _recorded(RunKind.VERIFY, RUN))
+    stamp = _stamp(10)
+
+    assert declared_event(DECLARED, state=state, stamp=stamp, now=NOW) is None
+    assert results_event(RunKind.VERIFY, RUN, state=state, stamp=stamp) is None
+    staging = results_event(RunKind.STAGING, RUN, state=state, stamp=stamp)
+
+    assert staging is not None
+    assert staging.seq == 10
