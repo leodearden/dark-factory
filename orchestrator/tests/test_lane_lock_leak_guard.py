@@ -2809,19 +2809,29 @@ async def cancel_mid_acquire_and_settle(
     mid-acquire, the holder is released, and this returns only after the
     orphaned acquire's completion has been handled on the loop, so its
     release callback has already run.
+
+    If the cancellation left no acquire Task in flight, the seam no longer
+    shields its acquire (B12 itself) or no longer wraps it in a Task.  Either
+    way the worker thread is still polling, so this waits for that thread's
+    own return instead and hands back what it won: the caller's
+    ``lane_is_free`` assert then reports the leak as esc-5548-5.
     """
     from orchestrator import git_ops as git_ops_mod
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
+    returned = asyncio.Event()
     won: dict[str, int | None] = {}
     real = git_ops_mod.acquire_merge_verify_flock
 
     def _watched(path: Path, wait_secs: float, **kw) -> int | None:
         loop.call_soon_threadsafe(entered.set)
-        fd = real(path, wait_secs, monotonic=_poll_counted_clock(), **kw)
-        won['fd'] = fd
-        return fd
+        try:
+            fd = real(path, wait_secs, monotonic=_poll_counted_clock(), **kw)
+            won['fd'] = fd
+            return fd
+        finally:
+            loop.call_soon_threadsafe(returned.set)
 
     monkeypatch.setattr(git_ops_mod, 'acquire_merge_verify_flock', _watched)
 
@@ -2843,12 +2853,16 @@ async def cancel_mid_acquire_and_settle(
         with pytest.raises(asyncio.CancelledError):
             await task
         orphans = other_pending_tasks()
-        assert len(orphans) == 1, (
-            f'the cancelled operation left no single acquire in flight, so '
-            f'there is no late win to settle; pending={orphans!r}'
+        assert len(orphans) <= 1, (
+            f'the cancelled operation left more than one task in flight, so '
+            f'there is no single acquire whose late win to settle; '
+            f'pending={orphans!r}'
         )
 
-    await asyncio.gather(*orphans)
+    if orphans:
+        await asyncio.gather(*orphans)
+    else:
+        await returned.wait()
     if 'fd' not in won:
         pytest.fail(
             'the orphaned acquire settled without returning — no handover '
