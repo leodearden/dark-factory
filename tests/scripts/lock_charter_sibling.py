@@ -16,6 +16,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS
+
 
 def plant_reify_guard(
     repo: Path,
@@ -94,3 +96,20 @@ def plant_tracked_repo(root: Path, paths: list[str], *, gitlinks: list[str] | No
             capture_output=True,
         )
     return root
+
+
+def plant_divergent_reify(root: Path, *, new_name: str = 'newtool') -> Path:
+    """A reify sibling that tracks an extension-less tool dark-factory has not mirrored.
+
+    The 2026-11-23 ``sccache`` shape: reify's guard emits dark-factory's vectors
+    plus *new_name* in the extension-less one, and its index tracks
+    ``scripts/canon-bin/guard/<new_name>``, a path dark-factory's predicate
+    rejects.  So every part of the reconciliation that can see the gap does.
+    """
+    repo = plant_tracked_repo(root, ['a/b.py', f'scripts/canon-bin/guard/{new_name}'])
+    plant_reify_guard(
+        repo,
+        extensions=sorted(FILE_EXTENSIONS),
+        extensionless=sorted([*EXTENSIONLESS_FILENAMES, new_name]),
+    )
+    return repo

@@ -524,6 +524,83 @@ class TestCheckCorpus:
         assert findings['sql'] == 'c/three.sql'
 
 
+class TestCheckExtensionless:
+    """``check_extensionless(reify_repo)`` — the extension-less half of the corpus sweep.
+
+    Before task 11623 these two reify-corpus properties were enforced ONLY by
+    the reify parametrizations of the in-suite guards, which read a live sibling
+    on the merge gate.  Those arms are gone, so this part is where the property
+    is still checked: an extension-less tracked file the predicate rejects (the
+    2026-11-23 ``scripts/canon-bin/guard/sccache`` shape), and an allowlisted
+    name that is also a DIRECTORY somewhere in the tree.
+    """
+
+    def test_allowlisted_extensionless_corpus_reports_ok(self, tmp_path):
+        paths = ['LICENSE', 'hooks/pre-commit', 'scripts/canon-bin/guard/sccache', 'a/b.py', 'docs/x.md']
+        for rel in paths:
+            assert is_file_path(rel), f'oracle disagrees: {rel} must be accepted'
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', paths)
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_OK
+        assert report['status'] == 'ok'
+        assert report['findings'] == {}
+        assert report['collisions'] == {}
+
+    def test_unallowlisted_extensionless_tracked_file_is_drift(self, tmp_path):
+        """The Nov-23 shape: reify tracks a no-dot tool name dark-factory has not mirrored."""
+        assert not is_file_path('scripts/canon-bin/guard/newtool')
+        repo = lock_charter_sibling.plant_tracked_repo(
+            tmp_path / 'reify', ['a/b.py', 'scripts/canon-bin/guard/newtool'],
+        )
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['status'] == 'drift'
+        assert report['findings'] == {'newtool': 'scripts/canon-bin/guard/newtool'}
+        assert report['collisions'] == {}
+        assert 'newtool' in report['detail']
+        assert 'scripts/canon-bin/guard/newtool' in report['detail']
+        assert 'NOT a fault in any dark-factory branch' in report['detail']
+
+    def test_allowlisted_name_used_as_a_directory_is_a_collision(self, tmp_path):
+        """A member that is also a directory name makes that directory declarable as a file lock."""
+        assert 'cargo' in EXTENSIONLESS_FILENAMES
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['tools/cargo/x.py'])
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['findings'] == {}
+        assert report['collisions'] == {'cargo': 'tools/cargo/x.py'}
+        assert 'cargo' in report['detail']
+        assert 'tools/cargo/x.py' in report['detail']
+
+    def test_extensionless_gitlink_is_neither_a_finding_nor_a_collision(self, tmp_path):
+        """A mode-160000 mount point is a directory in THIS repo, correctly rejected."""
+        assert not is_file_path('vendor/sub')
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/sub'])
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_OK
+        assert report['findings'] == {}
+        assert report['collisions'] == {}
+
+    def test_non_git_directory_is_unavailable_and_never_ok(self, tmp_path):
+        plain = tmp_path / 'not-a-checkout'
+        plain.mkdir()
+
+        report = drift.check_extensionless(plain)
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['status'] == 'unavailable'
+        assert report['findings'] == {}
+        assert report['collisions'] == {}
+
+
 class TestTrackedPaths:
     """``tracked_paths`` — one parse of the corpus, split by git's own mode column."""
 
@@ -622,7 +699,7 @@ class TestCheckComposition:
 
         assert report['exit_code'] == drift.EXIT_OK
         assert report['status'] == 'ok'
-        assert set(report['parts']) == {'vectors', 'corpus'}
+        assert set(report['parts']) == {'vectors', 'corpus', 'extensionless'}
         assert report['parts']['vectors']['exit_code'] == drift.EXIT_OK
         assert report['parts']['corpus']['exit_code'] == drift.EXIT_OK
 
@@ -666,6 +743,40 @@ class TestCheckComposition:
 
         assert report['parts']['corpus']['exit_code'] == drift.EXIT_DRIFT
         assert report['parts']['vectors']['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+
+    def test_an_extensionless_finding_alone_is_drift(self, tmp_path):
+        """Agreeing vectors and a clean dotted corpus do not mask an extension-less finding."""
+        repo = lock_charter_sibling.plant_tracked_repo(
+            tmp_path / 'reify', ['a/b.py', 'scripts/canon-bin/guard/newtool'],
+        )
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        report = drift.check(repo)
+
+        assert report['parts']['vectors']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['corpus']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['extensionless']['exit_code'] == drift.EXIT_DRIFT
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert 'newtool' in report['detail']
+
+    def test_unavailable_extensionless_part_is_never_masked_by_ok_siblings(self, tmp_path, monkeypatch):
+        """Each part asks git on its own; one that could not look is not a pass."""
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        unavailable = {
+            'status': 'unavailable',
+            'exit_code': drift.EXIT_UNAVAILABLE,
+            'findings': {},
+            'collisions': {},
+            'detail': 'extension-less sweep NOT PERFORMED',
+        }
+        monkeypatch.setattr(drift, 'check_extensionless', lambda *_a, **_k: unavailable)
+
+        report = drift.check(repo)
+
+        assert report['parts']['vectors']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['corpus']['exit_code'] == drift.EXIT_OK
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
 
 
@@ -794,6 +905,44 @@ class TestResolve:
         monkeypatch.setenv('REIFY_ROOT', str(tmp_path / 'operator-set-elsewhere'))
 
         assert drift.resolve() == reify_checkout.ReifyCheckout(discovered, False)
+
+
+class TestReconcile:
+    """``reconcile(explicit=None)`` — resolution plus check, the body ``main()`` and the heal router share."""
+
+    def test_divergent_reify_root_sibling_is_drift_naming_the_new_name(self, tmp_path, monkeypatch):
+        repo = lock_charter_sibling.plant_divergent_reify(tmp_path / 'reify')
+        monkeypatch.setenv('REIFY_ROOT', str(repo))
+
+        report = drift.reconcile()
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['status'] == 'drift'
+        assert report['parts']['vectors']['vectors']['extensionless']['only_in_reify'] == ['newtool']
+        assert report['parts']['extensionless']['findings'] == {
+            'newtool': 'scripts/canon-bin/guard/newtool',
+        }
+        assert 'newtool' in report['detail']
+
+    def test_missing_reify_root_is_unavailable_naming_the_path(self, tmp_path, monkeypatch):
+        missing = tmp_path / 'no-such-reify'
+        monkeypatch.setenv('REIFY_ROOT', str(missing))
+
+        report = drift.reconcile()
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['status'] == 'unavailable'
+        assert str(missing) in report['detail']
+
+    def test_explicit_argument_outranks_reify_root(self, tmp_path, monkeypatch):
+        agreeing = lock_charter_sibling.plant_tracked_repo(tmp_path / 'agreeing', ['a/b.py'])
+        lock_charter_sibling.plant_reify_guard(agreeing, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        divergent = lock_charter_sibling.plant_divergent_reify(tmp_path / 'divergent')
+        monkeypatch.setenv('REIFY_ROOT', str(divergent))
+
+        report = drift.reconcile(str(agreeing))
+
+        assert report['exit_code'] == drift.EXIT_OK, report['detail']
 
 
 class TestMainCli:
