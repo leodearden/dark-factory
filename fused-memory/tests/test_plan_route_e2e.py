@@ -11,7 +11,7 @@ import contextlib
 import json
 import sqlite3
 import types
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -173,7 +173,7 @@ class TestGraphitisLLMRidesThePlanRoute:
 _CLOCK_START = datetime(2026, 11, 24, 12, 0, tzinfo=UTC).timestamp()
 _CAPPED = 'plan_route_capped'
 
-_GraphitiStandIn = Callable[[MemoryService], Awaitable[None]]
+_GraphitiStandIn = Callable[[MemoryService], Coroutine[Any, Any, None]]
 
 
 async def _extract_on_the_plan_route(svc: MemoryService) -> None:
@@ -220,7 +220,11 @@ async def _routed_service(
     svc.graphiti.read_server_settings = AsyncMock(return_value=FalkorServerSettings(
         expected_graph_timeout_ms=30000, graph_timeout_ms=30000, appendonly='yes',
     ))
-    svc.graphiti.add_episode = lambda *_args, **_kwargs: graphiti_stand_in(svc)
+
+    async def add_episode(*_args: Any, **_kwargs: Any) -> None:
+        await graphiti_stand_in(svc)
+
+    svc.graphiti.add_episode = add_episode
     await svc.initialize()
     journal = WriteJournal(tmp_path / 'wj_plan_route')
     await journal.initialize()
@@ -277,6 +281,13 @@ async def _counts(svc: MemoryService) -> dict:
 async def _parked(svc: MemoryService) -> dict | None:
     counts = await _counts(svc)
     return counts if counts.get('parked', 0) >= 1 else None
+
+
+async def _parked_again(svc: MemoryService) -> dict | None:
+    """_parked, polled after a probe the gate refused inside the write. The read
+    queues behind the park on the queue's one connection, so it returns only
+    after the park's on_parked has read the clock."""
+    return await _parked(svc)
 
 
 async def _drained(svc: MemoryService) -> dict | None:
@@ -344,6 +355,8 @@ class TestACappedPlanThroughMemoryService:
                 lambda: _refreshed(root, page), message='a re-probe did not refresh the page',
             )
             assert confirmed['id'] == page['id']
+            await poll_until(lambda: _parked_again(svc), message='the failed probe did not re-park')
+            assert _parked_row(tmp_path)['next_retry_at'] == clock() + _interval(svc)
             assert _proxy_chats(endpoints) == 2
             assert len(_capped_records(root)) == 1
 

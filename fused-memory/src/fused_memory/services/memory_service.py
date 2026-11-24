@@ -2174,9 +2174,12 @@ class MemoryService:
         config: FusedMemoryConfig,
         *,
         mem0_retry_policy: Mem0RetryPolicy = DEFAULT_MEM0_RETRY_POLICY,
+        queue_clock: Callable[[], float] = time.time,
     ):
+        """*queue_clock* schedules the durable queue, and the plan route, whose probe times become parked rows' horizons."""
         self.config = config
         self._mem0_retry_policy = mem0_retry_policy
+        self._queue_clock = queue_clock
         self.graphiti = GraphitiBackend(config)
         self.mem0 = Mem0Backend(config)
         self.classifier = WriteClassifier(config)
@@ -2185,11 +2188,17 @@ class MemoryService:
         self._billing_alarm = BillingExhaustionAlarm(
             resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
         )
+        def queue_moment() -> datetime:
+            return datetime.fromtimestamp(queue_clock(), UTC)
+
         self._plan_cap_alarm = PlanCapAlarm(
             resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
             count_parked=self._count_parked_writes,
+            clock=queue_moment,
         )
-        self.plan_route = PlanRoute(config.plan_route, listener=self._plan_cap_alarm)
+        self.plan_route = PlanRoute(
+            config.plan_route, listener=self._plan_cap_alarm, clock=queue_moment,
+        )
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
@@ -2507,6 +2516,7 @@ class MemoryService:
                 BillingSource.API_KEY_CREDITS: ApiKeyCreditsParkGuard(self._billing_alarm),
                 BillingSource.PLAN_CAP: PlanRouteParkGuard(self.plan_route),
             }),
+            clock=self._queue_clock,
         )
         self.durable_queue.register_callback(
             QueueCallback.DUAL_WRITE_EPISODE, self._dual_write_callback
