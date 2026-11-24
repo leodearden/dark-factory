@@ -106,6 +106,7 @@ from orchestrator.branch_stack import (
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
 from orchestrator.index_lock_liveness import (
     GitProcessScan,
+    IndexLockHolderScanner,
     IndexLockVerdict,
     describe_holders,
     diagnose_index_lock,
@@ -322,6 +323,14 @@ class IndexLockStandOff:
     waited_s: float
     initial_age_s: float
     holder_scan: GitProcessScan | None
+
+    def __post_init__(self) -> None:
+        if (self.holder_scan is None) != self.cleared:
+            raise ValueError(
+                'an index-lock stand-off carries a holder scan exactly when the lock '
+                f'was NOT cleared; got cleared={self.cleared!r}, '
+                f'holder_scan={self.holder_scan!r}'
+            )
 
 
 # Bounded attempt budget for `git worktree add`, shared by the three sites
@@ -3119,10 +3128,12 @@ class GitOps:
         merge_spec_warm_lane_pool_size: int = 0,
         transcript_archive: TranscriptArchiveConfig | None = None,
         proc_root: Path = PROC_ROOT,
+        holder_scanner: IndexLockHolderScanner = scan_index_lock_holders,
     ):
         self.config = config
         self.project_root = project_root
         self.proc_root = proc_root
+        self.holder_scanner = holder_scanner
         # Teardown-archival backstop config (task 2786,
         # agent-transcript-archival-prd β).  None at the 3 non-dispatch
         # construction sites (cli/recover/evals) so the cleanup_worktree
@@ -16245,7 +16256,7 @@ class GitOps:
         """The live git processes in project_root's work tree that could have
         written its index lock, scanned off the event loop."""
         return await asyncio.to_thread(
-            scan_index_lock_holders, await self._index_lock_path(), self.project_root,
+            self.holder_scanner, await self._index_lock_path(), self.project_root,
             proc_root=self.proc_root,
         )
 
@@ -16287,7 +16298,9 @@ class GitOps:
         """
         held, age = await self._index_lock_state()
         if not held:
-            return IndexLockStandOff(True, 0.0, 0.0, None)
+            return IndexLockStandOff(
+                cleared=True, waited_s=0.0, initial_age_s=0.0, holder_scan=None,
+            )
 
         # Bind the pre-wait observation to a local the poll loop cannot
         # clobber — the loop rebinds `age` on every probe, which is exactly
@@ -16320,7 +16333,9 @@ class GitOps:
                 'clear by waiting. lock=%s context=%s',
                 initial_age, diagnosis.stale_after_s, lock_path, context,
             )
-            return IndexLockStandOff(False, 0.0, initial_age, scan)
+            return IndexLockStandOff(
+                cleared=False, waited_s=0.0, initial_age_s=initial_age, holder_scan=scan,
+            )
 
         started = time.monotonic()
         deadline = started + max(0.0, timeout_s)
@@ -16348,7 +16363,10 @@ class GitOps:
                     'with advance. lock=%s context=%s',
                     waited, lock_path, context,
                 )
-                return IndexLockStandOff(True, waited, initial_age, None)
+                return IndexLockStandOff(
+                    cleared=True, waited_s=waited, initial_age_s=initial_age,
+                    holder_scan=None,
+                )
             now = time.monotonic()
             if now - last_warned >= _INDEX_LOCK_WARN_INTERVAL_S:
                 last_warned = now
@@ -16369,9 +16387,13 @@ class GitOps:
                 'with advance. lock=%s context=%s',
                 waited, lock_path, context,
             )
-            return IndexLockStandOff(True, waited, initial_age, None)
+            return IndexLockStandOff(
+                cleared=True, waited_s=waited, initial_age_s=initial_age,
+                holder_scan=None,
+            )
         return IndexLockStandOff(
-            False, waited, initial_age, await self._scan_index_lock_holders(),
+            cleared=False, waited_s=waited, initial_age_s=initial_age,
+            holder_scan=await self._scan_index_lock_holders(),
         )
 
     async def _park_wip_on_private_ref(self, label: str) -> None:

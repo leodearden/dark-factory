@@ -87,7 +87,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1579, "function_local_imports": 4, "lines": 17412, "prose_lines": 9771, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1580, "function_local_imports": 4, "lines": 17434, "prose_lines": 9771, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 359, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 228, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_policy.py": {"cognitive": 24, "function_local_imports": 0, "lines": 125, "prose_lines": 18, "reexport_names": 0},
@@ -387,6 +387,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::warn_on_warm_lane_pool_shrink": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::worktree_has_unsaved_work": 4,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::worktree_head_beyond_main": 2,
+    "orchestrator/src/orchestrator/git_ops.py::IndexLockStandOff::__post_init__": 1,
     "orchestrator/src/orchestrator/git_ops.py::LaneLockSelfOwnedLeak::__init__": 0,
     "orchestrator/src/orchestrator/git_ops.py::MergeVerifyLeaseContended::__init__": 2,
     "orchestrator/src/orchestrator/git_ops.py::MergeVerifyLeaseHeld::__init__": 0,

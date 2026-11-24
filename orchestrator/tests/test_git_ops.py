@@ -16,6 +16,7 @@ from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _backdated_index_lock import REIFY_LOCK_AGE_S, index_lock_written_ago
 from _blocked_commit_fixture import commit_blocked_in_pre_commit_hook
 from _constructed_proc_table import add_git_process, empty_proc_table
 from _git_fixtures import _git, seed_repo
@@ -41,6 +42,7 @@ from orchestrator.git_ops import (
     CommitEffectProbe,
     GitOps,
     GitQueryFailed,
+    IndexLockStandOff,
     MergeParkContentionError,
     MergeParkError,
     MergeParkLockContentionError,
@@ -53,8 +55,9 @@ from orchestrator.git_ops import (
     _git_stderr_is_unresolved_ref,
     _run,
 )
-from orchestrator.index_lock_liveness import GitProcess, GitProcessScan
+from orchestrator.index_lock_liveness import GitProcess, GitProcessScan, scan_index_lock_holders
 from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
+from orchestrator.merge_lane.gates import _map_advance_failure
 from orchestrator.quarantine_provenance import NOT_RELOCATED
 
 
@@ -14779,18 +14782,12 @@ class TestGitOpsHoldsNoSecondSpawnPrimitive:
 # ---------------------------------------------------------------------------
 
 
-_REIFY_LOCK_AGE_S = 3290.0
 _HOLDER_PID = 728_900
 _HOLDER_COMMAND = 'git commit --only plans/x.md'
 _LATER_READER_COMMAND = 'git cherry main abc123'
-
-
-def _index_lock_written_ago(project_root: Path, seconds: float) -> Path:
-    lock_path = project_root / '.git' / 'index.lock'
-    lock_path.write_text('')
-    written_at = time.time() - seconds
-    os.utime(lock_path, (written_at, written_at))
-    return lock_path
+# A stand-off budget that still polls but costs no real wait.  The stale bar
+# is max(budget, _INDEX_LOCK_STALE_FLOOR_S), so it changes no verdict.
+_POLLED_BUDGET_S = 0.01
 
 
 def _table_holding_one_git_process(
@@ -14804,8 +14801,6 @@ def _table_holding_one_git_process(
 
 
 async def _park_lock_reason(git_ops: GitOps, merge_commit: str) -> str:
-    from orchestrator.merge_lane.gates import _map_advance_failure
-
     outcome = await _map_advance_failure(
         git_ops, 'park_lock_contended',
         task_id='t5229',
@@ -15098,7 +15093,7 @@ class TestAdvanceMainIndexLockStandoff:
         assert main_before.strip() == main_after.strip()
 
     async def test_lock_appearing_after_the_gate_is_still_transient(
-        self, git_ops: GitOps,
+        self, git_ops: GitOps, tmp_path: Path,
     ):
         """TOCTOU: a lock that appears BETWEEN the gate and `git stash create`
         must still be classified as transient, not halt the queue.
@@ -15113,6 +15108,7 @@ class TestAdvanceMainIndexLockStandoff:
         )
         (git_ops.project_root / 'README.md').write_text('# dirty during toctou\n')
         git_ops.config.merge_park_lock_grace_seconds = 0
+        git_ops.proc_root = empty_proc_table(tmp_path)
 
         lock_path = git_ops.project_root / '.git' / 'index.lock'
         original_run = _run
@@ -15137,6 +15133,14 @@ class TestAdvanceMainIndexLockStandoff:
         assert result.result == 'park_lock_contended', (
             'a lock appearing inside the TOCTOU window must still be '
             f'transient, never a queue halt; got {result.result!r}'
+        )
+        scan = git_ops._last_park_lock_info.get('holder_scan')
+        assert scan == GitProcessScan((), confirmed=True), (
+            f'the mid-park side channel must carry its own holder scan; got {scan!r}'
+        )
+        reason = await _park_lock_reason(git_ops, merge_result.merge_commit)
+        assert 'rm -f' not in reason, (
+            f'a lock watched appearing is young, never a crashed leftover; got {reason!r}'
         )
 
     async def test_park_raises_lock_contention_error_when_lock_present(
@@ -15358,10 +15362,7 @@ class TestAdvanceMainIndexLockStandoff:
         git_ops.config.merge_park_lock_grace_seconds = 0
         git_ops.proc_root = empty_proc_table(tmp_path)
 
-        lock_path = git_ops.project_root / '.git' / 'index.lock'
-        lock_path.write_text('')
-        backdated = time.time() - 1000
-        os.utime(lock_path, (backdated, backdated))
+        lock_path = index_lock_written_ago(git_ops.project_root, 1000)
         try:
             result = await git_ops.advance_main(merge_result.merge_commit)
         finally:
@@ -15433,7 +15434,7 @@ class TestAdvanceMainIndexLockStandoff:
         """
         from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
 
-        lock_path = _index_lock_written_ago(
+        lock_path = index_lock_written_ago(
             git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
         )
         git_ops.proc_root = _table_holding_one_git_process(
@@ -15443,7 +15444,7 @@ class TestAdvanceMainIndexLockStandoff:
         try:
             with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
                 standoff = await git_ops._await_index_lock_clear(
-                    timeout_s=1.0, context='live-holder-old-lock',
+                    timeout_s=_POLLED_BUDGET_S, context='live-holder-old-lock',
                 )
         finally:
             lock_path.unlink()
@@ -15468,7 +15469,7 @@ class TestAdvanceMainIndexLockStandoff:
             git_ops, 'lock-old-holder', 'lock_old_holder.py',
         )
         git_ops.config.merge_park_lock_grace_seconds = 0
-        lock_path = _index_lock_written_ago(git_ops.project_root, _REIFY_LOCK_AGE_S)
+        lock_path = index_lock_written_ago(git_ops.project_root, REIFY_LOCK_AGE_S)
         git_ops.proc_root = _table_holding_one_git_process(
             tmp_path, git_ops.project_root,
             command=_HOLDER_COMMAND, started_at=lock_path.stat().st_mtime - 60,
@@ -15498,7 +15499,7 @@ class TestAdvanceMainIndexLockStandoff:
             git_ops, 'lock-later-reader', 'lock_later_reader.py',
         )
         git_ops.config.merge_park_lock_grace_seconds = 0
-        lock_path = _index_lock_written_ago(git_ops.project_root, _REIFY_LOCK_AGE_S)
+        lock_path = index_lock_written_ago(git_ops.project_root, REIFY_LOCK_AGE_S)
         git_ops.proc_root = _table_holding_one_git_process(
             tmp_path, git_ops.project_root,
             command=_LATER_READER_COMMAND, started_at=time.time(),
@@ -15522,7 +15523,7 @@ class TestAdvanceMainIndexLockStandoff:
     async def test_a_git_process_started_after_an_old_lock_does_not_cost_the_standoff(
         self, git_ops: GitOps, tmp_path: Path,
     ):
-        lock_path = _index_lock_written_ago(git_ops.project_root, _REIFY_LOCK_AGE_S)
+        lock_path = index_lock_written_ago(git_ops.project_root, REIFY_LOCK_AGE_S)
         git_ops.proc_root = _table_holding_one_git_process(
             tmp_path, git_ops.project_root,
             command=_LATER_READER_COMMAND, started_at=time.time(),
@@ -15546,7 +15547,7 @@ class TestAdvanceMainIndexLockStandoff:
         from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
 
         git_ops.proc_root = empty_proc_table(tmp_path)
-        lock_path = _index_lock_written_ago(
+        lock_path = index_lock_written_ago(
             git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
         )
         try:
@@ -15565,7 +15566,7 @@ class TestAdvanceMainIndexLockStandoff:
     ):
         from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
 
-        lock_path = _index_lock_written_ago(
+        lock_path = index_lock_written_ago(
             git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
         )
         git_ops.proc_root = _table_holding_one_git_process(
@@ -15574,7 +15575,7 @@ class TestAdvanceMainIndexLockStandoff:
         )
         try:
             timed_out = await git_ops._await_index_lock_clear(
-                timeout_s=1.0, context='timed-out-standoff-scan',
+                timeout_s=_POLLED_BUDGET_S, context='timed-out-standoff-scan',
             )
         finally:
             lock_path.unlink()
@@ -15600,23 +15601,23 @@ class TestAdvanceMainIndexLockStandoff:
         )
         git_ops.config.merge_park_lock_grace_seconds = 0
         git_ops.proc_root = empty_proc_table(tmp_path)
-        lock_path = _index_lock_written_ago(git_ops.project_root, _REIFY_LOCK_AGE_S)
-        real_scan = git_ops._scan_index_lock_holders
+        lock_path = index_lock_written_ago(git_ops.project_root, REIFY_LOCK_AGE_S)
         late_arrival = GitProcessScan(
             (GitProcess(4_000_000, _LATER_READER_COMMAND),), confirmed=True,
         )
-        scans_taken: list[int] = []
+        scans_taken: list[Path] = []
 
-        async def first_scan_real_then_a_late_arrival() -> GitProcessScan:
-            scans_taken.append(1)
-            return await real_scan() if len(scans_taken) == 1 else late_arrival
+        def first_scan_real_then_a_late_arrival(
+            lock: Path, work_tree: Path, *, proc_root: Path,
+        ) -> GitProcessScan:
+            scans_taken.append(lock)
+            if len(scans_taken) > 1:
+                return late_arrival
+            return scan_index_lock_holders(lock, work_tree, proc_root=proc_root)
 
+        git_ops.holder_scanner = first_scan_real_then_a_late_arrival
         try:
-            with patch.object(
-                git_ops, '_scan_index_lock_holders',
-                side_effect=first_scan_real_then_a_late_arrival,
-            ):
-                result = await git_ops.advance_main(merge_result.merge_commit)
+            result = await git_ops.advance_main(merge_result.merge_commit)
         finally:
             lock_path.unlink()
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
@@ -15639,13 +15640,12 @@ class TestAdvanceMainIndexLockStandoff:
         from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
 
         git_ops.proc_root = tmp_path / 'no-proc-mounted'
-        lock_path = git_ops.project_root / '.git' / 'index.lock'
-        lock_path.write_text('')
-        backdated = time.time() - (_INDEX_LOCK_STALE_FLOOR_S + 1000)
-        os.utime(lock_path, (backdated, backdated))
+        lock_path = index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
         try:
             standoff = await git_ops._await_index_lock_clear(
-                timeout_s=1.0, context='unconfirmed-scan-old-lock',
+                timeout_s=_POLLED_BUDGET_S, context='unconfirmed-scan-old-lock',
             )
         finally:
             lock_path.unlink()
@@ -15767,10 +15767,9 @@ class TestAdvanceMainIndexLockStandoff:
         from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
 
         git_ops.proc_root = empty_proc_table(tmp_path)
-        lock_path = git_ops.project_root / '.git' / 'index.lock'
-        lock_path.write_text('')
-        backdated = time.time() - (_INDEX_LOCK_STALE_FLOOR_S + 1000)
-        os.utime(lock_path, (backdated, backdated))
+        lock_path = index_lock_written_ago(
+            git_ops.project_root, _INDEX_LOCK_STALE_FLOOR_S + 1000,
+        )
 
         original_state = git_ops._index_lock_state
         probes: list[bool] = []
@@ -15816,7 +15815,7 @@ class TestAdvanceMainIndexLockStandoff:
         so the staleness floor alone withholds the short-circuit.
         """
         git_ops.proc_root = empty_proc_table(tmp_path)
-        lock_path = _index_lock_written_ago(git_ops.project_root, 10.0)
+        lock_path = index_lock_written_ago(git_ops.project_root, 10.0)
 
         original_state = git_ops._index_lock_state
         probes: list[bool] = []
@@ -15832,7 +15831,7 @@ class TestAdvanceMainIndexLockStandoff:
             ):
                 standoff = (
                     await git_ops._await_index_lock_clear(
-                        timeout_s=0.5, context='young-lock',
+                        timeout_s=_POLLED_BUDGET_S, context='young-lock',
                     )
                 )
         finally:
@@ -15982,6 +15981,24 @@ class TestAdvanceMainIndexLockStandoff:
             'a wait spanning several warn intervals must re-announce itself; '
             f'got {[r.message for r in caplog.records]!r}'
         )
+
+
+class TestIndexLockStandOffInvariant:
+    """A stand-off carries the holder scan its reason is rendered from exactly
+    when the lock was not cleared."""
+
+    def test_a_held_lock_without_a_scan_is_refused(self):
+        with pytest.raises(ValueError, match=r'(?s)cleared=False.*holder_scan=None'):
+            IndexLockStandOff(
+                cleared=False, waited_s=1.0, initial_age_s=12.0, holder_scan=None,
+            )
+
+    def test_a_cleared_lock_with_a_scan_is_refused(self):
+        with pytest.raises(ValueError, match=r'(?s)cleared=True.*GitProcessScan'):
+            IndexLockStandOff(
+                cleared=True, waited_s=0.0, initial_age_s=0.0,
+                holder_scan=GitProcessScan((), confirmed=True),
+            )
 
 
 @pytest.mark.asyncio
