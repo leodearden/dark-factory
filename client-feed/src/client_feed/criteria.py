@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
@@ -15,14 +16,16 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from client_feed.contract import (
     CaseOutcome,
     CaseResult,
+    CommitSha,
     Criterion,
     CriterionOutcome,
     CriterionResult,
     UniqueCriteria,
+    UtcTimestamp,
     _first_error,
 )
 from client_feed.feed_io import FeedIoError, read_tail
-from client_feed.sources.archive import case_id
+from client_feed.sources.archive import case_id, read_junit_cases
 
 CRITERIA_RELPATH: Final = 'acceptance/criteria.yaml'
 COLLECTION_MAP_SUFFIX: Final = '.tests.json'
@@ -195,3 +198,40 @@ def join_criteria(
         )
         for criterion in declared
     )
+
+
+class CriteriaRun(BaseModel):
+    """What one run says about the criteria: criteria_results' payload less run_kind, and out/criteria-staging.json's shape."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    commit: CommitSha | None
+    run_at: UtcTimestamp
+    results: tuple[CriterionResult, ...]
+
+
+def _bound_report(root: Path, junit: Path) -> BoundReport | None:
+    map_relpath = collection_map_path(junit)
+    collection_map = read_collection_map(root / map_relpath, name=str(map_relpath))
+    if collection_map is None:
+        return None
+    return BoundReport(
+        cases=read_junit_cases(root, junit), criteria=criterion_bindings(collection_map)
+    )
+
+
+def verify_criteria(
+    root: Path,
+    junit_relpaths: Sequence[Path],
+    *,
+    declared: Sequence[Criterion],
+    commit: str | None,
+    run_at: datetime,
+) -> CriteriaRun | None:
+    """The criteria a verify run's archived junits evidence, each joined with the map beside it; None when no junit has one."""
+    reports = [
+        report for junit in junit_relpaths if (report := _bound_report(root, junit)) is not None
+    ]
+    if not reports:
+        return None
+    return CriteriaRun(commit=commit, run_at=run_at, results=join_criteria(declared, reports))
