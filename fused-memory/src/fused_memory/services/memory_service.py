@@ -2450,6 +2450,12 @@ class MemoryService:
             return 0
         return (await self.durable_queue.get_stats())['counts'].get('parked', 0)
 
+    async def _global_parked_count(self, queue_stats: object, project_id: str | None) -> int:
+        """The global parked count, read from *queue_stats* when they are unscoped."""
+        if project_id is None and isinstance(queue_stats, dict) and 'counts' in queue_stats:
+            return queue_stats['counts'].get('parked', 0)
+        return await self._count_parked_writes()
+
     def _graphiti_plan_route_client(self) -> httpx.AsyncClient | None:
         provider = self.config.llm.providers.openai
         if self.config.llm.provider != 'openai' or provider is None or not provider.api_url:
@@ -11527,6 +11533,14 @@ class MemoryService:
                 status['queue'] = await self.durable_queue.get_stats(group_id=project_id)
             except Exception as e:
                 status['queue'] = {'error': str(e)}
+
+        try:
+            status['plan_route'] = self.plan_route.state().to_status(
+                parked_items=await self._global_parked_count(status.get('queue'), project_id),
+                escalation_id=self._plan_cap_alarm.escalation_id(),
+            )
+        except Exception as e:
+            status['plan_route'] = {'error': str(e)}
 
         # Server uptime fields (informational; dashboard reads uptime_seconds as primary)
         status['started_at'] = self._started_at.isoformat()

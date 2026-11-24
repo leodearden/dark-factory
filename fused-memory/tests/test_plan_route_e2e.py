@@ -189,6 +189,8 @@ async def _routed_service(
         proxy_url=endpoints.proxy.base_url, probe_interval_seconds=_PROBE_INTERVAL_SECONDS,
     )
     svc = mock_memory_backends(MemoryService(config))
+    graphiti_initialize = AsyncMock()
+    svc.graphiti.initialize = graphiti_initialize
     svc.graphiti.list_graphs = AsyncMock(return_value=[])
     svc.graphiti.read_server_settings = AsyncMock(return_value=FalkorServerSettings(
         expected_graph_timeout_ms=30000, graph_timeout_ms=30000, appendonly='yes',
@@ -206,7 +208,7 @@ async def _routed_service(
     finally:
         await svc.close()
         await journal.close()
-        injected = svc.graphiti.initialize.await_args
+        injected = graphiti_initialize.await_args
         await close_wrapped_sdk_clients([injected.kwargs.get('llm_client') if injected else None])
 
 

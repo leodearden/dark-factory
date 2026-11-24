@@ -8252,11 +8252,7 @@ class TestGetStatusScoping:
 
         await service.get_status(project_id='dark_factory')
 
-        service.durable_queue.get_stats.assert_called_once()
-        call_kwargs = service.durable_queue.get_stats.call_args.kwargs
-        assert call_kwargs.get('group_id') == 'dark_factory', (
-            f'Expected group_id="dark_factory", got call_kwargs={call_kwargs}'
-        )
+        service.durable_queue.get_stats.assert_any_await(group_id='dark_factory')
 
     @pytest.mark.asyncio
     async def test_get_status_without_project_id_passes_no_group_filter(self, service):
