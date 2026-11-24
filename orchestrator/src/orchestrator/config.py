@@ -2471,9 +2471,12 @@ class GitConfig(BaseModel):
             'because parking through a foreign process\'s index lock would '
             'clobber the in-flight commit\'s staged/working state. This knob '
             'governs the WAIT only: the crashed-leftover verdict that offers '
-            'an operator destructive `rm -f <lock>` recovery keys on '
+            'an operator destructive `rm -f <lock>` recovery, and skips the '
+            'wait, requires a holder scan that found no live git process in '
+            'project_root\'s work tree AND a first-observed age past '
             'max(this, merge_gates._STALE_LOCK_FLOOR_S), so lowering it (0 '
-            'included) never widens what counts as a stale lock.'
+            'included) never widens what counts as a stale lock, and no '
+            'setting makes a lock with a live holder count as one.'
         ),
     )
     offline_lane_persist_passes: int = Field(

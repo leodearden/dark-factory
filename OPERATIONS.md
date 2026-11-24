@@ -1751,46 +1751,84 @@ That clause is absent on the ordinary gate path, where the dirty snapshot
 has not been taken yet and no WIP is known to be at risk.
 
 A normal `git commit --only` whose pre-commit hook outlives the 300s
-grace produces exactly that: a blocked merge, **no** recovery advice, and
-**nothing for you to do** — it is retried on re-dispatch.
+grace produces exactly that: a blocked merge, **no** destructive advice,
+and **nothing for you to do** — it is retried on re-dispatch.
 
-There is exactly one genuine operator action, and it is triggered by the
-lock having **already been older, the moment the merge worker first
-observed it, than the staleness floor** — not by the age in the line
-above. That post-wait age necessarily exceeds the grace whenever we
-waited the grace out (it is the initial age *plus* the wait), so it says
-nothing about staleness; the 301s example above is a perfectly live
-commit. The distinguishing sentence is spelled out in the reason and
-simply does not appear otherwise:
+The reason's last sentence comes from a holder check on the lock
+(`orchestrator/src/orchestrator/index_lock_liveness.py::diagnose_index_lock`),
+which has three outcomes:
 
-> `… The lock was ALREADY 3600s old when the merge worker FIRST observed
-> it — older than the 300s staleness floor (max of the configured 300s
-> grace and the 300s pre-commit budget) — so it is likely a crashed-git
-> leftover rather than a live commit: confirm no git process is running
-> in project_root, then clear it with rm -f /…/.git/index.lock.`
+- **A live git process may hold it.** The merge worker looks for
+  processes named `git` whose cwd is in `project_root`'s own work tree
+  (nested worktrees excluded) **and** which started before the lock was
+  last written, and the reason names each one by pid and command:
 
-The floor is `max(git.merge_park_lock_grace_seconds, 300s)`, **not** the
-configured grace alone. Tuning the grace *down* (including to `0`, the
-probe-only fail-fast off-switch) shortens how long the worker **waits**;
-it must never widen what counts as a crashed leftover, or a live
-half-second-old `git commit --only` would be reported as one. Tuning the
-grace *up* does raise the bar — an operator who allows longer hooks has
-declared locks that old to be normal.
+  > … A live git process that started before the lock was written is
+  > running in project_root's work tree and may hold it: pid 728900
+  > (`git commit --only plans/x.md -m …`). A long pre-commit hook is
+  > normal, so do NOT remove the lock: wait for that process to exit,
+  > then re-submit the merge.
 
-Only when you see that sentence should you clear the lock by hand, and
-only after confirming no git process is running in `project_root`. The
-advice is gated this narrowly because `rm -f` on a **live** commit's
-index lock corrupts that in-flight commit — the same reason
-`advance_main` never removes the lock itself.
+  When it names several processes it says "wait for those processes to
+  exit".
 
-A lock that is *already* past the staleness floor when first observed
-**skips the wait entirely** — it is reported immediately, with the same
-recovery sentence. Waiting cannot change a verdict that is already
-"crashed leftover", and the merge worker is serialized, so burning the
+  A `git` that started *after* the lock was written cannot have created
+  it and is ignored. The common case is the merge worker's own read-only
+  `git cherry` / `git log` children, which sit in `project_root` much of
+  the time; they never mask a crashed leftover.
+
+  A listed process wins **whatever the lock's age**: it may hold the
+  lock, so wait and re-submit; never `rm -f` it. A reify pre-commit runs
+  `verify.sh` for 10-60+ minutes, so a lock an hour old with a live
+  holder is a healthy commit, not a crash (task 5229).
+- **A complete scan found no live git process, and the lock was already
+  older than the staleness floor when the merge worker first observed
+  it.** This is the only case that gets the `rm -f` sentence:
+
+  > `… The lock was ALREADY 3600s old when the merge worker FIRST
+  > observed it, past the 300s staleness floor, and a complete /proc scan
+  > found no git process in project_root's work tree, so it is likely a
+  > crashed-git leftover: confirm no git process is running in
+  > project_root, then clear it with rm -f /…/.git/index.lock and
+  > re-submit the merge.`
+- **Anything else** gets no recovery sentence: a young lock, or a scan
+  that could not place a `git` that started before the lock was written
+  (another user's, say, whose cwd it may not read). Unknown is never read
+  as "nobody holds it". A `git` it cannot place that started *after* the
+  lock cannot have written it, so it does not block the proof.
+
+The age that counts is the one at the merge worker's **first
+observation**, not the age in the line above. That post-wait age
+necessarily exceeds the grace whenever we waited the grace out (it is the
+initial age *plus* the wait), so the 301s example above is a perfectly
+live commit. The floor is `max(git.merge_park_lock_grace_seconds, 300s)`,
+**not** the configured grace alone. Tuning the grace *down* (including to
+`0`, the probe-only fail-fast off-switch) shortens how long the worker
+**waits**; it must never widen what counts as a crashed leftover. Tuning
+the grace *up* does raise the bar. And the floor is only the second
+condition: age alone never earns `rm -f`.
+
+Do not check for a holder with `lsof` or `fuser` on the lock. git closes
+the lockfile's descriptor before it runs hooks, so for the whole of a
+pre-commit hook **no process has `index.lock` open**, and those tools
+report nobody for a perfectly live commit. Look for the `git` process
+itself: the pid the reason names, or any `git` whose cwd is
+`project_root`. A candidate must also have started before the lock's
+mtime: compare `ps -o lstart= -p <pid>` with `stat -c %y <lock>`. Removing a live commit's index lock corrupts that
+in-flight commit, which is also why `advance_main` never removes the lock
+itself.
+
+A proven crashed leftover **skips the wait entirely**: it is reported
+immediately, with the same `rm -f` sentence, and its reason reads
+`waited 0s`, which is correct, not a mis-report. That reason is rendered
+from the same scan that skipped the wait, so a `git` that appears a moment
+later cannot turn it into "wait for that process". After a full wait, the
+reason instead names whoever held the lock at the deadline. Waiting cannot clear a
+lock nobody holds, and the merge worker is serialized, so burning the
 full grace on every queued task until you clear the file would just be a
-slow-motion version of the stall this whole mechanism removes. So the
-blocked reason for a leftover reads `waited 0s`; that is correct, not a
-mis-report.
+slow-motion version of the stall this whole mechanism removes. A lock
+with a live holder, or one the scan cannot prove unowned, always gets the
+full wait, however old it is.
 
 One window the gate cannot cover: it is a *probe*, so a foreign process
 can still grab the index between it and the post-advance
