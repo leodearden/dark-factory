@@ -26,13 +26,17 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 ENC = '-home-leo-src-dark-factory'
 SID = 'sess-redact'
 TASK_ID = '6820'
-POOL_A = 'sk-ant-oat01-' + 'Pa' * 17 + 'z'
-OPENAI = 'sk-proj-' + 'Op' * 20
+ARCHIVING_SECRETS = {
+    'CLAUDE_OAUTH_TOKEN_A': 'sk-ant-oat01-' + 'Pa' * 17 + 'z',
+    'OPENAI_API_KEY': 'sk-proj-' + 'Op' * 20,
+    'OPENAI_PLAN_PROXY_KEY': 'plan-proxy-' + 'Pk' * 20,
+}
 OLD_MTIME_NS = 1_700_000_000_000_000_000
 
 
 def _transcript_lines() -> list[str]:
-    env_dump = f'PATH=/usr/bin\nCLAUDE_OAUTH_TOKEN_A={POOL_A}\nOPENAI_API_KEY={OPENAI}\nHOME=/h\n'
+    secrets = ''.join(f'{name}={value}\n' for name, value in ARCHIVING_SECRETS.items())
+    env_dump = f'PATH=/usr/bin\n{secrets}HOME=/h\n'
     return [
         json.dumps({'type': 'user', 'message': {'content': 'run env'}}),
         json.dumps({
@@ -61,10 +65,9 @@ def _archived_files(root: Path) -> list[Path]:
 
 def _assert_redacted_copy(archived: Path, *, size: int, line_count: int) -> None:
     data = archived.read_bytes()
-    assert POOL_A.encode() not in data
-    assert OPENAI.encode() not in data
-    assert b'<redacted:CLAUDE_OAUTH_TOKEN_A>' in data
-    assert b'<redacted:OPENAI_API_KEY>' in data
+    for name, value in ARCHIVING_SECRETS.items():
+        assert value.encode() not in data
+        assert f'<redacted:{name}>'.encode() in data
     assert len(data) == size
     lines = data.splitlines()
     assert len(lines) == line_count
@@ -74,8 +77,8 @@ def _assert_redacted_copy(archived: Path, *, size: int, line_count: int) -> None
 
 @pytest.fixture
 def archiving_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
-    monkeypatch.setenv('OPENAI_API_KEY', OPENAI)
+    for name, value in ARCHIVING_SECRETS.items():
+        monkeypatch.setenv(name, value)
 
 
 @pytest.fixture
