@@ -13672,6 +13672,7 @@ class Harness:
             reconcile_landing=self._reconcile_landing,
             merge_halt=self._merge_worker,
             event_store=self.event_store,
+            holds=holds,
         ).adopt(requests, schedule=self._schedule_coro_threadsafe)
         await holds.restore(requests)
         logger.info(
