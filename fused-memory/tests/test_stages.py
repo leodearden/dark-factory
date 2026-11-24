@@ -4785,6 +4785,15 @@ class TestCliStageRunnerCapWaitSanityBound:
 
         assert _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == 1800.0
 
+    def test_public_name_mirrors_private_name(self):
+        """(c) The public name RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable and the private name is an alias of it (task 9494; the alias goes in task 9501)."""
+        from fused_memory.reconciliation import (
+            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+        )
+
+        assert _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+
     @pytest.mark.asyncio
     async def test_run_stage_via_cli_forwards_cap_wait_sanity_secs(self, tmp_path):
         """(b) run_stage_via_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
