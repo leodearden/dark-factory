@@ -836,6 +836,7 @@ def _make_branch_reset_workflow(*, task_id: str = '2403') -> TaskWorkflow:
     wf.worktree = Path('/tmp/fake-worktree-2403')
     wf.artifacts = MagicMock()
     wf.artifacts.read_iteration_log = MagicMock(return_value=([], []))
+    wf.artifacts.lane_plan_fault = MagicMock(return_value=None)
     wf.plan = {'task_id': task_id, 'steps': []}
     wf.initial_plan = {'task_id': task_id, 'steps': []}
 
