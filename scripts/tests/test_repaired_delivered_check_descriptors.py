@@ -1,18 +1,11 @@
 """Live-corpus pins for repaired capability-manifest delivered_check descriptors.
 
-Three populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
-producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
-the stamper copies it from; task 9538 did the same for task 8461's file-existence
-gate, which a docstring had been satisfying as a grep. Tasks 5256 and 6209
-resynced sidecars, sidecar-only, to task records that had already been repaired. CI can never see the tasks.db half, so
-either way these pins guard the SIDECAR half: a stale sidecar would be
-re-stamped over the repaired record by the next re-decompose. Every resynced
-producer is done, as is 8461, so those rows are also evaluated at HEAD through
-the runtime primitive for their kind. They read only tracked files in this
-checkout and open no database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
-task-record half lives in reify's store; reify's tree is not this checkout, so
-its non-vacuity is checked behaviourally against committed fixture trees rather
-than at HEAD.
+A repaired descriptor has two halves: the producer task's ``metadata.delivered_checks``
+entry in tasks.db, and the sidecar the stamper copies it from. CI can never see the
+tasks.db half, so these pins guard the SIDECAR half: a stale sidecar would be
+re-stamped over the repaired record by the next re-decompose. Rows whose producer is
+done are also evaluated at HEAD through the runtime primitive for their kind. They
+read only tracked files in this checkout and open no database.
 
 MAINTENANCE CONTRACT: an exact pin also fires on a legitimate later both-sides
 re-repair. In that case, update the row here in the same change and re-run
@@ -118,7 +111,24 @@ _RESYNCED_TO_TASK_RECORD = [
     ),
 ]
 
-_REPAIRED_DESCRIPTORS = [*_REANCHORED, *_RESYNCED_TO_TASK_RECORD]
+# Task 6941: sidecar re-pointed after the rename its pattern names; the task-record
+# half is the post-merge operational task 10791.
+_REPOINTED_AFTER_RENAME = [
+    (
+        "plans/quality-metrics-snapshot-prd.capability-manifest.yaml",
+        6394, "S1", "workspace-domain-in-source-measures",
+        {"kind": "grep", "pattern": r"^def measurement_domain\(", "expect": "present",
+         "paths": ["scripts/source_measures.py"]},
+    ),
+    (
+        "plans/quality-metrics-snapshot-prd.capability-manifest.yaml",
+        6395, "S1b", "census-reads-workspace-domain",
+        {"kind": "grep", "pattern": r"measurement_domain\(", "expect": "present",
+         "paths": ["scripts/suite_census_pinning.py"]},
+    ),
+]
+
+_REPAIRED_DESCRIPTORS = [*_REANCHORED, *_RESYNCED_TO_TASK_RECORD, *_REPOINTED_AFTER_RENAME]
 
 _RETIRED_TO_MANUAL = [
     (
@@ -127,7 +137,9 @@ _RETIRED_TO_MANUAL = [
     ),
 ]
 
-# Task 6047: re-pointed foreign descriptor (producer reify:5616).
+# Task 6047: re-pointed foreign descriptor (producer reify:5616). Its task-record half
+# lives in reify's store and reify's tree is not this checkout, so its non-vacuity is
+# checked behaviourally against committed fixture trees rather than at HEAD.
 _KAPPA = (
     "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
     "κ", "reify-scripts-reduced-to-contract-primitives",
@@ -220,7 +232,9 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
 
 # Rows whose producer is done. The rest of _REANCHORED is left out: it holds a
 # pending producer (5324) whose forward-looking gate legitimately fails at HEAD.
-_DONE_PRODUCER_HEADS = [r[:4] for r in [*_RESYNCED_TO_TASK_RECORD, _QUALITY_BOUNDARY]]
+_DONE_PRODUCER_HEADS = [
+    r[:4] for r in [*_RESYNCED_TO_TASK_RECORD, _QUALITY_BOUNDARY, *_REPOINTED_AFTER_RENAME]
+]
 
 
 @pytest.mark.parametrize(

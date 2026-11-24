@@ -152,7 +152,7 @@ def pytest_project(root: Path) -> Path:
     defines class TestX (test_p, test_flaky) and test_q, test_e, test_s, test_r and
     test_live; fused-memory's defines only test_q.
     The root pyproject.toml declares those two as workspace members, so the
-    Part 2 census (``workspace_domain``) can enumerate the tree.
+    Part 2 census (``measurement_domain``) can enumerate the tree.
 
     - archived junit, run S1 (orchestrator): TestX::test_p[1]/[2] pass 2.0/3.0,
       test_q@grp failure 0.5, test_e error 0.2, test_s skipped,

@@ -555,7 +555,7 @@ def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
     started = time.monotonic()
     params = measurement_params()
     as_of = source_measures.head_commit(root)
-    domain = source_measures.workspace_domain(root)
+    domain = source_measures.measurement_domain(root)
     _require_clean_domain(root, as_of)
     measured = measure_domain(root, domain)
     _require_unmoved_head(root, as_of)
