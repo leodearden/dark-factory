@@ -28,7 +28,8 @@ import contextlib
 import os
 
 import pytest
-from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
+from _fm_qdrant_live import QDRANT_URL, assert_reapable, qdrant_skipif
+from _mem0_live_probe import probe_collection
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.models import VectorParams
@@ -42,16 +43,12 @@ FIXED_RECON_SUMMARY = (
     'Mem0.add(infer=False) ever dedup-drops a repeated recon system write.'
 )
 
-
-pytestmark = [
-    qdrant_skipif(),
-    pytest.mark.timeout(60),
-    # Whole module is a real, isolated-Qdrant probe (never a merge-lane gate):
-    # belongs in the integration/offline lane per task 3019 / the
-    # integration-test-lane PRD. fused-memory's `-m 'not integration'`
-    # addopts then deselects it from the merge lane's post-merge sweep.
-    pytest.mark.integration,
-]
+# Each live probe below is a real-Qdrant test (never a merge-lane gate), so it
+# carries qdrant_skipif(), timeout(60) and integration itself: it belongs in the
+# integration/offline lane per task 3019 / the integration-test-lane PRD, and
+# fused-memory's `-m 'not integration'` addopts deselects it from the merge
+# lane's post-merge sweep. The marks sit on the tests, not on the module, so the
+# pure reapability guard below still runs in the merge gate.
 
 
 @pytest.fixture
@@ -61,6 +58,13 @@ def recon_scope(worker_id) -> Scope:
         project_id=f'_test_recon_dedup_{worker_id}',
         agent_id='recon-stage-task_knowledge_sync',
     )
+
+
+def test_the_recon_dedup_probe_collection_is_one_the_reaper_can_reclaim(
+    probe_config, recon_scope,
+):
+    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(probe_collection(recon_scope, probe_config))
 
 
 @pytest.fixture
@@ -176,6 +180,9 @@ async def _assert_all_writes_land_distinct(backend, scope, *, n: int, run_id: st
     assert await backend.count(scope) == n
 
 
+@qdrant_skipif()
+@pytest.mark.timeout(60)
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_identical_infer_false_writes_all_land_distinct(
     mock_config, recon_scope, clean_collection, monkeypatch,
@@ -198,6 +205,9 @@ async def test_identical_infer_false_writes_all_land_distinct(
         await backend.close()
 
 
+@qdrant_skipif()
+@pytest.mark.timeout(60)
+@pytest.mark.integration
 @pytest.mark.skipif(not os.environ.get('OPENAI_API_KEY'), reason='real embedder needs OPENAI_API_KEY')
 @pytest.mark.asyncio
 async def test_identical_writes_land_with_real_openai_embeddings(
