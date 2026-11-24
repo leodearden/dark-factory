@@ -2,6 +2,7 @@
 
 import copy
 import errno
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from orchestrator.artifacts import (
     ArtifactWriteError,
     LanePlanFault,
     LanePlanFaultKind,
+    LanePlanOccupant,
     PlanConfirmation,
     PlanMutexNotHeld,
     PlanState,
@@ -3009,38 +3011,40 @@ def _other_task_plan(wt: Path) -> Path:
     return other
 
 
-def _relink(lane_plan: Path, target: Path) -> None:
+def _lane_entry_absent(lane_plan: Path, wt: Path) -> Path:
     lane_plan.unlink(missing_ok=True)
-    os.symlink(target, lane_plan)
+    return lane_plan
 
 
-def _lane_entry_absent(lane_plan: Path, wt: Path) -> None:
-    lane_plan.unlink(missing_ok=True)
-
-
-def _lane_entry_regular_file(lane_plan: Path, wt: Path) -> None:
-    content = lane_plan.read_text()
+def _lane_entry_regular_file(lane_plan: Path, wt: Path) -> Path:
+    content = lane_plan.read_bytes()
     lane_plan.unlink()
-    lane_plan.write_text(content)
+    lane_plan.write_bytes(content)
+    return lane_plan
 
 
-def _lane_entry_stray_dir(lane_plan: Path, wt: Path) -> None:
+def _lane_entry_stray_dir(lane_plan: Path, wt: Path) -> Path:
     lane_plan.unlink()
     lane_plan.mkdir()
     (lane_plan / 'junk.txt').write_text('stray')
+    return lane_plan
 
 
-def _lane_entry_other_task(lane_plan: Path, wt: Path) -> None:
-    _relink(lane_plan, _other_task_plan(wt))
+def _lane_entry_other_task(lane_plan: Path, wt: Path) -> Path:
+    other = _other_task_plan(wt)
+    lane_plan.unlink(missing_ok=True)
+    os.symlink(other, lane_plan)
+    return other
 
 
 _LANE_SABOTAGE = {
-    'absent': (_lane_entry_absent, LanePlanFaultKind.NOT_A_LINK),
-    'regular_file': (_lane_entry_regular_file, LanePlanFaultKind.NOT_A_LINK),
-    'stray_dir': (_lane_entry_stray_dir, LanePlanFaultKind.NOT_A_LINK),
-    'other_task': (_lane_entry_other_task, LanePlanFaultKind.WRONG_TARGET),
+    'absent': (_lane_entry_absent, LanePlanFaultKind.NOT_A_LINK, False),
+    'regular_file': (_lane_entry_regular_file, LanePlanFaultKind.NOT_A_LINK, True),
+    'stray_dir': (_lane_entry_stray_dir, LanePlanFaultKind.NOT_A_LINK, False),
+    'other_task': (_lane_entry_other_task, LanePlanFaultKind.WRONG_TARGET, False),
 }
-"""Each way a linked, planned lane's ``.task/plan.json`` is broken, and the kind it reads as."""
+"""Each way a linked, planned lane's ``.task/plan.json`` is broken: the breakage, which
+returns where the lane then resolves; the kind it reads as; whether it holds a regular file."""
 
 
 class TestLanePlanFault(_DualRootLayout):
@@ -3062,32 +3066,31 @@ class TestLanePlanFault(_DualRootLayout):
 
     @pytest.mark.parametrize('sabotage', sorted(_LANE_SABOTAGE))
     def test_each_broken_lane_entry_reads_as_its_kind(self, planned, lane_plan, wt, sabotage):
-        breaks, kind = _LANE_SABOTAGE[sabotage]
-        breaks(lane_plan, wt)
+        breaks, kind, holds_a_file = _LANE_SABOTAGE[sabotage]
+        resolves_to = breaks(lane_plan, wt)
 
         fault = planned.lane_plan_fault()
 
         assert isinstance(fault, LanePlanFault)
         assert fault.kind is kind
+        assert fault.resolved_path == Path(os.path.realpath(resolves_to))
+        assert (fault.occupant is not None) is holds_a_file
 
-    def test_never_linked_lane_is_not_a_link(self, arts):
-        arts.write_plan(copy.deepcopy(_PLAN))
-        assert arts.lane_plan_fault().kind is LanePlanFaultKind.NOT_A_LINK
-
-    def test_regular_file_with_identical_bytes_is_still_not_a_link(self, planned, lane_plan, wt, task):
+    @pytest.mark.parametrize(
+        ('edit', 'matches_plan'), [(None, True), (b'{"steps": "edited in the lane"}', False)],
+        ids=['plan_bytes', 'edited_bytes'],
+    )
+    def test_a_regular_file_in_the_lane_is_fingerprinted(self, planned, lane_plan, wt, edit, matches_plan):
         _lane_entry_regular_file(lane_plan, wt)
-        assert lane_plan.read_bytes() == (task / 'plan.json').read_bytes()
-
-        assert planned.lane_plan_fault().kind is LanePlanFaultKind.NOT_A_LINK
-
-    def test_wrong_target_resolves_to_the_other_tasks_plan(self, planned, lane_plan, wt):
-        other = _other_task_plan(wt)
-        _relink(lane_plan, other)
+        if edit is not None:
+            lane_plan.write_bytes(edit)
+        held = lane_plan.read_bytes()
 
         fault = planned.lane_plan_fault()
 
-        assert fault.kind is LanePlanFaultKind.WRONG_TARGET
-        assert fault.resolved_path == Path(os.path.realpath(other))
+        assert fault.kind is LanePlanFaultKind.NOT_A_LINK
+        assert fault.occupant == LanePlanOccupant(len(held), hashlib.sha256(held).hexdigest(), matches_plan)
+        assert fault.occupant.sha256 in fault.describe()
 
     def test_link_to_an_unwritten_plan_is_empty(self, arts):
         arts.ensure_lane_symlinks()
@@ -3127,7 +3130,7 @@ class TestLanePlanFault(_DualRootLayout):
 
     @pytest.mark.parametrize('sabotage', sorted(_LANE_SABOTAGE))
     def test_relinking_heals_every_link_fault(self, planned, lane_plan, wt, sabotage):
-        breaks, _ = _LANE_SABOTAGE[sabotage]
+        breaks, _kind, _holds_a_file = _LANE_SABOTAGE[sabotage]
         breaks(lane_plan, wt)
 
         planned.ensure_lane_symlinks()
