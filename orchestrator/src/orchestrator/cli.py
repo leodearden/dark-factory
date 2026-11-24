@@ -57,7 +57,8 @@ DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 # How long after asyncio.run() returns to wait before force-exiting.
 # The watchdog is armed AFTER asyncio.run() returns (not before) so that
 # long orchestration runs are never affected. After this deadline a diagnostic
-# dump is written to stderr and os._exit(137) fires.
+# dump is written to stderr and os._exit(137) fires. asyncio.run()'s own
+# teardown is bounded separately, by the teardown watchdog below.
 SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
 
 # Bounds asyncio.run()'s own teardown, which starts once the main coroutine has ended.
@@ -349,10 +350,11 @@ def run(prd: Path | None, config: OrchestratorConfig, dry_run: bool, delay: str 
         )
 
     try:
-        report = asyncio.run(_main())
+        report = _run_with_bounded_teardown(_main, teardown_secs=TEARDOWN_WATCHDOG_TIMEOUT_SECS)
     except asyncio.CancelledError:
         click.echo('Orchestrator cancelled', err=True)
-        # asyncio.run() has returned — arm the watchdog NOW to guard interpreter
+        # asyncio.run() has returned, its teardown bounded by the teardown
+        # watchdog and that watchdog disarmed — arm this one NOW to guard interpreter
         # shutdown (atexit callbacks + threading._shutdown() joining non-daemon
         # threads). The watchdog is intentionally NOT disarmed: if shutdown
         # completes cleanly, the daemon thread is killed with the process;
@@ -367,7 +369,9 @@ def run(prd: Path | None, config: OrchestratorConfig, dry_run: bool, delay: str 
 
     # asyncio.run() has returned and the report has been emitted — arm the watchdog
     # NOW to guard interpreter shutdown (atexit callbacks + threading._shutdown()
-    # joining non-daemon threads). Placed AFTER click.echo so user-visible work is
+    # joining non-daemon threads). asyncio.run()'s own teardown was bounded
+    # separately, by the teardown watchdog, which is disarmed before the report
+    # echo. Placed AFTER click.echo so user-visible work is
     # not covered by the timer; placed BEFORE the sys.exit(1) branch so both the
     # clean and blocked-exit paths are guarded — non-daemon threads from
     # harness.run() can linger regardless of whether tasks were blocked.
