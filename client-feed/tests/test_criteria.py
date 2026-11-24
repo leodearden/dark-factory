@@ -7,12 +7,22 @@ from typing import Any
 import pytest
 import yaml
 
-from client_feed.contract import Criterion, CriterionKind
+from client_feed.contract import (
+    CaseOutcome,
+    CaseResult,
+    Criterion,
+    CriterionKind,
+    CriterionOutcome,
+    CriterionResult,
+)
 from client_feed.criteria import (
+    BoundReport,
     CriteriaError,
     CriteriaProblem,
+    MapEntry,
     collection_map_path,
     criterion_bindings,
+    join_criteria,
     parse_criteria,
     read_collection_map,
 )
@@ -196,3 +206,143 @@ def test_a_symlinked_map_is_refused_and_never_followed(tmp_path: Path) -> None:
     (tmp_path / MAP_NAME).symlink_to(target)
 
     _map_refusal(tmp_path / MAP_NAME, CriteriaProblem.UNREADABLE)
+
+
+# the join
+
+DECLARED = tuple(
+    Criterion.model_validate({**CRITERION, 'id': criterion_id}) for criterion_id in ('C-1', 'C-2', 'C-3')
+)
+
+
+def _case(case_id: str, outcome: CaseOutcome) -> CaseResult:
+    return CaseResult(
+        id=case_id, outcome=outcome, duration_ms=None, criterion=None, exception_type=None
+    )
+
+
+def _report(cases: list[CaseResult], marked: dict[str, str]) -> BoundReport:
+    """A report whose collection map marks each nodeid in `marked` with its criterion."""
+    collection_map = {
+        nodeid: MapEntry(defects=(), criterion=criterion) for nodeid, criterion in marked.items()
+    }
+    return BoundReport(cases=tuple(cases), criteria=criterion_bindings(collection_map))
+
+
+def _outcomes(results: tuple[CriterionResult, ...]) -> dict[str, CriterionOutcome]:
+    return {result.id: result.outcome for result in results}
+
+
+@pytest.mark.criterion('CF-1')
+def test_b20_a_criterion_reads_its_bound_tests() -> None:
+    report = _report(
+        [
+            _case('tests.test_a::test_ok', CaseOutcome.PASSED),
+            _case('tests.test_a::test_bad', CaseOutcome.FAILED),
+            _case('tests.test_a::test_free', CaseOutcome.PASSED),
+        ],
+        {'tests/test_a.py::test_ok': 'C-1', 'tests/test_a.py::test_bad': 'C-2'},
+    )
+
+    assert join_criteria(DECLARED, [report]) == (
+        CriterionResult(id='C-1', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_ok',)),
+        CriterionResult(id='C-2', outcome=CriterionOutcome.FAILED, tests=('tests.test_a::test_bad',)),
+        CriterionResult(id='C-3', outcome=CriterionOutcome.NOT_RUN, tests=()),
+    )
+
+
+def test_an_errored_bound_case_fails_its_criterion() -> None:
+    report = _report(
+        [_case('tests.test_a::test_a', CaseOutcome.ERRORED)], {'tests/test_a.py::test_a': 'C-1'}
+    )
+
+    assert _outcomes(join_criteria(DECLARED, [report]))['C-1'] is CriterionOutcome.FAILED
+
+
+def test_a_bound_test_with_no_case_leaves_its_criterion_not_run() -> None:
+    report = _report(
+        [_case('tests.test_a::test_other', CaseOutcome.PASSED)], {'tests/test_a.py::test_a': 'C-1'}
+    )
+
+    (c1, *_) = join_criteria(DECLARED, [report])
+
+    assert c1 == CriterionResult(
+        id='C-1', outcome=CriterionOutcome.NOT_RUN, tests=('tests.test_a::test_a',)
+    )
+
+
+def test_a_skipped_bound_test_leaves_its_criterion_not_run() -> None:
+    report = _report(
+        [
+            _case('tests.test_a::test_a', CaseOutcome.SKIPPED),
+            _case('tests.test_a::test_b', CaseOutcome.PASSED),
+        ],
+        {'tests/test_a.py::test_a': 'C-1', 'tests/test_a.py::test_b': 'C-1'},
+    )
+
+    assert _outcomes(join_criteria(DECLARED, [report]))['C-1'] is CriterionOutcome.NOT_RUN
+
+
+def test_one_red_case_of_a_shared_id_fails_its_criterion() -> None:
+    report = _report(
+        [
+            _case('tests.test_a::test_a', CaseOutcome.PASSED),
+            _case('tests.test_a::test_a', CaseOutcome.FAILED),
+        ],
+        {'tests/test_a.py::test_a': 'C-1'},
+    )
+
+    assert _outcomes(join_criteria(DECLARED, [report]))['C-1'] is CriterionOutcome.FAILED
+
+
+def test_passed_needs_every_bound_test_to_have_passed_cases() -> None:
+    every = _report(
+        [
+            _case('tests.test_a::test_a', CaseOutcome.PASSED),
+            _case('tests.test_a::test_b', CaseOutcome.PASSED),
+        ],
+        {'tests/test_a.py::test_a': 'C-1', 'tests/test_a.py::test_b': 'C-1'},
+    )
+    one_missing = _report(
+        [_case('tests.test_a::test_a', CaseOutcome.PASSED)],
+        {'tests/test_a.py::test_a': 'C-1', 'tests/test_a.py::test_b': 'C-1'},
+    )
+
+    assert _outcomes(join_criteria(DECLARED, [every]))['C-1'] is CriterionOutcome.PASSED
+    assert _outcomes(join_criteria(DECLARED, [one_missing]))['C-1'] is CriterionOutcome.NOT_RUN
+
+
+def test_a_binding_to_an_undeclared_criterion_is_ignored() -> None:
+    report = _report(
+        [_case('tests.test_a::test_a', CaseOutcome.FAILED)], {'tests/test_a.py::test_a': 'C-9'}
+    )
+
+    assert join_criteria(DECLARED, [report]) == tuple(
+        CriterionResult(id=criterion.id, outcome=CriterionOutcome.NOT_RUN, tests=())
+        for criterion in DECLARED
+    )
+
+
+def test_the_join_is_per_report() -> None:
+    bound = _report(
+        [_case('tests.test_a::test_a', CaseOutcome.PASSED)], {'tests/test_a.py::test_a': 'C-1'}
+    )
+    unbound = _report([_case('tests.test_a::test_a', CaseOutcome.FAILED)], {})
+
+    (c1, *_) = join_criteria(DECLARED, [bound, unbound])
+
+    assert c1 == CriterionResult(
+        id='C-1', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_a',)
+    )
+
+
+def test_bound_test_ids_are_sorted_and_unique() -> None:
+    cases = [
+        _case('tests.test_a::test_b', CaseOutcome.PASSED),
+        _case('tests.test_a::test_a', CaseOutcome.PASSED),
+    ]
+    marked = {'tests/test_a.py::test_b': 'C-1', 'tests/test_a.py::test_a': 'C-1'}
+
+    (c1, *_) = join_criteria(DECLARED, [_report(cases, marked), _report(cases, marked)])
+
+    assert c1.tests == ('tests.test_a::test_a', 'tests.test_a::test_b')
