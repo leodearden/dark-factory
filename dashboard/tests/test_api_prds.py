@@ -295,11 +295,11 @@ def _serve_a_held_corpus_walk(
 
     monkeypatch.setattr(escalation_corpus, 'walk_corpus', _walk_after_the_first_response)
     try:
-        first = render(T0)
+        held = render(T0)
     finally:
         answered.set()
-    later = _render_until_fresh(render, T0 + timedelta(seconds=20))
-    return first, later
+    later = render_prds_settled(client, T0 + timedelta(seconds=20))['PRD_VIEW'][ROOT]
+    return held, later
 
 
 def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_request(
@@ -320,25 +320,28 @@ def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_requ
 def test_a_held_corpus_walk_degrades_only_the_view_when_the_run_ledger_opens_cold(
     client, tmp_path, monkeypatch,
 ):
-    """Every run-ledger open completes only once a response is back, so the first render's own
-    open outlasts its request wait at any load."""
+    """Every run-ledger open completes only once a response is back, so the scenario's first
+    (settling) render's own open outlasts its request wait at any load."""
     monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
     with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
         responded = threading.Event()
         client.event_hooks['response'].append(lambda response: responded.set())
         connect = aiosqlite.connect
+        gated: list[tuple[Any, ...]] = []
 
         async def _connect_once_a_response_is_back(*args, **kwargs):
+            gated.append(args)
             await asyncio.to_thread(responded.wait, _SETTLE_DEADLINE)
             return await connect(*args, **kwargs)
 
         monkeypatch.setattr(aiosqlite, 'connect', _connect_once_a_response_is_back)
-        first, later = _serve_a_held_corpus_walk(client, render, monkeypatch)
+        held, later = _serve_a_held_corpus_walk(client, render, monkeypatch)
 
-    contention = first['PRD_CONTENTION'][ROOT]
+    assert gated, 'the run-ledger open never reached the response gate, so this test no longer forces a cold open'
+    contention = held['PRD_CONTENTION'][ROOT]
     assert contention['state'] == 'fresh', contention['reason']
-    assert first['PRD_VIEW'][ROOT]['state'] == 'unknown'
-    assert 'escalations: ' in first['PRD_VIEW'][ROOT]['reason']
+    assert held['PRD_VIEW'][ROOT]['state'] == 'unknown'
+    assert 'escalations: ' in held['PRD_VIEW'][ROOT]['reason']
     assert later['state'] == 'fresh'
 
 
