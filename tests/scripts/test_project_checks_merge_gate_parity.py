@@ -306,12 +306,17 @@ class _Unit:
     pgid: int
 
 
-def _started_unit(pid_file: Path, out_path: Path) -> _Unit:
-    """The unit that wrote *pid_file*, with its process group read while it is still alive."""
-    assert _eventually(lambda: pid_file.is_file() and pid_file.read_text().strip() != '', 120), (
+def _await_written(path: Path, out_path: Path) -> str:
+    """What a unit wrote to *path*, once it has written anything."""
+    assert _eventually(lambda: path.is_file() and path.read_text().strip() != '', 120), (
         out_path.read_text(encoding='utf-8')
     )
-    pid = int(pid_file.read_text())
+    return path.read_text()
+
+
+def _started_unit(pid_file: Path, out_path: Path) -> _Unit:
+    """The unit that wrote *pid_file*, with its process group read while it is still alive."""
+    pid = int(_await_written(pid_file, out_path))
     stat = read_stat_fields(Path(f'/proc/{pid}'), skip_malformed=False)
     assert stat is not None, f'unit pid {pid} exited before its process group could be read'
     return _Unit(pid, stat.pgrp)
@@ -393,11 +398,16 @@ def test_an_interrupted_commit_stops_its_units_and_removes_their_logs(
 def test_an_interrupted_commit_stops_what_an_uncollected_unit_left_when_its_shell_exited(tmp_path: Path) -> None:
     blocker_pid_file = tmp_path / 'blocker.pid'
     orphan_pid_file = tmp_path / 'orphan.pid'
+    last_unit_file = tmp_path / 'last_unit.pid'
     blocker = f'sh -c {shlex.quote(f"echo $$ > {blocker_pid_file}; exec sleep 300")}'
     orphan = shlex.quote(
         f"trap '' INT; while kill -0 \"$1\" 2>/dev/null; do sleep 0.1; done; echo $$ > {orphan_pid_file}; exec sleep 300"
     )
-    commands = {'escalation': blocker, 'm1': f'sh -c {orphan} unit-shell $$ &', 'shared': 'true'}
+    commands = {
+        'escalation': blocker,
+        'm1': f'sh -c {orphan} unit-shell $$ &',
+        'shared': f'echo $$ > {shlex.quote(str(last_unit_file))}',
+    }
     repo = make_hook_repo(tmp_path, _type_only_modules(commands.__getitem__, 'm1'))
     before = repo.head()
     repo.stage('shared/src/x.py', 'x = 1\n')
@@ -411,6 +421,7 @@ def test_an_interrupted_commit_stops_what_an_uncollected_unit_left_when_its_shel
         units.append(_started_unit(blocker_pid_file, out_path))
         units.append(_started_unit(orphan_pid_file, out_path))
         pid = units[-1].pid
+        _await_written(last_unit_file, out_path)
         _ctrl_c(commit.pid)
         commit.wait(timeout=60)
         stopped = _eventually(lambda: not _pid_alive(pid), 30)
