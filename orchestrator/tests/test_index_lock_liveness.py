@@ -31,6 +31,8 @@ from orchestrator.index_lock_liveness import (
     scan_work_tree_git_processes,
 )
 
+_EXIT_TIMEOUT_S = 30.0
+
 
 def _env_fenced_at_parent_of(cwd: Path) -> dict[str, str]:
     env = git_env_with_ceiling(cwd)
@@ -56,10 +58,10 @@ def _waiting_on_stdin(argv: list[str], cwd: Path) -> Iterator[subprocess.Popen[b
         assert proc.stdin is not None
         proc.stdin.close()
         try:
-            proc.wait(timeout=30)
+            proc.wait(timeout=_EXIT_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=30)
+            proc.wait(timeout=_EXIT_TIMEOUT_S)
 
 
 def _pids(work_tree: Path) -> set[int]:
