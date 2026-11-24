@@ -56,7 +56,7 @@ class VerifyCacheAuditHook:
     def __init__(
         self,
         registry: Registry,
-        escalation_queue: EscalationQueue | None,
+        escalation_queue: EscalationQueue,
         *,
         now: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -102,14 +102,6 @@ class VerifyCacheAuditHook:
 
     def _sync_blockers(self, response: LeakResponse, now: datetime) -> None:
         """Resolve the blockers of ended disables, then file the live disable's blocker if it has none."""
-        if self._queue is None:
-            if response.l2_required:
-                logger.error(
-                    'verify-cache audit: the cache is DISABLED until %s but there is no escalation queue '
-                    'to file its L2 blocker on',
-                    response.policy.disabled_until,
-                )
-            return
         resolve_ended_blockers(
             self._queue, response.policy, now,
             resolved_by=AUDIT_ESCALATION_ROLE,

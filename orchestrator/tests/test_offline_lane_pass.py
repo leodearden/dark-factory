@@ -392,6 +392,7 @@ def test_a_verify_cache_leak_note_reaches_the_task_the_lane_files(tmp_path):
 def test_without_a_wired_queue_the_audit_files_its_kill_switch_blocker_on_the_projects_queue(tmp_path):
     _seed_leaks(tmp_path, ALPHA_KEY, BETA_KEY)
     (hook,) = lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), None)
+    assert isinstance(hook, VerifyCacheAuditHook)
 
     asyncio.run(hook(AUDIT_COMMAND, HEAD1, Confirmed(ConfirmMode.INTERSECTED, (ALPHA_NODE, BETA_NODE), (), ()), ()))
 
