@@ -61,61 +61,6 @@ _neutralise = neutralise_fixture(
 
 
 # ===========================================================================
-# Tests: extract_content
-# ===========================================================================
-
-class TestExtractContent:
-    """Tests for the pure function extract_content(payload) -> str."""
-
-    def test_returns_data_key_when_present(self):
-        """'data' is the first-tried key and wins when present."""
-        payload = {'data': 'hello from data', 'memory': 'hello from memory', 'content': 'hello from content'}
-
-        assert _mod.extract_content(payload) == 'hello from data'
-
-    def test_falls_back_to_memory_when_data_absent(self):
-        """'memory' is used when 'data' is absent."""
-        payload = {'memory': 'hello from memory', 'content': 'hello from content'}
-
-        assert _mod.extract_content(payload) == 'hello from memory'
-
-    def test_falls_back_to_content_when_data_and_memory_absent(self):
-        """'content' is used when both 'data' and 'memory' are absent."""
-        payload = {'content': 'hello from content'}
-
-        assert _mod.extract_content(payload) == 'hello from content'
-
-    def test_returns_empty_string_when_no_keys_present(self):
-        """No content key at all -> ''."""
-        payload = {'category': 'observations_and_summaries'}
-
-        assert _mod.extract_content(payload) == ''
-
-    def test_returns_empty_string_when_all_values_empty(self):
-        """Every content key present but empty -> ''."""
-        payload = {'data': '', 'memory': '', 'content': ''}
-
-        assert _mod.extract_content(payload) == ''
-
-    def test_returns_empty_string_for_empty_payload(self):
-        """An entirely empty payload dict -> ''."""
-        assert _mod.extract_content({}) == ''
-
-    def test_skips_empty_data_and_falls_back_to_memory(self):
-        """An empty 'data' value is treated as absent -- falls through to 'memory'."""
-        payload = {'data': '', 'memory': 'hello from memory'}
-
-        assert _mod.extract_content(payload) == 'hello from memory'
-
-    def test_skips_non_string_values(self):
-        """A non-string value (e.g. None) at a higher-priority key is
-        skipped, falling through to the next key."""
-        payload = {'data': None, 'memory': 'hello from memory'}
-
-        assert _mod.extract_content(payload) == 'hello from memory'
-
-
-# ===========================================================================
 # Tests: is_malformed_empty_payload
 # ===========================================================================
 

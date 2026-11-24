@@ -242,9 +242,10 @@ class CuratorDecision:
     pool_sizes: dict[str, int] = field(default_factory=dict)
     latency_ms: int = 0
     cost_usd: float = 0.0
-    # Set only by TaskCurator.curate_prepared when a candidate is a duplicate
-    # of another candidate in the same batch (neither yet materialised as a task).
-    # The worker substitutes the sibling's resulting task_id at dispatch time.
+    # Set only by TaskCurator.curate_prepared on a batch edge: a drop or combine
+    # of a candidate onto another candidate in the same batch (neither yet
+    # materialised as a task). The worker substitutes the sibling's resulting
+    # task_id at dispatch time.
     batch_target_index: int | None = None
     # True for a fail-open create that no dedupe judgement stands behind: the
     # response itself was unusable, or the curator never got one. False for a

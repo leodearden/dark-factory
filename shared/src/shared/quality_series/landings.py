@@ -24,6 +24,7 @@ __all__ = [
     'UnrecognisedTrainEvent',
     'landings',
     'parse_utc',
+    'recorded_landing_instants',
     'recorded_landing_keys',
 ]
 
@@ -245,6 +246,17 @@ def recorded_landing_keys(
         for recorded in _recorded_history(runs_db)
         if recorded_after is None or recorded.landed > recorded_after
     )
+
+
+def recorded_landing_instants(
+    runs_db: sqlite3.Connection, *, after: datetime, until: datetime,
+) -> tuple[datetime, ...]:
+    """When each landing recorded in (after, until] landed, oldest first, one per train member; reads runs.db, never git."""
+    if after.tzinfo is None or until.tzinfo is None:
+        raise ValueError(f'a landing window carries its offsets (after={after!r}, until={until!r})')
+    if after > until:
+        raise ValueError(f'a landing window ends no earlier than it starts (after={after!r}, until={until!r})')
+    return tuple(sorted(r.landed for r in _recorded_history(runs_db) if after < r.landed <= until))
 
 
 def _mark_late_claims(records: list[_Recorded]) -> list[_Recorded]:

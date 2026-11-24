@@ -90,18 +90,17 @@ test('sketch #9: the donut centre, attemptCount over the served attempts Datum, 
   }
 });
 
-test('the depth chart names the bucket width its served labels are spaced at', async () => {
-  const expected = { '24h': '15-min buckets', '7d': '1-h buckets' };
-  for (const [win, caption] of Object.entries(expected)) {
-    const { client } = await mergeBlock(win);
-    const { projectDepth, depthBucketCaption } = client.window.DF_MERGE_QUEUE;
-    const depth = projectDepth(client.window.DF_DATA, 'dark-factory').value;
-    const { labels, bucket_minutes: bucketMinutes } = depth;
+// The done merges land 2h, 20h, 30h and 70h before T0: two in the day, four in the week.
+const THROUGHPUT_READING = { '24h': 'now 2/day · mean 2/day', '7d': 'now 2/day · mean 0.57/day' };
 
-    assert.equal(depthBucketCaption(depth), caption, win);
-    assert.ok(labels.length >= 2, `${win}: the fixture's merges leave at least two buckets after the trim`);
-    for (let i = 1; i < labels.length; i += 1) {
-      assert.equal(Date.parse(labels[i]) - Date.parse(labels[i - 1]), bucketMinutes * 60_000, `${win} gap at ${i}`);
-    }
+test('the throughput panel names the trailing window its served rate was computed over', async () => {
+  for (const win of ['24h', '7d']) {
+    const { client } = await mergeBlock(win);
+    const { projectLandingRate, landingRateCaption, landingRateReading } = client.window.DF_MERGE_QUEUE;
+    const rate = projectLandingRate(client.window.DF_DATA, 'dark-factory').value;
+
+    assert.equal(landingRateCaption(rate), 'landings/day · 1-day trailing', win);
+    const reading = landingRateReading(rate);
+    assert.ok(reading.startsWith(THROUGHPUT_READING[win]), `${win}: ${reading}`);
   }
 });

@@ -19,16 +19,16 @@ runs:
     ``window_chip.js::recentMergesCaption``, covered by
     dashboard/tests/js/window_chip.test.mjs.
   * The "Merges (window)" tile and its spark, the per-project "attempts" and
-    "p50" pips, the depth, outcomes and latency panels and the worst-project
-    p95 tile read the served ``depth`` and ``attempts`` Datums through
+    "p50" pips, the outcomes and latency panels and the worst-project p95
+    tile read the served ``depth`` and ``attempts`` Datums through
     ``merge_queue.js`` (``projectDepth``, ``projectAttempts``,
     ``attemptCount``, ``attemptsOver``, ``attemptsHistory``,
     ``worstP95Over``), covered by dashboard/tests/js/merge_queue.test.mjs and,
     in the mounted MergeTab, by dashboard/tests/js/jsx_render.test.mjs.
-  * The depth panel's bucket-width caption is
-    ``merge_queue.js::depthBucketCaption``, covered by
-    dashboard/tests/js/merge_queue.test.mjs and, in the mounted MergeTab, by
-    dashboard/tests/js/jsx_render.test.mjs.
+  * The Throughput panel reads the served ``landing_rate`` Datum through
+    ``merge_queue.js`` (``projectLandingRate``, ``landingRateCaption``,
+    ``landingRateReading``), covered by dashboard/tests/js/merge_queue.test.mjs
+    and, in the mounted MergeTab, by dashboard/tests/js/jsx_render.test.mjs.
 
 What is left for this file is the WIRING that source text can settle and
 behaviour cannot: that MergeTab and the rail stopped reading two wire keys the

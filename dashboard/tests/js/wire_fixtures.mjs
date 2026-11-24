@@ -226,18 +226,22 @@ function unreadWireDatum(reason) {
 
 // One MERGE_QUEUE[project] block, as data/redux_api.py::shape_merge_queue
 // serves it: a measured, empty queue whose depth series holds `buckets` labels
-// ending at WIRE_AS_OF, `bucketMinutes` apart, every count zero but the newest.
-// A null `bucketMinutes` is a series that names no width; its labels are then
-// hourly. `outcomes` counts the window's untimed attempts by outcome. With
-// `unread`, the project's runs.db could not be read, so its depth and attempts
-// are unknown. With `noRunsDb`, the project has no runs.db file at all: it is
-// served runs_db_present false, its depth and attempts unknown saying so.
-// `active`, `recent` and `metrics` are served as given.
+// ending at WIRE_AS_OF, `bucketMinutes` apart (hourly when null), every count
+// zero but the newest. Its landing rate counts each point over `trailingMinutes` (null names
+// no trailing window): `rates` per point at labels spaced like the depth's, or,
+// when null, 1/day at each depth label, and serves `meanPerDay` as the window mean
+// the server counted over the whole window. `outcomes` counts the window's untimed
+// attempts by outcome. With `unread`, the project's runs.db could not be read,
+// so its depth, landing rate and attempts are unknown. With `noRunsDb`, the
+// project has no runs.db file at all: it is served runs_db_present false, its
+// depth, landing rate and attempts unknown saying so. `active`, `recent` and
+// `metrics` are served as given.
 export function mergeQueueBlock({
-  bucketMinutes = null, buckets = 3, outcomes = {}, unread = false, noRunsDb = false,
-  active = [], recent = [], metrics = {},
+  bucketMinutes = null, buckets = 3, trailingMinutes = 1440, rates = null, meanPerDay = 1, outcomes = {},
+  unread = false, noRunsDb = false, active = [], recent = [], metrics = {},
 } = {}) {
   const labels = sampleLabels(buckets, bucketMinutes ?? 60);
+  const rateLabels = rates ? sampleLabels(rates.length, bucketMinutes ?? 60) : labels;
   const outcomeLabels = Object.keys(outcomes);
   const outcomeValues = outcomeLabels.map(label => outcomes[label]);
   const attempts = outcomeValues.reduce((sum, n) => sum + n, 0);
@@ -248,7 +252,13 @@ export function mergeQueueBlock({
   return {
     depth: unread
       ? unreadWireDatum(unreadReason)
-      : wireDatum({ labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)), bucket_minutes: bucketMinutes }),
+      : wireDatum({ labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)) }),
+    landing_rate: unread
+      ? unreadWireDatum(unreadReason)
+      : wireDatum({
+        labels: rateLabels, values: rates ?? labels.map(() => 1),
+        trailing_minutes: trailingMinutes, window_mean_per_day: meanPerDay,
+      }),
     attempts: unread
       ? unreadWireDatum(unreadReason)
       : wireDatum({

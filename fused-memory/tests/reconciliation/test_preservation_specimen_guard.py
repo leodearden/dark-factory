@@ -400,7 +400,7 @@ class TestFlagAssertsStranded:
 #: A Mem0 row shaped exactly like the live Qdrant payload
 #: ``get_memories_by_metadata`` returns: ``metadata`` is the FULL payload, so
 #: the prose lives under ``metadata['data']`` and is reachable only through the
-#: canonical ``_mem0_content`` key fallback.
+#: canonical ``fused_memory/utils/mem0_content_keys.py::mem0_payload_text`` key fallback.
 LIVE_MEM0_ROW = {
     'id': 'd489942a-96b8-45a2-a0a2-fdad36741ff2',
     'created_at': '2026-08-10T17:22:17.388627+00:00',
@@ -633,7 +633,7 @@ class TestFilterPreservationSpecimenFlagsMem0Channel:
         """A row storing its text under 'memory' rather than 'data' still matches.
 
         The raw-payload key order (``data`` -> ``memory`` -> ``content``) is
-        owned by ``memory_service._MEM0_CONTENT_KEYS`` and imported, not
+        owned by ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` and imported, not
         re-spelled here — guessing one key is exactly the mistake that helper
         exists to prevent.
         """
