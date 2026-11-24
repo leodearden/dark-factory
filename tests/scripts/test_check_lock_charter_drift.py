@@ -2,7 +2,7 @@
 
 WHY THIS SCRIPT EXISTS AT ALL, restated here because it is what every
 assertion below is shaped by.  On 2026-07-29 reify widened its lock-charter
-allowlist 36 -> 58 entries.  dark-factory's in-suite Tier-2 drift guard shells
+allowlist 36 -> 58 entries.  dark-factory's in-suite Tier-2 drift guard then shelled
 out to reify's ``scripts/lock-charter-guard.sh`` LIVE, so every dark-factory
 worktree's full suite went red at once, and task 3118's ``post_merge_verify``
 failed on a 7-file orchestrator-only diff that could not possibly have caused
@@ -13,8 +13,8 @@ by pytest, so a reify commit reports drift where drift belongs instead of
 blocking an unrelated dark-factory merge.
 
 THE OUTCOME CONTRACT IS THE WHOLE POINT, and it is why there is no skip state.
-The in-suite guards degrade to a pytest SKIP when reify is not checked out, and
-a skip is indistinguishable from a pass to anything reading an exit code — the
+The retired in-suite guards degraded to a pytest SKIP when reify was not checked
+out, and a skip is indistinguishable from a pass to anything reading an exit code — the
 precise conflation this task's other half fixes inside verify.  So this script
 has exactly three outcomes, ``EXIT_OK`` / ``EXIT_DRIFT`` / ``EXIT_UNAVAILABLE``,
 and "I could not look" is reported as loudly as "I looked and found drift".
@@ -216,7 +216,7 @@ class TestCheckVectors:
     def test_absent_guard_script_is_unavailable_and_never_ok(self, tmp_path):
         """A reify directory carrying no guard script did not answer the question.
 
-        This is the arm the in-suite guards turn into a pytest SKIP.  Here it
+        This is the arm the retired in-suite guards turned into a pytest SKIP.  Here it
         must be an outcome a caller can see, because a scheduled job whose
         sibling checkout has gone missing is exactly the case where a silent
         green is most dangerous: it would read as "the mirrors agree" forever.
@@ -237,7 +237,7 @@ class TestCheckVectors:
     def test_present_but_failing_guard_is_unavailable_not_ok_and_not_drift(self, tmp_path):
         """A broken emitter is not agreement and it is not disagreement.
 
-        Mirrors ``_reify_guard_vector``'s loud-on-broken rationale: an
+        The loud-on-broken rationale on ``drift._guard_vector``: an
         unrecognised flag on the live script exits 2, so a checker that
         swallowed a non-zero rc into "no output, therefore both vectors empty,
         therefore drift" — or worse, into OK — would report a confident answer
@@ -348,7 +348,7 @@ class TestImportIsHermetic:
         """A fresh interpreter whose resolver and process spawners all raise
         must still import the module.
 
-        Module-level resolution is what makes the in-suite guards' constants
+        Module-level resolution is what made the retired in-suite guards' constants
         evaluate at IMPORT time and therefore un-steerable by ``monkeypatch``;
         here it would also make a scheduled job's ``--help`` depend on the
         ambient ``REIFY_ROOT``.  Patching the seams themselves, rather than
@@ -789,8 +789,7 @@ class TestCheckComposition:
 # matrix, nearest-ancestor precedence, marker-less-dir shadowing, and the whole
 # REIFY_ROOT override contract — in one place, 40-plus cases.  Restating it here
 # would mean two suites to edit for one semantic change, which is the exact
-# duplication the promotion of that module to shared/ existed to remove (see
-# `TestReifyCheckoutAdapter`'s note in fused-memory's copy).
+# duplication the promotion of that module to shared/ existed to remove.
 #
 # What THIS file pins is only what is specific to THIS call site: that it
 # DELEGATES rather than keeping a private copy of the walk, that it binds the
@@ -1015,7 +1014,7 @@ class TestMainCli:
         assert payload['exit_code'] == rc == drift.EXIT_UNAVAILABLE
 
     def test_discovery_miss_message_is_single_sourced(self, monkeypatch, capsys):
-        """The miss wording must be EXACTLY what the in-suite gates say.
+        """The miss wording must be EXACTLY what `reify_skip_reason` says.
 
         Two call sites describing the same condition in two hand-rolled strings
         is how "reify is not checked out" and "your REIFY_ROOT is wrong" get
