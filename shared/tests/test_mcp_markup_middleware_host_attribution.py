@@ -9,8 +9,8 @@ header. The ``host_attribution`` provider supplies that knowledge as a
 :class:`HostAttribution`. It fills only the axes the arguments left ``None``;
 arguments always win, and a provider that fails changes nothing.
 
-Also pins :func:`residue_caller_lines`, the one rendering of a residue
-record's caller lines that every residue filer shares.
+Also pins :func:`residue_header_lines`, the one rendering of a residue
+record's header lines, its caller first, that every residue filer shares.
 
 Driven through a ``Client``, the one harness that runs registered middleware,
 over a small toy server.
@@ -36,10 +36,11 @@ from shared.mcp_markup_middleware import (
     MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
     RESIDUE_CALLER_KEYS,
+    RESIDUE_HEADER_KEYS,
     HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
-    residue_caller_lines,
+    residue_header_lines,
 )
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 
@@ -227,7 +228,7 @@ class TestWithNoProviderAttributionIsArgumentOnly:
         await h.refusal('add_note', {'title': 't', 'detail': _UNREPAIRABLE})
 
         [residue] = h.residues
-        assert {key: residue[key] for key in RESIDUE_CALLER_KEYS[:4]} == {
+        assert {key: residue[key] for key in RESIDUE_CALLER_KEYS} == {
             'subject_task_id': None, 'subject_agent_role': None, 'agent_id': None, 'project': None,
         }
         [storm] = h.storms
@@ -240,12 +241,13 @@ class TestHostAttribution:
         assert HostAttribution() == HostAttribution(agent_id=None, agent_role=None)
 
 
-class TestResidueCallerLines:
+class TestResidueHeaderLines:
 
-    def test_the_keys_and_their_order(self):
-        assert RESIDUE_CALLER_KEYS == (
-            'subject_task_id', 'subject_agent_role', 'agent_id', 'project', 'override_swallowed',
-        )
+    def test_the_caller_keys_and_their_order(self):
+        assert RESIDUE_CALLER_KEYS == ('subject_task_id', 'subject_agent_role', 'agent_id', 'project')
+
+    def test_the_header_is_the_caller_then_the_leak(self):
+        assert RESIDUE_HEADER_KEYS == (*RESIDUE_CALLER_KEYS, 'override_swallowed')
 
     def test_one_key_equals_repr_line_per_key_in_order(self):
         record = {
@@ -254,7 +256,7 @@ class TestResidueCallerLines:
             'raw_value': 'never rendered here',
         }
 
-        assert list(residue_caller_lines(record)) == [
+        assert list(residue_header_lines(record)) == [
             "subject_task_id='5055'",
             "subject_agent_role='architect'",
             "agent_id='watcher-x'",
@@ -263,10 +265,10 @@ class TestResidueCallerLines:
         ]
 
     def test_an_absent_key_renders_as_none(self):
-        assert list(residue_caller_lines({})) == [f'{key}=None' for key in RESIDUE_CALLER_KEYS]
+        assert list(residue_header_lines({})) == [f'{key}=None' for key in RESIDUE_HEADER_KEYS]
 
     def test_a_newline_in_a_value_cannot_inject_a_line(self):
-        lines = list(residue_caller_lines({'agent_id': 'a\nproject=forged'}))
+        lines = list(residue_header_lines({'agent_id': 'a\nproject=forged'}))
 
-        assert len(lines) == len(RESIDUE_CALLER_KEYS)
+        assert len(lines) == len(RESIDUE_HEADER_KEYS)
         assert all('\n' not in line for line in lines)

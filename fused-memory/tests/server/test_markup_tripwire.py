@@ -38,7 +38,7 @@ from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
     OUTCOMES,
-    residue_caller_lines,
+    residue_header_lines,
 )
 
 from fused_memory.server import markup_tripwire
@@ -1143,7 +1143,7 @@ class TestTheResidueRecordNamesItsCaller:
 
         detail = self._filed_detail(tmp_path, record)
 
-        missing = set(residue_caller_lines(record)) - set(detail.splitlines())
+        missing = set(residue_header_lines(record)) - set(detail.splitlines())
         assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
         assert MARKUP_REFUSAL_CUSTODY_CAVEAT in detail
         assert 'only surviving copy' not in detail
@@ -1154,5 +1154,5 @@ class TestTheResidueRecordNamesItsCaller:
             tmp_path, {'tool': 'add_memory', 'field': 'content', 'raw_value': 'bytes'},
         )
 
-        missing = set(residue_caller_lines({})) - set(detail.splitlines())
+        missing = set(residue_header_lines({})) - set(detail.splitlines())
         assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'

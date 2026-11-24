@@ -520,27 +520,31 @@ MARKUP_RESIDUE_ERROR_TYPES = frozenset({
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
 
-#: The caller lines of a residue record, in the order every filer renders
-#: them. ``subject_task_id`` leads: a residue record's own ``task_id`` is a
-#: non-gating anchor, so this is where a reader learns whose call leaked.
+#: Whom a residue record belongs to. ``subject_task_id`` leads: a residue
+#: record's own ``task_id`` is a non-gating anchor, so this is where a reader
+#: learns whose call leaked.
 RESIDUE_CALLER_KEYS: tuple[str, ...] = (
     'subject_task_id',
     'subject_agent_role',
     'agent_id',
     'project',
-    'override_swallowed',
 )
 
+#: The flat lines every residue filer renders first, in order: the caller,
+#: then what the leak did to the call that the caller did not see. Every key
+#: after :data:`RESIDUE_CALLER_KEYS` describes the leak, not the caller.
+RESIDUE_HEADER_KEYS: tuple[str, ...] = (*RESIDUE_CALLER_KEYS, 'override_swallowed')
 
-def residue_caller_lines(record: Mapping[str, Any]) -> list[str]:
-    """One ``key=repr`` line per :data:`RESIDUE_CALLER_KEYS` entry, in order.
 
-    The ONE rendering of whom a residue record belongs to, shared by every
-    residue filer, so no sink can drop an axis the record carries. ``!r``
-    renders an absent key as ``None``, and escapes a newline in a
-    caller-supplied value so it cannot inject a line of its own.
+def residue_header_lines(record: Mapping[str, Any]) -> list[str]:
+    """One ``key=repr`` line per :data:`RESIDUE_HEADER_KEYS` entry, in order.
+
+    The ONE rendering shared by every residue filer, so no sink can drop an
+    axis the record carries. ``!r`` renders an absent key as ``None``, and
+    escapes a newline in a caller-supplied value so it cannot inject a line
+    of its own.
     """
-    return [f'{key}={record.get(key)!r}' for key in RESIDUE_CALLER_KEYS]
+    return [f'{key}={record.get(key)!r}' for key in RESIDUE_HEADER_KEYS]
 
 
 def residue_payload_length(record: Mapping[str, Any]) -> int:
@@ -1398,7 +1402,7 @@ class MarkupGuardMiddleware(Middleware):
         if unrecovered:
             preserved = await self._preserve_unrecovered(
                 name, identity, subject,
-                param, pattern, unrecovered,
+                param, pattern, unrecovered, override_swallowed,
             )
         return await self._forward(
             context, call_next, arguments, param, fix, storm,
@@ -1710,7 +1714,7 @@ class MarkupGuardMiddleware(Middleware):
 
     async def _preserve_unrecovered(
         self, name, identity, subject, param, pattern,
-        unrecovered: Mapping[str, str],
+        unrecovered: Mapping[str, str], override_swallowed: bool,
     ) -> ResiduePreservation:
         """Queue the slices FORWARD_REPAIR dropped, so nothing is destroyed.
 
@@ -1753,6 +1757,7 @@ class MarkupGuardMiddleware(Middleware):
                 # the only route back to a caller that was never told.
                 'subject_task_id': subject_task_id,
                 'subject_agent_role': subject_agent_role,
+                'override_swallowed': override_swallowed,
                 'raw_value': raw,
                 'summary': (
                     f'Recovered {name}.{field} could not be typed against its '

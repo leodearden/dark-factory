@@ -58,7 +58,7 @@ from shared.mcp_markup_middleware import (
     MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MarkupGuardMiddleware,
     RepairPolicy,
-    residue_caller_lines,
+    residue_header_lines,
 )
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
@@ -1409,7 +1409,7 @@ class TestTheResidueRendersTheSharedCallerLines:
             'project': None,
             'override_swallowed': False,
         }
-        missing = set(residue_caller_lines(caller)) - set(detail.splitlines())
+        missing = set(residue_header_lines(caller)) - set(detail.splitlines())
         assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
 
     @pytest.mark.asyncio

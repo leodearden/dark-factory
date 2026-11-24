@@ -14,7 +14,7 @@ verdict-tools and the escalation server (FORWARD_REPAIR) forward it repaired.
 Either way the destination holds the clean value and the swallowed sibling.
 
 ATTRIBUTION: an unrepairable leak is refused, and the residue record filed for
-it names its caller through the one shared rendering, ``residue_caller_lines``,
+it names its caller through the one shared rendering, ``residue_header_lines``,
 and states ``MARKUP_REFUSAL_CUSTODY_CAVEAT`` rather than claiming to hold the
 only copy.
 
@@ -38,7 +38,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
-    residue_caller_lines,
+    residue_header_lines,
 )
 from shared.project_layout import escalation_queue_dir
 
@@ -280,7 +280,7 @@ async def test_the_residue_names_its_caller(
     detail = await refused_residue(surface(tmp_path, monkeypatch), tool, field, sent)
 
     caller = {'agent_id': None, 'project': None, 'override_swallowed': False, **subject}
-    missing = set(residue_caller_lines(caller)) - set(detail.splitlines())
+    missing = set(residue_header_lines(caller)) - set(detail.splitlines())
     assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
 
 

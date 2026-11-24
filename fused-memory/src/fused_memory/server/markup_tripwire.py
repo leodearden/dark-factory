@@ -58,7 +58,7 @@ from typing import Any
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
-    residue_caller_lines,
+    residue_header_lines,
 )
 
 # markup_override_requested / strip_markup_override are RE-EXPORTS, not local
@@ -478,8 +478,8 @@ def emit_markup_residue_escalation(
     A TRANSLATOR, not a second escalation vocabulary (INV-5). The middleware
     already emits an escalation-SHAPED record — ``category``, ``level``,
     ``summary``, ``suggested_action``, plus the flat ``tool``/``field``/
-    ``matched_pattern``/``raw_value`` fields and the caller fields
-    ``residue_caller_lines`` renders — because
+    ``matched_pattern``/``raw_value`` fields and the header fields
+    ``residue_header_lines`` renders — because
     the record has to survive being routed to whichever queue a host server
     happens to own. This function moves those fields onto an
     :class:`escalation.models.Escalation` and writes it; it authors no prose of
@@ -498,7 +498,7 @@ def emit_markup_residue_escalation(
     """
     raw_value = record.get('raw_value')
     detail = '\n'.join([
-        *residue_caller_lines(record),
+        *residue_header_lines(record),
         f'tool={record.get("tool")!r}',
         f'field={record.get("field")!r}',
         f'matched_pattern={record.get("matched_pattern")!r}',

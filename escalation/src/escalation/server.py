@@ -34,7 +34,7 @@ from shared.mcp_markup_middleware import (
     HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
-    residue_caller_lines,
+    residue_header_lines,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.merge_state import CANCEL_STATES, MergeReason, MergeState
@@ -1509,7 +1509,7 @@ def create_server(
             # synthetic anchor, not the caller's, so without these lines a
             # critical L2 record names nobody at all. `agent_id` comes from the
             # connection's identity header when a tool declares none.
-            *residue_caller_lines(record),
+            *residue_header_lines(record),
             # The OWNER that will exit this hold unprompted (INV-7), read off
             # the record rather than restated: the middleware names it, and a
             # second spelling here could name a consumer that no longer exists.

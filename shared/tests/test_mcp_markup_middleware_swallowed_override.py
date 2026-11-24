@@ -33,6 +33,7 @@ from fastmcp.exceptions import ToolError
 
 from shared.markup_override_param import accepts_markup_override
 from shared.mcp_markup_middleware import (
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -63,6 +64,8 @@ _SWALLOWED_METADATA = _canonical('metadata', json.dumps(_OVERRIDE_MAP))
 #: A pseudo-parameter naming no parameter of the tool, so repair() refuses the
 #: value (PRD boundary row B8) and the call is unrepairable.
 _OUT_OF_SCHEMA = _canonical('not_a_parameter', 'stray')
+#: A declared list that does not decode, so FORWARD_REPAIR drops and files it.
+_UNTYPABLE = _canonical('alternatives', 'not a JSON list')
 
 
 def _leaked(*tail: str) -> str:
@@ -74,6 +77,8 @@ _UNREPAIRABLE_WITH_OVERRIDE = _leaked(_SWALLOWED_METADATA, _OUT_OF_SCHEMA)
 _UNREPAIRABLE_WITHOUT_OVERRIDE = _leaked(_OUT_OF_SCHEMA)
 _REPAIRABLE_WITH_OVERRIDE = _leaked(_SWALLOWED_METADATA)
 _REPAIRABLE_WITHOUT_OVERRIDE = _leaked()
+_UNRECOVERED_WITH_OVERRIDE = _leaked(_SWALLOWED_METADATA, _UNTYPABLE)
+_UNRECOVERED_WITHOUT_OVERRIDE = _leaked(_UNTYPABLE)
 
 
 def _swallowed_override_remedy(swallowed: dict[str, Any], plain: dict[str, Any]) -> str:
@@ -101,7 +106,9 @@ class _Harness:
 
         @self.mcp.tool
         @accepts_markup_override
-        def add_design_decision(decision: str, rationale: str) -> str:
+        def add_design_decision(
+            decision: str, rationale: str, alternatives: list[str] | None = None,
+        ) -> str:
             calls.append({'decision': decision, 'rationale': rationale})
             return 'ok'
 
@@ -172,6 +179,16 @@ class TestARepairableLeakThatSwallowedTheOverride:
         }
         assert not markup_override_requested(payload['repaired_call']['metadata'])
 
+    async def test_a_forwarded_call_files_an_unrecovered_residue_that_says_so(self):
+        h = _Harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call({'decision': _DECISION, 'rationale': _UNRECOVERED_WITH_OVERRIDE})
+
+        assert [(r['error_type'], r['override_swallowed']) for r in h.escalations] == [
+            (MARKUP_UNRECOVERED_PARAM_ERROR_TYPE, True),
+        ]
+        assert h.calls == [{'decision': _DECISION, 'rationale': _INTENDED}]
+
     async def test_resubmitting_repaired_call_verbatim_is_accepted(self):
         h = _Harness(RepairPolicy.REJECT_WITH_REPAIR)
         payload = await h.refusal({'decision': _DECISION, 'rationale': _REPAIRABLE_WITH_OVERRIDE})
@@ -191,6 +208,15 @@ class TestALeakWithNoOverrideReportsFalse:
 
         assert payload['override_swallowed'] is False
         assert [record['override_swallowed'] for record in h.escalations] == [False]
+
+    async def test_on_an_unrecovered_residue(self):
+        h = _Harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call({'decision': _DECISION, 'rationale': _UNRECOVERED_WITHOUT_OVERRIDE})
+
+        assert [(r['error_type'], r['override_swallowed']) for r in h.escalations] == [
+            (MARKUP_UNRECOVERED_PARAM_ERROR_TYPE, False),
+        ]
 
     async def test_on_the_reject_bounce(self):
         h = _Harness(RepairPolicy.REJECT_WITH_REPAIR)

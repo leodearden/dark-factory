@@ -45,7 +45,7 @@ from shared.mcp_markup_middleware import (
     MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
-    residue_caller_lines,
+    residue_header_lines,
 )
 from shared.project_layout import escalation_queue_dir
 
@@ -366,7 +366,7 @@ def residue_detail(
     says which. Everything above it is diagnostic and is written with ``!r``
     so an empty or ``None`` field reads as itself rather than as a blank line.
 
-    The caller lines are ``residue_caller_lines``', the one rendering every
+    The header lines are ``residue_header_lines``', the one rendering every
     residue filer shares, with ``subject_task_id`` overlaid by this site's
     thunk: the record's own ``task_id`` field is the non-gating anchor, so this
     is the only place a reader learns whose call leaked. ``owner`` is rendered
@@ -377,7 +377,7 @@ def residue_detail(
     silent drops.
     """
     return '\n'.join([
-        *residue_caller_lines({**record, 'subject_task_id': subject_task_id}),
+        *residue_header_lines({**record, 'subject_task_id': subject_task_id}),
         f'owner={record.get("owner")!r}',
         f'tool={record.get("tool")!r}',
         f'field={record.get("field")!r}',
