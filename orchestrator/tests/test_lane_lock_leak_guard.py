@@ -2810,11 +2810,17 @@ async def cancel_mid_acquire_and_settle(
     orphaned acquire's completion has been handled on the loop, so its
     release callback has already run.
 
-    If the cancellation left no acquire Task in flight, the seam no longer
-    shields its acquire (B12 itself) or no longer wraps it in a Task.  Either
-    way the worker thread is still polling, so this waits for that thread's
-    own return instead and hands back what it won: the caller's
-    ``lane_is_free`` assert then reports the leak as esc-5548-5.
+    The zero-orphan branch models only the UNSHIELDED seam (B12 itself): the
+    worker thread's own return is then the last event, nothing will ever
+    release what it won, so this waits for that return and hands the fd back
+    for the caller's ``lane_is_free`` assert to report as esc-5548-5.
+
+    The settle assumes the seam holds its in-flight acquire as an asyncio
+    Task.  A seam that holds it as a plain executor Future, even shielded and
+    releasing correctly, also leaves zero orphan Tasks, but ``returned`` fires
+    before the Future's release callback runs: this then returns early and
+    the caller reports a FALSE esc-5548-5.  Any such change to the seam must
+    re-home this settle onto the product's own release.
     """
     from orchestrator import git_ops as git_ops_mod
 
