@@ -9,13 +9,14 @@ which recon's plain-string add() calls never produce (mem0 always
 normalizes a str payload to a single role='user' message). So a repeated,
 byte-identical infer=False write is never dropped for being a near-duplicate.
 
-Confirmed empirically below against a real Qdrant, twice: once with a
-stubbed, identical-vector embedder (cosine=1.0 — a strictly stronger worst
-case than the survey's ~0.92), and again with real OpenAI embeddings when
-OPENAI_API_KEY is available. In both, every one of N byte-identical
-infer=False writes lands as a distinct point (N distinct ids and
-backend.count(scope)==N). See task 2221's memory notes for the full
-code-trace citations backing this finding.
+Confirmed empirically below against a real Qdrant, each run isolated by its
+own run_id in a reused collection (the harness contract is _mem0_live_probe's),
+twice: once with a stubbed, identical-vector embedder (cosine=1.0 — a
+strictly stronger worst case than the survey's ~0.92), and again with real
+OpenAI embeddings when OPENAI_API_KEY is available. In both, every one of N
+byte-identical infer=False writes lands as a distinct point (N distinct ids,
+and exactly N points carry the run's run_id). See task 2221's memory notes
+for the full code-trace citations backing this finding.
 
 Consequence for downstream tasks: δ's add_system_record is a no-op
 hardening (the premise it "fixes" is already false), and λ's deletion
@@ -24,17 +25,18 @@ dedup as a safety net either way.
 """
 from __future__ import annotations
 
-import contextlib
 import os
 
 import pytest
-from _fm_qdrant_live import QDRANT_URL, assert_reapable, qdrant_skipif
-from _mem0_live_probe import probe_collection
-from qdrant_client import QdrantClient
-from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
-from qdrant_client.models import VectorParams
+from _fm_qdrant_live import assert_reapable, qdrant_skipif
+from _mem0_live_probe import (
+    build_live_backend,
+    build_stub_embedder_backend,
+    isolated_run,
+    probe_collection,
+    reapable_config,
+)
 
-from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.scope import Scope
 
 FIXED_RECON_SUMMARY = (
@@ -52,12 +54,22 @@ FIXED_RECON_SUMMARY = (
 
 
 @pytest.fixture
-def recon_scope(worker_id) -> Scope:
-    """A recon-stage scope isolated per xdist worker."""
+def probe_config(mock_config):
+    return reapable_config(mock_config)
+
+
+@pytest.fixture
+def recon_scope() -> Scope:
+    """The recon-stage scope every run of both probes shares."""
     return Scope(
-        project_id=f'_test_recon_dedup_{worker_id}',
+        project_id='_test_recon_dedup',
         agent_id='recon-stage-task_knowledge_sync',
     )
+
+
+@pytest.fixture
+def probe_run_id(recon_scope, probe_config):
+    yield from isolated_run(recon_scope, probe_config, 'task-2221-premise-probe')
 
 
 def test_the_recon_dedup_probe_collection_is_one_the_reaper_can_reclaim(
@@ -67,93 +79,13 @@ def test_the_recon_dedup_probe_collection_is_one_the_reaper_can_reclaim(
     assert_reapable(probe_collection(recon_scope, probe_config))
 
 
-@pytest.fixture
-def clean_collection(recon_scope, mock_config):
-    """Delete the recon-scope's Qdrant collection before AND after the test."""
-    collection = recon_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(collection)
-    yield collection
-    with contextlib.suppress(Exception):
-        client.delete_collection(collection)
-    client.close()
-
-
-def _collection_vector_size(collection: str) -> int:
-    """Read back the vector dimension Qdrant actually created for *collection*.
-
-    This assumes mem0's Qdrant vector store creates the collection eagerly —
-    mem0.vector_stores.qdrant.QdrantDB.__init__ calls create_col()
-    unconditionally, so by the time _build_recon_backend has awaited
-    backend._get_instance(scope), the collection already exists. If a future
-    mem0 release makes collection creation lazy (e.g. deferred to the first
-    add()), fail loudly with a message that explains the assumption instead
-    of leaking a raw 404 traceback.
-    """
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    try:
-        try:
-            info = client.get_collection(collection)
-        except (ResponseHandlingException, UnexpectedResponse) as exc:
-            raise AssertionError(
-                f'collection {collection!r} does not exist yet. This harness '
-                "assumes mem0's AsyncMemory.from_config() eagerly creates the "
-                'Qdrant collection during _get_instance(); if a mem0 upgrade '
-                'made collection creation lazy instead, this stub-dimension '
-                'lookup needs reworking (e.g. force a real add() before '
-                'reading the dimension back).'
-            ) from exc
-        vectors = info.config.params.vectors
-        # mem0's Qdrant vector store always creates collections with a single
-        # unnamed vector config (see mem0.vector_stores.qdrant.create_col), never
-        # named vectors or none — assert that so a future mem0 change that breaks
-        # this assumption fails loudly here instead of silently misreading dims.
-        assert isinstance(vectors, VectorParams), (
-            f'expected an unnamed VectorParams config, got {vectors!r}'
-        )
-        return vectors.size
-    finally:
-        client.close()
-
-
-async def _build_recon_backend(mock_config, scope, monkeypatch, *, real_embedder=False):
-    """Construct a real Mem0Backend and force-create its AsyncMemory instance.
-
-    Stubs out everything that isn't the dedup question itself: mem0's
-    telemetry capture (offline safety). Unless *real_embedder* is set, also
-    stubs the embedder to return one constant vector for every call — the
-    strongest-possible (cosine=1.0) duplicate input the infer=False path could
-    ever see.
-    """
-    monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
-
-    config = mock_config.model_copy(deep=True)
-    if real_embedder:
-        # mock_config's embedder.providers.openai.api_key is a fake fixture
-        # value ('test-key'); clearing it here makes mem0's OpenAIEmbedding
-        # fall back to the real OPENAI_API_KEY env var instead.
-        config.embedder.providers.openai.api_key = None
-
-    backend = Mem0Backend(config)
-    inst = await backend._get_instance(scope)
-
-    if not real_embedder:
-        collection = scope.mem0_collection_name(config.mem0.collection_prefix)
-        dim = _collection_vector_size(collection)
-        stub_vector = [0.1] * dim
-        inst.embedding_model.embed = lambda *a, **kw: stub_vector
-
-    return backend
-
-
 async def _assert_all_writes_land_distinct(backend, scope, *, n: int, run_id: str) -> None:
     """Issue *n* byte-identical infer=False writes and assert none dedup-drop.
 
     Shared by both tests below: asserts each write returns exactly one
     result (the infer=False shape), that all *n* returned ids are distinct
-    (no in-place update in lieu of a fresh point), and that the collection's
-    exact point count is exactly *n* (no silent drop).
+    (no in-place update in lieu of a fresh point), and that exactly *n*
+    points carry *run_id* (no silent drop).
     """
     metadata = {
         'kind': 'cycle_summary',
@@ -177,7 +109,7 @@ async def _assert_all_writes_land_distinct(backend, scope, *, n: int, run_id: st
     assert len(set(ids)) == n, (
         f'expected {n} distinct ids (no dedup drop), got {len(set(ids))} distinct: {ids!r}'
     )
-    assert await backend.count(scope) == n
+    assert await backend.count_by_metadata(scope, {'run_id': run_id}) == n
 
 
 @qdrant_skipif()
@@ -185,22 +117,20 @@ async def _assert_all_writes_land_distinct(backend, scope, *, n: int, run_id: st
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_identical_infer_false_writes_all_land_distinct(
-    mock_config, recon_scope, clean_collection, monkeypatch,
+    probe_config, recon_scope, probe_run_id, monkeypatch,
 ):
     """N byte-identical recon-stage infer=False writes must all land distinct.
 
     Issues N=8 identical Mem0Backend.add(...) calls (content + metadata both
     fixed — no nonce) through the real production write path (infer=False
-    pinned in Mem0Backend.add) against a real, isolated Qdrant collection.
+    pinned in Mem0Backend.add) against a real Qdrant, isolated by run_id.
     If the §2.1 premise ('~0.92 cosine dedup can drop a repeat recon write')
     were true, at least one of these 8 writes would return zero results
-    and/or the collection would end up with fewer than 8 points.
+    and/or fewer than 8 points would carry this run's run_id.
     """
-    backend = await _build_recon_backend(mock_config, recon_scope, monkeypatch)
+    backend = await build_stub_embedder_backend(recon_scope, probe_config, monkeypatch)
     try:
-        await _assert_all_writes_land_distinct(
-            backend, recon_scope, n=8, run_id='task-2221-premise-probe-hermetic',
-        )
+        await _assert_all_writes_land_distinct(backend, recon_scope, n=8, run_id=probe_run_id)
     finally:
         await backend.close()
 
@@ -211,7 +141,7 @@ async def test_identical_infer_false_writes_all_land_distinct(
 @pytest.mark.skipif(not os.environ.get('OPENAI_API_KEY'), reason='real embedder needs OPENAI_API_KEY')
 @pytest.mark.asyncio
 async def test_identical_writes_land_with_real_openai_embeddings(
-    mock_config, recon_scope, clean_collection, monkeypatch,
+    probe_config, recon_scope, probe_run_id, monkeypatch,
 ):
     """Real-OpenAI-embedder confirmation: identical text still never dedups.
 
@@ -229,10 +159,11 @@ async def test_identical_writes_land_with_real_openai_embeddings(
     skipif above is retained as a belt-and-braces guard for the
     addopts-cleared recovery/flaky-rerun path (verify_cmd.serial_pytest).
     """
-    backend = await _build_recon_backend(mock_config, recon_scope, monkeypatch, real_embedder=True)
+    config = probe_config.model_copy(deep=True)
+    # mock_config's api_key is a fake 'test-key'; None makes mem0 read OPENAI_API_KEY.
+    config.embedder.providers.openai.api_key = None
+    backend = await build_live_backend(recon_scope, config, monkeypatch)
     try:
-        await _assert_all_writes_land_distinct(
-            backend, recon_scope, n=5, run_id='task-2221-premise-probe-real-embedder',
-        )
+        await _assert_all_writes_land_distinct(backend, recon_scope, n=5, run_id=probe_run_id)
     finally:
         await backend.close()
