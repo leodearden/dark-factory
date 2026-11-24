@@ -2,6 +2,8 @@
 // by MemoryTab, the Overview and the topbar alike so they cannot disagree:
 //   - the write queue, served by /memory as one Datum
 //     (dashboard/src/dashboard/data/memory.py::write_queue_datum);
+//   - the plan route's cap latch, served by /memory as one Datum
+//     (data/memory.py::plan_route_datum);
 //   - the window's memory operations, served by /memory-graphs as MEMORY_OPS
 //     (data/write_journal.py::get_memory_ops via redux_api.shape_memory_graphs),
 //     whose totals and newest_hour_total are served Datums the server derives,
@@ -63,6 +65,39 @@ function queueHealth(queue) {
   };
 }
 
+// ── The plan route's cap latch ──
+
+function planRoute(data) {
+  return servedMemoryDatum(
+    (data.MEMORY_STATUS || {}).plan_route,
+    MEMORY_ENDPOINT,
+    'the /memory payload has no plan_route Datum',
+    memoryReceipts(data),
+  );
+}
+
+function orUnknown(served) {
+  return served === null || served === undefined ? 'unknown' : served;
+}
+
+function planRouteText(route) {
+  if (route.state === 'ok') return 'plan route: ok';
+  if (route.state === 'unconfigured') return 'plan route: not configured';
+  if (route.state !== 'capped') return 'plan route: ' + route.state;
+  return (
+    'plan route: CAPPED since ' + orUnknown(route.capped_since) +
+    ', resets ' + orUnknown(route.resets_at) +
+    ', ' + route.parked_items + ' parked'
+  );
+}
+
+// queueHealth's rule: red is a MEASURED cap, amber anything short of a fresh
+// reading, an unread latch included.
+function planRouteHealth(route) {
+  if (viewOfMemoryDatum(route).isHole) return { ok: true, warn: true };
+  return { ok: route.value.state !== 'capped', warn: route.state !== 'fresh' };
+}
+
 // ── The window's memory operations ──
 
 function formatOpsCount(n) {
@@ -106,6 +141,9 @@ const MEMORY_READINGS_API = {
   queueCountsText,
   queueHint,
   queueHealth,
+  planRoute,
+  planRouteText,
+  planRouteHealth,
   opsTotals,
   opsCaption,
   opsTotalText,
