@@ -15,6 +15,7 @@ import pytest
 from _fm_helpers import (
     make_insufficient_quota_error,
     make_transient_rate_limit_error,
+    make_usage_limit_reached_error,
     wrap_like_graphiti,
 )
 
@@ -23,6 +24,7 @@ from fused_memory.services.provider_billing import (
     BillingSource,
     billing_source_of,
     classify_billing_exhaustion,
+    plan_cap_of,
 )
 
 
@@ -132,3 +134,90 @@ class TestBillingExhaustionValue:
         for field in dataclasses.fields(result):
             with pytest.raises(dataclasses.FrozenInstanceError):
                 setattr(result, field.name, 'other')
+
+
+_USAGE_LIMIT_BODY = (
+    b'{"error": {"type": "usage_limit_reached", "code": "usage_limit_reached",'
+    b' "message": "The usage limit has been reached", "resets_in_seconds": 3600}}'
+)
+
+
+def _assert_plan_cap(result: BillingExhaustion | None) -> BillingExhaustion:
+    assert result is not None
+    assert result.source is BillingSource.PLAN_CAP
+    assert result.provider == 'chatgpt-plan'
+    assert 'OPENAI_PLAN_PROXY_URL' in result.key_scope
+    assert 'OPENAI_PLAN_PROXY_KEY' in result.key_scope
+    assert 'OPENAI_API_KEY' not in result.key_scope
+    return result
+
+
+class TestPlanCapIsRecognised:
+    """Task 9944: a capped ChatGPT plan is a second billing source."""
+
+    def test_usage_limit_reached_classifies_as_plan_cap(self):
+        result = _assert_plan_cap(classify_billing_exhaustion(make_usage_limit_reached_error()))
+        assert result.code == 'usage_limit_reached'
+        assert result.error_type == 'RateLimitError'
+
+    def test_graphiti_wrapper_classifies_through_cause(self):
+        wrapped = wrap_like_graphiti(make_usage_limit_reached_error())
+        assert _assert_plan_cap(classify_billing_exhaustion(wrapped)).code == 'usage_limit_reached'
+
+    def test_names_the_plan_cap_source(self):
+        assert billing_source_of(make_usage_limit_reached_error()) == 'plan_cap'
+
+    def test_insufficient_quota_is_still_api_key_credits(self):
+        result = classify_billing_exhaustion(make_insufficient_quota_error())
+        assert result is not None
+        assert result.source is BillingSource.API_KEY_CREDITS
+
+    def test_server_error_from_the_proxy_is_not_a_cap(self):
+        request = httpx.Request('POST', 'http://127.0.0.1:8317/v1/responses')
+        response = httpx.Response(503, request=request)
+        exc = openai.InternalServerError('proxy unavailable', response=response, body=None)
+        assert classify_billing_exhaustion(exc) is None
+
+    def test_timeout_is_not_a_cap(self):
+        request = httpx.Request('POST', 'http://127.0.0.1:8317/v1/responses')
+        assert classify_billing_exhaustion(openai.APITimeoutError(request=request)) is None
+
+
+class TestPlanCapOfAProxyResponse:
+    """The plan-route rule: any 429 from the plan proxy is a cap."""
+
+    def test_usage_limit_body_names_its_code(self):
+        result = _assert_plan_cap(plan_cap_of(429, _USAGE_LIMIT_BODY))
+        assert result.code == 'usage_limit_reached'
+        assert result.error_type == 'HTTP 429'
+        assert 'The usage limit has been reached' in result.provider_message
+
+    def test_top_level_type_names_its_code(self):
+        body = b'{"type": "usage_limit_reached", "message": "capped"}'
+        assert _assert_plan_cap(plan_cap_of(429, body)).code == 'usage_limit_reached'
+
+    def test_bodyless_429_is_a_cap(self):
+        assert _assert_plan_cap(plan_cap_of(429, b'')).code == 'http_429'
+
+    def test_unparseable_429_is_a_cap(self):
+        result = _assert_plan_cap(plan_cap_of(429, b'<html>slow down</html>'))
+        assert result.code == 'http_429'
+        assert 'slow down' in result.provider_message
+
+    def test_provider_message_is_bounded(self):
+        assert len(_assert_plan_cap(plan_cap_of(429, b'x' * 10_000)).provider_message) <= 400
+
+    @pytest.mark.parametrize('status', [200, 400, 500, 503])
+    def test_any_other_status_is_not_a_cap(self, status):
+        assert plan_cap_of(status, _USAGE_LIMIT_BODY) is None
+
+
+class TestEachSourceNamesItsOwnAlarm:
+    def test_api_key_credits_alarm_category(self):
+        result = classify_billing_exhaustion(make_insufficient_quota_error())
+        assert result is not None
+        assert result.alarm_category == 'provider_billing_exhausted'
+
+    def test_plan_cap_alarm_category(self):
+        result = _assert_plan_cap(classify_billing_exhaustion(make_usage_limit_reached_error()))
+        assert result.alarm_category == 'plan_route_capped'

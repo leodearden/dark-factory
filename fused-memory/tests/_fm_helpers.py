@@ -949,6 +949,25 @@ def make_insufficient_quota_error(
     return RateLimitError(message, response=response, body=body)
 
 
+PLAN_PROXY_TEST_URL = 'http://127.0.0.1:8317/v1'
+
+
+def make_usage_limit_reached_error(
+    message: str = 'The usage limit has been reached for this ChatGPT plan.',
+    *,
+    base_url: str = PLAN_PROXY_TEST_URL,
+) -> RateLimitError:
+    """Build the openai.RateLimitError a capped ChatGPT plan proxy answers with.
+
+    The request goes to *base_url*'s ``/responses``, and the 429 body names
+    ``usage_limit_reached`` under both ``type`` and ``code``.
+    """
+    request = httpx.Request('POST', f'{base_url.rstrip("/")}/responses')
+    response = httpx.Response(429, request=request)
+    body = {'type': 'usage_limit_reached', 'code': 'usage_limit_reached', 'message': message}
+    return RateLimitError(message, response=response, body=body)
+
+
 def make_transient_rate_limit_error() -> RateLimitError:
     """Build a real openai.RateLimitError for a transient too-many-requests 429."""
     message = 'Rate limit reached for requests'
