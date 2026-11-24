@@ -512,6 +512,29 @@ MARKUP_RESIDUE_ERROR_TYPES = frozenset({
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
 
+#: The caller lines of a residue record, in the order every filer renders
+#: them. ``subject_task_id`` leads: a residue record's own ``task_id`` is a
+#: non-gating anchor, so this is where a reader learns whose call leaked.
+RESIDUE_CALLER_KEYS: tuple[str, ...] = (
+    'subject_task_id',
+    'subject_agent_role',
+    'agent_id',
+    'project',
+    'override_swallowed',
+)
+
+
+def residue_caller_lines(record: Mapping[str, Any]) -> list[str]:
+    """One ``key=repr`` line per :data:`RESIDUE_CALLER_KEYS` entry, in order.
+
+    The ONE rendering of whom a residue record belongs to, shared by every
+    residue filer, so no sink can drop an axis the record carries. ``!r``
+    renders an absent key as ``None``, and escapes a newline in a
+    caller-supplied value so it cannot inject a line of its own.
+    """
+    return [f'{key}={record.get(key)!r}' for key in RESIDUE_CALLER_KEYS]
+
+
 def residue_payload_length(record: Mapping[str, Any]) -> int:
     """How many characters of caller payload a residue record's ``raw_value`` holds."""
     raw_value = record.get('raw_value')
@@ -688,6 +711,18 @@ MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT = (
     'this value.'
 )
 
+#: All a ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` residue record can say about
+#: custody of its payload. The guard refuses at the boundary and reads nothing
+#: back, so it knows the call wrote nothing and that its caller was told to
+#: resend, never whether the caller did.
+MARKUP_REFUSAL_CUSTODY_CAVEAT = (
+    'This call wrote nothing, and its caller was told to resend from its own '
+    'copy. Whether it did resend is not known here: a refusal proves one '
+    'failed call, not lost data. Before recovering this payload, look at the '
+    "call's destination for a later write of the same content, because "
+    'recovering an already-resent payload writes a duplicate.'
+)
+
 #: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
 #: otherwise have no way to learn that its arguments were altered.
 _FORWARD_HINT = (
@@ -720,6 +755,23 @@ _OWNER = 'markup guard'
 
 #: The storm ERROR line's advice, derived from MARKUP_RECURRENCE_ROUTING.
 _STORM_LOG_ADVICE = f'the serialization leak is ACTIVE; {MARKUP_RECURRENCE_ROUTING}'
+
+
+@dataclass(frozen=True)
+class HostAttribution:
+    """What the HOST serving a guarded tool knows about its caller.
+
+    A second attribution source beside the call's own arguments
+    (:meth:`MarkupGuardMiddleware._identity` and
+    :meth:`MarkupGuardMiddleware._subject`). A per-role stdio server knows the
+    role it serves; an HTTP server sees its connection's identity header.
+    ``agent_id`` fills the identity axis and ``agent_role`` the subject axis,
+    and each fills ONLY an axis the arguments left ``None``: a caller's own
+    declaration always wins. Attribution only, never a gate.
+    """
+
+    agent_id: str | None = None
+    agent_role: str | None = None
 
 
 class RepairPolicy(enum.StrEnum):
@@ -774,6 +826,10 @@ class MarkupGuardMiddleware(Middleware):
     answers a residue record with where it preserved it, a
     :data:`ResiduePreservation`.
 
+    *host_attribution*, when given, returns the :class:`HostAttribution` the
+    registration site knows about its caller. It fills only the caller axes a
+    call's own arguments leave ``None`` (:meth:`_attribution`).
+
     Bursts are counted by a per-instance
     :class:`~shared.boundary_storm_escape.BoundaryStormEscape`
     (:attr:`storm_escape`), so no burst state bleeds between servers, or
@@ -808,11 +864,13 @@ class MarkupGuardMiddleware(Middleware):
         storm_threshold: int = 3,
         storm_window_seconds: float = 3600.0,
         time_provider: Callable[[], float] = time.time,
+        host_attribution: Callable[[], HostAttribution] | None = None,
     ) -> None:
         self.policy = policy
         self.exempt_tools = frozenset(exempt_tools)
         self._escalation_sink = escalation_sink
         self._fact_sink = fact_sink
+        self._host_attribution = host_attribution
         self._storm_escape = BoundaryStormEscape(
             owner=_OWNER,
             error_type=MARKUP_STORM_ERROR_TYPE,
@@ -1035,8 +1093,9 @@ class MarkupGuardMiddleware(Middleware):
         A DECLARED, deliberately narrow precedence, not an oversight: middleware
         sits above the tool bodies and has no equivalent of
         ``fused_memory.server.tools._resolve_identity(ctx)``, which can consult
-        the request context and the server's own config. All this layer has is
-        the call's own arguments.
+        the request context and the server's own config. This reads the call's
+        own arguments; what the HOST knows is added on top, only where these
+        come back ``None``, by :meth:`_attribution`.
 
         * ``agent_id`` — from the ``agent_id`` argument, or ``None``.
         * ``project`` — from ``project_root`` FIRST, then ``project_id``.
@@ -1094,6 +1153,41 @@ class MarkupGuardMiddleware(Middleware):
             return value if isinstance(value, str) else None
 
         return _text('task_id'), _text('agent_role')
+
+    def _attribution(
+        self, view: Mapping[str, Any]
+    ) -> tuple[tuple[str | None, str | None], tuple[str | None, str | None]]:
+        """``(identity, subject)`` for one event: the arguments, then the host.
+
+        :meth:`_identity` and :meth:`_subject` read *view*; the injected
+        :class:`HostAttribution` fills only the axes they left ``None``.
+        Resolved once per event, so the fact, the storm record and the residue
+        record all name the same caller.
+        """
+        (agent_id, project), (task_id, agent_role) = self._identity(view), self._subject(view)
+        host = self._host()
+        if agent_id is None:
+            agent_id = host.agent_id
+        if agent_role is None:
+            agent_role = host.agent_role
+        return (agent_id, project), (task_id, agent_role)
+
+    def _host(self) -> HostAttribution:
+        """The host's attribution, or an empty one when it has none to give.
+
+        This runs on a path whose outcome is already decided, so a provider
+        that raises is logged and attribution falls back to the arguments.
+        """
+        if self._host_attribution is None:
+            return HostAttribution()
+        try:
+            return self._host_attribution()
+        except Exception:
+            logger.warning(
+                'markup guard: host_attribution raised; attributing this event '
+                'from its arguments only', exc_info=True,
+            )
+            return HostAttribution()
 
     # -- schema resolution ------------------------------------------------
 
@@ -1157,14 +1251,11 @@ class MarkupGuardMiddleware(Middleware):
         # one function is what makes "the eight keys cannot drift between
         # paths" visible rather than merely intended.
         if fix is None:
-            # Identity from the RAW arguments: no recovery validated, so
-            # nothing from the tail may be believed.
-            identity = self._identity(arguments)
-            # Hoisted, not re-computed at the refusal: ONE resolution feeds
-            # both the burst record and the residue record, so the two cannot
-            # disagree about who leaked. ``_subject`` is pure over an
-            # unmutated ``arguments``, so this is behaviour-preserving.
-            subject = self._subject(arguments)
+            # Attribution from the RAW arguments: no recovery validated, so
+            # nothing from the tail may be believed. ONE resolution feeds the
+            # fact, the burst record and the residue record, so they cannot
+            # disagree about who leaked.
+            identity, subject = self._attribution(arguments)
             await self._emit_fact(
                 name, identity, param, pattern,
                 outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
@@ -1263,13 +1354,13 @@ class MarkupGuardMiddleware(Middleware):
             }
         fix = fix._replace(recovered=coerced)
 
-        # Identity from the REPAIRED view. If the leak ate the caller's own
-        # ``agent_id`` — PRD section 2.1's first specimen does exactly that —
-        # then reporting the pre-repair ``None`` would lose the one thing the
-        # attribution exists for. Reading the recovery cannot overwrite a
-        # supplied value: repair() only validates when the recovered names are
-        # DISJOINT from the supplied ones (boundary row B9).
-        identity = self._identity({**arguments, **fix.recovered})
+        # Attribution from the REPAIRED view. If the leak ate the caller's own
+        # ``agent_id`` or ``task_id`` — PRD section 2.1's first specimen does
+        # exactly that — then reporting the pre-repair ``None`` would lose the
+        # one thing the attribution exists for. Reading the recovery cannot
+        # overwrite a supplied value: repair() only validates when the
+        # recovered names are DISJOINT from the supplied ones (boundary row B9).
+        identity, subject = self._attribution({**arguments, **fix.recovered})
 
         if self.policy is RepairPolicy.REJECT_WITH_REPAIR:
             await self._emit_fact(
@@ -1277,14 +1368,9 @@ class MarkupGuardMiddleware(Middleware):
                 outcome=_OUTCOME_REJECTED, misclose=fix.misclose, recovered=fix.recovered,
                 quoting=quoting,
             )
-            # The REPAIRED view, matching the ``identity`` resolved from that
-            # same merged map one line above — if the leak ate the caller's own
-            # ``task_id`` the pre-repair read would lose it. This path does not
-            # file a residue record, so this is the one caller-attribution it
-            # gets at all.
-            storm = await self._record_storm(
-                _OUTCOME_REJECTED, identity, self._subject({**arguments, **fix.recovered}),
-            )
+            # This path files no residue record, so the burst record is the
+            # one caller-attribution it gets at all.
+            storm = await self._record_storm(_OUTCOME_REJECTED, identity, subject)
             return self._reject(name, arguments, param, fix, storm, quoting, override_swallowed)
 
         await self._emit_fact(
@@ -1292,7 +1378,6 @@ class MarkupGuardMiddleware(Middleware):
             outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
             quoting=quoting,
         )
-        subject = self._subject({**arguments, **fix.recovered})
         storm = await self._record_storm(_OUTCOME_REPAIRED, identity, subject)
         preserved: ResiduePreservation = None
         if unrecovered:
@@ -1524,9 +1609,9 @@ class MarkupGuardMiddleware(Middleware):
             'subject_agent_role': subject_agent_role,
             'override_swallowed': override_swallowed,
             # FULL and VERBATIM, deliberately unlike build_markup_block's
-            # 200-char content_excerpt. That excerpt is a diagnostic sitting
-            # beside a payload the caller still holds; this is the only
-            # surviving copy of data that may never be resent.
+            # 200-char content_excerpt. That excerpt is a diagnostic; this is
+            # the server's only copy of a payload its caller was told to
+            # resend but may not have (MARKUP_REFUSAL_CUSTODY_CAVEAT).
             'raw_value': value,
             # What the record CARRIES, never where it went: it is built before
             # any sink runs, and a host that preserves it nowhere dumps it to a
@@ -1581,8 +1666,8 @@ class MarkupGuardMiddleware(Middleware):
         The refusal is already decided by the time this runs, so preserving is
         purely ADDITIVE — see :meth:`_call_sink` for the never-raises contract
         and for why an ``async def`` emitter is awaited rather than left as an
-        unawaited coroutine, which on THIS path would destroy the only surviving
-        copy of the caller's payload.
+        unawaited coroutine, which on THIS path would silently drop the server's
+        only copy of the caller's payload.
 
         The sink answers where it preserved the record, so the refusal payload
         can name what holds the caller's data: an escalation id (``str``) or a
