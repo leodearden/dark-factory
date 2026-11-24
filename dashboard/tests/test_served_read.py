@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -299,8 +300,72 @@ async def test_a_wait_its_work_outlives_is_counted_and_joining_lands_the_work():
 
     assert served_read.unanswered_wait_count() == before + 1
     release.set()
-    await served_read.join_outlived_waits()
+    assert await served_read.join_outlived_waits() == ('the test walk',)
     assert landed == [7]
+
+
+async def test_a_join_names_the_work_it_waits_on_before_it_waits(caplog):
+    release = asyncio.Event()
+
+    async def walk() -> int:
+        await release.wait()
+        return 7
+
+    with pytest.raises(TimeoutError):
+        await wait_shielded(walk(), 0.01, what='the test walk')
+    with caplog.at_level(logging.WARNING, logger=served_read.__name__):
+        join = asyncio.ensure_future(served_read.join_outlived_waits())
+        await asyncio.sleep(0)
+        named = [record.getMessage() for record in caplog.records if record.name == served_read.__name__]
+        release.set()
+        await join
+
+    assert len(named) == 1
+    assert 'the test walk' in named[0]
+
+
+async def test_a_caller_that_stops_waiting_before_its_work_ends_is_counted_and_the_work_lands():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    landed: list[int] = []
+
+    async def held() -> int:
+        entered.set()
+        await release.wait()
+        landed.append(7)
+        return 7
+
+    before = served_read.unanswered_wait_count()
+    caller = asyncio.ensure_future(wait_shielded(held(), None, what='the held read'))
+    await entered.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    assert served_read.unanswered_wait_count() == before + 1
+    release.set()
+    assert await served_read.join_outlived_waits() == ('the held read',)
+    assert landed == [7]
+
+
+async def test_a_join_leaves_work_another_loop_outlived_to_that_loop():
+    outlived = threading.Event()
+    joined = threading.Event()
+
+    async def outlive_on_its_own_loop() -> None:
+        with pytest.raises(TimeoutError):
+            await wait_shielded(asyncio.Event().wait(), 0.01, what='the other loop read')
+        outlived.set()
+        await asyncio.to_thread(joined.wait)
+
+    other = threading.Thread(target=asyncio.run, args=(outlive_on_its_own_loop(),))
+    other.start()
+    try:
+        await asyncio.to_thread(outlived.wait)
+        assert await served_read.join_outlived_waits() == ()
+    finally:
+        joined.set()
+        await asyncio.to_thread(other.join)
 
 
 async def test_work_inside_its_wait_is_not_counted():
@@ -311,7 +376,7 @@ async def test_work_inside_its_wait_is_not_counted():
 
     assert await wait_shielded(answers(), 1.0, what='the answer') == 7
     assert served_read.unanswered_wait_count() == before
-    await served_read.join_outlived_waits()
+    assert await served_read.join_outlived_waits() == ()
 
 
 async def test_a_wait_whose_deadline_expires_as_its_work_ends_is_counted():

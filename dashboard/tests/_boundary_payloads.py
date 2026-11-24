@@ -664,16 +664,29 @@ the third."""
 def _render_prds_settled(client: TestClient, at: datetime) -> dict[str, Any]:
     """GET /prds at *at* from a render in which every read answered within its request wait."""
     assert client.portal is not None, 'a settled render joins its reads inside a live TestClient'
+    joined: list[tuple[str, ...]] = []
+    body: dict[str, Any] = {}
     for _ in range(_SETTLE_RENDERS):
         unanswered = unanswered_wait_count()
         body = _render_prds(client, at)
         if unanswered_wait_count() == unanswered:
             return body
-        client.portal.call(join_outlived_waits)
+        joined.append(client.portal.call(join_outlived_waits))
     raise AssertionError(
         f'GET /prds still had reads that did not answer within their request waits after '
-        f'{_SETTLE_RENDERS} renders',
+        f'{_SETTLE_RENDERS} renders; the work joined after each render: {joined}; the last '
+        f'body\'s data that are not fresh: {_not_fresh(body)}',
     )
+
+
+def _not_fresh(body: Mapping[str, Any]) -> list[str]:
+    """Each datum of a /prds *body* that is not fresh, named by section and root, with its reason."""
+    return [
+        f'{section}[{label}] {datum["state"]}: {datum["reason"]}'
+        for section in ('PRD_VIEW', 'PRD_CONTENTION')
+        for label, datum in body.get(section, {}).items()
+        if datum['state'] != 'fresh'
+    ]
 
 
 @contextmanager
@@ -698,7 +711,8 @@ def prd_view_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     ``prd_view_map_failed_tasks`` is the /tasks body served at the same
     instant as ``prd_view_map_failed``, so its census reason is the one the
     failed map half carried. Every /prds render is settled
-    (:func:`_render_prds_settled`), so no body depends on the host's speed.
+    (:func:`_render_prds_settled`): no body is shaped by a read that missed its
+    request wait.
     """
     bodies: dict[str, Any] = {}
 
@@ -860,8 +874,8 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     ``prd_lanes_contended`` adds :data:`CONTENDED_IDS` under a scheduler whose
     lock :data:`CARRIER` holds; ``prd_lanes_queueless`` lays out no escalation
     queue, so its view is a lower bound that still draws every row. Every /prds
-    body is a settled render (:func:`_render_prds_settled`), so none depends on
-    the host's speed.
+    body is a settled render (:func:`_render_prds_settled`): none is shaped by a
+    read that missed its request wait.
     """
     bodies: dict[str, Any] = {}
     with holder_processes() as (live, dead):
