@@ -21,6 +21,7 @@ from orchestrator.verify_cache.audit import (
     LeakResponse,
     apply,
     attribute,
+    held_reason,
 )
 from orchestrator.verify_cache.audit_run import AUDIT_COMMAND
 from orchestrator.verify_cache.registry import PolicyState, Registry
@@ -133,9 +134,7 @@ def _pending_blockers(queue: EscalationQueue) -> list[Escalation]:
 def _policy_now(policy: PolicyState, now: datetime) -> str:
     if policy.is_disabled(now):
         return f'the cache is now DISABLED until {_until(policy)} under a later disable'
-    if policy.disabled_until is not None:
-        return f'the kill switch expired at {_until(policy)}, so the cache is enabled'
-    return f'the cache is enabled ({policy.reason})'
+    return f'the cache is enabled ({held_reason(policy, now)})'
 
 
 def _disable_episode(policy: PolicyState) -> str:

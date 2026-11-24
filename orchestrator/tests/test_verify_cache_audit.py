@@ -258,6 +258,19 @@ class TestApply:
 
         assert expired.l2_required is False
 
+    def test_a_live_disables_streak_is_read_at_its_trip_past_the_leak_window(self, seeded):
+        seeded.leak(HEAD, ALPHA_NODE, BETA_NODE)
+        tripped = seeded.policy()
+        seeded.advance(timedelta(days=9))
+        assert tripped.is_disabled(seeded.now)
+
+        empty = asyncio.run(audit.apply(audit.AuditVerdict((), ()), seeded.registry, seeded.now))
+        redelivered = seeded.leak(HEAD, ALPHA_NODE)
+
+        for response in (empty, redelivered):
+            assert {leak.unit_id for leak in response.streak_leaks} == {'module:alpha:test', 'module:beta:test'}
+        assert seeded.policy() == tripped
+
 
 class TestEnable:
     def test_enable_clears_the_disable_and_the_old_leaks_never_count_again(self, seeded):
@@ -353,6 +366,14 @@ class TestEnableCli:
 
 def _reproduced(*nodes: str) -> Confirmed:
     return Confirmed(ConfirmMode.INTERSECTED, nodes, (), ())
+
+
+def _expired_resolution(until: datetime) -> str:
+    """The one resolution text an expired disable's blocker gets, whichever audit red resolves it."""
+    return (
+        'The kill-switch disable this blocker describes has ended: '
+        f'the cache is enabled (kill switch expired at {until.isoformat()}).'
+    )
 
 
 class _RefusingQueue(EscalationQueue):
@@ -494,7 +515,7 @@ class TestAuditHook:
         assert hooked.pending() == []
         resolved = hooked.queue.get(blocker.id)
         assert resolved is not None and resolved.status == 'resolved'
-        assert f'kill switch expired at {until.isoformat()}' in (resolved.resolution or ''), resolved.resolution
+        assert resolved.resolution == _expired_resolution(until)
 
     def test_a_failed_trip_filing_is_retried_by_the_next_reproduced_red_though_it_attributes_nothing(self, tmp_path):
         queue = _RefusingQueue(tmp_path / 'escalations')
@@ -521,6 +542,33 @@ class TestAuditHook:
 
         assert [esc.id for esc in hooked.pending()] == [blocker.id]
 
+    def test_a_trip_filing_retried_past_the_leak_window_names_the_leaks_that_tripped_it(self, tmp_path):
+        queue = _RefusingQueue(tmp_path / 'escalations')
+        hooked = _Hooked(tmp_path, queue=queue)
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+        assert hooked.pending() == []
+        queue.refusing = False
+        hooked.seeded.advance(timedelta(days=9))
+        assert hooked.seeded.policy().is_disabled(hooked.seeded.now)
+
+        hooked.call(_reproduced(GAMMA_NODE), head=LATER_HEAD)
+
+        [blocker] = hooked.pending()
+        assert 'module:alpha:test' in blocker.summary and 'module:beta:test' in blocker.summary, blocker.summary
+        assert 'not counting toward the streak' not in blocker.detail, blocker.detail
+
+    def test_a_hand_resolved_blocker_is_re_filed_while_the_cache_stays_disabled(self, hooked):
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+        [resolved_by_hand] = hooked.pending()
+        hooked.queue.resolve(resolved_by_hand.id, 'resolved by hand, without verify-cache enable')
+
+        hooked.call(_reproduced(GAMMA_NODE), head=LATER_HEAD)
+
+        assert hooked.seeded.policy().is_disabled(hooked.seeded.now)
+        [refiled] = hooked.pending()
+        assert refiled.id != resolved_by_hand.id
+        assert refiled.root_cause == resolved_by_hand.root_cause
+
     def test_an_expired_disables_blocker_is_resolved_by_an_unattributable_red(self, hooked):
         hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
         [blocker] = hooked.pending()
@@ -533,7 +581,7 @@ class TestAuditHook:
         assert hooked.pending() == []
         resolved = hooked.queue.get(blocker.id)
         assert resolved is not None and resolved.status == 'resolved'
-        assert f'kill switch expired at {until.isoformat()}' in (resolved.resolution or ''), resolved.resolution
+        assert resolved.resolution == _expired_resolution(until)
 
     def test_row_14_a_red_on_a_unit_that_ran_takes_the_ordinary_path(self, hooked):
         assert hooked.call(_reproduced(GAMMA_NODE)) == ()
@@ -583,11 +631,8 @@ class TestAuditHook:
             asyncio.run(hook(AUDIT_COMMAND, HEAD, _reproduced(ALPHA_NODE), ()))
         assert not seeded.present(KA)
 
-    def test_a_failing_queue_costs_the_blocker_never_the_notes(self, hooked, monkeypatch, caplog):
-        def refuse(escalation):
-            raise OSError('escalation queue is read-only')
-
-        monkeypatch.setattr(hooked.queue, 'submit', refuse)
+    def test_a_failing_queue_costs_the_blocker_never_the_notes(self, tmp_path, caplog):
+        hooked = _Hooked(tmp_path, queue=_RefusingQueue(tmp_path / 'escalations'))
 
         with caplog.at_level(logging.ERROR, logger=audit_hook.__name__):
             notes = hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))

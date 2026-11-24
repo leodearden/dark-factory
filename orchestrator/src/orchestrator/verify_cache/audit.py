@@ -134,7 +134,9 @@ async def apply(verdict: AuditVerdict, registry: Registry, now: datetime) -> Lea
     """Evict every leaked key, then record the leaks and trip or hold the kill switch; idempotent per leak."""
     if not verdict.attributions:
         current = await registry.policy_state()
-        return LeakResponse((), {}, (), _counting(_records(current), now), current, False, current.is_disabled(now))
+        return LeakResponse(
+            (), {}, (), _streak_leaks(current, _records(current), now), current, False, current.is_disabled(now),
+        )
     leaks = tuple(attribution.record(now) for attribution in verdict.attributions)
     evicted = await _evict(registry, leaks)
     current = await registry.policy_state()
@@ -194,11 +196,11 @@ def _next_state(
     new = _new_leaks(stored, leaks)
     kept = stored if disabled else tuple(r for r in stored if _within(r, now) or r.identity in replayable)
     records = (*kept, *new)
-    streak_leaks = _counting(records, now)
+    streak_leaks = _streak_leaks(current, records, now)
     trips = not disabled and bool(new) and len(streak_leaks) >= MIN_DISABLING_LEAKS
     state = PolicyState(
         disabled_until=_disabled_until(current, now, trips=trips),
-        reason=_disable_reason(streak_leaks) if trips else _held_reason(current, now),
+        reason=_disable_reason(streak_leaks) if trips else held_reason(current, now),
         streak=len(streak_leaks),
         leaks=tuple(record.to_text() for record in records),
         updated_at=current.updated_at,
@@ -213,8 +215,8 @@ def _disabled_until(current: PolicyState, now: datetime, *, trips: bool) -> date
     return now + DISABLE_FOR if trips else None
 
 
-def _held_reason(current: PolicyState, now: datetime) -> str | None:
-    """*current*'s reason, unless the disable it explains has just expired."""
+def held_reason(current: PolicyState, now: datetime) -> str | None:
+    """*current*'s reason, unless the disable it explains has expired, whether or not its row is rewritten yet."""
     if current.disabled_until is None or current.is_disabled(now):
         return current.reason
     return f'kill switch expired at {current.disabled_until.isoformat()}'
@@ -238,9 +240,16 @@ def _new_leaks(known: Iterable[LeakRecord], leaks: Iterable[LeakRecord]) -> tupl
     return tuple(new)
 
 
-def _counting(records: Iterable[LeakRecord], now: datetime) -> tuple[LeakRecord, ...]:
-    """The records the streak counts: inside the window, and not recorded before an operator re-enable."""
-    return tuple(record for record in records if _within(record, now) and record.counts)
+def _streak_leaks(current: PolicyState, records: Iterable[LeakRecord], now: datetime) -> tuple[LeakRecord, ...]:
+    """The records the streak counts, read at a live disable's trip so a late blocker names the leaks that tripped it."""
+    if current.disabled_until is not None and current.is_disabled(now):
+        return _counting(records, current.disabled_until - DISABLE_FOR)
+    return _counting(records, now)
+
+
+def _counting(records: Iterable[LeakRecord], at: datetime) -> tuple[LeakRecord, ...]:
+    """The records a streak read *at* counts: inside the window, and not recorded before an operator re-enable."""
+    return tuple(record for record in records if _within(record, at) and record.counts)
 
 
 def _disable_reason(counting: Sequence[LeakRecord]) -> str:
