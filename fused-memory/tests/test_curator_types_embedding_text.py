@@ -1,4 +1,4 @@
-"""Task 11429: every curator embedding input is composed by embedding_text and bounded by clip_for_embedding."""
+"""embedding_text composes the stored-task embedding text; clip_for_embedding bounds every curator embedding input."""
 
 from __future__ import annotations
 
@@ -41,20 +41,25 @@ class TestEmbeddingText:
 
     def test_an_over_long_multibyte_description_is_cut_on_a_character_boundary(self):
         for char in ('€', '\U0001f600'):
+            uncut = 'T\n\n' + char * _OVER_THE_BOUND
+
             text = embedding_text('T', char * _OVER_THE_BOUND, [])
 
             assert _utf8_size(text) <= EMBEDDING_INPUT_MAX_BYTES
-            assert text.encode('utf-8', 'strict').decode('utf-8', 'strict') == text
+            assert uncut.startswith(text)
 
 
 class TestClipForEmbedding:
     def test_the_bound_fits_the_text_embedding_3_window(self):
         assert EMBEDDING_INPUT_MAX_BYTES < _TEXT_EMBEDDING_3_WINDOW_TOKENS
 
-    def test_a_lone_surrogate_does_not_raise_and_the_result_is_bounded(self):
+    def test_a_lone_surrogate_in_an_over_long_text_is_dropped_and_the_result_is_bounded(self):
         text = clip_for_embedding('\ud800' + 'x' * _OVER_THE_BOUND)
 
-        assert len(text.encode('utf-8', 'surrogatepass')) <= EMBEDDING_INPUT_MAX_BYTES
+        assert _utf8_size(text) <= EMBEDDING_INPUT_MAX_BYTES
+
+    def test_a_lone_surrogate_in_a_short_text_is_dropped(self):
+        assert clip_for_embedding('a\ud800b') == 'ab'
 
     def test_a_short_text_is_returned_unchanged(self):
         assert clip_for_embedding('Fix the bug') == 'Fix the bug'

@@ -587,12 +587,11 @@ def clip_for_embedding(text: str) -> str:
     """Cut *text* to at most ``EMBEDDING_INPUT_MAX_BYTES`` UTF-8 bytes, never splitting a character.
 
     The one bound every curator embedding input goes through: stored and query
-    vectors are comparable only if both sides are cut alike. Never raises; a
-    lone surrogate is measured, then dropped if the cut falls past it.
+    vectors are comparable only if both sides are cut alike. Never raises, and
+    always drops a lone surrogate, which UTF-8 cannot encode and the OpenAI
+    client refuses before sending, however short the text.
     """
-    encoded = text.encode('utf-8', 'surrogatepass')
-    if len(encoded) <= EMBEDDING_INPUT_MAX_BYTES:
-        return text
+    encoded = text.encode('utf-8', 'ignore')
     return encoded[:EMBEDDING_INPUT_MAX_BYTES].decode('utf-8', 'ignore')
 
 
