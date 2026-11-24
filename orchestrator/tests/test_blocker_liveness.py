@@ -74,16 +74,20 @@ class TestHeldBlocker:
         _task('blocked', claimant='run-x', beat_secs_ago=10),
         _task('done'),
         _task('cancelled'),
-        _task('in-progress', claimant='run-x', beat_secs_ago=900, metadata={'infra_hold': True}),
-        _task('blocked', metadata={'infra_hold': True}),
     ], ids=[
         'heartbeating', 'dispatched-not-yet-claimed', 'requeued-before-its-claim-clears',
         'blocked-on-its-way-out', 'done-before-release', 'cancelled-before-release',
-        'legacy-infra-held', 'legacy-infra-held-blocked',
     ])
     def test_an_in_flight_owner_with_progress_or_unwinding_is_live(
         self, record: dict[str, Any],
     ) -> None:
+        assert non_live_holder(_held('H'), _world({'H': record})) is None
+
+    @pytest.mark.parametrize('record', [
+        _task('in-progress', claimant='run-x', beat_secs_ago=900, metadata={'infra_hold': True}),
+        _task('blocked', metadata={'infra_hold': True}),
+    ], ids=['stale-heartbeat', 'blocked-no-claimant'])
+    def test_a_legacy_infra_held_owner_is_live(self, record: dict[str, Any]) -> None:
         assert non_live_holder(_held('H'), _world({'H': record})) is None
 
     def test_an_in_flight_owner_gone_from_the_task_read_is_live(self) -> None:
