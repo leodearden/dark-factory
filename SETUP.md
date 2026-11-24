@@ -483,7 +483,7 @@ cd dark-factory
 uv run --project orchestrator orchestrator status --config /path/to/your-project/dark-factory-orchestrator.yaml
 
 # Or via the MCP tools inside a Claude Code session:
-#   get_tasks(project_root="/path/to/your-project")
+#   get_statuses(project_root="/path/to/your-project", page_size=50)
 
 # Dashboard — visual view of tasks/escalations/memory across all projects
 xdg-open http://127.0.0.1:8080   # or just open it in a browser
