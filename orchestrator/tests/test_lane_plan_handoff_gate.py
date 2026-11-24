@@ -3,8 +3,9 @@
 Task 3608.  Between planning and EXECUTE the workflow checks the lane's
 agent-facing plan link, relinks it once when it is broken, and blocks the task
 as an ``infra_issue`` rather than dispatch an implementer whose first read
-would fail.  Both cases drive the public ``TaskWorkflow.run()`` in a fresh
-repo, breaking the lane link right after the architect writes the plan.
+would fail.  It checks again before resuming the implementer after an
+escalation wait, during which the steward works in the same worktree.  Every
+case drives the public ``TaskWorkflow.run()`` in a fresh repo.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from _workflow_helpers import (
     _init_repo,
     _make_git_ops,
 )
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 
 from orchestrator.agents.review_briefing import ReviewBriefing
@@ -34,6 +37,12 @@ from orchestrator.workflow import WorkflowOutcome
 
 def _lane_plan(cwd: Path) -> Path:
     return cwd / '.task' / 'plan.json'
+
+
+def _read_lane_plan(cwd: Path) -> tuple[bool, str]:
+    """Whether the lane plan is a symlink, and what reading it returns."""
+    lane = _lane_plan(cwd)
+    return lane.is_symlink(), lane.read_text()
 
 
 class _LaneBreakingStub(AgentStub):
@@ -53,18 +62,67 @@ class _LaneBreakingStub(AgentStub):
 
     async def _implementer(self, cwd: Path) -> AgentResult:
         if self.first_implementer_read is None:
-            lane = _lane_plan(cwd)
-            self.first_implementer_read = (lane.is_symlink(), lane.read_text())
+            self.first_implementer_read = _read_lane_plan(cwd)
         return await super()._implementer(cwd)
 
 
-async def _run(tmp_path: Path, monkeypatch, stub: AgentStub):
+class _EscalatingStub(AgentStub):
+    """Files a blocking L0 from its first implementer call, and records what the resumed implementer read."""
+
+    def __init__(self, queue: EscalationQueue) -> None:
+        super().__init__()
+        self._queue = queue
+        self._implementer_calls = 0
+        self.resumed_read: tuple[bool, str] | None = None
+
+    async def _implementer(self, cwd: Path) -> AgentResult:
+        self._implementer_calls += 1
+        if self._implementer_calls == 1:
+            self._queue.submit(Escalation(
+                id=self._queue.make_id(TASK_ID), task_id=TASK_ID, agent_role='implementer',
+                severity='blocking', category='task_failure', summary='needs a steward ruling',
+            ))
+            return AgentResult(success=True, output='Escalated')
+        if self.resumed_read is None:
+            self.resumed_read = _read_lane_plan(cwd)
+        return await super()._implementer(cwd)
+
+
+def _lane_breaking_steward(queue: EscalationQueue) -> type:
+    """A steward that, working in the task's worktree, breaks its lane plan link and resolves every pending L0."""
+
+    class _Steward:
+        def __init__(self, wt_path: Path, cfg_dir: Path) -> None:
+            self._lane = _lane_plan(wt_path)
+
+        def set_outcome_channel(self, channel) -> None:
+            pass
+
+        def set_wip_probe(self, probe) -> None:
+            pass
+
+        async def start(self) -> None:
+            _replace_with_empty_file(self._lane)
+            for esc in queue.get_by_task(TASK_ID, status='pending', level=0):
+                queue.resolve(esc.id, 'resolved by the lane-breaking steward', resolved_by='steward')
+
+        async def stop(self) -> None:
+            pass
+
+    return _Steward
+
+
+async def _run(
+    tmp_path: Path, monkeypatch, stub: AgentStub, *,
+    queue: EscalationQueue | None = None, steward_factory: type | None = None,
+):
     repo = tmp_path / 'repo'
     repo.mkdir()
     _init_repo(repo)
     config = run_config(repo, briefing=ReviewBriefing.DIFF_ONLY, router_enabled=True)
     workflow, _scheduler, queue = _build_workflow_with_escalation(
         config, _make_git_ops(config.project_root), assignment(), stub, tmp_path,
+        queue=queue, steward_factory=steward_factory,
     )
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
     monkeypatch.setattr(
@@ -131,3 +189,21 @@ async def test_a_lane_plan_that_cannot_be_relinked_blocks_before_any_implementer
         if esc.category == 'infra_issue' and (lane in esc.summary or lane in esc.detail)
     ]
     assert refusals, [(esc.category, esc.summary) for esc in queue.get_by_task(TASK_ID)]
+
+
+@pytest.mark.asyncio
+async def test_a_lane_plan_broken_during_an_escalation_wait_is_relinked_before_the_implementer_resumes(
+    tmp_path, monkeypatch,
+):
+    queue = EscalationQueue(tmp_path / 'escalation_queue')
+    stub = _EscalatingStub(queue)
+
+    outcome, _queue = await _run(
+        tmp_path, monkeypatch, stub, queue=queue, steward_factory=_lane_breaking_steward(queue),
+    )
+
+    assert outcome == WorkflowOutcome.DONE
+    assert stub.resumed_read is not None
+    was_link, read = stub.resumed_read
+    assert was_link
+    assert [step['id'] for step in json.loads(read)['steps']] == ['step-1', 'step-2']

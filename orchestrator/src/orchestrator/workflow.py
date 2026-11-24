@@ -3297,6 +3297,8 @@ class TaskWorkflow:
                 return _r
             # Normal path: EXECUTE + VERIFY + REVIEW loop (with escalation retry)
             while True:
+                if (refused := await self._hand_off_lane_plan()) is not None:
+                    return refused
                 outcome = await self._execute_verify_review_loop()
                 if outcome == WorkflowOutcome.ESCALATED:
                     self._enter_phase(WorkflowState.ESCALATED)
@@ -3421,6 +3423,8 @@ class TaskWorkflow:
                                 'Scope grant',
                             )
 
+                    if (refused := await self._hand_off_lane_plan()) is not None:
+                        return refused
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                     async def build_resume_prompt(
@@ -16808,6 +16812,27 @@ class TaskWorkflow:
         return await self._finalise_recovery_done(
             basis='fallback', sha=evidence_sha, kind='found_on_main',
             note='branch already on main at workflow start (pre-PLAN recovery)',
+        )
+
+    async def _hand_off_lane_plan(self) -> WorkflowOutcome | None:
+        """Hand the implementer a lane whose ``.task/plan.json`` reads this task's plan: relink once, else block."""
+        fault = self.artifacts.lane_plan_fault()
+        if fault is None:
+            return None
+        logger.warning('Task %s: relinking before the implementer handoff: %s', self.task_id, fault.describe())
+        relink_error: OSError | None = None
+        try:
+            self.artifacts.ensure_lane_symlinks()
+        except OSError as exc:
+            relink_error = exc
+        fault = self.artifacts.lane_plan_fault()
+        if fault is None:
+            return None
+        detail = fault.describe()
+        if relink_error is not None:
+            detail += f'\nRelink failed: {relink_error!r}'
+        return await self._mark_blocked(
+            f'Lane handoff refused: {fault.describe()}', detail=detail, category='infra_issue',
         )
 
     async def _recover_before_execute(self) -> WorkflowOutcome | None:
