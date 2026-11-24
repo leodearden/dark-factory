@@ -29,7 +29,8 @@ exec sleep 3600
 _EXIT_TIMEOUT_S = 30.0
 
 
-def _hermetic_git_env(repo: Path) -> dict[str, str]:
+def hermetic_git_env(repo: Path) -> dict[str, str]:
+    """The env for a git child in *repo*: discovery fenced at its parent, no redirects inherited."""
     env = git_env_with_ceiling(repo)
     for key in git_redirect_env(env):
         del env[key]
@@ -84,7 +85,7 @@ def commit_blocked_in_pre_commit_hook(repo: Path, path: str) -> Iterator[int]:
         proc = subprocess.Popen(
             ['git', '-c', f'core.hooksPath={hooks_dir}', 'commit', '-q',
              '--only', path, '-m', 'blocked in its pre-commit hook'],
-            cwd=repo, env=_hermetic_git_env(repo),
+            cwd=repo, env=hermetic_git_env(repo),
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, text=True,
         )
