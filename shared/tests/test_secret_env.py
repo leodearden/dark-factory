@@ -48,8 +48,6 @@ ORDINARY_NAMES = (
     'PYTHON_KEYRING_BACKEND',
 )
 
-PLAN_PROXY_KEY_VALUE = 'plan-proxy-' + 'k' * 40
-
 POOL = {f'CLAUDE_OAUTH_TOKEN_{letter}': f'pool-{letter}-' + 'p' * 40 for letter in 'ABCDEFGH'}
 
 ORDINARY_ENV = {
@@ -67,6 +65,7 @@ def _environ_with_secrets() -> dict[str, str]:
         'ANTHROPIC_API_KEY': 'anthropic-' + 'a' * 40,
         'GEMINI_API_KEY': 'gemini-' + 'g' * 40,
         'CLAUDE_CODE_OAUTH_TOKEN': 'session-' + 's' * 40,
+        'OPENAI_PLAN_PROXY_KEY': 'plan-proxy-' + 'k' * 40,
         **ORDINARY_ENV,
     }
 
@@ -91,7 +90,7 @@ class TestAgentSubprocessEnv:
     def test_drops_the_pool_and_every_api_key(self):
         child = agent_subprocess_env(_environ_with_secrets())
         assert [k for k in child if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
-        for name in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY'):
+        for name in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_PLAN_PROXY_KEY'):
             assert name not in child
 
     def test_keeps_the_session_credential_and_ordinary_vars_unchanged(self):
@@ -173,14 +172,9 @@ class TestAgentSubprocessEnv:
         assert 'ANTHROPIC_BASE_URL' not in child
         assert 'ANTHROPIC_AUTH_TOKEN' not in child
 
-    def test_drops_the_plan_proxy_key_and_keeps_its_url(self):
-        environ = {
-            **_environ_with_secrets(),
-            'OPENAI_PLAN_PROXY_URL': 'http://127.0.0.1:8317/v1',
-            'OPENAI_PLAN_PROXY_KEY': PLAN_PROXY_KEY_VALUE,
-        }
+    def test_keeps_the_plan_proxy_url(self):
+        environ = {**_environ_with_secrets(), 'OPENAI_PLAN_PROXY_URL': 'http://127.0.0.1:8317/v1'}
         child = agent_subprocess_env(environ)
-        assert 'OPENAI_PLAN_PROXY_KEY' not in child
         assert child['OPENAI_PLAN_PROXY_URL'] == environ['OPENAI_PLAN_PROXY_URL']
 
 
@@ -233,7 +227,3 @@ class TestSecretEnvValues:
 
     def test_no_secrets_yields_nothing(self):
         assert secret_env_values(ORDINARY_ENV) == {}
-
-    def test_maps_the_plan_proxy_key(self):
-        environ = {**_environ_with_secrets(), 'OPENAI_PLAN_PROXY_KEY': PLAN_PROXY_KEY_VALUE}
-        assert secret_env_values(environ)['OPENAI_PLAN_PROXY_KEY'] == PLAN_PROXY_KEY_VALUE
