@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import textwrap
 from pathlib import Path
 
@@ -186,8 +187,9 @@ def test_a_key_listed_more_times_than_found_is_stale() -> None:
 
 def test_the_census_verdict_is_frozen() -> None:
     verdict = judge_census([], {})
-    with pytest.raises(AttributeError):
-        verdict.unlisted = (_KEY,)  # type: ignore[misc]
+    field = 'unlisted'
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(verdict, field, (_KEY,))
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +248,9 @@ def test_only_code_writers_and_model_prose_need_a_test() -> None:
 
 def test_the_census_row_is_frozen() -> None:
     row = CensusRow(count=1, disposition=Disposition.RELAY, reason='relays a caller')
-    with pytest.raises(AttributeError):
-        row.count = 2  # type: ignore[misc]
+    field = 'count'
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(row, field, 2)
 
 
 def test_a_census_of_well_formed_rows_has_no_problems(tmp_path: Path) -> None:
