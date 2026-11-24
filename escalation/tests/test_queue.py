@@ -32,14 +32,19 @@ from escalation.amendments import (
     MAX_AMENDMENTS,
     amendment_room,
 )
-from escalation.classify import default_resolution_class_for_resolver, effective_benign
-from escalation.models import Escalation
+from escalation.classify import (
+    default_resolution_class_for_resolver,
+    effective_benign,
+    resolver_tier,
+)
+from escalation.models import RESOLUTION_CLASS_REQUIRED_CODE, Escalation
 from escalation.queue import (
     _MAX_LATE_RESOLUTION_CHARS,
     _MAX_LATE_RESOLUTIONS,
     _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
+    ResolutionClassRequired,
     ResolveOutcome,
     iter_all_escalation_paths,
 )
@@ -1893,7 +1898,7 @@ class TestGetByTaskAgentRoleFilter:
         queue.submit(self._make_esc('esc-42-1', '42', 'orchestrator-deterministic', level=0))
         # Matching role and level, but resolved -> excluded by status='pending'.
         queue.submit(self._make_esc('esc-42-2', '42', 'orchestrator-deterministic', level=2))
-        queue.resolve('esc-42-2', 'done')
+        queue.resolve('esc-42-2', 'done', resolution_class='actionable')
         # Wrong role, matching level+status -> excluded by agent_role filter.
         queue.submit(self._make_esc('esc-42-3', '42', 'orchestrator-starvation-watchdog', level=2))
         # Matches all three filters.
@@ -3832,7 +3837,7 @@ class TestFindPendingL2ByRootCause:
         """(d) Returns None when the matching L2 is already resolved (status filter)."""
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2(queue, 'task-1', 'Bad merge strategy')
-        queue.resolve(l2.id, 'Fixed')
+        queue.resolve(l2.id, 'Fixed', resolution_class='actionable')
 
         result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
 
@@ -4177,7 +4182,7 @@ class TestAddMembersToL2:
         """(d) Returns None when the L2 is archived or unknown (refuses archived L2s)."""
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2(queue)
-        queue.resolve(l2.id, 'Fixed')  # moves to archive
+        queue.resolve(l2.id, 'Fixed', resolution_class='actionable')  # moves to archive
 
         result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
 
@@ -4882,7 +4887,7 @@ class TestStampTriage:
         """(c) Returns None for a resolved+archived record; never resurrects it into the queue root."""
         queue = EscalationQueue(tmp_path / 'esc')
         esc = self._make_pending(queue)
-        queue.resolve(esc.id, 'Fixed')  # moves to archive
+        queue.resolve(esc.id, 'Fixed', resolution_class='actionable')  # moves to archive
 
         result = queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='note')
 
@@ -5364,7 +5369,7 @@ class TestResolveCascade:
         self._make_l1(queue, 'esc-l1-2', 'task-2')
         l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-l1-2'])
 
-        queue.resolve(l2.id, 'Resolved the root cause')
+        queue.resolve(l2.id, 'Resolved the root cause', resolution_class='actionable')
 
         r1 = queue.get('esc-l1-1')
         r2 = queue.get('esc-l1-2')
@@ -5381,7 +5386,7 @@ class TestResolveCascade:
         self._make_l1(queue, 'esc-l1-1')
         l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1'])
 
-        queue.resolve(l2.id, 'Fixed upstream')
+        queue.resolve(l2.id, 'Fixed upstream', resolution_class='actionable')
 
         m = queue.get('esc-l1-1')
         assert m is not None
@@ -5397,7 +5402,7 @@ class TestResolveCascade:
         self._make_l1(queue, 'esc-l1-2')
         l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-l1-2'])
 
-        queue.resolve(l2.id, 'Dismissed: not actionable', dismiss=True)
+        queue.resolve(l2.id, 'Dismissed: not actionable', dismiss=True, resolution_class='benign')
 
         m1 = queue.get('esc-l1-1')
         m2 = queue.get('esc-l1-2')
@@ -5414,7 +5419,7 @@ class TestResolveCascade:
         l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1'])
 
         # Cascade should hit the idempotency guard in resolve() for m1
-        queue.resolve(l2.id, 'L2 resolution')
+        queue.resolve(l2.id, 'L2 resolution', resolution_class='actionable')
 
         m1_reloaded = queue.get('esc-l1-1')
         assert m1_reloaded is not None
@@ -5434,7 +5439,7 @@ class TestResolveCascade:
         l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-nonexistent'])
 
         # Must not raise
-        result = queue.resolve(l2.id, 'Fixed')
+        result = queue.resolve(l2.id, 'Fixed', resolution_class='actionable')
 
         assert result is not None
         assert result.status == 'resolved'
@@ -5448,7 +5453,7 @@ class TestResolveCascade:
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2_with_members(queue, 'esc-l2-1', [])
 
-        result = queue.resolve(l2.id, 'Fixed; no members')
+        result = queue.resolve(l2.id, 'Fixed; no members', resolution_class='actionable')
 
         assert result is not None
         assert result.status == 'resolved'
@@ -5570,7 +5575,7 @@ class TestResolveWarnsOnDeclaredPin:
         queue.submit(l2)
 
         with caplog.at_level(logging.WARNING, logger='escalation.queue'):
-            queue.resolve('esc-l2-head', 'bulk close', dismiss=True)
+            queue.resolve('esc-l2-head', 'bulk close', dismiss=True, resolution_class='benign')
 
         (warning,) = self._pin_warnings(caplog)
         assert 'esc-member-pin' in warning, (
@@ -5874,25 +5879,23 @@ class TestResolveCascadeResolutionClass:
                 f"defaulted stamp); got {member.resolution_class!r}"
             )
 
-    def test_members_inherit_none_when_parent_class_resolves_to_none(self, tmp_path: Path):
-        """resolve(L2, resolved_by='interactive', no explicit class) -> parent stays None -> members inherit None."""
+    def test_an_unclassified_parent_close_is_refused_and_cascades_nothing(self, tmp_path: Path):
+        """resolve(L2, resolved_by='interactive', no explicit class) is refused, so no member closes.
+
+        A level-2 close must carry a class (plans/instruments-honesty-prd.md decision 8).
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         self._make_l1(queue, 'esc-1-2', 'task-2')
         self._make_l1(queue, 'esc-1-3', 'task-3')
         l2 = self._make_l2_with_members(queue, 'esc-1-1', ['esc-1-2', 'esc-1-3'])
 
-        queue.resolve(l2.id, 'Resolved by a human', resolved_by='interactive')
+        with pytest.raises(ResolutionClassRequired):
+            queue.resolve(l2.id, 'Resolved by a human', resolved_by='interactive')
 
-        parent = queue.get(l2.id)
-        assert parent is not None
-        assert parent.resolution_class is None
-
-        for member_id in ('esc-1-2', 'esc-1-3'):
-            member = queue.get(member_id)
-            assert member is not None
-            assert member.resolution_class is None, (
-                f"Expected {member_id} resolution_class=None (inherited from parent); got {member.resolution_class!r}"
-            )
+        for esc_id in (l2.id, 'esc-1-2', 'esc-1-3'):
+            record = queue.get(esc_id)
+            assert record is not None
+            assert record.status == 'pending', f'{esc_id} must stay pending; got {record.status!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -6776,7 +6779,7 @@ class TestCrossProcessArchiveStaleness:
 
         # harness_q resolves + archives esc-2799-1 OUT OF BAND — server_q's
         # memo, already built, does not know about this move.
-        resolved = harness_q.resolve('esc-2799-1', 'resolved out-of-band')
+        resolved = harness_q.resolve('esc-2799-1', 'resolved out-of-band', resolution_class='actionable')
         assert resolved is not None and resolved.status == 'resolved', (
             'Setup: harness_q must have resolved+archived esc-2799-1'
         )
@@ -6811,7 +6814,7 @@ class TestCrossProcessArchiveStaleness:
         assert server_q.get('esc-absent-1') is None, 'Setup: unrelated id must be absent'
         assert server_q._archive_listing is not None, 'Setup: memo must be built by now'
 
-        harness_q.resolve('esc-2799-2', 'resolved out-of-band')
+        harness_q.resolve('esc-2799-2', 'resolved out-of-band', resolution_class='actionable')
 
         result = server_q.patch_resolution_metadata('esc-2799-2', resolved_by='steward')
         assert result is not None, (
@@ -6844,7 +6847,7 @@ class TestCrossProcessArchiveStaleness:
         assert server_q.get('esc-absent-2') is None, 'Setup: unrelated id must be absent'
         assert server_q._archive_listing is not None, 'Setup: memo must be built by now'
 
-        harness_q.resolve('esc-2799-3', 'resolved out-of-band')
+        harness_q.resolve('esc-2799-3', 'resolved out-of-band', resolution_class='actionable')
 
         with patch.object(
             server_q, '_iter_archive_paths', wraps=server_q._iter_archive_paths,
@@ -6883,7 +6886,7 @@ class TestCrossProcessArchiveStaleness:
         # Give the archive subtree real (unrelated) content so the reprobe
         # walks a non-trivial directory, not just an existence check.
         harness_q.submit(_make_escalation('esc-2799-4', task_id='2799', level=2))
-        harness_q.resolve('esc-2799-4', 'unrelated archived id')
+        harness_q.resolve('esc-2799-4', 'unrelated archived id', resolution_class='actionable')
 
         # Force server_q's memo to build (finds esc-2799-4, since it was
         # already archived by the time this scan runs).
@@ -6922,12 +6925,12 @@ class TestCrossProcessArchiveStaleness:
         # harness_q creates AND archives esc-2799-5 out of band, AFTER
         # server_q already negative-cached it as absent.
         harness_q.submit(_make_escalation('esc-2799-5', task_id='2799', level=2))
-        harness_q.resolve('esc-2799-5', 'resolved out-of-band after negative-cache')
+        harness_q.resolve('esc-2799-5', 'resolved out-of-band after negative-cache', resolution_class='actionable')
 
         # server_q performs an unrelated self-archival — this must clear the
         # negative cache wholesale.
         server_q.submit(_make_escalation('esc-2799-6', task_id='2799', level=2))
-        server_q.resolve('esc-2799-6', 'unrelated self-archival')
+        server_q.resolve('esc-2799-6', 'unrelated self-archival', resolution_class='actionable')
         assert 'esc-2799-5' not in server_q._archive_negative_cache, (
             'Expected the negative cache to be cleared by the self-archival'
         )
@@ -8911,7 +8914,7 @@ class TestCascadeForwardIsCapturedButNotReportedAsARace:
         with caplog.at_level(logging.INFO, logger='escalation.queue'):
             queue.resolve(
                 self.L2, 'root cause was a stale lockfile across the whole cluster',
-                resolved_by='interactive',
+                resolved_by='interactive', resolution_class='actionable',
             )
 
         record = queue.get(self.MEMBER)
@@ -9231,6 +9234,54 @@ class TestLateResolutionCorrectsResolutionClass:
         assert record.resolution_class == 'actionable'
 
 
+class TestLateResolutionRecordsTheRulingAssertion:
+    """A late resolve keeps its ruled_by_human assertion on the captured entry.
+
+    Like the rest of the terminal state, the record's own flag is not moved, so
+    the record stays in the sweep's tier.
+    """
+
+    def _swept(self, queue: EscalationQueue, esc_id: str, *, level: int = 1) -> None:
+        queue.submit(_make_escalation(esc_id, task_id='8562', level=level))
+        queue.resolve(esc_id, 'Auto-dismissed: aged out', dismiss=True, resolved_by='auto-dismissed')
+
+    @pytest.mark.parametrize('flag', [True, False, None])
+    def test_a_late_resolve_records_its_ruling_flag_on_the_entry(
+        self, tmp_path: Path, flag: bool | None,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._swept(queue, 'esc-8562-1')
+
+        queue.resolve(
+            'esc-8562-1', 'Leo ruled: a real defect', resolved_by='interactive',
+            ruled_by_human=flag,
+        )
+
+        record = queue.get('esc-8562-1')
+        assert record is not None
+        assert [entry.get('ruled_by_human') for entry in record.late_resolutions] == [flag]
+        assert record.ruled_by_human is None
+        assert resolver_tier(record) == 'reaper-sweep'
+
+    def test_an_l2_ruling_cascading_onto_a_swept_member_is_recorded_on_its_entry(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._swept(queue, 'esc-8562-2')
+        l2 = _make_escalation('esc-8562-3', task_id='8562', level=2)
+        l2.members = ['esc-8562-2']
+        queue.submit(l2)
+
+        queue.resolve(
+            'esc-8562-3', 'Leo ruled on the cluster', resolved_by='interactive',
+            resolution_class='actionable', ruled_by_human=True,
+        )
+
+        member = queue.get('esc-8562-2')
+        assert member is not None
+        assert [entry.get('ruled_by_human') for entry in member.late_resolutions] == [True]
+
+
 class TestLateResolutionBounds:
     """`late_resolutions` is SIZE-bounded, and every loss is a durable fact.
 
@@ -9428,3 +9479,132 @@ class TestGetPendingByTask:
             assert [e.id for e in grouped[task_id]] == [
                 e.id for e in queue.get_by_task(task_id, status='pending')
             ] == ['esc-1-1']
+
+
+class TestLevel2ResolutionClassRequired:
+    """A level-2 close must carry a resolution_class (plans/instruments-honesty-prd.md decision 8).
+
+    The refusal raises inside the lock before any write, so the record is
+    unchanged on disk and nothing is archived.
+    """
+
+    def _submit(self, queue: EscalationQueue, esc_id: str, *, level: int, members=()) -> Escalation:
+        esc = _make_escalation(esc_id, task_id=f'task-{esc_id}', level=level)
+        esc.members = list(members)
+        queue.submit(esc)
+        return esc
+
+    def _on_disk(self, queue: EscalationQueue, esc_id: str) -> dict:
+        return json.loads((queue.queue_dir / f'{esc_id}.json').read_text())
+
+    def _archived(self, queue: EscalationQueue) -> list[Path]:
+        return sorted((queue.queue_dir / 'archive').glob('*/*.json'))
+
+    @pytest.mark.parametrize('dismiss', [False, True], ids=['resolve', 'dismiss'])
+    @pytest.mark.parametrize('resolved_by', ['escalation-watcher', 'interactive', None])
+    def test_an_unclassified_level_2_close_is_refused_and_changes_nothing(
+        self, tmp_path: Path, resolved_by: str | None, dismiss: bool,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-1', level=2)
+        before = self._on_disk(queue, 'esc-2-1')
+        outcome: ResolveOutcome = {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': None,
+        }
+
+        with pytest.raises(ResolutionClassRequired) as raised:
+            queue.resolve(
+                'esc-2-1', 'closing it', dismiss=dismiss, resolved_by=resolved_by, outcome=outcome,
+            )
+
+        assert raised.value.code == RESOLUTION_CLASS_REQUIRED_CODE == 'resolution_class_required'
+        message = str(raised.value)
+        assert 'esc-2-1' in message
+        assert 'level 2' in message
+        assert repr(resolved_by) in message
+        assert self._on_disk(queue, 'esc-2-1') == before
+        record = queue.get('esc-2-1')
+        assert record is not None and record.status == 'pending'
+        assert self._archived(queue) == []
+        assert outcome['applied'] is False
+
+    def test_a_reaper_sweep_level_2_close_is_not_refused(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-1', level=2)
+
+        closed = queue.resolve(
+            'esc-2-1', 'swept', dismiss=True, resolved_by='harness-escalation-revalidation-sweep',
+        )
+
+        assert closed is not None and closed.status == 'dismissed'
+        assert closed.resolution_class is not None
+
+    @pytest.mark.parametrize('level', [0, 1])
+    def test_an_unclassified_level_0_or_1_close_still_closes(self, tmp_path: Path, level: int):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-1', level=level)
+
+        closed = queue.resolve('esc-2-1', 'done', resolved_by='escalation-watcher')
+
+        assert closed is not None and closed.status == 'resolved'
+        assert closed.resolution_class is None
+
+    def test_a_human_ruling_on_an_l2_is_stamped_on_the_head_and_each_member(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-2', level=1)
+        self._submit(queue, 'esc-2-3', level=1)
+        self._submit(queue, 'esc-2-1', level=2, members=['esc-2-2', 'esc-2-3'])
+
+        queue.resolve(
+            'esc-2-1', 'Leo ruled', resolved_by='escalation-watcher',
+            resolution_class='actionable', ruled_by_human=True,
+        )
+
+        head = queue.get('esc-2-1')
+        assert head is not None
+        assert head.ruled_by_human is True
+        assert head.resolution_class is not None
+        for member_id in ('esc-2-2', 'esc-2-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.status == 'resolved'
+            assert member.resolved_by == 'l2-cascade:esc-2-1'
+            assert member.resolution_class == head.resolution_class
+            assert member.ruled_by_human is True
+
+    def test_an_omitted_ruling_flag_stays_none_on_the_head_and_members(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-2', level=1)
+        self._submit(queue, 'esc-2-1', level=2, members=['esc-2-2'])
+
+        queue.resolve('esc-2-1', 'closed', resolved_by='escalation-watcher', resolution_class='actionable')
+
+        for esc_id in ('esc-2-1', 'esc-2-2'):
+            record = queue.get(esc_id)
+            assert record is not None
+            assert record.ruled_by_human is None
+
+    def test_an_already_dismissed_level_2_resolved_again_unclassified_does_not_raise(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-1', level=2)
+        queue.resolve('esc-2-1', 'swept', dismiss=True, resolved_by='auto-dismissed')
+
+        again = queue.resolve('esc-2-1', 'a late human close', resolved_by='interactive')
+
+        assert again is not None and again.status == 'dismissed'
+
+    def test_submit_resolved_of_an_unclassified_level_2_is_refused_before_mutation(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = _make_escalation('esc-2-1', level=2)
+        before = esc.to_dict()
+
+        with pytest.raises(ResolutionClassRequired):
+            queue.submit_resolved(esc, 'closed at filing', resolved_by='interactive')
+
+        assert esc.to_dict() == before
+        assert queue.get('esc-2-1') is None

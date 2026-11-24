@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from escalation.models import RESOLUTION_CLASSES
 from escalation.shadow_ruling import SHADOW_RULING_MARKER
 from orchestrator.decision_registry import (
     DecisionRecord,
@@ -45,6 +46,8 @@ FINDING = mod.Finding(escalation_id='esc-6798-1', summary='rebase hazard', detai
 PREPARED = mod.PreparedMarker(recommendation='B', no_lean_reason='', sitting_id='nightly-2026-09-26',
                               prepared_at='2026-09-26T05:30:00+00:00')
 AGREED = mod.AgreedMarker(answer='B', agreed=True, answer_rounds=1, at='2026-09-26T09:00:00+00:00')
+#: The provenance every resolve_issue_payload call must state.
+PROVENANCE = {'resolution_class': 'actionable', 'ruled_by_human': True}
 
 DF_QUEUE = '/src/dark-factory/data/escalations'
 DF_RECON_QUEUE = '/src/dark-factory/data/reconciliation/escalations'
@@ -95,7 +98,8 @@ def _argvs(payload: mod.ApplyPayload) -> list[list[str]]:
 
 def _all_builder_payloads() -> list[mod.ApplyPayload]:
     return [
-        mod.resolve_issue_payload('esc-4803-2', 'ruled B', 'resume', resolved_by='leo', resolution_turns=2),
+        mod.resolve_issue_payload('esc-4803-2', 'ruled B', 'resume', resolved_by='leo', resolution_turns=2,
+                                  **PROVENANCE),
         mod.update_task_payload('4803', PROJECT_ROOT, RULING, existing=None),
         mod.append_details_payload('5255', PROJECT_ROOT, FINDING),
         mod.add_dependency_payload('5255', '4803', PROJECT_ROOT),
@@ -125,16 +129,19 @@ class TestResolveIssuePayload:
 
     @pytest.mark.parametrize('action', sorted(_server_resolve_actions()))
     def test_every_server_action_is_accepted(self, action):
-        payload = mod.resolve_issue_payload('esc-1-1', 'r', action, resolved_by='leo', resolution_turns=1)
+        payload = mod.resolve_issue_payload('esc-1-1', 'r', action, resolved_by='leo', resolution_turns=1,
+                                            **PROVENANCE)
 
         assert _args(payload)['action'] == action
 
     def test_unknown_action_is_refused(self):
         with pytest.raises(ValueError):
-            mod.resolve_issue_payload('esc-1-1', 'r', 'dismiss', resolved_by='leo', resolution_turns=1)
+            mod.resolve_issue_payload('esc-1-1', 'r', 'dismiss', resolved_by='leo', resolution_turns=1,
+                                      **PROVENANCE)
 
     def test_resolution_turns_is_carried_as_an_int(self):
-        payload = mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=3)
+        payload = mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=3,
+                                            **PROVENANCE)
 
         assert _args(payload)['resolution_turns'] == 3
         assert type(_args(payload)['resolution_turns']) is int
@@ -142,7 +149,37 @@ class TestResolveIssuePayload:
     @pytest.mark.parametrize('turns', ['3', True, 0, -1, 2.0])
     def test_non_int_or_non_positive_turns_are_refused(self, turns):
         with pytest.raises(ValueError):
-            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=turns)
+            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=turns,
+                                      **PROVENANCE)
+
+    @pytest.mark.parametrize('omitted', sorted(PROVENANCE))
+    def test_each_provenance_field_is_required(self, omitted):
+        stated = {k: v for k, v in PROVENANCE.items() if k != omitted}
+
+        with pytest.raises(TypeError, match=omitted):
+            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=1, **stated)
+
+    @pytest.mark.parametrize('resolution_class', sorted(RESOLUTION_CLASSES))
+    @pytest.mark.parametrize('ruled_by_human', [True, False])
+    def test_the_args_carry_the_class_and_the_human_ruling_flag(self, resolution_class, ruled_by_human):
+        payload = mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=1,
+                                            resolution_class=resolution_class, ruled_by_human=ruled_by_human)
+
+        assert _args(payload)['resolution_class'] == resolution_class
+        assert _args(payload)['ruled_by_human'] is ruled_by_human
+
+    def test_a_class_outside_the_vocabulary_is_refused_naming_the_legal_values(self):
+        with pytest.raises(ValueError) as refused:
+            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=1,
+                                      resolution_class='urgent', ruled_by_human=True)
+
+        assert all(legal in str(refused.value) for legal in RESOLUTION_CLASSES)
+
+    @pytest.mark.parametrize('flag', ['true', 1, 0, None])
+    def test_a_non_bool_human_ruling_flag_is_refused(self, flag):
+        with pytest.raises(ValueError, match='ruled_by_human'):
+            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=1,
+                                      resolution_class='actionable', ruled_by_human=flag)
 
 
 class TestUpdateTaskPayload:

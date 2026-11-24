@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from escalation.classify import classify_resolver_tier, effective_benign
+from escalation.classify import effective_benign, resolver_tier
 from escalation.models import RESOLUTION_CLASSES, Escalation
 
 from dashboard.data.datum import Datum
@@ -396,7 +396,7 @@ def _lifespan_block(
     - ``samples``: one ``[date, tier, level, secs]`` row per terminal-with-
       valid-times record, ``date`` = ``date(resolved_at)`` (matches
       ``flow_daily``'s key so the two reconcile — row 11) and ``tier`` =
-      :func:`~escalation.classify.classify_resolver_tier` of ``resolved_by``.
+      :func:`~escalation.classify.resolver_tier` of the record.
     - ``open_items``: one ``{id, task_id, level, age_secs, breach_6h}`` per
       pending record, ``age_secs`` = ``now - timestamp``,
       ``breach_6h`` = ``age_secs > 6h``, plus ``pins_recovery`` /
@@ -490,7 +490,7 @@ def _lifespan_block(
             continue
 
         secs = (resolved_at - filed_at).total_seconds()
-        tier = classify_resolver_tier(esc.resolved_by)
+        tier = resolver_tier(esc)
         secs_by_level.setdefault(esc.level, []).append(secs)
         samples.append([resolved_at.date().isoformat(), tier, esc.level, secs])
 
@@ -560,7 +560,7 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
 
     - ``tier_weekly``: ISO-week (``YYYY-Www``) -> ``{tier: count}``, over
       terminal records with a parseable ``resolved_at``
-      (:func:`~escalation.classify.classify_resolver_tier` of ``resolved_by``).
+      (:func:`~escalation.classify.resolver_tier` of the record).
     - ``action_mix``: ``resolution_action`` counts over EVERY terminal record
       — the population ``origin`` classifies — ``None`` -> ``'unspecified'``
       (visible adoption gap — INV-4).
@@ -604,7 +604,7 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
             )
             continue
 
-        tier = classify_resolver_tier(esc.resolved_by)
+        tier = resolver_tier(esc)
         iso = resolved_at.isocalendar()
         week_key = f'{iso.year}-W{iso.week:02d}'
         week_bucket = tier_weekly.setdefault(week_key, {})

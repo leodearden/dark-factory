@@ -80,7 +80,7 @@ class TestGetTaskEscalationHistoryTool:
         """
         queue = EscalationQueue(tmp_path / 'esc')
         self._seed(queue, 'esc-3164-1', level=2, agent_role='deterministic')
-        queue.resolve('esc-3164-1', 'Human reviewed the gate')
+        queue.resolve('esc-3164-1', 'Human reviewed the gate', resolution_class='actionable')
         self._seed(queue, 'esc-3164-2', level=0, agent_role='implementer')
         return queue
 

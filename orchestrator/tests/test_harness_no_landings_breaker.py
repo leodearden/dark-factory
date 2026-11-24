@@ -325,6 +325,30 @@ class TestHarnessNoLandingsResume:
         )
 
     @pytest.mark.asyncio
+    async def test_resume_classifies_a_parked_info_escalation(self, tmp_path: Path) -> None:
+        """A watcher's park promotes the record to level 2, whose close must be classified."""
+        harness, _rs, escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
+        await self._drive_to_trip(harness)
+        (filed,) = [
+            e
+            for e in escalations.get_by_task(_BREAKER_SENTINEL, status='pending')
+            if e.agent_role == _BREAKER_ROLE
+        ]
+        escalations.park(filed.id, 'parked for a human')
+
+        _stub_merge_worker(harness, landings_total=6)
+        with patch('shutil.disk_usage') as mock_du:
+            mock_du.return_value = MagicMock(free=150_000)
+            await harness._run_no_landings_breaker_pass()
+
+        closed = escalations.get(filed.id)
+        assert closed is not None
+        assert closed.status != 'pending'
+        assert closed.resolution_class is not None
+
+    @pytest.mark.asyncio
     async def test_disk_recovery_resumes(self, tmp_path: Path) -> None:
         """Disk recovered above absolute floor also unpauses the scheduler.
 

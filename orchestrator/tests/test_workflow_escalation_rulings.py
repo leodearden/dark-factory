@@ -67,7 +67,7 @@ def _resolve_ruling(queue: EscalationQueue, task_id: str) -> str:
         summary='keep or drop the solver wrap?',
     )
     queue.submit(ruling)
-    queue.resolve(ruling.id, RULING_TEXT, resolved_by='interactive')
+    queue.resolve(ruling.id, RULING_TEXT, resolved_by='interactive', resolution_class='actionable')
     return ruling.id
 
 

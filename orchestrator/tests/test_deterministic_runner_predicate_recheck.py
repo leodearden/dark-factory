@@ -256,7 +256,7 @@ def _seed_resolved_escalation(queue: EscalationQueue) -> str:
         level=2,
     )
     queue.submit(escalation)
-    queue.resolve(escalation.id, 'fixed upstream')
+    queue.resolve(escalation.id, 'fixed upstream', resolution_class='actionable')
     return escalation.id
 
 
@@ -529,7 +529,7 @@ class TestStallCap:
         clock.now = FIXED_NOW + timedelta(days=1)
         await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
         [stall] = _pending(queue)
-        queue.resolve(stall.id, 'resume')
+        queue.resolve(stall.id, 'resume', resolution_class='actionable')
         clock.now = FIXED_NOW + timedelta(days=2)
 
         outcome = await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))

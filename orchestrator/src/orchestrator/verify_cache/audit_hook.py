@@ -105,7 +105,7 @@ class VerifyCacheAuditHook:
         """Resolve the blockers of ended disables, then file the live disable's blocker if it has none."""
         resolve_ended_blockers(
             self._queue, response.policy, now,
-            resolved_by=AUDIT_ESCALATION_ROLE,
+            resolved_by=AUDIT_ESCALATION_ROLE, resolution_class='benign',
             resolution=f'The kill-switch disable this blocker describes has ended: {_policy_now(response.policy, now)}.',
         )
         if not response.l2_required:
@@ -117,13 +117,14 @@ class VerifyCacheAuditHook:
 
 
 def resolve_ended_blockers(
-    queue: EscalationQueue, policy: PolicyState, now: datetime, *, resolved_by: str, resolution: str,
+    queue: EscalationQueue, policy: PolicyState, now: datetime, *,
+    resolved_by: str, resolution: str, resolution_class: str,
 ) -> tuple[str, ...]:
     """Resolve every pending kill-switch blocker except the one for *policy*'s live disable; the ids resolved."""
     live = _disable_episode(policy) if policy.is_disabled(now) else None
     ended = [blocker for blocker in _pending_blockers(queue) if blocker.root_cause != live]
     for blocker in ended:
-        queue.resolve(blocker.id, resolution, resolved_by=resolved_by)
+        queue.resolve(blocker.id, resolution, resolved_by=resolved_by, resolution_class=resolution_class)
     return tuple(blocker.id for blocker in ended)
 
 

@@ -686,7 +686,7 @@ class TestPendingLevel2ByTask:
         _file(queue, 'esc-3546-2', '3546')
         _file(queue, 'esc-10-1', '10', level=1)
         _file(queue, 'esc-11-1', '11')
-        queue.resolve('esc-11-1', 'ruled')
+        queue.resolve('esc-11-1', 'ruled', resolution_class='actionable')
         _file(queue, 'esc-12-1', '12')
         _archive_pending(queue, 'esc-12-1')
         _file(queue, 'esc-b13-1', 'b13')

@@ -1200,7 +1200,7 @@ class TestAlreadyLandedDispatchGateArbitrationHoldIsDurable:
 
         # The operator arbitrates: the hold releases, and the streak state
         # goes with it on the next tick that observes the release.
-        h._escalation_queue.resolve(escalation_id, 'operator arbitrated')
+        h._escalation_queue.resolve(escalation_id, 'operator arbitrated', resolution_class='actionable')
         await h._already_landed_dispatch_gate('42')
 
         assert h._provenance_conflict_sink.note_hold_observed(

@@ -491,7 +491,7 @@ class TestAggregateOverLiveArchive:
 
     The α↔γ seam — γ reads the records α wrote through its production
     chokepoints (not hand-written golden dicts) via the SAME
-    ``effective_benign``/``classify_resolver_tier`` predicates, so a
+    ``effective_benign``/``resolver_tier`` predicates, so a
     disagreement in record shape or classification surfaces here.
     """
 

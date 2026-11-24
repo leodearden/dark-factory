@@ -22,11 +22,13 @@ from __future__ import annotations
 import dataclasses
 import json
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 
 import pytest
 
 from escalation.authority import (
+    COORDINATOR_IDENTITY,
     L2_AUTO_CLOSE_DENY_CATEGORIES,
     L2_AUTO_CLOSE_DENY_ROLES,
     POLICY_TABLE,
@@ -34,7 +36,7 @@ from escalation.authority import (
     REVERSIBLE_POLICY_ACTIONS,
     PolicyAction,
 )
-from escalation.classify import classify_resolver_tier
+from escalation.classify import SeatTier, classify_resolver_tier
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
 from escalation.shadow_ruling import (
@@ -601,6 +603,19 @@ def _stamped_note(ruling: ShadowRuling) -> str:
     return f'{_FRESHNESS_NOTE}\n{ruling.to_note_line()}'
 
 
+class _BySeat(Enum):
+    """The fixture's default ruling flag, derived from the resolver."""
+
+    DEFAULT = 'by-seat'
+
+
+def _ruled_by_human_for(resolved_by: str, flag: bool | None | _BySeat) -> bool | None:
+    """A human seat's close is a ruling; any other seat asserts nothing, as in production."""
+    if flag is not _BySeat.DEFAULT:
+        return flag
+    return True if classify_resolver_tier(resolved_by) is SeatTier.HUMAN else None
+
+
 class _Fixture:
     """Builds records through the REAL queue: submit -> stamp_triage -> resolve.
 
@@ -608,6 +623,10 @@ class _Fixture:
     this file's beliefs rather than about production code paths — and the
     load-bearing premise of the whole measurement is precisely that the real
     paths preserve the stamp into the archive.
+
+    A resolve by a human seat is a human ruling (``ruled_by_human=True``) unless
+    the test says otherwise: that is the measurement's ordinary subject. Any
+    other resolver asserts nothing unless the test says so.
     """
 
     def __init__(self, tmp_path: Path, seq: int = 0):
@@ -634,9 +653,13 @@ class _Fixture:
     def stamp(self, record: Escalation, ruling: ShadowRuling, *, by: str) -> None:
         self.stamp_note(record, _stamped_note(ruling), by=by)
 
-    def resolve(self, record: Escalation, *, by: str, dismiss: bool = True) -> Escalation:
+    def resolve(
+        self, record: Escalation, *, by: str, dismiss: bool = True,
+        ruled_by_human: bool | None | _BySeat = _BySeat.DEFAULT,
+    ) -> Escalation:
         resolved = self.queue.resolve(
-            record.id, 'ruled', dismiss=dismiss, resolved_by=by,
+            record.id, 'ruled', dismiss=dismiss, resolved_by=by, resolution_class='actionable',
+            ruled_by_human=_ruled_by_human_for(by, ruled_by_human),
         )
         assert resolved is not None
         return resolved
@@ -645,12 +668,16 @@ class _Fixture:
         self, ruling: ShadowRuling, *, observed_action: str | None, stamped_by: str = 'watcher-a',
         resolved_by: str = 'interactive', category: str = 'risk_identified',
         agent_role: str = 'claude-task-1-implementer',
+        ruled_by_human: bool | None | _BySeat = _BySeat.DEFAULT,
     ) -> Escalation:
         record = self.submit(
             category=category, agent_role=agent_role, resolution_action=observed_action,
         )
         self.stamp(record, ruling, by=stamped_by)
-        return self.resolve(record, by=resolved_by, dismiss=observed_action == 'close_only')
+        return self.resolve(
+            record, by=resolved_by, dismiss=observed_action == 'close_only',
+            ruled_by_human=ruled_by_human,
+        )
 
     def report(self, *, since: datetime | None = None, until: datetime | None = None):
         return agreement_report(
@@ -918,7 +945,9 @@ class TestSelfResolvedBucket:
             record.id, triaged_by=None, triage_note=_stamped_note(_ruling()),
         )
         assert stamped is not None and stamped.triaged_by is None
-        resolved = fixture.queue.resolve(record.id, 'ruled', dismiss=True, resolved_by=None)
+        resolved = fixture.queue.resolve(
+            record.id, 'ruled', dismiss=True, resolved_by=None, resolution_class='actionable',
+        )
         assert resolved is not None and resolved.resolved_by is None
 
         report = fixture.report()
@@ -1113,7 +1142,7 @@ class TestExclusionsAndWindow:
             'a cascade close is not a human ruling and must not inflate the rate'
         )
         assert (klass.comparable, klass.agreement_rate) == (0, None)
-        assert klass.non_human_resolver == 1
+        assert klass.not_human_ruled == 1
         assert report.resolver_tiers.get('cascade') == 1
 
     def test_a_sweep_resolver_is_reported_in_its_tier(self, tmp_path: Path):
@@ -1124,7 +1153,7 @@ class TestExclusionsAndWindow:
 
         report = fixture.report()
         klass = report.for_class(_BRANCH_BEHIND)
-        assert klass is not None and klass.non_human_resolver == 1
+        assert klass is not None and klass.not_human_ruled == 1
         assert (klass.agreed, klass.diverged, klass.not_comparable) == (0, 0, 0)
         assert report.resolver_tiers.get('reaper-sweep') == 1
 
@@ -1151,7 +1180,7 @@ class TestExclusionsAndWindow:
         behind = report.for_class(_BRANCH_BEHIND)
         veto = report.for_class(_VETO_STREAK)
         assert behind is not None and veto is not None
-        assert (behind.non_human_resolver, veto.non_human_resolver) == (1, 1)
+        assert (behind.not_human_ruled, veto.not_human_ruled) == (1, 1)
         assert (behind.agreed, behind.comparable) == (1, 1), (
             'the excluded record must not reach the rate of the class that lost it'
         )
@@ -1160,7 +1189,75 @@ class TestExclusionsAndWindow:
     def test_human_resolutions_are_reported_in_the_human_tier(self, tmp_path: Path):
         fixture = _Fixture(tmp_path)
         fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
-        assert fixture.report().resolver_tiers.get('human') == 1
+        assert fixture.report().resolver_tiers.get('human-ruled') == 1
+
+
+class TestOnlyHumanRulingsAreComparable:
+    """The agreement denominator is human-ruled records only (plans/instruments-honesty-prd.md decision 10).
+
+    An attended seat closing a record without a ruling is not an adjudication.
+    """
+
+    def test_an_attended_seat_close_without_a_ruling_is_not_human_ruled(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(action='close_only'), observed_action='close_only',
+            stamped_by='watcher-a', resolved_by='escalation-watcher', ruled_by_human=None,
+        )
+
+        report = fixture.report()
+        klass = report.for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert (klass.agreed, klass.diverged) == (0, 0)
+        assert klass.not_human_ruled == 1
+        assert report.resolver_tiers.get('attended-seat') == 1
+
+    def test_the_same_close_with_a_ruling_is_agreed(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(action='close_only'), observed_action='close_only',
+            stamped_by='watcher-a', resolved_by='escalation-watcher', ruled_by_human=True,
+        )
+
+        report = fixture.report()
+        klass = report.for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.agreed == 1
+        assert report.resolver_tiers.get('human-ruled') == 1
+
+    def test_a_coordinator_ruling_is_comparable(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(action='close_only'), observed_action='close_only',
+            resolved_by=COORDINATOR_IDENTITY, ruled_by_human=True,
+        )
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.comparable == 1
+
+    def test_a_cascade_member_inheriting_a_ruling_is_comparable(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        member = Escalation(
+            id='esc-5374-90', task_id='5374', agent_role='claude-task-1-implementer',
+            severity='info', category='risk_identified', summary='cluster member',
+            level=1, resolution_action='close_only',
+        )
+        fixture.queue.submit(member)
+        fixture.stamp(member, _ruling(action='close_only'), by='watcher-a')
+        head = Escalation(
+            id='esc-5374-91', task_id='5374', agent_role='escalation-watcher-auto',
+            severity='blocking', category='risk_identified', summary='cluster',
+            level=2, members=[member.id],
+        )
+        fixture.queue.submit(head)
+        fixture.queue.resolve(
+            head.id, 'Leo ruled', dismiss=True, resolved_by='interactive',
+            resolution_class='actionable', ruled_by_human=True,
+        )
+
+        report = fixture.report()
+        klass = report.for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.comparable == 1
+        assert report.resolver_tiers.get('human-ruled') == 1
 
 
 class TestRejectedStamps:
@@ -1446,13 +1543,13 @@ def _row_cells(out: str, ruling_class: str) -> dict[str, str]:
     """
     cells = _row_for(out, ruling_class).split()
     assert len(cells) == 7, f'expected the 7 columns _ROW writes, got {cells!r}'
-    cls, agreed, diverged, not_comparable, non_human, comparable, rate = cells
+    cls, agreed, diverged, not_comparable, not_human_ruled, comparable, rate = cells
     assert cls == ruling_class
     return {
         'agreed': agreed,
         'diverged': diverged,
         'not_comparable': not_comparable,
-        'non_human': non_human,
+        'not_human_ruled': not_human_ruled,
         'comparable': comparable,
         'rate': rate,
     }
@@ -1480,7 +1577,7 @@ class TestCliTable:
         # a row that had them in the wrong columns.
         assert _row_cells(capsys.readouterr().out, _BRANCH_BEHIND) == {
             'agreed': '3', 'diverged': '1', 'not_comparable': '1',
-            'non_human': '0', 'comparable': '4', 'rate': '75.0%',
+            'not_human_ruled': '0', 'comparable': '4', 'rate': '75.0%',
         }
 
     def test_prints_every_excluded_bucket(self, tmp_path: Path, capsys):
@@ -1539,7 +1636,7 @@ class TestCliTable:
         # because the rate happened to render without a 2.
         assert _row_cells(out, _BRANCH_BEHIND) == {
             'agreed': '1', 'diverged': '0', 'not_comparable': '0',
-            'non_human': '0', 'comparable': '1', 'rate': '100.0%',
+            'not_human_ruled': '0', 'comparable': '1', 'rate': '100.0%',
         }
 
     def test_a_class_whose_samples_a_cascade_took_still_gets_a_row(
@@ -1559,7 +1656,7 @@ class TestCliTable:
         out = capsys.readouterr().out
         assert _row_cells(out, _BRANCH_BEHIND) == {
             'agreed': '0', 'diverged': '0', 'not_comparable': '0',
-            'non_human': '2', 'comparable': '0', 'rate': 'n/a',
+            'not_human_ruled': '2', 'comparable': '0', 'rate': 'n/a',
         }
         assert 'cascade=2' in out
 
@@ -1808,7 +1905,7 @@ class TestCliJson:
         assert payload['rejected_stamps'] == 0
         row = next(c for c in payload['classes'] if c['class'] == _BRANCH_BEHIND)
         assert (row['agreed'], row['diverged'], row['not_comparable']) == (1, 1, 0)
-        assert row['non_human_resolver'] == 0
+        assert row['not_human_ruled'] == 0
         assert row['comparable'] == 2
         assert row['agreement_rate'] == 0.5
         assert payload['since'] and payload['until']
