@@ -11,16 +11,25 @@ happens to be running.  The scan's own children are always readable.
 from __future__ import annotations
 
 import contextlib
+import re
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
 from _blocked_commit_fixture import commit_blocked_in_pre_commit_hook
 from _git_fixtures import seed_repo
 from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
-from orchestrator.index_lock_liveness import GitProcessScan, scan_work_tree_git_processes
+from orchestrator.index_lock_liveness import (
+    GitProcess,
+    GitProcessScan,
+    IndexLockDiagnosis,
+    IndexLockVerdict,
+    diagnose_index_lock,
+    scan_work_tree_git_processes,
+)
 
 
 def _env_fenced_at_parent_of(cwd: Path) -> dict[str, str]:
@@ -135,3 +144,102 @@ class TestScanWorkTreeGitProcesses:
         _proc_entry(proc_root, 4242, 'git')
         scan = scan_work_tree_git_processes(tmp_path, proc_root=proc_root)
         assert scan == GitProcessScan((), confirmed=False)
+
+
+_LOCK = '/r/.git/index.lock'
+_REIFY_HOLDER = GitProcess(728900, 'git commit --only plans/x.md')
+_NOBODY = GitProcessScan((), confirmed=True)
+
+
+def _diagnose(initial_age_s, scan, *, grace_s=300.0, stale_floor_s=300.0):
+    return diagnose_index_lock(
+        initial_age_s=initial_age_s, grace_s=grace_s,
+        stale_floor_s=stale_floor_s, scan=scan,
+    )
+
+
+class TestDiagnoseIndexLock:
+    def test_an_old_lock_with_a_live_commit_is_named_and_never_removed(self):
+        diagnosis = _diagnose(3290.0, GitProcessScan((_REIFY_HOLDER,), confirmed=True))
+        assert diagnosis.verdict is IndexLockVerdict.LIVE_HOLDER
+        advice = diagnosis.advice(_LOCK)
+        assert '728900' in advice
+        assert 'git commit --only plans/x.md' in advice
+        assert 'rm -f' not in advice
+
+    def test_a_young_lock_with_a_live_holder_names_it_too(self):
+        diagnosis = _diagnose(2.0, GitProcessScan((_REIFY_HOLDER,), confirmed=True))
+        assert diagnosis.verdict is IndexLockVerdict.LIVE_HOLDER
+        assert '728900' in diagnosis.advice(_LOCK)
+
+    def test_a_live_holder_wins_over_an_unconfirmed_scan(self):
+        diagnosis = _diagnose(3290.0, GitProcessScan((_REIFY_HOLDER,), confirmed=False))
+        assert diagnosis.verdict is IndexLockVerdict.LIVE_HOLDER
+
+    def test_an_old_lock_nobody_holds_is_a_crashed_leftover(self):
+        diagnosis = _diagnose(3290.0, _NOBODY)
+        assert diagnosis.verdict is IndexLockVerdict.CRASHED_LEFTOVER
+        advice = diagnosis.advice(_LOCK)
+        assert f'rm -f {_LOCK}' in advice
+        assert 'no git process' in advice
+
+    @pytest.mark.parametrize(('grace_s', 'initial_age_s'), [
+        (0.0, 0.5), (0.0, 2.0), (0.0, 299.0), (0.0, 300.0), (900.0, 400.0), (900.0, 900.0),
+    ])
+    def test_a_lock_nobody_holds_is_unproven_until_it_clears_the_age_floor(
+        self, grace_s, initial_age_s,
+    ):
+        diagnosis = _diagnose(initial_age_s, _NOBODY, grace_s=grace_s)
+        assert diagnosis.verdict is IndexLockVerdict.UNPROVEN
+        assert diagnosis.advice(_LOCK) == ''
+
+    def test_an_unconfirmed_empty_scan_is_never_a_crashed_leftover(self):
+        diagnosis = _diagnose(3600.0, GitProcessScan((), confirmed=False))
+        assert diagnosis.verdict is IndexLockVerdict.UNPROVEN
+        assert 'rm -f' not in diagnosis.advice(_LOCK)
+
+    def test_no_scan_at_all_is_never_a_crashed_leftover(self):
+        assert _diagnose(3600.0, None).verdict is IndexLockVerdict.UNPROVEN
+
+    @pytest.mark.parametrize(('initial_age_s', 'grace_s'), [(None, 300.0), (3600.0, None)])
+    def test_a_missing_age_fact_is_never_a_crashed_leftover(self, initial_age_s, grace_s):
+        diagnosis = _diagnose(initial_age_s, _NOBODY, grace_s=grace_s)
+        assert diagnosis.verdict is IndexLockVerdict.UNPROVEN
+
+    def test_many_holders_are_capped_and_counted(self):
+        holders = tuple(GitProcess(1000 + n, f'git status #{n}') for n in range(9))
+        advice = _diagnose(10.0, GitProcessScan(holders, confirmed=True)).advice(_LOCK)
+        assert 'pid 1000 ' in advice
+        assert 'pid 1008 ' not in advice
+        assert re.search(r'\+\d+ more', advice)
+        assert 'rm -f' not in advice
+
+
+class TestIndexLockDiagnosisInvariant:
+    def test_a_crashed_leftover_with_holders_is_refused(self):
+        with pytest.raises(ValueError, match=r'(?s)CRASHED_LEFTOVER.*728900'):
+            IndexLockDiagnosis(
+                IndexLockVerdict.CRASHED_LEFTOVER, (_REIFY_HOLDER,),
+                initial_age_s=3290.0, stale_after_s=300.0,
+            )
+
+    def test_a_crashed_leftover_younger_than_its_floor_is_refused(self):
+        with pytest.raises(ValueError, match=r'(?s)CRASHED_LEFTOVER.*12\.0.*300\.0'):
+            IndexLockDiagnosis(
+                IndexLockVerdict.CRASHED_LEFTOVER, (),
+                initial_age_s=12.0, stale_after_s=300.0,
+            )
+
+    def test_a_crashed_leftover_without_an_age_is_refused(self):
+        with pytest.raises(ValueError, match=r'(?s)CRASHED_LEFTOVER.*None'):
+            IndexLockDiagnosis(
+                IndexLockVerdict.CRASHED_LEFTOVER, (),
+                initial_age_s=None, stale_after_s=300.0,
+            )
+
+    def test_a_live_holder_without_holders_is_refused(self):
+        with pytest.raises(ValueError, match=r'(?s)LIVE_HOLDER.*\(\)'):
+            IndexLockDiagnosis(
+                IndexLockVerdict.LIVE_HOLDER, (),
+                initial_age_s=3290.0, stale_after_s=300.0,
+            )
