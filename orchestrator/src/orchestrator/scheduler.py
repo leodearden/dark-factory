@@ -7127,6 +7127,9 @@ class Scheduler:
         blocked pin neither reserves nor reports, as before task 6040.
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the timed-gate and scored loops.
+        The dispatched row is the store's row re-read after the claim
+        (:meth:`_confirm_claim`): a pin the store no longer holds dispatchable
+        is skipped, not lock-blocked, and an unreadable store ends the tick.
 
         A tick restricted to a scope other than ANY skips this phase, so it
         neither dispatches a pin the scope does not admit nor releases pin
@@ -7156,10 +7159,18 @@ class Scheduler:
                 continue
             modules = self._get_modules(pin.task)
             if self._claim(pin.task_id, modules):
-                await self._settle_dispatch(
-                    pin.task_id, modules, tier=pin.tier, signal=pin.signal,
-                )
-                return await self._finish_dispatch(pin.task_id, pin.task, modules, tier=pin.tier)
+                match await self._confirm_claim(ctx, pin.task_id, pin.task):
+                    case DispatchRefusal.UNREADABLE:
+                        return TickOutcome(None)
+                    case DispatchRefusal.NO_LONGER_DISPATCHABLE:
+                        continue
+                    case _ConfirmedClaim() as winner:
+                        await self._settle_dispatch(
+                            pin.task_id, modules, tier=pin.tier, signal=winner.signal,
+                        )
+                        return await self._finish_dispatch(
+                            pin.task_id, winner.task, modules, tier=pin.tier,
+                        )
             if not self.config.pin_reservations_enabled:
                 continue
             is_head = (
@@ -7187,8 +7198,9 @@ class Scheduler:
         The PSI hold applies through :meth:`_exempt_from_psi_hold`, as in the
         pin and scored loops; a timed gate is deterministic, so today it is
         exempt (DA-D4) and holds no module lock.  Runs after the pins, so an
-        operator pin still goes first.  Ends the tick only when it dispatches;
-        otherwise returns ``_CONTINUE``.
+        operator pin still goes first.  Ends the tick only when it dispatches
+        the store's row re-read after the claim (:meth:`_confirm_claim`), or
+        when that re-read fails; otherwise returns ``_CONTINUE``.
         """
         for task in timed_gates(ctx.candidates):
             tid = str(task.get('id', ''))
@@ -7196,12 +7208,17 @@ class Scheduler:
                 self._note_heavy_deferral(ctx, ctx.psi_hold, tid)
                 continue
             modules = self._get_modules(task)
-            if self._claim(tid, modules):
-                tier = ctx.tier_of(tid, task)
-                await self._settle_dispatch(
-                    tid, modules, tier=tier, signal=ctx.candidate_signals.get(tid),
-                )
-                return await self._finish_dispatch(tid, task, modules, tier=tier)
+            if not self._claim(tid, modules):
+                continue
+            match await self._confirm_claim(ctx, tid, task):
+                case DispatchRefusal.UNREADABLE:
+                    return TickOutcome(None)
+                case DispatchRefusal.NO_LONGER_DISPATCHABLE:
+                    continue
+                case _ConfirmedClaim() as winner:
+                    tier = ctx.tier_of(tid, task)
+                    await self._settle_dispatch(tid, modules, tier=tier, signal=winner.signal)
+                    return await self._finish_dispatch(tid, winner.task, modules, tier=tier)
         return _CONTINUE
 
     def _note_pin_blocked(
