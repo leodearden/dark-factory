@@ -1091,8 +1091,8 @@ verify_env:
 # ever gate, that is a deliberate operator decision, not a silent one.
 #
 # LIVE ON THIS PROJECT. This file enables the `laptop` verify runner with
-# verify_drift_check_every_n_lands: 10, so these probes run on both hosts at the
-# first drift check after the deploy that carries them, and every 10 lands after
+# verify_drift_check_every_n_lands: 20, so these probes run on both hosts at the
+# first drift check after the deploy that carries them, and every 20 lands after
 # that. The first check is expected to report the real tool skew measured below
 # as ONE deduped L1 — designed behaviour, not a defect. RESTART-ONLY
 # (deliberately absent from RELOADABLE_FIELDS): the probe list is only
@@ -1621,8 +1621,12 @@ verify_cache:
 # TRUST-ANCHOR TRADE-OFF, EYES OPEN: prefer-local existed because local is the trust
 # anchor (a laptop false green landed a red commit, #5120). Under prefer_remote nearly
 # every verdict is a REMOTE verdict, so verify_drift_check_every_n_lands is the
-# standing fidelity guard: 10 here, not the 20 of the PRD's first draft. A drift check
-# leases BOTH hosts and runs both legs, so 1-in-10 gives back a little local CPU.
+# standing fidelity guard: 1 in 20 landings (Leo's ruling 2026-11-20, down from 1 in 10;
+# the key stays explicit so the value sits beside this rationale). A drift check leases
+# BOTH hosts and runs both legs. Measured 2026-11-12 to 2026-11-19: 14 checks held the
+# workstation merge slot 9.5 h and the laptop's 2.6 h. 77 checks since 2026-10-03 gave 72
+# agreements and 5 divergences: one real laptop false green (2026-10-15), four
+# workstation-side noise. Leo ruled the check is worth keeping at half the rate.
 # verify_cross_check_remote_green: false (2026-10-02, task 5416 OFF step). Leo ruled on
 # esc-5416-2 to shorten the parity window to one day and pre-approved the OFF step. The
 # window ran 2026-10-01T05:01Z to 2026-10-02T05:01Z on the code default TRUE (a blocking
@@ -1641,7 +1645,7 @@ verify_runners:
     gate_checkouts_path: /home/leo/src/dark-factory-gate
     enabled: true
 verify_host_policy: prefer_remote
-verify_drift_check_every_n_lands: 10
+verify_drift_check_every_n_lands: 20
 verify_cross_check_remote_green: false
 # Remote TASK verifies (task 6670, plans/remote-task-leg-verify-prd.md §5.7): the four
 # verify_task_* keys let an implement-phase task verify run on a verify_runners host
