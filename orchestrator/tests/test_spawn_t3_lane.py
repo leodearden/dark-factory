@@ -7,7 +7,7 @@ constants below, in T3 Code v0.1.6's shapes (``~/src/t3code-v0.1.6``):
 ``packages/contracts/src/project.ts::Project``,
 ``apps/server/src/mcp/toolkits/project/tools.ts`` (``t3_project_list``,
 ``t3_thread_launch``) and ``packages/contracts/src/orchestratorMcp.ts`` (the
-thread list, read and wait results).
+thread list, read and wait results, and ``orchestrator_capabilities``').
 """
 
 from __future__ import annotations
@@ -123,6 +123,33 @@ THREAD_READ_JSON: dict[str, Any] = {
 """``t3_thread_read``'s ``OrchestratorMcpThreadReadResult``
 (``packages/contracts/src/orchestratorMcp.ts``, the detail abridged); :func:`thread_read` varies it."""
 
+HAIKU_CAPABILITY: dict[str, Any] = {
+    'id': 'claude-haiku-4-5',
+    'options': [{'id': 'effort', 'values': ['low', 'medium', 'high'], 'default': 'high'}],
+}
+
+CAPABILITIES_JSON: dict[str, Any] = {
+    'parentThreadId': None,
+    'inheritedProviderInstanceId': None,
+    'inheritedModel': None,
+    'runtimeMode': 'full-access',
+    'interactionMode': 'default',
+    'providers': [
+        {
+            'providerInstanceId': 'claude-proxy',
+            'driverKind': 'claudeAgent',
+            'displayName': None,
+            'models': [HAIKU_CAPABILITY],
+            'canRunChildTask': True,
+            'canRunCrossProviderChildTask': True,
+            'constraints': [],
+        }
+    ],
+    'features': {'threadManagement': True, 'maxBatchThreads': 8},
+}
+"""``orchestrator_capabilities``' ``OrchestratorMcpCapabilitiesResult`` (features abridged);
+:func:`capabilities_with` varies its one provider's models."""
+
 SERVER_RUNTIME_JSON: dict[str, Any] = {
     'version': 1,
     'pid': 881190,
@@ -143,6 +170,13 @@ def waited(*, timed_out: bool, status: str = 'running') -> ToolSuccess:
 def thread_read(**thread: Any) -> ToolSuccess:
     """``t3_thread_read``'s reply with the thread's ``status``, ``archived`` or ``latestRunId`` overridden."""
     return ToolSuccess({**THREAD_READ_JSON, 'thread': {**THREAD_READ_JSON['thread'], **thread}})
+
+
+def capabilities_with(*models: dict[str, Any], instance_id: str = 'claude-proxy') -> ToolSuccess:
+    """``orchestrator_capabilities``' reply listing *models* on *instance_id*, its only provider."""
+    [provider] = CAPABILITIES_JSON['providers']
+    listed = {**provider, 'providerInstanceId': instance_id, 'models': list(models)}
+    return ToolSuccess({**CAPABILITIES_JSON, 'providers': [listed]})
 
 
 def project(root: Path | str, **overrides: Any) -> dict[str, Any]:
@@ -862,6 +896,74 @@ class TestLaunch:
             assert spill.read_text() == big
         finally:
             spill.unlink()
+
+
+class TestEffortVet:
+    """``launch --effort`` checks the level against T3's ``orchestrator_capabilities`` before any thread starts."""
+
+    @pytest.fixture(autouse=True)
+    def _proxy_host(self, env: Env, t3: FakeT3Server) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        t3.tool_replies['t3_thread_launch'] = echoing_launch()
+        t3.tool_replies['orchestrator_capabilities'] = ToolSuccess(CAPABILITIES_JSON)
+
+    @pytest.mark.parametrize('model', ['claude-haiku-4-5', 'haiku'], ids=['listed-id', 'alias-the-search-matched'])
+    def test_a_level_t3_does_not_offer_for_the_model_is_launch_failed_without_a_launch(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str], model: str
+    ) -> None:
+        line = launch_line(capsys, tmp_path, env.project, '--model', model, '--effort', 'max')
+
+        word, fields = verdict_tokens(line)
+        assert word == 'launch-failed'
+        assert all(name in fields['detail'] for name in ('low', 'medium', 'high', 'claude-haiku-4-5', 'claude-proxy'))
+        assert t3.tool_calls('t3_thread_launch') == []
+        assert [call.get('search') for call in t3.tool_calls('orchestrator_capabilities')] == [model]
+
+    def test_a_level_t3_offers_for_the_model_is_started(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = launch_line(capsys, tmp_path, env.project, '--model', 'claude-haiku-4-5', '--effort', 'high')
+
+        assert line.split()[0] == 'started'
+        assert sent_launch(t3)['modelSelection']['options'] == [{'id': 'effort', 'value': 'high'}]
+
+    @pytest.mark.parametrize(
+        ('model', 'capabilities'),
+        [
+            ('claude-haiku-4-5', None),
+            ('claude-haiku-4-5', ToolFailure('orchestration_error', 'the provider catalogue is unavailable')),
+            ('claude-haiku-4-5', capabilities_with()),
+            ('claude-haiku-4-5', capabilities_with(HAIKU_CAPABILITY, instance_id='claudeAgent')),
+            ('haiku', capabilities_with(HAIKU_CAPABILITY, {**HAIKU_CAPABILITY, 'id': 'claude-haiku-4-5-20251001'})),
+            (
+                'claude-haiku-4-5',
+                capabilities_with({**HAIKU_CAPABILITY, 'options': [{'id': 'fastMode', 'values': [True, False]}]}),
+            ),
+        ],
+        ids=['not-served', 'tool-failure', 'model-unlisted', 'instance-unlisted', 'alias-ambiguous', 'no-effort-option'],
+    )
+    def test_an_unverifiable_level_still_launches_with_its_effort_option(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        model: str, capabilities: ToolSuccess | ToolFailure | None,
+    ) -> None:
+        if capabilities is None:
+            del t3.tool_replies['orchestrator_capabilities']
+        else:
+            t3.tool_replies['orchestrator_capabilities'] = capabilities
+
+        line = launch_line(capsys, tmp_path, env.project, '--model', model, '--effort', 'max')
+
+        assert line.split()[0] == 'started'
+        assert sent_launch(t3)['modelSelection']['options'] == [{'id': 'effort', 'value': 'max'}]
+
+    def test_an_effort_without_a_model_is_launch_failed_without_a_launch(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = launch_line(capsys, tmp_path, env.project, '--effort', 'xhigh')
+
+        word, fields = verdict_tokens(line)
+        assert word == 'launch-failed' and 'needs a model' in fields['detail']
+        assert t3.tool_calls('t3_thread_launch') == []
 
 
 @dataclass
