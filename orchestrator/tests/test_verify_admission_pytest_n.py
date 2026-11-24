@@ -36,6 +36,7 @@ from orchestrator.config import (
     apply_reload,
     diff_config,
 )
+from orchestrator.defect_tests_config import DefectTestsConfig, DefectTestsMode
 from orchestrator.verify import run_verification
 from orchestrator.verify_cmd import (
     ToolKind,
@@ -241,7 +242,7 @@ class TestApplyPytestNumprocessesSerialRecoveryCollision:
         assert '-n 16' not in rendered
 
 
-def armed_admission_config(tmp_path: Path, pytest_n: str) -> OrchestratorConfig:
+def armed_admission_config(tmp_path: Path, pytest_n: str, **overrides) -> OrchestratorConfig:
     """A config with verify admission armed: ``verify_admission_enabled`` is
     pinned, so an operator edit to the yaml cannot silently disarm the
     ``-n`` injection site these wiring tests observe."""
@@ -250,6 +251,7 @@ def armed_admission_config(tmp_path: Path, pytest_n: str) -> OrchestratorConfig:
         verify_admission_slots_dir=str(tmp_path / 'slots'),
         verify_admission_task_slots=1,
         verify_admission_pytest_n=pytest_n,
+        **overrides,
     )
 
 
@@ -333,7 +335,9 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        config = armed_admission_config(tmp_path, 'auto')
+        config = armed_admission_config(
+            tmp_path, 'auto', defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
+        )
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -366,6 +370,7 @@ class TestPytestNWiring:
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
             verify_admission_pytest_n='16',
+            defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
         )
         worktree = tmp_path / 'wt'
         worktree.mkdir()
@@ -390,7 +395,7 @@ class TestPytestNWiring:
         [
             (
                 'cd orchestrator && uv run pytest tests/ -x',
-                'cd orchestrator && uv run pytest -x -n 16 tests/',
+                'cd orchestrator && uv run pytest -x -p _df_defect_plugin -n 16 tests/',
             ),
             (
                 # The actual shape used in orchestrator/config.yaml's per-subproject
@@ -400,7 +405,7 @@ class TestPytestNWiring:
                 # argv-equivalent to the input plus '-n 16' for a realistic,
                 # currently-deployed module command shape.
                 'cd orchestrator && uv run pytest tests/ --timeout=300',
-                'cd orchestrator && uv run pytest --timeout=300 -n 16 tests/',
+                'cd orchestrator && uv run pytest --timeout=300 -p _df_defect_plugin -n 16 tests/',
             ),
         ],
     )
@@ -432,7 +437,7 @@ class TestPytestNWiring:
         expected = 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(expected_inner)
         assert test_cmd == expected, (
             f'expected the parse->render round-trip to be argv-equivalent to '
-            f'{test_command!r} plus -n 16; got {test_cmd!r}'
+            f'{test_command!r} plus the defect plugin and -n 16; got {test_cmd!r}'
         )
 
     @pytest.mark.real_verify_admission

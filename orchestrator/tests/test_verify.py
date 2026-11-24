@@ -10927,7 +10927,8 @@ class TestRunVerificationGovernRouting:
             )
 
         assert len(captured_cmds) == 1
-        expected_inner = 'pytest -v tests/x.py'  # canonical: flags before targets
+        # canonical: flags before targets, the default defect mode's plugin pair among them
+        expected_inner = 'pytest -v -p _df_defect_plugin tests/x.py'
         expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(expected_inner)}'
         assert captured_cmds[0] == expected, (
             f'Expected govern wrap around the canonically-rendered inner command '

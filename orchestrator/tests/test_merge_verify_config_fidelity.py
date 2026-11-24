@@ -173,6 +173,13 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
         'whose missing registry makes every unit UNAVAILABLE, so every leg still runs. The mode also '
         'stamps the off-wire VerifyResult.cache_record, which never reaches the verdict.',
     ),
+    'defect_tests': Classified(
+        Fidelity.MERGE_NEUTRAL,
+        "Task 7045: read only as injects_plugin, which decides whether the test leg gets the observe-only "
+        '-p _df_defect_plugin and its PYTHONPATH entry. The plugin registers markers and writes sidecar '
+        'maps; its makereport hookwrapper never replaces a result. A host that skips it can only fail a '
+        'strict-marker project closed. The I5 gates the mode also governs are not on the merge path.',
+    ),
     'verify_admission_background_promote_secs': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
     'verify_admission_enabled': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
     'verify_admission_nice_background': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
