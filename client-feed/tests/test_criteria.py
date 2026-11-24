@@ -1,11 +1,13 @@
 """Acceptance criteria: the criteria file, the collection map, the junit join and the criteria events (PRD §7.7)."""
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from _archive_files import junit_xml, passed, red, write_junit
 
 from client_feed.contract import (
     CaseOutcome,
@@ -19,12 +21,14 @@ from client_feed.criteria import (
     BoundReport,
     CriteriaError,
     CriteriaProblem,
+    CriteriaRun,
     MapEntry,
     collection_map_path,
     criterion_bindings,
     join_criteria,
     parse_criteria,
     read_collection_map,
+    verify_criteria,
 )
 
 EXEMPLAR = Path(__file__).parent / 'fixtures' / 'acceptance' / 'criteria.yaml'
@@ -346,3 +350,92 @@ def test_bound_test_ids_are_sorted_and_unique() -> None:
     (c1, *_) = join_criteria(DECLARED, [_report(cases, marked), _report(cases, marked)])
 
     assert c1.tests == ('tests.test_a::test_a', 'tests.test_a::test_b')
+
+
+# a verify run's criteria
+
+SHA = 'a' * 40
+RUN_AT = datetime(2026, 10, 1, 10, 5, tzinfo=UTC)
+
+
+def _archived_junit(root: Path, content: bytes, *, minute: int, qualifiers: str) -> Path:
+    when = datetime(2026, 10, 1, 10, minute, tzinfo=UTC)
+    return write_junit(root, when, content, qualifiers=qualifiers).relative_to(root)
+
+
+def _map_beside(root: Path, junit: Path, marked: dict[str, str]) -> Path:
+    path = root / collection_map_path(junit)
+    path.write_text(
+        json.dumps({nodeid: {'defects': [], 'criterion': c} for nodeid, c in marked.items()})
+    )
+    return path
+
+
+def _verify(root: Path, junits: list[Path]) -> CriteriaRun | None:
+    return verify_criteria(root, junits, declared=DECLARED, commit=SHA, run_at=RUN_AT)
+
+
+def test_a_verify_run_joins_its_archived_junit_with_the_map_beside_it(tmp_path: Path) -> None:
+    junit = _archived_junit(
+        tmp_path, junit_xml(passed('test_a'), red('test_b', 'failure')), minute=1, qualifiers='alpha'
+    )
+    _map_beside(tmp_path, junit, {'tests/test_a.py::test_a': 'C-1', 'tests/test_a.py::test_b': 'C-2'})
+
+    assert _verify(tmp_path, [junit]) == CriteriaRun(
+        commit=SHA,
+        run_at=RUN_AT,
+        results=(
+            CriterionResult(id='C-1', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_a',)),
+            CriterionResult(id='C-2', outcome=CriterionOutcome.FAILED, tests=('tests.test_a::test_b',)),
+            CriterionResult(id='C-3', outcome=CriterionOutcome.NOT_RUN, tests=()),
+        ),
+    )
+
+
+def test_each_module_junit_is_joined_with_its_own_map(tmp_path: Path) -> None:
+    alpha = _archived_junit(tmp_path, junit_xml(passed('test_a')), minute=1, qualifiers='alpha')
+    beta = _archived_junit(
+        tmp_path, junit_xml(red('test_a', 'failure')), minute=2, qualifiers='beta'
+    )
+    _map_beside(tmp_path, alpha, {'tests/test_a.py::test_a': 'C-1'})
+    _map_beside(tmp_path, beta, {'tests/test_a.py::test_a': 'C-2'})
+
+    run = _verify(tmp_path, [alpha, beta])
+
+    assert run is not None
+    assert _outcomes(run.results) == {
+        'C-1': CriterionOutcome.PASSED,
+        'C-2': CriterionOutcome.FAILED,
+        'C-3': CriterionOutcome.NOT_RUN,
+    }
+
+
+def test_a_junit_with_no_map_binds_nothing_while_its_sibling_binds(tmp_path: Path) -> None:
+    alpha = _archived_junit(tmp_path, junit_xml(passed('test_a')), minute=1, qualifiers='alpha')
+    beta = _archived_junit(
+        tmp_path, junit_xml(red('test_a', 'failure')), minute=2, qualifiers='beta'
+    )
+    _map_beside(tmp_path, alpha, {'tests/test_a.py::test_a': 'C-1'})
+
+    run = _verify(tmp_path, [alpha, beta])
+
+    assert run is not None
+    assert _outcomes(run.results)['C-1'] is CriterionOutcome.PASSED
+
+
+def test_a_run_with_no_map_records_no_criteria(tmp_path: Path) -> None:
+    junit = _archived_junit(tmp_path, junit_xml(passed('test_a')), minute=1, qualifiers='alpha')
+
+    assert _verify(tmp_path, [junit]) is None
+
+
+def test_a_malformed_archived_map_is_refused_relative_to_the_root(tmp_path: Path) -> None:
+    junit = _archived_junit(tmp_path, junit_xml(passed('test_a')), minute=1, qualifiers='alpha')
+    (tmp_path / collection_map_path(junit)).write_text('[]')
+
+    with pytest.raises(CriteriaError) as caught:
+        _verify(tmp_path, [junit])
+
+    assert caught.value.problem is CriteriaProblem.INVALID_MAP
+    assert str(collection_map_path(junit)) in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
