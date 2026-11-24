@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
+import httpx
 from graphiti_core.nodes import EpisodeType
 from shared.streak import KeyedStreaks
 
@@ -24,6 +25,7 @@ from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     GraphitiBackend,
     ReadCompleteness,
+    build_llm_client,
     read_all_valid_edges_checked,
     read_entity_nodes_checked,
 )
@@ -155,7 +157,8 @@ from fused_memory.services.overreach_shadow import (
     open_overreach_shadow,
     shadow_job_from_write,
 )
-from fused_memory.services.plan_route import PlanRoute, PlanRouteParkGuard
+from fused_memory.services.plan_cap_alarm import PlanCapAlarm
+from fused_memory.services.plan_route import PlanRoute, PlanRouteParkGuard, PlanRouteSite
 from fused_memory.services.provider_billing import (
     BillingSource,
     billing_source_of,
@@ -2182,7 +2185,11 @@ class MemoryService:
         self._billing_alarm = BillingExhaustionAlarm(
             resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
         )
-        self.plan_route = PlanRoute(config.plan_route)
+        self._plan_cap_alarm = PlanCapAlarm(
+            resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
+            count_parked=self._count_parked_writes,
+        )
+        self.plan_route = PlanRoute(config.plan_route, listener=self._plan_cap_alarm)
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
@@ -2438,9 +2445,26 @@ class MemoryService:
         if self._event_buffer:
             await self._event_buffer.push(event)
 
+    async def _count_parked_writes(self) -> int:
+        if self.durable_queue is None:
+            return 0
+        return (await self.durable_queue.get_stats())['counts'].get('parked', 0)
+
+    def _graphiti_plan_route_client(self) -> httpx.AsyncClient | None:
+        provider = self.config.llm.providers.openai
+        if self.config.llm.provider != 'openai' or provider is None or not provider.api_url:
+            return None
+        return self.plan_route.http_client_for(provider.api_url, site=PlanRouteSite.GRAPHITI)
+
     async def initialize(self) -> None:
         """Initialize backends and the durable write queue."""
-        await self.graphiti.initialize()
+        plan_client = self._graphiti_plan_route_client()
+        if plan_client is None:
+            await self.graphiti.initialize()
+        else:
+            await self.graphiti.initialize(
+                llm_client=build_llm_client(self.config, http_client=plan_client),
+            )
 
         qcfg = self.config.queue
 
