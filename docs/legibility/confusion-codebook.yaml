@@ -5098,6 +5098,62 @@ entries:
     manifested_phase: recon
     note: A deferred fused-memory tool was called before its schema was loaded. The agent guessed the parameter name `id`, the server rejected it as an undeclared argument, and the error text says the schema was not in the prompt.
     evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-23'
+    project: dark_factory
+    session: ab4c9a10-0a34-429b-a111-f1e9b929da46
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred mcp__fused-memory__get_task tool with a guessed project_id argument before its schema was loaded. The call was rejected at validation, and the error text confirms the schema was absent from the prompt at call time.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-23'
+    project: dark_factory
+    session: f2bed6c5-d0c9-4290-8d08-24b39b3f6141
+    origin_phase: recon
+    manifested_phase: recon
+    note: The deferred fused-memory tool was called before its schema was loaded via ToolSearch. The guessed argument name 'metadata' was rejected by validation as undeclared, and the same guess was retried across task ids 1133, 1134, 1135, and 1137.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is: {"type":"object","properties":{"project_id":{"title":"Project Id","type":"string"},"filters":{"additionalProperties":true,"title":"Filters","type":"object"}},"required":["project_id","filters"],"title":"count_memories_by_metadataArguments"}'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: d472a4a6-d831-4c03-9a93-d7e447416228
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred fused-memory tool count_memories_by_metadata before loading its schema via ToolSearch. It guessed a 'metadata' parameter, which the tool does not declare, and the call failed validation four times (records 24, 26, 28, 30). The digest's schema notice says the schema was not in the prompt at call time.
+    evidence_quote: This tool's input schema was not in your prompt when you called it. ... If the corrected call fails the same way, call ToolSearch with query "select:mcp__fused-memory__count_memories_by_metadata" to load the tool, then call it again.
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 57410f3d-d595-432c-9566-cd5bd56afcff
+    origin_phase: recon
+    manifested_phase: recon
+    note: The deferred get_task tool was called three times with a guessed project_id argument that its schema does not declare, and each call was rejected by validation. The digest does not show a ToolSearch call before the guesses, so the sequence is inferred from the error text, which states the schema was not in the prompt.
+    evidence_quote: 'get_task was called with argument(s) it does not declare: project_id'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 21a6be85-388a-47a9-803c-f8ce24e45b9c
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called a deferred fused-memory tool before loading its schema, guessed the argument name 'metadata', and got an unknown_argument rejection. The schema notice then appeared, and the agent repeated the same guessed shape on a second call (record 26).
+    evidence_quote: 'count_memories_by_metadata was called with argument(s) it does not declare: metadata'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 900c237f-b1d6-4ba6-a996-a4b7123254f3
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred fused-memory get_task tool without first loading its schema via ToolSearch, guessed a project_id argument, and got rejected as undeclared. The digest notes the schema was not in the prompt at call time, and the same wrong guess recurred across three calls.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is: {"type":"object","properties":{"id":{"title":"Id","type":"string"},"project_root":{"title":"Project Root","type":"string"},"tag":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Tag"}},"required":["id","project_root"],"title":"get_taskArguments"}'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: a29da771-3fb0-43cc-a6ef-1a394a03eca3
+    origin_phase: recon
+    manifested_phase: recon
+    note: The session called the deferred mcp__fused-memory__get_task tool with an undeclared project_id argument, and the server rejected it at validation. The tool's input schema was not in the prompt, which matches the deferred-tool-before-ToolSearch mechanism.
+    evidence_quote: 'get_task was called with argument(s) it does not declare: project_id'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 15191e0c-ff85-4d04-894d-f485845b3d72
+    origin_phase: recon
+    manifested_phase: recon
+    note: The digest shows a deferred fused-memory tool called without its input schema loaded, so the agent guessed a parameter (project_id) that the server rejected with unknown_argument. The error text itself points to ToolSearch discovery. Only one such call appears, so the rest of the session is not visible.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. ... {"name": "project_id", "closest_declared": "project_root"}'
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -10886,6 +10942,13 @@ entries:
     manifested_phase: unknown
     note: Digest shows ModuleNotFoundError and command-not-found in a task worktree, with the worktree's .venv missing. The digest does not establish that the failing agent was in an architect explore phase, so phase is unknown.
     evidence_quote: 'ls: cannot access ''.venv'': No such file or directory'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: b963dccc-f187-4651-aeff-fca8f9e4cbf3
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest shows ModuleNotFoundError and command-not-found failures inside a task worktree (pyright binary absent from node_modules in .worktrees/11479). The digest gives no phase evidence, so phases are unknown; the match is on mechanism only, not architect explore-phase specifically.
+    evidence_quote: 'ls: cannot access ''node_modules/.bin/pyright'': No such file or directory'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -14046,6 +14109,51 @@ entries:
       - (record 62) does not exist
 
       - (record 108) does not exist'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: addf7c6d-f4d5-46f3-bc7f-4641be654df2
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard-trip lines render as bare templates with the matched substring dropped. All six df_guard entries read only 'blocked:' with nothing after it.
+    evidence_quote: '- (record 65) blocked:'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 435e33ea-c9f4-4f58-91f9-504c2953013b
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'Guard Trips' section renders each guard signal as a bare template with the matched substring dropped, even though df_guard is 3.
+    evidence_quote: '- (record 52) blocked:'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 0fc25988-0a94-4e3d-b83b-82ead9866d06
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Guard trips are rendered as bare templates with the matched substring missing: each ''blocked:'' line has no content after it, even though df_guard reads 4.'
+    evidence_quote: '## Guard Trips
+
+      - (record 50) blocked:
+
+      - (record 95) blocked:'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: e55c4bda-79d5-467f-8a07-6f0c6665d34b
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest renders the guard trip as a bare 'blocked:' line with no matched content, and the not_found signal as the generic 'no such file or directory' template with no path, so the matched substring is dropped.
+    evidence_quote: '- (record 140) blocked:
+
+
+      ## Not Found
+
+      - (record 142) no such file or directory'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 335bd252-a55b-4207-8522-734672e9fc68
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: structured-facts-at-failure
+    note: 'The guard-trip line renders as a bare ''blocked:'' template with no matched substring or detail, which is the mechanism this entry names. The digest records a guard trip (df_guard: 1) but gives no structured fact about what was blocked. Phase cannot be supported from the digest.'
+    evidence_quote: '- (record 457) blocked:'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -24661,6 +24769,20 @@ entries:
     manifested_phase: unknown
     note: Orchestrated worktree task (cwd .worktrees/11283, agent_class orchestrated-task, n_user_turns 0) hits repeated 'no such file or directory' errors (not_found records 167 and 224) with no other diagnostic signal. Phase cannot be determined from the digest.
     evidence_quote: 'ls: cannot access ''escalation/.venv'': No such file or directory'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 4e1ac57f-0b9e-4488-8cfc-9736194f7f9b
+    origin_phase: implement
+    manifested_phase: implement
+    note: 'Orchestrated worktree task shows repeated ''no such file or directory'' not_found signals (6 total, including records 53, 151, 198, 1108) with little other diagnostic context. Weak match: the signals are not_found-only and the failing paths are not clearly worktree-specific.'
+    evidence_quote: '- (record 53) no such file or directory'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 6a7d2b63-4bbd-484c-8dfc-b95b2fd2b110
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session (cwd .worktrees/11434, agent_class orchestrated-task) with 7 not_found signals, all 'no such file or directory' or 'does not exist', and every other signal count at zero, so the digest gives no further diagnostic context. Phase is unknown because the digest does not show which stage the session was in.
+    evidence_quote: (record 90) no such file or directory / (record 135) no such file or directory / (record 150) does not exist / (record 156) does not exist / (record 314) no such file or directory / (record 344) no such file or directory / (record 391) no such file or directory
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25548,6 +25670,29 @@ entries:
       - Bash x5 (3 designed-outcome results: [exit 124] [watcher-rearm-declared]): {"command": "cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh --queue-dir /home/leo/src/dark-factory/data/escalations --level 1 --timeout 3600", "description": "Wait for next L1 escalation (bounded)", "timeout": 3660000}
 
       - Bash x4: {"command": "echo $(( 1795370428 + 14400 - $(date +%s) ))", "description": "Compute remaining seconds"}'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: addf7c6d-f4d5-46f3-bc7f-4641be654df2
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The Retry Loops bucket flags three Bash calls that re-arm a long-running escalation watcher (watcher-rearm.sh with a date check). The digest presents these as retry loops, though the session is a designed wait for the next L1 escalation.
+    evidence_quote: cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh --queue-dir /home/leo/src/dark-factory/data/escalations --level 1 --timeout $t
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 65295794-9587-4f3a-b5d1-e6fef2e40f5d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'Retry Loops' bucket flags a designed, bounded background wait (timeout-capped, sleep-based, run_in_background) as a retry loop.
+    evidence_quote: 'Bash x3: {"command": "timeout 7000 bash -c ''while git merge-base --is-ancestor task/5429 main 2>/dev/null; [ $? -eq 1 ]; do sleep 15; done''; echo \"wait rc=$?\"", "description": "Wait up to ~2h for task/5429 to land", "run_in_background": true'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 0fc25988-0a94-4e3d-b83b-82ead9866d06
+    origin_phase: ops
+    manifested_phase: ops
+    note: The Retry Loops bucket lists the watcher's repeated watcher-rearm.sh Bash calls, whose results are designed outcomes (exit 124 CEILING, watcher-rearm-declared), as retry loops.
+    evidence_quote: '## Retry Loops
+
+      - Bash x6 (2 designed-outcome results: [exit 124] [watcher-rearm-declared])'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -28474,6 +28619,22 @@ entries:
     manifested_phase: unknown
     note: The 'User Corrections' bucket captured a skill invocation (/unblock) and its injected instruction block as if it were user feedback. The digest's own signal_counts show no correction signal (self_correct 0), which fits the entry's mislabeling mechanism.
     evidence_quote: '## User Corrections - (record 4) <command-message>unblock</command-message> <command-name>/unblock</command-name>'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 435e33ea-c9f4-4f58-91f9-504c2953013b
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket captured a slash-command skill invocation (/unblock with its injected args and result.md instructions) as if it were user feedback.
+    evidence_quote: '- (record 4) <command-message>unblock</command-message>
+
+      <command-name>/unblock</command-name>'
+  - date: '2026-11-23'
+    project: dark_factory
+    session: 65295794-9587-4f3a-b5d1-e6fef2e40f5d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket captures a /unblock skill invocation and its injected instructions as if they were user corrections.
+    evidence_quote: <command-name>/unblock</command-name>
   filed_tickets:
   - ticket: tkt_0RW5FRCC10XP47EPHA3X9HRK50
     project_root: /home/leo/src/dark-factory
@@ -28994,6 +29155,13 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: An orchestrated-task sub-agent's read-only Bash inspection (git log, git status, ls of the task reviews directory) was denied because the session runs in don't-ask mode. The verify-failure diagnosis named in the title is not visible in this digest; the match rests on the denied read-only Bash inspection itself.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-23'
+    project: dark_factory
+    session: a286772d-6791-4521-98bc-ec5cae8d61e5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The Bash call for read-only git inspection was denied under don't-ask mode, and the agent had to continue without that inspection.
     evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
   filed_tickets:
   - ticket: null
@@ -46986,6 +47154,32 @@ candidates:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: 'mcp__fused-memory__count_memories_by_metadata({"metadata": "{\"task_id\":\"10197\",\"stage2_suppress\":true}", "project_id": "reify"}) -> {"error": "count_memories_by_metadata was called with argument(s) it does not declare: metadata", "code": "unknown_argument", "tool": "count_memories_by_metadata", "unknown": [{"name": "metadata", "closest_declared": null}], "declared": ["project_id", "filters"]'
+- id: cand-20261123-1
+  title: Ratchet baseline for gates.py growth is not surfaced to planners, so plans assume no baseline update is needed
+  cause: The plan assumed that growth in orchestrator/src/orchestrator/merge_lane/gates.py needed no change to the ratchet baseline. The agent had to correct this mid-session, and a Bash probe of merge_lane_ratchet_baseline.json then failed with exit 1. The ratchet baseline's coupling to file-size and complexity metrics is not visible from the plan's own text.
+  area: orchestrator/merge_lane ratchet gates
+  first_seen: '2026-11-23'
+  disposition: pending
+  sightings:
+  - date: '2026-11-23'
+    project: dark_factory
+    session: c42feeac-5692-4efc-91b7-107b61e51e28
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (record 263) [correction:] **The correction:** the original plan treated `gates.py`'s line growth as needing no baseline change. That was wrong.
+- id: cand-20261123-2
+  title: Plan asserts markup-check behavior on redo tasks without verifying the override-removal ordering, so the plan drops redos it should keep
+  cause: The planning agent reasoned that the markup check could not reject a redo because the original's text had already passed it. It did not account for the allow_mcp_markup override being removed before the task is saved, so the premise was wrong and the agent had to correct it.
+  area: task redo pipeline / MCP markup check ordering
+  first_seen: '2026-11-23'
+  disposition: pending
+  sightings:
+  - date: '2026-11-23'
+    project: dark_factory
+    session: c859b9a2-8aed-48d0-90f5-4492c8389709
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: The plan assumes a markup check can't reject the redo's text because the original's text already passed it. That's wrong for an original filed with the `allow_mcp_markup` override, which is removed before the task is saved.
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
