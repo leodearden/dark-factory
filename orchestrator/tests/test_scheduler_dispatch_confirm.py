@@ -8,13 +8,16 @@ stand now. A row that differs between the two is a write that landed mid-tick.
 
 from __future__ import annotations
 
+import asyncio
 import copy
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import wait_responsive
 from _park_test_helpers import make_task
 from shared.task_read import TaskAbsent, TaskFound, TaskRead, TaskReadFailed
 
@@ -47,6 +50,7 @@ class _Board:
         self.rows = {str(row['id']): copy.deepcopy(row) for row in rows}
         self.statuses = dict(statuses or {})
         self.unreadable = False
+        self._held_read: tuple[asyncio.Event, asyncio.Event] | None = None
         self.get_tasks = AsyncMock(side_effect=lambda **_: copy.deepcopy(self.snapshot))
         self.read_task = AsyncMock(side_effect=self._read_task)
         self.get_statuses = AsyncMock(side_effect=self._get_statuses)
@@ -54,7 +58,17 @@ class _Board:
         scheduler.read_task = self.read_task
         scheduler.get_statuses = self.get_statuses
 
-    def _read_task(self, task_id: str) -> TaskRead:
+    def hold_next_read(self) -> tuple[asyncio.Event, asyncio.Event]:
+        """The next read_task sets the first event, then waits for the second before answering."""
+        self._held_read = (asyncio.Event(), asyncio.Event())
+        return self._held_read
+
+    async def _read_task(self, task_id: str) -> TaskRead:
+        if self._held_read is not None:
+            entered, release = self._held_read
+            self._held_read = None
+            entered.set()
+            await release.wait()
         if self.unreadable:
             return TaskReadFailed('fused-memory unreachable')
         row = self.rows.get(task_id)
@@ -258,3 +272,68 @@ async def test_a_timed_gate_dispatch_hands_out_the_store_s_row(tmp_path):
 
     assert result is not None and result.task_id == T['id']
     assert result.task['metadata']['gate_escalated_at'] == STAMP
+
+
+def _acquired(rig: _Rig, task_id: str) -> int:
+    return sum(1 for event in rig.store.fetch_events_by_type(EventType.lock_acquired) if event['task_id'] == task_id)
+
+
+def _assert_not_passed_over(rig: _Rig, task_id: str) -> None:
+    snapshot = rig.scheduler.get_state_snapshot()
+    assert task_id not in snapshot.skip_counts
+    assert task_id not in snapshot.parks
+    assert all(event['task_id'] != task_id for event in rig.store.fetch_events_by_type(EventType.park_refused))
+
+
+async def _race(
+    rig: _Rig, board: _Board, *, meanwhile: Callable[[], None] = lambda: None,
+) -> tuple[str | None, str | None]:
+    """Pass A suspends in its winner's confirmation read; *meanwhile* runs, then pass B runs whole; then A resumes."""
+    entered, release = board.hold_next_read()
+    pass_a = asyncio.create_task(rig.scheduler.acquire_next())
+    await wait_responsive(entered.wait(), label="pass A reaches its winner's confirmation read")
+    meanwhile()
+    b = await rig.scheduler.acquire_next()
+    release.set()
+    a = await wait_responsive(pass_a, label='pass A finishes after the release')
+    return (a.task_id if a else None), (b.task_id if b else None)
+
+
+async def test_a_top_started_while_the_scan_was_confirming_is_not_passed_over(tmp_path):
+    rig = _rig(tmp_path)
+    holder = make_task('H', 'critical', ['m1.py'])
+    top, confirming, last = (
+        make_task('X', 'high', ['m1.py']),
+        make_task('T', 'medium', ['m2.py']),
+        make_task('W', 'low', ['m3.py']),
+    )
+    board = _Board(
+        rig.scheduler,
+        snapshot=[holder],
+        rows=[holder, top, _with(confirming, status='blocked'), last],
+    )
+    held = await rig.scheduler.acquire_next()
+    assert held is not None and held.task_id == 'H', 'premise: H holds m1.py'
+    board.snapshot = [_with(holder, status='in-progress'), top, confirming, last]
+
+    a, b = await _race(rig, board, meanwhile=lambda: rig.scheduler.release('H'))
+
+    assert (b, a) == ('X', 'W')
+    assert _acquired(rig, 'X') == 1
+    _assert_not_passed_over(rig, 'X')
+
+
+async def test_a_pin_started_while_an_earlier_pin_was_confirming_is_not_lock_blocked(tmp_path):
+    rig = _rig(tmp_path, pinned=('P1', 'P2'))
+    first, second = make_task('P1', 'high', ['p1.py']), make_task('P2', 'high', ['p2.py'])
+    board = _Board(rig.scheduler, snapshot=[first, second], rows=[_with(first, status='blocked'), second])
+
+    a, b = await _race(rig, board)
+
+    assert b == 'P2'
+    assert a != 'P2'
+    assert _acquired(rig, 'P2') == 1
+    snapshot = rig.scheduler.get_state_snapshot()
+    assert 'P2' not in snapshot.parks
+    assert 'P2' not in snapshot.pin_reservations
+    assert all(event['task_id'] != 'P2' for event in rig.store.fetch_events_by_type(EventType.pin_blocked))
