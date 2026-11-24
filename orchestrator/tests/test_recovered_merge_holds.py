@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _landed_rows import record_landing
@@ -185,8 +185,11 @@ class TestRestoreToleratesWhatItCannotTake:
         assert incomplete['task_id'] == other
         assert incomplete['data'] == {
             'request_id': request_ids[other],
+            'cause': 'contested',
             'restored': list(own[other]),
-            'unheld': [{'module': shared, 'owner': first, 'kind': 'held'}],
+            'unheld': [shared],
+            'blockers': [{'module': shared, 'owner': first, 'kind': 'held'}],
+            'error': None,
         }
 
     async def test_a_request_finalized_before_the_restore_gains_no_hold(
@@ -212,8 +215,8 @@ class TestRestoreToleratesWhatItCannotTake:
     async def test_an_unreadable_task_store_restores_nothing_and_does_not_raise(
         self, tmp_path: Path, failure: str,
     ) -> None:
-        h, scheduler, _store = _scene(tmp_path)
-        await journal_merge_request(h, _TID, task_files=_FILES)
+        h, scheduler, store = _scene(tmp_path)
+        request_id = await journal_merge_request(h, _TID, task_files=_FILES)
         scheduler.get_statuses = (
             AsyncMock(return_value=({}, RuntimeError('store down')))
             if failure == 'error_result'
@@ -224,6 +227,33 @@ class TestRestoreToleratesWhatItCannotTake:
 
         assert [r.task_id for r in report['requests']] == [_TID]
         assert _held(scheduler) == {}
+        assert _event_data(store, 'recovered_merge_hold_incomplete', _TID) == [{
+            'request_id': request_id,
+            'cause': 'status_unread',
+            'restored': [],
+            'unheld': list(_keys(h, _FILES)),
+            'blockers': [],
+            'error': "RuntimeError('store down')",
+        }]
+
+    async def test_a_restore_that_raises_is_named_and_does_not_raise(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, store = _scene(tmp_path)
+        request_id = await journal_merge_request(h, _TID, task_files=_FILES)
+        scheduler.restore_hold = MagicMock(side_effect=RuntimeError('lock table down'))
+
+        await h._recover_pending_merges()
+
+        assert _held(scheduler) == {}
+        assert _event_data(store, 'recovered_merge_hold_incomplete', _TID) == [{
+            'request_id': request_id,
+            'cause': 'raised',
+            'restored': [],
+            'unheld': list(_keys(h, _FILES)),
+            'blockers': [],
+            'error': "RuntimeError('lock table down')",
+        }]
 
 
 def _recording_hold(scheduler: Scheduler, seen: list) -> AsyncMock:

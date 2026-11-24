@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import enum
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Protocol
 
 from shared.task_statuses import TaskStatus
@@ -15,10 +15,12 @@ from orchestrator.module_charter import derive_modules
 if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.lock_table import UncontestedAcquisition
+    from orchestrator.pin_reservation import Blocker
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'HoldShortfall',
     'HoldTasks',
     'LockRestoreReason',
     'RecoveredMergeHolds',
@@ -30,6 +32,14 @@ class LockRestoreReason(enum.StrEnum):
     """The ``reason`` of a ``lock_acquired`` that restores a hold."""
 
     RECOVERED_MERGE = 'recovered_merge'
+
+
+class HoldShortfall(enum.StrEnum):
+    """The ``cause`` of a ``recovered_merge_hold_incomplete``: why the task holds less than its journalled keys."""
+
+    CONTESTED = 'contested'
+    STATUS_UNREAD = 'status_unread'
+    RAISED = 'raised'
 
 
 class _Outcome(Protocol):
@@ -89,13 +99,18 @@ class RecoveredMergeHolds:
     async def restore(self, requests: Iterable[RestorableRequest]) -> None:
         """Re-take each in-progress task's journalled files for its unfinished request.
 
-        Never raises: a failure is logged and restores less, so start-up goes on.
+        Never raises: a failure restores less, so start-up goes on, and emits a
+        ``recovered_merge_hold_incomplete`` naming its cause for each request it cost.
         """
         wanted = self._wanted(requests)
         if not wanted:
             return
-        statuses = await self._read_statuses([request.task_id for request, _keys in wanted])
-        if statuses is None:
+        statuses, unread = await self._read_statuses([request.task_id for request, _keys in wanted])
+        if unread is not None:
+            for request, keys in wanted:
+                self._report_shortfall(
+                    request, HoldShortfall.STATUS_UNREAD, unheld=keys, error=unread,
+                )
             return
         restored = False
         for request, keys in wanted:
@@ -114,40 +129,43 @@ class RecoveredMergeHolds:
                 )
                 if keys and not request.result.done():
                     wanted.append((request, keys))
-            except Exception:
+            except Exception as exc:
                 logger.warning(
                     'Recovered merge request %s: deriving its task\'s lock keys '
                     'raised; no hold restored', request.request_id, exc_info=True,
                 )
+                self._report_shortfall(request, HoldShortfall.RAISED, unheld=(), error=repr(exc))
         return wanted
 
-    async def _read_statuses(self, ids: list[str]) -> dict[str, str] | None:
+    async def _read_statuses(self, ids: list[str]) -> tuple[dict[str, str], str | None]:
+        """The tasks' statuses, and the read's error when they could not be read."""
         try:
             statuses, error = await self._tasks.get_statuses(ids)
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 'Reading the statuses of recovered merge requests\' tasks %s raised; '
                 'no hold restored', ids, exc_info=True,
             )
-            return None
+            return {}, repr(exc)
         if error is not None:
             logger.warning(
                 'Reading the statuses of recovered merge requests\' tasks %s failed '
                 '(%r); no hold restored', ids, error,
             )
-            return None
-        return statuses
+            return {}, repr(error)
+        return statuses, None
 
     def _restore_contained(
         self, request: RestorableRequest, keys: list[str], status: str | None,
     ) -> bool:
         try:
             return self._restore_one(request, keys, status)
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 'Task %s: restoring the hold of recovered merge request %s raised',
                 request.task_id, request.request_id, exc_info=True,
             )
+            self._report_shortfall(request, HoldShortfall.RAISED, unheld=keys, error=repr(exc))
             return False
 
     def _restore_one(
@@ -176,28 +194,36 @@ class RecoveredMergeHolds:
                 tid, list(acquisition.acquired), request.request_id,
             )
         if acquisition.contested:
-            self._report_incomplete(request, acquisition)
+            unheld = list(dict.fromkeys(blocker.module for blocker in acquisition.contested))
+            logger.warning(
+                'Task %s could not re-take %s for recovered merge request %s: '
+                'another task holds or parks them', tid, unheld, request.request_id,
+            )
+            self._report_shortfall(
+                request, HoldShortfall.CONTESTED, unheld=unheld,
+                restored=acquisition.acquired, blockers=acquisition.contested,
+            )
         return bool(acquisition.acquired)
 
-    def _report_incomplete(
-        self, request: RestorableRequest, acquisition: UncontestedAcquisition,
+    def _report_shortfall(
+        self, request: RestorableRequest, cause: HoldShortfall, *,
+        unheld: Sequence[str], restored: Sequence[str] = (),
+        blockers: Sequence[Blocker] = (), error: str | None = None,
     ) -> None:
-        unheld = [blocker.as_payload() for blocker in acquisition.contested]
-        logger.warning(
-            'Task %s could not re-take %s for recovered merge request %s: '
-            'another task holds or parks them', request.task_id, unheld,
-            request.request_id,
+        if self._event_store is None:
+            return
+        self._event_store.emit(
+            EventType.recovered_merge_hold_incomplete,
+            task_id=request.task_id,
+            data={
+                'request_id': request.request_id,
+                'cause': cause,
+                'restored': sorted(restored),
+                'unheld': sorted(unheld),
+                'blockers': [blocker.as_payload() for blocker in blockers],
+                'error': error,
+            },
         )
-        if self._event_store is not None:
-            self._event_store.emit(
-                EventType.recovered_merge_hold_incomplete,
-                task_id=request.task_id,
-                data={
-                    'request_id': request.request_id,
-                    'restored': list(acquisition.acquired),
-                    'unheld': unheld,
-                },
-            )
 
     async def _flush_snapshot(self) -> None:
         try:
