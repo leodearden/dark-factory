@@ -8166,6 +8166,27 @@ class Scheduler:
             )
         return result
 
+    def restore_hold(
+        self, task_id: str, modules: list[str], *, reason: str,
+    ) -> UncontestedAcquisition:
+        """Re-take, for a task no workflow runs, every free key of *modules*; name the rest.
+
+        Unlike :meth:`acquire_uncontested` it writes no module cache (a partial
+        set cached there would under-lock a later dispatch), status or park.
+        Synchronous, so a caller's check and this acquire cannot interleave.
+        The caller is
+        ``orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds``.
+        """
+        result = self.lock_table.acquire_uncontested(task_id, modules)
+        if result.acquired:
+            self._emit_lock_event(
+                EventType.lock_acquired,
+                task_id=task_id,
+                modules=list(result.acquired),
+                reason=reason,
+            )
+        return result
+
     def acquire_as_successor(
         self, task_id: str, modules: list[str], *, predecessor: str, priority: str,
     ) -> bool:

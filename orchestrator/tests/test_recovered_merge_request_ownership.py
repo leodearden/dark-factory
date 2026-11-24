@@ -143,7 +143,7 @@ class TestRecoveredRequestOwnsItsTask:
 def _recovered_request() -> SimpleNamespace:
     return SimpleNamespace(
         task_id=_TID, request_id='mr-recovered', branch=SimpleNamespace(bare_id=_TID),
-        result=asyncio.get_running_loop().create_future(),
+        task_files=None, result=asyncio.get_running_loop().create_future(),
     )
 
 

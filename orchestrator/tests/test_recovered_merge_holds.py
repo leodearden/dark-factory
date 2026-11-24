@@ -10,6 +10,7 @@ module: it reads harness privates, which the merge-lane ratchet
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock
@@ -27,7 +28,8 @@ from orchestrator.recovered_merge_holds import LockRestoreReason
 from orchestrator.scheduler import Scheduler
 
 _TID = '40'
-_FILES = ['a.md', 'b.md']
+# Not .md: this scene's config gives root-level markdown unlimited holders.
+_FILES = ['a.py', 'b.py']
 
 
 class _Scene(NamedTuple):
@@ -58,7 +60,7 @@ def _event_data(store: EventStore, name: str, task_id: str) -> list[dict]:
     return [e['data'] for e in store.fetch_events_by_type(name) if e['task_id'] == task_id]
 
 
-def _held(scheduler: Scheduler) -> dict[str, tuple[str, ...]]:
+def _held(scheduler: Scheduler) -> Mapping[str, tuple[str, ...]]:
     return scheduler.get_state_snapshot().held_by_task
 
 
@@ -89,8 +91,8 @@ class TestRestoreAtStartup:
         assert acquired['reason'] == LockRestoreReason.RECOVERED_MERGE
 
         scheduler.get_tasks = AsyncMock(return_value=[
-            make_task('50', 'high', ['a.md']),
-            make_task('51', 'high', ['c.md']),
+            make_task('50', 'high', ['a.py']),
+            make_task('51', 'high', ['c.py']),
         ])
         scheduler.finish_startup()
 
