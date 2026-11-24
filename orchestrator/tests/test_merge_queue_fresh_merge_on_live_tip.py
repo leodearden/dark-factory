@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -122,23 +122,23 @@ async def _status(req: MergeRequest) -> str:
 
 
 class _SignalsDequeueOf(EventStore):
-    """An event store that sets ``dequeued`` on *task_id*'s ``merge_dequeued``
-    row, which the merger writes once its fresh-dequeue decision is made."""
+    """An event store that sets ``dequeued[task_id]`` on each of *task_ids*'
+    ``merge_dequeued`` rows, which the merger writes once its fresh-dequeue
+    decision is made."""
 
-    def __init__(self, db_path: Path, run_id: str, *, task_id: str) -> None:
+    def __init__(self, db_path: Path, run_id: str, *, task_ids: Collection[str]) -> None:
         super().__init__(db_path, run_id)
-        self._task_id = task_id
-        self.dequeued = asyncio.Event()
+        self.dequeued = {task_id: asyncio.Event() for task_id in task_ids}
 
     def emit(self, event_type: EventType, **fields: Any) -> int | None:
-        if event_type is EventType.merge_dequeued and fields.get('task_id') == self._task_id:
-            self.dequeued.set()
+        if event_type is EventType.merge_dequeued and fields.get('task_id') in self.dequeued:
+            self.dequeued[fields['task_id']].set()
         return super().emit(event_type, **fields)
 
 
 @dataclasses.dataclass
 class _Run:
-    """A running lane: H's verify on 'head-host' is held until ``release_h``."""
+    """A running lane: H's verify is held until ``release_h``."""
 
     scene: _Scene
     lane: MergeLane
@@ -165,22 +165,51 @@ class _Run:
 
 
 @contextlib.asynccontextmanager
-async def _running(
-    scene: _Scene, head: MergeRequest, local: FakeVerifier,
+async def _running_with_head(
+    scene: _Scene, head: MergeRequest, local: FakeVerifier, *,
+    head_host: str, release_h: asyncio.Event, h_entered: asyncio.Event,
+    speculation_depth: int, remote_runners: Sequence[FakeRemoteRunner],
 ) -> AsyncIterator[_Run]:
-    """*head* merged on main and verifying on 'head-host', held there."""
-    h_entered, release_h = asyncio.Event(), asyncio.Event()
+    """*head* merged on main and verifying on *head_host*, held there until *release_h*."""
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue, verifier=local, clock=healthy_verify_clock(),
-        speculation_depth=2,
-        remote_runners=[FakeRemoteRunner(_HEAD_HOST, release=release_h, entered=h_entered)],
+        speculation_depth=speculation_depth, remote_runners=remote_runners,
         event_store=scene.events, escalation_queue=scene.escalations,
     )
     async with running_lane(lane):
         run = _Run(scene, lane, queue, local, release_h)
         run.put(head)
-        await _entered(h_entered, f'{head.task_id} verifying on {_HEAD_HOST}')
+        await _entered(h_entered, f'{head.task_id} verifying on {head_host}')
+        yield run
+
+
+@contextlib.asynccontextmanager
+async def _running(
+    scene: _Scene, head: MergeRequest, local: FakeVerifier,
+) -> AsyncIterator[_Run]:
+    """*head* merged on main and verifying on 'head-host', held there."""
+    h_entered, release_h = asyncio.Event(), asyncio.Event()
+    async with _running_with_head(
+        scene, head, local, head_host=_HEAD_HOST, release_h=release_h, h_entered=h_entered,
+        speculation_depth=2,
+        remote_runners=[FakeRemoteRunner(_HEAD_HOST, release=release_h, entered=h_entered)],
+    ) as run:
+        yield run
+
+
+@contextlib.asynccontextmanager
+async def _running_on_one_host(
+    scene: _Scene, head: MergeRequest, local: FakeVerifier, *,
+    release_h: asyncio.Event, h_entered: asyncio.Event,
+) -> AsyncIterator[_Run]:
+    """*head* verifying on 'local', the lane's only host, held by its own
+    local script on *release_h*. Depth 3 is production's K = verify hosts + 1
+    for a configured two-host fleet with one host unavailable."""
+    async with _running_with_head(
+        scene, head, local, head_host='local', release_h=release_h, h_entered=h_entered,
+        speculation_depth=3, remote_runners=[],
+    ) as run:
         yield run
 
 
@@ -239,7 +268,7 @@ class TestAFreshDequeueAfterARequestThatBuiltNothing:
         escalates a request conflicting with the frozen tip before the merger
         ever dequeues it."""
         events = _SignalsDequeueOf(
-            tmp_path / 'events-dequeue.db', 'fresh-after-nothing', task_id='Y',
+            tmp_path / 'events-dequeue.db', 'fresh-after-nothing', task_ids=('Y',),
         )
         scene = dataclasses.replace(_scene(tmp_path), events=events)
         h = await _request(scene, 'H', {'H.txt': 'H\n'})
@@ -249,7 +278,7 @@ class TestAFreshDequeueAfterARequestThatBuiltNothing:
         local = FakeVerifier(scripts={'X': hangs_until(release_x, entered=x_entered)})
         async with _running(scene, h, local) as run:
             run.put(y)
-            await _entered(events.dequeued, 'Y dequeued behind H')
+            await _entered(events.dequeued['Y'], 'Y dequeued behind H')
 
             run.put(x)
             await _entered(x_entered, 'X verifying on local')
@@ -264,4 +293,58 @@ class TestAFreshDequeueAfterARequestThatBuiltNothing:
             statuses = {req.task_id: await _status(req) for req in (h, x, y)}
             assert statuses == {'H': 'done', 'X': 'done', 'Y': 'already_merged'}, statuses
             assert await _main_task_files(scene) == {'H.txt', 'X.txt'}
+            assert run.divergence_alarms() == []
+
+
+class TestAFreshDequeueBehindABuildAwaitingAHost:
+    """A fresh dequeue stacks on the merger's own newest build while that
+    build still waits for a host, not beside it on the frozen-prefix tip."""
+
+    async def test_a_fresh_arrival_stacks_on_the_mergers_build_still_waiting_for_a_host(
+        self, tmp_path: Path,
+    ) -> None:
+        """H holds 'local', the only host. M merges on H's commit and waits
+        for a host; Y, with no work of its own, consumes M's commit as its
+        base and is found already merged. X, dequeued next, stacks on M."""
+        events = _SignalsDequeueOf(
+            tmp_path / 'events-dequeue.db', 'fresh-behind-awaiting-host', task_ids=('Y', 'X'),
+        )
+        scene = dataclasses.replace(_scene(tmp_path), events=events)
+        h = await _request(scene, 'H', {'H.txt': 'H\n'})
+        m = await _request(scene, 'M', {'M.txt': 'M\n'})
+        y = await _request(scene, 'Y', {})
+        x = await _request(scene, 'X', {'X.txt': 'X\n'})
+        h_entered, release_h = asyncio.Event(), asyncio.Event()
+        x_entered, release_x = asyncio.Event(), asyncio.Event()
+        local = FakeVerifier(scripts={
+            'H': hangs_until(release_h, entered=h_entered),
+            'X': hangs_until(release_x, entered=x_entered),
+        })
+        async with _running_on_one_host(
+            scene, h, local, release_h=release_h, h_entered=h_entered,
+        ) as run:
+            run.put(m)
+            run.put(y)
+            await _entered(events.dequeued['Y'], 'Y dequeued behind M')
+
+            run.put(x)
+            await _entered(events.dequeued['X'], 'X dequeued behind M')
+
+            run.release_h.set()
+            await _entered(x_entered, 'X verifying on local')
+            assert run.tree_at_call(-1) == {'H.txt', 'M.txt', 'X.txt'}, (
+                "X did not stack on M's build awaiting a host"
+            )
+            assert run.divergence_alarms() == []
+            assert run.recorded_divergences() == []
+
+            release_x.set()
+            statuses = {req.task_id: await _status(req) for req in (h, m, x, y)}
+            assert statuses == {
+                'H': 'done', 'M': 'done', 'X': 'done', 'Y': 'already_merged',
+            }, statuses
+            assert await _main_task_files(scene) == {'H.txt', 'M.txt', 'X.txt'}
+            assert len(run.local.verify_calls) == 3, (
+                f'X did not verify exactly once: {run.local.verified}'
+            )
             assert run.divergence_alarms() == []
