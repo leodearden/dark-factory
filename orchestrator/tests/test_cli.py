@@ -605,7 +605,7 @@ class TestRunWithBoundedTeardown:
             main, teardown_secs=0.5, _exit=exits.append,
         )
         for thread in _shutdown_watchdog_threads() - before:
-            thread.join(timeout=5.0)
+            thread.join(timeout=_HANG_GUARD_SECS)
 
         assert result == 'report'
         assert exits == [], 'the teardown watchdog stayed armed after asyncio.run returned'
