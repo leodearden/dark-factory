@@ -238,6 +238,25 @@ class TestApply:
         assert state.streak == 1
         assert (after.newly_disabled, after.l2_required) == (False, False)
 
+    def test_an_empty_verdict_reports_the_live_disable_and_writes_nothing(self, seeded):
+        seeded.leak(HEAD, ALPHA_NODE, BETA_NODE)
+        before = seeded.policy()
+        assert before.disabled_until is not None
+
+        response = asyncio.run(audit.apply(audit.AuditVerdict((), ()), seeded.registry, seeded.now))
+
+        assert response.l2_required is True
+        assert response.newly_disabled is False
+        assert response.leaks == ()
+        assert response.policy == before
+        assert seeded.policy() == before
+        assert {leak.unit_id for leak in response.streak_leaks} == {'module:alpha:test', 'module:beta:test'}
+
+        seeded.now = before.disabled_until + timedelta(days=1)
+        expired = asyncio.run(audit.apply(audit.AuditVerdict((), ()), seeded.registry, seeded.now))
+
+        assert expired.l2_required is False
+
 
 class TestEnable:
     def test_enable_clears_the_disable_and_the_old_leaks_never_count_again(self, seeded):
