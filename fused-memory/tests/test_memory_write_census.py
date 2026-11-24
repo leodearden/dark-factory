@@ -74,8 +74,8 @@ CENSUS: dict[CensusKey, CensusRow] = {
         tests=('reconciliation/test_stage1_stall_detector.py::TestTrackHumanOperatorStalls::test_each_marker_declares_its_task',),
     ),
     ('reconciliation/flag_dedup.py', 'write_suppression_record', 'add_memory'): CensusRow(
-        1, Disposition.CODE_WRITER, 'the suppression mirror, declaring every suppressed task id',
-        tests=('test_flag_dedup.py::TestWriteSuppressionRecord::test_the_mirror_declares_every_suppressed_task',),
+        1, Disposition.CODE_WRITER, "the suppression mirror has no subject task: its ids may name other projects' tasks, so it declares no link",
+        tests=('test_flag_dedup.py::TestWriteSuppressionRecord::test_the_mirror_declares_no_task_link',),
     ),
     ('reconciliation/audit_trail_rotation.py', '_MemoryServiceArchive.write', 'add_memory'): CensusRow(
         1, Disposition.CODE_WRITER, "the rotation archive, declaring its task; the body is the task's own shed history",
