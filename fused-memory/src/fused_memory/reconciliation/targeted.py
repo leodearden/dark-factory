@@ -15,6 +15,7 @@ from shared.task_fields import dependency_ids as task_dependency_ids
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.memory_metadata import (
     RECONCILIATION_COMPLETION_ECHO_MARKER,
+    RECONCILIATION_VERDICT_KEY,
     TARGETED_RECONCILIATION_SOURCE,
     is_reconciliation_completion_echo,
     normalize_supersedes,
@@ -607,10 +608,12 @@ class TargetedReconciler:
                     # done-transition later proves premature/false (e.g. the
                     # predates-own-deps architect close-out bug) — so this
                     # fallback is reframed to report the transition without
-                    # claiming the deliverable is verified.
+                    # claiming the deliverable is verified. C5 of
+                    # plans/live-task-facts-at-recall-prd.md: the wording
+                    # names no task status.
                     unverified_completion = True
                     content = (
-                        f"Task '{title}' transitioned to done; "
+                        f"Task '{title}' was marked finished; "
                         "completion not yet verified."
                     )
                     if description:
@@ -917,7 +920,7 @@ class TargetedReconciler:
                         metadata={
                             'source': TARGETED_RECONCILIATION_SOURCE,
                             'task_id': task_id,
-                            'verification_verdict': verification.verdict,
+                            RECONCILIATION_VERDICT_KEY: verification.verdict,
                         },
                         causation_id=run_id,
                     )

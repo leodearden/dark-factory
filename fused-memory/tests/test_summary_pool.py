@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _code_writer_links import assert_writes_c5
 
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
@@ -520,6 +521,11 @@ class TestWriteCycleSummaryRemediationFlag:
         memory_service.add_system_record.assert_awaited_once()
         metadata = memory_service.add_system_record.call_args.kwargs.get('metadata') or {}
         assert metadata.get('remediation') is True
+        # C5: a cycle summary has no subject task, and names no task status.
+        assert_writes_c5(
+            memory_service.add_system_record.call_args.kwargs,
+            project_id='dark_factory', subject=None,
+        )
 
     @pytest.mark.asyncio
     async def test_remediation_default_false_stamps_ledger_payload_and_mirror_metadata(

@@ -1867,10 +1867,9 @@ class ReconciliationHarness:
                 'source': 'stage1_status_correction',
             }
             content = (
-                f'Stage 1 status-correction reconciliation: the cached '
-                f'project_status_correction memory diverged from the authoritative '
-                f"get_statuses census: done={live['done']} total={live['total']} "
-                f"active={len(live['active_tasks'])}."
+                'Stage 1 status-correction reconciliation: the cached '
+                'project_status_correction record disagreed with the live task '
+                'census and was superseded.'
             )
             # Add-then-delete: guarantees at least one correct memory always exists
             # even if a delete below fails — the fresh memory (supersedes=[<old_id>])

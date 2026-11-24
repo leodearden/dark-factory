@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from _code_writer_links import assert_writes_c5
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
@@ -420,6 +421,8 @@ class TestWriteEntityStandingDecision:
         assert md['kind'] == RECORD_KIND_ENTITY_STANDING_DECISION
         assert md['entity_uuid'] == _ENTITY_UUID
         assert md['grounds'] == GROUNDS_STRUCTURAL_SIZE_CONFLATION
+        # C5: an entity decision has no subject task, and names no task status.
+        assert_writes_c5(service.add_memory.call_args.kwargs, project_id=_PROJECT_ID, subject=None)
 
     @pytest.mark.asyncio
     async def test_gated_write_when_arm2_satisfied(self, writer_memory_service):
