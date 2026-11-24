@@ -20,13 +20,14 @@ import time
 from pathlib import Path
 
 from shared.safe_io import atomic_write_text
+from shared.testing_own_time import state_letter
 
 SYS_EXIT = {"x86_64": 60, "aarch64": 93}
 POLL_SECS = 0.01
 
 
 def leader_state(pid: int) -> str:
-    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    return state_letter(Path(f"/proc/{pid}/stat").read_text())
 
 
 def serve(listener: socket.socket, ready: Path, release: Path) -> None:

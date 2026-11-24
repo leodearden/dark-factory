@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+from shared.testing_own_time import state_letter
+
 STATE = Path(os.environ["FAKE_SYSTEMD_STATE"])
 UNIT_DIR = Path(os.environ["HOME"]) / ".config" / "systemd" / "user"
 EXITED_STATES = {"Z", "X"}
@@ -31,7 +33,7 @@ STOP_DEADLINE_SECS = 5
 def task_state(stat: Path) -> str:
     """The state letter in one /proc stat file; X once the task has gone."""
     try:
-        return stat.read_text().rsplit(")", 1)[1].split()[0]
+        return state_letter(stat.read_text())
     except OSError:
         return "X"
 
