@@ -278,6 +278,28 @@ class PlanRoute:
         return urlsplit(self._proxy_url).netloc if self._proxy_url else None
 
 
+class PlanRouteParkGuard:
+    """The plan cap's guard in the durable queue's billing park policy.
+
+    Parked plan-cap rows re-probe when the latch next lets a probe through.
+    A cap that reached the queue by a path the route does not gate still
+    latches it. Clearing does nothing: the route learns recovery from its own
+    probe.
+    """
+
+    def __init__(self, route: PlanRoute) -> None:
+        self._route = route
+
+    def park_until(self) -> float | None:
+        return self._route.next_probe_epoch()
+
+    async def on_parked(self, exhaustion: BillingExhaustion, *, site: str) -> None:
+        await self._route.observe_cap(exhaustion, site=site)
+
+    async def on_cleared(self, *, site: str) -> None:
+        return None
+
+
 class _PlanRouteTransport(httpx.AsyncBaseTransport):
     def __init__(
         self, route: PlanRoute, site: PlanRouteSite, inner: httpx.AsyncBaseTransport,

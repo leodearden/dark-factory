@@ -119,9 +119,10 @@ from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
 from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
 from fused_memory.services.billing_exhaustion_alarm import (
+    ApiKeyCreditsParkGuard,
     BillingExhaustionAlarm,
-    BillingParkPolicy,
 )
+from fused_memory.services.billing_park_policy import BillingParkPolicy
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -154,7 +155,9 @@ from fused_memory.services.overreach_shadow import (
     open_overreach_shadow,
     shadow_job_from_write,
 )
+from fused_memory.services.plan_route import PlanRoute, PlanRouteParkGuard
 from fused_memory.services.provider_billing import (
+    BillingSource,
     billing_source_of,
     classify_billing_exhaustion,
 )
@@ -2179,6 +2182,7 @@ class MemoryService:
         self._billing_alarm = BillingExhaustionAlarm(
             resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
         )
+        self.plan_route = PlanRoute(config.plan_route)
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
@@ -2469,7 +2473,10 @@ class MemoryService:
             transient_error_names=qcfg.transient_error_names,
             on_terminal=self._record_queue_terminal_outcome,
             on_dead_letter=self._report_queue_dead_letter,
-            park_policy=BillingParkPolicy(self._billing_alarm),
+            park_policy=BillingParkPolicy({
+                BillingSource.API_KEY_CREDITS: ApiKeyCreditsParkGuard(self._billing_alarm),
+                BillingSource.PLAN_CAP: PlanRouteParkGuard(self.plan_route),
+            }),
         )
         self.durable_queue.register_callback(
             QueueCallback.DUAL_WRITE_EPISODE, self._dual_write_callback
