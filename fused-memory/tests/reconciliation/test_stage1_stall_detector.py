@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _code_writer_links import assert_writes_c5, subject_task
 
 from fused_memory.reconciliation.stage1_stall_detector import (
     _GATE_BACKLOG_ESCALATION_CATEGORY,
@@ -187,6 +188,26 @@ class TestTrackHumanOperatorStalls:
 
         # search must NOT have been awaited (deterministic count only)
         memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_each_marker_declares_its_task(self):
+        """C5: one marker per task, each linking that task and naming no status."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m1']})
+
+        await track_human_operator_stalls(
+            memory_service=memory_service, project_id='proj', run_id='run-001',
+            task_ids=['42', '57'],
+        )
+
+        writes = [call.kwargs for call in memory_service.add_memory.await_args_list]
+        assert [w['metadata']['task_id'] for w in writes] == ['42', '57']
+        for written in writes:
+            assert_writes_c5(
+                written, project_id='proj',
+                subject=subject_task('proj', written['metadata']['task_id']),
+            )
 
     @pytest.mark.asyncio
     async def test_count_failure_treats_prior_as_zero(self):
