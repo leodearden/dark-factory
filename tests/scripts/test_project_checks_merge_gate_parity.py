@@ -507,3 +507,29 @@ def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_
         f'blocker pid {units[0].pid} outlived a Ctrl-C that landed while the hook was reaping a helper mid-launch'
     )
     assert logs_removed, sorted(path.name for path in hook_tmp.iterdir())
+
+
+def test_a_unit_log_directory_that_cannot_be_made_refuses_the_commit_before_any_unit_runs(tmp_path: Path) -> None:
+    repo = make_hook_repo(tmp_path, _type_only_modules(lambda prefix: 'true'))
+    before = repo.head()
+    repo.stage('shared/src/x.py', 'x = 1\n')
+    hook_tmp = tmp_path / 'hook_tmp'
+    hook_tmp.mkdir()
+    out_path = tmp_path / 'commit.out'
+    failing_bin = tmp_path / 'failing_bin'
+    failing_bin.mkdir()
+    stub = failing_bin / 'mktemp'
+    stub.write_text("#!/bin/sh\necho 'mktemp stub: refused' >&2; exit 1\n", encoding='utf-8')
+    stub.chmod(0o755)
+
+    commit = _start_commit(repo, hook_tmp, out_path, bin_dir=failing_bin)
+    try:
+        rc = commit.wait(timeout=60)
+    finally:
+        _kill_leftovers(commit, [])
+
+    output = out_path.read_text(encoding='utf-8')
+    assert rc != 0, output
+    assert repo.head() == before
+    assert re.findall(r'^  running ', output, re.MULTILINE) == [], output
+    assert 'unit log directory' in output, output
