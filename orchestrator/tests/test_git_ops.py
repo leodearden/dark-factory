@@ -13,9 +13,10 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+from _blocked_commit_fixture import commit_blocked_in_pre_commit_hook
 from _git_fixtures import _git, seed_repo
 from _orch_helpers import (
     NonIsolatedGitRepoError,
@@ -51,6 +52,7 @@ from orchestrator.git_ops import (
     _git_stderr_is_unresolved_ref,
     _run,
 )
+from orchestrator.index_lock_liveness import GitProcessScan
 from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
 from orchestrator.quarantine_provenance import NOT_RELOCATED
 
@@ -14776,6 +14778,13 @@ class TestGitOpsHoldsNoSecondSpawnPrimitive:
 # ---------------------------------------------------------------------------
 
 
+def _process_table_with_no_git(tmp_path: Path) -> Path:
+    """A proc root in which a holder scan is complete and finds no git process."""
+    proc_root = tmp_path / 'proc-with-no-git'
+    proc_root.mkdir()
+    return proc_root
+
+
 class _MergedNotAdvanced(NamedTuple):
     """The two already-narrowed fields the stand-off tests need off a merge.
 
@@ -15297,14 +15306,17 @@ class TestAdvanceMainIndexLockStandoff:
         )
 
     async def test_side_channel_reports_a_crashed_leftover_as_old(
-        self, git_ops: GitOps,
+        self, git_ops: GitOps, tmp_path: Path,
     ):
-        """CRASHED-LEFTOVER SHAPE: a lock already ancient at the first probe.
+        """CRASHED-LEFTOVER SHAPE: a lock already ancient at the first probe,
+        and a complete holder scan that found no git process.
 
         This is the ONLY shape for which destructive `rm -f` recovery advice
         is defensible, so the side channel must make it distinguishable from
         the live-commit shape above.  grace=0 (probe-only fail-fast) keeps the
-        test from sleeping.
+        test from sleeping.  The process table is an empty one, the proof of
+        no holder: whether the host's /proc yields a CONFIRMED scan depends on
+        every other process on it (see test_index_lock_liveness.py).
         """
         merge_result = await self._make_merge(
             git_ops, 'lock-stale-age', 'lock_stale_age.py',
@@ -15312,6 +15324,7 @@ class TestAdvanceMainIndexLockStandoff:
         (git_ops.project_root / 'README.md').write_text('# dirty for stale age\n')
 
         git_ops.config.merge_park_lock_grace_seconds = 0
+        git_ops.proc_root = _process_table_with_no_git(tmp_path)
 
         lock_path = git_ops.project_root / '.git' / 'index.lock'
         lock_path.write_text('')
@@ -15335,6 +15348,115 @@ class TestAdvanceMainIndexLockStandoff:
             'grace=0 must travel through as-is — the fail-fast off-switch is '
             'still a real, comparable grace downstream; got '
             f'{info.get("grace_seconds", "<unset>")!r}'
+        )
+        assert info.get('holder_scan') == GitProcessScan((), confirmed=True), (
+            'the side channel must carry the holder scan that proves no git '
+            f'process holds the lock; got {info.get("holder_scan", "<unset>")!r}'
+        )
+
+    async def test_a_live_commit_in_its_hook_is_named_not_called_a_leftover(
+        self, git_ops: GitOps,
+    ):
+        """THE REIFY INCIDENT (task 5229), end to end through the reason.
+
+        A healthy `git commit --only` 55 minutes into its pre-commit hook
+        holds an index.lock that is 3290s old at the first probe.  Age alone
+        called that a crashed leftover and advised `rm -f`.  The real commit
+        below holds the lock exactly as it did there: no fd on it, the git
+        process alive in project_root.
+        """
+        from orchestrator.merge_lane.gates import _map_advance_failure
+
+        merge_result = await self._make_merge(
+            git_ops, 'lock-live-holder', 'lock_live_holder.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# a commit in its hook\n')
+        git_ops.config.merge_park_lock_grace_seconds = 0
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        try:
+            with commit_blocked_in_pre_commit_hook(git_ops.project_root, 'README.md') as git_pid:
+                backdated = time.time() - 3290
+                os.utime(lock_path, (backdated, backdated))
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+        scan = git_ops._last_park_lock_info.get('holder_scan')
+        assert isinstance(scan, GitProcessScan), (
+            f'the side channel must carry a holder scan; got {scan!r}'
+        )
+        assert git_pid in {process.pid for process in scan.processes}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t5229',
+            merge_commit_fallback=merge_result.merge_commit,
+            halt=MagicMock(),
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+        assert f'pid {git_pid}' in outcome.reason
+        assert '--only README.md' in outcome.reason
+        assert 'rm -f' not in outcome.reason, (
+            f'a lock a live commit holds must never be offered removal; got {outcome.reason!r}'
+        )
+
+    async def test_an_old_lock_with_a_live_holder_is_still_waited_on(
+        self, git_ops: GitOps, caplog,
+    ):
+        """Age past the floor no longer skips the stand-off when a live git
+        holds the lock: the reify commit finished minutes after the deferral.
+
+        `waited > 0.0` is load-independent: the short-circuit returns exactly
+        0.0, and the poll loop runs to its own monotonic deadline.
+        """
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        (git_ops.project_root / 'README.md').write_text('# live holder of an old lock\n')
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            commit_blocked_in_pre_commit_hook(git_ops.project_root, 'README.md') as git_pid,
+        ):
+            backdated = time.time() - (_INDEX_LOCK_STALE_FLOOR_S + 1000)
+            os.utime(lock_path, (backdated, backdated))
+            cleared, waited, initial_age = await git_ops._await_index_lock_clear(
+                timeout_s=1.0, context='live-holder-old-lock',
+            )
+
+        assert cleared is False
+        assert initial_age > _INDEX_LOCK_STALE_FLOOR_S
+        assert waited > 0.0, (
+            f'a lock a live git process holds must be waited on; got waited={waited!r}'
+        )
+        assert any(f'pid {git_pid}' in record.getMessage() for record in caplog.records), (
+            'the stand-off warning must name the live holder; got '
+            f'{[record.getMessage() for record in caplog.records]!r}'
+        )
+
+    async def test_an_old_lock_with_an_unconfirmed_scan_is_still_waited_on(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Unknown is never "none": a scan that could not enumerate the
+        process table cannot prove the holder dead, so the wait still runs."""
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        git_ops.proc_root = tmp_path / 'no-proc-mounted'
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        backdated = time.time() - (_INDEX_LOCK_STALE_FLOOR_S + 1000)
+        os.utime(lock_path, (backdated, backdated))
+        try:
+            cleared, waited, _initial = await git_ops._await_index_lock_clear(
+                timeout_s=1.0, context='unconfirmed-scan-old-lock',
+            )
+        finally:
+            lock_path.unlink()
+
+        assert cleared is False
+        assert waited > 0.0, (
+            f'an unconfirmed scan must not skip the stand-off; got waited={waited!r}'
         )
 
     async def test_post_advance_sync_failure_under_a_lock_is_retried(
@@ -15430,21 +15552,25 @@ class TestAdvanceMainIndexLockStandoff:
             'the NEXT advance reads the delta as dirty WIP'
         )
 
-    async def test_already_stale_lock_skips_the_standoff(self, git_ops: GitOps):
+    async def test_already_stale_lock_skips_the_standoff(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
         """A crashed-git leftover must not cost the queue the whole grace.
 
-        `_map_advance_failure` declares staleness on the PRE-wait age against
-        `max(grace, _INDEX_LOCK_STALE_FLOOR_S)`.  Once that bar is cleared no
-        amount of waiting can change the verdict, so waiting only burns the
-        full grace in the SERIALIZED merge worker for EVERY queued task until
-        an operator clears the file — a slow-motion version of the stall this
-        gate exists to remove.
+        A crashed leftover is a PRE-wait age past
+        `max(grace, _INDEX_LOCK_STALE_FLOOR_S)` AND a complete holder scan
+        that found no git process (here, an empty process table).  Waiting
+        cannot change that verdict, so waiting only burns the full grace in
+        the SERIALIZED merge worker for EVERY queued task until an operator
+        clears the file — a slow-motion version of the stall this gate exists
+        to remove.
 
         Asserted by PROBE COUNT, not elapsed time: a short-circuit takes the
         single pre-wait probe and nothing more.
         """
         from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
 
+        git_ops.proc_root = _process_table_with_no_git(tmp_path)
         lock_path = git_ops.project_root / '.git' / 'index.lock'
         lock_path.write_text('')
         backdated = time.time() - (_INDEX_LOCK_STALE_FLOOR_S + 1000)
