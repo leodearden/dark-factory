@@ -39,15 +39,18 @@ _SINCE = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
 _RESETS = _SINCE + timedelta(days=3)
 _NEXT = _SINCE + timedelta(minutes=15)
 _RECOVERED = _SINCE + timedelta(hours=2)
+_RECAPPED = _SINCE + timedelta(hours=5)
 _PROXY_BODY = '{"error": {"type": "usage_limit_reached", "message": "weekly limit reached"}}'
 _ALARM_LOGGER = 'fused_memory.services.plan_cap_alarm'
 
 
-def _snapshot(*, resets_at: datetime | None = _RESETS, judge_calls: int = 3) -> PlanRouteSnapshot:
+def _snapshot(
+    *, capped_since: datetime = _SINCE, resets_at: datetime | None = _RESETS, judge_calls: int = 3,
+) -> PlanRouteSnapshot:
     return PlanRouteSnapshot(
         state=PlanRouteStateName.CAPPED,
         proxy_host='127.0.0.1:8317',
-        capped_since=_SINCE,
+        capped_since=capped_since,
         resets_at=resets_at,
         next_probe_at=_NEXT,
         affected_calls_by_site=MappingProxyType({
@@ -61,7 +64,7 @@ def _recovered_snapshot() -> PlanRouteSnapshot:
     return PlanRouteSnapshot(state=PlanRouteStateName.OK, proxy_host='127.0.0.1:8317')
 
 
-class _Parked:
+class _ParkedOrInFlight:
     def __init__(self, count: int = 4) -> None:
         self.count = count
 
@@ -70,10 +73,12 @@ class _Parked:
 
 
 def _alarm(
-    root: Callable[[], str | None], parked: _Parked | None = None,
+    root: Callable[[], str | None], writes: _ParkedOrInFlight | None = None,
 ) -> PlanCapAlarm:
     return PlanCapAlarm(
-        resolve_project_root=root, count_parked=parked or _Parked(), clock=lambda: _RECOVERED,
+        resolve_project_root=root,
+        count_parked_or_in_flight=writes or _ParkedOrInFlight(),
+        clock=lambda: _RECOVERED,
     )
 
 
@@ -108,7 +113,7 @@ class TestTheFirstCap:
             f'resets_at={_RESETS.isoformat()}',
             f'next_probe_at={_NEXT.isoformat()}',
             'sites_affected=graphiti:1,write_triage_judge:3',
-            'parked_items=4',
+            'parked_or_in_flight_writes=4',
             'judge_fail_opens=3',
         ):
             assert line in detail, (line, detail)
@@ -129,31 +134,56 @@ class TestTheFirstCap:
         assert 'resets_at=unknown' in record['detail'].splitlines()
 
     @pytest.mark.asyncio
-    async def test_a_restarted_alarm_adopts_the_open_record(self, tmp_path: Path) -> None:
+    async def test_a_restarted_alarm_adopts_and_refreshes_the_open_record(
+        self, tmp_path: Path,
+    ) -> None:
         first = _alarm(lambda: str(tmp_path))
         await first.on_capped(_snapshot())
 
         restarted = _alarm(lambda: str(tmp_path))
-        await restarted.on_capped(_snapshot())
+        await restarted.on_capped(_snapshot(capped_since=_RECAPPED))
 
         [record] = _records(tmp_path)
         assert restarted.escalation_id() == record['id'] == first.escalation_id()
+        assert record['dedupe_count'] == 1
+        assert f'capped_since={_RECAPPED.isoformat()}' in record['detail'].splitlines()
+        assert _RECAPPED.isoformat() in record['summary']
+
+
+class TestASecondCapWhileTheRecordIsOpen:
+    @pytest.mark.asyncio
+    async def test_refreshes_the_open_record_with_the_new_episode(self, tmp_path: Path) -> None:
+        writes = _ParkedOrInFlight(1)
+        alarm = _alarm(lambda: str(tmp_path), writes)
+        await alarm.on_capped(_snapshot())
+        await alarm.on_recovered(_recovered_snapshot())
+        writes.count = 2
+
+        await alarm.on_capped(_snapshot(capped_since=_RECAPPED))
+
+        [record] = _records(tmp_path)
+        assert record['id'] == alarm.escalation_id()
+        assert record['dedupe_count'] == 1
+        detail = record['detail'].splitlines()
+        assert f'capped_since={_RECAPPED.isoformat()}' in detail
+        assert 'parked_or_in_flight_writes=2' in detail
+        assert _RECAPPED.isoformat() in record['summary']
 
 
 class TestAReconfirmedCap:
     @pytest.mark.asyncio
     async def test_refreshes_the_one_record_in_place(self, tmp_path: Path) -> None:
-        parked = _Parked(4)
-        alarm = _alarm(lambda: str(tmp_path), parked)
+        writes = _ParkedOrInFlight(4)
+        alarm = _alarm(lambda: str(tmp_path), writes)
         await alarm.on_capped(_snapshot())
-        parked.count = 9
+        writes.count = 9
 
         await alarm.on_cap_confirmed(_snapshot(judge_calls=7))
 
         [record] = _records(tmp_path)
         assert record['id'] == alarm.escalation_id()
         assert record['dedupe_count'] == 1
-        assert 'parked_items=9' in record['detail'].splitlines()
+        assert 'parked_or_in_flight_writes=9' in record['detail'].splitlines()
         assert 'judge_fail_opens=7' in record['detail'].splitlines()
 
     @pytest.mark.asyncio

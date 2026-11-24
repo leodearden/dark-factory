@@ -1000,7 +1000,7 @@ def _billing_exhaustion(module: Any, project_root: str) -> object:
     return asyncio.run(alarm.record_exhausted(exhaustion, site='durable_queue:add_episode'))
 
 
-async def _no_parked_writes() -> int:
+async def _no_parked_or_in_flight_writes() -> int:
     return 0
 
 
@@ -1012,7 +1012,8 @@ def _plan_cap(module: Any, project_root: str) -> object:
         exhaustion=plan_cap_of(b'{"error": {"code": "usage_limit_reached"}}'),
     )
     alarm = module.PlanCapAlarm(
-        resolve_project_root=lambda: project_root, count_parked=_no_parked_writes,
+        resolve_project_root=lambda: project_root,
+        count_parked_or_in_flight=_no_parked_or_in_flight_writes,
     )
     return asyncio.run(alarm.on_capped(snapshot))
 

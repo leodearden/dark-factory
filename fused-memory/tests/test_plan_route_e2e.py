@@ -312,6 +312,11 @@ def _epoch(iso: str) -> float:
     return datetime.fromisoformat(iso).timestamp()
 
 
+#: The page's count of the one write: in flight while a gated call trips the
+#: cap, parked by the time an ungated cap reaches the park policy.
+_ONE_WRITE_WAITING = 'parked_or_in_flight_writes=1'
+
+
 @pytest.mark.skipif(
     not _folded_escalation.HAS_ESCALATION, reason='escalation package unavailable (minimal env)',
 )
@@ -349,12 +354,14 @@ class TestACappedPlanThroughMemoryService:
             assert page['level'] == 2
             assert page['severity'] == 'blocking'
             assert capped['escalation_id'] == page['id']
+            assert _ONE_WRITE_WAITING in page['detail'].splitlines()
 
             clock.advance(_interval(svc))
             [confirmed] = await poll_until(
                 lambda: _refreshed(root, page), message='a re-probe did not refresh the page',
             )
             assert confirmed['id'] == page['id']
+            assert _ONE_WRITE_WAITING in confirmed['detail'].splitlines()
             await poll_until(lambda: _parked_again(svc), message='the failed probe did not re-park')
             assert _parked_row(tmp_path)['next_retry_at'] == clock() + _interval(svc)
             assert _proxy_chats(endpoints) == 2
@@ -387,7 +394,11 @@ class TestACappedPlanThroughMemoryService:
                 lambda: _capped_records(root) or None, message='no plan_route_capped page was filed',
             )
             assert page['level'] == 2
-            assert _parked_row(tmp_path)['next_retry_at'] == _CLOCK_START + _interval(svc)
+            parked = _parked_row(tmp_path)
+            assert parked['next_retry_at'] == _CLOCK_START + _interval(svc)
+            detail = page['detail'].splitlines()
+            assert _ONE_WRITE_WAITING in detail
+            assert f"sites_affected=durable_queue:{parked['operation']}:1" in detail
             assert (await svc.get_status())['plan_route']['state'] == 'capped'
 
             clock.advance(_interval(svc))

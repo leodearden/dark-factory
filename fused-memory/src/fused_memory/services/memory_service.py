@@ -2193,7 +2193,7 @@ class MemoryService:
 
         self._plan_cap_alarm = PlanCapAlarm(
             resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
-            count_parked=self._count_parked_writes,
+            count_parked_or_in_flight=self._count_parked_or_in_flight_writes,
             clock=queue_moment,
         )
         self.plan_route = PlanRoute(
@@ -2458,6 +2458,12 @@ class MemoryService:
         if self.durable_queue is None:
             return 0
         return (await self.durable_queue.get_stats())['counts'].get('parked', 0)
+
+    async def _count_parked_or_in_flight_writes(self) -> int:
+        if self.durable_queue is None:
+            return 0
+        counts = (await self.durable_queue.get_stats())['counts']
+        return counts.get('parked', 0) + counts.get('in_flight', 0)
 
     async def _global_parked_count(self, queue_stats: object, project_id: str | None) -> int:
         """The global parked count, read from *queue_stats* when they are unscoped."""

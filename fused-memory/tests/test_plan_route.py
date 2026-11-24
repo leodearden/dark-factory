@@ -390,12 +390,14 @@ class TestACapAnUngatedPathReports:
         state = harness.route.state()
         assert state.state is PlanRouteStateName.CAPPED
         assert state.next_probe_at == _START + timedelta(seconds=_INTERVAL)
+        assert state.affected_calls_by_site == {_PARKED_SITE: 1}
         assert len(harness.listener.named('capped')) == 1
         assert guard.park_until() == _epoch_after(_START, _INTERVAL)
 
         await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
 
         assert len(harness.listener.calls) == 1
+        assert harness.route.state().affected_calls_by_site == {_PARKED_SITE: 2}
         assert guard.park_until() == _epoch_after(_START, _INTERVAL)
 
     @pytest.mark.asyncio

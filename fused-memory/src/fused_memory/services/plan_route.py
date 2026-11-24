@@ -52,7 +52,7 @@ class PlanRouteStateName(StrEnum):
     UNCONFIGURED = 'unconfigured'
 
 
-def _no_affected_calls() -> Mapping[PlanRouteSite, int]:
+def _no_affected_calls() -> Mapping[str, int]:
     return MappingProxyType({})
 
 
@@ -61,7 +61,8 @@ class PlanRouteSnapshot:
     """The route's latch at one moment.
 
     ``affected_calls_by_site`` counts the calls each site lost to the cap since
-    it latched.
+    it latched: a gated call under its :class:`PlanRouteSite`, and a cap an
+    ungated path reported under the site that reported it.
     """
 
     state: PlanRouteStateName
@@ -69,7 +70,7 @@ class PlanRouteSnapshot:
     capped_since: datetime | None = None
     resets_at: datetime | None = None
     next_probe_at: datetime | None = None
-    affected_calls_by_site: Mapping[PlanRouteSite, int] = field(default_factory=_no_affected_calls)
+    affected_calls_by_site: Mapping[str, int] = field(default_factory=_no_affected_calls)
     exhaustion: BillingExhaustion | None = None
 
     @property
@@ -133,7 +134,7 @@ class PlanRoute:
         self._next_probe_at: datetime | None = None
         self._exhaustion: BillingExhaustion | None = None
         self._gate_has_seen_cap = False
-        self._affected: dict[PlanRouteSite, int] = {}
+        self._affected: dict[str, int] = {}
 
     def http_client_for(self, base_url: str, *, site: PlanRouteSite) -> httpx.AsyncClient | None:
         """A gated client for *base_url*, or None when it is not the plan proxy."""
@@ -178,9 +179,11 @@ class PlanRoute:
         now = self._clock()
         if self._capped_since is None:
             self._latch(exhaustion, resets_at=None, now=now, site=site)
+            self._count(site)
             snapshot = self.state()
             await self._notify(lambda listener: listener.on_capped(snapshot))
             return
+        self._count(site)
         if self._next_probe_at is not None and now < self._next_probe_at:
             return
         await self._confirm(exhaustion, resets_at=None, now=now)
@@ -284,7 +287,7 @@ class PlanRoute:
             return self._resets_at
         return ceiling
 
-    def _count(self, site: PlanRouteSite) -> None:
+    def _count(self, site: str) -> None:
         self._affected[site] = self._affected.get(site, 0) + 1
 
     def _cap_response(self, request: httpx.Request) -> httpx.Response:
