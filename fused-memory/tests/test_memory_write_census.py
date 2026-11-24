@@ -70,8 +70,8 @@ CENSUS: dict[CensusKey, CensusRow] = {
         ),
     ),
     ('reconciliation/stage1_stall_detector.py', 'track_human_operator_stalls', 'add_memory'): CensusRow(
-        1, Disposition.CODE_WRITER, 'one stall marker per task, declaring that task',
-        tests=('reconciliation/test_stage1_stall_detector.py::TestTrackHumanOperatorStalls::test_each_marker_declares_its_task',),
+        1, Disposition.CODE_WRITER, "one stall marker per flagged task; a flag-cited id may be composite or name another project's task, so it declares no link",
+        tests=('reconciliation/test_stage1_stall_detector.py::TestTrackHumanOperatorStalls::test_a_marker_declares_no_task_link',),
     ),
     ('reconciliation/flag_dedup.py', 'write_suppression_record', 'add_memory'): CensusRow(
         1, Disposition.CODE_WRITER, "the suppression mirror has no subject task: its ids may name other projects' tasks, so it declares no link",
