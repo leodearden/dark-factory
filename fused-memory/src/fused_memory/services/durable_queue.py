@@ -280,7 +280,10 @@ _CLAIMABLE_SQL = 'status IN ({})'.format(', '.join(f"'{s}'" for s in CLAIMABLE_S
 
 
 class DurableWriteQueue:
-    """SQLite WAL-backed write queue with per-group workers and global semaphore."""
+    """SQLite WAL-backed write queue with per-group workers and global semaphore.
+
+    Every time the queue stamps on a row or compares against one is read from *clock*.
+    """
 
     def __init__(
         self,
@@ -298,8 +301,10 @@ class DurableWriteQueue:
         on_terminal: TerminalHookFn | None = None,
         on_dead_letter: DeadLetterHookFn | None = None,
         park_policy: ParkPolicy | None = None,
+        clock: Callable[[], float] = time.time,
     ):
         self._data_dir = Path(data_dir)
+        self._clock = clock
         self._execute_write = execute_write
         self._on_terminal = on_terminal
         self._on_dead_letter = on_dead_letter
@@ -406,7 +411,7 @@ class DurableWriteQueue:
         if callback is not None:
             check_callback_pairing(value, callback)
         group_id = value.envelope.group_id
-        now = time.time()
+        now = self._clock()
         async with self._require_access().write() as db:
             cursor = await db.execute(
                 # `executed` = 0 is a RECORDED negative, distinct from a legacy
@@ -431,7 +436,7 @@ class DurableWriteQueue:
         for value, callback in values:
             if callback is not None:
                 check_callback_pairing(value, callback)
-        now = time.time()
+        now = self._clock()
         ids: list[int] = []
         groups_seen: set[str] = set()
         async with self._require_access().write() as db:
@@ -499,7 +504,7 @@ class DurableWriteQueue:
         """
         lock = self._group_locks[group_id]
         async with lock:
-            now = time.time()
+            now = self._clock()
             async with self._require_access().write() as db:
                 rows = list(await db.execute_fetchall(
                     "SELECT * FROM write_queue "
@@ -804,7 +809,7 @@ class DurableWriteQueue:
             await db.execute(
                 "UPDATE write_queue SET status = 'completed', completed_at = ?, "
                 "attempts = attempts + 1 WHERE id = ?",
-                (time.time(), item.id),
+                (self._clock(), item.id),
             )
 
     def _is_transient(self, exc: BaseException) -> bool:
@@ -851,7 +856,7 @@ class DurableWriteQueue:
         than now, is that horizon when set."""
         reason = decision.reason
         error_msg = f'parked ({reason}): {type(exc).__name__}: {exc}'
-        now = time.time()
+        now = self._clock()
         if decision.retry_at is not None:
             horizon = max(decision.retry_at, now)
             horizon_source = "the park policy's probe time"
@@ -918,7 +923,7 @@ class DurableWriteQueue:
                     + random.uniform(0, self._retry_base_seconds),
                     self._retry_max_delay_seconds,
                 )
-                next_retry = time.time() + delay
+                next_retry = self._clock() + delay
                 await db.execute(
                     "UPDATE write_queue SET status = 'retry', attempts = ?, "
                     "next_retry_at = ?, error = ?, "
@@ -1048,7 +1053,7 @@ class DurableWriteQueue:
         if row:
             min_created = row[0] if isinstance(row, tuple) else row[0]
             if min_created is not None:
-                oldest_pending_age = time.time() - min_created
+                oldest_pending_age = self._clock() - min_created
 
         # No new index: idx_wq_status_group is on (status, group_id,
         # next_retry_at), so both spellings below seek the status='dead'
