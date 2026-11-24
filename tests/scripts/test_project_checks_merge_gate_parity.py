@@ -17,6 +17,7 @@ import dataclasses
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -288,12 +289,17 @@ def _eventually(condition: Callable[[], bool], timeout_secs: float) -> bool:
     return True
 
 
-def _start_commit(repo: HookRepo, hook_tmp: Path, out_path: Path) -> subprocess.Popen[bytes]:
+def _start_commit(
+    repo: HookRepo, hook_tmp: Path, out_path: Path, *, bin_dir: Path | None = None,
+) -> subprocess.Popen[bytes]:
+    env = {**repo.env, 'TMPDIR': str(hook_tmp)}
+    if bin_dir is not None:
+        env['PATH'] = f'{bin_dir}{os.pathsep}{repo.env["PATH"]}'
     with out_path.open('w', encoding='utf-8') as out:
         return subprocess.Popen(
             ['git', 'commit', '-m', 't'],
             cwd=repo.root,
-            env={**repo.env, 'TMPDIR': str(hook_tmp)},
+            env=env,
             stdout=out,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -349,6 +355,18 @@ def _terminate_the_hook(git_pid: int) -> None:
 
 def _hang_up(git_pid: int) -> None:
     os.killpg(git_pid, signal.SIGHUP)
+
+
+HELD_MKTEMP = """#!/bin/sh
+trap '' INT
+made=$({real} "$@") || exit
+echo "$made"
+grep -q '^  running ' {out} || exit 0
+exec >&-
+: > {held}
+until [ -e {release} ]; do sleep 0.05; done
+exit 0
+"""
 
 
 @pytest.mark.parametrize(
@@ -434,3 +452,58 @@ def test_an_interrupted_commit_stops_what_an_uncollected_unit_left_when_its_shel
         'module:escalation:type', 'module:m1:type', 'module:shared:type',
     ], 'the orphan must come from a unit launched after the blocker and before the last unit'
     assert stopped, f'pid {pid}, left running by a unit whose shell had exited, outlived the interrupted commit'
+
+
+def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_launched_unit(tmp_path: Path) -> None:
+    blocker_pid_file = tmp_path / 'blocker.pid'
+    last_unit_file = tmp_path / 'last_unit.pid'
+    commands = {
+        'escalation': f'sh -c {shlex.quote(f"echo $$ > {blocker_pid_file}; exec sleep 300")}',
+        'shared': f'echo $$ > {shlex.quote(str(last_unit_file))}',
+    }
+    repo = make_hook_repo(tmp_path, _type_only_modules(commands.__getitem__))
+    before = repo.head()
+    repo.stage('shared/src/x.py', 'x = 1\n')
+    hook_tmp = tmp_path / 'hook_tmp'
+    hook_tmp.mkdir()
+    out_path = tmp_path / 'commit.out'
+    held = tmp_path / 'mktemp.held'
+    release = tmp_path / 'mktemp.release'
+    real_mktemp = shutil.which('mktemp')
+    assert real_mktemp is not None
+    held_bin = tmp_path / 'held_bin'
+    held_bin.mkdir()
+    stub = held_bin / 'mktemp'
+    stub.write_text(
+        HELD_MKTEMP.format(**{
+            name: shlex.quote(str(path))
+            for name, path in (('real', real_mktemp), ('out', out_path), ('held', held), ('release', release))
+        }),
+        encoding='utf-8',
+    )
+    stub.chmod(0o755)
+
+    commit = _start_commit(repo, hook_tmp, out_path, bin_dir=held_bin)
+    units: list[_Unit] = []
+    try:
+        units.append(_started_unit(blocker_pid_file, out_path))
+        hook = _hook_pid(commit.pid)
+        assert _eventually(
+            lambda: (held.exists() or (last_unit_file.is_file() and last_unit_file.read_text().strip() != ''))
+            and Path(f'/proc/{hook}/wchan').read_text() == 'do_wait',
+            120,
+        ), out_path.read_text(encoding='utf-8')
+        _ctrl_c(commit.pid)
+        release.touch()
+        commit.wait(timeout=60)
+        stopped = _eventually(lambda: not _pid_alive(units[0].pid), 30)
+        logs_removed = _eventually(lambda: not any(hook_tmp.iterdir()), 30)
+    finally:
+        release.touch()
+        _kill_leftovers(commit, units)
+
+    assert repo.head() == before
+    assert stopped, (
+        f'blocker pid {units[0].pid} outlived a Ctrl-C that landed while the hook was reaping a helper mid-launch'
+    )
+    assert logs_removed, sorted(path.name for path in hook_tmp.iterdir())
