@@ -249,8 +249,9 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
 
 _REQUEST_READS_WAIT = 0.5
 """Short, yet long enough for the run-ledger walk the same wait bounds."""
-_COLD_WALK_DELAY = 1.0
-"""Well past :data:`_REQUEST_READS_WAIT`: timers fire in deadline order, so the wait expires first."""
+_COLD_POOL_WARM_UP = 2.0
+"""Past twice :data:`_REQUEST_READS_WAIT`, so a render issued as soon as the first one's wait expired
+still waits out its own before the pool is warm."""
 
 
 def _unreadable_walk(queues):
@@ -474,16 +475,19 @@ def test_an_unreachable_scheduler_degrades_only_the_contention_line(bodies):
 def test_a_cold_run_ledger_walk_past_its_wait_never_shapes_a_lanes_family_body(
     client, tmp_path, monkeypatch,
 ):
+    """Every walk waits for one shared warm-up the first walk starts, so a render issued before
+    that walk is joined still finds the pool cold."""
     monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
     walk = prds._project_scoped_dbs_labeled
-    cold_delays = [_COLD_WALK_DELAY]
+    warm_up: list[asyncio.Future[None]] = []
 
-    async def _cold_first_walk(config, pool, relative):
-        if cold_delays:
-            await asyncio.sleep(cold_delays.pop())
+    async def _walk_once_the_pool_is_warm(config, pool, relative):
+        if not warm_up:
+            warm_up.append(asyncio.ensure_future(asyncio.sleep(_COLD_POOL_WARM_UP)))
+        await asyncio.shield(warm_up[0])
         return await walk(config, pool, relative)
 
-    monkeypatch.setattr(prds, '_project_scoped_dbs_labeled', _cold_first_walk)
+    monkeypatch.setattr(prds, '_project_scoped_dbs_labeled', _walk_once_the_pool_is_warm)
     family = prd_lanes_family(client, tmp_path)
 
     view = family['prd_lanes']['PRD_VIEW'][LANES_ROOT]
