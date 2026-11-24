@@ -59,7 +59,7 @@ from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
-from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off, most_conservative
 
 logger = logging.getLogger(__name__)
 
@@ -1489,13 +1489,17 @@ class VerifyCacheConfig(BaseModel):
     (plans/verify-result-cache-prd.md § Amendments, A3: per-role modes).
 
     Each role's mode is its own green-tier reload leaf. The kill switch is not
-    here: it lives in the registry's policy_state.
+    here: it lives in the registry's policy_state. Remote replay has its own
+    per-role mode, never less conservative than the role's (A5.2).
     """
 
     model_config = ConfigDict(extra='forbid')
 
     task_mode: CacheMode = CacheMode.OFF
     merge_mode: CacheMode = CacheMode.OFF
+    remote_task_mode: CacheMode = CacheMode.OFF
+    remote_merge_mode: CacheMode = CacheMode.OFF
+    remote_candidates_per_unit: int = Field(16, ge=1)
 
     def mode_for(self, role: VerifyRole) -> CacheMode:
         """*role*'s mode; the cache has no background role, so that is always OFF.
@@ -1507,6 +1511,20 @@ class VerifyCacheConfig(BaseModel):
         if role == 'merge':
             return self.merge_mode
         return CacheMode.OFF
+
+    def remote_mode_for(self, role: VerifyRole) -> CacheMode:
+        """The mode a remote verify of *role* may act under: the role's own mode, capped by its remote mode."""
+        if role == 'task':
+            return most_conservative(self.mode_for(role), self.remote_task_mode)
+        if role == 'merge':
+            return most_conservative(self.mode_for(role), self.remote_merge_mode)
+        return CacheMode.OFF
+
+    def with_mode(self, role: VerifyRole, mode: CacheMode) -> 'VerifyCacheConfig':
+        """A copy whose *role* acts under *mode*, as a runner pins the mode its dispatcher shipped."""
+        if role not in ('task', 'merge'):
+            raise ValueError(f'the verify cache has no {role!r} mode to pin')
+        return self.model_copy(update={f'{role}_mode': mode})
 
 
 class DepthRow(NamedTuple):
