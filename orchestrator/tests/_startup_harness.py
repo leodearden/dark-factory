@@ -18,6 +18,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig
 from orchestrator.harness import Harness
+from orchestrator.scheduler import Scheduler
 
 #: The stubbed table steps in run() order, as (step name, Harness attribute).
 STUBBED_STEPS: tuple[tuple[str, str], ...] = (
@@ -97,7 +98,7 @@ def merge_lane_harness_factory(
 
 
 async def harness_with_real_merge_worker(
-    make: Callable[[], Harness], scheduler: MagicMock,
+    make: Callable[[], Harness], scheduler: Scheduler,
 ) -> Harness:
     """A Harness over the factory's shared escalation dir, holding a real merge worker."""
     h = make()

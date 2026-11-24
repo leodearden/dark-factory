@@ -18,11 +18,17 @@ from typing import NamedTuple
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _landed_rows import record_landing
 from _orch_helpers import HermeticMcpSession
 from _park_test_helpers import make_task
-from _startup_harness import journal_merge_request, merge_lane_harness_factory
+from _startup_harness import (
+    harness_with_real_merge_worker,
+    journal_merge_request,
+    merge_lane_harness_factory,
+)
+from escalation.queue import EscalationQueue
 
-from orchestrator.config import PsiAdmissionConfig
+from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.module_charter import derive_modules
@@ -40,16 +46,32 @@ class _Scene(NamedTuple):
     store: EventStore
 
 
-def _scene(tmp_path: Path, *, status: str = 'in-progress') -> _Scene:
-    """Step 1c0a's harness over a real Scheduler; every task reads as *status*."""
-    h = merge_lane_harness_factory(tmp_path)()
-    h.config.psi_admission = PsiAdmissionConfig(enabled=False)
-    store = EventStore(tmp_path / 'runs.db', 'run-test')
-    scheduler = Scheduler(h.config, event_store=store, mcp_session=HermeticMcpSession())
+def _scheduler(config: OrchestratorConfig, store: EventStore, *, status: str) -> Scheduler:
+    """A real Scheduler with a real lock table; every task reads as *status*."""
+    config.psi_admission = PsiAdmissionConfig(enabled=False)
+    scheduler = Scheduler(config, event_store=store, mcp_session=HermeticMcpSession())
     scheduler.get_statuses = AsyncMock(
         side_effect=lambda ids=None: ({tid: status for tid in ids or []}, None),
     )
+    return scheduler
+
+
+def _scene(tmp_path: Path, *, status: str = 'in-progress') -> _Scene:
+    """Step 1c0a's harness over a real Scheduler."""
+    h = merge_lane_harness_factory(tmp_path)()
+    store = EventStore(tmp_path / 'runs.db', 'run-test')
+    scheduler = _scheduler(h.config, store, status=status)
     h.scheduler = scheduler
+    h.event_store = store
+    return _Scene(h, scheduler, store)
+
+
+async def _scene_with_real_merge_worker(tmp_path: Path) -> _Scene:
+    """Step 1c0a's harness over a real Scheduler, holding a real merge worker."""
+    make = merge_lane_harness_factory(tmp_path)
+    store = EventStore(tmp_path / 'runs.db', 'run-test')
+    scheduler = _scheduler(make().config, store, status='in-progress')
+    h = await harness_with_real_merge_worker(make, scheduler)
     h.event_store = store
     return _Scene(h, scheduler, store)
 
@@ -136,9 +158,12 @@ async def _drain(h: Harness) -> None:
     await asyncio.gather(*h._background_tasks)
 
 
-def _stub_routing_writes(scheduler: Scheduler) -> None:
+def _stub_routing_writes(scheduler: Scheduler) -> AsyncMock:
+    """Stub the reads and the block write settling needs; the block write's mock."""
     scheduler.get_status = AsyncMock(return_value='in-progress')
-    scheduler.clear_claim_then_set_status = AsyncMock()
+    block_write = AsyncMock()
+    scheduler.clear_claim_then_set_status = block_write
+    return block_write
 
 
 _VERIFY_RED = SimpleNamespace(
@@ -212,3 +237,108 @@ class TestRestoreToleratesWhatItCannotTake:
 
         assert [r.task_id for r in report['requests']] == [_TID]
         assert _held(scheduler) == {}
+
+
+# Spelled out: importing the lane's constant would make this file lane-importing.
+_WORKER_SHUTDOWN = SimpleNamespace(
+    status='blocked', reason='Merge worker shutting down',
+    block_category=SimpleNamespace(value='merge_error'),
+    failure_category=None, failure_cause_hint=None,
+)
+
+
+def _recording_hold(scheduler: Scheduler, seen: list) -> AsyncMock:
+    """An AsyncMock that records the task's hold at the moment it is awaited."""
+    return AsyncMock(side_effect=lambda *_a, **_k: seen.append(_held(scheduler).get(_TID)))
+
+
+@pytest.mark.asyncio
+class TestRestoredHoldEndsWithItsRequest:
+    async def test_a_landed_request_releases_its_files_after_the_task_is_marked_done(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, store = await _scene_with_real_merge_worker(tmp_path)
+        assert h._merge_worker is not None
+        outbox = h._merge_worker._landed_outbox
+        assert outbox is not None
+        main_sha = await h.git_ops.get_main_sha()
+        record_landing(outbox, _TID, advanced_sha=main_sha)
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+        scheduler.get_task = AsyncMock(return_value={'metadata': {}})
+        held_at_done: list = []
+        scheduler.mark_done = _recording_hold(scheduler, held_at_done)
+        request = _fake_request()
+        await _recover(h, request)
+        keys = _keys(h, _FILES)
+
+        request.result.set_result(SimpleNamespace(status='done', merge_sha=main_sha, reason=''))
+        await _drain(h)
+
+        scheduler.mark_done.assert_awaited_once_with(_TID, kind='merged', sha=main_sha)
+        assert held_at_done == [keys]
+        assert _TID not in _held(scheduler)
+        [released] = _event_data(store, 'lock_released', _TID)
+        assert tuple(sorted(released['modules'])) == keys
+
+    async def test_a_failed_request_releases_its_files_after_blocking_the_task(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, _store = _scene(tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+        held_at_block: list = []
+        scheduler.clear_claim_then_set_status = _recording_hold(scheduler, held_at_block)
+        request = _fake_request()
+        await _recover(h, request)
+
+        request.result.set_exception(RuntimeError('verify host lost'))
+        await _drain(h)
+
+        scheduler.clear_claim_then_set_status.assert_awaited_once_with(_TID, 'blocked')
+        assert held_at_block == [_keys(h, _FILES)]
+        assert _TID not in _held(scheduler)
+        [esc] = h._escalation_queue.get_by_task(_TID, status='pending', level=1)
+        assert esc.category == 'merge_error'
+
+    async def test_an_operator_cancel_releases_the_files(self, tmp_path: Path) -> None:
+        h, scheduler, _store = _scene(tmp_path)
+        block_write = _stub_routing_writes(scheduler)
+        request = _fake_request()
+        await _recover(h, request)
+
+        request.result.cancel()
+        await _drain(h)
+
+        assert _TID not in _held(scheduler)
+        block_write.assert_not_awaited()
+
+    async def test_a_worker_shutdown_outcome_keeps_the_hold(self, tmp_path: Path) -> None:
+        h, scheduler, store = _scene(tmp_path)
+        _stub_routing_writes(scheduler)
+        request = _fake_request()
+        await _recover(h, request)
+
+        request.result.set_result(_WORKER_SHUTDOWN)
+        await _drain(h)
+
+        assert _held(scheduler)[_TID] == _keys(h, _FILES)
+        assert _event_data(store, 'lock_released', _TID) == []
+
+    async def test_a_task_dispatched_since_the_restore_keeps_its_workflows_locks(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, _store = _scene(tmp_path)
+        block_write = _stub_routing_writes(scheduler)
+        request = _fake_request()
+        await _recover(h, request)
+        scheduler.get_tasks = AsyncMock(return_value=[make_task(_TID, 'high', _FILES)])
+        scheduler.finish_startup()
+
+        assignment = await scheduler.acquire_next()
+
+        assert assignment is not None
+        assert assignment.task_id == _TID
+        request.result.set_exception(RuntimeError('verify host lost'))
+        await _drain(h)
+        block_write.assert_not_awaited()
+        assert _TID in _held(scheduler)
