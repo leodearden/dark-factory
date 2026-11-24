@@ -65,6 +65,7 @@ import argparse
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -333,6 +334,18 @@ def tracked_paths(
     return paths, gitlinks
 
 
+Corpus = tuple[list[str], list[str]]
+"""One read of a tracked corpus, as `tracked_paths` returns it."""
+
+
+def _read_corpus(reify_repo: Path, timeout: float) -> Corpus | GuardUnavailable:
+    """`tracked_paths`, with "could not look" returned for the sweeps to report rather than raised."""
+    try:
+        return tracked_paths(Path(reify_repo), timeout=timeout)
+    except GuardUnavailable as exc:
+        return exc
+
+
 def check_corpus(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> Report:
     """Sweep reify's tracked corpus and report paths the predicate REJECTS.
 
@@ -355,19 +368,22 @@ def check_corpus(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) 
     an empty extension.  Widening ``EXTENSIONLESS_FILENAMES`` is a separate,
     name-by-name judgement, swept by `check_extensionless`.
     """
-    try:
-        paths, gitlinks = tracked_paths(Path(reify_repo), timeout=timeout)
-    except GuardUnavailable as exc:
+    return _sweep_dotted(reify_repo, _read_corpus(reify_repo, timeout))
+
+
+def _sweep_dotted(reify_repo: Path, corpus: Corpus | GuardUnavailable) -> Report:
+    if isinstance(corpus, GuardUnavailable):
         return {
             'status': _STATUS_BY_EXIT[EXIT_UNAVAILABLE],
             'exit_code': EXIT_UNAVAILABLE,
             'findings': {},
             'detail': (
-                f'tracked-corpus sweep NOT PERFORMED: {exc}  '
+                f'tracked-corpus sweep NOT PERFORMED: {corpus}  '
                 f'This is not a pass — nothing was swept.'
             ),
         }
 
+    paths, gitlinks = corpus
     findings: dict[str, str] = {}
     for path in paths:
         segment = path.rsplit('/', 1)[-1]
@@ -425,20 +441,23 @@ def check_extensionless(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT
     segments to this part.  Never raises for a reify-side problem: a ``git``
     that could not answer becomes an `EXIT_UNAVAILABLE` report.
     """
-    try:
-        paths, gitlinks = tracked_paths(Path(reify_repo), timeout=timeout)
-    except GuardUnavailable as exc:
+    return _sweep_extensionless(reify_repo, _read_corpus(reify_repo, timeout))
+
+
+def _sweep_extensionless(reify_repo: Path, corpus: Corpus | GuardUnavailable) -> Report:
+    if isinstance(corpus, GuardUnavailable):
         return {
             'status': _STATUS_BY_EXIT[EXIT_UNAVAILABLE],
             'exit_code': EXIT_UNAVAILABLE,
             'findings': {},
             'collisions': {},
             'detail': (
-                f'extension-less corpus sweep NOT PERFORMED: {exc}  '
+                f'extension-less corpus sweep NOT PERFORMED: {corpus}  '
                 f'This is not a pass — nothing was swept.'
             ),
         }
 
+    paths, gitlinks = corpus
     findings: dict[str, str] = {}
     for path in paths:
         segment = path.rsplit('/', 1)[-1]
@@ -516,13 +535,20 @@ def check(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> Repo
     and a report that stopped at the first problem would need re-running to
     find the second.
 
+    The two corpus parts judge ONE read of reify's index: a single
+    ``git ls-files`` per reconciliation, and never two snapshots of a
+    machine-operated checkout taken moments apart.
+
     The per-part sub-reports are kept under ``parts`` so a ``--json`` consumer
     can see exactly WHICH part was unavailable rather than inferring it.
+    `drifted_by_direction` is the one reader of that layout outside this file's
+    builders.
     """
+    corpus = _read_corpus(Path(reify_repo), timeout)
     parts = {
         'vectors': check_vectors(Path(reify_repo), timeout=timeout),
-        'corpus': check_corpus(Path(reify_repo), timeout=timeout),
-        'extensionless': check_extensionless(Path(reify_repo), timeout=timeout),
+        'corpus': _sweep_dotted(Path(reify_repo), corpus),
+        'extensionless': _sweep_extensionless(Path(reify_repo), corpus),
     }
     exit_code = max((p['exit_code'] for p in parts.values()), key=lambda c: _SEVERITY[c])
     return {
@@ -531,6 +557,50 @@ def check(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> Repo
         'parts': parts,
         'detail': '\n'.join(f'[{name}] {p["detail"]}' for name, p in parts.items()),
     }
+
+
+@dataclass(frozen=True)
+class Drifted:
+    """One drifted name: what kind of drift, the name, and a witness path when a corpus sweep supplied one."""
+
+    kind: str
+    name: str
+    witness: str | None = None
+
+
+_VECTOR_KINDS = (('extensions', 'extensions'), ('extensionless', 'extension-less names'))
+
+
+def drifted_by_direction(report: Report) -> tuple[list[Drifted], list[Drifted]]:
+    """``(only_in_reify, only_in_dark_factory)`` across every part of a `check` report.
+
+    Keys are indexed strictly: a report of any other shape, including an
+    UNAVAILABLE one that compared nothing, raises `KeyError` rather than
+    reading as a drift with nothing in it.
+    """
+    parts = report['parts']
+    vectors = parts['vectors']['vectors']
+    extensionless = parts['extensionless']
+    only_in_reify: list[Drifted] = []
+    only_in_dark_factory: list[Drifted] = []
+    for key, kind in _VECTOR_KINDS:
+        only_in_reify += [Drifted(f'{kind} reify declares', n) for n in vectors[key]['only_in_reify']]
+        only_in_dark_factory += [
+            Drifted(f'{kind} reify no longer declares', n) for n in vectors[key]['only_in_dark_factory']
+        ]
+    only_in_reify += [
+        Drifted('tracked extensions the predicate rejects', ext, path)
+        for ext, path in sorted(parts['corpus']['findings'].items())
+    ]
+    only_in_reify += [
+        Drifted('tracked extension-less names the predicate rejects', name, path)
+        for name, path in sorted(extensionless['findings'].items())
+    ]
+    only_in_dark_factory += [
+        Drifted('allowlisted names that are directories in reify', name, path)
+        for name, path in sorted(extensionless['collisions'].items())
+    ]
+    return only_in_reify, only_in_dark_factory
 
 
 def resolve(explicit: str | None = None) -> reify_checkout.ReifyCheckout:
