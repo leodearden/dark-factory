@@ -5154,9 +5154,24 @@ entries:
     manifested_phase: recon
     note: The digest shows a deferred fused-memory tool called without its input schema loaded, so the agent guessed a parameter (project_id) that the server rejected with unknown_argument. The error text itself points to ToolSearch discovery. Only one such call appears, so the rest of the session is not visible.
     evidence_quote: 'This tool''s input schema was not in your prompt when you called it. ... {"name": "project_id", "closest_declared": "project_root"}'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 81e98fa6-86fd-4ba6-8238-31793a9c263a
+    origin_phase: recon
+    manifested_phase: recon
+    note: The recon agent called the deferred get_task tool without first loading its schema. It guessed a project_id parameter that the tool does not declare, and the call was rejected before running.
+    evidence_quote: 'get_task was called with argument(s) it does not declare: project_id ... This tool''s input schema was not in your prompt when you called it.'
+  - date: '2026-11-21'
+    project: dark_factory
+    session: 9219bd09-e9b1-49bf-88fb-950006afaa89
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'The recon agent called count_memories_by_metadata with a guessed ''metadata'' argument without first loading the tool''s schema. The server rejected it twice with unknown_argument (declared: project_id, filters). The agent repeated the same wrong parameter on a second call (task 10207 after task 10210) instead of loading the schema.'
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is: {"type":"object","properties":{"project_id":{"title":"Project Id","type":"string"},"filters":{"additionalProperties":true,"title":"Filters","type":"object"}}'
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
+  - census-dark_factory-20261124
 - id: entry-cand-20260719-2
   title: Graphiti memory search returns self-referential summaries stripped of the actual fact
   severity: medium
@@ -10949,11 +10964,19 @@ entries:
     manifested_phase: unknown
     note: Digest shows ModuleNotFoundError and command-not-found failures inside a task worktree (pyright binary absent from node_modules in .worktrees/11479). The digest gives no phase evidence, so phases are unknown; the match is on mechanism only, not architect explore-phase specifically.
     evidence_quote: 'ls: cannot access ''node_modules/.bin/pyright'': No such file or directory'
+  - date: '2026-11-14'
+    project: dark_factory
+    session: e01c7dd7-508f-4e21-bdea-a46f1f073c92
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The orchestrated-task session in worktree 7300 hit a ModuleNotFoundError. The digest does not show the phase, so I cannot confirm it was the architect explore phase that the entry names.
+    evidence_quote: (record 40) modulenotfounderror
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
   - census-dark_factory-20261031
   - census-dark_factory-20261107
+  - census-dark_factory-20261124
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -11220,9 +11243,35 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: The User Corrections bucket holds the injected supervisor task-framing prompt (rotation limits, DARK_FACTORY_ROOT, re-arm command) at turn 3. That is not a user correction.
+  - date: '2026-10-29'
+    project: dark_factory
+    session: 97a17973-54c7-4ad8-b904-6ab1271fa8e5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The session has a single user turn (n_user_turns: 1), and it is the initial task-framing prompt. The digest files it under ''User Corrections'' even though it is not a correction.'
+    evidence_quote: '## User Corrections
+
+      - (record 4) Match reviewer findings to ground truth issues in this code diff.'
+  - date: '2026-10-30'
+    project: dark_factory
+    session: 4b9f7dc5-bf80-4e4b-b381-536ee50962e3
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' bucket holds the session's initial task-framing prompt (a reviewer-to-ground-truth matching instruction) instead of any corrective user feedback. The session has a single user turn and the corrective signal counters (self_correct, interrupt) are zero.
+    evidence_quote: (record 4) Match reviewer findings to ground truth issues in this code diff.
+  - date: '2026-10-30'
+    project: dark_factory
+    session: ef064e6b-c89c-434a-8067-2717f735914a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The session has a single user turn, which is the task-framing prompt for a reviewer-vs-ground-truth grading task. The digest files it under 'User Corrections' even though it is not corrective feedback.
+    evidence_quote: '## User Corrections
+
+      - (record 4) Match reviewer findings to ground truth issues in this code diff.'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
+  - census-dark_factory-20261124
 - id: entry-cand-20260713-3
   title: Recon category labels applied by surface keyword match, not guard definition
   severity: medium
@@ -12094,11 +12143,28 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: The 'User Corrections' bucket's turn-4 entry is the spawn-brief task framing (instructions to read a brief file and run /reflect before ending), not a user correction. The digest mislabels injected task framing as corrective feedback.
+  - date: '2026-10-30'
+    project: dark_factory
+    session: 1b9bd06a-636e-4ded-9d83-96db0ca1380d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' bucket holds the session's injected task-framing prompt, not corrective user feedback. The session has one user turn and every corrective signal count reads zero.
+    evidence_quote: (record 4) Match reviewer findings to ground truth issues in this code diff.
+  - date: '2026-10-30'
+    project: dark_factory
+    session: 8cdfd0db-8808-46c6-81c6-9075c2ac800d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The session''s only user turn is the injected task-framing prompt, yet the digest files it under ''User Corrections''. The signal counts show no corrective event: self_correct 0 and interrupt 0.'
+    evidence_quote: '## User Corrections
+
+      - (record 4) Match reviewer findings to ground truth issues in this code diff.'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
   - census-dark_factory-20261031
   - census-dark_factory-20261107
+  - census-dark_factory-20261124
 - id: entry-cand-20260723-5
   title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
   severity: medium
@@ -14154,11 +14220,50 @@ entries:
     invariant_violated: structured-facts-at-failure
     note: 'The guard-trip line renders as a bare ''blocked:'' template with no matched substring or detail, which is the mechanism this entry names. The digest records a guard trip (df_guard: 1) but gives no structured fact about what was blocked. Phase cannot be supported from the digest.'
     evidence_quote: '- (record 457) blocked:'
+  - date: '2026-10-29'
+    project: dark_factory
+    session: 97a17973-54c7-4ad8-b904-6ab1271fa8e5
+    origin_phase: unknown
+    manifested_phase: review
+    note: 'The df_guard signal fired once (df_guard: 1), but the Guard Trips section renders only a bare ''blocked:'' with no matched substring or reason.'
+    evidence_quote: '## Guard Trips
+
+      - (record 4) blocked:'
+  - date: '2026-10-30'
+    project: dark_factory
+    session: 8cdfd0db-8808-46c6-81c6-9075c2ac800d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The Guard Trips section renders the df_guard signal (count 1) as a bare 'blocked:' with no matched substring or reason, so the guard cannot be identified from the digest.
+    evidence_quote: '## Guard Trips
+
+      - (record 4) blocked:'
+  - date: '2026-10-30'
+    project: dark_factory
+    session: ef064e6b-c89c-434a-8067-2717f735914a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The Guard Trips section is a bare template (''blocked:'') with no matched substring, and signal_counts shows df_guard: 1. The detail of what the guard blocked is dropped.'
+    evidence_quote: '## Guard Trips
+
+      - (record 4) blocked:'
+  - date: '2026-11-21'
+    project: dark_factory
+    session: 9880310a-95aa-4ca4-9aa4-24225af88414
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Three df_guard trips are rendered as bare 'blocked:' lines with no matched substring or reason, so the guard's cause cannot be read from the digest.
+    evidence_quote: '- (record 57) blocked:
+
+      - (record 104) blocked:
+
+      - (record 113) blocked:'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
   - census-dark_factory-20261031
   - census-dark_factory-20261107
+  - census-dark_factory-20261124
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -26699,11 +26804,26 @@ entries:
     task_id: 7073
     resolution: created
     step: curator
+  - ticket: tkt_0RXBESWYBADD907JBVD0V8N0CW
+    project_root: /home/leo/src/dark-factory
+    run_id: census-dark_factory-20261124
+    finding_key: fk-c1df06e83aa5
+    task_id: 11555
+    resolution: created
+    step: curator
+  follow_up:
+    kind: refiled
+    standing: done
+    project_root: /home/leo/src/dark-factory
+    task_id: 7073
+    run_id: census-dark_factory-20261124
+    as_of_sha: null
+    ticket: tkt_0RXBESWYBADD907JBVD0V8N0CW
 - id: entry-cand-20260929-1
   title: 'Escalation watcher emits get_task_escalations calls with an empty-valued optional parameter (`"status": ,`), producing unparseable JSON that recurs across tasks'
   severity: low
   severity_reason: Each occurrence wastes one turn and the agent recovers by retrying. It recurs across tasks, but it causes no wrong state.
-  status: open
+  status: fixed
   origin_phase: ops
   manifested_phase: ops
   first_seen_run: census-dark_factory-20261017
@@ -26861,11 +26981,12 @@ entries:
     task_id: 7074
     resolution: created
     step: curator
+  fixed_at_sha: d575b86d667efce5b6fe883f20c6c4810729e9c0
 - id: entry-cand-20261008-5
   title: Agent guesses the reconciliation tickets.db location and schema by trial and error
   severity: low
   severity_reason: This costs a few wasted turns per forensic read of the tickets store. It does not affect correctness or any change to the code.
-  status: open
+  status: fixed
   origin_phase: ops
   manifested_phase: ops
   first_seen_run: census-dark_factory-20261024
@@ -26900,11 +27021,12 @@ entries:
     task_id: 7438
     resolution: created
     step: curator
+  fixed_at_sha: d575b86d667efce5b6fe883f20c6c4810729e9c0
 - id: entry-cand-20260922-3
   title: Digest not_found at turns exceeding session turn count
   severity: low
   severity_reason: The label misleads a reader of the digest and makes miners flag false anomalies. The data is correct and nothing operational breaks.
-  status: open
+  status: fixed
   origin_phase: implement
   manifested_phase: ops
   first_seen_run: census-dark_factory-20261024
@@ -27095,6 +27217,7 @@ entries:
     task_id: 7439
     resolution: created
     step: curator
+  fixed_at_sha: d575b86d667efce5b6fe883f20c6c4810729e9c0
 - id: entry-cand-20260911-28
   title: Interactive agent session with zero user turns contradicts session class
   severity: low
@@ -27283,7 +27406,22 @@ entries:
     task_id: 7440
     resolution: existing
     step: key
+  - ticket: tkt_0RXBESX4BCWVYFAAGYHXMZCV7N
+    project_root: /home/leo/src/dark-factory
+    run_id: census-dark_factory-20261124
+    finding_key: fk-e18c7f482a29
+    task_id: 11556
+    resolution: created
+    step: curator
   cause: 'AgentClassEvidence.agent_class treats INTERACTIVE as the unguarded catch-all: when records exist but no agent-class marker matches, it returns INTERACTIVE regardless of whether a primary user turn was observed, while render_digest derives n_user_turns independently. A transcript of only assistant, system, isMeta or sidechain records therefore renders as agent_class: interactive with n_user_turns: 0.'
+  follow_up:
+    kind: refiled
+    standing: done
+    project_root: /home/leo/src/dark-factory
+    task_id: 7440
+    run_id: census-dark_factory-20261124
+    as_of_sha: null
+    ticket: tkt_0RXBESX4BCWVYFAAGYHXMZCV7N
 - id: entry-cand-20260918-18
   title: Digest 'User Corrections' bucket mislabels injected task context/briefing as a correction
   severity: medium
@@ -27296,6 +27434,7 @@ entries:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
   - census-dark_factory-20261107
+  - census-dark_factory-20261124
   finding_key: fk-a69ec55ddc08
   finding_area: shared
   finding_anchor: scripts/legibility/reingestion.py::HARNESS_PROMPT_MARKERS
@@ -28364,6 +28503,13 @@ entries:
     manifested_phase: unknown
     note: The digest's 'User Corrections' bucket holds a /team command with an injected spawn-brief ('Read ... and follow it as your brief'), not a human correction. signal_counts are all zero except not_found, so the bucket is mislabeled injected briefing content.
     evidence_quote: <command-name>/team</command-name> <command-args>--fable Read /home/leo/.claude/spawn-briefs/gate-11190-git-ops-split-decompose.md and follow it as your brief
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 43c1b34c-efed-4f8b-b27e-7d5102169ca1
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest files the spawn-brief instruction and its boilerplate (the result.md format and the /reflect reminder) under 'User Corrections'. That text is an injected task brief, not corrective user feedback, and the session's signal_counts show no self_correct, interrupt or tool_error events.
+    evidence_quote: Read /home/leo/.claude/spawn-briefs/team-handcarry-10943-2026-11-19.md and follow it as your brief; that file holds your whole task.
   filed_tickets:
   - ticket: tkt_0RW5FRC7ET51RZA763BVXH7ZAA
     project_root: /home/leo/src/dark-factory
@@ -28379,6 +28525,14 @@ entries:
     task_id: 7442
     resolution: existing
     step: semantic
+  follow_up:
+    kind: present-structural
+    standing: done
+    project_root: /home/leo/src/dark-factory
+    task_id: 7442
+    run_id: census-dark_factory-20261124
+    as_of_sha: d575b86d667efce5b6fe883f20c6c4810729e9c0
+    ticket: null
 - id: entry-cand-20260916-1
   title: Digest 'User Corrections' bucket captures skill invocations and task notifications
   severity: low
@@ -28643,6 +28797,21 @@ entries:
     task_id: 7442
     resolution: created
     step: curator
+  - ticket: tkt_0RXBESXC06EWRRDVJ9WR7FMX81
+    project_root: /home/leo/src/dark-factory
+    run_id: census-dark_factory-20261124
+    finding_key: fk-c2e12c9e2b12
+    task_id: 11557
+    resolution: created
+    step: curator
+  follow_up:
+    kind: refiled
+    standing: done
+    project_root: /home/leo/src/dark-factory
+    task_id: 7442
+    run_id: census-dark_factory-20261124
+    as_of_sha: null
+    ticket: tkt_0RXBESXC06EWRRDVJ9WR7FMX81
 - id: entry-cand-20261030-3
   title: Orchestrated-task sub-agent denied read-only Bash inspection in don't-ask mode, forcing blind guesses while diagnosing a verify failure
   severity: low
@@ -28653,6 +28822,7 @@ entries:
   first_seen_run: census-dark_factory-20261031
   last_seen_runs:
   - census-dark_factory-20261031
+  - census-dark_factory-20261124
   finding_key: fk-8dabfa972cc0
   finding_area: orchestrator
   finding_anchor: orchestrator/src/orchestrator/dry_run_unblock.py::_ALLOWED_TOOLS
@@ -29163,6 +29333,13 @@ entries:
     manifested_phase: unknown
     note: The Bash call for read-only git inspection was denied under don't-ask mode, and the agent had to continue without that inspection.
     evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-10-29'
+    project: dark_factory
+    session: 0b81f333-731f-4ae5-965c-fde8cf269661/subagents/agent-a89bf01277cbf5f41
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: An unattended sub-agent's read-only Bash inspection calls (sed -n and grep on worker.py, plus ls) were both rejected, so it could not read the code it was examining. The digest does not show the task's phase or whether it was a verify failure, so both phases stay unknown.
+    evidence_quote: The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.
   filed_tickets:
   - ticket: null
     project_root: /home/leo/src/dark-factory
@@ -29175,8 +29352,8 @@ entries:
     project_root: /home/leo/src/dark-factory
     run_id: census-dark_factory-20261107
     finding_key: fk-8dabfa972cc0
-    task_id: null
-    resolution: null
+    task_id: 8704
+    resolution: created
     step: curator
   follow_up:
     kind: refiled
@@ -29276,14 +29453,21 @@ entries:
     task_id: 8705
     resolution: created
     step: curator
+  - ticket: tkt_0RXBESXHE29FQ7N49GP45ZGH8Y
+    project_root: /home/leo/src/dark-factory
+    run_id: census-dark_factory-20261124
+    finding_key: fk-a6083fb7ed86
+    task_id: 11558
+    resolution: created
+    step: curator
   follow_up:
     kind: refiled
     standing: done
     project_root: /home/leo/src/dark-factory
-    task_id: 3160
-    run_id: census-dark_factory-20261107
+    task_id: 8705
+    run_id: census-dark_factory-20261124
     as_of_sha: null
-    ticket: tkt_0RWPNGVF759WQH288G1WG14GA3
+    ticket: tkt_0RXBESXHE29FQ7N49GP45ZGH8Y
 - id: entry-cand-20261101-3
   title: Capability manifest names a script that exists only in the task worktree, never git-added, so main lacks it and post-merge verify fails
   severity: medium
@@ -29376,7 +29560,7 @@ entries:
   title: Agent constructs malformed Python one-liners in bash -c with improper statement separation
   severity: low
   severity_reason: 'The error is loud and cheap to recover from: the script fails to parse and nothing partial runs. It costs the agent only a retry turn.'
-  status: open
+  status: fixed
   origin_phase: implement
   manifested_phase: verify
   first_seen_run: census-dark_factory-20261107
@@ -29417,11 +29601,12 @@ entries:
     task_id: 5683
     resolution: combined
     step: curator
+  fixed_at_sha: d575b86d667efce5b6fe883f20c6c4810729e9c0
 - id: entry-cand-20260828-22
   title: Orchestrated-task planning session abandons work mid-turn awaiting backgrounded task
   severity: low
   severity_reason: The failure is detected and classified, and a retryable planning failure costs one lost architect run. The guidance is already in place.
-  status: open
+  status: fixed
   origin_phase: architect
   manifested_phase: architect
   first_seen_run: census-dark_factory-20261107
@@ -29456,6 +29641,7 @@ entries:
     task_id: 2761
     resolution: combined
     step: curator
+  fixed_at_sha: d575b86d667efce5b6fe883f20c6c4810729e9c0
 - id: entry-cand-20260825-12
   title: MCP tool parameter contamination with XML envelope markup
   severity: low
@@ -29513,6 +29699,136 @@ entries:
     finding_key: fk-cef39957cd50
     task_id: 4696
     resolution: combined
+    step: curator
+  - ticket: tkt_0RXBESXK1BWDA061S4ZSDC4TQS
+    project_root: /home/leo/src/dark-factory
+    run_id: census-dark_factory-20261124
+    finding_key: fk-cef39957cd50
+    task_id: 5055
+    resolution: combined
+    step: curator
+  follow_up:
+    kind: refiled
+    standing: done
+    project_root: /home/leo/src/dark-factory
+    task_id: 4696
+    run_id: census-dark_factory-20261124
+    as_of_sha: null
+    ticket: tkt_0RXBESXK1BWDA061S4ZSDC4TQS
+- id: entry-cand-20261122-3
+  title: Escalation resolve_issue rejects project_root, a parameter the repo instructions teach for every task operation
+  severity: low
+  severity_reason: The failure is loud and costs one wasted turn. The cost is contained and recoverable.
+  status: open
+  origin_phase: implement
+  manifested_phase: unknown
+  first_seen_run: census-dark_factory-20261124
+  last_seen_runs:
+  - census-dark_factory-20261124
+  finding_key: fk-bb99b8dda638
+  finding_area: escalation
+  finding_anchor: escalation/src/escalation/server.py::resolve_issue
+  finding_tags:
+  - h10
+  - h3
+  - kind:confusion
+  supersedes: []
+  sightings:
+  - date: '2026-11-22'
+    project: dark_factory
+    session: 27f27d95-730e-4f1f-9d88-f35b8d1663c9/subagents/agent-acc07e68888a0a78d
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: "mcp__escalation__resolve_issue({\"action\": \"resume\", \"escalation_id\": \"esc-10213-1\", \"project_root\": \"/home/leo/src/dark-factory\", ...) -> 1 validation error for call[resolve_issue]\nproject_root\n  Unexpected keyword argument [type=unexpected_keyword_argument"
+  filed_tickets:
+  - ticket: tkt_0RXBESWAC6KZRNAPJM1FQMF63B
+    project_root: /home/leo/src/dark-factory
+    run_id: census-dark_factory-20261124
+    finding_key: fk-bb99b8dda638
+    task_id: 11553
+    resolution: created
+    step: curator
+- id: entry-cand-20261122-2
+  title: Recon agent repeatedly calls count_memories_by_metadata with undeclared 'metadata' argument instead of declared 'filters'
+  severity: low
+  severity_reason: The server rejects each bad call before it executes, so nothing is written. The cost is wasted agent turns.
+  status: open
+  origin_phase: unknown
+  manifested_phase: recon
+  first_seen_run: census-dark_factory-20261124
+  last_seen_runs:
+  - census-dark_factory-20261124
+  finding_key: fk-f1449a2f494f
+  finding_area: repo
+  finding_anchor: slug:recon-count-memories-by-metadata-undeclared-arg
+  finding_tags:
+  - h10
+  - kind:confusion
+  supersedes: []
+  sightings:
+  - date: '2026-11-22'
+    project: dark_factory
+    session: ce32c7a8-0614-44b5-bd11-cd7cba96eced
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: 'mcp__fused-memory__count_memories_by_metadata({"metadata": "{\"task_id\":\"10197\",\"stage2_suppress\":true}", "project_id": "reify"}) -> {"error": "count_memories_by_metadata was called with argument(s) it does not declare: metadata", "code": "unknown_argument", "tool": "count_memories_by_metadata", "unknown": [{"name": "metadata", "closest_declared": null}], "declared": ["project_id", "filters"]'
+  - date: '2026-11-17'
+    project: dark_factory
+    session: 8936645c-c0e0-4549-84c4-c92036819e93
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: 'count_memories_by_metadata was called with argument(s) it does not declare: metadata'
+  - date: '2026-11-17'
+    project: dark_factory
+    session: 1ca2ffe0-ab7a-45be-b413-599b6b1d2aab
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: 'count_memories_by_metadata was called with argument(s) it does not declare: metadata", "code": "unknown_argument" ... "declared": ["project_id", "filters"]'
+  filed_tickets:
+  - ticket: null
+    project_root: /home/leo/src/dark-factory
+    run_id: census-dark_factory-20261124
+    finding_key: fk-f1449a2f494f
+    task_id: 5968
+    resolution: existing
+    step: semantic
+- id: entry-cand-20261118-2
+  title: Agent shell cwd left pointing at a worktree another session removed, failing subsequent commands until recovery
+  severity: low
+  severity_reason: The harness recovers the shell cwd automatically and the agent only has to re-issue the command, so the cost is one retry.
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  first_seen_run: census-dark_factory-20261124
+  last_seen_runs:
+  - census-dark_factory-20261124
+  finding_key: fk-7c4ee0eb5759
+  finding_area: repo
+  finding_anchor: slug:shell-cwd-removed-worktree
+  finding_tags:
+  - h10
+  - kind:confusion
+  supersedes: []
+  sightings:
+  - date: '2026-11-18'
+    project: dark_factory
+    session: 5f254cc9-5b29-4ec0-8bd5-38d2095e9580
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Working directory "/home/leo/src/dark-factory/.claude/worktrees/mut-10723/orchestrator" no longer exists, so this command was not run. Shell cwd recovered to "/home/leo/src/dark-factory": re-issue the command if it still makes sense there.'
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 25e6eb98-9f01-4455-b9b5-a3af90952172
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'pwd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory'
+  filed_tickets:
+  - ticket: tkt_0RXBESWRHS50VR4C793YPRE9PY
+    project_root: /home/leo/src/dark-factory
+    run_id: census-dark_factory-20261124
+    finding_key: fk-7c4ee0eb5759
+    task_id: 11554
+    resolution: created
     step: curator
 candidates:
 - id: cand-20260715-1
@@ -31506,7 +31822,7 @@ candidates:
   cause: Path-scope guard may over-fire on worktree paths, or worktree-scoped paths are not properly recognized as in-scope; alternatively, scope guard logic is ambiguous for .worktrees/ subdirectories within the project_root
   area: path-scope guard implementation; worktree path normalization and scope detection
   first_seen: '2026-07-31'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-07-31'
     project: dark_factory
@@ -31514,6 +31830,13 @@ candidates:
     origin_phase: implement
     manifested_phase: unknown
     evidence_quote: 6 darkfactorypathscopeviolation guard trips in turns 24, 29, 34, 36, 39, 51 within a tiny interactive session (565 bytes, 12.0 score) running in .worktrees/3106—rapid cascading failures suggest guard is repeatedly blocking agent attempts, either due to over-aggressive matching or incorrect worktree-path classification
+  finding_key: fk-48903ce02ba5
+  finding_area: fused-memory
+  finding_anchor: fused-memory/src/fused_memory/middleware/path_scope_guard.py
+  finding_tags:
+  - h10
+  - kind:confusion
+  adjudicated_with: cand-20260815-2
 - id: cand-20260731-13
   title: Watcher ignores tool-use rejection in retry loop
   cause: Escalation watcher's retry harness checks for exceptions but not permission denials; when user rejects Bash tool at turn 264 ('user doesn't want to proceed'), watcher queues and executes 11 identical retries of the same command without stopping or alerting
@@ -31675,7 +31998,7 @@ candidates:
   cause: Digest categorization bucket treats supervisor-injected operational context (rotation limits prompt) identically to user-provided corrections, without distinguishing injected content from user input
   area: digest generation / signal categorization
   first_seen: '2026-08-01'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-08-01'
     project: dark_factory
@@ -31683,6 +32006,13 @@ candidates:
     origin_phase: ops
     manifested_phase: ops
     evidence_quote: 'Turn 3 supervisor-injected prompt ''You are running as an autonomous escalation watcher. Rotation limits (injected by supervisor): ROTATION_ESCALATIONS=50 ROTATION_HOURS=4.0'' + turn 169 system interruption message + turn 177 user interrupt all appear under ''User Corrections'' section; separate ''Interrupts'' section exists for turn 177 only'
+  finding_key: fk-a69ec55ddc08
+  finding_area: shared
+  finding_anchor: scripts/legibility/reingestion.py::HARNESS_PROMPT_MARKERS
+  finding_tags:
+  - h11
+  - kind:confusion
+  adjudicated_with: cand-20260812-8
 - id: cand-20260801-2
   title: Orchestrated task calls MCP tool with stale/incorrect schema
   cause: Task implementation or injected briefing has outdated tool-contract knowledge for plan-tools report_ready_to_merge; called with summary= but tool requires commit= and evidence= as mandatory parameters
@@ -33530,7 +33860,7 @@ candidates:
   cause: The trickle-coder attempts to emit findings via StructuredOutput but the output structure has double-nested 'findings' (outer object wraps inner array) and is missing the required 'severity' field at root, causing validation rejection. The error indicates schema mismatch between generated output and expected ReportFindings contract.
   area: trickle-coder / digest-generation / tool-validation
   first_seen: '2026-08-09'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-08-09'
     project: dark_factory
@@ -33538,12 +33868,19 @@ candidates:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: 'StructuredOutput({"findings": {"findings": [...]}}); tool_error signal in digest; error: ''Output does not match required schema: root: must have required property \''severity\'', /findings: must be array'''
+  finding_key: fk-75991adc483b
+  finding_area: fused-memory
+  finding_anchor: fused-memory/src/fused_memory/reconciliation/judge.py::JUDGE_VERDICT_SCHEMA
+  finding_tags:
+  - h10
+  - kind:confusion
+  adjudicated_with: cand-20260809-14
 - id: cand-20260809-14
   title: Trickle-coder ReportFindings output produces double-wrapped findings with missing schema field
   cause: 'Trickle-coder invocation of ReportFindings generates {"findings": {"findings": [...]}} structure (parameter name matches schema key pattern) and omits required ''severity'' field'
   area: trickle-coder
   first_seen: '2026-08-09'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-08-09'
     project: dark_factory
@@ -33551,6 +33888,12 @@ candidates:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: 'Turn 12 StructuredOutput validation error: StructuredOutput({"findings": {"findings": [...]}}) -> root: must have required property ''severity'', /findings: must be array'
+  finding_key: fk-75991adc483b
+  finding_area: fused-memory
+  finding_anchor: fused-memory/src/fused_memory/reconciliation/judge.py::JUDGE_VERDICT_SCHEMA
+  finding_tags:
+  - h10
+  - kind:confusion
 - id: cand-20260809-15
   title: Recon digest capture mislabels foreign-project reconciliation reports as User Corrections
   cause: Digest extraction pipeline captures raw recon run-review JSON dumps and classifies them as user-provided corrections; no project-boundary filter or content-type discrimination between user input and injected structured reports
@@ -33970,7 +34313,7 @@ candidates:
   cause: Digest generator captures the supervisor-injected rotation limits prompt and categorizes it as a User Correction instead of recognizing it as harness-injected context.
   area: digest generation / watcher rotation
   first_seen: '2026-08-12'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-08-12'
     project: dark_factory
@@ -33978,6 +34321,12 @@ candidates:
     origin_phase: ops
     manifested_phase: ops
     evidence_quote: "## User Corrections\n- (turn 3) You are running as an autonomous escalation watcher.\nRotation limits (injected by supervisor):\n  ROTATION_ESCALATIONS=50\n  ROTATION_HOURS=4.0"
+  finding_key: fk-a69ec55ddc08
+  finding_area: shared
+  finding_anchor: scripts/legibility/reingestion.py::HARNESS_PROMPT_MARKERS
+  finding_tags:
+  - h11
+  - kind:confusion
 - id: cand-20260812-9
   title: Harness resume boilerplate mislabeled as User Corrections in digest
   cause: Digest generator captures harness-injected resume prompts from usage-limit interrupts and categorizes them as User Corrections, inflating the corrections bucket with non-corrective system messages.
@@ -34181,7 +34530,7 @@ candidates:
   cause: Scope guards designed/tested against main checkout paths do not account for ephemeral worktree subdirectories (.worktrees/<id>), causing systematic false-positive blocks on legitimate worktree operations early in task execution
   area: guards
   first_seen: '2026-08-15'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-08-15'
     project: dark_factory
@@ -34189,6 +34538,12 @@ candidates:
     origin_phase: architect
     manifested_phase: implement
     evidence_quote: 'cwd: ''/home/leo/src/dark-factory/.worktrees/4159'', guard trips at turns 3, 21, 33, 57, 87 (rapid recurrence), all 7 signals are df_guard with no tool_error/diagnostic context'
+  finding_key: fk-48903ce02ba5
+  finding_area: fused-memory
+  finding_anchor: fused-memory/src/fused_memory/middleware/path_scope_guard.py
+  finding_tags:
+  - h10
+  - kind:confusion
 - id: cand-20260815-3
   title: Escalation-promotion prose mutates source references when restated from memory
   cause: Escalation promotion memos restate source strings/paths from memory instead of quoting verbatim, causing corruption (e.g., dropped path segments)
@@ -34744,7 +35099,7 @@ candidates:
   cause: Agents dispatched to task worktrees use relative paths as if they are in the repo root (project_root), not the worktree subdir; no explicit cwd awareness or validation before file operations
   area: task-dispatch
   first_seen: '2026-08-18'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-08-18'
     project: dark_factory
@@ -34752,6 +35107,13 @@ candidates:
     origin_phase: architect
     manifested_phase: implement
     evidence_quote: 'Turn 111: agent code path(''scripts/consolidate_namespace_families.py'') fails to find file in worktree; agent has no context that cwd is /.worktrees/3515/ rather than repo root, leading to silent relative-path failures'
+  finding_key: fk-1b24c833a286
+  finding_area: orchestrator
+  finding_anchor: orchestrator/src/orchestrator/agents/bash_cwd_guidance.py::BASH_CWD_ANCHOR_GUIDANCE
+  finding_tags:
+  - h10
+  - kind:confusion
+  adjudicated_with: cand-20260818-15
 - id: cand-20260818-6
   title: Watcher supervisor rotation context captured in digest 'User Corrections' bucket
   cause: Digest extraction pipeline mislabels system-injected supervisor context (rotation parameters, environment setup, re-arm instructions) as user corrections, conflating session setup directives with actual user feedback
@@ -34891,7 +35253,7 @@ candidates:
   cause: Orchestrated task agents run within `.worktrees/<id>` with cwd set to worktree root, but attempt to use repo-relative paths (e.g., `orchestrator/src/orchestrator/`) without adjusting for depth or incomplete checkout. No briefing context supplied regarding worktree structure, available sources, or required path adjustments.
   area: task-initialization/worktree-dispatch
   first_seen: '2026-08-18'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-08-18'
     project: dark_factory
@@ -34899,6 +35261,12 @@ candidates:
     origin_phase: unknown
     manifested_phase: implement
     evidence_quote: 'Bash cd orchestrator/src/orchestrator: No such file or directory (turn 29); sed orchestrator/src/orchestrator/lane_lifecycle.py: No such file or directory (turn 36)'
+  finding_key: fk-1b24c833a286
+  finding_area: orchestrator
+  finding_anchor: orchestrator/src/orchestrator/agents/bash_cwd_guidance.py::BASH_CWD_ANCHOR_GUIDANCE
+  finding_tags:
+  - h10
+  - kind:confusion
 - id: cand-20260818-16
   title: Background shell command completion record loss at session/process boundaries
   cause: 'Background Bash tasks invoked with `run_in_background: true` are interrupted (via UI, Monitor timeout, or agent teardown) without leaving transcript markers. When the session/process exits before completion, subsequent session resumption finds no completion marker, creating an unresolvable ambiguity: command never started, still running, stopped before completion, or completed but marker lost. The task notification is the only trace of the command''s existence.'
@@ -45600,7 +45968,7 @@ candidates:
   cause: The agent's working directory was deleted while the session was still running. Later Bash calls fail with 'error retrieving current directory' instead of a clear diagnosis, so the agent sees generic no-such-file failures and cannot tell that the worktree itself is gone.
   area: worktree/harness lifecycle
   first_seen: '2026-10-11'
-  disposition: pending
+  disposition: promoted
   sightings:
   - date: '2026-10-11'
     project: dark_factory
@@ -45608,6 +45976,14 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: 'pwd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory'
+  finding_key: fk-7c4ee0eb5759
+  finding_area: repo
+  finding_anchor: slug:shell-cwd-removed-worktree
+  finding_tags:
+  - h10
+  - kind:confusion
+  adjudicated_with: cand-20261118-2
+  promoted_to: entry-cand-20261118-2
 - id: cand-20261011-4
   title: Write-triage fail-open on judge AuthenticationError surfaces as an unrelated post-merge test failure
   cause: 'When the write-triage judge call raises AuthenticationError, the pipeline logs a WARNING and stores the write without triage (fail-open). The test then asserts on a result it did not expect (''routed'': ''stored''), so the merge verify reports two new failing tests. The root cause, a failed judge call, is only in the captured log and the block reason does not name it, so the next agent has to read a long traceback to find it.'
@@ -46895,7 +47271,7 @@ candidates:
   cause: The agent passes a 'metadata' argument to count_memories_by_metadata, whose declared parameters are project_id and filters. The server rejects each call with unknown_argument before it runs, and the agent resubmits the same shape for each task_id (6 tool errors in one session). The stage-2 suppression check therefore never executes, and the agent does not correct the argument name until a ToolSearch schema load is suggested.
   area: fused-memory
   first_seen: '2026-11-17'
-  disposition: pending
+  disposition: promoted
   sightings:
   - date: '2026-11-17'
     project: dark_factory
@@ -46903,6 +47279,14 @@ candidates:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: 'count_memories_by_metadata was called with argument(s) it does not declare: metadata'
+  finding_key: fk-f1449a2f494f
+  finding_area: repo
+  finding_anchor: slug:recon-count-memories-by-metadata-undeclared-arg
+  finding_tags:
+  - h10
+  - kind:confusion
+  adjudicated_with: cand-20261122-2
+  promoted_to: entry-cand-20261122-2
 - id: cand-20261117-6
   title: Test config helper silently inherits the operational yaml's shell command chain, so its default test_command is not plain pytest
   cause: The end-to-end test's _make_config helper does not produce the root test command its name and surrounding code suggest. It inherits the operational yaml's `cd shared && ...` chain, and the planner assumed plain `pytest` without reading the inheritance path, so a test author has to set test_command explicitly to get the intended behaviour.
@@ -46921,7 +47305,7 @@ candidates:
   cause: The recon agent calls count_memories_by_metadata with a 'metadata' argument on three successive turns (25, 27, 29). The tool declares only 'project_id' and 'filters', so each call is rejected before running. The error hint and the deferred-schema notice point to the right parameter, but the agent does not correct the name, and the tool name suggests a 'metadata' parameter the schema lacks.
   area: fused-memory MCP tool surface (count_memories_by_metadata)
   first_seen: '2026-11-17'
-  disposition: pending
+  disposition: promoted
   sightings:
   - date: '2026-11-17'
     project: dark_factory
@@ -46929,6 +47313,14 @@ candidates:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: 'count_memories_by_metadata was called with argument(s) it does not declare: metadata", "code": "unknown_argument" ... "declared": ["project_id", "filters"]'
+  finding_key: fk-f1449a2f494f
+  finding_area: repo
+  finding_anchor: slug:recon-count-memories-by-metadata-undeclared-arg
+  finding_tags:
+  - h10
+  - kind:confusion
+  adjudicated_with: cand-20261122-2
+  promoted_to: entry-cand-20261122-2
 - id: cand-20261117-8
   title: Hardcoded AST construction-count tripwire tests fail on legitimate refactors and force magic-number edits
   cause: The test asserts a hardcoded minimum count (>=26, >=27) of Escalation(...) constructions in harness.py. When constructions moved, the count dropped to 22 and 23, failing the post-merge verify. The fixed threshold couples the test to code layout rather than to the property it guards, so routine refactors trip it and the agent must reason about the magic number.
@@ -46947,7 +47339,7 @@ candidates:
   cause: The agent passes a project_id argument that get_task does not declare, even though the rejection names the declared parameters and the inline schema lists only id, project_root and tag. It repeats the same rejected call across several turns instead of correcting the argument. Each rejection is loud and self-describing, so the failure comes from the agent's call shape, not from a silent or misleading tool contract.
   area: fused-memory
   first_seen: '2026-11-20'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-11-20'
     project: dark_factory
@@ -46955,6 +47347,12 @@ candidates:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: 'get_task was called with argument(s) it does not declare: project_id'
+  finding_key: fk-17a8a0365263
+  finding_area: fused-memory
+  finding_anchor: fused-memory/src/fused_memory/server/tools.py::get_task
+  finding_tags:
+  - h10
+  - kind:confusion
 - id: cand-20261118-1
   title: Agent reroutes denied Bash inspection through interpreter workarounds instead of stopping on the permission denial
   cause: After a don't-ask-mode Bash denial, the agent retried the same inspection through alternative forms (python3 -I with subprocess git show, a temp-file write then parse, and new git command variants) rather than stopping to report the blocked need, as the denial text instructs. This wastes turns and risks circumventing the intended permission boundary.
@@ -46977,7 +47375,7 @@ candidates:
   cause: A worktree directory that the session's shell was using was removed by another process (the worktree named mut-10723 was deleted while the session worked in carry-10723). The agent's shell cwd then refers to a nonexistent directory, so every later Bash call fails with getcwd or no-such-directory errors, and the agent has to re-issue commands after the shell recovers.
   area: worktree-lifecycle
   first_seen: '2026-11-18'
-  disposition: pending
+  disposition: promoted
   sightings:
   - date: '2026-11-18'
     project: dark_factory
@@ -46985,6 +47383,13 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: 'Working directory "/home/leo/src/dark-factory/.claude/worktrees/mut-10723/orchestrator" no longer exists, so this command was not run. Shell cwd recovered to "/home/leo/src/dark-factory": re-issue the command if it still makes sense there.'
+  finding_key: fk-7c4ee0eb5759
+  finding_area: repo
+  finding_anchor: slug:shell-cwd-removed-worktree
+  finding_tags:
+  - h10
+  - kind:confusion
+  promoted_to: entry-cand-20261118-2
 - id: cand-20261118-3
   title: Background shell waits are silently cancelled by a server restart and never report back
   cause: A T3 server restart cancelled in-flight background work (a 2-hour sleep-and-poll wait on a merge). The cancelled work does not report back on its own, so the agent must notice and re-arm it manually.
@@ -47016,7 +47421,7 @@ candidates:
   cause: The agent guessed a project_id argument that get_task does not declare (it declares id, project_root, tag). The unknown_argument rejection named project_root as the closest declared parameter, but the agent kept the undeclared argument on turns 19, 21 and 23 instead of renaming it or reading the schema.
   area: fused-memory
   first_seen: '2026-11-18'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-11-18'
     project: dark_factory
@@ -47024,6 +47429,13 @@ candidates:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: 'mcp__fused-memory__get_task({"id": "177", "project_id": "solar_challenge_platform", "project_root": "/home/leo/src/solar-challenge-platform"}) -> {"error": "get_task was called with argument(s) it does not declare: project_id", "code": "unknown_argument", "tool": "get_task", "unknown": [{"name": "project_id", "closest_declared": "project_root"}], "declared": ["id", "project_root", "tag"]'
+  finding_key: fk-17a8a0365263
+  finding_area: fused-memory
+  finding_anchor: fused-memory/src/fused_memory/server/tools.py::get_task
+  finding_tags:
+  - h10
+  - kind:confusion
+  adjudicated_with: cand-20261120-1
 - id: cand-20261121-1
   title: Repo-root Glob/Ripgrep searches time out after 20s, burning turns on wide-pattern retries
   cause: Glob and Ripgrep calls rooted at the full dark-factory repo (or a worktree parent) with broad patterns hit the 20-second search timeout, and the agent repeats similar wide searches instead of narrowing scope first, wasting turns and context.
@@ -47133,7 +47545,7 @@ candidates:
   cause: session_registry.py lease-claim prints a success decision (decision=acquired, lease acquired) but returns exit code 2, so an agent that trusts the exit code will misread a successful claim as a failure and may retry or abandon it.
   area: orchestrator
   first_seen: '2026-11-22'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-11-22'
     project: dark_factory
@@ -47141,12 +47553,18 @@ candidates:
     origin_phase: ops
     manifested_phase: ops
     evidence_quote: '[exit 2] Exit code 2 .worktrees/6701 decision=acquired lease unblock-dark_factory#6701 acquired by unblock-dark_factory#6701-1042027 holder_liveness=none'
+  finding_key: fk-9cfea71d75c0
+  finding_area: orchestrator
+  finding_anchor: orchestrator/src/orchestrator/session_registry.py::main
+  finding_tags:
+  - h10
+  - kind:confusion
 - id: cand-20261122-2
   title: Recon agent repeatedly calls count_memories_by_metadata with undeclared 'metadata' argument instead of declared 'filters'
   cause: The agent passes a filter object under an argument name the fused-memory tool does not declare. The server rejects each call before execution with an error that lists the declared parameters, but the same wrong call shape recurs across three task IDs with no evidence of the correct shape being learned.
   area: fused-memory tool call shapes in recon stages
   first_seen: '2026-11-22'
-  disposition: pending
+  disposition: promoted
   sightings:
   - date: '2026-11-22'
     project: dark_factory
@@ -47154,12 +47572,19 @@ candidates:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: 'mcp__fused-memory__count_memories_by_metadata({"metadata": "{\"task_id\":\"10197\",\"stage2_suppress\":true}", "project_id": "reify"}) -> {"error": "count_memories_by_metadata was called with argument(s) it does not declare: metadata", "code": "unknown_argument", "tool": "count_memories_by_metadata", "unknown": [{"name": "metadata", "closest_declared": null}], "declared": ["project_id", "filters"]'
+  finding_key: fk-f1449a2f494f
+  finding_area: repo
+  finding_anchor: slug:recon-count-memories-by-metadata-undeclared-arg
+  finding_tags:
+  - h10
+  - kind:confusion
+  promoted_to: entry-cand-20261122-2
 - id: cand-20261123-1
   title: Ratchet baseline for gates.py growth is not surfaced to planners, so plans assume no baseline update is needed
   cause: The plan assumed that growth in orchestrator/src/orchestrator/merge_lane/gates.py needed no change to the ratchet baseline. The agent had to correct this mid-session, and a Bash probe of merge_lane_ratchet_baseline.json then failed with exit 1. The ratchet baseline's coupling to file-size and complexity metrics is not visible from the plan's own text.
   area: orchestrator/merge_lane ratchet gates
   first_seen: '2026-11-23'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-11-23'
     project: dark_factory
@@ -47167,12 +47592,18 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: (record 263) [correction:] **The correction:** the original plan treated `gates.py`'s line growth as needing no baseline change. That was wrong.
+  finding_key: fk-a228fbac9480
+  finding_area: orchestrator
+  finding_anchor: orchestrator/tests/merge_lane_ratchet_baseline.json
+  finding_tags:
+  - h11
+  - kind:confusion
 - id: cand-20261123-2
   title: Plan asserts markup-check behavior on redo tasks without verifying the override-removal ordering, so the plan drops redos it should keep
   cause: The planning agent reasoned that the markup check could not reject a redo because the original's text had already passed it. It did not account for the allow_mcp_markup override being removed before the task is saved, so the premise was wrong and the agent had to correct it.
   area: task redo pipeline / MCP markup check ordering
   first_seen: '2026-11-23'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-11-23'
     project: dark_factory
@@ -47180,6 +47611,33 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: The plan assumes a markup check can't reject the redo's text because the original's text already passed it. That's wrong for an original filed with the `allow_mcp_markup` override, which is removed before the task is saved.
+  finding_key: fk-bfb605e0d3d7
+  finding_area: repo
+  finding_anchor: slug:redo-markup-override-ordering
+  finding_tags:
+  - h10
+  - kind:confusion
+- id: cand-20261122-3
+  title: Escalation resolve_issue rejects project_root, a parameter the repo instructions teach for every task operation
+  cause: CLAUDE.md tells agents to pass project_root on task operations, which are fused-memory tools. The escalation MCP server's resolve_issue takes no such keyword, so an agent carrying that habit across servers gets a pydantic unexpected_keyword_argument error. The call fails and the agent spends a turn working out the real signature. No guidance says which servers accept project_root.
+  area: mcp-tool-contracts
+  first_seen: '2026-11-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-11-22'
+    project: dark_factory
+    session: 27f27d95-730e-4f1f-9d88-f35b8d1663c9/subagents/agent-acc07e68888a0a78d
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: "mcp__escalation__resolve_issue({\"action\": \"resume\", \"escalation_id\": \"esc-10213-1\", \"project_root\": \"/home/leo/src/dark-factory\", ...) -> 1 validation error for call[resolve_issue]\nproject_root\n  Unexpected keyword argument [type=unexpected_keyword_argument"
+  finding_key: fk-bb99b8dda638
+  finding_area: escalation
+  finding_anchor: escalation/src/escalation/server.py::resolve_issue
+  finding_tags:
+  - h10
+  - h3
+  - kind:confusion
+  promoted_to: entry-cand-20261122-3
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
