@@ -102,6 +102,13 @@ routing:
   model: null
   reasoning_effort: null
 
+# The ChatGPT-plan proxy (CLIProxyAPI) every plan-routed call goes through. A
+# cap parks the work and pages L2; it never falls back onto OPENAI_API_KEY
+# (task 9944). Restart-tier.
+plan_route:
+  proxy_url: ${OPENAI_PLAN_PROXY_URL}
+  probe_interval_seconds: 900
+
 queue:
   semaphore_limit: ${SEMAPHORE_LIMIT:3}
   workers_per_group: ${QUEUE_WORKERS_PER_GROUP:1}
