@@ -43,6 +43,7 @@ from shared.toolcall_markup import (
     MARKUP_OVERRIDE_KEY,
     closer_for,
     markup_override_requested,
+    swallowed_markup_override,
 )
 
 BOTH_POLICIES = pytest.mark.parametrize(
@@ -80,6 +81,14 @@ _REPAIRABLE_WITHOUT_OVERRIDE = _leaked()
 _UNRECOVERED_WITH_OVERRIDE = _leaked(_SWALLOWED_METADATA, _UNTYPABLE)
 _UNRECOVERED_WITHOUT_OVERRIDE = _leaked(_UNTYPABLE)
 
+#: Intended text carrying far more inert opener-shaped tokens than the
+#: non-validating scanner inspects, so it gives up on the whole value.
+_SCANNER_BLIND_INTENDED = 'Rendered table: ' + '\x3cb>x' * 1024
+_SCANNER_BLIND_WITH_OVERRIDE = (
+    _SCANNER_BLIND_INTENDED + closer_for('rationale') + _SWALLOWED_METADATA
+)
+_SCANNER_BLIND_WITHOUT_OVERRIDE = _SCANNER_BLIND_INTENDED + closer_for('rationale')
+
 
 def _swallowed_override_remedy(swallowed: dict[str, Any], plain: dict[str, Any]) -> str:
     """What a swallowed override adds to the hint the same leak gets without one.
@@ -99,10 +108,11 @@ class _Harness:
 
     def __init__(self, policy: RepairPolicy) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.notes: list[dict[str, Any]] = []
         self.facts: list[dict[str, Any]] = []
         self.escalations: list[dict[str, Any]] = []
         self.mcp = FastMCP('swallowed-override-harness')
-        calls = self.calls
+        calls, notes = self.calls, self.notes
 
         @self.mcp.tool
         @accepts_markup_override
@@ -110,6 +120,12 @@ class _Harness:
             decision: str, rationale: str, alternatives: list[str] | None = None,
         ) -> str:
             calls.append({'decision': decision, 'rationale': rationale})
+            return 'ok'
+
+        @self.mcp.tool
+        def record_note(note: str, metadata: dict[str, Any] | None = None) -> str:
+            """Declares ``metadata`` natively, so what it receives is observable."""
+            notes.append({'note': note, 'metadata': metadata})
             return 'ok'
 
         self.guard = MarkupGuardMiddleware(
@@ -123,9 +139,9 @@ class _Harness:
         self.escalations.append(record)
         return 'esc-markup-residue-1'
 
-    async def call(self, arguments: dict[str, Any]) -> Any:
+    async def call(self, arguments: dict[str, Any], tool: str = 'add_design_decision') -> Any:
         async with Client(self.mcp) as client:
-            return await client.call_tool('add_design_decision', arguments)
+            return await client.call_tool(tool, arguments)
 
     async def refusal(self, arguments: dict[str, Any]) -> dict[str, Any]:
         with pytest.raises(ToolError) as excinfo:
@@ -196,6 +212,46 @@ class TestARepairableLeakThatSwallowedTheOverride:
         await h.call(payload['repaired_call'])
 
         assert h.calls == [{'decision': _DECISION, 'rationale': _INTENDED}]
+
+
+class TestAnOverrideTheScannerCannotSeeIsStillStripped:
+    """The strip keys on the validated recovery, never on the scanner's verdict."""
+
+    def test_the_scanner_gives_up_on_this_value(self):
+        # If the scanner's cap ever grows past these 1024 tokens, grow them too.
+        assert swallowed_markup_override(_SCANNER_BLIND_WITH_OVERRIDE) is False
+
+    async def test_the_bounce_restores_the_map_without_the_override(self):
+        h = _Harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        payload = await h.refusal({'decision': _DECISION, 'rationale': _SCANNER_BLIND_WITH_OVERRIDE})
+
+        assert payload['repaired_call'] == {
+            'decision': _DECISION, 'rationale': _SCANNER_BLIND_INTENDED, 'metadata': {},
+        }
+        assert not markup_override_requested(payload['repaired_call']['metadata'])
+
+    async def test_the_bounce_reports_what_it_stripped(self):
+        h = _Harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        payload = await h.refusal({'decision': _DECISION, 'rationale': _SCANNER_BLIND_WITH_OVERRIDE})
+        plain = await h.refusal({'decision': _DECISION, 'rationale': _SCANNER_BLIND_WITHOUT_OVERRIDE})
+
+        assert payload['override_swallowed'] is True
+        _swallowed_override_remedy(payload, plain)
+
+    @pytest.mark.parametrize(
+        'intended',
+        ['A short note.', _SCANNER_BLIND_INTENDED],
+        ids=['scanner-visible', 'scanner-blind'],
+    )
+    async def test_a_forwarded_call_receives_no_live_override(self, intended):
+        h = _Harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call({'note': intended + closer_for('note') + _SWALLOWED_METADATA}, tool='record_note')
+
+        assert [entry['note'] for entry in h.notes] == [intended]
+        assert not markup_override_requested(h.notes[0]['metadata'])
 
 
 class TestALeakWithNoOverrideReportsFalse:
