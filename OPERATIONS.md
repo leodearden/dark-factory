@@ -2434,6 +2434,13 @@ takes no arguments: it always re-reads that process's own
   kill all land on the next dispatch round.
 - `plan_text_fp_gate_enabled` (task 4031 amendment gate; OFF = pre-4031
   Lever-B skip).
+- `defect_tests.*` (whole submodel: `mode`, `max_plan_repairs`,
+  `max_proof_replans`, `proof_timeout_secs`, `streak_threshold`,
+  `test_file_pattern`). `mode` (`off` / `shadow` / `enforce`, shipped
+  `shadow`) governs only the plan, proof and merge gates
+  (`plans/defect-tests-prd.md` I5); `mode: off` also stops the verify test
+  legs injecting `-p _df_defect_plugin`, from the next verify leg. Normative
+  home: `orchestrator/src/orchestrator/defect_tests_config.py::DefectTestsConfig`.
 - `verify_task_host_policy`, `verify_task_remote_modules`,
   `verify_task_remote_red_confirms_locally` and
   `verify_task_remote_cross_check_every_n` (task 6670; default `local`, which

@@ -193,6 +193,7 @@ from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.project_slice_weight import ensure_project_slice_weight
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.quarantine_provenance import QuarantineOutcome
+from orchestrator.recovered_merge_holds import RecoveredMergeHolds
 from orchestrator.recovered_merge_owner import RecoveredMergeOwner
 from orchestrator.recovery_emission import (
     STREAK_CHARGING_SITES,
@@ -13663,6 +13664,12 @@ class Harness:
         (task 7277): a landing drives the landed-outbox done-write through
         :meth:`_reconcile_landing`, a durable failure blocks the task and files
         an L1, and an outcome that halted the merge queue files the halt-owning L1.
+
+        Each recovered request's in-progress task then re-takes its journalled
+        files through
+        ``orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds``
+        (task 10093), before the first ``acquire_next``, which
+        ``Scheduler.finish_startup`` gates.
         """
         report = await recover_pending_merges(
             self._merge_store,
@@ -13676,13 +13683,20 @@ class Harness:
             enqueue_merge_request=enqueue_merge_request,
             select_recovery_winner=select_recovery_winner,
         )
+        requests = report.get('requests', [])
+        holds = RecoveredMergeHolds(
+            self.scheduler, lock_depth=self.config.lock_depth, event_store=self.event_store,
+        )
         RecoveredMergeOwner(
             tasks=self.scheduler,
             escalations=self._escalation_queue,
             reconcile_landing=self._reconcile_landing,
             merge_halt=self._merge_worker,
             event_store=self.event_store,
-        ).adopt(report.get('requests', []), schedule=self._schedule_coro_threadsafe)
+            holds=holds,
+            stopping=lambda: self._draining,
+        ).adopt(requests, schedule=self._schedule_coro_threadsafe)
+        await holds.restore(requests)
         logger.info(
             '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
             'journal_corrupt=%s',

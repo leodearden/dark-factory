@@ -12,9 +12,11 @@ from datetime import UTC, datetime
 from typing import Any, get_args
 
 import pytest
+from _code_writer_links import assert_writes_c5, subject_task
 from shared.task_metadata import parse_metadata
 
 from fused_memory import memory_metadata
+from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.audit_trail_rotation import (
     ARCHIVE_MAX_BYTES,
     HISTORY_KEEP,
@@ -27,6 +29,7 @@ from fused_memory.reconciliation.audit_trail_rotation import (
     TaskRewrite,
     archive_link_query,
     bound_audit_trail,
+    memory_service_archive,
     near_duplicate_key,
     plan_rotation,
     render_audit_trail_rotation_section,
@@ -871,3 +874,43 @@ class TestStage2PromptStatesTheRule:
         section = render_audit_trail_rotation_section()
         assert section in STAGE2_SYSTEM_PROMPT
         assert section in build_stage2_system_prompt(project_id)
+
+
+class _RecordingMemoryService:
+    """The MemoryService surface memory_service_archive uses, recording every write."""
+
+    def __init__(self) -> None:
+        self.writes: list[dict[str, Any]] = []
+        self._contents: dict[str, str] = {}
+
+    async def add_memory(self, **kwargs: Any) -> AddMemoryResponse:
+        memory_id = f'mem-{len(self.writes) + 1}'
+        self.writes.append(kwargs)
+        self._contents[memory_id] = kwargs['content']
+        return AddMemoryResponse(memory_ids=[memory_id])
+
+    async def get_memory_by_id(self, project_id: str, memory_id: str) -> dict[str, Any] | None:
+        content = self._contents.get(memory_id)
+        return None if content is None else {'id': memory_id, 'content': content}
+
+    async def delete_memory(self, *, memory_id: str, **_: Any) -> None:
+        self._contents.pop(memory_id, None)
+
+
+class TestMemoryServiceArchiveLinksItsTask:
+    @pytest.mark.asyncio
+    async def test_a_rotation_archive_declares_its_task(self):
+        """C5: the archive a real rotation writes links its task, and its
+        code-written header names no status (the fixture's shed text is neutral)."""
+        task = size_triggered_task()
+        memory_service = _RecordingMemoryService()
+
+        outcome = await bound_audit_trail(
+            task, project_id='p', now=NOW,
+            archive=memory_service_archive(memory_service), commit=RecordingCommit(task),
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'rotated'
+        (written,) = memory_service.writes
+        assert_writes_c5(written, project_id='p', subject=subject_task('p', task['id']))

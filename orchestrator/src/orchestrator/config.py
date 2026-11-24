@@ -52,6 +52,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.defect_tests_config import DefectTestsConfig
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.merge_pool_config import MergePoolConfig
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
@@ -5715,6 +5716,9 @@ class OrchestratorConfig(BaseSettings):
     # checks PRD delta). Task 2583 (epsilon) extends this sub-model further.
     delivered_checks: DeliveredChecksConfig = Field(default_factory=DeliveredChecksConfig)
 
+    # Defect-test gates and the verify-leg plugin injection (plans/defect-tests-prd.md).
+    defect_tests: DefectTestsConfig = Field(default_factory=DefectTestsConfig)
+
     # Warm-lane session-resume guard (task γ, plans/warm-lane-session-resume-prd.md).
     # An absent stanza yields the enabled-by-default instance (default_factory
     # suffices — no defaults.yaml edit, like delivered_checks). Read by the
@@ -7030,6 +7034,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # Live shadow eval (task 5382, plans/live-shadow-eval-prd.md C6): green tier on
     # purpose, NOT auto_eval_redo_budget_usd's restart tier (PRD S2).
     _submodel_leaf_paths('shadow_eval', ShadowEvalConfig),
+    # Defect tests: green tier, so the human gate flips mode without a restart (PRD Config).
+    _submodel_leaf_paths('defect_tests', DefectTestsConfig),
     {
         # Steward grace
         'steward_completion_timeout',
