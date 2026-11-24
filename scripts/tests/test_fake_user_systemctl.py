@@ -5,6 +5,8 @@ thread still holds its listening port. Real systemd counts such a unit as
 running until its cgroup is empty, so the fake must too: a restart that starts
 the new instance before every thread of the old one has gone races it for the
 port.
+Past its stop deadline, a stop or restart of a unit still running must fail
+naming it, never start a second instance beside it.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ from pathlib import Path
 
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
-from fake_user_systemctl_state import kill_all_units, log_file, unit_pid
+from fake_user_systemctl_state import kill_all_units, log_file, pid_file, unit_pid
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from zombie_leader_service import SYS_EXIT
 
@@ -68,10 +70,10 @@ class UnitWorld:
     ready: Path
     release: Path
 
-    def systemctl(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def systemctl(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-I", str(FAKE_SYSTEMCTL), "--user", *args],
-            env=self.env,
+            env={**self.env, **env},
             capture_output=True,
             text=True,
             timeout=CLI_TIMEOUT,
@@ -97,8 +99,8 @@ class UnitWorld:
 
 
 @pytest.fixture
-def started(tmp_path: Path) -> Iterator[UnitWorld]:
-    """zombie-leader.service started through the fake, its leader already Z."""
+def world(tmp_path: Path) -> Iterator[UnitWorld]:
+    """A scratch HOME holding zombie-leader.service's unit file, and the fake's state."""
     home = tmp_path / "home"
     unit_dir = home / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True)
@@ -111,13 +113,31 @@ def started(tmp_path: Path) -> Iterator[UnitWorld]:
         ready=ready,
         release=release,
     )
+    world.state.mkdir()
     try:
-        proc = world.systemctl("start", UNIT)
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        world.wait_until_ready()
         yield world
     finally:
         world.kill_all()
+
+
+@pytest.fixture
+def started(world: UnitWorld) -> UnitWorld:
+    """zombie-leader.service started through the fake, its leader already Z."""
+    proc = world.systemctl("start", UNIT)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    world.wait_until_ready()
+    return world
+
+
+@pytest.fixture
+def ungrouped_child() -> Iterator[subprocess.Popen[bytes]]:
+    """A live process that leads no process group, so killpg on its pid signals nothing."""
+    child = subprocess.Popen(["sleep", "infinity"])
+    try:
+        yield child
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_a_unit_whose_main_thread_exited_is_active_while_a_thread_runs(
@@ -144,3 +164,17 @@ def test_restart_leaves_no_thread_of_the_old_instance(started: UnitWorld) -> Non
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert bind_errno(old_port) == 0, f"a thread of the old instance (pid {old_pid}) holds its port"
     assert started.pid() != old_pid
+
+
+@pytest.mark.parametrize("command", ["restart", "stop"])
+def test_a_unit_still_running_at_the_stop_deadline_fails_naming_it(
+    world: UnitWorld, ungrouped_child: subprocess.Popen[bytes], command: str
+) -> None:
+    pid_file(world.state, UNIT).write_text(str(ungrouped_child.pid))
+
+    proc = world.systemctl(command, UNIT, FAKE_SYSTEMD_STOP_DEADLINE_SECS="0")
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert f"{UNIT} (pid {ungrouped_child.pid}) still running" in proc.stderr
+    assert unit_pid(world.state, UNIT) == ungrouped_child.pid
+    assert ungrouped_child.poll() is None

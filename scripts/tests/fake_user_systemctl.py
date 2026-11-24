@@ -5,8 +5,10 @@ installer wrote under $HOME/.config/systemd/user, apply its Environment= and
 EnvironmentFile= lines, and spawn its one-line ExecStart= in a new session.
 Every invocation's argv, a service's pid and output, and a marker for each
 enabled unit are kept under $FAKE_SYSTEMD_STATE, laid out by
-fake_user_systemctl_state.py. A service counts as running until every thread of its process has exited, as
-systemd's stop waits for the unit's cgroup to empty.
+fake_user_systemctl_state.py.
+A service counts as running until every thread of its process has exited, as
+systemd's stop waits for the unit's cgroup to empty;
+$FAKE_SYSTEMD_STOP_DEADLINE_SECS (default 5) bounds that wait.
 A timer is active exactly when it is enabled.
 """
 from __future__ import annotations
@@ -33,7 +35,7 @@ finally:
 STATE = Path(os.environ["FAKE_SYSTEMD_STATE"])
 UNIT_DIR = Path(os.environ["HOME"]) / ".config" / "systemd" / "user"
 EXITED_STATES = {"Z", "X"}
-STOP_DEADLINE_SECS = 5
+STOP_DEADLINE_SECS = float(os.environ.get("FAKE_SYSTEMD_STOP_DEADLINE_SECS", "5"))
 
 
 def task_state(stat: Path) -> str:
@@ -72,7 +74,7 @@ def stop(unit: str) -> bool:
     if live_pid(unit):
         print(
             f"fake systemctl: {unit} (pid {pid}) still running"
-            f" {STOP_DEADLINE_SECS}s after SIGKILL",
+            f" {STOP_DEADLINE_SECS:g}s after SIGKILL",
             file=sys.stderr,
         )
         return False
