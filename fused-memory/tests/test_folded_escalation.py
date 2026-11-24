@@ -48,7 +48,8 @@ from fused_memory.middleware._folded_escalation import (
 )
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.ticket_store import CurationBacklog
-from fused_memory.services.provider_billing import classify_billing_exhaustion
+from fused_memory.services.plan_route import PlanRouteSnapshot, PlanRouteStateName
+from fused_memory.services.provider_billing import classify_billing_exhaustion, plan_cap_of
 from fused_memory.services.write_journal import JournalGrowthSample, Mem0RetryBacklog
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -999,6 +1000,23 @@ def _billing_exhaustion(module: Any, project_root: str) -> object:
     return asyncio.run(alarm.record_exhausted(exhaustion, site='durable_queue:add_episode'))
 
 
+async def _no_parked_writes() -> int:
+    return 0
+
+
+def _plan_cap(module: Any, project_root: str) -> object:
+    since = datetime(2026, 11, 24, 12, tzinfo=UTC)
+    snapshot = PlanRouteSnapshot(
+        state=PlanRouteStateName.CAPPED, proxy_host='127.0.0.1:8317',
+        capped_since=since, next_probe_at=since + timedelta(minutes=15),
+        exhaustion=plan_cap_of(429, b'{"error": {"code": "usage_limit_reached"}}'),
+    )
+    alarm = module.PlanCapAlarm(
+        resolve_project_root=lambda: project_root, count_parked=_no_parked_writes,
+    )
+    return asyncio.run(alarm.on_capped(snapshot))
+
+
 #: THE SINGLE POINT OF TRUTH (heuristic 11) for the escalation level each
 #: migrated filer's record is born at.
 #:
@@ -1116,6 +1134,13 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         _billing_exhaustion,
         # Born at L2 on purpose: exhausted credits clear only when a human
         # pays, so the page skips the watcher, which can do nothing about it.
+        2,
+    ),
+    _Filer(
+        'plan_cap_alarm',
+        'fused_memory.services.plan_cap_alarm',
+        _plan_cap,
+        # L2 on purpose: only Leo can upgrade the ChatGPT plan (task 9944).
         2,
     ),
 )
@@ -1317,10 +1342,11 @@ class TestEveryFilerPinsItsLevels:
         }
         assert not_l1 == {
             'markup_tripwire residue': 2, 'completion_claim_gate': 0,
-            'billing_exhaustion_alarm': 2,
+            'billing_exhaustion_alarm': 2, 'plan_cap_alarm': 2,
         }, (
             'L1 is the house escalation level; residue (L2), '
-            'billing_exhaustion_alarm (L2: only a human can buy credits) and '
+            'billing_exhaustion_alarm (L2: only a human can buy credits), '
+            'plan_cap_alarm (L2: only Leo can upgrade the plan) and '
             f'completion_claim_gate (L0) are its exceptions. {not_l1!r} says '
             'another filer moved'
         )
@@ -1430,6 +1456,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.services.mem0_retry_backlog_alarm import (
         ANCHOR_TASK_ID as MEM0_RETRY_BACKLOG_ANCHOR,
     )
+    from fused_memory.services.plan_cap_alarm import (
+        ANCHOR_TASK_ID as PLAN_CAP_ANCHOR,
+    )
     from fused_memory.services.memory_metadata_census import (
         _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
     )
@@ -1454,6 +1483,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'classification_fallback_alarm': CLASSIFICATION_FALLBACK_ANCHOR,
         'mem0_retry_backlog_alarm': MEM0_RETRY_BACKLOG_ANCHOR,
         'billing_exhaustion_alarm': BILLING_EXHAUSTION_ANCHOR,
+        'plan_cap_alarm': PLAN_CAP_ANCHOR,
         # -- markup_guard, which CALLS the tripwire's filers with anchors of
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
@@ -1610,6 +1640,7 @@ class TestNoTwoFilersShareAnAnchor:
             'journal_growth_alarm insert_rate',
             'classification_fallback_alarm',
             'billing_exhaustion_alarm',
+            'plan_cap_alarm',
             'markup_guard storm',
             'markup_guard residue',
             'mem0_update_storm_escalator',
