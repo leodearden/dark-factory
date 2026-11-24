@@ -391,6 +391,12 @@ async def wait_until(
         await asyncio.sleep(interval)
 
 
+def other_pending_tasks() -> set[asyncio.Task]:
+    """After a cancelled lane-lock acquire, names the acquire that cancellation left in flight."""
+    current = asyncio.current_task()
+    return {t for t in asyncio.all_tasks() if t is not current and not t.done()}
+
+
 def wait_for_lane_lock_holder(
     lock_path: Path,
     pid: int,
