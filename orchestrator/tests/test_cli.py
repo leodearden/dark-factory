@@ -543,6 +543,7 @@ class TestRunWithBoundedTeardown:
     """asyncio.run()'s own teardown waits, unbounded, on every task left when
     the main coroutine ends; _run_with_bounded_teardown bounds that wait."""
 
+    @pytest.mark.timing(reason='the teardown watchdog deadline is the behaviour under test')
     @pytest.mark.parametrize('ending', ['returns', 'raises_cancelled'])
     def test_a_leftover_task_that_ignores_its_cancel_is_force_exited(self, ending, capsys):
         box: dict = {}
@@ -632,6 +633,7 @@ class TestRunWithBoundedTeardown:
 
         assert [r for r in caplog.records if r.name == 'orchestrator.cli'] == []
 
+    @pytest.mark.timing(reason='the teardown watchdog deadline is the behaviour under test')
     def test_a_clean_teardown_disarms_the_watchdog(self):
         exits: list[int] = []
         leftovers: list[asyncio.Task] = []
@@ -642,7 +644,7 @@ class TestRunWithBoundedTeardown:
 
         before = _shutdown_watchdog_threads()
         result = cli_module._run_with_bounded_teardown(
-            main, teardown_secs=0.5, _exit=exits.append,
+            main, teardown_secs=_HANG_GUARD_SECS / 2, _exit=exits.append,
         )
         for thread in _shutdown_watchdog_threads() - before:
             thread.join(timeout=_HANG_GUARD_SECS)
