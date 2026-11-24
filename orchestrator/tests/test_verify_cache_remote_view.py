@@ -5,6 +5,7 @@ dispatcher settles what the runner reports."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -14,11 +15,25 @@ import pytest
 from _verify_cache_units import record_entry, unit_key
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheConfig
+from orchestrator.task_verify_spec import (
+    build_task_verify_spec,
+    spec_from_dict,
+    spec_to_dict,
+    task_spec_from_json,
+    task_spec_to_json,
+)
 from orchestrator.verify_cache import keys
 from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_cache.registry import Candidate, KillSwitch, PolicyState, Registry
 from orchestrator.verify_cache.remote_view import ShippedView, planned_unit_ids, ship_view
 from orchestrator.verify_cache.replay import ExecutedModule
+from orchestrator.verify_runner import (
+    MergeVerifySpec,
+    UnscopedTypecheckSpec,
+    build_merge_verify_spec,
+    spec_from_json,
+    spec_to_json,
+)
 from orchestrator.verify_spec_shared import VerifyCommand
 
 _NOW = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
@@ -200,3 +215,66 @@ class TestPlannedUnitIds:
         assert set(planned_unit_ids([VerifyCommand.from_module_config(alpha), global_command])) == {
             *ExecutedModule.of(alpha, config).unit_ids(), *ExecutedModule.of(None, config).unit_ids(), keys.TREE_UNIT_ID,
         }
+
+
+_ALPHA_MODULE = ModuleConfig(prefix='alpha', test_command='pytest alpha', lint_command='ruff check alpha')
+_SHIPPED = ShippedView(
+    CacheMode.ON, _NOW + timedelta(days=1), 'two leaks', (_candidate(), _candidate(_BETA, entry_id=2)), True,
+)
+
+
+def _merge_spec(view: ShippedView | None = None) -> MergeVerifySpec:
+    return MergeVerifySpec(
+        verify_commands=(VerifyCommand.from_module_config(_ALPHA_MODULE),),
+        unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+        task_files=('alpha/a.py',),
+        verify_env={},
+        cold_timeout_secs=60.0,
+        verify_cache=view,
+    )
+
+
+def _task_spec(config: OrchestratorConfig):
+    return build_task_verify_spec(
+        config, [_ALPHA_MODULE], ['alpha/a.py'], force_workspace=False, attempt_id=1, task_id='9123', tip_sha='a' * 40,
+    )
+
+
+class TestMergeSpecCarriesTheView:
+    @pytest.mark.parametrize('view', [_SHIPPED, None], ids=['view', 'none'])
+    def test_the_view_round_trips(self, view):
+        assert spec_from_json(spec_to_json(_merge_spec(view))).verify_cache == view
+
+    def test_a_legacy_spec_without_the_block_decodes_to_no_view(self):
+        legacy = _merge_spec(_SHIPPED).to_dict()
+        del legacy['verify_cache']
+
+        assert MergeVerifySpec.from_dict(legacy).verify_cache is None
+
+    def test_the_builder_ships_no_view(self):
+        config = OrchestratorConfig()
+
+        assert build_merge_verify_spec(config, [_ALPHA_MODULE], None).verify_cache is None
+
+
+class TestTaskSpecCarriesTheView:
+    @pytest.mark.parametrize('view', [_SHIPPED, None], ids=['view', 'none'])
+    def test_the_view_round_trips(self, view):
+        spec = dataclasses.replace(_task_spec(OrchestratorConfig()), verify_cache=view)
+
+        assert task_spec_from_json(task_spec_to_json(spec)) == spec
+        assert 'verify_cache' in spec_to_dict(spec)
+
+    def test_a_spec_dict_without_the_block_is_still_rejected(self):
+        wire = spec_to_dict(_task_spec(OrchestratorConfig()))
+        del wire['verify_cache']
+
+        with pytest.raises(TypeError, match='verify_cache'):
+            spec_from_dict(wire)
+
+    def test_a_view_that_is_not_a_shipped_view_is_rejected_naming_the_field(self):
+        with pytest.raises(TypeError, match='TaskVerifySpec.verify_cache'):
+            dataclasses.replace(_task_spec(OrchestratorConfig()), verify_cache=_SHIPPED.to_wire())
+
+    def test_the_builder_ships_no_view(self):
+        assert _task_spec(OrchestratorConfig()).verify_cache is None
