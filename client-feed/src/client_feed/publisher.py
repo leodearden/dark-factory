@@ -19,6 +19,9 @@ from pydantic import BaseModel, ConfigDict
 from client_feed.budget import counted_set
 from client_feed.contract import (
     Branch,
+    CriteriaDeclared,
+    CriteriaResults,
+    Criterion,
     Degradation,
     EngagementProjection,
     EventHeader,
@@ -28,9 +31,19 @@ from client_feed.contract import (
     Heartbeat,
     NonNegativeInt,
     RevealBudget,
+    RunKind,
     Source,
     TreeFile,
     TreeSnapshot,
+)
+from client_feed.criteria import (
+    CriteriaError,
+    CriteriaRun,
+    declared_event,
+    read_declared,
+    read_staging,
+    results_event,
+    verify_criteria,
 )
 from client_feed.engagement import EngagementUnusable, read_engagement
 from client_feed.envelope import Stamp
@@ -75,6 +88,7 @@ _FIXED_SOURCE_ERRORS: Final[Mapping[type[Exception], Source]] = MappingProxyType
         ArchiveReadError: Source.ARCHIVE,
         EngagementUnusable: Source.ENGAGEMENT,
         InboxUnusable: Source.INBOX,
+        CriteriaError: Source.CRITERIA,
     }
 )
 _SOURCE_ERRORS: Final = (StoreReadError, *_FIXED_SOURCE_ERRORS)
@@ -284,6 +298,61 @@ def _summaries_unit(
     )
 
 
+def _declared_unit(
+    root: Path, git: _Git | None, degraded: list[Degradation]
+) -> tuple[Criterion, ...] | None:
+    """The criteria main's head declares; None, so the state's declaration stands, when they cannot be read."""
+    if git is None or git.head is None:
+        return None
+    head = git.head
+    return _guarded(lambda: read_declared(root, head), degraded)
+
+
+def _verify_criteria_unit(
+    root: Path,
+    stream: StreamOutput | None,
+    declared: tuple[Criterion, ...],
+    degraded: list[Degradation],
+) -> CriteriaRun | None:
+    """The criteria the pass's newest tested verify run evidences; None when it has none or nothing is declared."""
+    if stream is None or not stream.reports or not declared:
+        return None
+    newest = stream.reports[-1]
+    return _guarded(
+        lambda: verify_criteria(
+            root,
+            newest.junit_relpaths,
+            declared=declared,
+            commit=newest.run.commit,
+            run_at=newest.run.at,
+        ),
+        degraded,
+    )
+
+
+def _criteria_events(
+    policy: Policy,
+    *,
+    git: _Git | None,
+    stream: StreamOutput | None,
+    view: FeedState,
+    stamp: Stamp,
+    now: datetime,
+    degraded: list[Degradation],
+) -> tuple[CriteriaDeclared | CriteriaResults, ...]:
+    """The declaration read at main's head, then the verify and staging results; each read fails alone."""
+    read = _declared_unit(policy.project_root, git, degraded)
+    declared = tuple(view.criteria_declared.values()) if read is None else read
+    verify = _verify_criteria_unit(policy.project_root, stream, declared, degraded)
+    staging = _guarded(lambda: read_staging(policy.out_dir), degraded)
+    events = (
+        None if read is None else declared_event(read, state=view, stamp=stamp, now=now),
+        None if verify is None else results_event(RunKind.VERIFY, verify, state=view, stamp=stamp),
+        None if staging is None else results_event(RunKind.STAGING, staging, state=view, stamp=stamp),
+    )
+    return tuple(event for event in events if event is not None)
+
+
 def _inbox_unit(policy: Policy, cursor: Cursor, degraded: list[Degradation]) -> InboxRead | None:
     """The requests past the cursor's offset; lines that are no request are named, and the tail moves past them."""
     inbox = _guarded(lambda: read_inbox(policy.in_dir, offset=cursor.inbox_offset), degraded)
@@ -428,7 +497,7 @@ def _advanced(
 def run_pass(
     policy: Policy, out: OutDir, *, now: datetime, rescan_tasks: bool = True
 ) -> PassReport:
-    """Read every source, append what is news in the order tasks, stream, factory, branches, reveals, tree, PRDs, heartbeat.
+    """Read every source, append what is news in the order tasks, stream, factory, branches, reveals, tree, PRDs, criteria, heartbeat.
 
     A source that cannot be read is named in the heartbeat's degraded and holds only its own cursor fields.
     """
@@ -478,6 +547,9 @@ def run_pass(
         stamp=stamp,
         now=now,
     )
+    criteria = _criteria_events(
+        policy, git=git, stream=stream, view=view, stamp=stamp, now=now, degraded=degraded
+    )
     heartbeat = Heartbeat(
         **stamp(now),
         head=None if git is None else git.head,
@@ -493,6 +565,7 @@ def run_pass(
         *(() if reveals is None else reveals.events),
         *(() if snapshot is None else (snapshot,)),
         *prds,
+        *criteria,
         heartbeat,
     ]
     events_id = None if store is None or stream is None else store.cursor
