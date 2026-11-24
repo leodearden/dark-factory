@@ -7,8 +7,10 @@ until the test opens its gate.  Startup collaborators are stubbed the way
 
 ``Board`` records every dispatch tick and every wait for a slot to turn over;
 ``build_board_harness`` wires it into a harness; ``run_driven`` runs ``h.run()``
-while a test coroutine steers it.  Nothing here sleeps in real time: ``until``
-polls by yielding, and ``Board.settle`` counts the loop's own polls.
+while a test coroutine steers it.  Nothing here sleeps in real time:
+``Board.until`` wakes on each change the board records, ``Board.settle`` counts
+the loop's own polls, and ``until`` polls by yielding, for a predicate over
+state the board does not record.
 """
 
 from __future__ import annotations
@@ -78,6 +80,7 @@ class Board:
         self.max_live = 0
         self.leases: dict[str, SlotLease] = {}
         self.turnover_waits = 0
+        self._change = asyncio.Event()
         self._all_open = False
         self._inside_next_restricted_tick: Callable[[], Awaitable[None]] | None = None
         real_acquire = scheduler.acquire_next
@@ -89,6 +92,7 @@ class Board:
                 await action()
             assignment = await real_acquire(scope)
             self.ticks.append(Tick(epoch, scope, assignment.task_id if assignment else None))
+            self._changed()
             return assignment
 
         scheduler.get_tasks = AsyncMock(side_effect=lambda **_: list(self.tasks))
@@ -116,10 +120,29 @@ class Board:
         """The run loop's polls so far: every dispatch tick and every wait for a slot to turn over."""
         return len(self.ticks) + self.turnover_waits
 
+    def count_turnover_wait(self) -> None:
+        self.turnover_waits += 1
+        self._changed()
+
+    def _changed(self) -> None:
+        change, self._change = self._change, asyncio.Event()
+        change.set()
+
+    async def until(self, predicate: Callable[[], bool], label: str) -> None:
+        """Wait until *predicate* over the board holds, re-checking on each change the board records.
+
+        Fails by *label* on the responsive-time deadline.
+        """
+        async def wait() -> None:
+            while not predicate():
+                await self._change.wait()
+
+        await wait_responsive(wait(), label=label)
+
     async def settle(self) -> None:
         """Let the run loop make ``SETTLE_POLLS`` more polls."""
         target = self.polls() + SETTLE_POLLS
-        await until(lambda: self.polls() >= target, f'the run loop makes {SETTLE_POLLS} more polls')
+        await self.until(lambda: self.polls() >= target, f'the run loop makes {SETTLE_POLLS} more polls')
 
     def holds_locks(self, tid: str) -> bool:
         return self.scheduler.lock_table.is_held(tid)
@@ -139,6 +162,7 @@ class Board:
         self.live.add(tid)
         self.live_at_start[tid] = len(self.live)
         self.max_live = max(self.max_live, len(self.live))
+        self._changed()
         if self._all_open:
             self.gates[tid].set()
         try:
@@ -150,10 +174,14 @@ class Board:
             self.live.discard(tid)
             self.tasks = [t for t in self.tasks if t['id'] != tid]
             lease.release(requeued=False)
+            self._changed()
 
 
 async def until(predicate: Callable[[], bool], label: str) -> None:
-    """Yield to the loop until *predicate* holds, failing by *label* on the responsive-time deadline."""
+    """Yield to the loop until *predicate* holds, failing by *label* on the responsive-time deadline.
+
+    For state the board does not record; a predicate over the board waits in ``Board.until``.
+    """
     async def poll() -> None:
         while not predicate():
             await asyncio.sleep(0)
@@ -208,7 +236,7 @@ def build_board_harness(
 
     async def counted_wait_for_slot_turnover() -> None:
         await wait_for_slot_turnover()
-        board.turnover_waits += 1
+        board.count_turnover_wait()
 
     stubs: tuple[tuple[str, object], ...] = (
         ('_start_escalation_server', AsyncMock()),

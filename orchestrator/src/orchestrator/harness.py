@@ -234,6 +234,7 @@ from orchestrator.service_restart import (
     schedule_detached_systemd_restart,
 )
 from orchestrator.slot_lease import (
+    LendingRule,
     SlotLease,
     SlotLendingError,
     SuspendedTask,
@@ -14832,12 +14833,15 @@ class Harness:
         step.  Rules: ``plans/early-start-on-predecessor-branch-prd.md``
         section 5.3 "Slot".
         """
-        lender = self._slot_lease_registry().get(lender_task_id)
+        leases = self._slot_lease_registry()
+        lender = leases.get(lender_task_id)
         if lender is None:
             raise SlotLendingError(
-                f'slot lending refused: task {lender_task_id} cannot lend to task '
-                f'{assignment.task_id}: a borrower borrows from a live slot, and task '
-                f'{lender_task_id} has none',
+                LendingRule.NO_LIVE_SLOT, lender_task_id=lender_task_id, borrower_task_id=assignment.task_id,
+            )
+        if assignment.task_id in leases:
+            raise SlotLendingError(
+                LendingRule.BORROWER_HAS_SLOT, lender_task_id=lender_task_id, borrower_task_id=assignment.task_id,
             )
         slot = self._launch_slot(assignment, lender.lend(assignment.task_id), task_reports)
         logger.info(

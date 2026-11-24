@@ -25,7 +25,6 @@ from _run_loop_board import (
     run_driven,
     run_ready_callbacks,
     task,
-    until,
 )
 from shared.psi import PsiSample
 
@@ -62,7 +61,7 @@ def _fleet_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def _saturate(board: Board) -> None:
-    await until(lambda: len(board.live) == _GENERAL_SLOTS, 'every general slot holds a merge-waiter')
+    await board.until(lambda: len(board.live) == _GENERAL_SLOTS, 'every general slot holds a merge-waiter')
 
 
 @pytest.mark.asyncio
@@ -77,7 +76,7 @@ class TestMainHealthFixReserve:
             await _saturate(board)
             filed = board.file(plain('50', 'critical'), _fix('60'))
 
-            await until(lambda: board.started('60'), 'the fix starts on the reserve')
+            await board.until(lambda: board.started('60'), 'the fix starts on the reserve')
             assert board.live_at_start['60'] == _GENERAL_SLOTS + 1
             first = board.ticks_since(filed)[0]
             assert (first.scope, first.picked) == (DispatchScope.MAIN_HEALTH_FIX, '60')
@@ -103,7 +102,7 @@ class TestMainHealthFixReserve:
             host.sample = _SATURATED_PSI
             filed = board.file(plain('50', 'critical'), _fix('60'))
 
-            await until(lambda: board.started('60'), 'the fix starts on the reserve under a PSI hold')
+            await board.until(lambda: board.started('60'), 'the fix starts on the reserve under a PSI hold')
             assert board.live_at_start['60'] == _GENERAL_SLOTS + 1
             first = board.ticks_since(filed)[0]
             assert (first.scope, first.picked) == (DispatchScope.MAIN_HEALTH_FIX, '60')
@@ -122,7 +121,7 @@ class TestMainHealthFixReserve:
         async def drive() -> None:
             await _saturate(board)
             board.file(_fix('60'))
-            await until(lambda: board.started('60'), 'the fix takes the reserve')
+            await board.until(lambda: board.started('60'), 'the fix takes the reserve')
 
             ticks_when_full = len(board.ticks)
             board.file(plain('70'))
@@ -132,7 +131,7 @@ class TestMainHealthFixReserve:
 
             freed = board.mark()
             board.gates['1'].set()
-            await until(lambda: board.started('70'), 'the next task starts on the freed slot')
+            await board.until(lambda: board.started('70'), 'the next task starts on the freed slot')
             first = board.ticks_since(freed)[0]
             assert (first.scope, first.picked) == (DispatchScope.ANY, '70')
 
@@ -162,7 +161,7 @@ class TestMainHealthFixReserve:
         async def drive() -> None:
             await _saturate(board)
             board.file(_fix('60'), _fix('61'))
-            await until(lambda: board.started('60') or board.started('61'), 'one fix starts')
+            await board.until(lambda: board.started('60') or board.started('61'), 'one fix starts')
             await board.settle()
 
             [first_fix] = [tid for tid in ('60', '61') if board.started(tid)]
@@ -172,7 +171,7 @@ class TestMainHealthFixReserve:
 
             freed = board.mark()
             board.gates[first_fix].set()
-            await until(lambda: board.started(second_fix), 'the second fix takes the freed reserve')
+            await board.until(lambda: board.started(second_fix), 'the second fix takes the freed reserve')
             assert board.live_at_start[second_fix] == _GENERAL_SLOTS + 1
             first = board.ticks_since(freed)[0]
             assert (first.scope, first.picked) == (DispatchScope.MAIN_HEALTH_FIX, second_fix)
@@ -190,13 +189,13 @@ class TestMainHealthFixReserve:
         async def end_a_merge_waiter_and_file_plain_work() -> None:
             filed.append(board.file(plain('70')))
             board.gates['1'].set()
-            await until(lambda: board.started('1') and '1' not in board.live, 'merge-waiter 1 ends mid-tick')
+            await board.until(lambda: board.started('1') and '1' not in board.live, 'merge-waiter 1 ends mid-tick')
             await run_ready_callbacks()
 
         board.inside_next_restricted_tick(end_a_merge_waiter_and_file_plain_work)
 
         async def drive() -> None:
-            await until(lambda: board.started('70'), 'the freed general slot is refilled before the next poll')
+            await board.until(lambda: board.started('70'), 'the freed general slot is refilled before the next poll')
             [epoch] = filed
             first = board.ticks_since(epoch)[0]
             assert (first.scope, first.picked) == (DispatchScope.ANY, '70')

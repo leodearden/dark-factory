@@ -30,12 +30,14 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 from escalation.categories import EscalationCategory
 from escalation.models import Escalation
 
 __all__ = [
+    'LendingRule',
     'SlotLease',
     'SlotLendingError',
     'SuspendedTask',
@@ -53,8 +55,27 @@ class _LockReleaser(Protocol):
     def release(self, task_id: str, *, requeued: bool = ...) -> None: ...
 
 
+class LendingRule(Enum):
+    """The slot rule a refused lend breaks; each value says it in prose."""
+
+    OWN_TASK = 'a lease cannot lend to its own task'
+    LENDER_RELEASED = 'the lender is already released'
+    ALREADY_LENDS = 'the lender already lends to a live borrower'
+    NO_OWN_PERMIT = 'the lender holds no permit of its own; a borrower lends only after it inherits'
+    NO_LIVE_SLOT = 'a borrower borrows from a live slot, and the lender has none'
+    BORROWER_HAS_SLOT = 'the borrower already has a live slot of its own'
+
+
 class SlotLendingError(RuntimeError):
-    """A lend the slot rules refuse: the lender is released, holds no permit, or already lends."""
+    """A lend the slot rules refuse: which *rule* it breaks, and the two tasks."""
+
+    def __init__(self, rule: LendingRule, *, lender_task_id: str, borrower_task_id: str) -> None:
+        super().__init__(
+            f'slot lending refused: task {lender_task_id} cannot lend to task {borrower_task_id}: {rule.value}',
+        )
+        self.rule = rule
+        self.lender_task_id = lender_task_id
+        self.borrower_task_id = borrower_task_id
 
 
 class SlotLease:
@@ -103,23 +124,23 @@ class SlotLease:
 
     def lend(self, task_id: str) -> SlotLease:
         """A lease for *task_id* that takes no permit and inherits this one's when this one is released."""
-        rule = self._broken_lending_rule()
+        rule = self._broken_lending_rule(task_id)
         if rule is not None:
-            raise SlotLendingError(
-                f'slot lending refused: task {self._task_id} cannot lend to task {task_id}: {rule}',
-            )
+            raise SlotLendingError(rule, lender_task_id=self._task_id, borrower_task_id=task_id)
         borrower = SlotLease.__new__(SlotLease)
         borrower._bind(task_id, self._scheduler, permit=None, lender=self)
         self._borrower = borrower
         return borrower
 
-    def _broken_lending_rule(self) -> str | None:
+    def _broken_lending_rule(self, borrower_task_id: str) -> LendingRule | None:
+        if borrower_task_id == self._task_id:
+            return LendingRule.OWN_TASK
         if self._released:
-            return 'the lender is already released'
+            return LendingRule.LENDER_RELEASED
         if self._borrower is not None:
-            return f'the lender already lends to live borrower task {self._borrower._task_id}'
+            return LendingRule.ALREADY_LENDS
         if self._permit is None:
-            return 'the lender holds no permit of its own; a borrower lends only after it inherits'
+            return LendingRule.NO_OWN_PERMIT
         return None
 
     async def wait_released(self) -> None:
@@ -127,7 +148,7 @@ class SlotLease:
         await self._released_event.wait()
 
     def release(self, *, requeued: bool) -> bool:
-        """Release the slot's module locks, give back its permit, then signal; False on a repeat.
+        """Release the slot's module locks, settle its permit, then signal; False on a repeat.
 
         *requeued* arms the scheduler's requeue cooldown, as
         ``scheduler.py::Scheduler.release`` documents. A held permit passes to
@@ -142,12 +163,12 @@ class SlotLease:
             self._scheduler.release(self._task_id, requeued=requeued)
         finally:
             try:
-                self._give_back_permit()
+                self._settle_permit()
             finally:
                 self._released_event.set()
         return True
 
-    def _give_back_permit(self) -> None:
+    def _settle_permit(self) -> None:
         permit, self._permit = self._permit, None
         borrower, self._borrower = self._borrower, None
         if permit is None:

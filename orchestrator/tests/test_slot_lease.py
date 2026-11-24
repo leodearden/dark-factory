@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from _orch_helpers import wait_responsive
 
-from orchestrator.slot_lease import SlotLease, SlotLendingError
+from orchestrator.slot_lease import LendingRule, SlotLease, SlotLendingError
 
 pytestmark = pytest.mark.asyncio
 
@@ -166,10 +166,24 @@ class TestLendRefusals:
         with pytest.raises(SlotLendingError) as refused:
             lender.lend(BORROWER)
 
-        message = str(refused.value)
-        assert 'already released' in message
-        assert LENDER in message and BORROWER in message
+        assert refused.value.rule is LendingRule.LENDER_RELEASED
+        assert (refused.value.lender_task_id, refused.value.borrower_task_id) == (LENDER, BORROWER)
+        assert f'task {LENDER} cannot lend to task {BORROWER}' in str(refused.value)
         assert lender.borrower is None
+        assert await free_permits(pool) == before
+
+    async def test_a_lease_cannot_lend_to_its_own_task(
+        self, scheduler: _RecordingScheduler, pool: asyncio.Semaphore,
+    ) -> None:
+        lender = await _claimed(LENDER, scheduler, pool)
+        before = await free_permits(pool)
+
+        with pytest.raises(SlotLendingError) as refused:
+            lender.lend(LENDER)
+
+        assert refused.value.rule is LendingRule.OWN_TASK
+        assert lender.borrower is None
+        assert lender.holds_permit and not lender.released
         assert await free_permits(pool) == before
 
     async def test_a_lease_with_a_live_borrower_cannot_lend_a_second_time(
@@ -182,9 +196,8 @@ class TestLendRefusals:
         with pytest.raises(SlotLendingError) as refused:
             lender.lend(SECOND)
 
-        message = str(refused.value)
-        assert 'already lends' in message
-        assert LENDER in message and SECOND in message and BORROWER in message
+        assert refused.value.rule is LendingRule.ALREADY_LENDS
+        assert (refused.value.lender_task_id, refused.value.borrower_task_id) == (LENDER, SECOND)
         assert lender.borrower is borrower
         assert lender.holds_permit and not borrower.holds_permit
         assert not lender.released and not borrower.released
@@ -200,9 +213,8 @@ class TestLendRefusals:
         with pytest.raises(SlotLendingError) as refused:
             borrower.lend(SECOND)
 
-        message = str(refused.value)
-        assert 'holds no permit' in message
-        assert BORROWER in message and SECOND in message
+        assert refused.value.rule is LendingRule.NO_OWN_PERMIT
+        assert (refused.value.lender_task_id, refused.value.borrower_task_id) == (BORROWER, SECOND)
         assert borrower.borrower is None
         assert lender.borrower is borrower
         assert lender.holds_permit and not borrower.holds_permit

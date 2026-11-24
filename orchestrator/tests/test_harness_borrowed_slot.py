@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
-from _orch_helpers import HermeticMcpSession
+from _orch_helpers import HermeticMcpSession, wait_responsive
 from _run_loop_board import (
     build_board_harness,
     fleet_dir_env,
@@ -35,11 +35,10 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.run_slots import DispatchScope, RunSlots
 from orchestrator.scheduler import Scheduler, TaskAssignment
-from orchestrator.slot_lease import SlotLease, SlotLendingError
+from orchestrator.slot_lease import LendingRule, SlotLease, SlotLendingError
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 from orchestrator.workflow_types import CancellationScope, WorkflowCancelled
 
-BARRIER = 5.0
 HARD_CANCEL_POLLS = 2
 FORCE_RELEASE_POLLS = 3
 CLEANUP_GRACE = 10.0
@@ -174,6 +173,12 @@ class _Rig:
         sem = await self.slots.claim(DispatchScope.ANY, {'id': tid})
         return SlotLease(tid, self.scheduler, sem)
 
+    async def outside_lease(self, tid: str) -> SlotLease:
+        """A lease on a permit outside the rig's pool, so *tid* runs beside P without taking P's permit."""
+        pool = asyncio.Semaphore(1)
+        await pool.acquire()
+        return SlotLease(tid, self.scheduler, pool)
+
     def launch(self, assignment: TaskAssignment, lease: SlotLease) -> asyncio.Task:
         slot = self.harness._launch_slot(assignment, lease, self.reports)
         self.slot_of[assignment.task_id] = slot
@@ -184,11 +189,16 @@ class _Rig:
         self.slot_of[assignment.task_id] = slot
         return slot
 
-    async def launch_pair(self) -> SlotLease:
-        """Lender P on a holding lease, then D borrowing from it; returns P's lease."""
+    async def launch_lender(self) -> SlotLease:
+        """Lender P on a holding lease, running; returns its lease."""
         p_lease = await self.holding_lease('P')
         self.launch(self.assignment('P'), p_lease)
         await self.wait_active('P')
+        return p_lease
+
+    async def launch_pair(self) -> SlotLease:
+        """Lender P on a holding lease, then D borrowing from it; returns P's lease."""
+        p_lease = await self.launch_lender()
         self.launch_borrowing(self.assignment('D'), 'P')
         await self.wait_active('D')
         return p_lease
@@ -214,8 +224,7 @@ class _Rig:
                 slot.cancel()
             else:
                 self.gate(tid).set()
-            await asyncio.wait({slot}, timeout=BARRIER)
-            assert slot.done(), f'slot {tid} did not end'
+            await wait_responsive(asyncio.wait({slot}), label=f'slot {tid} ends')
         assert not self.harness.is_workflow_active(tid)
 
     async def assert_never_launched(self, tid: str) -> None:
@@ -240,7 +249,7 @@ class _Rig:
         for release in self.wedge_releases:
             release.set()
         if self.slot_of:
-            await asyncio.wait(self.slot_of.values(), timeout=BARRIER)
+            await wait_responsive(asyncio.wait(set(self.slot_of.values())), label='every slot ends')
 
 
 @pytest_asyncio.fixture
@@ -277,6 +286,23 @@ class TestSlotOnALease:
         assert await rig.exactly_one_permit_free()
         assert not rig.scheduler.lock_table.is_held('P')
 
+    async def test_a_borrower_cancelled_before_its_first_step_detaches_and_the_lender_returns_its_permit(
+        self, rig: _Rig,
+    ) -> None:
+        p_lease = await rig.launch_lender()
+        slot = rig.launch_borrowing(rig.assignment('D'), 'P')
+        slot.cancel()
+        await asyncio.gather(slot, return_exceptions=True)
+
+        assert slot.cancelled()
+        assert 'D' not in rig.built
+        assert p_lease.borrower is None
+        assert not rig.scheduler.lock_table.is_held('D')
+        assert rig.slots.free_scope() is None
+
+        await rig.end('P')
+        assert await rig.exactly_one_permit_free()
+
     async def test_a_holding_lease_slot_that_ends_returns_its_permit_and_frees_its_locks(
         self, rig: _Rig,
     ) -> None:
@@ -285,7 +311,7 @@ class TestSlotOnALease:
         assert rig.slots.free_scope() is None
 
         rig.gate('P').set()
-        report = await asyncio.wait_for(slot, BARRIER)
+        report = await wait_responsive(slot, label='slot P ends')
 
         assert report is not None and report.outcome is WorkflowOutcome.DONE
         assert await rig.exactly_one_permit_free()
@@ -306,25 +332,25 @@ async def test_a_borrower_in_the_run_loop_takes_no_permit_and_the_waiting_task_s
     )
 
     async def drive() -> None:
-        await until(lambda: len(board.live) == _GENERAL_SLOTS, 'every general slot is taken')
+        await board.until(lambda: len(board.live) == _GENERAL_SLOTS, 'every general slot is taken')
         lender = min(board.live)
         [waiting] = [tid for tid in ('1', '2', '3') if not board.started(tid)]
 
         h._launch_slot(
             TaskAssignment(task_id='D', task=plain('D'), modules=[]), board.leases[lender].lend('D'), [],
         )
-        await until(lambda: board.started('D'), 'the borrower starts')
+        await board.until(lambda: board.started('D'), 'the borrower starts')
         await board.settle()
         assert not board.started(waiting), 'the borrower took a permit'
 
         first, second = (lender, 'D') if first_to_end == 'lender' else ('D', lender)
         board.gates[first].set()
-        await until(lambda: first not in board.live, f'{first} ends')
+        await board.until(lambda: first not in board.live, f'{first} ends')
         await board.settle()
         assert not board.started(waiting), f'{first} ending returned a permit while {second} still runs'
 
         board.gates[second].set()
-        await until(lambda: board.started(waiting), 'the waiting task starts on the returned permit')
+        await board.until(lambda: board.started(waiting), 'the waiting task starts on the returned permit')
 
     await run_driven(h, board, drive)
     assert board.max_live <= _GENERAL_SLOTS + 1
@@ -359,6 +385,9 @@ class TestBorrowedSlotExits:
         assert not rig.scheduler.lock_table.is_held('P')
         assert not rig.scheduler.lock_table.is_held('D')
 
+        await rig.retire()
+        assert await rig.exactly_one_permit_free(), 'a force-released slot released its lease again when it ended'
+
     @pytest.mark.parametrize('first', ['P', 'D'], ids=['lender-first', 'borrower-first'])
     async def test_shutting_down_both_slots_returns_exactly_one_permit(self, rig: _Rig, first: str) -> None:
         await rig.launch_pair()
@@ -378,8 +407,9 @@ class TestBorrowingRefusals:
     async def test_a_lender_lends_to_one_borrower_at_a_time(self, rig: _Rig) -> None:
         await rig.launch_pair()
 
-        with pytest.raises(SlotLendingError, match='already lends'):
+        with pytest.raises(SlotLendingError) as refused:
             rig.launch_borrowing(_assignment('D2'), 'P')
+        assert refused.value.rule is LendingRule.ALREADY_LENDS
         await rig.assert_never_launched('D2')
         assert rig.slots.free_scope() is None
 
@@ -395,8 +425,9 @@ class TestBorrowingRefusals:
     async def test_a_borrower_lends_only_after_it_inherits(self, rig: _Rig) -> None:
         await rig.launch_pair()
 
-        with pytest.raises(SlotLendingError, match='holds no permit'):
+        with pytest.raises(SlotLendingError) as refused:
             rig.launch_borrowing(_assignment('D3'), 'D')
+        assert refused.value.rule is LendingRule.NO_OWN_PERMIT
         await rig.assert_never_launched('D3')
         assert rig.slots.free_scope() is None
 
@@ -414,10 +445,28 @@ class TestBorrowingRefusals:
         with pytest.raises(SlotLendingError) as refused:
             rig.launch_borrowing(_assignment('X'), 'nobody')
 
-        message = str(refused.value)
-        assert 'live slot' in message
-        assert 'task X' in message and 'task nobody' in message
+        assert refused.value.rule is LendingRule.NO_LIVE_SLOT
+        assert (refused.value.lender_task_id, refused.value.borrower_task_id) == ('nobody', 'X')
         await rig.assert_never_launched('X')
+        assert await rig.exactly_one_permit_free()
+
+    async def test_a_task_with_a_live_slot_cannot_borrow_a_second_one(self, rig: _Rig) -> None:
+        rig.launch(rig.assignment('Q'), await rig.outside_lease('Q'))
+        await rig.wait_active('Q')
+        p_lease = await rig.launch_lender()
+
+        with pytest.raises(SlotLendingError) as refused:
+            rig.launch_borrowing(_assignment('Q'), 'P')
+
+        assert refused.value.rule is LendingRule.BORROWER_HAS_SLOT
+        await run_ready_callbacks()
+        assert rig.built.count('Q') == 1
+        assert p_lease.borrower is None
+
+        await rig.end('Q')
+        assert not rig.scheduler.lock_table.is_held('Q')
+        assert rig.slots.free_scope() is None
+        await rig.end('P')
         assert await rig.exactly_one_permit_free()
 
 
@@ -446,7 +495,7 @@ class TestSlotEndedSignal:
             assert not waiting.done(), 'the signal fired while P still runs'
 
             await rig.end('P')
-            await asyncio.wait_for(waiting, BARRIER)
+            await wait_responsive(waiting, label='the slot-ended waiter wakes')
         finally:
             waiting.cancel()
 
