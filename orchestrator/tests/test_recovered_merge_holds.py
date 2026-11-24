@@ -10,10 +10,12 @@ module: it reads harness privates, which the merge-lane ratchet
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NamedTuple
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _orch_helpers import HermeticMcpSession
@@ -110,3 +112,103 @@ class TestRestoreAtStartup:
 
         assert _TID not in _held(scheduler)
         assert _event_data(store, 'lock_acquired', _TID) == []
+
+
+def _fake_request(task_id: str = _TID, files: list[str] = _FILES) -> SimpleNamespace:
+    return SimpleNamespace(
+        task_id=task_id, request_id=f'mr-recovered-{task_id}',
+        branch=SimpleNamespace(bare_id=task_id), task_files=list(files),
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+
+async def _recover(h: Harness, *requests: SimpleNamespace) -> dict:
+    report = {
+        'recovered': len(requests), 'dropped': 0, 'coalesced': 0,
+        'requests': list(requests), 'journal_corrupt': False,
+    }
+    with patch('orchestrator.harness.recover_pending_merges', AsyncMock(return_value=report)):
+        return await h._recover_pending_merges()
+
+
+async def _drain(h: Harness) -> None:
+    await asyncio.sleep(0)
+    await asyncio.gather(*h._background_tasks)
+
+
+def _stub_routing_writes(scheduler: Scheduler) -> None:
+    scheduler.get_status = AsyncMock(return_value='in-progress')
+    scheduler.clear_claim_then_set_status = AsyncMock()
+
+
+_VERIFY_RED = SimpleNamespace(
+    status='blocked', reason='post-merge verify red',
+    block_category=SimpleNamespace(value='merge_error'),
+    failure_category=None, failure_cause_hint=None,
+)
+
+
+@pytest.mark.asyncio
+class TestRestoreToleratesWhatItCannotTake:
+    async def test_a_key_already_taken_is_left_unheld_and_named(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, store = _scene(tmp_path)
+        files = {'40': ['shared.py', 'a.py'], '41': ['shared.py', 'b.py']}
+        for tid, task_files in files.items():
+            await journal_merge_request(h, tid, task_files=task_files)
+
+        report = await h._recover_pending_merges()
+
+        request_ids = {r.task_id: r.request_id for r in report['requests']}
+        assert sorted(request_ids) == ['40', '41']
+        [shared] = _keys(h, ['shared.py'])
+        held = _held(scheduler)
+        [first] = [tid for tid in files if shared in held.get(tid, ())]
+        [other] = [tid for tid in files if tid != first]
+        own = {tid: _keys(h, task_files[1:], tid) for tid, task_files in files.items()}
+        assert held[first] == tuple(sorted((shared, *own[first])))
+        assert held[other] == own[other]
+        [incomplete] = store.fetch_events_by_type('recovered_merge_hold_incomplete')
+        assert incomplete['task_id'] == other
+        assert incomplete['data'] == {
+            'request_id': request_ids[other],
+            'restored': list(own[other]),
+            'unheld': [{'module': shared, 'owner': first, 'kind': 'held'}],
+        }
+
+    async def test_a_request_finalized_before_the_restore_gains_no_hold(
+        self, tmp_path: Path,
+    ) -> None:
+        h, scheduler, store = _scene(tmp_path)
+        _stub_routing_writes(scheduler)
+        request = _fake_request()
+
+        def finalize_then_answer(ids=None):
+            request.result.set_result(_VERIFY_RED)
+            return {_TID: 'in-progress'}, None
+
+        scheduler.get_statuses = AsyncMock(side_effect=finalize_then_answer)
+
+        await _recover(h, request)
+
+        assert _TID not in _held(scheduler)
+        assert _event_data(store, 'lock_acquired', _TID) == []
+        await _drain(h)
+
+    @pytest.mark.parametrize('failure', ['error_result', 'raises'])
+    async def test_an_unreadable_task_store_restores_nothing_and_does_not_raise(
+        self, tmp_path: Path, failure: str,
+    ) -> None:
+        h, scheduler, _store = _scene(tmp_path)
+        await journal_merge_request(h, _TID, task_files=_FILES)
+        scheduler.get_statuses = (
+            AsyncMock(return_value=({}, RuntimeError('store down')))
+            if failure == 'error_result'
+            else AsyncMock(side_effect=RuntimeError('store down'))
+        )
+
+        report = await h._recover_pending_merges()
+
+        assert [r.task_id for r in report['requests']] == [_TID]
+        assert _held(scheduler) == {}
