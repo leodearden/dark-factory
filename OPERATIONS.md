@@ -4344,23 +4344,49 @@ directly, not just interactive sessions. Treat it accordingly:
 
 dark-factory and the sibling **reify** repo each carry a copy of the
 lock-charter file-path allowlist (`FILE_EXTENSIONS` /
-`EXTENSIONLESS_FILENAMES`). They must agree, and that agreement is checked
-*live, in-suite*, on the merge-verify critical path. That is why the
-2026-07-29 incident happened: reify widened its allowlist 36 → 58 with no
-dark-factory change involved, and every dark-factory worktree's full suite
-went red.
+`EXTENSIONLESS_FILENAMES`). They must agree. Until task 11623 that agreement
+was checked *live, in-suite*, on the merge-verify critical path, so a verdict
+depended on whichever reify HEAD the verifying host had checked out. That is
+why the 2026-07-29 incident happened (reify widened its allowlist 36 → 58 with
+no dark-factory change involved, and every dark-factory worktree's full suite
+went red), and why reify's 2026-11-23 `sccache` addition reddened unchanged
+main on one host and a correct mirror fix on another.
 
-That in-suite check is **still live**, and this section does not retire it:
-the Tier-2 guard in `fused-memory/tests/test_lock_charter_guard.py` still
-shells out to reify's `scripts/lock-charter-guard.sh` and hard-asserts the
-two vectors match, on the merge-verify path. Re-run the 2026-07-29 shape
-today and it reds again — that guard is what you will actually see fail.
-The script below does not replace it. It **adds** an off-critical-path way
-to run the same comparison, so you can answer "did reify move?"
-deliberately: without a suite run, and without attributing the red to
-whatever branch happened to be in the lane (see the attribution contract
-below). Run it whenever either repo's allowlist changes, and before
-believing an in-suite drift failure:
+**The merge gate no longer reads any reify checkout.** The lock-charter suites
+pin committed data only: each vector copy against the literals in its own test
+file (`shared/tests/test_locking.py`,
+`fused-memory/tests/test_lock_charter_guard.py`), fused-memory's copy against
+`shared.locking` (`test_gamma_vectors_match_shared_locking`), and this
+checkout's own tracked corpus
+(`tests/repo_guards/test_lock_charter_tracked_corpus.py`). A reify-side change
+to its extension or extension-less list no longer reds any dark-factory merge,
+on any host.
+
+The cross-repo comparison runs **nightly at 01:45** instead, through
+`lock-charter-drift-check.timer` ([§12](#12-nightly-maintenance-timers)). Its
+wrapper, `scripts/lock-charter-drift-check.sh`, runs
+`scripts/lock_charter_drift_heal.py` against `/home/leo/src/reify`
+(`REIFY_REPO` overrides that path), which routes the outcome:
+
+- **`drift`** files **one** heal task, deduped on metadata
+  `x_lock_charter_drift`. It names every drifted name, split into
+  only-in-reify and only-in-dark-factory, and the four files a mirror edit
+  touches (`HEAL_SITES`: both vector copies and both test vectors). While that
+  task is open, a persisting drift adopts it instead of filing again; once it
+  is done or cancelled, renewed drift files a fresh one.
+- **`unavailable`** files one `escalate_info` (category `infra_issue`) in slot
+  `lock-charter-drift:unavailable`, skipped while one is pending there.
+- **`ok`** calls nothing.
+
+To see what the nightly run would route, without calling either MCP server:
+
+```bash
+uv run --project shared python scripts/lock_charter_drift_heal.py --dry-run
+```
+
+The comparison itself still runs by hand. Run it whenever either repo's
+allowlist changes, and to confirm a heal task's mirror edit is complete (it
+exits 0):
 
 ```bash
 uv run --project shared python scripts/check_lock_charter_drift.py
@@ -4369,10 +4395,9 @@ uv run --project shared python scripts/check_lock_charter_drift.py \
     --reify-repo /path/to/reify
 ```
 
-The reify checkout is located by `--reify-repo`, then `$REIFY_ROOT`, then a
-marker-bound nearest-ancestor walk — the same single-sourced resolution
-(`shared/src/shared/reify_checkout.py`) the in-suite guards use, so the
-script and the suite can never disagree about *which* checkout they mean.
+Both scripts locate the reify checkout by `--reify-repo`, then `$REIFY_ROOT`,
+then a marker-bound nearest-ancestor walk — the single-sourced resolution in
+`shared/src/shared/reify_checkout.py`.
 
 ### The three exit codes
 
@@ -4383,7 +4408,7 @@ never read as a pass.
 | Exit | Status | Meaning |
 |---|---|---|
 | `0` | `ok` | Both vectors agree and reify's tracked corpus is fully covered by the allowlist. |
-| `1` | `drift` | The two repos disagree, or a tracked reify path has an extension the allowlist rejects. |
+| `1` | `drift` | The two repos disagree, a tracked reify path has an extension the allowlist rejects, or (the `extensionless` part) a tracked reify file with no extension is not allowlisted or an allowlisted name is also a reify directory. |
 | `2` | `unavailable` | The comparison **did not happen** — no reify checkout found, no guard script, the guard exited non-zero, it timed out, or the corpus sweep could not run. |
 
 ### Attribution contract
@@ -4391,10 +4416,10 @@ never read as a pass.
 Read the outcome as a statement about the *pair of repos*, not about
 whatever dark-factory branch happens to be under test:
 
-- **`drift` is a cross-repo MIRROR gap, owned by a mirror task. It is NEVER
-  a fault in the dark-factory branch under test.** Do not debug, revert, or
-  re-dispatch a task on the strength of a drift result; file/advance the
-  mirror work instead.
+- **`drift` is a cross-repo MIRROR gap, owned by the heal task the nightly
+  run files. It is NEVER a fault in any dark-factory branch.** Do not debug,
+  revert, or re-dispatch a task on the strength of a drift result; advance the
+  heal task instead.
 - **`unavailable` is not a pass.** Nothing was compared. Fix the
   availability problem (check out the sibling, correct `$REIFY_ROOT`, repair
   the guard script) and re-run before drawing any conclusion.
@@ -4793,6 +4818,7 @@ declared registry and its `LoadState`-aware detector).
 | Slot | Job | Units |
 |---|---|---|
 | 01:30 | Timeout-headroom self-check (per-test ceiling anchors and family leg budgets against the verify archive; files `escalate_info`) | `timeout-headroom-selfcheck.timer` |
+| 01:45 | Cross-repo lock-charter drift check (reify vs dark-factory allowlists; files one heal task / escalate_info) | `lock-charter-drift-check.timer` |
 | 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
 | 02:30 | Transcript secret sweep (leo-laptop runs its own copy) | `transcript-secret-sweep.timer` |
@@ -4813,7 +4839,8 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [Timeout headroom self-check (01:30)](#timeout-headroom-self-check-0130)
-for the 01:30 job; [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
+for the 01:30 job; [§9a Cross-repo lock-charter reconciliation](#9a-cross-repo-lock-charter-reconciliation)
+for the 01:45 job; [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
 for the 02:00 job; [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
 for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
 02:15 one; the sections below for the 02:30, 03:00, 03:15, 03:45, 04:00 and 05:00 ones,
