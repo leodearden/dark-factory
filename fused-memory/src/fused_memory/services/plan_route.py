@@ -127,6 +127,7 @@ class PlanRoute:
         self._resets_at: datetime | None = None
         self._next_probe_at: datetime | None = None
         self._exhaustion: BillingExhaustion | None = None
+        self._gate_has_seen_cap = False
         self._affected: dict[PlanRouteSite, int] = {}
 
     def http_client_for(self, base_url: str, *, site: PlanRouteSite) -> httpx.AsyncClient | None:
@@ -150,19 +151,38 @@ class PlanRoute:
             exhaustion=self._exhaustion,
         )
 
-    def next_probe_epoch(self) -> float | None:
-        """When a capped route next lets a probe through, or None while it is not capped."""
-        if self._capped_since is None or self._next_probe_at is None:
-            return None
-        return self._next_probe_at.timestamp()
+    def park_horizon(self) -> float:
+        """The epoch at which work parked on a plan cap reported now re-probes.
+
+        That is the latch's next probe while it lies ahead. Otherwise the
+        reported cap is the first sighting or the very probe that fell due, so
+        the next probe is a period out, or the reset when that is sooner.
+        """
+        now = self._clock()
+        if self._next_probe_at is not None and now < self._next_probe_at:
+            return self._next_probe_at.timestamp()
+        return self._next_probe(now).timestamp()
 
     async def observe_cap(self, exhaustion: BillingExhaustion, *, site: str) -> None:
-        """Latch a cap that reached a caller by a path this route does not gate."""
-        if self._capped_since is not None:
+        """Take a cap that reached a caller by a path this route does not gate
+        as a probe made outside the gate: it latches an uncapped route and
+        re-confirms a capped one whose probe is due."""
+        now = self._clock()
+        if self._capped_since is None:
+            self._latch(exhaustion, resets_at=None, now=now, site=site)
+            snapshot = self.state()
+            await self._notify(lambda listener: listener.on_capped(snapshot))
             return
-        self._latch(exhaustion, resets_at=None, now=self._clock(), site=site)
-        snapshot = self.state()
-        await self._notify(lambda listener: listener.on_capped(snapshot))
+        if self._next_probe_at is not None and now < self._next_probe_at:
+            return
+        await self._confirm(exhaustion, resets_at=None, now=now)
+
+    async def observe_clearance(self, *, site: str) -> None:
+        """Recover a latch the gate has never seen once a parked write landed
+        via *site*: that write is the only recovery evidence such a cap gets."""
+        if self._capped_since is None or self._gate_has_seen_cap:
+            return
+        await self._recover(evidence=f'the parked write that landed via {site}')
 
     async def _send(
         self, request: httpx.Request, *, site: PlanRouteSite, inner: httpx.AsyncBaseTransport,
@@ -174,7 +194,7 @@ class PlanRoute:
         response = await inner.handle_async_request(request)
         if response.status_code != httpx.codes.TOO_MANY_REQUESTS:
             if response.is_success and admission is _Admission.PROBE:
-                await self._recover()
+                await self._recover(evidence="the gate's probe")
             return response
         body = await response.aread()
         await response.aclose()
@@ -203,13 +223,19 @@ class PlanRoute:
         now = self._clock()
         if self._capped_since is None:
             self._latch(exhaustion, resets_at=resets_at, now=now, site=site)
+            self._gate_has_seen_cap = True
             self._count(site)
             snapshot = self.state()
             await self._notify(lambda listener: listener.on_capped(snapshot))
             return
+        self._gate_has_seen_cap = True
         self._count(site)
-        if not probe:
-            return
+        if probe:
+            await self._confirm(exhaustion, resets_at=resets_at, now=now)
+
+    async def _confirm(
+        self, exhaustion: BillingExhaustion, *, resets_at: datetime | None, now: datetime,
+    ) -> None:
         self._exhaustion = exhaustion
         self._resets_at = resets_at or self._resets_at
         self._next_probe_at = self._next_probe(now)
@@ -223,6 +249,7 @@ class PlanRoute:
         self._exhaustion = exhaustion
         self._resets_at = resets_at
         self._next_probe_at = self._next_probe(now)
+        self._gate_has_seen_cap = False
         self._affected = {}
         logger.warning(
             'plan route: CAPPED since %s (%s, seen by %s); plan-routed calls are refused '
@@ -230,17 +257,18 @@ class PlanRoute:
             _iso(now), exhaustion.code, site, _iso(self._next_probe_at),
         )
 
-    async def _recover(self) -> None:
+    async def _recover(self, *, evidence: str) -> None:
         if self._capped_since is None:
             return
         logger.warning(
-            'plan route: recovered at %s after a cap since %s',
-            _iso(self._clock()), _iso(self._capped_since),
+            'plan route: recovered at %s after a cap since %s, on %s',
+            _iso(self._clock()), _iso(self._capped_since), evidence,
         )
         self._capped_since = None
         self._resets_at = None
         self._next_probe_at = None
         self._exhaustion = None
+        self._gate_has_seen_cap = False
         self._affected = {}
         snapshot = self.state()
         await self._notify(lambda listener: listener.on_recovered(snapshot))
@@ -285,23 +313,25 @@ class PlanRoute:
 class PlanRouteParkGuard:
     """The plan cap's guard in the durable queue's billing park policy.
 
-    Parked plan-cap rows re-probe when the latch next lets a probe through.
-    A cap that reached the queue by a path the route does not gate still
-    latches it. Clearing does nothing: the route learns recovery from its own
+    Parked plan-cap rows re-probe when the route next lets a probe through. A
+    cap that reached the queue by a path the route does not gate counts as a
+    probe made outside the gate: it latches the route, and re-confirms it once
+    per probe period. A parked write that lands recovers only a latch the
+    gate has never seen; one the gate has seen learns recovery from its own
     probe.
     """
 
     def __init__(self, route: PlanRoute) -> None:
         self._route = route
 
-    def park_until(self) -> float | None:
-        return self._route.next_probe_epoch()
+    def park_until(self) -> float:
+        return self._route.park_horizon()
 
     async def on_parked(self, exhaustion: BillingExhaustion, *, site: str) -> None:
         await self._route.observe_cap(exhaustion, site=site)
 
     async def on_cleared(self, *, site: str) -> None:
-        return None
+        await self._route.observe_clearance(site=site)
 
 
 class _PlanRouteTransport(httpx.AsyncBaseTransport):
