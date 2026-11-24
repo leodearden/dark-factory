@@ -1,22 +1,7 @@
 """Whether a lock blocker's holder is live, following parks to their owner's own blockers.
 
-A HELD module's owner must be a slot this scheduler process has dispatched and
-not yet released; a lock outside every slot is a leak.  An in-flight owner
-awaiting its claim or its release is live: terminal, pending with no claimant
-(dispatched, not yet claimed), or gone from the task read.  Any other in-flight
-owner is live while someone alive holds it, by
-``shared.task_claimant.is_stranded_any_status``: the dispatch gate's
-claimant/heartbeat liveness at its TTL, plus the legacy ``metadata.infra_hold``
-exemption.  A workflow heartbeats for its whole slot, merge phase included, so
-an owner no one holds is non-live: ``blocked`` when blocked, else
-``no_live_claimant``.  A pending owner still carrying a stale claimant is a
-slot whose requeue exit hung past the TTL.  A PARKED module's owner is a
-pending task waiting for its own modules; it is followed to those modules'
-blockers, at most ``PARK_FOLLOW_DEPTH`` parks deep.  A park owner whose modules
-are all free waits only for a run slot, which is not a wedge.
-
-plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 "Cap L1" records why
-the walk stops where it does.
+plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 "Cap L1" *Liveness*
+states the rule and records why the walk stops where it does.
 """
 
 from __future__ import annotations
