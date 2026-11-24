@@ -256,7 +256,10 @@ class TestTheQueuesClock:
             await poll_until(_status_is(tmp_path, item_id, 'completed'))
 
             assert _row(tmp_path, item_id)['completed_at'] == start + _PROBE_AHEAD_SECONDS
-            assert policy.cleared == 1
+            await poll_until(
+                lambda: policy.cleared == 1,
+                message='on_cleared runs after the completion commits and was never reported',
+            )
         finally:
             await q.close()
 
