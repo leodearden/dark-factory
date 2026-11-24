@@ -16,7 +16,12 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.label_spans import labels_from_spans
-from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
+from dashboard.data.memory import (
+    PLAN_ROUTE_FRESHNESS_BOUND_SECONDS,
+    WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+    plan_route_datum,
+    write_queue_datum,
+)
 from dashboard.data.merge_queue import MergeAttempts, TrainThroughput
 from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
@@ -221,7 +226,15 @@ def _queue_datum(*, pending=0, retry=0, dead=0, oldest=None, measured_at=_MEMORY
     )
 
 
+def _plan_route_reading(*, state='ok', measured_at=_MEMORY_SERVED_AT, **fields):
+    """A reachable plan-route reading, built by its real producer."""
+    return plan_route_datum(
+        {**_ONLINE_STATUS, 'plan_route': {'state': state, **fields}}, measured_at=measured_at,
+    )
+
+
 def _shape_memory(status, queue=None, **kwargs):
+    kwargs.setdefault('plan_route', _plan_route_reading())
     return redux_api.shape_memory(
         status,
         _queue_datum() if queue is None else queue,
@@ -288,6 +301,55 @@ def test_shape_memory_ages_a_queue_reading_past_its_bound():
     assert stats['state'] == 'stale'
     assert stats['value']['pending'] == 1
     assert 'freshness bound' in stats['reason']
+
+
+_CAPPED_ROUTE = {
+    'state': 'capped',
+    'capped_since': '2026-10-03T11:40:00+00:00',
+    'resets_at': '2026-10-03T16:00:00+00:00',
+    'next_probe_at': '2026-10-03T12:10:00+00:00',
+    'parked_items': 3,
+    'judge_fail_opens_since_latch': 2,
+    'escalation_id': 'esc-plan-route-capped-1',
+}
+
+
+@pytest.mark.parametrize('status', [_ONLINE_STATUS, _OFFLINE_STATUS], ids=['online', 'offline'])
+def test_shape_memory_serves_the_plan_route_on_both_branches(status):
+    """get_status's plan_route is one Datum served the same whether the stores answered."""
+    measured_at = _MEMORY_SERVED_AT - timedelta(seconds=5)
+    plan_route = _plan_route_reading(measured_at=measured_at, **_CAPPED_ROUTE)
+    body = _shape_memory(status, plan_route=plan_route)
+    served = body['MEMORY_STATUS']['plan_route']
+    assert served == plan_route.to_wire()
+    assert served['state'] == 'fresh'
+    assert served['value']['state'] == 'capped'
+    assert served['value']['parked_items'] == 3
+    assert served['as_of'] == measured_at.isoformat()
+
+
+@pytest.mark.parametrize('status', [_ONLINE_STATUS, _OFFLINE_STATUS], ids=['online', 'offline'])
+def test_shape_memory_serves_an_unmeasured_plan_route_as_unknown(status):
+    plan_route = unknown_datum('get_status reports no plan_route', PLAN_ROUTE_FRESHNESS_BOUND_SECONDS)
+    served = _shape_memory(status, plan_route=plan_route)['MEMORY_STATUS']['plan_route']
+    assert served['state'] == 'unknown'
+    assert served['value'] is None
+    assert served['reason'] == 'get_status reports no plan_route'
+
+
+def test_shape_memory_ages_a_plan_route_reading_past_its_bound():
+    measured_at = _MEMORY_SERVED_AT - timedelta(seconds=PLAN_ROUTE_FRESHNESS_BOUND_SECONDS + 30)
+    plan_route = _plan_route_reading(measured_at=measured_at, **_CAPPED_ROUTE)
+    served = _shape_memory(_ONLINE_STATUS, plan_route=plan_route)['MEMORY_STATUS']['plan_route']
+    assert served['state'] == 'stale'
+    assert served['value']['state'] == 'capped'
+    assert 'freshness bound' in served['reason']
+
+
+def test_shape_memory_refuses_a_plan_route_that_is_not_a_datum():
+    with pytest.raises(DatumContractError) as raised:
+        _shape_memory(_ONLINE_STATUS, plan_route={'state': 'ok'})
+    assert raised.value.invariant is DatumInvariant.DATUM_REQUIRED
 
 
 def test_shape_memory_payload_carries_served_at():
@@ -373,7 +435,7 @@ def _basic_status_and_queue():
 
 def test_shape_memory_wal_offline_when_wal_missing():
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal=None)
+    body = _shape_memory(status, queue, wal=None)
     wal = body['MEMORY_STATUS']['wal']
     assert wal['status'] == 'offline'
     assert wal['rows'] == []
@@ -381,8 +443,8 @@ def test_shape_memory_wal_offline_when_wal_missing():
 
 def test_shape_memory_wal_offline_payload_propagates_error():
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(
-        status, queue, served_at=_MEMORY_SERVED_AT, wal={'offline': True, 'error': 'unreachable'},
+    body = _shape_memory(
+        status, queue, wal={'offline': True, 'error': 'unreachable'},
     )
     wal = body['MEMORY_STATUS']['wal']
     assert wal['status'] == 'offline'
@@ -393,7 +455,7 @@ def test_shape_memory_wal_ok_when_all_rows_healthy():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {
             'http://srv': {
                 'task_backend': {'ts': now_iso, 'busy': 0, 'log': 12, 'checkpointed': 12,
@@ -415,7 +477,7 @@ def test_shape_memory_wal_red_on_busy_row():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {'http://srv': {
             'recon_journal': {'ts': now_iso, 'busy': 1, 'log': 200, 'checkpointed': 0,
                               'detail': None},
@@ -431,7 +493,7 @@ def test_shape_memory_wal_warn_on_log_frames_overflow():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {'http://srv': {
             'event_buffer': {'ts': now_iso, 'busy': 0, 'log': 10_000, 'checkpointed': 10_000,
                              'detail': None},
@@ -446,7 +508,7 @@ def test_shape_memory_wal_red_on_stale_ts():
     from datetime import UTC, datetime, timedelta
     old_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {'http://srv': {
             'write_journal': {'ts': old_iso, 'busy': 0, 'log': 5, 'checkpointed': 5,
                               'detail': None},
@@ -468,7 +530,7 @@ def test_shape_wal_status_red_on_corrupt_ts(caplog):
 
     status, queue = _basic_status_and_queue()
     with caplog.at_level(logging.WARNING):
-        body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+        body = _shape_memory(status, queue, wal={
             'stores': {'http://srv': {
                 'task_backend': {
                     'ts': 'not-a-date',
@@ -506,7 +568,7 @@ def test_shape_wal_status_ok_on_valid_recent_ts():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {'http://srv': {
             'task_backend': {'ts': now_iso, 'busy': 0, 'log': 0, 'checkpointed': 0,
                              'detail': None},
@@ -523,7 +585,7 @@ def test_shape_wal_status_benign_on_missing_ts(caplog):
 
     status, queue = _basic_status_and_queue()
     with caplog.at_level(logging.WARNING):
-        body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+        body = _shape_memory(status, queue, wal={
             'stores': {'http://srv': {
                 'task_backend': {'ts': None, 'busy': 0, 'log': 0, 'checkpointed': 0,
                                  'detail': None},
