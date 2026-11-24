@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
@@ -10,12 +12,22 @@ from typing import Final, Literal, TypeAlias
 import yaml
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
-from client_feed.contract import Criterion, UniqueCriteria, _first_error
+from client_feed.contract import (
+    CaseOutcome,
+    CaseResult,
+    Criterion,
+    CriterionOutcome,
+    CriterionResult,
+    UniqueCriteria,
+    _first_error,
+)
 from client_feed.feed_io import FeedIoError, read_tail
 from client_feed.sources.archive import case_id
 
 CRITERIA_RELPATH: Final = 'acceptance/criteria.yaml'
 COLLECTION_MAP_SUFFIX: Final = '.tests.json'
+
+_RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
 
 
 class CriteriaProblem(StrEnum):
@@ -118,3 +130,68 @@ def criterion_bindings(collection_map: CollectionMap) -> dict[str, str]:
         for nodeid, entry in collection_map.items()
         if entry.criterion is not None
     }
+
+
+@dataclass(frozen=True)
+class BoundReport:
+    """One junit report's cases and the criterion each of its marked tests evidences, keyed by case id."""
+
+    cases: tuple[CaseResult, ...]
+    criteria: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class _Evidence:
+    """One bound test and the outcomes of its cases in the report that binds it."""
+
+    test: str
+    outcomes: tuple[CaseOutcome, ...]
+
+
+def _report_evidence(report: BoundReport) -> list[tuple[str, _Evidence]]:
+    outcomes: dict[str, list[CaseOutcome]] = defaultdict(list)
+    for case in report.cases:
+        outcomes[case.id].append(case.outcome)
+    return [
+        (criterion, _Evidence(test=test, outcomes=tuple(outcomes.get(test, ()))))
+        for test, criterion in report.criteria.items()
+    ]
+
+
+def _evidence(reports: Sequence[BoundReport]) -> dict[str, list[_Evidence]]:
+    """Each criterion's evidence, every report read on its own so a case never borrows another report's binding."""
+    by_criterion: dict[str, list[_Evidence]] = defaultdict(list)
+    for report in reports:
+        for criterion, evidence in _report_evidence(report):
+            by_criterion[criterion].append(evidence)
+    return by_criterion
+
+
+def _passed(evidence: _Evidence) -> bool:
+    return bool(evidence.outcomes) and all(
+        outcome is CaseOutcome.PASSED for outcome in evidence.outcomes
+    )
+
+
+def _outcome(evidence: Sequence[_Evidence]) -> CriterionOutcome:
+    """Failed on any red bound case; passed only when every bound test ran and passed; otherwise not run."""
+    if any(outcome in _RED for item in evidence for outcome in item.outcomes):
+        return CriterionOutcome.FAILED
+    if evidence and all(map(_passed, evidence)):
+        return CriterionOutcome.PASSED
+    return CriterionOutcome.NOT_RUN
+
+
+def join_criteria(
+    declared: Sequence[Criterion], reports: Sequence[BoundReport]
+) -> tuple[CriterionResult, ...]:
+    """Each declared criterion's outcome over the reports' bound cases, in declaration order."""
+    evidence = _evidence(reports)
+    return tuple(
+        CriterionResult(
+            id=criterion.id,
+            outcome=_outcome(evidence.get(criterion.id, ())),
+            tests=tuple(sorted({item.test for item in evidence.get(criterion.id, ())})),
+        )
+        for criterion in declared
+    )
