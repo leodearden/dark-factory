@@ -134,7 +134,7 @@ async def apply(verdict: AuditVerdict, registry: Registry, now: datetime) -> Lea
     """Evict every leaked key, then record the leaks and trip or hold the kill switch; idempotent per leak."""
     if not verdict.attributions:
         current = await registry.policy_state()
-        return LeakResponse((), {}, (), _counting(_records(current), now), current, False, False)
+        return LeakResponse((), {}, (), _counting(_records(current), now), current, False, current.is_disabled(now))
     leaks = tuple(attribution.record(now) for attribution in verdict.attributions)
     evicted = await _evict(registry, leaks)
     current = await registry.policy_state()
