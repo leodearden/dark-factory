@@ -312,11 +312,13 @@ class _Unit:
     pgid: int
 
 
+def _written(path: Path) -> bool:
+    return path.is_file() and path.read_text().strip() != ''
+
+
 def _await_written(path: Path, out_path: Path) -> str:
     """What a unit wrote to *path*, once it has written anything."""
-    assert _eventually(lambda: path.is_file() and path.read_text().strip() != '', 120), (
-        out_path.read_text(encoding='utf-8')
-    )
+    assert _eventually(lambda: _written(path), 120), out_path.read_text(encoding='utf-8')
     return path.read_text()
 
 
@@ -343,6 +345,23 @@ def _hook_pid(git_pid: int) -> int:
     children = Path(f'/proc/{git_pid}/task/{git_pid}/children').read_text(encoding='utf-8').split()
     assert len(children) == 1, children
     return int(children[0])
+
+
+def _wchan(pid: int) -> str:
+    """The kernel function *pid* sleeps in, or '' once it has exited."""
+    try:
+        return Path(f'/proc/{pid}/wchan').read_text(encoding='utf-8')
+    except OSError:
+        return ''
+
+
+def _path_stub(bin_dir: Path, name: str, body: str) -> Path:
+    """*bin_dir*, holding an executable *name* that shadows the real one once *bin_dir* leads PATH."""
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / name
+    stub.write_text(body, encoding='utf-8')
+    stub.chmod(0o755)
+    return bin_dir
 
 
 def _ctrl_c(git_pid: int) -> None:
@@ -455,6 +474,12 @@ def test_an_interrupted_commit_stops_what_an_uncollected_unit_left_when_its_shel
 
 
 def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_launched_unit(tmp_path: Path) -> None:
+    """Guards the hook's rule against a command substitution once its traps are armed, for mktemp only.
+
+    The stub mktemp holds only when the hook calls it after launching a unit, which is where the
+    per-unit ``$(mktemp)`` used to run. A command substitution of any other helper, or of a builtin,
+    in the launch loop or in gate_collect_next is not caught here.
+    """
     blocker_pid_file = tmp_path / 'blocker.pid'
     last_unit_file = tmp_path / 'last_unit.pid'
     commands = {
@@ -471,17 +496,10 @@ def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_
     release = tmp_path / 'mktemp.release'
     real_mktemp = shutil.which('mktemp')
     assert real_mktemp is not None
-    held_bin = tmp_path / 'held_bin'
-    held_bin.mkdir()
-    stub = held_bin / 'mktemp'
-    stub.write_text(
-        HELD_MKTEMP.format(**{
-            name: shlex.quote(str(path))
-            for name, path in (('real', real_mktemp), ('out', out_path), ('held', held), ('release', release))
-        }),
-        encoding='utf-8',
-    )
-    stub.chmod(0o755)
+    held_bin = _path_stub(tmp_path / 'held_bin', 'mktemp', HELD_MKTEMP.format(
+        real=shlex.quote(real_mktemp), out=shlex.quote(str(out_path)),
+        held=shlex.quote(str(held)), release=shlex.quote(str(release)),
+    ))
 
     commit = _start_commit(repo, hook_tmp, out_path, bin_dir=held_bin)
     units: list[_Unit] = []
@@ -489,8 +507,7 @@ def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_
         units.append(_started_unit(blocker_pid_file, out_path))
         hook = _hook_pid(commit.pid)
         assert _eventually(
-            lambda: (held.exists() or (last_unit_file.is_file() and last_unit_file.read_text().strip() != ''))
-            and Path(f'/proc/{hook}/wchan').read_text() == 'do_wait',
+            lambda: (held.exists() or _written(last_unit_file)) and _wchan(hook) == 'do_wait',
             120,
         ), out_path.read_text(encoding='utf-8')
         _ctrl_c(commit.pid)
@@ -507,6 +524,7 @@ def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_
         f'blocker pid {units[0].pid} outlived a Ctrl-C that landed while the hook was reaping a helper mid-launch'
     )
     assert logs_removed, sorted(path.name for path in hook_tmp.iterdir())
+    assert not held.exists(), 'the hook ran mktemp after launching a unit'
 
 
 def test_a_unit_log_directory_that_cannot_be_made_refuses_the_commit_before_any_unit_runs(tmp_path: Path) -> None:
@@ -516,11 +534,7 @@ def test_a_unit_log_directory_that_cannot_be_made_refuses_the_commit_before_any_
     hook_tmp = tmp_path / 'hook_tmp'
     hook_tmp.mkdir()
     out_path = tmp_path / 'commit.out'
-    failing_bin = tmp_path / 'failing_bin'
-    failing_bin.mkdir()
-    stub = failing_bin / 'mktemp'
-    stub.write_text("#!/bin/sh\necho 'mktemp stub: refused' >&2; exit 1\n", encoding='utf-8')
-    stub.chmod(0o755)
+    failing_bin = _path_stub(tmp_path / 'failing_bin', 'mktemp', "#!/bin/sh\necho 'mktemp stub: refused' >&2; exit 1\n")
 
     commit = _start_commit(repo, hook_tmp, out_path, bin_dir=failing_bin)
     try:
