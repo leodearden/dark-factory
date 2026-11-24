@@ -616,6 +616,12 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         'markers',
+        'real_dispatch_row_refresh: opt a test OUT of the autouse '
+        '`_hermetic_dispatch_row` patch so the Scheduler re-reads its dispatch '
+        'winner through its own read_task/get_statuses (task 11430).',
+    )
+    config.addinivalue_line(
+        'markers',
         f'{REAL_MCP_SESSION_MARKER}: opt a test OUT of the autouse forbid_live_mcp '
         'guard so shared.mcp_session.McpSession runs for real (stub server / '
         'mocked transport only) — task 7802',
