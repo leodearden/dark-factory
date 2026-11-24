@@ -426,9 +426,21 @@ For a normal task, `TaskWorkflow._drive()`
 
 1. **Setup.** Pre-empt-race check → `set_task_status('in-progress', ...)` →
    `git_ops.create_worktree` (branch `task/<id>`, worktree
-   `.worktrees/<id>/`) → task artifacts (`.task/plan.json`, mirrored to a
-   durable `.task-meta/` sidecar so state survives an orchestrator restart).
-   A ghost-loop check (`_recover_if_already_merged`) sends an already-landed
+   `.worktrees/<id>/`) → task artifacts, kept outside the worktree so they
+   survive a worktree reset and an orchestrator restart. Task-lifetime state
+   (plan, iteration log, reviews, verdicts) lives in the task root
+   `.worktrees/.task-meta/task-<id>/`, and per-dispatch exits in the lane
+   root `.worktrees/.task-meta/<lane>/`. The two shapes are owned by
+   `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.task_root_for`
+   and `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.meta_root_for`,
+   and each artifact's root by the routing table
+   `orchestrator/src/orchestrator/artifacts.py::ARTIFACT_ROOTS`. The
+   worktree's `.task/plan.json` and `.task/iterations.jsonl` are absolute
+   symlinks into the task root
+   (`orchestrator/src/orchestrator/artifacts.py::LANE_SYMLINKED_ARTIFACTS`),
+   and each link dangles until its target is written: the plan link until
+   the architect creates the plan, the iterations link until the first
+   iteration is logged. A ghost-loop check (`_recover_if_already_merged`) sends an already-landed
    branch straight to `done`.
 2. **Simple-task fast path (optional).** If `metadata.complexity == 'simple'`
    and no hard-blocker token vetoes it (`migration`, `architecture`,
@@ -450,7 +462,12 @@ For a normal task, `TaskWorkflow._drive()`
    the plan: RED test → GREEN implementation → commit → mark the step done.
    After each iteration, a cheap, read-only `judge` agent verdicts whether
    the diff actually represents substantive completion — deliberately
-   distrusting the plan's own step-done bookkeeping.
+   distrusting the plan's own step-done bookkeeping. Before EXECUTE, and
+   again before the implementer resumes after each escalation resolution,
+   the workflow checks that the lane `.task/plan.json` reads the task's plan
+   (`orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.lane_plan_fault`).
+   It relinks once, and blocks the task as `infra_issue` if the link still
+   does not.
 5. **VERIFY.** Scoped test/lint/typecheck commands are derived per-module
    and run through a `VerifyRunnerPool` (prefers a remote runner, falls back
    to local). A failure hands off to `debugger` to fix it and re-verify,
