@@ -110,8 +110,9 @@ def _stamped(task: dict) -> dict:
     return _with(task, metadata={**task['metadata'], 'gate_escalated_at': STAMP})
 
 
-def _holds_nothing(rig: _Rig, *task_ids: str) -> bool:
-    return all(rig.scheduler.lock_table.held_modules(tid) == frozenset() for tid in task_ids)
+def _unclaimed(rig: _Rig, *task_ids: str) -> bool:
+    """None of *task_ids* is started or holds a lock-table entry, keyless entries included."""
+    return not any(rig.scheduler.is_actively_held(tid) for tid in task_ids)
 
 
 def _skipped(rig: _Rig, task_id: str) -> bool:
@@ -120,20 +121,23 @@ def _skipped(rig: _Rig, task_id: str) -> bool:
     )
 
 
-def _open_pure_gate(tid: str) -> dict:
-    """A timed gate (orchestrator/timed_gates.py) whose dated milestone opened an hour ago."""
+def _pure_gate(tid: str) -> dict:
+    """A pending pure gate with no milestone: it dispatches through the scored path, holding no module lock."""
     return {
         'id': tid,
         'title': f'Gate {tid}',
         'status': 'pending',
         'priority': 'low',
         'dependencies': [],
-        'metadata': {
-            'task_kind': 'deterministic',
-            'always_escalates': True,
-            'milestone': {'mode': 'dated', 'at': (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
-        },
+        'metadata': {'task_kind': 'deterministic', 'always_escalates': True},
     }
+
+
+def _open_pure_gate(tid: str) -> dict:
+    """A timed gate (orchestrator/timed_gates.py) whose dated milestone opened an hour ago."""
+    gate = _pure_gate(tid)
+    gate['metadata']['milestone'] = {'mode': 'dated', 'at': (datetime.now(UTC) - timedelta(hours=1)).isoformat()}
+    return gate
 
 
 A = make_task('A', 'high', ['a.py'])
@@ -154,7 +158,7 @@ async def test_a_dependency_added_mid_tick_holds_the_winner_until_it_is_done(tmp
     )
 
     assert await rig.scheduler.acquire_next() is None
-    assert _holds_nothing(rig, 'A')
+    assert _unclaimed(rig, 'A')
 
     board.rows['9']['status'] = 'done'
     board.statuses['9'] = 'done'
@@ -181,7 +185,7 @@ async def test_fresh_dependency_statuses_outrank_the_snapshot_s(tmp_path):
     _Board(rig.scheduler, snapshot=[waiting, dep], rows=[waiting, dep], statuses={'9': 'pending'})
 
     assert await rig.scheduler.acquire_next() is None
-    assert _holds_nothing(rig, 'A')
+    assert _unclaimed(rig, 'A')
 
 
 async def test_a_top_dropped_at_confirmation_frees_its_claim_and_is_not_passed_over(tmp_path):
@@ -191,7 +195,7 @@ async def test_a_top_dropped_at_confirmation_frees_its_claim_and_is_not_passed_o
     result = await rig.scheduler.acquire_next()
 
     assert result is not None and result.task_id == 'B'
-    assert _holds_nothing(rig, 'A')
+    assert _unclaimed(rig, 'A')
     assert not _skipped(rig, 'A')
 
 
@@ -202,7 +206,7 @@ async def test_a_winner_the_store_no_longer_holds_yields_to_the_next_candidate(t
     result = await rig.scheduler.acquire_next()
 
     assert result is not None and result.task_id == 'B'
-    assert _holds_nothing(rig, 'A')
+    assert _unclaimed(rig, 'A')
 
 
 async def test_an_unreadable_store_stops_dispatch_for_the_tick(tmp_path):
@@ -212,7 +216,7 @@ async def test_an_unreadable_store_stops_dispatch_for_the_tick(tmp_path):
 
     assert await rig.scheduler.acquire_next() is None
     assert board.read_task.await_count == 1
-    assert _holds_nothing(rig, 'A', 'C')
+    assert _unclaimed(rig, 'A', 'C')
 
     board.unreadable = False
     first = await rig.scheduler.acquire_next()
@@ -228,7 +232,7 @@ async def test_a_pin_the_store_has_blocked_yields_to_an_unpinned_candidate(tmp_p
     result = await rig.scheduler.acquire_next()
 
     assert result is not None and result.task_id == 'C'
-    assert _holds_nothing(rig, 'P')
+    assert _unclaimed(rig, 'P')
     assert not _skipped(rig, 'P')
 
 
@@ -239,7 +243,7 @@ async def test_a_pin_on_an_unreadable_store_stops_dispatch_for_the_tick(tmp_path
 
     assert await rig.scheduler.acquire_next() is None
     assert board.read_task.await_count == 1
-    assert _holds_nothing(rig, 'P', 'C')
+    assert _unclaimed(rig, 'P', 'C')
 
 
 async def test_a_timed_gate_that_gained_a_pending_dependency_is_not_dispatched(tmp_path):
@@ -252,6 +256,21 @@ async def test_a_timed_gate_that_gained_a_pending_dependency_is_not_dispatched(t
     )
 
     assert await rig.scheduler.acquire_next() is None
+    assert _unclaimed(rig, T['id'])
+
+
+async def test_a_pure_gate_that_gained_a_pending_dependency_leaves_no_claim(tmp_path):
+    rig = _rig(tmp_path)
+    gate = _pure_gate('600')
+    _Board(
+        rig.scheduler,
+        snapshot=[gate],
+        rows=[_with(gate, dependencies=['9']), make_task('9', 'high', ['n.py'])],
+        statuses={'9': 'pending'},
+    )
+
+    assert await rig.scheduler.acquire_next() is None
+    assert _unclaimed(rig, '600')
 
 
 async def test_a_pin_dispatch_hands_out_the_store_s_row(tmp_path):
