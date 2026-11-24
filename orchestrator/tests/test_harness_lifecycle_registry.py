@@ -507,6 +507,22 @@ class TestFlakeDebtResolutionPass:
         }
 
     @pytest.mark.asyncio
+    async def test_a_pass_over_an_empty_ledger_still_emits_its_event(
+        self, tmp_path: Path,
+    ) -> None:
+        """An hour with no event must mean the service is not running, never that it
+        found nothing to examine."""
+        h = Harness(OrchestratorConfig(project_root=tmp_path))
+        h.event_store = EventStore(tmp_path / 'events.db', run_id='t')
+
+        await self._run_registered_pass(h)
+
+        [event] = h.event_store.fetch_events_by_type(EventType.flake_debt_resolution_pass)
+        assert event['data'] == {
+            'examined': 0, 'resolved': 0, 'owner_unreadable': 0, 'stop': None,
+        }
+
+    @pytest.mark.asyncio
     async def test_pass_without_an_event_store_still_resolves(self, tmp_path: Path) -> None:
         h = await self._seeded_harness(tmp_path)
         h.event_store = None

@@ -73,11 +73,11 @@ from orchestrator.flake_ledger import (
     delete_due_item,
     due_item_context,
     fix_contained,
-    list_open_debt,
     name_stale_due_items,
     open_debt,
     read_debt,
     read_due_items,
+    read_open_debt,
     record_failed_due_attempt,
     resolve_debt,
     resolving_commit,
@@ -124,10 +124,12 @@ class DueFailure(StrEnum):
 
 
 class DrainStop(StrEnum):
-    """Why a pass, the drain's or the resolution sweep's, ended before the work it read."""
+    """Why a pass, the drain's or the resolution sweep's, ended before the work it read,
+    or read none: a failed ledger read is not an empty ledger."""
 
     TASK_CLIENT_FAILED = 'task_client_failed'
     BUDGET = 'budget'
+    LEDGER_UNREADABLE = 'ledger_unreadable'
 
 
 @dataclass(frozen=True)
@@ -740,7 +742,7 @@ async def run_drain_pass(
         )
         if items is None:
             logger.warning('flake_debt_drain: could not read the due list; pass skipped')
-            return DrainPassReport(0, 0, 0, None)
+            return DrainPassReport(0, 0, 0, DrainStop.LEDGER_UNREADABLE)
         waiting: set[str] = set()
         for item in items:
             if item.test_id in waiting:
@@ -774,8 +776,12 @@ async def run_drain_pass(
 
 @dataclass(frozen=True)
 class ResolutionPassReport:
-    """What one resolution pass did: owned open rows examined, cycles it closed, owner
-    reads that failed, and why it ended early, if it did."""
+    """What one resolution pass did: owned open rows examined, cycles it closed, whether
+    it hit an unreadable owner, and why it ended early, if it did.
+
+    ``owner_unreadable`` is 0 or 1, never a count of the backlog's unreadable owners: the
+    pass stops at the first one.
+    """
 
     examined: int
     resolved: int
@@ -827,7 +833,8 @@ class DebtResolutionSweep:
         """One pass over the ledger at *db_path*: at most 50 owned rows in five minutes of
         *clock*, stopping at the first unreadable owner (INV-4).  A missing task reads
         back as an absence, so a failed read means fused-memory is failing, and each
-        further row would spend its own read budget on the same failure.
+        further row would spend its own read budget on the same failure.  A failed ledger
+        read examines nothing and keeps the cursor.
 
         ``resolved_at`` is stamped with the ledger's own wall clock (§5.4), never *clock*.
         Never raises; a cancellation propagates.
@@ -836,9 +843,11 @@ class DebtResolutionSweep:
         stop: DrainStop | None = None
         try:
             started = clock()
-            window, reaches_end = self._next_window(
-                await asyncio.to_thread(list_open_debt, db_path),
-            )
+            rows = await asyncio.to_thread(read_open_debt, db_path)
+            if rows is None:
+                stop = DrainStop.LEDGER_UNREADABLE
+                rows = []
+            window, reaches_end = self._next_window(rows)
             for row in window:
                 if clock() - started >= _PASS_BUDGET:
                     stop = DrainStop.BUDGET

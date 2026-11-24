@@ -951,7 +951,7 @@ class TestPassBounds:
         unopenable = tmp_path / 'not-a-db'
         unopenable.mkdir()
         assert await _pass(unopenable, _FakeLedgerTaskClient(), clock) == DrainPassReport(
-            0, 0, 0, None,
+            0, 0, 0, DrainStop.LEDGER_UNREADABLE,
         )
 
 
@@ -1211,6 +1211,9 @@ class TestResolutionPassBounds:
         assert report == flake_debt_drain.ResolutionPassReport(
             examined=1, resolved=0, owner_unreadable=1, stop=DrainStop.TASK_CLIENT_FAILED,
         )
+        assert report.event_data() == {
+            'examined': 1, 'resolved': 0, 'owner_unreadable': 1, 'stop': 'task_client_failed',
+        }
         assert not any(_resolved(db, test_id) for test_id in (A, B, C))
         assert len(client.task_calls[reads:]) == 1
 
@@ -1245,7 +1248,7 @@ class TestResolutionPassBounds:
         unopenable.mkdir()
         assert await _resolution_pass(
             unopenable, _FakeLedgerTaskClient(), clock,
-        ) == flake_debt_drain.ResolutionPassReport(0, 0, 0, None)
+        ) == flake_debt_drain.ResolutionPassReport(0, 0, 0, DrainStop.LEDGER_UNREADABLE)
 
         db = _db(tmp_path)
         await _open_owned(db, _FakeLedgerTaskClient(), A)
@@ -1310,6 +1313,28 @@ class TestResolutionSweepResumes:
         assert client.task_calls[reads:] == [owner_b, owner_c]
         assert (await _resolution_pass(db, client, clock, sweep)).resolved == 1
         assert _resolved(db, A)
+
+    async def test_an_unreadable_ledger_is_reported_and_keeps_the_cursor(
+        self, tmp_path: Path,
+    ) -> None:
+        """A failed ledger read is not an empty backlog: the report says so, and the next
+        pass resumes where the last readable one stopped."""
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owners = [await _open_owned(db, client, _numbered(n)) for n in range(51)]
+        unopenable = tmp_path / 'not-a-db'
+        unopenable.mkdir()
+        sweep = flake_debt_drain.DebtResolutionSweep()
+        assert (await _resolution_pass(db, client, clock, sweep)).examined == 50
+
+        unread = await _resolution_pass(unopenable, client, clock, sweep)
+
+        assert unread == flake_debt_drain.ResolutionPassReport(
+            0, 0, 0, DrainStop.LEDGER_UNREADABLE,
+        )
+        assert unread.event_data()['stop'] == 'ledger_unreadable'
+        reads = len(client.task_calls)
+        assert (await _resolution_pass(db, client, clock, sweep)).examined == 1
+        assert client.task_calls[reads:] == [owners[50]]
 
     async def test_the_pass_after_a_budget_stop_starts_at_the_row_it_did_not_reach(
         self, tmp_path: Path,

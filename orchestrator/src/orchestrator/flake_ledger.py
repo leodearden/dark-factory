@@ -2767,7 +2767,13 @@ async def _resolve(
 
 
 def list_open_debt(db_path: Path) -> list[DebtRow]:
-    """Every test currently in debt, oldest first.
+    """:func:`read_open_debt`, with a failed read as ``[]``."""
+    rows = read_open_debt(db_path)
+    return [] if rows is None else rows
+
+
+def read_open_debt(db_path: Path) -> list[DebtRow] | None:
+    """Every test currently in debt, oldest first; ``None`` when the read failed (B12).
 
     Ordering is part of the contract (``opened_at`` then ``test_id``) because ι prints
     this list.
@@ -2788,4 +2794,4 @@ def list_open_debt(db_path: Path) -> list[DebtRow]:
             db_path,
             exc_info=True,
         )
-        return []
+        return None
