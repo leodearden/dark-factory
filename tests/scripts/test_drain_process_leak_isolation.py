@@ -42,7 +42,7 @@ from nested_pytest_session import (
     arming_conftest,
     run_nested_pytest,
 )
-from shared.testing_own_time import OwnTimeClock
+from shared.testing_own_time import OwnTimeClock, wait_on_own_time
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import df_pytest_isolation
@@ -613,7 +613,7 @@ class TestRunInNewSessionWhileProgressing:
         leaker = _leaker_script(tmp_path)
 
         def stall_clock(pid: int) -> Callable[[], float]:
-            read_leaked_pid(pidfile)
+            wait_on_own_time(pid, _pid_recorded(pidfile), budget=10)
             raise RuntimeError('stall clock blew up')
 
         leaked_pid = None
