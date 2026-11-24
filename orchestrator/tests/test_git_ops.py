@@ -15803,15 +15803,20 @@ class TestAdvanceMainIndexLockStandoff:
             f'probes mean the poll loop ran anyway; got {probes!r}'
         )
 
-    async def test_a_young_lock_is_still_waited_on(self, git_ops: GitOps):
+    async def test_a_young_lock_is_still_waited_on(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
         """The stale short-circuit must not over-fire.
 
         The ordinary docs-direct-commit-on-main window is a YOUNG lock, and
         that is precisely the case the stand-off exists for — it must still
         get its full budget.  Contrast the test above.
+
+        The scan is complete and empty and the lock is older than the grace,
+        so the staleness floor alone withholds the short-circuit.
         """
-        lock_path = git_ops.project_root / '.git' / 'index.lock'
-        lock_path.write_text('')  # fresh => far below the staleness floor
+        git_ops.proc_root = empty_proc_table(tmp_path)
+        lock_path = _index_lock_written_ago(git_ops.project_root, 10.0)
 
         original_state = git_ops._index_lock_state
         probes: list[bool] = []
@@ -15827,7 +15832,7 @@ class TestAdvanceMainIndexLockStandoff:
             ):
                 standoff = (
                     await git_ops._await_index_lock_clear(
-                        timeout_s=1.5, context='young-lock',
+                        timeout_s=0.5, context='young-lock',
                     )
                 )
         finally:
