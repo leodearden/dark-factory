@@ -813,7 +813,14 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
 §12:
 
 - `engagement`: reveals are disabled for the pass (δ entry (d)).
-- `inbox`: the inbox offset is held (δ entry (e)).
+- `inbox`: the inbox offset is held (δ entry (e)), and so are the defect
+  scan's `defect_scan_offset` and `pending_reports`.
+- `filer`: a `defect_reported` line older than `filer_grace_seconds`
+  (`client-feed/src/client_feed/policy.py::Policy`, default 600) still has no
+  non-deferred carrier. The reason names each such ref, and the report waits
+  in `cursor.json`'s `pending_reports` until its carrier appears or a
+  `defect_ruled` line rules it. It is raised while the engagement is unusable,
+  and while `tasks` is degraded, too.
 - `git`: a merge commit git cannot read holds the landing batch (γ entry (f)).
   Unparseable git output and a timed-out `git cat-file --batch` read degrade
   `git` too (task 7484 entry (c)).
@@ -822,6 +829,27 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
   `skipped N rows: …` (γ entry (f)).
 
 The same failures are WARNING lines in the unit's journal.
+
+#### Rolling back to feed 1.0
+
+1.0 code refuses a 1.1 `cursor.json`, because `Cursor` is `extra='forbid'`
+(`client-feed/src/client_feed/feed_io.py::Cursor`), and then restarts every
+source from the beginning. So before starting 1.0 code, stop the instance and
+delete the `defect_scan_offset` and `pending_reports` keys from
+`out/cursor.json`, keeping the file 0640. Rewriting it in place keeps its mode
+and owner:
+
+```bash
+systemctl --user stop client-feed@<name>.service
+python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("defect_scan_offset", None); c.pop("pending_reports", None); open(p, "w").write(json.dumps(c))' <out>/cursor.json
+```
+
+1.0 code refolds the `state.json` a 1.1 publisher wrote from the feed. A
+`defect_filed` line is an unknown type to it and is skipped. A heartbeat whose
+`degraded` names `filer` is not skipped: `filer` is not a 1.0 `Source`, so 1.0
+code refuses to open a feed holding one, with a contract violation at that
+line. Roll back only while `grep -c '"source":"filer"' <out>/feed.jsonl`
+prints 0; once a heartbeat has named `filer`, fix forward instead.
 
 #### The isolation check
 
