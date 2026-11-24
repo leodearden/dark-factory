@@ -46,10 +46,10 @@ from types import MappingProxyType
 from typing import Any, Concatenate, ParamSpec, TypeVar
 
 from fastmcp import FastMCP
+from shared.markup_override_param import accepts_markup_override
 from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
-    accepts_markup_override,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind

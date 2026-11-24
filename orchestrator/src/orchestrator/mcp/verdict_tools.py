@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from shared.markup_override_param import accepts_markup_override
 
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
@@ -38,7 +39,6 @@ from shared.mcp_markup_middleware import (
 from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
-    accepts_markup_override,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 
