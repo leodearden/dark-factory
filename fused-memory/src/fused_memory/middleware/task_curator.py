@@ -54,6 +54,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict, TypeVar
 
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cancel_dispositions import sibling_lookup_values
 from shared.cli_invoke import (
     AgentResult,
@@ -2861,6 +2862,9 @@ class TaskCurator:
             timeout_seconds=call.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
             park_on_frozen_pool=False,
+            work_class=WorkClass(
+                kind=WorkKind.ESSENTIAL, project_id=call.project_id, role=call.ledger_role,
+            ),
             **self._ledger_kwargs(call.ledger_role),
             **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )

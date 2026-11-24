@@ -28,6 +28,7 @@ from fused_memory.reconciliation import (
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
 )
+from fused_memory.reconciliation.reserve_step_aside import RECONCILIATION_WORK_CLASS
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +356,7 @@ class AgentLoop:
             permission_mode='dontAsk',
             setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
             env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
+            work_class=RECONCILIATION_WORK_CLASS,
             # --tools does not filter MCP, so MCP is closed by the strict empty
             # config.  cwd is the codebase root (tasks 1989/4722), which may
             # hold a live .mcp.json.

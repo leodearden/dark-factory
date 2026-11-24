@@ -25,6 +25,7 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cli_invoke import AgentResult, is_zero_output_timeout, no_mcp_servers_config
 from shared.followup_items import FollowupItem
 from shared.neutral_cwd import neutral_cli_cwd
@@ -405,6 +406,7 @@ async def judge_pack(
         timeout_seconds=cfg.timeout_seconds,
         cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
         park_on_frozen_pool=False,
+        work_class=WorkClass(kind=WorkKind.ESSENTIAL, project_id=project_id, role=PACK_LEDGER_ROLE),
         **curator._ledger_kwargs(PACK_LEDGER_ROLE),
     )
     if not result.success:

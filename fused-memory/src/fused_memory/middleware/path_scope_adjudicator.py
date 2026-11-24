@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
     AgentResult,  # (re-exported for tests)
@@ -365,6 +366,9 @@ class PathScopeAdjudicator:
                 permission_mode='bypassPermissions',
                 timeout_seconds=self._config.timeout_seconds,
                 cap_wait_sanity_secs=_ADJUDICATOR_CAP_WAIT_SANITY_SECS,
+                work_class=WorkClass(
+                    kind=WorkKind.ESSENTIAL, project_id=project_id, role=_LEDGER_ROLE,
+                ),
                 **self._ledger_kwargs(),
             )
         except Exception as exc:

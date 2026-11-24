@@ -30,6 +30,7 @@ from _curator_helpers import (
 from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
 from _curator_helpers import prepared as _bundle
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cli_invoke import AgentResult, no_mcp_servers_config
 from shared.declared_scope import derive_declared_scope
 from shared.followup_items import observed_item
@@ -1789,6 +1790,7 @@ class TestInjectedInvoker:
             **self._scoping_kwargs(),
             'label': 'task-curator[p]',
             'role': 'task_curator',
+            'work_class': WorkClass(kind=WorkKind.ESSENTIAL, project_id='p', role='task_curator'),
             'output_schema': CURATOR_OUTPUT_SCHEMA,
             'system_prompt': CURATOR_SINGLE_SPEC.in_code_constant,
             'model': cfg.model,
@@ -1821,6 +1823,9 @@ class TestInjectedInvoker:
             **self._scoping_kwargs(),
             'label': 'task-curator-batch[p]',
             'role': 'task_curator_batch',
+            'work_class': WorkClass(
+                kind=WorkKind.ESSENTIAL, project_id='p', role='task_curator_batch',
+            ),
             'output_schema': CURATOR_BATCH_OUTPUT_SCHEMA,
             'system_prompt': CURATOR_BATCH_SPEC.in_code_constant,
             'model': cfg.model,
