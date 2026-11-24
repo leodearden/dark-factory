@@ -109,7 +109,7 @@ from orchestrator.index_lock_liveness import (
     IndexLockVerdict,
     describe_holders,
     diagnose_index_lock,
-    scan_work_tree_git_processes,
+    scan_index_lock_holders,
 )
 from orchestrator.lane_attach import (
     HeadRelation,
@@ -16224,9 +16224,11 @@ class GitOps:
         return (True, max(0.0, time.time() - mtime))
 
     async def _scan_index_lock_holders(self) -> GitProcessScan:
-        """The live git processes in project_root's work tree, scanned off the event loop."""
+        """The live git processes in project_root's work tree that could have
+        written its index lock, scanned off the event loop."""
         return await asyncio.to_thread(
-            scan_work_tree_git_processes, self.project_root, proc_root=self.proc_root,
+            scan_index_lock_holders, await self._index_lock_path(), self.project_root,
+            proc_root=self.proc_root,
         )
 
     async def _await_index_lock_clear(
