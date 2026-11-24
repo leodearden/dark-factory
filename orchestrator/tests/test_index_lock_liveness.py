@@ -1,9 +1,10 @@
 """Who holds a work tree's index.lock, and what is safe to tell an operator (task 5229).
 
 Which processes a scan LISTS is pinned with real processes in real repos:
-the property is what ``/proc`` says about them.  Whether a scan is CONFIRMED
-is pinned with a constructed proc root instead, because on the real ``/proc``
-it depends on the whole host: inside an agent's landlock sandbox the cwd of
+the property is what ``/proc`` says about them.  Whether a scan is CONFIRMED,
+and every verdict drawn from one, is pinned with a constructed proc root
+(``_constructed_proc_table``) instead, because on the real ``/proc`` it
+depends on the whole host: inside an agent's landlock sandbox the cwd of
 every process outside the sandbox's domain is unreadable (EACCES, measured
 2026-11-24), so a real scan there is unconfirmed whenever another agent's git
 happens to be running.  The scan's own children are always readable.
@@ -11,13 +12,16 @@ happens to be running.  The scan's own children are always readable.
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from _blocked_commit_fixture import commit_blocked_in_pre_commit_hook
+from _constructed_proc_table import add_git_process, add_process, empty_proc_table
 from _git_fixtures import seed_repo
 from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
@@ -28,6 +32,7 @@ from orchestrator.index_lock_liveness import (
     IndexLockDiagnosis,
     IndexLockVerdict,
     diagnose_index_lock,
+    scan_index_lock_holders,
     scan_work_tree_git_processes,
 )
 
@@ -75,15 +80,6 @@ def _nested_worktree(repo: Path) -> Path:
         cwd=repo, env=_env_fenced_at_parent_of(repo), check=True, capture_output=True,
     )
     return nested
-
-
-def _proc_entry(proc_root: Path, pid: int, comm: str) -> Path:
-    """One pid in a constructed process table, its ``cwd`` NOT a link, so it cannot be read."""
-    entry = proc_root / str(pid)
-    entry.mkdir(parents=True)
-    (entry / 'comm').write_text(f'{comm}\n')
-    (entry / 'cwd').write_text('')
-    return entry
 
 
 class TestScanWorkTreeGitProcesses:
@@ -135,16 +131,107 @@ class TestScanWorkTreeGitProcesses:
         assert scan.processes == ()
 
     def test_a_process_table_with_no_git_process_is_a_confirmed_empty_scan(self, tmp_path):
-        proc_root = tmp_path / 'proc'
-        proc_root.mkdir()
-        _proc_entry(proc_root, 4242, 'cat')
+        proc_root = empty_proc_table(tmp_path)
+        add_process(proc_root, 4242, comm='cat', cwd=None, command='cat', started_at=time.time())
         scan = scan_work_tree_git_processes(tmp_path, proc_root=proc_root)
         assert scan == GitProcessScan((), confirmed=True)
 
     def test_a_git_process_that_cannot_be_placed_makes_the_scan_unconfirmed(self, tmp_path):
-        proc_root = tmp_path / 'proc'
-        _proc_entry(proc_root, 4242, 'git')
+        proc_root = empty_proc_table(tmp_path)
+        add_git_process(proc_root, 4242, cwd=None, command='git status', started_at=time.time())
         scan = scan_work_tree_git_processes(tmp_path, proc_root=proc_root)
+        assert scan == GitProcessScan((), confirmed=False)
+
+
+_REIFY_LOCK_AGE_S = 3290.0
+
+
+def _lock_written_ago(work_tree: Path, seconds: float) -> Path:
+    lock = work_tree / '.git' / 'index.lock'
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text('')
+    written_at = time.time() - seconds
+    os.utime(lock, (written_at, written_at))
+    return lock
+
+
+class TestScanIndexLockHolders:
+    """Only a git process that could have WRITTEN the lock is a holder.
+
+    git creates index.lock after it starts, so a git process that started
+    after the lock's mtime cannot be its creator: the merge worker's own
+    read-only ``git cherry`` / ``git log`` children are the common case.
+    """
+
+    def test_a_git_process_started_before_the_lock_is_listed(self, tmp_path):
+        repo = seed_repo(tmp_path / 'repo')
+        with _waiting_on_stdin(['git', 'hash-object', '--stdin'], repo) as proc:
+            lock = _lock_written_ago(repo, 0.0)
+            scan = scan_index_lock_holders(lock, repo)
+            assert proc.pid in {process.pid for process in scan.processes}
+
+    def test_a_git_process_started_after_an_old_lock_is_not_listed(self, tmp_path):
+        """The backdate must dwarf the start-time slack: btime is truncated to
+        whole seconds, so a computed start reads up to a second early."""
+        repo = seed_repo(tmp_path / 'repo')
+        lock = _lock_written_ago(repo, 600.0)
+        with _waiting_on_stdin(['git', 'hash-object', '--stdin'], repo) as proc:
+            scan = scan_index_lock_holders(lock, repo)
+            assert proc.pid not in {process.pid for process in scan.processes}
+
+    def test_a_later_read_only_git_does_not_mask_a_crashed_leftover(self, tmp_path):
+        work_tree = tmp_path / 'wt'
+        lock = _lock_written_ago(work_tree, _REIFY_LOCK_AGE_S)
+        proc_root = empty_proc_table(tmp_path)
+        add_git_process(
+            proc_root, 4_000_000, cwd=work_tree,
+            command='git cherry main abc123', started_at=time.time(),
+        )
+        scan = scan_index_lock_holders(lock, work_tree, proc_root=proc_root)
+        assert scan == GitProcessScan((), confirmed=True)
+        assert _diagnose(_REIFY_LOCK_AGE_S, scan).verdict is IndexLockVerdict.CRASHED_LEFTOVER
+
+    def test_a_git_process_that_predates_the_lock_is_listed(self, tmp_path):
+        work_tree = tmp_path / 'wt'
+        lock = _lock_written_ago(work_tree, _REIFY_LOCK_AGE_S)
+        proc_root = empty_proc_table(tmp_path)
+        add_git_process(
+            proc_root, 728900, cwd=work_tree, command='git commit --only plans/x.md',
+            started_at=lock.stat().st_mtime - 10,
+        )
+        scan = scan_index_lock_holders(lock, work_tree, proc_root=proc_root)
+        assert [process.pid for process in scan.processes] == [728900]
+        assert _diagnose(_REIFY_LOCK_AGE_S, scan).verdict is IndexLockVerdict.LIVE_HOLDER
+
+    def test_a_git_process_with_an_unparseable_start_time_stays_listed(self, tmp_path):
+        work_tree = tmp_path / 'wt'
+        lock = _lock_written_ago(work_tree, _REIFY_LOCK_AGE_S)
+        proc_root = empty_proc_table(tmp_path)
+        add_git_process(
+            proc_root, 728900, cwd=work_tree, command='git commit --only plans/x.md',
+            started_at=None,
+        )
+        scan = scan_index_lock_holders(lock, work_tree, proc_root=proc_root)
+        assert [process.pid for process in scan.processes] == [728900]
+
+    def test_a_git_process_stays_listed_when_the_boot_time_is_unknown(self, tmp_path):
+        work_tree = tmp_path / 'wt'
+        lock = _lock_written_ago(work_tree, _REIFY_LOCK_AGE_S)
+        proc_root = empty_proc_table(tmp_path, boot_epoch_known=False)
+        add_git_process(
+            proc_root, 4_000_000, cwd=work_tree,
+            command='git cherry main abc123', started_at=time.time(),
+        )
+        scan = scan_index_lock_holders(lock, work_tree, proc_root=proc_root)
+        assert [process.pid for process in scan.processes] == [4_000_000]
+
+    def test_an_absent_lock_is_unknown_not_unheld(self, tmp_path):
+        work_tree = tmp_path / 'wt'
+        work_tree.mkdir()
+        proc_root = empty_proc_table(tmp_path)
+        scan = scan_index_lock_holders(
+            work_tree / '.git' / 'index.lock', work_tree, proc_root=proc_root,
+        )
         assert scan == GitProcessScan((), confirmed=False)
 
 
