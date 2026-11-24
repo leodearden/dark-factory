@@ -392,9 +392,10 @@ lands in exactly one bucket:
   separately and never folded into either side: a class whose proposals are
   mostly task-side is visibly not yet measurable rather than falsely green, and
   missing data never reads as disagreement.
-- `non_human_resolver` — the record was resolved by no human at all: a
-  cascade, a reaper sweep, the steward. The proposal was never held against an
-  adjudication, so it reaches no rate. Counted per class for the same reason as
+- `not_human_ruled` — the record carries no human ruling: an attended-seat
+  close that asserted none, a cascade, a reaper sweep, the steward
+  (`escalation/src/escalation/classify.py::resolver_tier`). The proposal was
+  never held against an adjudication, so it reaches no rate. Counted per class for the same reason as
   `not_comparable`: the report's aggregate `resolver_tiers` line says which
   tier took the sample, and only the class row says which class paid for it —
   a class whose every record went that way still gets a row rather than
@@ -430,8 +431,8 @@ list only, not against the row's own acts; task 8478 adds that per-row check.
 - `verify_host_reprobed` (`reprobe_quarantine`) — the verify-host monitor
   resolves these records itself
   (`orchestrator/src/orchestrator/merge_lane/liveness.py::_resolve_pending_alarm`):
-  a non-human resolver, with no `resolution_action`. Every stamp therefore
-  lands in `non_human_resolver`, and the class's agreement rate is `None` while
+  no human ruling, and no `resolution_action`. Every stamp therefore
+  lands in `not_human_ruled`, and the class's agreement rate is `None` while
   the monitor closes them. η cannot flip it on this measurement.
 - `dead_letter_replayed` (`replay_dead_letters`) — not file-writing, so only the
   random audit draw checks the replay. No ruling yet names a stronger check.

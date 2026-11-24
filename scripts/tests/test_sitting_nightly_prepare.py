@@ -16,12 +16,22 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from legibility import account_pool
 from orchestrator.agents import landlock, sandbox, sandbox_dispatch
+from shared.account_reserve import WorkKind
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, build_claude_argv, resolve_claude_binary
+from shared.testing import make_gate_mock
+from shared.testing_reserve import (
+    PROTECTED,
+    RELEASE_AT,
+    ReserveClock,
+    cap_all_but_reserve,
+    reserve_gate,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import nightly_prepare as mod
 from sitting import prepare_sitting
@@ -1108,3 +1118,37 @@ def test_every_seat_rejecting_its_credentials_fails_and_never_rides_the_host_log
     line = _exhaustion_line(capsys.readouterr().err)
     assert f'capped [], auth-failed [{SEAT_B}, {SEAT_H}]; earliest reset unknown' in line
     assert _credentials_left(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# 8. The preparer is background work: the allowance reserve refuses it in its
+#    protected window (plans/allowance-reserve-by-account-prd.md C10).
+# ---------------------------------------------------------------------------
+
+
+def test_a_pool_open_only_on_the_reserve_fails_naming_the_reserve_and_its_release(tmp_path, capsys):
+    """SEAT_H is the reserve; with SEAT_B capped inside its protected window the run never starts."""
+    reserve_dir = tmp_path / 'reserve'
+    reserve_dir.mkdir()
+    gate = reserve_gate(reserve_dir, clock=ReserveClock(PROTECTED), account_names=(SEAT_B, SEAT_H))
+    cap_all_but_reserve(gate, SEAT_H)
+    fake = _fake_claude(tmp_path)
+
+    assert _run(fake, gate) == mod.EXIT_FAILED
+
+    assert _tokens_called(fake) == []
+    line = _exhaustion_line(capsys.readouterr().err)
+    assert SEAT_H in line and RELEASE_AT.isoformat() in line, line
+    assert _credentials_left(tmp_path) == []
+
+
+def test_the_preparer_declares_background_work(tmp_path):
+    gate = make_gate_mock(shutdown=AsyncMock())
+    fake = _fake_claude(tmp_path, stdout=OK_RESULT)
+
+    assert _run(fake, gate) == mod.EXIT_OK
+
+    [admission] = gate.before_invoke.await_args_list
+    work_class = admission.kwargs.get('work_class')
+    assert work_class is not None, admission
+    assert work_class.kind is WorkKind.BACKGROUND

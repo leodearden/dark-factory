@@ -574,18 +574,18 @@ class TestAggregateProjectLifespan:
         samples = {tuple(row) for row in lifespan['samples']}
         assert samples == {
             ((now - timedelta(days=9)).date().isoformat(), 'reaper-sweep', 0, 86400.0),
-            ((now - timedelta(days=7)).date().isoformat(), 'human', 0, 86400.0),
+            ((now - timedelta(days=7)).date().isoformat(), 'attended-seat', 0, 86400.0),
             (
                 (now - timedelta(days=6) + timedelta(hours=2)).date().isoformat(),
                 'auto-watcher', 1, 7200.0,
             ),
             (
                 (now - timedelta(days=5) + timedelta(hours=3)).date().isoformat(),
-                'human', 2, 10800.0,
+                'attended-seat', 2, 10800.0,
             ),
             (
                 (now - timedelta(days=4) + timedelta(hours=1)).date().isoformat(),
-                'human', 2, 3600.0,
+                'attended-seat', 2, 3600.0,
             ),
         }
 
@@ -658,6 +658,51 @@ class TestAggregateProjectLifespan:
 # ---------------------------------------------------------------------------
 
 
+class TestResolverTierFromTheRecord:
+    """Every block tiers a record through escalation.classify.resolver_tier
+    (plans/instruments-honesty-prd.md decision 10): the human-ruling flag first."""
+
+    def _one_terminal(self, esc_dir: Path, now: datetime, **fields) -> None:
+        esc = {
+            'id': 'esc-77-1', 'task_id': '77', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'scope_violation', 'summary': 'tier fixture',
+            'timestamp': _iso(now - timedelta(days=3)), 'status': 'resolved', 'level': 2,
+            'resolved_at': _iso(now - timedelta(days=3) + timedelta(hours=1)),
+            'resolution_class': 'actionable',
+        }
+        esc.update(fields)
+        _write_escalation(esc_dir, esc, archived=True)
+
+    def _tiers(self, tmp_path: Path, **fields) -> tuple[set, set, set]:
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        self._one_terminal(esc_dir, now, **fields)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        samples = {row[1] for row in entry['lifespan']['samples']}
+        weekly = {tier for week in entry['workflow']['tier_weekly'].values() for tier in week}
+        flow = {row['tier'] for row in entry['workflow']['flow_daily']}
+        return samples, weekly, flow
+
+    def test_a_human_ruling_is_human_ruled_in_every_block(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='interactive', ruled_by_human=True)
+        assert tiers == ({'human-ruled'},) * 3
+
+    def test_a_seat_close_without_a_ruling_is_attended_seat_in_every_block(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='interactive')
+        assert tiers == ({'attended-seat'},) * 3
+
+    def test_a_cascade_close_keeps_its_tier(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='l2-cascade:esc-76-1')
+        assert tiers == ({'cascade'},) * 3
+
+    def test_an_unstamped_legacy_resolve_still_infers_actionable(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        self._one_terminal(esc_dir, now, resolved_by='interactive', resolution_class=None)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        assert {row['class'] for row in entry['workflow']['flow_daily']} == {'actionable'}
+
+
 class TestAggregateProjectWorkflow:
     """_aggregate(...)['workflow'] over the golden mini-archive."""
 
@@ -672,10 +717,10 @@ class TestAggregateProjectWorkflow:
         # week numbers.
         expected_tier_by_resolved = [
             (now - timedelta(days=9), 'reaper-sweep'),                        # 101-1
-            (now - timedelta(days=7), 'human'),                               # 102-1
+            (now - timedelta(days=7), 'attended-seat'),                               # 102-1
             (now - timedelta(days=6) + timedelta(hours=2), 'auto-watcher'),   # 103-1
-            (now - timedelta(days=5) + timedelta(hours=3), 'human'),          # 104-1
-            (now - timedelta(days=4) + timedelta(hours=1), 'human'),          # 105-1
+            (now - timedelta(days=5) + timedelta(hours=3), 'attended-seat'),          # 104-1
+            (now - timedelta(days=4) + timedelta(hours=1), 'attended-seat'),          # 105-1
         ]
         expected_tier_weekly: dict[str, dict[str, int]] = {}
         for dt, tier in expected_tier_by_resolved:
@@ -747,18 +792,18 @@ class TestAggregateProjectWorkflow:
         }
         assert flow_cells == {
             ((now - timedelta(days=9)).date().isoformat(), 'implementer', 0, 'reaper-sweep', 'benign'),
-            ((now - timedelta(days=7)).date().isoformat(), 'implementer', 0, 'human', 'actionable'),
+            ((now - timedelta(days=7)).date().isoformat(), 'implementer', 0, 'attended-seat', 'actionable'),
             (
                 (now - timedelta(days=6) + timedelta(hours=2)).date().isoformat(),
                 'architect', 1, 'auto-watcher', 'benign',
             ),
             (
                 (now - timedelta(days=5) + timedelta(hours=3)).date().isoformat(),
-                'architect', 2, 'human', 'actionable',
+                'architect', 2, 'attended-seat', 'actionable',
             ),
             (
                 (now - timedelta(days=4) + timedelta(hours=1)).date().isoformat(),
-                'implementer', 2, 'human', 'actionable',
+                'implementer', 2, 'attended-seat', 'actionable',
             ),
         }
         assert all(row['n'] == 1 for row in workflow['flow_daily'])
@@ -933,11 +978,11 @@ class TestSamplesDownsampling:
     # 3 tiers at a 3:2:1 ratio (60/40/20 of 120 total) so a threshold=40
     # downsample gives every tier a comfortably non-zero quota.
     _TIER_RESOLVERS = {
-        'human': 'interactive',
+        'attended-seat': 'interactive',
         'auto-watcher': 'escalation-watcher-auto',
         'reaper-sweep': 'auto-dismissed',
     }
-    _TIER_COUNTS = {'human': 60, 'auto-watcher': 40, 'reaper-sweep': 20}
+    _TIER_COUNTS = {'attended-seat': 60, 'auto-watcher': 40, 'reaper-sweep': 20}
 
     def _build_fixture(self, esc_dir: Path, now: datetime) -> int:
         """Write ``_TIER_COUNTS`` terminal records per tier; return the total count."""

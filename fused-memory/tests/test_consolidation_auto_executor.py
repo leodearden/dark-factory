@@ -27,6 +27,7 @@ from _auto_consolidation_fakes import (
     new_id,
     propose,
 )
+from _code_writer_links import assert_writes_c5
 from escalation.queue import EscalationQueue
 from shared.task_metadata import HUMAN_CURATOR_GATE_KEY
 
@@ -177,6 +178,8 @@ class TestFreshClusterPasses:
         await run(svc, queue=queue)
 
         (record,) = svc.system_records
+        # C5: a system record has no subject task, and names no task status.
+        assert_writes_c5(record, project_id=PROJECT_ID, subject=None)
         meta = record['metadata']
         assert meta['record_kind'] == 'auto_consolidation'
         assert 'topic' not in meta

@@ -2488,24 +2488,24 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_judge_infra
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS forwarded by judge to
+# RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS forwarded by judge to
 # invoke_with_cap_retry (task 1401)
 # ─────────────────────────────────────────────────────────────────────
 
 
 class TestJudgeCapWaitSanityBound:
-    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
+    """RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
     invoke_with_cap_retry by judge; prevents stalling the reconciliation
     queue under cap."""
 
     @pytest.mark.asyncio
     async def test_call_judge_cli_forwards_cap_wait_sanity_secs(self):
-        """(b) _call_judge_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
+        """(b) _call_judge_cli forwards cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
         from unittest.mock import AsyncMock
 
         from shared.cli_invoke import AgentResult
 
-        from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+        from fused_memory.reconciliation import RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
         config = _make_judge_config(
             judge_llm_provider='claude_cli',
@@ -2523,7 +2523,7 @@ class TestJudgeCapWaitSanityBound:
             new=mock,
         ):
             await judge._call_judge_cli('p', run_id='run-test')
-        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 
 # ─────────────────────────────────────────────────────────────────────

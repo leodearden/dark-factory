@@ -22,6 +22,7 @@ from _lane_episode_fakes import (
     _run,
 )
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
 from orchestrator.config import LaneCommand, OrchestratorConfig
 from orchestrator.offline_lane_confirm import (
@@ -56,7 +57,7 @@ from orchestrator.offline_lane_records import (
 )
 from orchestrator.offline_lane_runs import ConfirmRunner
 from orchestrator.verify_cache import keys, registry
-from orchestrator.verify_cache.audit_hook import VerifyCacheAuditHook
+from orchestrator.verify_cache.audit_hook import AUDIT_ESCALATION_SENTINEL, VerifyCacheAuditHook
 from orchestrator.verify_cache.audit_run import AUDIT_COMMAND, AuditNode
 from orchestrator.verify_evidence import UnitTier
 
@@ -309,6 +310,8 @@ AUDIT_LEG = LaneLeg.generic(LaneCommand(
 ))
 ALPHA_NODE = str(AuditNode('alpha', 'tests/test_a.py::t1'))
 ALPHA_KEY = keys.UnitKey.of('module:alpha:test', UnitTier.MODULE, 's', (('spec', 's'), ('tree:alpha', 'a' * 40)))
+BETA_NODE = str(AuditNode('beta', 'tests/test_b.py::t1'))
+BETA_KEY = keys.UnitKey.of('module:beta:test', UnitTier.MODULE, 's', (('spec', 's'), ('tree:beta', 'b' * 40)))
 
 
 def _audit_record(store: RunRecordStore, phase: str) -> RunRecord:
@@ -346,15 +349,18 @@ class _Tee:
         return await self.engine.observe(observation)
 
 
-def _seed_alpha_leak(project_root: Path) -> tuple[registry.Registry, registry.Entry]:
+def _seed_leaks(project_root: Path, *unit_keys: keys.UnitKey) -> tuple[registry.Registry, tuple[registry.Entry, ...]]:
+    """The project's registry with a green for each of *unit_keys*, every one consumed by HEAD1's landing."""
     store = registry.Registry(registry.registry_db_path(project_root))
-    entry = asyncio.run(store.record_green(ALPHA_KEY, evidence_event_id=7, run_id='r1', sha='abc'))
-    asyncio.run(store.consume(HEAD1, [entry]))
-    return store, entry
+    entries = tuple(
+        asyncio.run(store.record_green(key, evidence_event_id=7, run_id='r1', sha='abc')) for key in unit_keys
+    )
+    asyncio.run(store.consume(HEAD1, entries))
+    return store, entries
 
 
 def test_a_verify_cache_leak_note_reaches_the_task_the_lane_files(tmp_path):
-    store, entry = _seed_alpha_leak(tmp_path)
+    store, (entry,) = _seed_leaks(tmp_path, ALPHA_KEY)
     config = OrchestratorConfig(project_root=tmp_path)
     hooks = lane_pass_outcome_hooks(config, EscalationQueue(tmp_path / 'escalations'))
     lane = Pass(tmp_path)
@@ -381,6 +387,32 @@ def test_a_verify_cache_leak_note_reaches_the_task_the_lane_files(tmp_path):
     for named in ('module:alpha:test', ALPHA_KEY.key, f'entry {entry.entry_id}', HEAD1):
         assert named in filed['details'], filed['details']
     assert asyncio.run(store.policy_state()).streak == 1
+
+
+def test_without_a_wired_queue_the_audit_files_its_kill_switch_blocker_on_the_projects_queue(tmp_path):
+    _seed_leaks(tmp_path, ALPHA_KEY, BETA_KEY)
+    (hook,) = lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), None)
+    assert isinstance(hook, VerifyCacheAuditHook)
+
+    asyncio.run(hook(AUDIT_COMMAND, HEAD1, Confirmed(ConfirmMode.INTERSECTED, (ALPHA_NODE, BETA_NODE), (), ()), ()))
+
+    (blocker,) = EscalationQueue(escalation_queue_dir(tmp_path)).get_by_task(
+        AUDIT_ESCALATION_SENTINEL, status='pending',
+    )
+    assert blocker.level == 2
+
+
+def test_a_wired_queue_is_the_one_the_audit_files_its_kill_switch_blocker_on(tmp_path):
+    _seed_leaks(tmp_path, ALPHA_KEY, BETA_KEY)
+    wired = EscalationQueue(tmp_path / 'other-escalations')
+    (hook,) = lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), wired)
+    assert isinstance(hook, VerifyCacheAuditHook)
+
+    asyncio.run(hook(AUDIT_COMMAND, HEAD1, Confirmed(ConfirmMode.INTERSECTED, (ALPHA_NODE, BETA_NODE), (), ()), ()))
+
+    (blocker,) = wired.get_by_task(AUDIT_ESCALATION_SENTINEL, status='pending')
+    assert blocker.level == 2
+    assert EscalationQueue(escalation_queue_dir(tmp_path)).get_by_task(AUDIT_ESCALATION_SENTINEL) == []
 
 
 @pytest.mark.asyncio

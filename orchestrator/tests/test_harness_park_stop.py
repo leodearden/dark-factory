@@ -1274,7 +1274,7 @@ class TestHarnessRunForever:
         harness.scheduler.acquire_next = AsyncMock(side_effect=[assignment, None, None])
         harness.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
 
-        async def fake_slot(_assignment, _sem):
+        async def fake_slot(_assignment, _lease):
             return TaskReport(task_id='T1', title='t', outcome=WorkflowOutcome.DONE)
 
         harness._run_slot = fake_slot  # type: ignore[method-assign]

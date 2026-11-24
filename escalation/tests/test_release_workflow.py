@@ -473,6 +473,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
 
     from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
     from orchestrator.scheduler import TaskAssignment  # type: ignore[reportMissingImports]
+    from orchestrator.slot_lease import SlotLease
     from orchestrator.workflow import (  # type: ignore[reportMissingImports]
         TerminalReport,
         WorkflowOutcome,
@@ -577,7 +578,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
         server = create_server(queue, harness=h)
 
         # Start the slot task — it blocks inside mock run() awaiting cancel_event.
-        slot_task = asyncio.create_task(h._run_slot(assignment, sem))
+        slot_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
 
         # Wait for _run_slot to register the cancel_event in _workflow_cancel_events.
         for _ in range(100):

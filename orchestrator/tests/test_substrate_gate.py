@@ -23,6 +23,7 @@ import pytest
 from _git_fixtures import seed_repo
 
 from orchestrator import substrate_gate as gate
+from orchestrator.slot_lease import SlotLease
 
 # ---------------------------------------------------------------------------
 # Shared scaffolding (pre-1)
@@ -1152,7 +1153,7 @@ class TestRunSlotSubstrateGateWiring:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (a1) TaskWorkflow must NOT have been constructed.
         assert not MockWorkflow.called, (
@@ -1184,7 +1185,7 @@ class TestRunSlotSubstrateGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (b1) TaskWorkflow must have been constructed.
         assert MockWorkflow.called, 'TaskWorkflow must be constructed on PASS gate verdict'
@@ -1209,7 +1210,7 @@ class TestRunSlotSubstrateGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (c1) _run_substrate_gate must NOT have been called.
         gate_mock.assert_not_awaited()
@@ -1290,7 +1291,7 @@ class TestRunSlotSubstrateFailClosed:
             patch('orchestrator.harness.build_workflow') as MockWorkflow,
         ):
             MockWorkflow.return_value = _make_mock_workflow()
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert not MockWorkflow.called, (
             f'TaskWorkflow must NOT be constructed for malformed descriptor '
@@ -1349,7 +1350,7 @@ class TestRunSlotSubstrateFailClosed:
         ):
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert MockWorkflow.called, 'TaskWorkflow must be constructed when no probe is declared'
         mock_wf.run.assert_awaited_once()

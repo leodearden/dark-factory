@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.offline_lane_escalations import (
@@ -25,6 +26,7 @@ from orchestrator.offline_lane_escalations import (
     file_stuck_filing,
     file_tick_failure,
     file_unlanded_red,
+    release_lane_record,
     resolve_stuck_filing,
     resolve_tick_failure,
     sentinel_task_id,
@@ -224,6 +226,56 @@ def test_resolving_a_tick_failure_is_read_back_as_resolved_by_the_lane(queue: Es
     assert escalation_state(queue, escalation_id) == 'resolved'
     assert _record(queue, escalation_id).resolved_by == LANE_ESCALATION_ROLE
     assert queue.get_pending() == []
+
+
+def _assert_closed_with_a_class(queue: EscalationQueue, escalation_id: str) -> None:
+    record = _record(queue, escalation_id)
+    assert record.status != 'pending'
+    assert record.resolution_class is not None
+
+
+def test_a_parked_stuck_filing_closes_with_a_resolution_class(queue: EscalationQueue):
+    """A watcher's park promotes the record to level 2, whose close must be classified."""
+    escalation_id = file_stuck_filing(queue, _stuck())
+    queue.park(escalation_id, 'parked for a human')
+
+    resolve_stuck_filing(queue, escalation_id)
+
+    _assert_closed_with_a_class(queue, escalation_id)
+
+
+def test_a_parked_tick_failure_closes_with_a_resolution_class(queue: EscalationQueue):
+    escalation_id = file_tick_failure(queue, FAILURE)
+    queue.park(escalation_id, 'parked for a human')
+
+    resolve_tick_failure(queue, escalation_id)
+
+    _assert_closed_with_a_class(queue, escalation_id)
+
+
+def test_a_released_parked_lane_record_closes_with_a_resolution_class(queue: EscalationQueue):
+    escalation_id = file_unlanded_red(queue, RED)
+    queue.park(escalation_id, 'parked for a human')
+
+    release_lane_record(queue, escalation_id, 'the covering task landed')
+
+    _assert_closed_with_a_class(queue, escalation_id)
+
+
+def test_a_released_records_sole_member_holder_closes_with_a_resolution_class(
+    queue: EscalationQueue,
+):
+    escalation_id = file_unlanded_red(queue, RED)
+    holder = Escalation(
+        id=queue.make_id('7123'), task_id='7123', agent_role='escalation-watcher-auto',
+        severity='blocking', category='infra_issue', summary='holds the lane record',
+        level=2, members=[escalation_id],
+    )
+    queue.submit(holder)
+
+    release_lane_record(queue, escalation_id, 'the covering task landed')
+
+    _assert_closed_with_a_class(queue, holder.id)
 
 
 def test_state_of_an_unknown_escalation_is_none(queue: EscalationQueue):

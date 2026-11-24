@@ -158,7 +158,7 @@ class TestQueueAmend:
     def test_archived_record_is_not_found_and_never_resurrected(self, tmp_path):
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = _framed_l2(queue, members=[])
-        assert queue.resolve(l2.id, 'decided') is not None
+        assert queue.resolve(l2.id, 'decided', resolution_class='actionable') is not None
         assert not _record_path(queue, l2.id).exists()
         snapshot = _json_files(queue)
 
@@ -375,7 +375,7 @@ class TestAmendEscalationTool:
     async def test_archived_record_is_not_pending_and_untouched(self, tmp_path):
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = _framed_l2(queue, members=[])
-        assert queue.resolve(l2.id, 'decided') is not None
+        assert queue.resolve(l2.id, 'decided', resolution_class='actionable') is not None
         server = create_server(queue, startup_sweep=False)
         snapshot = _json_files(queue)
 

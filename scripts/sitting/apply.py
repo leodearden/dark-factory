@@ -498,7 +498,9 @@ class _ApplyContext:
             if cleared is None or action is None:
                 return no_escalation
             return payloads.resolve_issue_payload(cleared.escalation_id, ruling_text, action,
-                                                  resolved_by=COORDINATOR_IDENTITY, resolution_turns=turns)
+                                                  resolved_by=COORDINATOR_IDENTITY, resolution_turns=turns,
+                                                  resolution_class=payloads.SITTING_RULING_CLASS,
+                                                  ruled_by_human=True)
 
         def x_ruling() -> ApplyPayload | _Skip | _Failed:
             if cleared is None or action is None:

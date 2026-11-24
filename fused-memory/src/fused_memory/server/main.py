@@ -2086,9 +2086,11 @@ async def _setup_curator_usage_gate(
     run key the gate's account events and the curator's invocations share.
 
     Otherwise the CostStore is opened first (persistent aiosqlite connection).
-    If ``UsageGate.__init__`` or the success-path log subsequently raises for
-    any reason, both the gate (if constructed) and the open store are cleaned up
-    before re-raising — preventing a file-handle / WAL thread leak that would
+    The gate is built without it, stamped, and only then given the store through
+    ``UsageGate.attach_cost_store``, so the ``reserve_config`` row that attaching
+    records carries the run key. If ``UsageGate.__init__``, the attach or the
+    success-path log subsequently raises for any reason, both the gate (if
+    constructed) and the open store are cleaned up before re-raising — preventing a file-handle / WAL thread leak that would
     occur if the caller's ``finally:`` block never ran.
 
     **Cancellation hardening:** each cleanup await is wrapped in
@@ -2115,8 +2117,9 @@ async def _setup_curator_usage_gate(
 
     curator_usage_gate: UsageGate | None = None
     try:
-        curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+        curator_usage_gate = UsageGate(config.usage_cap)
         curator_usage_gate.run_id = run_id or _mint_curator_run_id()
+        curator_usage_gate.attach_cost_store(curator_cost_store)
         logger.info(
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',

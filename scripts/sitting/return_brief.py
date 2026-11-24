@@ -463,10 +463,10 @@ def _agreement_lines(rulings: StandingPolicyRulings) -> list[str]:
     report = rulings.report
     lines = ['No shadow-stamped record was resolved in the window.']
     if report.classes:
-        lines = ['| class | agreed | diverged | not comparable | non-human resolver | agreement |',
+        lines = ['| class | agreed | diverged | not comparable | not human-ruled | agreement |',
                  '|---|---|---|---|---|---|']
         lines += [f'| {c.ruling_class} | {c.agreed} | {c.diverged} | {c.not_comparable} | '
-                  f'{c.non_human_resolver} | {_percent(c.agreement_rate)} |' for c in report.classes]
+                  f'{c.not_human_ruled} | {_percent(c.agreement_rate)} |' for c in report.classes]
     return [*lines, '', f'Also resolved in the window: {report.gated_stamps} gated, {report.self_resolved} '
                         f'self-resolved, {report.rejected_stamps} with an unreadable stamp. Still pending '
                         f'(lifetime backlog): {report.unresolved_lifetime}.']

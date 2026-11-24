@@ -63,6 +63,7 @@ from orchestrator.harness import Harness
 from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.review_payload import NoteDisposition
 from orchestrator.scheduler import Scheduler
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 ORPHAN_REAPER = 'harness-orphan-reaper'
@@ -464,7 +465,9 @@ class TestRow06TerminalStatusCancelDuringTheTail:
             return run.build_workflow(cancel_event=kwargs['cancel_event'])
 
         with patch('orchestrator.harness.build_workflow', side_effect=_build_this_runs_workflow):
-            slot = asyncio.create_task(harness._run_slot(assignment(), asyncio.Semaphore(0)))
+            slot = asyncio.create_task(
+                harness._run_slot(assignment(), SlotLease(TASK_ID, harness.scheduler, asyncio.Semaphore(0))),
+            )
             await wait_responsive(flips.done_written.wait(), label='the merged row flips done')
             assert await harness._scan_for_terminal_active_tasks() == 1
             report = await wait_responsive(slot, label='the soft-cancelled slot unwinds')

@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -85,6 +86,7 @@ from fused_memory.reconciliation.overreach_flags import (
 )
 from fused_memory.reconciliation.predecessor_drain_recovery import recover_predecessor_drains
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
+from fused_memory.reconciliation.reserve_step_aside import ReserveStepAside, StepAsideSite
 from fused_memory.reconciliation.scope_freshness import (
     ScopeFreshnessResult,
     compute_scope_signature,
@@ -234,6 +236,17 @@ logger = logging.getLogger(__name__)
 # commits). Exceeding the cap is WARN-logged so a wedged judge is visible rather
 # than silently re-run each restart.
 _JUDGE_RECOVERY_MAX_SPAWN = 20
+
+
+class _JudgeRecoveryOccasion(StrEnum):
+    """Why a judge-recovery pass runs; the value completes its log lines."""
+
+    STARTUP = 'after restart'
+    RESERVE_REFUSAL_ENDED = 'after the reserve refusal ended'
+
+
+def _judge_task_name(run_id: str) -> str:
+    return f'judge-{run_id}'
 
 # Task 1755 / PRD β: stable finding identity for the dead_owner_shielded storm alarm.
 # The fingerprint is keyed on finding['category'] / affected_ids / description
@@ -815,6 +828,7 @@ class ReconciliationHarness:
         escalation_listener: socket.socket | None = None,
         full_cycle_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
         escalation_queue: EscalationQueue | None = None,
+        usage_gate: UsageGate | None = None,
     ):
         self.memory = memory_service
         # systemd-held listening socket for the escalation port, so it stays
@@ -920,10 +934,12 @@ class ReconciliationHarness:
         # SOONER than the bound would have — the fail-safe direction.
         self._remediation_deferrals: dict[str, int] = {}
 
-        # Usage gate (multi-account cap failover)
-        self.usage_gate: UsageGate | None = None
-        if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
+        # Usage gate (multi-account cap failover): the injected one, else one from config.
+        # Either way the harness owns it and shuts it down with itself.
+        self.usage_gate: UsageGate | None = usage_gate
+        if self.usage_gate is None and hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
+        self._reserve_step_aside = ReserveStepAside(self.usage_gate)
 
         # Judge — receives a callback that clears _halt_escalated so a
         # subsequent halt in the same process re-fires the escalation.
@@ -1867,10 +1883,9 @@ class ReconciliationHarness:
                 'source': 'stage1_status_correction',
             }
             content = (
-                f'Stage 1 status-correction reconciliation: the cached '
-                f'project_status_correction memory diverged from the authoritative '
-                f"get_statuses census: done={live['done']} total={live['total']} "
-                f"active={len(live['active_tasks'])}."
+                'Stage 1 status-correction reconciliation: the cached '
+                'project_status_correction record disagreed with the live task '
+                'census and was superseded.'
             )
             # Add-then-delete: guarantees at least one correct memory always exists
             # even if a delete below fails — the fresh memory (supersedes=[<old_id>])
@@ -2570,7 +2585,7 @@ class ReconciliationHarness:
             logger.info('Reconciliation escalation server stopped')
 
     async def _shutdown_usage_gate(self) -> None:
-        """Tear down the usage gate built in ``__init__``, best-effort."""
+        """Tear down the usage gate, best-effort: the one built from config or the one injected."""
         if self.usage_gate is None:
             return
         try:
@@ -2990,7 +3005,7 @@ class ReconciliationHarness:
         # guarded (self.judge is not None) inside the method. Fail-safe wrapped like
         # the sibling one-shot passes so a recovery hiccup never crashes the loop.
         try:
-            await self._recover_pending_judge_reviews()
+            await self._recover_pending_judge_reviews(why=_JudgeRecoveryOccasion.STARTUP)
         except Exception as e:
             logger.warning(f'_recover_pending_judge_reviews at startup failed: {e}')
 
@@ -3120,6 +3135,10 @@ class ReconciliationHarness:
                 logger.info('reconciliation.drain_ack', extra={'project_id': project_id})
                 return
             try:
+                # Asked before should_trigger, which consumes a manual trigger.
+                if await self.reserve_steps_aside(project_id, site=StepAsideSite.PROJECT_LOOP):
+                    await _sleep(5)
+                    continue
                 should, reason = await self.buffer.should_trigger(project_id)
                 if not should:
                     idle_ticks += 1
@@ -3308,8 +3327,24 @@ class ReconciliationHarness:
             except Exception as e:
                 logger.warning(f'Heartbeat failed for {project_id}: {e}')
 
-    async def _spawn_judge(self, run_id: str, project_id: str) -> None:
-        """Durably mark a judge review pending, then fire a tracked judge task.
+    async def reserve_steps_aside(self, project_id: str, *, site: StepAsideSite) -> bool:
+        """Whether *site* defers now because the allowance reserve refuses reconciliation.
+
+        The policy is fused_memory/reconciliation/reserve_step_aside.py's. On the
+        first check after a refusal ends, the judges it left pending are recovered.
+        """
+        check = self._reserve_step_aside.check(project_id, site=site)
+        if check.refusal_ended:
+            try:
+                await self._recover_pending_judge_reviews(
+                    why=_JudgeRecoveryOccasion.RESERVE_REFUSAL_ENDED,
+                )
+            except Exception as e:
+                logger.warning(f'_recover_pending_judge_reviews after a reserve refusal failed: {e}')
+        return check.refused
+
+    async def _spawn_judge(self, run_id: str, project_id: str) -> bool:
+        """Durably mark a judge review pending, then fire a tracked judge task; whether one started.
 
         The single seam for both fresh cycle-end launches (run_full_cycle,
         _run_remediation_pass) and startup recovery (task 2708). Awaiting the
@@ -3318,11 +3353,24 @@ class ReconciliationHarness:
         marker is cleared atomically inside ``add_verdict``. The task is tracked
         in ``_judge_tasks`` (with a done-callback that discards it) so shutdown
         can drain it deterministically.
+
+        While the allowance reserve refuses reconciliation, no task starts and the
+        marker waits for the recovery pass the refusal's end runs. That check comes
+        before the in-flight one because the pass it runs may start this run's judge.
         """
         await self.journal.mark_judge_pending(run_id, project_id)
-        task = asyncio.create_task(self._run_judge(run_id), name=f'judge-{run_id}')
+        if await self.reserve_steps_aside(project_id, site=StepAsideSite.JUDGE):
+            return False
+        if self._judge_in_flight(run_id):
+            return False
+        task = asyncio.create_task(self._run_judge(run_id), name=_judge_task_name(run_id))
         self._judge_tasks.add(task)
         task.add_done_callback(self._judge_tasks.discard)
+        return True
+
+    def _judge_in_flight(self, run_id: str) -> bool:
+        name = _judge_task_name(run_id)
+        return any(task.get_name() == name and not task.done() for task in self._judge_tasks)
 
     async def _drain_judge_tasks(self) -> None:
         """Cancel and await every in-flight judge task on shutdown (task 2708).
@@ -3340,12 +3388,17 @@ class ReconciliationHarness:
             await asyncio.gather(*pending, return_exceptions=True)
         self._judge_tasks.clear()
 
-    async def _recover_pending_judge_reviews(self) -> None:
+    async def _recover_pending_judge_reviews(
+        self, *, why: _JudgeRecoveryOccasion = _JudgeRecoveryOccasion.STARTUP,
+    ) -> None:
         """Re-fire the judge for every run left with a judge_pending marker (task 2708).
 
-        One-shot startup pass: a restart landing in the cycle-end→verdict-commit
+        It runs at startup: a restart landing in the cycle-end→verdict-commit
         window cancels the fire-and-forget judge before add_verdict's atomic
-        marker-clear, so the marker survives. Re-running the judge is safe — the
+        marker-clear, so the marker survives. It runs again when an allowance
+        reserve refusal ends, for the judges _spawn_judge left pending meanwhile.
+        Runs whose judge is still in flight are skipped: their markers clear only
+        when their verdicts commit. Re-running the judge is safe — the
         review is read-only over the run record, and the invariant 'marker present
         ⟹ no committed verdict' (add_verdict clears atomically) means the re-run's
         judge_verdicts INSERT never collides on the run_id PK. Routes through the
@@ -3353,7 +3406,11 @@ class ReconciliationHarness:
         """
         if self.judge is None:
             return
-        pending = await self.journal.get_pending_judge_runs()
+        pending = [
+            (run_id, project_id)
+            for run_id, project_id in await self.journal.get_pending_judge_runs()
+            if not self._judge_in_flight(run_id)
+        ]
         if not pending:
             return
         # Account-availability gate (task 2947 ask c): if a usage gate is wired
@@ -3380,19 +3437,21 @@ class ReconciliationHarness:
         to_spawn = pending[:_JUDGE_RECOVERY_MAX_SPAWN]
         if total > _JUDGE_RECOVERY_MAX_SPAWN:
             logger.warning(
-                f'{total} pending judge review(s) at startup exceeds the '
-                f'{_JUDGE_RECOVERY_MAX_SPAWN}-per-restart recovery cap — a judge may '
+                f'{total} pending judge review(s) {why} exceed the '
+                f'{_JUDGE_RECOVERY_MAX_SPAWN}-per-pass recovery cap — a judge may '
                 'be persistently failing (a judge_pending marker clears only on a '
                 f'committed verdict). Re-firing the {len(to_spawn)} oldest; the '
                 f'remaining {total - len(to_spawn)} will be recovered on '
-                'subsequent restarts.'
+                'later passes.'
             )
-        else:
-            logger.info(
-                f'Recovering {total} pending judge review(s) after restart'
-            )
-        for run_id, project_id in to_spawn:
-            await self._spawn_judge(run_id, project_id)
+        started = [
+            run_id for run_id, project_id in to_spawn if await self._spawn_judge(run_id, project_id)
+        ]
+        held = len(to_spawn) - len(started)
+        logger.info(
+            f'Recovering {len(started)} pending judge review(s) {why}'
+            + (f'; {held} stay pending while the allowance reserve refuses reconciliation' if held else '')
+        )
 
     async def _run_judge(self, run_id: str) -> None:
         """Fire-and-forget judge wrapper with error logging."""
@@ -6136,6 +6195,11 @@ class BacklogIterator:
                     )
                     yielded = True
                     break
+                if await self.harness.reserve_steps_aside(
+                    project_id, site=StepAsideSite.BACKLOG_CHUNK,
+                ):
+                    yielded = True
+                    break
 
                 # Peek at up to 1000 events (far more than a single budget can hold)
                 peeked = await self.buffer.peek_buffered(
@@ -6154,9 +6218,9 @@ class BacklogIterator:
                     return  # Stop iteration on failure
 
             # Final consolidation pass — skipped when the loop yielded on the
-            # cumulative budget (task 2040): the remaining backlog stays
-            # buffered for the next cycle instead of forcing an extra
-            # consolidation cycle past the budget.
+            # cumulative budget (task 2040) or on a reserve refusal (task 10432):
+            # the remaining backlog stays buffered for the next cycle instead of
+            # forcing an extra consolidation cycle.
             if chunk_num > 0 and not yielded:
                 await self._run_final_consolidation(project_id, opus_tier)
 

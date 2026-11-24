@@ -808,7 +808,10 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
 2. **Warm worktrees.** Decided (Leo, 2026-11-17): a stacked worktree comes from the warm pool where the project
    has one (section 5.3). T9 reports how many pool worktrees early starts took from tasks that were not
    running.
-3. **Where the per-task "slot ended" signal lives** (the scheduler's release or the lease). Decide in T3.
+3. **Where the per-task "slot ended" signal lives** (the scheduler's release or the lease). Decided in T3: at the
+   lease. `orchestrator/src/orchestrator/slot_lease.py::SlotLease.wait_released` is set at the end of the lease's
+   release, after the permit is handed over or returned. T6a and T6b await it through the borrower lease's
+   `lender`, never by task id, because the harness drops a lease from its registry several awaits before releasing it.
 4. **`merge_entry_alert_secs`.** Suggested 12 h: the two merge-entry waits the first seat observed were 7.1 h and
    10.8 h. Decide in T6b.
 5. **Whether review runs again after a replay at a later start** (test 24 requires only the verify). Suggested:

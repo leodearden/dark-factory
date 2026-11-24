@@ -71,7 +71,9 @@ def discharge_sentinel_wrappers(
                 continue
             if blocking_pin_declarations([wrapper, *members]):
                 continue
-            escalation_queue.resolve(wrapper.id, resolution, resolved_by=alarm_role)
+            escalation_queue.resolve(
+                wrapper.id, resolution, resolved_by=alarm_role, resolution_class='benign',
+            )
             discharged += 1
     except Exception as exc:  # fail-open backstop
         logger.warning(

@@ -1269,11 +1269,18 @@ class TestCompletionRecordRegistry:
     RECONCILIATION_ECHO = {
         'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5', 'transition': 'done',
     }
+    VERIFICATION_VERDICT_NOTE = {
+        'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5',
+        'verification_verdict': 'confirmed',
+    }
 
     @pytest.mark.parametrize(
         'meta',
-        [ORCHESTRATOR_RECORD, LEGACY_ORCHESTRATOR_RECORD, RECONCILIATION_ECHO],
-        ids=['orchestrator', 'legacy-unkinded-orchestrator', 'reconciliation-echo'],
+        [ORCHESTRATOR_RECORD, LEGACY_ORCHESTRATOR_RECORD, RECONCILIATION_ECHO, VERIFICATION_VERDICT_NOTE],
+        ids=[
+            'orchestrator', 'legacy-unkinded-orchestrator', 'reconciliation-echo',
+            'verification-verdict-note',
+        ],
     )
     def test_a_registered_completion_record_counts(self, meta):
         assert is_completion_record(meta) is True
@@ -1282,17 +1289,15 @@ class TestCompletionRecordRegistry:
         'meta',
         [
             {'task_id': '5'},
-            {
-                'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5',
-                'verification_verdict': 'confirmed',
-            },
+            {'source': 'stage2', 'task_id': '5', 'verification_verdict': 'confirmed'},
+            {'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5', 'verification_verdict': ''},
             {'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5', 'transition': 'blocked'},
             {'kind': 'task_completion', 'task_id': '5'},
             {},
         ],
         ids=[
-            'bare-task-id', 'verification-verdict-note', 'echo-source-not-done',
-            'agent-written-kind-only', 'empty',
+            'bare-task-id', 'verdict-key-from-another-source', 'empty-verdict',
+            'echo-source-not-done', 'agent-written-kind-only', 'empty',
         ],
     )
     def test_anything_else_does_not_count(self, meta):

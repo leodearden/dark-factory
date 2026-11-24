@@ -654,7 +654,7 @@ class TestRegressionFromTheDrain:
 
         (esc,) = queue.regressions()
         assert _item(db, A).last_error == DueFailure.TASK_CLIENT_FAILED.value
-        queue.resolve(esc.id, 'looked at it by hand', resolved_by='interactive')
+        queue.resolve(esc.id, 'looked at it by hand', resolved_by='interactive', resolution_class='actionable')
         client.submit_raises = None
         clock.advance(timedelta(minutes=6))
         await _pass(db, client, clock, queue=queue)
@@ -1019,6 +1019,33 @@ class TestStaleItemEscalation:
         assert resolved is not None and resolved.status == 'resolved'
         assert resolved.resolved_by == STALE_DUE_ESCALATION_ROLE
         assert len([e for e in queue.submitted if e.task_id == STALE_DUE_ESCALATION_SENTINEL]) == 2
+
+    async def test_a_parked_stale_record_closes_with_a_resolution_class(
+        self, tmp_path: Path,
+    ) -> None:
+        """A watcher's park promotes the record to level 2, whose close must be classified."""
+        db, clock = _db(tmp_path), _Clock()
+        client = _FakeLedgerTaskClient(unreachable=True)
+        queue = _RecordingQueue(tmp_path / 'queue')
+
+        async def _at(minutes: int) -> None:
+            clock.now = T0 + timedelta(minutes=minutes)
+            await _pass(db, client, clock, queue=queue)
+
+        _enqueue(db, A, 0, at=T0)
+        await _at(0)
+        await _at(31)
+        (stale,) = queue.stale_records()
+        queue.park(stale.id, 'parked for a human')
+
+        client.unreachable = False
+        await _at(140)
+        await _at(141)
+
+        closed = queue.get(stale.id)
+        assert closed is not None
+        assert closed.status != 'pending'
+        assert closed.resolution_class is not None
 
     async def test_the_stale_record_is_filed_before_any_client_call(self, tmp_path: Path) -> None:
         db, clock = _db(tmp_path), _Clock()

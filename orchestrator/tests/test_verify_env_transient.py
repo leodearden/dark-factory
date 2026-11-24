@@ -229,8 +229,11 @@ class TestRunVerificationEnvRecovery:
     # structured (non-chained) render path puts base_flags before targets
     # and shlex.quote leaves the safe 'addopts=' token unquoted — distinct
     # from the deleted _force_serial_pytest's append-at-end, quoted
-    # ``addopts=''`` form.
+    # ``addopts=''`` form. It is what CheckRun.cmd persists; the spawned
+    # command additionally carries the default defect mode's
+    # ``-p _df_defect_plugin``.
     RECOVERED_TEST_COMMAND = 'uv run pytest -p no:xdist -o addopts= tests/'
+    SPAWNED_RECOVERY_COMMAND = 'uv run pytest -p no:xdist -o addopts= -p _df_defect_plugin tests/'
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
         # lint/type are non-Optional str fields on OrchestratorConfig (unlike
@@ -267,9 +270,9 @@ class TestRunVerificationEnvRecovery:
             f'Expected exactly 2 pytest invocations (original + one bounded '
             f'recovery retry), got {len(pytest_invocations)}: {pytest_invocations!r}'
         )
-        assert any(c == self.RECOVERED_TEST_COMMAND for c in pytest_invocations), (
+        assert any(c == self.SPAWNED_RECOVERY_COMMAND for c in pytest_invocations), (
             f'Expected the serial_pytest()-rendered recovery command '
-            f'{self.RECOVERED_TEST_COMMAND!r} to be invoked, got {pytest_invocations!r}'
+            f'{self.SPAWNED_RECOVERY_COMMAND!r} to be invoked, got {pytest_invocations!r}'
         )
 
     @pytest.mark.asyncio
@@ -302,9 +305,9 @@ class TestRunVerificationEnvRecovery:
             f'the first-pass category untouched), got {len(pytest_invocations)}: '
             f'{pytest_invocations!r}'
         )
-        assert any(c == self.RECOVERED_TEST_COMMAND for c in pytest_invocations), (
+        assert any(c == self.SPAWNED_RECOVERY_COMMAND for c in pytest_invocations), (
             f'Expected the bounded recovery retry to invoke the '
-            f'serial_pytest()-rendered command {self.RECOVERED_TEST_COMMAND!r}, '
+            f'serial_pytest()-rendered command {self.SPAWNED_RECOVERY_COMMAND!r}, '
             f'got {pytest_invocations!r}'
         )
 

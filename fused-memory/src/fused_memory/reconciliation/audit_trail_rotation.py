@@ -649,6 +649,7 @@ def _unrotatable_report(task: Mapping[str, Any], refusal: Refusal) -> dict[str, 
 class AuditTrailArchive(Protocol):
     """Where rotated-out text goes; ``read`` must return exactly what ``write`` stored.
 
+    ``write``'s ``metadata`` carries ``task_id``, the task whose history it archives.
     ``discard`` removes an archive that no committed rewrite points at.
     """
 
@@ -803,6 +804,7 @@ class _MemoryServiceArchive:
             metadata=dict(metadata),
             _source=ARCHIVE_SOURCE,
             defer_transient_mem0_failure=False,
+            declared_referents=[{'kind': 'task', 'id': metadata['task_id']}],
         )
         if response.mem0_write_state is Mem0WriteState.LANDED:
             return response.memory_ids[0]
