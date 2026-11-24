@@ -112,6 +112,11 @@ class EventType(StrEnum):
     cap_hit = 'cap_hit'
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
+    # A recovered merge request's task could not re-take every journalled key
+    # under the new process's limits, from
+    # orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds.restore.
+    # data: {request_id, restored: [keys], unheld: [{module, owner, kind}]}
+    recovered_merge_hold_incomplete = 'recovered_merge_hold_incomplete'
     # Durable persist of the plan-tightened lock set on the success branch of
     # handle_blast_radius_expansion. Payload: {files, released, acquired,
     # persisted: bool}. Complements lock_released (reason='plan_refinement')
