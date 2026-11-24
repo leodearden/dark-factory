@@ -1,6 +1,16 @@
-"""The flake-debt DRAIN: files the de-flake owners an observation owes, after it.
+"""The flake ledger's off-merge-path settlement against the live task store.
 
-plans/offline-lane-red-path-prd.md D6, §5.8 and §14 item 24 (task 6934, ε0).  An
+Two passes, each a harness background service bounded to 50 rows and five minutes:
+
+- the DRAIN (:func:`run_drain_pass`, ``flake-debt-drain``, every
+  :data:`DRAIN_INTERVAL_SECS`) files the de-flake owners an observation owes, after it;
+- the RESOLUTION SWEEP (:class:`DebtResolutionSweep`, ``flake-debt-resolution``, every
+  :data:`RESOLUTION_INTERVAL_SECS`) closes every open debt cycle whose owner reads back
+  live-done (plans/flake-ledger-prd.md task θ, task 8409), stopping at the first
+  unreadable owner, so a fixed test's row need not wait for a suppression its fix
+  prevents.
+
+THE DRAIN.  plans/offline-lane-red-path-prd.md D6, §5.8 and §14 item 24 (task 6934, ε0).  An
 observation writes its occurrence rows and one due item per suppressed test in ONE
 local transaction (``orchestrator/src/orchestrator/flake_ledger.py::enqueue_debt``), so
 nothing on the merge path waits on fused-memory.  This module turns each item into
@@ -22,9 +32,10 @@ background service.  A pass:
 A failed attempt backs off 5 minutes, doubling to an hour.  Nothing caps how many owners
 a burst files.  The drain never raises.
 
-The drain's own ledger calls run off the event-loop thread (INV-8);
-:func:`~orchestrator.flake_ledger.open_debt`'s internal sqlite stays on it, unchanged,
-bounded by that function's connection count and by 50 calls per pass.
+Both passes' own ledger calls run off the event-loop thread (INV-8); the internal sqlite
+of :func:`~orchestrator.flake_ledger.open_debt` and
+:func:`~orchestrator.flake_ledger.resolve_debt` stays on it, unchanged, bounded by those
+functions' connection counts and by 50 calls per pass.
 
 Import discipline: ``flake_ledger`` and ``shared`` only, and ``escalation.models`` lazily.
 Never a lane module or ``git_ops``: the ancestry read arrives through
