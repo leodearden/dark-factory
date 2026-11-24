@@ -3061,58 +3061,25 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         """
         from orchestrator import git_ops as git_ops_mod
 
-        # Bounded well above the ~0.1s poll that actually elapses, so the
-        # acquire cannot reach its deadline and return None — which would make
-        # the assertions below vacuously true.
+        # A budget of 300 polls, far above the few that elapse before the
+        # handover, so the acquire cannot reach its deadline and return None —
+        # which would make the assertions below vacuously true.
         monkeypatch.setattr(git_ops_mod, '_MERGE_VERIFY_LEASE_WAIT_SECS', 30.0)
 
         git_ops = _git_ops(tmp_path)
         lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
 
-        polling = threading.Event()
-        outcome: dict[str, int | None] = {}
-        real_acquire = git_ops_mod.acquire_merge_verify_flock
-
-        def _watched_acquire(*args, **kwargs):
-            polling.set()
-            fd = real_acquire(*args, **kwargs)
-            outcome['fd'] = fd
-            return fd
-
-        monkeypatch.setattr(
-            git_ops_mod, 'acquire_merge_verify_flock', _watched_acquire,
-        )
-
         async def _lease() -> None:
             async with git_ops.merge_verify_lease():
                 pytest.fail('the lease body must never run: the lane is held')
 
-        with foreign_lane_lock_holder(lock_path):
-            task = asyncio.create_task(_lease())
-            assert await wait_until(polling.is_set), (
-                'the lease never entered its bounded-wait acquire'
-            )
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        # The foreign holder is gone: the orphaned worker thread now wins.
-
-        # Ordered BEFORE any probe of our own: a probe fired while the worker is
-        # still polling would take the freed lock itself, report "free", and
-        # pass this test without the orphan ever having won anything.  Waiting
-        # for the worker's own return value removes that race AND proves the
-        # premise — a timed-out (`None`) acquire holds nothing, so everything
-        # below it would be vacuously true.
-        assert await wait_until(lambda: 'fd' in outcome, timeout=10.0), (
-            'the orphaned acquire never returned — the lane handover never '
-            'happened, so this test would prove nothing about a late win'
-        )
-        assert outcome['fd'] is not None, (
+        fd = await cancel_mid_acquire_and_settle(lock_path, _lease, monkeypatch)
+        assert fd is not None, (
             'the acquire hit its bounded-wait deadline instead of winning the '
             'freed lock: nothing was ever held, so there is no orphan to detect'
         )
 
-        assert await wait_until(lambda: lane_is_free(lock_path), timeout=10.0), (
+        assert lane_is_free(lock_path), (
             f'the cancelled lease left the lane lock HELD by this process — '
             f'the exact esc-5548-5 state: every later merge-verify on this lane '
             f'blocks behind an fd no code path can reach, until process exit. '
@@ -3185,7 +3152,7 @@ class TestCancelledResetNeverOrphansTheLaneLock:
         """
         from orchestrator import git_ops as git_ops_mod
 
-        # Long enough that the acquire is provably STILL POLLING when the
+        # A budget of 100 polls: the acquire is provably STILL POLLING when the
         # cancellation lands — the whole point is a win that arrives after its
         # awaiter is gone, not a wait that expires first.
         monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 10)
@@ -3196,32 +3163,18 @@ class TestCancelledResetNeverOrphansTheLaneLock:
 
         warm_path = real_git_ops.persistent_merge_worktree_path
         lock_path = lane_lock_path(warm_path)
-        polling, outcome = self._watch_acquire(monkeypatch)
 
-        with foreign_lane_lock_holder(lock_path):
-            task = asyncio.create_task(
-                real_git_ops.reset_persistent_merge_worktree(commit_b)
-            )
-            assert await wait_until(polling.is_set), (
-                'the reset never entered its bounded-wait acquire — cancelling '
-                'now would prove nothing about a late win'
-            )
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        # The foreign holder is gone; the orphaned worker thread now wins.
-
-        # Ordered before any probe of ours, which would otherwise take the freed
-        # lock itself and report "free" without the orphan ever winning.
-        assert await wait_until(lambda: 'fd' in outcome, timeout=10.0), (
-            'the orphaned acquire never returned — no handover happened'
+        fd = await cancel_mid_acquire_and_settle(
+            lock_path,
+            lambda: real_git_ops.reset_persistent_merge_worktree(commit_b),
+            monkeypatch,
         )
-        assert outcome['fd'] is not None, (
+        assert fd is not None, (
             'the acquire hit its deadline instead of winning the freed lock: '
             'nothing was held, so there is no orphan to detect here'
         )
 
-        assert await wait_until(lambda: lane_is_free(lock_path), timeout=10.0), (
+        assert lane_is_free(lock_path), (
             f'the cancelled reset left the lane lock HELD by this process — '
             f'esc-5548-5 exactly: every later merge-verify and reset on this '
             f'lane blocks behind an fd no code path can reach, until process '
