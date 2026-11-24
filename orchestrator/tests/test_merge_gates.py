@@ -1375,6 +1375,7 @@ class TestMapAdvanceFailureParkLockContended:
                 'initial_age_seconds': initial_age,
                 'grace_seconds': 0.0,
                 'dirty_files': [],
+                'holder_scan': GitProcessScan((), confirmed=True),
             })
 
             halt.assert_not_called()
@@ -1431,6 +1432,7 @@ class TestMapAdvanceFailureParkLockContended:
             'initial_age_seconds': 400.0,   # > 300s floor, < 900s grace
             'grace_seconds': 900.0,
             'dirty_files': [],
+            'holder_scan': GitProcessScan((), confirmed=True),
         })
 
         assert 'rm -f' not in outcome.reason, (
@@ -1468,6 +1470,7 @@ class TestMapAdvanceFailureParkLockContended:
             'age_seconds': 3900.0,
             'waited_seconds': 300.0,
             'dirty_files': [],
+            'holder_scan': GitProcessScan((), confirmed=True),
         })
 
         halt.assert_not_called()
