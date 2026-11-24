@@ -194,12 +194,14 @@ class TestOnDequeueAttachFallback:
         return controller, ledger, pred
 
     async def test_attach_when_all_four_conditions_hold(self) -> None:
-        controller, ledger, _pred = await self._seeded_controller()
+        controller, ledger, pred = await self._seeded_controller()
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
-        assert result == 'PRED_SHA'
+        assert result is not None
+        assert result.sha == 'PRED_SHA'
+        assert result.owner is pred
         assert controller.spec_base == 'PRED_SHA'
         assert controller.held_by_merger == 1
         assert ledger.slot_available == 0  # unchanged — permit retained/transferred
@@ -211,7 +213,7 @@ class TestOnDequeueAttachFallback:
         controller.pending_spec_base = None  # break condition (a)
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
         assert result is None
         assert controller.spec_base is None
@@ -225,7 +227,7 @@ class TestOnDequeueAttachFallback:
         controller._permit = None  # break condition (b)
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
         assert result is None
         assert controller.spec_base is None
@@ -239,7 +241,7 @@ class TestOnDequeueAttachFallback:
         controller.pending_predecessor = None  # break condition (c)
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
         assert result is None
         assert controller.spec_base is None
@@ -253,7 +255,7 @@ class TestOnDequeueAttachFallback:
         pred.result.set_result(MergeOutcome('done'))  # break condition (d)
         new_req = _make_pending_request('new')
 
-        result = controller.on_dequeue(new_req)
+        result = controller.on_dequeue(new_req, live_tip=None)
 
         assert result is None
         assert controller.spec_base is None
@@ -749,7 +751,7 @@ class TestSpeculationControllerLedgerRouting:
         # FALLBACK releases the held permit.
         new_req = _make_pending_request('new')
 
-        controller.on_dequeue(new_req)
+        controller.on_dequeue(new_req, live_tip=None)
 
         assert controller.held_by_merger == 0
         assert ledger.live == frozenset()
@@ -1050,7 +1052,7 @@ class TestOnBaseInvalidated:
         controller.on_base_invalidated('sha-dead', None)
         before = controller.snapshot()
 
-        assert controller.on_dequeue(_make_pending_request('late')) is None
+        assert controller.on_dequeue(_make_pending_request('late'), live_tip=None) is None
 
         assert controller.snapshot()['slot_available'] == before['slot_available']
         assert controller.snapshot()['held_by_merger'] == 0
@@ -1086,3 +1088,114 @@ class TestOnBaseInvalidated:
         controller.on_base_invalidated('sha-dead', live_tip)
 
         assert controller.snapshot()['slot_available'] >= before
+
+
+# ---------------------------------------------------------------------------
+# task 10851: a fresh dequeue stacks on the live frontier tip the worker passes
+# ---------------------------------------------------------------------------
+
+
+def _fresh_controller(depth: int = 2) -> SpeculationController:
+    return SpeculationController(PermitLedger(asyncio.Semaphore(depth), depth), depth)
+
+
+async def _pending_on(sha: str, predecessor: MergeRequest) -> SpeculationController:
+    """A permit held and a late ATTACH onto *sha* armed, owned by *predecessor*."""
+    controller = await _controller_holding()
+    controller.on_lookahead_pending(sha, predecessor)
+    return controller
+
+
+@pytest.mark.asyncio
+class TestOnDequeueStacksOnTheLiveTip:
+    """``on_dequeue(req, live_tip=...)`` attaches to the pending base, else
+    stacks on the live tip, with the held or a free permit; it never waits."""
+
+    async def test_a_free_slot_is_taken_to_stack_on_the_live_tip(self) -> None:
+        controller = _fresh_controller()
+        tip = _tip()
+        before = controller.snapshot()
+
+        result = controller.on_dequeue(_make_pending_request('fresh'), live_tip=tip)
+
+        assert result is not None
+        assert result.sha == 't'
+        assert result.owner is tip.owner
+        after = controller.snapshot()
+        assert after['spec_base'] == 't'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available'] - 1
+
+    async def test_the_held_permit_is_kept_when_the_pending_predecessor_resolved(self) -> None:
+        predecessor = _make_pending_request('pred')
+        controller = await _pending_on('p', predecessor)
+        predecessor.result.set_result(MergeOutcome('done'))
+        before = controller.snapshot()
+
+        result = controller.on_dequeue(_make_pending_request('fresh'), live_tip=_tip())
+
+        assert result is not None
+        assert result.sha == 't'
+        after = controller.snapshot()
+        assert after['spec_base'] == 't'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_with_no_free_slot_it_merges_on_main(self) -> None:
+        ledger = PermitLedger(asyncio.Semaphore(1), 1)
+        await ledger.acquire()
+        controller = SpeculationController(ledger, 1)
+        before = controller.snapshot()
+
+        assert controller.on_dequeue(_make_pending_request('fresh'), live_tip=_tip()) is None
+
+        after = controller.snapshot()
+        assert after['spec_base'] is None
+        assert after['held_by_merger'] == 0
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_a_live_tip_whose_owner_resolved_is_not_stacked_on(self) -> None:
+        controller = _fresh_controller()
+        tip = _tip()
+        tip.owner.result.set_result(MergeOutcome('done'))
+        before = controller.snapshot()
+
+        assert controller.on_dequeue(_make_pending_request('fresh'), live_tip=tip) is None
+
+        after = controller.snapshot()
+        assert after['spec_base'] is None
+        assert after['held_by_merger'] == 0
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_a_pending_base_with_an_in_flight_predecessor_beats_the_live_tip(
+        self,
+    ) -> None:
+        predecessor = _make_pending_request('pred')
+        controller = await _pending_on('p', predecessor)
+
+        result = controller.on_dequeue(_make_pending_request('fresh'), live_tip=_tip())
+
+        assert result is not None
+        assert result.sha == 'p'
+        assert result.owner is predecessor
+        assert controller.snapshot()['spec_base'] == 'p'
+
+    async def test_a_fresh_arrival_after_an_attach_that_built_nothing_stacks_on_the_head(
+        self,
+    ) -> None:
+        """Y attaches to H's commit and ends terminal; X, dequeued next, still
+        stacks on H while H is in flight."""
+        head = _make_pending_request('H')
+        live_head = LiveTip('h', head)
+        controller = await _pending_on('h', head)
+
+        attached = controller.on_dequeue(_make_pending_request('Y'), live_tip=live_head)
+        assert attached is not None
+        assert attached.sha == 'h'
+        assert controller.on_transfer_terminal() is not None
+
+        result = controller.on_dequeue(_make_pending_request('X'), live_tip=live_head)
+
+        assert result is not None
+        assert result.sha == 'h'
+        assert controller.snapshot()['held_by_merger'] == 1

@@ -33,7 +33,7 @@ from _merge_lane_fakes import (
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
 
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeVerifyLeaseHeld
 from orchestrator.merge_lane import MergeLane, MergeRequest, QueuedBranch
 from orchestrator.merge_lane.verify_base_detector import VERIFY_BASE_DIVERGENCE_SENTINEL
@@ -121,6 +121,21 @@ async def _status(req: MergeRequest) -> str:
     return outcome.status
 
 
+class _SignalsDequeueOf(EventStore):
+    """An event store that sets ``dequeued`` on *task_id*'s ``merge_dequeued``
+    row, which the merger writes once its fresh-dequeue decision is made."""
+
+    def __init__(self, db_path: Path, run_id: str, *, task_id: str) -> None:
+        super().__init__(db_path, run_id)
+        self._task_id = task_id
+        self.dequeued = asyncio.Event()
+
+    def emit(self, event_type: EventType, **fields: Any) -> int | None:
+        if event_type is EventType.merge_dequeued and fields.get('task_id') == self._task_id:
+            self.dequeued.set()
+        return super().emit(event_type, **fields)
+
+
 @dataclasses.dataclass
 class _Run:
     """A running lane: H's verify on 'head-host' is held until ``release_h``."""
@@ -205,4 +220,48 @@ class TestARequeuedRequestRemergesOnTheLiveHead:
             statuses = {req.task_id: await _status(req) for req in (h, s)}
             assert statuses == {'H': 'done', 'S': 'done'}, statuses
             assert await _main_task_files(scene) == {'H.txt', 'S.txt'}
+            assert run.divergence_alarms() == []
+
+
+class TestAFreshDequeueAfterARequestThatBuiltNothing:
+    """A speculative request that consumed the merger's stack tip and built
+    nothing leaves the next fresh dequeue stacking on the head still verifying."""
+
+    async def test_a_fresh_arrival_after_an_already_merged_speculative_request_stacks_on_the_live_head(
+        self, tmp_path: Path,
+    ) -> None:
+        """Y, a branch with no work of its own, attaches to H's commit and
+        is found already merged, so it builds nothing. X, dequeued after it
+        while H still verifies, stacks on H.
+
+        Y is not a conflict with H: the η suffix bounce
+        (orchestrator/suffix_graph.py::SuffixConflictTracker.bounce_conflicting_suffix_items)
+        escalates a request conflicting with the frozen tip before the merger
+        ever dequeues it."""
+        events = _SignalsDequeueOf(
+            tmp_path / 'events-dequeue.db', 'fresh-after-nothing', task_id='Y',
+        )
+        scene = dataclasses.replace(_scene(tmp_path), events=events)
+        h = await _request(scene, 'H', {'H.txt': 'H\n'})
+        y = await _request(scene, 'Y', {})
+        x = await _request(scene, 'X', {'X.txt': 'X\n'})
+        x_entered, release_x = asyncio.Event(), asyncio.Event()
+        local = FakeVerifier(scripts={'X': hangs_until(release_x, entered=x_entered)})
+        async with _running(scene, h, local) as run:
+            run.put(y)
+            await _entered(events.dequeued, 'Y dequeued behind H')
+
+            run.put(x)
+            await _entered(x_entered, 'X verifying on local')
+            assert run.tree_at_call(0) == {'H.txt', 'X.txt'}, (
+                "X did not stack on H's live commit"
+            )
+            assert run.divergence_alarms() == []
+            assert run.recorded_divergences() == []
+
+            run.release_h.set()
+            release_x.set()
+            statuses = {req.task_id: await _status(req) for req in (h, x, y)}
+            assert statuses == {'H': 'done', 'X': 'done', 'Y': 'already_merged'}, statuses
+            assert await _main_task_files(scene) == {'H.txt', 'X.txt'}
             assert run.divergence_alarms() == []
