@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _cancel_immune import ignore_cancels_until
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import OrchestratorConfig, ReviewConfig
@@ -74,7 +75,7 @@ class _Slots:
             self.gates[tid].set()
         try:
             if tid in self.immune:
-                await _ignore_cancels_until(self.immune_release)
+                await ignore_cancels_until(self.immune_release)
                 return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.CANCELLED)
             if tid in self.absorbs_one_cancel:
                 await _absorb_one_cancel(lambda: self.events.append(f'slot {tid} absorbed a cancel'))
@@ -118,14 +119,6 @@ async def _absorb_one_cancel(on_absorbed: Callable[[], None]) -> None:
     except asyncio.CancelledError:
         on_absorbed()
     await asyncio.Event().wait()
-
-
-async def _ignore_cancels_until(release: asyncio.Event) -> None:
-    while not release.is_set():
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            continue
 
 
 class _Dispatch:
@@ -418,7 +411,7 @@ class TestParkedLoop:
 
         async def sigterm_beside_an_immune_bystander() -> None:
             await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
-            bystanders.append(asyncio.create_task(_ignore_cancels_until(release), name='immune-bystander'))
+            bystanders.append(asyncio.create_task(ignore_cancels_until(release), name='immune-bystander'))
             await asyncio.sleep(0)
             guard.arm()
             main.cancel()

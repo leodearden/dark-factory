@@ -10,6 +10,7 @@ import traceback as traceback_module
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _cancel_immune import ignore_cancels_until
 from _orch_helpers import pydantic_spec
 from click.testing import CliRunner
 
@@ -527,14 +528,6 @@ class TestForceExitWatchdog:
 _HANG_GUARD_SECS = 10.0
 
 
-async def _ignore_cancels_until(release: asyncio.Event) -> None:
-    while not release.is_set():
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            continue
-
-
 def _shutdown_watchdog_threads() -> set[threading.Thread]:
     return {t for t in threading.enumerate() if t.name == 'shutdown-watchdog'}
 
@@ -554,7 +547,7 @@ class TestRunWithBoundedTeardown:
             box['loop'] = asyncio.get_running_loop()
             box['release'] = asyncio.Event()
             box['leftover'] = asyncio.create_task(
-                _ignore_cancels_until(box['release']), name='immune-leftover',
+                ignore_cancels_until(box['release']), name='immune-leftover',
             )
             await asyncio.sleep(0)
             if ending == 'raises_cancelled':
@@ -653,18 +646,19 @@ class TestRunWithBoundedTeardown:
         assert exits == [], 'the teardown watchdog stayed armed after asyncio.run returned'
 
 
-def _wire_run_with_fake_harness(monkeypatch, fake_report):
-    """Wire mocks so the real _main coroutine runs and calls harness.run once."""
-    # Stub the watchdog so no real daemon timer thread is spawned.
-    monkeypatch.setattr(
-        cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock()
-    )
+def _wire_run_with_fake_harness(monkeypatch, fake_report=None, *, force_exit=None, harness_run=None):
+    """Wire mocks so the real _main coroutine runs and calls harness.run once.
+
+    *harness_run* stands in for ``harness.run``, by default an AsyncMock
+    returning *fake_report*. *force_exit* stands in for
+    ``_force_exit_after_delay``, by default a stub that spawns no watchdog thread.
+    """
+    monkeypatch.setattr(cli_module, '_force_exit_after_delay', force_exit or (lambda *a, **k: MagicMock()))
     fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
     fake_harness = MagicMock()
-    # AsyncMock so `await harness.run(...)` inside the real _main resolves.
-    fake_harness.run = AsyncMock(return_value=fake_report)
+    fake_harness.run = AsyncMock(return_value=fake_report) if harness_run is None else harness_run
     monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
     return fake_harness
 
@@ -1079,7 +1073,6 @@ class TestRunBoundsAsyncioTeardown:
                 thread=MagicMock(spec=threading.Thread),
             )
 
-        monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
         original_echo = cli_module.click.echo
 
         def recording_echo(msg=None, **kwargs):
@@ -1087,17 +1080,12 @@ class TestRunBoundsAsyncioTeardown:
             return original_echo(msg, **kwargs)
 
         monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
-        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
-        fake_harness = MagicMock()
 
         async def recording_run(*args, **kwargs):
             events.append(('harness.run',))
             return await harness_run(*args, **kwargs)
 
-        fake_harness.run = recording_run
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
-
+        _wire_run_with_fake_harness(monkeypatch, force_exit=fake_force_exit, harness_run=recording_run)
         result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
         return result, events
 
