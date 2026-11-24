@@ -74,6 +74,7 @@ from dashboard.data.quality_snapshot_sampler import refresh_snapshots
 from dashboard.data.quality_snapshots import BASELINE_HOME
 from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
+from dashboard.data.served_read import join_outlived_waits, outlived_wait_count
 from dashboard.loops import _QualityStore
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
@@ -654,6 +655,26 @@ def _render_prds(client: TestClient, at: datetime) -> dict[str, Any]:
         return _get(client, PRDS)
 
 
+_SETTLE_RENDERS = 5
+"""Livelock guard on :func:`_render_prds_settled`: each render after the first follows a join, so
+the deepest chain of dependent reads (run-ledger walk → activity, lineage → documents) settles by
+the third."""
+
+
+def _render_prds_settled(client: TestClient, at: datetime) -> dict[str, Any]:
+    """GET /prds at *at* from a render no read outlived its request wait in."""
+    assert client.portal is not None, 'a settled render joins its reads inside a live TestClient'
+    for _ in range(_SETTLE_RENDERS):
+        outlived = outlived_wait_count()
+        body = _render_prds(client, at)
+        if outlived_wait_count() == outlived:
+            return body
+        client.portal.call(join_outlived_waits)
+    raise AssertionError(
+        f'GET /prds still left reads outliving their request waits after {_SETTLE_RENDERS} renders',
+    )
+
+
 @contextmanager
 def canned_prd_roots(
     client: TestClient,
@@ -675,7 +696,8 @@ def prd_view_family(client: TestClient, workdir: Path) -> dict[str, Any]:
 
     ``prd_view_map_failed_tasks`` is the /tasks body served at the same
     instant as ``prd_view_map_failed``, so its census reason is the one the
-    failed map half carried.
+    failed map half carried. Every /prds render is settled
+    (:func:`_render_prds_settled`), so no body depends on the host's speed.
     """
     bodies: dict[str, Any] = {}
 
@@ -683,26 +705,26 @@ def prd_view_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     with _canned_roots(
         client, workdir / 'prd_view_fresh', two_projects, furnish=_quietly(two_projects),
     ):
-        bodies['prd_view_fresh'] = _render_prds(client, T0)
+        bodies['prd_view_fresh'] = _render_prds_settled(client, T0)
 
     growing = prd_tree()
     with _canned_roots(
         client, workdir / 'prd_view_overlay', {'dark-factory': growing},
         furnish=_quietly(['dark-factory']),
     ):
-        _render_prds(client, T0)
+        _render_prds_settled(client, T0)
         _grow_past_lineage(growing)
-        bodies['prd_view_overlay'] = _render_prds(client, T0 + timedelta(seconds=20))
+        bodies['prd_view_overlay'] = _render_prds_settled(client, T0 + timedelta(seconds=20))
 
     failing = prd_tree()
     with _canned_roots(
         client, workdir / 'prd_view_map_failed', {'dark-factory': failing},
         furnish=_quietly(['dark-factory']),
     ) as render_tasks:
-        _render_prds(client, T0)
+        _render_prds_settled(client, T0)
         _fail_status_map(failing)
         failed_at = T0 + timedelta(seconds=20)
-        bodies['prd_view_map_failed'] = _render_prds(client, failed_at)
+        bodies['prd_view_map_failed'] = _render_prds_settled(client, failed_at)
         bodies['prd_view_map_failed_tasks'] = render_tasks(failed_at)
 
     return bodies
@@ -836,7 +858,9 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     database; ``prd_lanes_lineage_failed`` a lineage read that fails;
     ``prd_lanes_contended`` adds :data:`CONTENDED_IDS` under a scheduler whose
     lock :data:`CARRIER` holds; ``prd_lanes_queueless`` lays out no escalation
-    queue, so its view is a lower bound that still draws every row.
+    queue, so its view is a lower bound that still draws every row. Every /prds
+    body is a settled render (:func:`_render_prds_settled`), so none depends on
+    the host's speed.
     """
     bodies: dict[str, Any] = {}
     with holder_processes() as (live, dead):
@@ -865,7 +889,7 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             with _canned_roots(
                 client, workdir / name, substrates, schedulers=schedulers, furnish=furnish,
             ) as render_tasks:
-                bodies[name] = _render_prds(client, T0)
+                bodies[name] = _render_prds_settled(client, T0)
                 if tasks_body is not None:
                     bodies[tasks_body] = render_tasks(T0)
 
