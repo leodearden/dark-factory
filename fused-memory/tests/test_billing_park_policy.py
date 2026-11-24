@@ -8,7 +8,6 @@ plan-cap row re-probes when the latch next lets a probe through.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 
 import httpx
 import openai
@@ -20,23 +19,11 @@ from _fm_helpers import (
     wrap_like_graphiti,
 )
 
-from fused_memory.config.schema import PlanRouteConfig
 from fused_memory.services.billing_park_policy import BillingParkPolicy
 from fused_memory.services.durable_queue import ParkedWriteEvent
-from fused_memory.services.plan_route import (
-    PlanRoute,
-    PlanRouteParkGuard,
-    PlanRouteSnapshot,
-    PlanRouteStateName,
-)
-from fused_memory.services.provider_billing import (
-    BillingExhaustion,
-    BillingSource,
-    classify_billing_exhaustion,
-)
+from fused_memory.services.provider_billing import BillingExhaustion, BillingSource
 
 _PROBE_AT = 1_800_000_000.0
-_NOW = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
 
 
 @dataclass
@@ -130,53 +117,3 @@ class TestDispatchBySource:
         assert guards.api_key.cleared == ['durable_queue']
         assert guards.plan.cleared == ['durable_queue']
 
-
-class _CapListener:
-    def __init__(self) -> None:
-        self.capped: list[PlanRouteSnapshot] = []
-
-    async def on_capped(self, snapshot: PlanRouteSnapshot) -> None:
-        self.capped.append(snapshot)
-
-    async def on_cap_confirmed(self, snapshot: PlanRouteSnapshot) -> None:
-        raise AssertionError('no probe ran')
-
-    async def on_recovered(self, snapshot: PlanRouteSnapshot) -> None:
-        raise AssertionError('no probe ran')
-
-
-class TestThePlanRoutesGuard:
-    def _route(self, listener: _CapListener | None = None) -> PlanRoute:
-        config = PlanRouteConfig(proxy_url='http://127.0.0.1:8317/v1', probe_interval_seconds=60)
-        return PlanRoute(config, listener=listener, clock=lambda: _NOW)
-
-    def test_an_ok_route_names_no_probe_time(self) -> None:
-        assert PlanRouteParkGuard(self._route()).park_until() is None
-
-    @pytest.mark.asyncio
-    async def test_a_cap_by_an_ungated_path_latches_the_route_once(self) -> None:
-        listener = _CapListener()
-        route = self._route(listener)
-        guard = PlanRouteParkGuard(route)
-        plan_cap = classify_billing_exhaustion(make_usage_limit_reached_error())
-        assert plan_cap is not None
-
-        await guard.on_parked(plan_cap, site='durable_queue:add_episode')
-        await guard.on_parked(plan_cap, site='durable_queue:add_episode')
-
-        assert route.state().state is PlanRouteStateName.CAPPED
-        assert len(listener.capped) == 1
-        assert guard.park_until() == route.next_probe_epoch()
-        assert guard.park_until() is not None
-
-    @pytest.mark.asyncio
-    async def test_clearing_leaves_the_route_to_learn_recovery_itself(self) -> None:
-        route = self._route()
-        guard = PlanRouteParkGuard(route)
-        plan_cap = classify_billing_exhaustion(make_usage_limit_reached_error())
-        assert plan_cap is not None
-        await guard.on_parked(plan_cap, site='durable_queue:add_episode')
-
-        await guard.on_cleared(site='durable_queue')
-
-        assert route.state().state is PlanRouteStateName.CAPPED

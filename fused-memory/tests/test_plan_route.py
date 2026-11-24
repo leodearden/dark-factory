@@ -14,16 +14,22 @@ from typing import Any
 import openai
 import pydantic
 import pytest
+from _fm_helpers import make_usage_limit_reached_error
 from _mock_openai_server import MockOpenAIServer, chat_completion_body, mock_openai_server
 
 from fused_memory.config.schema import FusedMemoryConfig, PlanRouteConfig
 from fused_memory.services.plan_route import (
     PlanRoute,
+    PlanRouteParkGuard,
     PlanRouteSite,
     PlanRouteSnapshot,
     PlanRouteStateName,
 )
-from fused_memory.services.provider_billing import BillingSource, classify_billing_exhaustion
+from fused_memory.services.provider_billing import (
+    BillingExhaustion,
+    BillingSource,
+    classify_billing_exhaustion,
+)
 
 _PROXY_URL = 'http://127.0.0.1:8317/v1'
 
@@ -204,7 +210,6 @@ class TestTheFirstCap:
         assert state.capped_since == _START
         assert state.next_probe_at == _START + timedelta(seconds=_INTERVAL)
         assert len(harness.listener.named('capped')) == 1
-        assert harness.route.next_probe_epoch() == (_START + timedelta(seconds=_INTERVAL)).timestamp()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -349,3 +354,149 @@ class TestTheStatusField:
 
         assert status['state'] == 'unconfigured'
         assert status['proxy_host'] is None
+
+
+_PARKED_SITE = 'durable_queue:add_episode'
+_CLEARED_SITE = 'durable_queue'
+
+
+def _plan_cap() -> BillingExhaustion:
+    exhaustion = classify_billing_exhaustion(make_usage_limit_reached_error())
+    assert exhaustion is not None
+    return exhaustion
+
+
+def _epoch_after(moment: datetime, seconds: float) -> float:
+    return (moment + timedelta(seconds=seconds)).timestamp()
+
+
+class TestACapAnUngatedPathReports:
+    """The plan route's park guard: a plan cap that reached the durable queue
+    by a path the route does not gate counts as a probe made outside the gate."""
+
+    def test_an_ok_route_parks_a_reported_cap_one_probe_period_out(
+        self, harness: _Harness,
+    ) -> None:
+        guard = PlanRouteParkGuard(harness.route)
+
+        assert guard.park_until() == _epoch_after(_START, _INTERVAL)
+
+    @pytest.mark.asyncio
+    async def test_the_first_report_latches_the_route_once(self, harness: _Harness) -> None:
+        guard = PlanRouteParkGuard(harness.route)
+
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        state = harness.route.state()
+        assert state.state is PlanRouteStateName.CAPPED
+        assert state.next_probe_at == _START + timedelta(seconds=_INTERVAL)
+        assert len(harness.listener.named('capped')) == 1
+        assert guard.park_until() == _epoch_after(_START, _INTERVAL)
+
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        assert len(harness.listener.calls) == 1
+        assert guard.park_until() == _epoch_after(_START, _INTERVAL)
+
+    @pytest.mark.asyncio
+    async def test_a_report_once_the_probe_is_due_confirms_once_per_period(
+        self, harness: _Harness,
+    ) -> None:
+        guard = PlanRouteParkGuard(harness.route)
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+        harness.clock.advance(_INTERVAL)
+
+        assert guard.park_until() == _epoch_after(harness.clock.now, _INTERVAL)
+
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        [confirmed] = harness.listener.named('confirmed')
+        next_probe = harness.clock.now + timedelta(seconds=_INTERVAL)
+        assert confirmed.next_probe_at == next_probe
+        assert harness.route.state().next_probe_at == next_probe
+        assert guard.park_until() == next_probe.timestamp()
+
+        harness.clock.advance(_INTERVAL / 2)
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        assert len(harness.listener.named('confirmed')) == 1
+
+        harness.clock.advance(3.5 * _INTERVAL)
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        assert len(harness.listener.named('confirmed')) == 2
+        assert guard.park_until() >= _epoch_after(harness.clock.now, _INTERVAL)
+
+    @pytest.mark.asyncio
+    async def test_a_latch_only_ungated_evidence_set_recovers_when_a_parked_write_lands(
+        self, harness: _Harness,
+    ) -> None:
+        guard = PlanRouteParkGuard(harness.route)
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        await guard.on_cleared(site=_CLEARED_SITE)
+
+        assert harness.route.state().state is PlanRouteStateName.OK
+        assert len(harness.listener.named('recovered')) == 1
+
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        assert harness.route.state().state is PlanRouteStateName.CAPPED
+        assert len(harness.listener.named('capped')) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_latch_the_gate_set_survives_clearing(self, harness: _Harness) -> None:
+        guard = PlanRouteParkGuard(harness.route)
+        harness.answer((429, _usage_limit_body()))
+        async with harness.client() as client:
+            await _assert_capped_call(client)
+
+        await guard.on_cleared(site=_CLEARED_SITE)
+
+        assert harness.route.state().state is PlanRouteStateName.CAPPED
+        assert harness.listener.named('recovered') == []
+
+    @pytest.mark.asyncio
+    async def test_a_latch_the_gate_has_since_probed_survives_clearing(
+        self, harness: _Harness,
+    ) -> None:
+        guard = PlanRouteParkGuard(harness.route)
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+        harness.clock.advance(_INTERVAL)
+        harness.answer((429, _usage_limit_body()))
+        async with harness.client() as client:
+            await _assert_capped_call(client)
+        assert harness.sent() == 1
+
+        await guard.on_cleared(site=_CLEARED_SITE)
+
+        assert harness.route.state().state is PlanRouteStateName.CAPPED
+        assert harness.listener.named('recovered') == []
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_route_latches_confirms_and_clears_the_same_way(self) -> None:
+        config = PlanRouteConfig()
+        clock = _Clock()
+        listener = _Listener()
+        route = PlanRoute(config, listener=listener, clock=clock)
+        guard = PlanRouteParkGuard(route)
+
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        state = route.state()
+        assert state.state is PlanRouteStateName.CAPPED
+        assert state.proxy_host is None
+        assert len(listener.named('capped')) == 1
+
+        clock.advance(config.probe_interval_seconds)
+
+        assert guard.park_until() >= _epoch_after(clock.now, config.probe_interval_seconds)
+
+        await guard.on_parked(_plan_cap(), site=_PARKED_SITE)
+
+        assert len(listener.named('confirmed')) == 1
+
+        await guard.on_cleared(site=_CLEARED_SITE)
+
+        assert route.state().state is PlanRouteStateName.UNCONFIGURED
+        assert len(listener.named('recovered')) == 1
