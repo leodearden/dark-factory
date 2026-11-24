@@ -314,6 +314,28 @@ async def test_work_inside_its_wait_is_not_counted():
     await served_read.join_outlived_waits()
 
 
+async def test_a_wait_whose_deadline_expires_as_its_work_ends_is_counted():
+    async def answers() -> int:
+        return 7
+
+    before = served_read.outlived_wait_count()
+    with pytest.raises(TimeoutError):
+        await wait_shielded(answers(), 0, what='the answer')
+
+    assert served_read.outlived_wait_count() == before + 1
+
+
+async def test_work_that_raises_timeout_error_inside_its_wait_is_not_counted():
+    async def times_out() -> int:
+        raise TimeoutError('its own timeout')
+
+    before = served_read.outlived_wait_count()
+    with pytest.raises(TimeoutError, match='its own timeout'):
+        await wait_shielded(times_out(), 1.0, what='the walk')
+
+    assert served_read.outlived_wait_count() == before
+
+
 async def test_a_served_read_that_fails_after_its_wait_is_logged_as_a_bug_naming_its_key(caplog):
     served = make([60.0])
     release = asyncio.Event()
