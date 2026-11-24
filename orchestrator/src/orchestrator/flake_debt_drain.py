@@ -62,11 +62,13 @@ from orchestrator.flake_ledger import (
     delete_due_item,
     due_item_context,
     fix_contained,
+    list_open_debt,
     name_stale_due_items,
     open_debt,
     read_debt,
     read_due_items,
     record_failed_due_attempt,
+    resolve_debt,
     resolving_commit,
     summarize_due,
 )
@@ -751,3 +753,64 @@ async def run_drain_pass(
     except Exception:
         logger.warning('flake_debt_drain: the pass failed', exc_info=True)
     return DrainPassReport(attempted, settled, failed, stop)
+
+
+# ---------------------------------------------------------------------------
+# The eager resolution sweep (plans/flake-ledger-prd.md task θ, task 8409)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResolutionPassReport:
+    """What one resolution pass did: owned open rows examined, cycles it closed, owner
+    reads that failed, and why it ended early, if it did."""
+
+    examined: int
+    resolved: int
+    owner_unreadable: int
+    stop: DrainStop | None
+
+
+class DebtResolutionSweep:
+    """Closes every open debt cycle whose stored owner reads back live-done.
+
+    It is the EAGER caller :func:`~orchestrator.flake_ledger.resolve_debt` names: each
+    owned open row goes through that function, whose live read, done-only rule and
+    compare-and-set stamp are the whole rule; the sweep adds only the caller.
+    """
+
+    async def run_pass(
+        self,
+        db_path: Path,
+        project_id: str,
+        *,
+        task_client: FlakeLedgerTaskClient,
+        clock: Callable[[], datetime] = _utc_now,
+    ) -> ResolutionPassReport:
+        """One pass over the ledger at *db_path*.  ``resolved_at`` is stamped with the
+        ledger's own wall clock (§5.4), never *clock*.  Never raises; a cancellation
+        propagates."""
+        examined = resolved = owner_unreadable = 0
+        stop: DrainStop | None = None
+        try:
+            rows = await asyncio.to_thread(list_open_debt, db_path)
+            owned = sorted((r for r in rows if r.owner_task_id), key=lambda r: r.test_id)
+            for row in owned:
+                client = _WatchedTaskClient(task_client)
+                closed = await resolve_debt(db_path, project_id, row.test_id, task_client=client)
+                examined += 1
+                if closed:
+                    resolved += 1
+                if client.failed:
+                    owner_unreadable += 1
+        except Exception:
+            logger.warning('flake_debt_drain: the resolution pass failed', exc_info=True)
+        logger.info(
+            'flake_debt_drain: resolution pass examined %d, resolved %d, owner unreadable '
+            '%d, stop=%s',
+            examined,
+            resolved,
+            owner_unreadable,
+            stop,
+        )
+        return ResolutionPassReport(examined, resolved, owner_unreadable, stop)
