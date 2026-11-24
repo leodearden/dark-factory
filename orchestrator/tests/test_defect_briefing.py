@@ -2,9 +2,10 @@
 
 The renderer is driven over records built through the real ``shared.defects``
 model and ref minters, so no enum value or ref is spelled here. The wiring half
-renders the four briefings that open with ``_task_preamble`` through the real
-``BriefingAssembler`` and checks that each lists the declared refs and never
-restates ``DEFECT_TEST_RULE``, whose one site per dispatch is the system prompt.
+renders, through the real ``BriefingAssembler``, the four briefings that open
+with ``_task_preamble`` and the context-complete reviewer's, whose task block
+``_format_task`` also renders. Each lists the declared refs and never restates
+``DEFECT_TEST_RULE``, whose one site per dispatch is the system prompt.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from shared.defects import (
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.defect_briefing import DECLARED_DEFECTS_HEADING, format_declared_defects
+from orchestrator.agents.review_briefing import ChangedFile, ReviewChange, ReviewSubject
 from orchestrator.agents.roles import DEFECT_TEST_RULE
 from orchestrator.agents.steward_digest import EarlierAttempts
 
@@ -79,9 +81,11 @@ class TestFormatDeclaredDefects:
 
         for declaration in _DECLARED:
             line = _line_naming(rendered, declaration.ref)
-            assert str(declaration.origin) in line
-            assert str(declaration.status) in line
             assert declaration.summary in line
+            # Every ref opens with its origin, so origin and status are sought beside it.
+            rest = line.replace(declaration.ref, '').replace(declaration.summary, '')
+            assert str(declaration.origin) in rest
+            assert str(declaration.status) in rest
 
     def test_the_block_opens_with_its_heading(self):
         rendered = format_declared_defects({DEFECTS_METADATA_KEY: _wire(_HUMAN)})
@@ -96,16 +100,17 @@ class TestFormatDeclaredDefects:
     def test_nothing_declared_renders_nothing(self, metadata):
         assert format_declared_defects(metadata) == ''
 
-    def test_a_malformed_entry_is_counted_not_rendered(self):
-        rendered = format_declared_defects(
-            {DEFECTS_METADATA_KEY: [*_wire(_HUMAN), {'ref': 'not-a-ref'}]}
-        )
+    @pytest.mark.parametrize('count', [1, 2])
+    def test_malformed_entries_are_counted_not_rendered(self, count):
+        malformed = [{'ref': f'not-a-ref-{n}'} for n in range(count)]
+
+        rendered = format_declared_defects({DEFECTS_METADATA_KEY: [*_wire(_HUMAN), *malformed]})
 
         assert _HUMAN.ref in rendered
         assert 'not-a-ref' not in rendered
         warnings = _warnings(rendered)
         assert len(warnings) == 1
-        assert '1' in warnings[0]
+        assert str(count) in warnings[0]
 
     @pytest.mark.parametrize(
         'value', [{'ref': 'not-a-ref'}, 'not-a-list'], ids=['dict', 'str'],
@@ -177,31 +182,49 @@ async def _steward_initial(assembler: BriefingAssembler, worktree: Path) -> str:
         )
 
 
-_TASK_PREAMBLE_BUILDERS: dict[str, _Builder] = {
+async def _context_complete_reviewer(assembler: BriefingAssembler, worktree: Path) -> str:
+    subject = ReviewSubject(
+        task=_TASK,
+        plan=None,
+        plan_absent_reason='no plan in this test',
+        change=ReviewChange(
+            base_sha='0123456789abcdef0123456789abcdef01234567',
+            diff='diff --git a/widget.py b/widget.py\n',
+            files=(ChangedFile('widget.py', 1, 0),),
+        ),
+        conventions=(),
+    )
+    return await assembler.build_context_complete_reviewer_prompt(
+        'reviewer_comprehensive', subject, context='',
+    )
+
+
+_TASK_BLOCK_BUILDERS: dict[str, _Builder] = {
     'architect': _architect,
     'replan': _replan,
     'simple_task': _simple_task,
     'steward_initial': _steward_initial,
+    'context_complete_reviewer': _context_complete_reviewer,
 }
 
 
-class TestTaskPreambleBriefingsListDeclaredDefects:
+class TestTaskBlockBriefingsListDeclaredDefects:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('builder', sorted(_TASK_PREAMBLE_BUILDERS))
+    @pytest.mark.parametrize('builder', sorted(_TASK_BLOCK_BUILDERS))
     async def test_every_declared_ref_is_listed(
         self, briefing: BriefingAssembler, tmp_path: Path, builder: str,
     ):
-        prompt = await _TASK_PREAMBLE_BUILDERS[builder](briefing, tmp_path)
+        prompt = await _TASK_BLOCK_BUILDERS[builder](briefing, tmp_path)
 
         missing = [d.ref for d in _DECLARED if d.ref not in prompt]
         assert missing == [], f'the {builder} briefing omits declared defects {missing}'
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('builder', sorted(_TASK_PREAMBLE_BUILDERS))
+    @pytest.mark.parametrize('builder', sorted(_TASK_BLOCK_BUILDERS))
     async def test_the_rule_is_not_restated(
         self, briefing: BriefingAssembler, tmp_path: Path, builder: str,
     ):
-        prompt = await _TASK_PREAMBLE_BUILDERS[builder](briefing, tmp_path)
+        prompt = await _TASK_BLOCK_BUILDERS[builder](briefing, tmp_path)
 
         assert DEFECT_TEST_RULE not in prompt, (
             f'the {builder} briefing restates DEFECT_TEST_RULE; its one site per '
