@@ -93,7 +93,8 @@ class _FakeLedgerTaskClient:
     of every method (a test's clock advance).  *folds_titles* (toggleable) is the task
     store's candidate key: a submission whose title matches an existing task that is not
     cancelled is answered as COMBINED into that task, a ``done`` one included.
-    *get_task_hangs* (toggleable) makes ``get_task`` never answer.
+    *get_task_hangs* (toggleable) makes ``get_task`` never answer, setting
+    :attr:`get_task_entered` first.
     """
 
     def __init__(
@@ -129,6 +130,7 @@ class _FakeLedgerTaskClient:
         self.commit_hangs = commit_hangs
         self.submit_entered = asyncio.Event()
         self.commit_entered = asyncio.Event()
+        self.get_task_entered = asyncio.Event()
         self._on_call = on_call
         self.submit_raises = submit_raises
         self._status_after_submit = status_after_submit
@@ -180,6 +182,7 @@ class _FakeLedgerTaskClient:
         self._enter('get_task')
         self.task_calls.append(task_id)
         if self.get_task_hangs:
+            self.get_task_entered.set()
             await asyncio.Event().wait()
         if self.unreachable:
             return None, ConnectionError('unreachable')
@@ -1259,9 +1262,7 @@ class TestResolutionPassBounds:
         client.get_task_hangs = True
 
         sweep = asyncio.create_task(_resolution_pass(db, client, clock))
-        async with asyncio.timeout(5):
-            while 'get_task' not in client.order:
-                await asyncio.sleep(0.01)
+        await client.get_task_entered.wait()
         sweep.cancel()
 
         with pytest.raises(asyncio.CancelledError):
