@@ -58,7 +58,9 @@ async def record_entry(registry: Registry, key: UnitKey, evidence: int = 7) -> E
 async def recorded_entries(registry: Registry, *keys: UnitKey) -> dict[str, Entry]:
     """The live entry of each of *keys*, by unit id."""
     view = await registry.view(keys)
-    return {unit_id: entry for (unit_id, _key_digest), entry in view.entries.items()}
+    entries = {unit_id: entry for (unit_id, _key_digest), entry in view.entries.items() if isinstance(entry, Entry)}
+    assert len(entries) == len(view.entries), 'a dispatcher registry reads full entries'
+    return entries
 
 
 def verify_result(**overrides: Any) -> VerifyResult:

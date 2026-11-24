@@ -195,15 +195,19 @@ def apply_task_verify_spec(
     """The remote host's half: its own *config* with *spec* applied, plus the rebuilt modules.
 
     The modules are host-shaped (no per-module env, no cold timeout): the spec
-    env is applied once, at config level.
+    env is applied once, at config level. A shipped view pins the task role's
+    cache mode in place of the host's.
     """
     module_configs = [module_config_from_command(vc) for vc in spec.verify_commands]
+    field_overrides: dict[str, object] = {'scope_cargo': spec.scope_cargo}
+    if spec.verify_cache is not None:
+        field_overrides['verify_cache'] = config.verify_cache.with_mode('task', spec.verify_cache.mode)
     applied = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides={'scope_cargo': spec.scope_cargo},
+        field_overrides=field_overrides,
         git_field_overrides={},
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )

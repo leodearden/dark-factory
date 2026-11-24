@@ -168,10 +168,10 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
     ),
     'verify_cache': Classified(
         Fidelity.MERGE_NEUTRAL,
-        "Task 5653: the host's verify-result cache mode. A run joins the cache only through a "
-        'CacheAccess its caller passes, and the remote leg reaches it only as CacheAccess.on_runner(), '
-        'whose missing registry makes every unit UNAVAILABLE, so every leg still runs. The mode also '
-        'stamps the off-wire VerifyResult.cache_record, which never reaches the verdict.',
+        "Tasks 5653 and 9123: the host's verify-result cache mode never decides the verdict. A "
+        "shipped view's mode replaces the host's for the merge role (_spec_field_overrides), and "
+        'without a view CacheAccess.on_runner() holds no registry, so every unit is UNAVAILABLE '
+        'and every leg runs. The dispatcher backs every replay the runner reports before it counts.',
     ),
     'defect_tests': Classified(
         Fidelity.MERGE_NEUTRAL,

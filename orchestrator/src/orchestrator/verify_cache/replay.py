@@ -22,7 +22,14 @@ from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult, Unavailable
 from orchestrator.verify_cache.recorder import CacheRecord, LegRun, RecordedUnit
-from orchestrator.verify_cache.registry import Candidate, Entry, Registry, registry_db_path
+from orchestrator.verify_cache.registry import (
+    Candidate,
+    Entry,
+    Registry,
+    RegistryView,
+    registry_db_path,
+)
+from orchestrator.verify_cache.remote_view import ShippedView
 from orchestrator.verify_evidence import (
     COMMAND_FIELD_BY_LEG,
     GREEN_OUTCOMES,
@@ -73,19 +80,25 @@ def _gate_checkout_code() -> str | Unavailable:
 
 @dataclass(frozen=True)
 class CacheAccess:
-    """How a verify reaches the registry, and the code identity its keys carry."""
+    """How a verify reaches recorded greens, and the code identity its keys carry: the
+    dispatcher reads its *registry*; a runner holds none and decides against the view
+    its dispatcher *shipped* (A5), or against nothing when none was shipped."""
 
     registry: Registry | None
     orchestrator_code: str | Unavailable
     clock: Callable[[], datetime] = _utc_now
+    shipped: RegistryView | None = None
 
     @classmethod
     def on_dispatcher(cls, project_root: Path, *, deployed: deployed_sha.DeployedSha | None) -> CacheAccess:
         return cls(registry=Registry(registry_db_path(project_root)), orchestrator_code=_deployed_code(deployed))
 
     @classmethod
-    async def on_runner(cls) -> CacheAccess:
-        return cls(registry=None, orchestrator_code=await asyncio.to_thread(_gate_checkout_code))
+    async def on_runner(cls, view: ShippedView | None = None) -> CacheAccess:
+        return cls(
+            registry=None, orchestrator_code=await asyncio.to_thread(_gate_checkout_code),
+            shipped=None if view is None else view.registry_view(),
+        )
 
 
 @dataclass(frozen=True)
@@ -285,7 +298,8 @@ async def _decide_all(
     plan_dict = None if plan is None else plan.to_dict()
     tree_key = keys.tree_unit_key(tree, executed_spec_hash(plan_dict, modules), base)
     module_keys = await _module_keys(worktree, tree, plan, executed, base, leg_env)
-    view = await policy.consult(access.registry, [tree_key, *module_keys.values()])
+    source = access.registry if access.registry is not None else access.shipped
+    view = await policy.consult(source, [tree_key, *module_keys.values()])
     never = {mc.prefix for mc in executed if mc is not None and mc.verify_cache == 'never'}
     decide = functools.partial(policy.decide, modes, role, view=view, now=access.clock())
     tree_decision = UnitDecision(tree_key, decide(tree_key, never_cache=bool(never)))

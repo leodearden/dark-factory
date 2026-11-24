@@ -2617,7 +2617,7 @@ class TestRunMergeVerifyOnWorktree:
             run_scoped=run_scoped, run_unscoped=run_unscoped,
         )
 
-        assert result is pass_result
+        assert result == pass_result
 
     async def test_module_configs_reconstructed_from_spec(self):
         """run_scoped is called with module_configs reconstructed from spec."""
@@ -3436,7 +3436,7 @@ class TestRunMergeVerifyOnWorktreeDefaults:
 
         fake_scoped.assert_awaited_once()
         fake_unscoped.assert_awaited_once()
-        assert result is pass_result
+        assert result == pass_result
 
 
 # ---------------------------------------------------------------------------

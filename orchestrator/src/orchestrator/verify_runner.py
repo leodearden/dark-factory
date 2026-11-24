@@ -98,6 +98,7 @@ from orchestrator.verify_cache.recorder import (
     cache_report_from_wire,
     consume_replayed,
     record_greens,
+    report_of,
 )
 from orchestrator.verify_cache.registry import Registry
 from orchestrator.verify_cache.remote_view import ShippedView
@@ -710,7 +711,7 @@ async def run_merge_verify_on_worktree(
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides=_spec_field_overrides(spec),
+        field_overrides=_spec_field_overrides(spec, config),
         git_field_overrides=_spec_git_field_overrides(spec),
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
@@ -723,21 +724,35 @@ async def run_merge_verify_on_worktree(
         run_scoped=run_scoped,
         run_unscoped=run_unscoped,
         task_id=task_id,
-        # A runner reaches no registry: its units settle UNAVAILABLE, and its
-        # cache record stays off the wire until gamma2 (task 9123).
-        verify_cache=await CacheAccess.on_runner(),
+        # A runner reaches no registry: it decides against the view its
+        # dispatcher shipped, and reports its units for the dispatcher to record (A5).
+        verify_cache=await CacheAccess.on_runner(spec.verify_cache),
     )
-    return await runner.run_merge_verify(merge_sha, spec)
+    return runner_reported(await runner.run_merge_verify(merge_sha, spec))
 
 
-def _spec_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
-    """The top-level OrchestratorConfig fields the spec decides; a None scope_cargo is not carried."""
+def runner_reported(result: VerifyResult) -> VerifyResult:
+    """*result* carrying the report of its units a runner ships its dispatcher, since
+    its cache record stays off the wire (A5); None when the cache settled nothing."""
+    record = result.cache_record
+    report = (
+        report_of(record, flake_suppressed=result.flake_suppression is not None)
+        if isinstance(record, CacheRecord) else None
+    )
+    return dataclasses.replace(result, cache_report=report)
+
+
+def _spec_field_overrides(spec: MergeVerifySpec, config: OrchestratorConfig) -> dict[str, Any]:
+    """The top-level OrchestratorConfig fields the spec decides; a None scope_cargo is not
+    carried, and a shipped view pins the merge role's cache mode in place of the host's."""
     overrides: dict[str, Any] = {
         'merge_verify_workspace': spec.merge_verify_workspace,
         'merge_verify_breadth': spec.merge_verify_breadth,
     }
     if spec.scope_cargo is not None:
         overrides['scope_cargo'] = spec.scope_cargo
+    if spec.verify_cache is not None:
+        overrides['verify_cache'] = config.verify_cache.with_mode('merge', spec.verify_cache.mode)
     return overrides
 
 

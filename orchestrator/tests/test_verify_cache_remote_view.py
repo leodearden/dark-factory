@@ -390,8 +390,8 @@ class TestTheRunnerDecidesAgainstTheShippedView:
         reported = {unit.unit.unit: unit for unit in result.cache_report.units}
         assert set(reported) == module_units('alpha') | module_units('beta')
         assert all(unit.key is not None for unit in reported.values())
-        assert all(reported[unit_id].admission is not None and reported[unit_id].admission.admitted
-                   for unit_id in module_units('beta'))
+        beta_admissions = [reported[unit_id].admission for unit_id in module_units('beta')]
+        assert all(admission is not None and admission.admitted for admission in beta_admissions)
 
     @pytest.mark.asyncio
     async def test_a_log_view_cannot_be_raised_by_the_runners_own_config(self, repo, modules, registry, store, markers):

@@ -14,6 +14,7 @@ from typing import Any, Literal
 import pytest
 from _git_fixtures import RepoSeed
 from _orch_helpers import git_env_with_ceiling
+from _verify_cache_units import recorded_entries
 
 from orchestrator import verify_plan
 from orchestrator.config import (
@@ -236,5 +237,4 @@ async def entries_for(registry: Registry, result: VerifyResult) -> dict[str, Ent
     record = result.cache_record
     assert record is not None
     settled = (*record.units, *(() if record.tree is None else (record.tree,)))
-    view = await registry.view([unit.key for unit in settled if unit.key is not None])
-    return {entry.unit_id: entry for entry in view.entries.values()}
+    return await recorded_entries(registry, *(unit.key for unit in settled if unit.key is not None))
