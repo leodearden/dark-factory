@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+CannedResponse = tuple[int, dict[str, Any]] | tuple[int, dict[str, Any], Mapping[str, str]]
+"""``(status, body)`` or ``(status, body, extra_headers)``."""
 
 # Long enough to survive graphiti's OpenAIEmbedder, which TRUNCATES the vector
 # to embedding_dim — a short vector would surface as a length mismatch and be
@@ -128,7 +131,7 @@ class MockOpenAIServer:
         # ThreadingHTTPServer serves concurrently — guard the record list.
         self._lock = threading.Lock()
         self._requests: list[dict[str, Any]] = []
-        self._responses: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        self._responses: dict[str, list[CannedResponse]] = {}
         self.chat_content = '{"ok": true}'
         self.chat_responder: Callable[[Any], str] | None = None
         """When set, each chat reply's content is computed from that request's JSON body."""
@@ -157,9 +160,12 @@ class MockOpenAIServer:
         self.set_response_sequence(path_suffix, [(200, body)])
 
     def set_response_sequence(
-        self, path_suffix: str, bodies: Sequence[tuple[int, dict[str, Any]]]
+        self, path_suffix: str, bodies: Sequence[CannedResponse]
     ) -> None:
-        """Serve ``(status, body)`` pairs in order for ``path_suffix``; the last one repeats."""
+        """Serve canned responses in order for ``path_suffix``; the last one repeats.
+
+        Each is ``(status, body)``, or ``(status, body, extra_headers)``.
+        """
         if not bodies:
             raise ValueError('a response sequence needs at least one (status, body) pair')
         with self._lock:
@@ -171,7 +177,7 @@ class MockOpenAIServer:
         with self._lock:
             self._requests.append(entry)
 
-    def _canned(self, path: str) -> tuple[int, dict[str, Any]] | None:
+    def _canned(self, path: str) -> CannedResponse | None:
         with self._lock:
             for suffix, sequence in self._responses.items():
                 if path.endswith(suffix):
@@ -186,11 +192,15 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
         def log_message(self, *args: Any) -> None:  # stdlib signature
             """Silence the default stderr access log."""
 
-        def _send_json(self, status: int, body: dict[str, Any]) -> None:
+        def _send_json(
+            self, status: int, body: dict[str, Any], extra_headers: Mapping[str, str] | None = None,
+        ) -> None:
             payload = json.dumps(body).encode()
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(payload)))
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(payload)
 
