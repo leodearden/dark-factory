@@ -49,15 +49,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _escalation_http import escalation_http_call
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
+    MARKUP_REFUSAL_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MarkupGuardMiddleware,
     RepairPolicy,
+    residue_header_lines,
 )
-from shared.toolcall_markup import INVOKE_CLOSER, closer_for, detect
+from shared.toolcall_markup import (
+    CANONICAL_OPENER_PREFIX,
+    INVOKE_CLOSER,
+    closer_for,
+    detect,
+)
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 from escalation.queue import EscalationQueue
@@ -1025,7 +1034,7 @@ class TestTheResidueProseMatchesItsKind:
     The sink receives ``mcp_markup_unrepairable`` (refused: nothing written,
     the caller was told, a retry may be coming) and
     ``mcp_markup_unrecovered_param`` (FORWARDED without the parameter and
-    nobody was told, so no retry is coming). The second kind's record is filed
+    nobody was bounced, so no retry is coming). The second kind's record is filed
     before the forwarded call runs, so whether that call then succeeded is not
     known to the sink. This server is the only registration site that produces
     the second kind, because ``_preserve_unrecovered`` is FORWARD_REPAIR-only.
@@ -1082,7 +1091,7 @@ class TestTheResidueProseMatchesItsKind:
         )
         assert 'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER' in residue.detail
         # And the half a reader acts on: nobody is coming back for this.
-        assert 'was NOT told' in residue.detail
+        assert MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT in residue.detail
         # The record does not contradict its own summary any more.
         assert 'forwarded WITHOUT it' in residue.summary
 
@@ -1109,7 +1118,7 @@ class TestTheResidueProseMatchesItsKind:
     async def test_the_forwarded_record_still_carries_the_dropped_value(
         self, tmp_path: Path
     ):
-        """It is the only surviving copy — the caller was never told to resend."""
+        """It is the only copy this boundary holds — nothing bounced the caller to resend."""
         residues = await self._residues(
             tmp_path,
             detail=_leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE),
@@ -1307,3 +1316,131 @@ class TestAQuotedHtmlBlockIsFiledVerbatim:
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         assert payload['field'] == field
         assert payload['matched_pattern'] == closer_for('summary')
+
+
+# ---------------------------------------------------------------------------
+# Task 5055: one caller rendering, the connection's identity, a truthful custody
+# claim.
+# ---------------------------------------------------------------------------
+
+
+def _unrepairable(field: str) -> str:
+    """*field* mis-closed, then a pseudo-parameter no tool declares (boundary row B8)."""
+    return (
+        'The note the caller meant to send.' + closer_for(field) + '\n'
+        + CANONICAL_OPENER_PREFIX + '"not_a_declared_parameter">' + 'stray'
+    )
+
+
+def _residues_of(queue: EscalationQueue) -> list[Escalation]:
+    return queue.get_by_task('mcp-markup-residue', status='pending')
+
+
+class TestTheResidueNamesTheConnectionsIdentity:
+    """``stamp_triage`` declares no ``agent_id``, so only the connection can name its caller.
+
+    The L2 watcher made the measured ``stamp_triage`` and ``resolve_issue``
+    leaks, and it connects with an ``X-Escalation-Identity`` header. That
+    header resolves only under a real ASGI request, so these rows run over HTTP.
+    """
+
+    WATCHER = 'l2-escalation-watcher'
+
+    @pytest.fixture
+    def served(self, tmp_path: Path, serve_escalation_mcp) -> tuple[str, EscalationQueue, str]:
+        """A running server, its queue, and one pending record to annotate.
+
+        Sync, because the fixture's readiness handshake runs its own event loop.
+        """
+        base_url, _port, queue = serve_escalation_mcp(tmp_path / 'esc')
+        seeded = Escalation(
+            id=queue.make_id('3441'), task_id='3441', agent_role='implementer',
+            level=0, severity='blocking', category='scope_violation',
+            summary='A pending record for the watcher to annotate.',
+        )
+        queue.submit(seeded)
+        return base_url, queue, seeded.id
+
+    @staticmethod
+    async def _refuse_over_http(served, identity: str | None) -> list[str]:
+        base_url, queue, escalation_id = served
+        with pytest.raises(ToolError):
+            await escalation_http_call(
+                base_url, 'stamp_triage', identity=identity,
+                escalation_id=escalation_id, triage_note=_unrepairable('triage_note'),
+            )
+        [residue] = _residues_of(queue)
+        return residue.detail.splitlines()
+
+    @pytest.mark.asyncio
+    async def test_the_identity_header_names_the_caller(self, served):
+        lines = await self._refuse_over_http(served, self.WATCHER)
+
+        assert f'agent_id={self.WATCHER!r}' in lines
+
+    @pytest.mark.asyncio
+    async def test_an_unlabelled_connection_is_never_guessed(self, served):
+        lines = await self._refuse_over_http(served, None)
+
+        assert 'agent_id=None' in lines
+
+
+class TestTheResidueRendersTheSharedCallerLines:
+    """The escalation server renders its caller lines the way every residue filer does."""
+
+    async def _residue_detail(self, tmp_path: Path) -> str:
+        record = specimen(UNREPAIRABLE)
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    'escalate_info', {**REQUIRED, record['param']: record['value']},
+                )
+        [residue] = _residues_of(queue)
+        return residue.detail
+
+    @pytest.mark.asyncio
+    async def test_every_caller_line_is_rendered(self, tmp_path: Path):
+        detail = await self._residue_detail(tmp_path)
+
+        caller = {
+            'subject_task_id': REQUIRED['task_id'],
+            'subject_agent_role': REQUIRED['agent_role'],
+            'agent_id': None,
+            'project': None,
+            'override_swallowed': False,
+        }
+        missing = set(residue_header_lines(caller)) - set(detail.splitlines())
+        assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
+
+    @pytest.mark.asyncio
+    async def test_the_custody_claim_is_the_shared_caveat(self, tmp_path: Path):
+        detail = await self._residue_detail(tmp_path)
+
+        assert MARKUP_REFUSAL_CUSTODY_CAVEAT in detail
+        assert 'only surviving copy' not in detail
+
+
+class TestAResolutionLeakIsForwardedClean:
+    """Characterization: FORWARD_REPAIR lands a repairable ``resolve_issue.resolution`` leak."""
+
+    RESOLUTION = 'Fixed by folding the duplicates into one entry.'
+
+    @pytest.mark.asyncio
+    async def test_the_stored_resolution_is_the_clean_value(self, tmp_path: Path):
+        queue, server = build(tmp_path)
+        leaked = (
+            self.RESOLUTION + closer_for('resolution') + '\n'
+            + '\x3cresolved_by>' + 'steward' + closer_for('resolved_by') + INVOKE_CLOSER
+        )
+
+        async with Client(server) as client:
+            filed = await client.call_tool('escalate_info', REQUIRED)
+            await client.call_tool(
+                'resolve_issue', {'escalation_id': filed.data['id'], 'resolution': leaked},
+            )
+
+        resolved = queue.get(filed.data['id'])
+        assert resolved is not None
+        assert resolved.resolution == self.RESOLUTION
+        assert resolved.resolved_by == 'steward'

@@ -5,7 +5,7 @@ Verifies the two genuinely new behaviors of _inject_plan_tools_mcp():
    with a 'plan-tools' entry equal to
    plan_tools_mcp_server(_ORCH_PROJECT_DIR, worktree, python_executable=sys.executable,
    meta_root=_meta_root_for_worktree(worktree), task_root=task_root,
-   granted_tools=role.plan_tools_grants)
+   granted_tools=role.plan_tools_grants, caller_role=role.name)
    (single source of truth — no-uv hot path + worktree propagation guaranteed
    transitively; task 1776).  The 'command' key must equal sys.executable (not 'uv').
 2. A pre-existing server entry (e.g. fused-memory) is preserved alongside the
@@ -69,7 +69,7 @@ class TestInjectPlanToolsMcp:
         expected = plan_tools_mcp_server(
             _ORCH_PROJECT_DIR, wt, python_executable=sys.executable,
             meta_root=_meta_root_for_worktree(wt), task_root=_TASK_ROOT,
-            granted_tools=IMPLEMENTER.plan_tools_grants,
+            granted_tools=IMPLEMENTER.plan_tools_grants, caller_role=IMPLEMENTER.name,
         )
         assert out['mcpServers']['plan-tools'] == expected
         # Explicit command assertion: must be the venv interpreter, not 'uv'.
@@ -118,3 +118,13 @@ class TestInjectPlanToolsMcp:
         assert sorted(grants) == sorted(IMPLEMENTER.plan_tools_grants)
         assert len(grants) == len(set(grants))
         assert args.count('--grants-enforced') == 1
+
+    def test_args_carry_the_roles_name_as_its_caller_role(self):
+        """The server is told which role it serves, so its markup records can
+        name that role as their caller (task 5055)."""
+
+        out = _inject_plan_tools_mcp(None, Path('/wt'), IMPLEMENTER, task_root=_TASK_ROOT)
+
+        args = out['mcpServers']['plan-tools']['args']
+        idx = args.index('--caller-role')
+        assert args[idx:idx + 2] == ['--caller-role', IMPLEMENTER.name]

@@ -354,6 +354,8 @@ def _inject_plan_tools_mcp(
     The server exposes only ``role.plan_tools_grants``: dispatches run under
     ``bypassPermissions``, where ``allowed_tools`` neither hides nor denies a
     tool, so the grant is enforced by the server registering only these names.
+    ``role.name`` is passed as ``--caller-role``, so the server's markup
+    records name the role they came from (task 5055).
 
     The plan-tools server is launched via the direct-interpreter no-uv hot path
     (task 1776): ``sys.executable -m orchestrator.mcp.plan_tools --worktree <wt>``.
@@ -382,7 +384,7 @@ def _inject_plan_tools_mcp(
     mcp_config.setdefault('mcpServers', {})[PLAN_TOOLS_MCP_SERVER] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
-        granted_tools=role.plan_tools_grants,
+        granted_tools=role.plan_tools_grants, caller_role=role.name,
     )
     return mcp_config
 

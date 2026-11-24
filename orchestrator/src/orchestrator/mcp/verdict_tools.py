@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from shared.markup_override_param import accepts_markup_override
 
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
@@ -36,9 +37,9 @@ from shared.mcp_markup_middleware import (
     OUTCOMES as MARKUP_OUTCOMES,
 )
 from shared.mcp_markup_middleware import (
+    HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
-    accepts_markup_override,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 
@@ -260,8 +261,7 @@ MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     storm_anchor_task_id='verdict-tools-markup-storm',
     refusal_consequence=(
         'NO verdict was written, so the review gate this call was supposed to '
-        "close is still open and the reviewer's findings list below is the "
-        'only copy of it that exists.'
+        'close stays open until the reviewer resends it.'
     ),
     storm_consequence=(
         'further review gates strand on verdicts that never land.'
@@ -489,6 +489,7 @@ def create_server(
             loss_sink=fact_journal,
             resolve_root=resolve_project_root,
         ),
+        host_attribution=lambda: HostAttribution(agent_role=role),
     ))
     mcp.add_middleware(MissingArgumentMiddleware())
 

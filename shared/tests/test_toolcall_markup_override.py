@@ -9,9 +9,12 @@ import json
 import pytest
 
 from shared.toolcall_markup import (
+    CANONICAL_OPENER_PREFIX,
     MARKUP_OVERRIDE_KEY,
+    closer_for,
     markup_override_requested,
     strip_markup_override,
+    swallowed_markup_override,
 )
 
 
@@ -156,3 +159,92 @@ class TestMarkupOverrideReExport:
         assert tripwire.MARKUP_OVERRIDE_KEY is MARKUP_OVERRIDE_KEY
         assert tripwire.markup_override_requested is markup_override_requested
         assert tripwire.strip_markup_override is strip_markup_override
+
+
+#: What the caller meant to send for the leaking parameter.
+_INTENDED = 'The guard repairs at the boundary.'
+
+#: The wrong-dialect closer that starts the leak: the parameter closed on its
+#: own name.
+_SELF_NAME_MISCLOSE = closer_for('rationale')
+
+
+def _canonical(name: str, body: str) -> str:
+    """A canonical-dialect pseudo-parameter, as the over-consume leaves it."""
+    return CANONICAL_OPENER_PREFIX + '"' + name + '">' + body + closer_for('parameter')
+
+
+def _echo(name: str, body: str) -> str:
+    """A name-echo-dialect pseudo-parameter."""
+    return '\x3c' + name + '>' + body + closer_for(name)
+
+
+def _leaked(*tail: str) -> str:
+    """A value that absorbed every pseudo-parameter in *tail* after a mis-close."""
+    return _INTENDED + _SELF_NAME_MISCLOSE + '\n' + '\n'.join(tail)
+
+
+class TestSwallowedMarkupOverride:
+    """``swallowed_markup_override``: the override found INSIDE a leaked value.
+
+    The leak swallows the parameters that follow the leaking one, so a
+    ``metadata`` override sent after it arrives as text inside the value. This
+    predicate reports that; it never honours it. Only a literal boolean
+    ``True`` counts, as for :func:`markup_override_requested`.
+    """
+
+    def test_a_canonical_metadata_carrying_the_flag_is_found(self):
+        value = _leaked(_canonical('metadata', json.dumps({MARKUP_OVERRIDE_KEY: True})))
+
+        assert swallowed_markup_override(value) is True
+
+    def test_a_name_echo_metadata_carrying_the_flag_is_found(self):
+        value = _leaked(_echo('metadata', json.dumps({MARKUP_OVERRIDE_KEY: True})))
+
+        assert swallowed_markup_override(value) is True
+
+    def test_the_flag_beside_a_sibling_pseudo_parameter_is_found(self):
+        value = _leaked(
+            _canonical('alternatives', 'none'),
+            _canonical('metadata', json.dumps({MARKUP_OVERRIDE_KEY: True})),
+        )
+
+        assert swallowed_markup_override(value) is True
+
+    @pytest.mark.parametrize(
+        'body',
+        [
+            json.dumps({MARKUP_OVERRIDE_KEY: False}),
+            json.dumps({MARKUP_OVERRIDE_KEY: 'true'}),
+            json.dumps({MARKUP_OVERRIDE_KEY: 1}),
+            json.dumps({'other': True}),
+            json.dumps({}),
+        ],
+        ids=repr,
+    )
+    def test_anything_but_a_literal_true_is_not_an_override(self, body):
+        assert swallowed_markup_override(_leaked(_canonical('metadata', body))) is False
+
+    def test_a_leak_without_a_metadata_pseudo_parameter_is_not_an_override(self):
+        value = _leaked(_canonical('alternatives', json.dumps({MARKUP_OVERRIDE_KEY: True})))
+
+        assert swallowed_markup_override(value) is False
+
+    def test_a_clean_value_is_not_an_override(self):
+        assert swallowed_markup_override(_INTENDED) is False
+
+    @pytest.mark.parametrize(
+        'body',
+        ['not json at all', '{"unterminated": ', '[true]', 'true'],
+        ids=repr,
+    )
+    def test_a_metadata_body_that_is_not_a_json_map_is_not_an_override(self, body):
+        assert swallowed_markup_override(_leaked(_canonical('metadata', body))) is False
+
+    @pytest.mark.parametrize(
+        'value',
+        [None, 42, 3.5, True, b'bytes', ['metadata'], {MARKUP_OVERRIDE_KEY: True}],
+        ids=repr,
+    )
+    def test_a_non_str_value_is_not_an_override_and_never_raises(self, value):
+        assert swallowed_markup_override(value) is False

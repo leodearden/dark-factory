@@ -191,6 +191,7 @@ def plan_tools_mcp_server(
     meta_root: Path | None = None,
     task_root: Path | None = None,
     granted_tools: Iterable[str] = (),
+    caller_role: str | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the plan-tools server.
 
@@ -248,6 +249,9 @@ def plan_tools_mcp_server(
             args, so the default exposes no tool
             (``orchestrator.mcp.plan_tools.server_from_argv``). One
             ``--grant <name>`` pair per name follows it, sorted.
+        caller_role: The role the launched server serves, emitted as
+            ``--caller-role <role>`` after the grants. Attribution on markup
+            records only (task 5055); ``None`` (default) emits no flag.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
@@ -258,6 +262,7 @@ def plan_tools_mcp_server(
         extra_args=(
             '--grants-enforced',
             *(token for name in sorted(set(granted_tools)) for token in ('--grant', name)),
+            *(() if caller_role is None else ('--caller-role', caller_role)),
         ),
     )
 
