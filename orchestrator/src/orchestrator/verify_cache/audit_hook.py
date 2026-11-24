@@ -50,7 +50,7 @@ class VerifyCacheAuditHook:
     """The lane's section 5.7 hook for the verify-cache-audit command (plans/verify-result-cache-prd.md § Audit).
 
     Only a confirmed red's reproduced nodes are evidence; registry errors propagate, so the lane drops only these notes.
-    An escalation-queue error costs only the blocker sync, which the next attributable pass retries.
+    An escalation-queue error costs only the blocker sync, which the next reproduced audit red retries.
     """
 
     def __init__(
@@ -73,19 +73,17 @@ class VerifyCacheAuditHook:
         verdict = await attribute(head, outcome.reproduced, self._registry)
         if not verdict.attributions:
             await self._note_unattributable(verdict)
-            return ()
         now = self._now()
         response = await apply(verdict, self._registry, now)
-        notes = _notes(response, now)
         try:
             await asyncio.to_thread(self._sync_blockers, response, now)
         except Exception:
             logger.exception(
                 'verify-cache audit: syncing the kill-switch blocker with the escalation queue failed '
-                '(policy disabled_until=%s); the next attributable pass retries it',
+                '(policy disabled_until=%s); the next reproduced audit red retries it',
                 response.policy.disabled_until,
             )
-        return notes
+        return _notes(response, now)
 
     async def _note_unattributable(self, verdict: AuditVerdict) -> None:
         """Tell 'nothing records a consumption' apart from 'no leak', once per process (INV-13)."""
@@ -143,6 +141,8 @@ def _pending_blockers(queue: EscalationQueue) -> list[Escalation]:
 def _policy_now(policy: PolicyState, now: datetime) -> str:
     if policy.is_disabled(now):
         return f'the cache is now DISABLED until {_until(policy)} under a later disable'
+    if policy.disabled_until is not None:
+        return f'the kill switch expired at {_until(policy)}, so the cache is enabled'
     return f'the cache is enabled ({policy.reason})'
 
 
@@ -183,6 +183,7 @@ def _blocker_detail(records: Sequence[LeakRecord], response: LeakResponse) -> st
         *(f'- {_leak_line(record, streak)}' for record in records),
         'Evicted by this pass:',
         *(f'- key {key}: {count} entries' for key, count in response.evicted.items()),
+        *(() if response.evicted else ('- none',)),
     ]
     return '\n'.join(lines)
 
