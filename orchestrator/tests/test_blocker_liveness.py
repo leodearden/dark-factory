@@ -62,12 +62,12 @@ class TestHeldBlocker:
     @pytest.mark.parametrize('record', [
         _running(),
         _task('pending'),
-        _task('pending', claimant='run-x', beat_secs_ago=900),
+        _task('pending', claimant='run-x', beat_secs_ago=10),
         _task('blocked', claimant='run-x', beat_secs_ago=10),
         _task('done'),
         _task('cancelled'),
     ], ids=[
-        'heartbeating', 'dispatched-not-yet-claimed', 'requeued-unwinding',
+        'heartbeating', 'dispatched-not-yet-claimed', 'requeued-before-its-claim-clears',
         'blocked-on-its-way-out', 'done-before-release', 'cancelled-before-release',
     ])
     def test_an_in_flight_owner_with_progress_or_unwinding_is_live(
@@ -84,9 +84,11 @@ class TestHeldBlocker:
         (_task('in-progress', claimant='run-x'), HolderState.NO_LIVE_CLAIMANT),
         (_task('blocked', claimant='run-x', beat_secs_ago=301), HolderState.BLOCKED),
         (_task('blocked'), HolderState.BLOCKED),
+        (_task('pending', claimant='run-x', beat_secs_ago=900), HolderState.NO_LIVE_CLAIMANT),
+        (_task('pending', claimant='run-x'), HolderState.NO_LIVE_CLAIMANT),
     ], ids=[
         'stale-heartbeat', 'no-claimant', 'no-heartbeat', 'blocked-stale-claimant',
-        'blocked-no-claimant',
+        'blocked-no-claimant', 'requeue-exit-hung', 'requeued-no-heartbeat',
     ])
     def test_an_in_flight_owner_without_a_live_claimant_names_its_blocker(
         self, record: dict[str, Any], reason: HolderState,
