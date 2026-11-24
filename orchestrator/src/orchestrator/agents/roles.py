@@ -343,6 +343,34 @@ INFO_ONLY_ESCALATION_INSTRUCTIONS = _ESCALATION_SECTION_OPENING + """
 You hold `escalate_info` only, so nothing you file blocks work or waits on a decision.
 """ + _ESCALATION_CATEGORIES + ESCALATE_INFO_CONTRACT + _OBSERVATIONS_VS_HYPOTHESES
 
+# Rationale: plans/defect-tests-prd.md decision 17; the skills/ and CONTRIBUTING.md excerpts are mirrored by tests/scripts/test_defect_rule_mirror.py.
+DEFECT_TEST_RULE = """
+## Fixing a defect
+
+A defect is wrong runtime behaviour. A defect fix starts from a test that fails
+without the fix and passes with it: write that test first and watch it fail.
+When the defect is declared, mark that test `@pytest.mark.defect("<ref>")` with
+the defect's ref. A test carrying `@pytest.mark.defect` is a defect's
+reproducing test.
+
+Never weaken a failing test (loosen or delete an assertion, skip it, mark it
+xfail, or delete the test) without stating in the commit message why the test,
+not the code, was wrong.
+"""
+
+
+def splice_defect_test_rule(prompt: str, rule: str) -> str:
+    """The one splice site of the defect-test rule: immediately before the prompt's escalation section."""
+    count = prompt.count(ESCALATION_LADDER_CORE)
+    if count != 1:
+        raise ValueError(
+            f'splice_defect_test_rule needs exactly one ESCALATION_LADDER_CORE in '
+            f'the prompt to anchor on; found {count}'
+        )
+    before, anchor, after = prompt.partition(ESCALATION_LADDER_CORE)
+    return before + rule + anchor + after
+
+
 _MEMORY_TOOLS = [
     'mcp__fused-memory__add_memory',
     'mcp__fused-memory__search',
