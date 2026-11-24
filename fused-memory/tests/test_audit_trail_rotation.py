@@ -910,6 +910,7 @@ class TestMemoryServiceArchiveLinksItsTask:
             archive=memory_service_archive(memory_service), commit=RecordingCommit(task),
         )
 
+        assert outcome is not None
         assert outcome.status == 'rotated'
         (written,) = memory_service.writes
         assert_writes_c5(written, project_id='p', subject=subject_task('p', task['id']))
