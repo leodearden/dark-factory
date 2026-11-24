@@ -16833,7 +16833,7 @@ class TaskWorkflow:
         if relink_error is not None:
             detail += f'\nRelink failed: {relink_error!r}'
         return await self._mark_blocked(
-            f'Lane handoff refused: {fault.describe()}', detail=detail, category='infra_issue',
+            f'Lane handoff refused: {fault.kind.value} at {fault.lane_path}', detail=detail, category='infra_issue',
         )
 
     async def _recover_before_execute(self) -> WorkflowOutcome | None:

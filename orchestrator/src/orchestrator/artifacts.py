@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -726,6 +727,19 @@ _LANE_PLAN_FAULT_MEANINGS: Mapping[LanePlanFaultKind, str] = MappingProxyType({
 
 
 @dataclass(frozen=True)
+class LanePlanOccupant:
+    """The regular file a lane ``.task/plan.json`` holds in place of its link, fingerprinted before a relink discards it."""
+
+    size: int
+    sha256: str
+    matches_plan: bool
+
+    def describe(self) -> str:
+        sameness = 'identical to' if self.matches_plan else 'different from'
+        return f'a regular file of {self.size} bytes, sha256 {self.sha256}, {sameness} the task plan'
+
+
+@dataclass(frozen=True)
 class LanePlanFault:
     """Why the lane ``.task/plan.json`` does not read this task's plan, and the paths involved."""
 
@@ -733,11 +747,13 @@ class LanePlanFault:
     lane_path: Path
     resolved_path: Path
     plan_path: Path
+    occupant: LanePlanOccupant | None = None
 
     def describe(self) -> str:
+        held = '' if self.occupant is None else f'; the lane entry is {self.occupant.describe()}'
         return (
             f'lane plan {self.lane_path} {_LANE_PLAN_FAULT_MEANINGS[self.kind]}: '
-            f'it resolves to {self.resolved_path}; the task plan is {self.plan_path}'
+            f'it resolves to {self.resolved_path}; the task plan is {self.plan_path}{held}'
         )
 
 
@@ -810,6 +826,18 @@ def _replace_with_symlink(link: Path, target: Path) -> None:
     else:
         link.unlink(missing_ok=True)
     os.symlink(target, link)
+
+
+def _regular_file_occupant(lane: Path, plan: Path) -> LanePlanOccupant | None:
+    """Fingerprint *lane* when it is a readable regular file rather than a link, else None."""
+    if lane.is_symlink() or not lane.is_file():
+        return None
+    try:
+        content = lane.read_bytes()
+        matches_plan = plan.is_file() and plan.read_bytes() == content
+    except OSError:
+        return None
+    return LanePlanOccupant(len(content), hashlib.sha256(content).hexdigest(), matches_plan)
 
 
 def _is_nonempty_file(path: Path) -> bool:
@@ -1123,15 +1151,16 @@ class TaskArtifacts:
         """Why the agent-facing ``.task/plan.json`` does not read this task's non-empty plan, else None; changes nothing."""
         plan = self.artifact_path('plan.json')
         lane = self._lane_link('plan.json') or plan
+        resolved = Path(os.path.realpath(lane))
         if lane != plan and not lane.is_symlink():
-            kind = LanePlanFaultKind.NOT_A_LINK
-        elif os.path.realpath(lane) != os.path.realpath(plan):
-            kind = LanePlanFaultKind.WRONG_TARGET
-        elif not _is_nonempty_file(lane):
-            kind = LanePlanFaultKind.EMPTY
-        else:
-            return None
-        return LanePlanFault(kind, lane, Path(os.path.realpath(lane)), plan)
+            return LanePlanFault(
+                LanePlanFaultKind.NOT_A_LINK, lane, resolved, plan, _regular_file_occupant(lane, plan),
+            )
+        if resolved != Path(os.path.realpath(plan)):
+            return LanePlanFault(LanePlanFaultKind.WRONG_TARGET, lane, resolved, plan)
+        if not _is_nonempty_file(lane):
+            return LanePlanFault(LanePlanFaultKind.EMPTY, lane, resolved, plan)
+        return None
 
     def write_blocking_dependency(
         self,

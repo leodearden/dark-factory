@@ -467,7 +467,8 @@ For a normal task, `TaskWorkflow._drive()`
    the workflow checks that the lane `.task/plan.json` reads the task's plan
    (`orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.lane_plan_fault`).
    It relinks once, and blocks the task as `infra_issue` if the link still
-   does not.
+   does not. The relink WARNING records the size and sha256 of any regular
+   file the relink replaces, and whether its bytes matched the plan.
 5. **VERIFY.** Scoped test/lint/typecheck commands are derived per-module
    and run through a `VerifyRunnerPool` (prefers a remote runner, falls back
    to local). A failure hands off to `debugger` to fix it and re-verify,

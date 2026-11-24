@@ -10,7 +10,9 @@ case drives the public ``TaskWorkflow.run()`` in a fresh repo.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -25,12 +27,14 @@ from _workflow_helpers import (
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
     _init_repo,
     _make_git_ops,
+    _make_resolving_steward,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 
 from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.artifacts import LanePlanFaultKind
 from orchestrator.event_store import EventStore
 from orchestrator.workflow import WorkflowOutcome
 
@@ -89,27 +93,18 @@ class _EscalatingStub(AgentStub):
 
 
 def _lane_breaking_steward(queue: EscalationQueue) -> type:
-    """A steward that, working in the task's worktree, breaks its lane plan link and resolves every pending L0."""
+    """The shared resolving steward double, which first breaks the lane plan link of the worktree it works in."""
 
-    class _Steward:
+    class _LaneBreakingSteward(_make_resolving_steward(queue, TASK_ID)):
         def __init__(self, wt_path: Path, cfg_dir: Path) -> None:
+            super().__init__(wt_path, cfg_dir)
             self._lane = _lane_plan(wt_path)
-
-        def set_outcome_channel(self, channel) -> None:
-            pass
-
-        def set_wip_probe(self, probe) -> None:
-            pass
 
         async def start(self) -> None:
             _replace_with_empty_file(self._lane)
-            for esc in queue.get_by_task(TASK_ID, status='pending', level=0):
-                queue.resolve(esc.id, 'resolved by the lane-breaking steward', resolved_by='steward')
+            await super().start()
 
-        async def stop(self) -> None:
-            pass
-
-    return _Steward
+    return _LaneBreakingSteward
 
 
 async def _run(
@@ -186,9 +181,10 @@ async def test_a_lane_plan_that_cannot_be_relinked_blocks_before_any_implementer
     lane = str(stub.lane_paths[-1])
     refusals = [
         esc for esc in queue.get_by_task(TASK_ID, status='pending')
-        if esc.category == 'infra_issue' and (lane in esc.summary or lane in esc.detail)
+        if esc.category == 'infra_issue' and lane in esc.detail
     ]
     assert refusals, [(esc.category, esc.summary) for esc in queue.get_by_task(TASK_ID)]
+    assert all(LanePlanFaultKind.NOT_A_LINK.value in esc.summary for esc in refusals)
 
 
 @pytest.mark.asyncio
@@ -207,3 +203,20 @@ async def test_a_lane_plan_broken_during_an_escalation_wait_is_relinked_before_t
     was_link, read = stub.resumed_read
     assert was_link
     assert [step['id'] for step in json.loads(read)['steps']] == ['step-1', 'step-2']
+
+
+@pytest.mark.asyncio
+async def test_the_relink_warning_fingerprints_the_regular_file_it_replaces(tmp_path, monkeypatch, caplog):
+    edited = b'{"steps": "edited in the lane"}'
+
+    def replace_with_edited_file(lane: Path) -> None:
+        lane.unlink()
+        lane.write_bytes(edited)
+
+    stub = _LaneBreakingStub(replace_with_edited_file)
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+        outcome, _queue = await _run(tmp_path, monkeypatch, stub)
+
+    assert outcome == WorkflowOutcome.DONE
+    assert hashlib.sha256(edited).hexdigest() in caplog.text
