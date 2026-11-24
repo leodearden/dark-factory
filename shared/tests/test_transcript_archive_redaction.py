@@ -28,6 +28,7 @@ SID = 'sess-redact'
 TASK_ID = '6820'
 POOL_A = 'sk-ant-oat01-' + 'Pa' * 17 + 'z'
 OPENAI = 'sk-proj-' + 'Op' * 20
+PLAN_PROXY = 'plan-proxy-' + 'Pk' * 20
 OLD_MTIME_NS = 1_700_000_000_000_000_000
 
 
@@ -130,6 +131,28 @@ def test_a_transcript_without_a_secret_is_archived_byte_identical(archiving_env,
     assert archive_task_transcripts(config_dir, TASK_ID, archive_root=root) == 1
 
     assert _archived(root).read_bytes() == src_bytes
+
+
+def test_the_plan_proxy_key_is_redacted(archiving_env, monkeypatch, tmp_path):
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', PLAN_PROXY)
+    config_dir = tmp_path / 'claude-config'
+    root = tmp_path / 'archive'
+    _write_transcript(config_dir, [
+        json.dumps({
+            'type': 'user',
+            'message': {
+                'content': [
+                    {'type': 'tool_result', 'content': f'OPENAI_PLAN_PROXY_KEY={PLAN_PROXY}\n'},
+                ],
+            },
+        }),
+    ])
+
+    assert archive_task_transcripts(config_dir, TASK_ID, archive_root=root) == 1
+
+    data = _archived(root).read_bytes()
+    assert PLAN_PROXY.encode() not in data
+    assert b'<redacted:OPENAI_PLAN_PROXY_KEY>' in data
 
 
 class TestRefusedRedaction:
