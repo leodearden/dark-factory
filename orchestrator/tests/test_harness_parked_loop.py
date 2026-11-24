@@ -467,7 +467,8 @@ class TestParkedLoop:
             [immune_slot] = immune_slots
             assert not immune_slot.done(), 'shutdown must not wait for a slot that ignores its cancel'
             assert immune_slot not in h._live_tasks
-            assert _harness_errors_naming(caplog, 'workflow-1')
+            detach_errors = [m for m in _harness_errors_naming(caplog, 'workflow-1') if 'detached' in m]
+            assert len(detach_errors) == 1, 'the workflow drain must log the slot it detached'
             outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
             assert outcomes == {'2': WorkflowOutcome.CANCELLED}
         finally:
