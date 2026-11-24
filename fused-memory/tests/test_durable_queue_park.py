@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _fm_polling import poll_until, poll_until_dead
 from _queued_write_fixtures import queued
+from shared.testing_fake_clock import FakeClock
 
 from fused_memory.services.durable_queue import DurableWriteQueue, ParkDecision, ParkedWriteEvent
 from fused_memory.services.queued_writes import QueueCallback, QueuedWrite
@@ -230,6 +231,32 @@ class TestTheProbeTimeAParkNames:
             assert before <= horizons[0] <= time.time()
             assert _row(tmp_path, item_id)['status'] == 'parked'
             assert _row(tmp_path, item_id)['attempts'] == 0
+        finally:
+            await q.close()
+
+
+class TestTheQueuesClock:
+    @pytest.mark.asyncio
+    async def test_parking_and_landing_follow_the_injected_clock(self, tmp_path):
+        start = 1_800_000_000.0
+        clock = FakeClock(start=start)
+        policy = _RecordingParkPolicy(retry_at=lambda: clock() + _PROBE_AHEAD_SECONDS)
+        execute = AsyncMock(side_effect=[_Exhausted('capped'), None])
+        q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
+        await q.initialize()
+        try:
+            item_id = await q.enqueue(_write('on the fake clock'))
+            await poll_until(_status_is(tmp_path, item_id, 'parked'))
+
+            row = _row(tmp_path, item_id)
+            assert row['created_at'] == start
+            assert row['next_retry_at'] == start + _PROBE_AHEAD_SECONDS
+
+            clock.advance(_PROBE_AHEAD_SECONDS)
+            await poll_until(_status_is(tmp_path, item_id, 'completed'))
+
+            assert _row(tmp_path, item_id)['completed_at'] == start + _PROBE_AHEAD_SECONDS
+            assert policy.cleared == 1
         finally:
             await q.close()
 
