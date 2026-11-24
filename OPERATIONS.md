@@ -4656,10 +4656,14 @@ effect. The switch lives in the
 registry, not in config, so a reload does not clear it.
 
 To re-enable once the leaks are fixed, an operator runs `orchestrator
-verify-cache enable --config <path>`, or calls `resolve_issue` on the blocker;
-either records the re-enable. Waiting out `disabled_until` also re-enables. Both
-arrive with task 5655; `orchestrator verify-cache status` shows the switch
-meanwhile (`policy: DISABLED until …` with the reason and leaks).
+verify-cache enable --reason "<why the cache is safe again>" --config <path>`,
+which clears `disabled_until` with that reason and resolves the pending
+blocker. Resolving the blocker by hand (`resolve_issue`) does **not** re-enable
+the cache: while `disabled_until` is in the future, the audit re-files a
+hand-resolved blocker at its next reproduced red. Waiting out `disabled_until`
+also re-enables, and the audit's next reproduced red resolves that disable's
+blocker. `orchestrator verify-cache status` shows the switch meanwhile
+(`policy: DISABLED until …` with the reason and leaks).
 
 ### Never cached
 
