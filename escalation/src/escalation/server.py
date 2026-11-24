@@ -25,13 +25,16 @@ from shared.eval_lane import eval_lane_provenance
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
     MARKUP_RECURRENCE_ROUTING,
+    MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
+    residue_caller_lines,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.merge_state import CANCEL_STATES, MergeReason, MergeState
@@ -936,8 +939,8 @@ _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
 # so there is no caller task to file against even if one were wanted.
 #
 # They are DISTINCT anchors because the two records have opposite dedup needs.
-# A residue record is the ONLY surviving copy of one specific caller's payload,
-# so every one must land on its own; a storm record is a rate alarm about a
+# Each residue record holds a different caller's payload, so folding two would
+# destroy one and every one must land on its own; a storm record is a rate alarm about a
 # condition, so a second one while the first is still open is noise.  One shared
 # anchor would force a single answer to both.
 _MARKUP_RESIDUE_ANCHOR_TASK_ID = 'mcp-markup-residue'
@@ -1096,10 +1099,7 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
         return (
             'THE CALL WAS REFUSED. The leaked fragment\'s own boundary could '
             'not be determined, so no repair was attempted and nothing was '
-            'guessed. Nothing this call carried reached the escalation store, '
-            'and the caller WAS told: it holds its own copy and can resend, so '
-            'the payload below is a recovery aid rather than the only route '
-            'back to the data.'
+            'guessed. ' + MARKUP_REFUSAL_CUSTODY_CAVEAT
         )
     if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
         return (
@@ -1505,17 +1505,11 @@ def create_server(
         level = int(record.get('level') or 2)
         subject_task_id = record.get('subject_task_id')
         detail = '\n'.join([
-            # WHOSE call leaked. Rendered FIRST and unconditionally because on
-            # this server it is the only attribution that always resolves: the
-            # middleware's `_identity` reads `agent_id` / `project_root` /
-            # `project_id` off the call's own arguments; no escalation tool
-            # declares `agent_id` or `project_id`, and the tools that accept an
-            # OPTIONAL `project_root` see it omitted by fleet callers, so
-            # `project` below usually stays None. The record's own `task_id` is
-            # the synthetic anchor, not the caller's, so without these two
-            # lines a critical L2 record names nobody at all.
-            f'subject_task_id={subject_task_id!r}',
-            f'subject_agent_role={record.get("subject_agent_role")!r}',
+            # WHOSE call leaked, FIRST: the record's own `task_id` is the
+            # synthetic anchor, not the caller's, so without these lines a
+            # critical L2 record names nobody at all. `agent_id` comes from the
+            # connection's identity header when a tool declares none.
+            *residue_caller_lines(record),
             # The OWNER that will exit this hold unprompted (INV-7), read off
             # the record rather than restated: the middleware names it, and a
             # second spelling here could name a consumer that no longer exists.
@@ -1523,13 +1517,11 @@ def create_server(
             f'tool={record.get("tool")!r}',
             f'field={record.get("field")!r}',
             f'matched_pattern={record.get("matched_pattern")!r}',
-            f'agent_id={record.get("agent_id")!r}',
-            f'project={record.get("project")!r}',
             f'raw_value_chars={len(record.get("raw_value") or "")}',
             '',
             _markup_residue_prose(record),
             '',
-            'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. '
+            'RAW PAYLOAD, VERBATIM AND ENTIRE. '
             'Recover it for the caller if it is still needed, then chase the '
             'harness serialization leak that produced it and '
             f'{MARKUP_RECURRENCE_ROUTING}.',
@@ -1575,6 +1567,10 @@ def create_server(
         # server is the one place the residue can actually be preserved.
         escalation_sink=_file_markup_residue,
         fact_sink=_emit_markup_fact,
+        # Attribution only, never a gate: the same header stamp_triage reads.
+        host_attribution=lambda: HostAttribution(
+            agent_id=get_http_headers().get(_IDENTITY_HEADER),
+        ),
     ))
     # --- Truncated-uuid citations (PRD uuid-prefix-resolution §4-C3) ---
     # After the markup guard, so a parameter it recovers is scanned too (B15).
