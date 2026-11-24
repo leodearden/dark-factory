@@ -15442,16 +15442,16 @@ class TestAdvanceMainIndexLockStandoff:
         )
         try:
             with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-                cleared, waited, initial_age = await git_ops._await_index_lock_clear(
+                standoff = await git_ops._await_index_lock_clear(
                     timeout_s=1.0, context='live-holder-old-lock',
                 )
         finally:
             lock_path.unlink()
 
-        assert cleared is False
-        assert initial_age > _INDEX_LOCK_STALE_FLOOR_S
-        assert waited > 0.0, (
-            f'a lock a live git process holds must be waited on; got waited={waited!r}'
+        assert standoff.cleared is False
+        assert standoff.initial_age_s > _INDEX_LOCK_STALE_FLOOR_S
+        assert standoff.waited_s > 0.0, (
+            f'a lock a live git process holds must be waited on; got waited={standoff.waited_s!r}'
         )
         assert any(f'pid {_HOLDER_PID}' in record.getMessage() for record in caplog.records), (
             'the stand-off warning must name the live holder; got '
@@ -15528,16 +15528,16 @@ class TestAdvanceMainIndexLockStandoff:
             command=_LATER_READER_COMMAND, started_at=time.time(),
         )
         try:
-            cleared, waited, _initial = await git_ops._await_index_lock_clear(
+            standoff = await git_ops._await_index_lock_clear(
                 timeout_s=1.0, context='later-reader-old-lock',
             )
         finally:
             lock_path.unlink()
 
-        assert cleared is False
-        assert waited == 0.0, (
+        assert standoff.cleared is False
+        assert standoff.waited_s == 0.0, (
             'a git process that started after the lock must not turn a crashed '
-            f'leftover into a stand-off; got waited={waited!r}'
+            f'leftover into a stand-off; got waited={standoff.waited_s!r}'
         )
 
     async def test_a_skipped_standoff_reports_the_scan_it_decided_on(
@@ -15644,15 +15644,15 @@ class TestAdvanceMainIndexLockStandoff:
         backdated = time.time() - (_INDEX_LOCK_STALE_FLOOR_S + 1000)
         os.utime(lock_path, (backdated, backdated))
         try:
-            cleared, waited, _initial = await git_ops._await_index_lock_clear(
+            standoff = await git_ops._await_index_lock_clear(
                 timeout_s=1.0, context='unconfirmed-scan-old-lock',
             )
         finally:
             lock_path.unlink()
 
-        assert cleared is False
-        assert waited > 0.0, (
-            f'an unconfirmed scan must not skip the stand-off; got waited={waited!r}'
+        assert standoff.cleared is False
+        assert standoff.waited_s > 0.0, (
+            f'an unconfirmed scan must not skip the stand-off; got waited={standoff.waited_s!r}'
         )
 
     async def test_post_advance_sync_failure_under_a_lock_is_retried(
@@ -15784,7 +15784,7 @@ class TestAdvanceMainIndexLockStandoff:
             with patch.object(
                 git_ops, '_index_lock_state', side_effect=counting_state,
             ):
-                cleared, waited, initial_age = (
+                standoff = (
                     await git_ops._await_index_lock_clear(
                         timeout_s=60.0, context='stale-shortcircuit',
                     )
@@ -15792,12 +15792,12 @@ class TestAdvanceMainIndexLockStandoff:
         finally:
             lock_path.unlink()
 
-        assert cleared is False
-        assert waited == 0.0, (
+        assert standoff.cleared is False
+        assert standoff.waited_s == 0.0, (
             'an already-stale lock must not be waited on at all; got '
-            f'waited={waited!r}'
+            f'waited={standoff.waited_s!r}'
         )
-        assert initial_age > _INDEX_LOCK_STALE_FLOOR_S
+        assert standoff.initial_age_s > _INDEX_LOCK_STALE_FLOOR_S
         assert len(probes) == 1, (
             'the short-circuit must take exactly the pre-wait probe — more '
             f'probes mean the poll loop ran anyway; got {probes!r}'
@@ -15825,7 +15825,7 @@ class TestAdvanceMainIndexLockStandoff:
             with patch.object(
                 git_ops, '_index_lock_state', side_effect=counting_state,
             ):
-                cleared, _waited, _initial = (
+                standoff = (
                     await git_ops._await_index_lock_clear(
                         timeout_s=1.5, context='young-lock',
                     )
@@ -15833,7 +15833,7 @@ class TestAdvanceMainIndexLockStandoff:
         finally:
             lock_path.unlink()
 
-        assert cleared is False
+        assert standoff.cleared is False
         assert len(probes) >= 2, (
             'a young lock must be POLLED, not short-circuited — the whole '
             f'point of the stand-off; got {probes!r}'
@@ -15953,7 +15953,7 @@ class TestAdvanceMainIndexLockStandoff:
                 patch('orchestrator.git_ops.time', clock),
                 patch('orchestrator.git_ops.asyncio', _FakeAsyncio(fake_sleep)),
             ):
-                cleared, waited, _initial = (
+                standoff = (
                     await git_ops._await_index_lock_clear(
                         timeout_s=budget, context='fake-clock',
                     )
@@ -15963,10 +15963,10 @@ class TestAdvanceMainIndexLockStandoff:
 
         # (a) It gave up at its own monotonic deadline, despite the wall clock
         # running backwards by an hour per poll.
-        assert cleared is False
-        assert waited == pytest.approx(budget, abs=_INDEX_LOCK_POLL_INTERVAL_S), (
+        assert standoff.cleared is False
+        assert standoff.waited_s == pytest.approx(budget, abs=_INDEX_LOCK_POLL_INTERVAL_S), (
             'the budget must be measured on the MONOTONIC clock; got '
-            f'waited={waited!r} for a {budget}s budget'
+            f'waited={standoff.waited_s!r} for a {budget}s budget'
         )
 
         # (b) The wait re-announced itself rather than stalling silently.

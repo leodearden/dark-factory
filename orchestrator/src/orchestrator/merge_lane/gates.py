@@ -3318,7 +3318,8 @@ _OVERLAP_GIT_ERROR_SENTINEL = ['<git-error: re-verify required>']
 # scan cannot see.  Equal to the GitConfig default grace (pinned by
 # test_floor_matches_the_default_grace), and aliased from git_ops rather than
 # re-declared, because `_await_index_lock_clear` decides its stand-off
-# short-circuit through the same diagnose_index_lock with the same floor.
+# short-circuit through the same diagnose_index_lock with the same floor, over
+# the very scan it then hands this mapper in the side channel.
 _STALE_LOCK_FLOOR_S = _INDEX_LOCK_STALE_FLOOR_S
 
 
