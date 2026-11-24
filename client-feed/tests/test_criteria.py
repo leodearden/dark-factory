@@ -1,6 +1,7 @@
 """Acceptance criteria: the criteria file, the collection map, the junit join and the criteria events (PRD §7.7)."""
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from client_feed.contract import (
     RunKind,
 )
 from client_feed.criteria import (
+    STAGING_FILENAME,
     BoundReport,
     CriteriaError,
     CriteriaProblem,
@@ -36,10 +38,13 @@ from client_feed.criteria import (
     parse_criteria,
     read_collection_map,
     read_declared,
+    read_staging,
     results_event,
     verify_criteria,
+    write_staging,
 )
 from client_feed.envelope import Stamp
+from client_feed.feed_io import FeedIoError, FeedIoProblem
 from client_feed.fold import fold
 
 EXEMPLAR = Path(__file__).parent / 'fixtures' / 'acceptance' / 'criteria.yaml'
@@ -637,3 +642,68 @@ def test_an_unemitted_event_spends_no_seq() -> None:
 
     assert staging is not None
     assert staging.seq == 10
+
+
+# the staging file
+
+
+def _staging_refusal(out_dir: Path, problem: CriteriaProblem) -> CriteriaError:
+    with pytest.raises(CriteriaError) as caught:
+        read_staging(out_dir)
+    assert caught.value.problem is problem
+    assert STAGING_FILENAME in str(caught.value)
+    return caught.value
+
+
+def test_a_staging_run_round_trips_through_its_file(tmp_path: Path) -> None:
+    write_staging(tmp_path, RUN)
+
+    assert read_staging(tmp_path) == RUN
+
+
+def test_the_staging_file_is_group_readable_under_any_umask_and_leaves_no_temp(
+    tmp_path: Path,
+) -> None:
+    previous = os.umask(0o077)
+    try:
+        write_staging(tmp_path, RUN)
+    finally:
+        os.umask(previous)
+
+    assert [path.name for path in tmp_path.iterdir()] == [STAGING_FILENAME]
+    assert (tmp_path / STAGING_FILENAME).stat().st_mode & 0o777 == 0o640
+
+
+def test_no_staging_file_is_no_staging_run(tmp_path: Path) -> None:
+    assert read_staging(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    'text',
+    [
+        '{"commit": ',
+        json.dumps({**RUN.model_dump(mode='json'), 'run_kind': 'staging'}),
+        json.dumps({**RUN.model_dump(mode='json'), 'commit': 'abc123'}),
+        json.dumps({**RUN.model_dump(mode='json'), 'run_at': '2026-10-01T10:05:00'}),
+    ],
+    ids=['not-json', 'extra-key', 'short-commit', 'naive-run-at'],
+)
+def test_a_malformed_staging_file_is_refused_by_name(tmp_path: Path, text: str) -> None:
+    (tmp_path / STAGING_FILENAME).write_text(text)
+
+    _staging_refusal(tmp_path, CriteriaProblem.INVALID_STAGING)
+
+
+def test_a_symlinked_staging_file_is_neither_read_nor_replaced(tmp_path: Path) -> None:
+    target = tmp_path / 'elsewhere.json'
+    target.write_text(RUN.model_dump_json())
+    (tmp_path / STAGING_FILENAME).symlink_to(target)
+    other = RUN.model_copy(update={'commit': None})
+
+    _staging_refusal(tmp_path, CriteriaProblem.UNREADABLE)
+    with pytest.raises(FeedIoError) as caught:
+        write_staging(tmp_path, other)
+
+    assert caught.value.problem is FeedIoProblem.SYMLINK
+    assert (tmp_path / STAGING_FILENAME).is_symlink()
+    assert CriteriaRun.model_validate_json(target.read_text()) == RUN
