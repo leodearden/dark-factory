@@ -56,7 +56,9 @@ _OVERRIDE_DESCRIPTION = (
     "Write-time-only control for this server's tool-call markup guard, and "
     "NOT payload. Send {'" + MARKUP_OVERRIDE_KEY + "': True} to declare that "
     'envelope markup in these arguments is quoted DELIBERATELY, so the guard '
-    'lets the call through instead of bouncing it. The tool persists nothing '
+    'lets the call through instead of bouncing it. Send it BEFORE the string '
+    'argument that carries the markup: a leak swallows only the parameters '
+    'that follow it. The tool persists nothing '
     'from this map — the flag is consumed before dispatch and any other key '
     'is discarded, so this is not a place to attach metadata to whatever the '
     'tool writes.'

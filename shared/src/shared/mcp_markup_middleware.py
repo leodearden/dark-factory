@@ -139,6 +139,7 @@ from shared.toolcall_markup import (
     only_inert_html_closers,
     repair,
     strip_markup_override,
+    swallowed_markup_override,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,10 +169,28 @@ FACT_MARKUP_DETECTED = 'markup_detected'
 #: ``shared/src/shared/markup_override_param.py::accepts_markup_override`` for
 #: how a tool declares it.
 _OVERRIDE_SENTENCE = (
-    "override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}. On a tool "
-    'that takes no metadata the flag is dropped before dispatch rather than '
-    'forwarded as an unexpected argument, so it works there too.'
+    "override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}, sent BEFORE "
+    'the string argument that carries the markup, because a leak swallows only '
+    'the parameters that follow it. On a tool that takes no metadata the flag '
+    'is dropped before dispatch rather than forwarded as an unexpected '
+    'argument, so it works there too.'
 )
+
+#: Appended to a refusal or reject hint when the leaking value itself carries
+#: the override (:func:`~shared.toolcall_markup.swallowed_markup_override`).
+#: A genuine quotation never makes the harness over-consume, so the flag found
+#: there is evidence of a real leak and is never honoured.
+_OVERRIDE_SWALLOWED_HINT = (
+    ' Your metadata override was swallowed by this leak along with every '
+    'parameter after the leaking one, so it never reached the guard. An '
+    'override cannot vouch for a value whose own envelope leaked. If the '
+    'markup really is quoted, resend with metadata as the FIRST argument.'
+)
+
+
+def _with_swallowed_override(hint: str, override_swallowed: bool) -> str:
+    """*hint*, plus the swallowed-override remedy when it applies."""
+    return hint + _OVERRIDE_SWALLOWED_HINT if override_swallowed else hint
 
 #: Surfaced at the point of rejection, mirroring markup_tripwire's
 #: ``_MARKUP_HINT``: the remediation must be discoverable where the caller is
@@ -1126,6 +1145,10 @@ class MarkupGuardMiddleware(Middleware):
         """
         param, value, properties, fix = live.param, live.value, live.properties, live.fix
         pattern = detect_for(value, param, tuple(properties)) or live.pattern
+        # Computed ONCE and threaded to every publication, like the quoting
+        # census below: the refusal, the bounce and the residue record must
+        # agree about whether the leak swallowed the caller's override.
+        override_swallowed = swallowed_markup_override(value)
 
         # All three emissions sit SIDE BY SIDE, and every one of them runs
         # BEFORE its outcome is delivered. Two reasons. The detection is a fact
@@ -1153,7 +1176,7 @@ class MarkupGuardMiddleware(Middleware):
             storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity, subject)
             await self._refuse_unrepairable(
                 name, identity, subject,
-                param, value, pattern, storm,
+                param, value, pattern, storm, override_swallowed,
             )
 
         # THE CENSUS IS TAKEN HERE, ABOVE THE COERCION, AND THAT ORDER IS THE
@@ -1262,7 +1285,7 @@ class MarkupGuardMiddleware(Middleware):
             storm = await self._record_storm(
                 _OUTCOME_REJECTED, identity, self._subject({**arguments, **fix.recovered}),
             )
-            return self._reject(name, arguments, param, fix, storm, quoting)
+            return self._reject(name, arguments, param, fix, storm, quoting, override_swallowed)
 
         await self._emit_fact(
             name, identity, param, pattern,
@@ -1450,7 +1473,8 @@ class MarkupGuardMiddleware(Middleware):
         return payload
 
     async def _refuse_unrepairable(
-        self, name, identity, subject, param, value, pattern, storm
+        self, name, identity, subject, param, value, pattern, storm,
+        override_swallowed: bool,
     ) -> NoReturn:
         """ONE refusal, shared by both tiers, when the boundary is a guess.
 
@@ -1498,6 +1522,7 @@ class MarkupGuardMiddleware(Middleware):
             # escalation surface they are the only two that resolve at all.
             'subject_task_id': subject_task_id,
             'subject_agent_role': subject_agent_role,
+            'override_swallowed': override_swallowed,
             # FULL and VERBATIM, deliberately unlike build_markup_block's
             # 200-char content_excerpt. That excerpt is a diagnostic sitting
             # beside a payload the caller still holds; this is the only
@@ -1542,7 +1567,10 @@ class MarkupGuardMiddleware(Middleware):
             # neither a str nor a SpooledResidue preserved exactly nothing, and
             # must select the unpreserved variant too. See the constants for
             # why the claim is conditional at all.
-            'hint': _unrepairable_hint(preserved),
+            'override_swallowed': override_swallowed,
+            'hint': _with_swallowed_override(
+                _unrepairable_hint(preserved), override_swallowed,
+            ),
         }, storm)))
 
     async def _preserve_residue(
@@ -1640,7 +1668,8 @@ class MarkupGuardMiddleware(Middleware):
         return preserved
 
     def _reject(
-        self, name, arguments, param, fix, storm, quoting: tuple[str, ...]
+        self, name, arguments, param, fix, storm, quoting: tuple[str, ...],
+        override_swallowed: bool,
     ) -> NoReturn:
         """Write nothing; bounce the caller with the repaired argument map.
 
@@ -1691,7 +1720,8 @@ class MarkupGuardMiddleware(Middleware):
             # mechanical retry into an adjudicable report (task 4502).
             'quoted_markup_params': list(quoting),
             'repaired_call': repaired_call,
-            'hint': _REJECT_HINT,
+            'override_swallowed': override_swallowed,
+            'hint': _with_swallowed_override(_REJECT_HINT, override_swallowed),
         }, storm)))
 
     async def _forward(
