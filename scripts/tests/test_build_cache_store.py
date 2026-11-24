@@ -440,6 +440,14 @@ class StoreWorld:
             timeout=2 * CLI_TIMEOUT,
         )
 
+    def install_failure(self, proc: subprocess.CompletedProcess[str]) -> str:
+        """The installer's output, then the tail of the store unit's log when it has one."""
+        report = proc.stdout + proc.stderr
+        store_log = self.state / f"{STORE_UNIT}.log"
+        if store_log.exists():
+            report += f"\n--- {store_log} ends:\n{log_tail(store_log)}"
+        return report
+
     def credentials(self) -> dict[str, str]:
         pairs = (line.partition("=") for line in self.credentials_file.read_text().splitlines())
         return {name: value for name, sep, value in pairs if sep}
@@ -518,7 +526,7 @@ def store_world(tmp_path: Path) -> Iterator[StoreWorld]:
 @pytest.fixture
 def installed(store_world: StoreWorld) -> StoreWorld:
     proc = store_world.install()
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.returncode == 0, store_world.install_failure(proc)
     return store_world
 
 
@@ -586,7 +594,7 @@ class TestStoreInstall:
 
     def test_check_after_apply_passes(self, installed: StoreWorld) -> None:
         proc = installed.install("--check")
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.returncode == 0, installed.install_failure(proc)
 
     def test_reapply_changes_nothing_and_keeps_the_store_running(
         self, installed: StoreWorld
@@ -598,7 +606,7 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.returncode == 0, installed.install_failure(proc)
         assert {unit: installed.unit_text(unit) for unit in STORE_UNITS} == before
         assert installed.credentials_file.read_bytes() == credentials
         assert installed.store_pid() == pid
@@ -620,7 +628,7 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.returncode == 0, installed.install_failure(proc)
         new_auth = installed.auth()
         assert new_auth[1] != old_password
         rerun_calls = installed.systemctl_calls()[calls_before:]
@@ -651,7 +659,7 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert proc.returncode == 1, installed.install_failure(proc)
         assert "nothing was restarted" in proc.stderr
         assert installed.store_pid() == pid
         assert not installed.systemctl_calls()[calls_before:]
