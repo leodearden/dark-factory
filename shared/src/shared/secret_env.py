@@ -1,7 +1,7 @@
 """Which environment variables carry secrets, and which of them an agent subprocess may inherit.
 
 A variable is secret-bearing when its name starts with the OAuth pool prefix or
-ends in ``_API_KEY`` or ``_TOKEN``; the rule reads names only, never values. An
+ends in ``_KEY`` or ``_TOKEN``; the rule reads names only, never values. An
 agent child inherits no secret-bearing variable except the credentials its
 spawner names. The default is its own session credential,
 ``CLAUDE_CODE_OAUTH_TOKEN``; each non-Claude backend names its provider keys
@@ -40,7 +40,7 @@ ENDPOINT_BASE_URL_VAR = 'ANTHROPIC_BASE_URL'
 ENDPOINT_AUTH_TOKEN_VAR = 'ANTHROPIC_AUTH_TOKEN'
 AGENT_ENDPOINT_VARS = frozenset({ENDPOINT_BASE_URL_VAR, ENDPOINT_AUTH_TOKEN_VAR})
 
-_SECRET_SUFFIXES = ('_API_KEY', '_TOKEN')
+_SECRET_SUFFIXES = ('_KEY', '_TOKEN')
 _SESSION_CREDENTIALS = frozenset({AGENT_CREDENTIAL_VAR})
 
 
