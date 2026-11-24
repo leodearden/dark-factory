@@ -369,18 +369,15 @@ class _RefusingQueue(EscalationQueue):
 class _Hooked:
     """The step-7 fixture registry behind a real VerifyCacheAuditHook and a real escalation queue."""
 
-    def __init__(self, tmp_path: Path, *, with_queue: bool = True, queue: EscalationQueue | None = None) -> None:
+    def __init__(self, tmp_path: Path, *, queue: EscalationQueue | None = None) -> None:
         self.seeded = _Seeded(tmp_path / 'verify_cache.db')
-        if queue is None:
-            queue = EscalationQueue(tmp_path / 'escalations')
-        self.queue = queue if with_queue else None
+        self.queue = queue if queue is not None else EscalationQueue(tmp_path / 'escalations')
         self.hook = audit_hook.VerifyCacheAuditHook(self.seeded.registry, self.queue, now=lambda: self.seeded.now)
 
     def call(self, outcome, *, command: str = AUDIT_COMMAND, head: str = HEAD):
         return asyncio.run(self.hook(command, head, outcome, ()))
 
     def pending(self):
-        assert self.queue is not None
         return self.queue.get_by_task(audit_hook.AUDIT_ESCALATION_SENTINEL, status='pending')
 
 
@@ -455,7 +452,6 @@ class TestAuditHook:
         hooked.call(_reproduced(ALPHA_NODE), head=LATER_HEAD)
 
         assert [esc.id for esc in hooked.pending()] == [blocker.id]
-        assert hooked.queue is not None
         hooked.queue.resolve(blocker.id, 'root cause fixed')
         asyncio.run(audit.enable(hooked.seeded.registry, 'root cause fixed', hooked.seeded.now))
         hooked.seeded.fresh_leak_source(KA, 'c3' * 20)
@@ -481,7 +477,6 @@ class TestAuditHook:
         assert second.id != first.id
         assert until.isoformat() in second.summary, second.summary
         assert retrip_head in second.detail, second.detail
-        assert hooked.queue is not None
         superseded = hooked.queue.get(first.id)
         assert superseded is not None
         assert (superseded.status, superseded.resolved_by) == ('resolved', audit_hook.AUDIT_ESCALATION_ROLE)
@@ -497,7 +492,6 @@ class TestAuditHook:
         hooked.call(_reproduced(ALPHA_NODE), head=LATER_HEAD)
 
         assert hooked.pending() == []
-        assert hooked.queue is not None
         resolved = hooked.queue.get(blocker.id)
         assert resolved is not None and resolved.status == 'resolved'
         assert f'kill switch expired at {until.isoformat()}' in (resolved.resolution or ''), resolved.resolution
@@ -537,7 +531,6 @@ class TestAuditHook:
         assert hooked.call(_reproduced(GAMMA_NODE), head=LATER_HEAD) == ()
 
         assert hooked.pending() == []
-        assert hooked.queue is not None
         resolved = hooked.queue.get(blocker.id)
         assert resolved is not None and resolved.status == 'resolved'
         assert f'kill switch expired at {until.isoformat()}' in (resolved.resolution or ''), resolved.resolution
@@ -549,7 +542,7 @@ class TestAuditHook:
 
     def test_an_unconfirmable_outcome_touches_nothing(self, tmp_path):
         db_path = tmp_path / 'absent' / 'verify_cache.db'
-        hook = audit_hook.VerifyCacheAuditHook(registry.Registry(db_path), None)
+        hook = audit_hook.VerifyCacheAuditHook(registry.Registry(db_path), EscalationQueue(tmp_path / 'escalations'))
         outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '1')
 
         assert asyncio.run(hook(AUDIT_COMMAND, HEAD, outcome, ())) == ()
@@ -573,7 +566,7 @@ class TestAuditHook:
         corrupt = tmp_path / 'corrupt.db'
         corrupt.write_bytes(b'this is not a sqlite database' * 64)
         for db_path in (directory, corrupt):
-            hook = audit_hook.VerifyCacheAuditHook(registry.Registry(db_path), None)
+            hook = audit_hook.VerifyCacheAuditHook(registry.Registry(db_path), EscalationQueue(tmp_path / 'escalations'))
             with pytest.raises(registry.RegistryError):
                 asyncio.run(hook(AUDIT_COMMAND, HEAD, _reproduced(ALPHA_NODE), ()))
 
@@ -584,7 +577,7 @@ class TestAuditHook:
             async def write_policy_state(self, state: registry.PolicyState) -> None:
                 raise registry.RegistryError(tmp_path / 'verify_cache.db', 'disk full')
 
-        hook = audit_hook.VerifyCacheAuditHook(_WriteFails(tmp_path / 'verify_cache.db'), None)
+        hook = audit_hook.VerifyCacheAuditHook(_WriteFails(tmp_path / 'verify_cache.db'), EscalationQueue(tmp_path / 'escalations'))
 
         with pytest.raises(registry.RegistryError):
             asyncio.run(hook(AUDIT_COMMAND, HEAD, _reproduced(ALPHA_NODE), ()))
@@ -594,7 +587,6 @@ class TestAuditHook:
         def refuse(escalation):
             raise OSError('escalation queue is read-only')
 
-        assert hooked.queue is not None
         monkeypatch.setattr(hooked.queue, 'submit', refuse)
 
         with caplog.at_level(logging.ERROR, logger=audit_hook.__name__):
@@ -609,7 +601,7 @@ class TestAuditHook:
     def test_an_unattributable_red_with_no_consumption_on_record_is_logged_once(self, tmp_path, caplog):
         unconsumed = registry.Registry(tmp_path / 'verify_cache.db')
         asyncio.run(unconsumed.record_green(KA, evidence_event_id=7, run_id='r1', sha='abc'))
-        hook = audit_hook.VerifyCacheAuditHook(unconsumed, None)
+        hook = audit_hook.VerifyCacheAuditHook(unconsumed, EscalationQueue(tmp_path / 'escalations'))
 
         with caplog.at_level(logging.WARNING, logger=audit_hook.__name__):
             for _ in range(2):
@@ -622,16 +614,6 @@ class TestAuditHook:
             assert hooked.call(_reproduced(GAMMA_NODE)) == ()
 
         assert not [record for record in caplog.records if 'records no consumption' in record.getMessage()]
-
-    def test_without_a_queue_the_disable_still_lands_and_the_loss_is_logged(self, tmp_path, caplog):
-        hooked = _Hooked(tmp_path, with_queue=False)
-
-        with caplog.at_level(logging.ERROR, logger=audit_hook.__name__):
-            notes = hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
-
-        assert len(notes) == 2
-        assert hooked.seeded.policy().is_disabled(hooked.seeded.now)
-        assert any('no escalation queue' in record.getMessage() for record in caplog.records), caplog.text
 
     def test_a_note_states_the_kill_switch_when_the_cache_is_disabled(self, hooked):
         [quiet] = hooked.call(_reproduced(ALPHA_NODE))
