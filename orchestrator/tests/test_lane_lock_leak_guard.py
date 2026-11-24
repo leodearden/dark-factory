@@ -2876,6 +2876,48 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
             f'by hand in /proc/locks); released={obs["released"]!r}'
         )
 
+    async def test_the_late_win_is_already_released_once_its_orphaned_acquire_settles(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Awaiting the orphaned acquire is a sufficient settle for its release.
+
+        The end-to-end cases below settle on exactly this: the release callback
+        is attached to the in-flight acquire at cancellation, before anyone
+        else can await it, so by the time that acquire has settled for a later
+        awaiter its late win has already been released.
+        """
+        gate = threading.Event()
+        obs = self._stub_acquire(monkeypatch, gate, _SENTINEL_FD)
+
+        task = asyncio.create_task(
+            GitOps._acquire_lane_flock_off_thread(lane_lock_path(tmp_path / 'lane'), 5.0)
+        )
+        assert await wait_until(obs['running'].is_set), (  # type: ignore[union-attr]
+            'the acquire never reached the worker thread — cancelling now '
+            'would prove nothing about a late win'
+        )
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        orphans = other_pending_tasks()
+        assert len(orphans) == 1, (
+            f'the cancellation must leave exactly the shielded acquire in '
+            f'flight; pending={orphans!r}'
+        )
+        assert obs['released'] == [], (
+            'nothing may be released while the acquire is still gated'
+        )
+
+        gate.set()
+        await asyncio.gather(*orphans)
+
+        assert obs['released'] == [_SENTINEL_FD], (
+            f'the late win had not been released by the time its orphaned '
+            f'acquire settled, so a settle on the acquire would race the '
+            f'release; released={obs["released"]!r}'
+        )
+
     async def test_cancelled_acquire_that_times_out_releases_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
