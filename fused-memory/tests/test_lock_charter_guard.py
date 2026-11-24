@@ -516,7 +516,9 @@ def test_leading_dot_directories_stay_directories(path):
 # identical to the 2026-07-31 measurement): every tracked path whose final
 # segment contains no '.'.  dark-factory contributes Dockerfile LICENSE
 # pre-commit pre-merge-commit project-checks; reify adds cargo
-# cargo-audit-orphans reference-transaction.  Union = the 8 below.
+# cargo-audit-orphans reference-transaction, and sccache
+# (scripts/canon-bin/guard/sccache, reify task 10232, measured on reify main
+# 2026-11-23).  Union = the 9 below.
 #
 # GITLINK EXCLUSION (load-bearing, not a measurement artefact): entries with
 # mode 160000 are submodule mount points — `graphiti` and `mem0` in
@@ -536,11 +538,13 @@ _CANONICAL_EXTENSIONLESS = [
     'pre-merge-commit',
     'project-checks',
     'reference-transaction',
+    'sccache',
 ]
 
 # One REAL tracked path per canonical extension-less name — dark-factory unless
 # the comment says reify (same convention as _ACCEPT_PATHS above).  Verified
-# tracked with `git ls-files --error-unmatch` on 2026-08-09.  Enforced complete
+# tracked with `git ls-files --error-unmatch` on 2026-08-09 (the sccache entry
+# on 2026-11-23).  Enforced complete
 # by test_extensionless_accept_corpus_covers_every_canonical_name.
 _EXTENSIONLESS_ACCEPT_PATHS = [
     'LICENSE',
@@ -552,6 +556,8 @@ _EXTENSIONLESS_ACCEPT_PATHS = [
     'hooks/reference-transaction',
     # reify
     'scripts/agent-bin/cargo',
+    # reify
+    'scripts/canon-bin/guard/sccache',
     # reify
     'scripts/cargo-audit-orphans',
 ]
@@ -574,7 +580,7 @@ def test_extensionless_drift_guard_vs_reify_script():
     and the reason the extension-half guard cannot stand in for it: that one
     compares ``--list-extensions``, a vector of EXTENSION strings, so it is
     structurally blind to this frozenset.  Without this test the three copies
-    could silently disagree on the 8 names while every other guard stayed green.
+    could silently disagree on these names while every other guard stayed green.
 
     #3248 was PLANNED on the premise that this vector was a dark_factory-only
     lead and that reify's bash ``_is_file_path`` still conservative-rejected all
@@ -951,7 +957,7 @@ def test_no_canonical_extensionless_name_is_also_a_directory(repo: str, repo_roo
     [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
 )
 def test_every_tracked_extensionless_file_is_allowlisted(repo: str, repo_root: Path):
-    """Corpus->allowlist self-audit: the 9th extensionless file must go RED.
+    """Corpus->allowlist self-audit: a newly tracked extensionless file must go RED.
 
     The extension-less sibling of test_every_tracked_extension_is_allowlisted,
     and the same direction — **corpus → allowlist**.  Turns "add 8 names" into a

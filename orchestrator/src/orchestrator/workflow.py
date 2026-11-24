@@ -92,8 +92,16 @@ from orchestrator.agents.write_set import (
     compute_write_set,
     ensure_claude_fleet_dir,
 )
+from orchestrator.architect_phase_verdict import (
+    clear_exit_reports,
+    find_plan_exit_conflict,
+    is_confirmed,
+    newly_confirmed,
+    read_exit_reports,
+)
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    Plan,
     ReviewAggregation,
     ReviewsRootMissing,
     TaskArtifacts,
@@ -103,6 +111,12 @@ from orchestrator.artifacts import (
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
+from orchestrator.branch_stack import (
+    RestackConflict,
+    StackInspectionError,
+    StackRecordState,
+    StackTarget,
+)
 from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
@@ -166,6 +180,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
     LandingVerdict,
     file_unattributed_landing_escalation,
+    is_valid_sha_40,
     validate_landing_evidence,
     validate_reported_landing,
 )
@@ -256,6 +271,8 @@ from orchestrator.verify import (
     run_scoped_verification,
     verify_failure_is_preexisting_on_main,
 )
+from orchestrator.verify_cache.recorder import VerifyEvidenceRef, record_greens
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import (
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,
@@ -1417,6 +1434,8 @@ class TaskWorkflow:
         resume_outcome_sink: ResumeOutcomeSink | None = None,
         task_verify: TaskVerifyPort | None = None,
         task_priority: TaskPriorityLookup | None = None,
+        verify_cache: CacheAccess | None = None,
+        stack_target: StackTarget | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -1446,9 +1465,14 @@ class TaskWorkflow:
         # TaskVerifyDispatcher); None keeps the module-level
         # run_scoped_verification, resolved at call time.
         self._task_verify = task_verify
+        # The dispatcher's verify-result cache, which the pre-merge re-verify joins; None keeps it outside.
+        self._verify_cache = verify_cache
         # Task 9908: the scheduler's tier/pin lookup, recorded on merge_queued;
         # None leaves those keys null.
         self._task_priority = task_priority
+        # Task 10473: the predecessor commit this task's branch is stacked on
+        # (early start); None dispatches off main as before.
+        self._stack_target = stack_target
 
         self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
@@ -1547,6 +1571,8 @@ class TaskWorkflow:
         self._verify_green_result: VerifyResult | None = None
         # The host whose verdict that green is (task 6670), with the same lifetime.
         self._verify_green_runner: str = LOCAL_RUNNER
+        # The workflow_verify row that green emitted (task 5653), with the same lifetime.
+        self._verify_green_event_id: int | None = None
         # Set by _verify_debugfix_loop when a failure is classified as inherited
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
@@ -2716,7 +2742,7 @@ class TaskWorkflow:
                 and new_state is WorkflowState.REVIEW
                 and not self._verify_checkpoint_hit
             ):
-                self._emit_workflow_verify(
+                self._verify_green_event_id = self._emit_workflow_verify(
                     site=VerifySite.IMPLEMENT,
                     result=self._verify_green_result,
                     passed=True,
@@ -2750,14 +2776,15 @@ class TaskWorkflow:
         tip_sha: str | TipUnresolved,
         base_sha: str | None,
         runner: str,
-    ) -> None:
+    ) -> int | None:
         """Record one task-role verify verdict; both workflow sites emit through here.
 
-        *runner* names the host whose verdict this is (task 6670).
+        *runner* names the host whose verdict this is (task 6670). Returns the
+        emitted row's id, or None when there is no store or the emit failed.
         """
         if self.event_store is None:
-            return
-        self.event_store.emit(
+            return None
+        return self.event_store.emit(
             EventType.workflow_verify,
             task_id=self.task_id,
             data=workflow_verify_event_data(
@@ -2769,6 +2796,24 @@ class TaskWorkflow:
                 site=site,
                 runner=runner,
             ),
+        )
+
+    async def _record_task_verify_cache(
+        self, result: VerifyResult | None, event_id: int | None, tip: str | TipUnresolved,
+    ) -> None:
+        """Record *result*'s admitted greens into the joined cache, citing the workflow_verify row *event_id* at *tip*.
+
+        Records nothing outside the cache, without a cache record, a row id, or
+        a resolved tip. The task role writes no consumed rows: I6 is merge-role only.
+        """
+        registry = self._verify_cache.registry if self._verify_cache is not None else None
+        if registry is None or result is None or result.cache_record is None or event_id is None or not isinstance(tip, str):
+            return
+        assert self.event_store is not None  # event_id is one of its rows
+        await record_greens(
+            registry, result.cache_record,
+            flake_suppressed=result.flake_suppression is not None,
+            evidence=VerifyEvidenceRef(event_id, self.event_store.run_id, tip, result.passed),
         )
 
     async def _restamp_branch_base_if_no_own_commits(self) -> bool:
@@ -2904,6 +2949,7 @@ class TaskWorkflow:
                 # Redundant second enforcement of the harness gate's ruling
                 # (orchestrator/recut_ruling.py), from the same dispatch snapshot.
                 recut_ruling=ruling_to_enforce(self.task),
+                stack_on=self._stack_target,
             )
             self.worktree = worktree_info.path
             self._reify_debug_port = worktree_info.reify_debug_port
@@ -3475,7 +3521,11 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
 
-        except WarmLaneRequeue as e:
+        except (WarmLaneRequeue, RestackConflict) as e:
+            # A RestackConflict (task 10473) is an uncounted requeue through
+            # the same table row lookup and re-pend; RestackBlocked and
+            # StackRecordUnconfirmed fall through to the broad except.
+            #
             # W9-ε: block_reason is now single-sourced from
             # classify_failure(e) -> BlockDisposition instead of this
             # clause's own inline isinstance(e, WarmLanePoolHardDown)/
@@ -3508,7 +3558,7 @@ class TaskWorkflow:
             disp = classify_failure(e)
             block_reason = disp.reason_prefix
             logger.info(
-                'Task %s: warm-lane requeue (%s, counts_against_requeue_cap=%s): %s',
+                'Task %s: requeue (%s, counts_against_requeue_cap=%s): %s',
                 self.task_id, block_reason, disp.counts_against_requeue_cap, e,
             )
             # γ3/D6: make the REQUEUED exit TRUTHFUL — re-pend the row BEFORE
@@ -4203,10 +4253,12 @@ class TaskWorkflow:
                 role='task',
                 task_id=self.task_id,
                 event_store=self.event_store,
+                # It does not go through TaskVerifyDispatcher, so it joins the harness's cache directly.
+                verify_cache=self._verify_cache,
             )
         if self.event_store is not None:
             tip = await self._verified_tip('the post-rebase re-verify')
-            self._emit_workflow_verify(
+            event_id = self._emit_workflow_verify(
                 site=VerifySite.PRE_MERGE,
                 result=verify,
                 passed=verify.passed,
@@ -4214,6 +4266,7 @@ class TaskWorkflow:
                 base_sha=None if isinstance(tip, TipUnresolved) else await self.git_ops.merge_base_with_main(tip),
                 runner=LOCAL_RUNNER,
             )
+            await self._record_task_verify_cache(verify, event_id, tip)
         if not verify.passed:
             if verify.timed_out:
                 logger.warning(
@@ -5806,6 +5859,47 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.PLANNED
 
+    async def _architect_prompt_unless_confirmed(
+        self, build_prompt: PromptBuilder, plan_before_invoke: Plan | None,
+    ) -> str | None:
+        """The architect's prompt, or None once the plan on disk carries a confirmation *plan_before_invoke* did not."""
+        assert self.artifacts is not None
+        plan = self.artifacts.peek_plan_model()
+        if newly_confirmed(plan, plan_before_invoke):
+            logger.warning(
+                'Task %s: the architect confirmed its plan (_finalized_at %s, was %s) '
+                'before its run ended; declining the re-dispatch (task 6814)',
+                self.task_id, plan.lifecycle.confirmed_at,
+                plan_before_invoke.lifecycle.confirmed_at if plan_before_invoke else None,
+            )
+            return None
+        return await build_prompt()
+
+    async def _hold_on_plan_exit_conflict(self, plan_before_phase: Plan | None) -> WorkflowOutcome | None:
+        """Block behind one L1 when this phase both confirmed a plan and wrote exit reports; None when it did not."""
+        assert self.artifacts is not None
+        conflict = find_plan_exit_conflict(
+            self.artifacts.peek_plan_model(), plan_before_phase, read_exit_reports(self.artifacts),
+        )
+        if conflict is None:
+            return None
+        logger.error(
+            'Task %s: the architect phase confirmed a plan and also wrote exit report(s) %s',
+            self.task_id, [report.value for report in conflict.reports],
+        )
+        await self._stop_and_clear_steward()
+        outcome = await self._mark_blocked(
+            conflict.summary(),
+            detail=conflict.detail(),
+            escalate_to_human=True,
+            category='design_concern',
+            dry_run_spawn=DryRunSpawn.NEVER,
+        )
+        # Cleared only once the escalation is filed, so a raising
+        # _mark_blocked leaves the evidence for the next attempt.
+        clear_exit_reports(self.artifacts, conflict.reports)
+        return outcome
+
     async def _run_architect_for_plan(
         self, build_prompt: PromptBuilder,
     ) -> WorkflowOutcome | None:
@@ -5825,12 +5919,20 @@ class TaskWorkflow:
                     self.task_id, status='pending', level=0,
                 )
             }
+        plan_before_phase = self.artifacts.peek_plan_model()
 
         result: AgentResult | None = None
         rebase_retry_used = False
         for _outer_attempt in range(2):  # at most one rebase-retry round-trip
             for attempt in range(2):
-                result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
+                result = await self._invoke(
+                    ARCHITECT,
+                    partial(
+                        self._architect_prompt_unless_confirmed, build_prompt,
+                        self.artifacts.peek_plan_model(),
+                    ),
+                    self.worktree,
+                )
 
                 if not result.success:
                     cls = classify_agent_failure(result)
@@ -5839,15 +5941,14 @@ class TaskWorkflow:
                     # otherwise cut off).  A plan carrying ``_finalized_at`` was
                     # explicitly declared complete, so it is safe to use despite
                     # the run-level failure — the same validation gates below
-                    # still apply.  Without the marker the plan is an unfinished
-                    # partial; block and let the next session's completion pass
-                    # finish it.
-                    salvaged = self.artifacts.read_plan()
-                    if (
-                        salvaged
-                        and salvaged.get('_finalized_at')
-                        and salvaged.get('steps')
-                    ):
+                    # still apply.  A re-dispatch declined by
+                    # _architect_prompt_unless_confirmed lands here too, since
+                    # newly_confirmed implies is_confirmed.  Without the marker
+                    # the plan is an unfinished partial; block and let the next
+                    # session's completion pass finish it.
+                    salvaged_plan = self.artifacts.read_plan_model()
+                    salvaged = salvaged_plan.to_json() if salvaged_plan is not None else {}
+                    if is_confirmed(salvaged_plan):
                         logger.warning(
                             'Task %s: architect run failed (%s) but a finalized '
                             'plan (%d steps) is on disk — salvaging instead of '
@@ -5943,7 +6044,10 @@ class TaskWorkflow:
             # merge submit (less decisive than already_done's clean DONE — the
             # work is on the BRANCH, not main — but more decisive than a
             # re-looping blocking_dependency); blocking_dependency may re-loop
-            # the architect.
+            # the architect.  A plan confirmed in this same phase turns any of
+            # them into a conflict, held for a ruling before routing (task 6814).
+            if outcome := await self._hold_on_plan_exit_conflict(plan_before_phase):
+                return outcome
             verdict = await self._route_task_verdict_report()
             if verdict is not None:
                 return verdict
@@ -7887,10 +7991,12 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation, in three parts. **Reachability**: ``commit`` must be
-        non-empty and reachable from main — ``git merge-base --is-ancestor``
-        returns false for both unknown SHAs and SHAs not on main, so that
-        single check covers both. **Attribution** (task 4704): reachability
+        Validation, in three parts. **Reachability**: ``commit`` must be a
+        full 40-character lowercase hex sha (``is_valid_sha_40``; anything
+        else is a malformed report and never reaches git) and reachable from
+        main, read through ``GitOps.is_ancestor_checked``. A git error there
+        is reported as reachability left unanswered, never as not-reachable.
+        **Attribution** (task 4704): reachability
         proves only that the commit EXISTS on main, so the report is
         corroborated against the task's own declared ``metadata.files`` /
         ``delivered_checks`` and the commit's effect must survive at main
@@ -7938,17 +8044,35 @@ class TaskWorkflow:
                 detail=json.dumps(report, indent=2)[:2000],
                 merge_phase=merge_phase,
             )
+        if not is_valid_sha_40(commit):
+            return await self._mark_blocked(
+                f'Architect wrote malformed already_done.json (commit '
+                f'{commit[:60]!r} is not a full 40-character lowercase hex '
+                f'commit sha)',
+                detail=json.dumps(report, indent=2)[:2000],
+                merge_phase=merge_phase,
+            )
 
         main_sha = await self.git_ops.get_main_sha()
-        on_main = await self.git_ops.is_ancestor(commit, main_sha)
+        on_main = await self.git_ops.is_ancestor_checked(commit, main_sha)
+        reachability_detail = (
+            f'commit: {commit}\nmain_sha: {main_sha}\nevidence: {evidence}'
+        )[:2000]
+        if on_main is None:
+            return await self._mark_blocked(
+                f'Architect reported task already done at {commit[:12]} '
+                f'but git could not answer whether that commit is reachable '
+                f'from main (merge-base --is-ancestor errored; usually the '
+                f'sha is not a commit in this repository, otherwise a git '
+                f'failure), so reachability was never established',
+                detail=reachability_detail,
+                merge_phase=merge_phase,
+            )
         if not on_main:
             return await self._mark_blocked(
                 f'Architect reported task already done at {commit[:12]} '
                 f'but commit is not reachable from main',
-                detail=(
-                    f'commit: {commit}\nmain_sha: {main_sha}\n'
-                    f'evidence: {evidence}'
-                )[:2000],
+                detail=reachability_detail,
                 merge_phase=merge_phase,
             )
 
@@ -8725,9 +8849,7 @@ class TaskWorkflow:
         reason = str(report.get('reason') or '').strip()
         evidence = str(report.get('evidence') or '')
 
-        if self._steward:
-            await self._steward.stop()
-            self._steward = None
+        await self._stop_and_clear_steward()
 
         self.artifacts.clear_unactionable_task()
 
@@ -8777,9 +8899,7 @@ class TaskWorkflow:
         evidence = str(report.get('evidence') or '')
         proposed_resolution = str(report.get('proposed_resolution') or '')
 
-        if self._steward:
-            await self._steward.stop()
-            self._steward = None
+        await self._stop_and_clear_steward()
 
         if not premise:
             result = await self._mark_blocked(
@@ -8993,6 +9113,7 @@ class TaskWorkflow:
             self._verify_green_tip_sha = TipUnresolved.NOT_CAPTURED
             self._verify_green_result = None
             self._verify_green_runner = LOCAL_RUNNER
+            self._verify_green_event_id = None
             self._enter_phase(WorkflowState.VERIFY)
             if self.event_store is not None:
                 tip = await self._head_commit_or_none('the VERIFY checkpoint lookup')
@@ -9044,6 +9165,9 @@ class TaskWorkflow:
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
+            await self._record_task_verify_cache(
+                self._verify_green_result, self._verify_green_event_id, self._verify_green_tip_sha,
+            )
             # Tree-hash verdict cache (task 2749): if a non-blocking verdict
             # is already recorded for HEAD's committed tree hash — from a
             # prior dispatch that reviewed byte-identical content — skip the
@@ -11771,11 +11895,32 @@ class TaskWorkflow:
         return self.artifacts.aggregate_reviews()
 
     async def _own_work_base(self) -> str:
-        """The base whose ``...HEAD`` range in the worktree is this task's own work."""
+        """The base whose ``...HEAD`` range in the worktree is this task's own work.
+
+        A branch still stacked on an unlanded predecessor's commits measures
+        from the top of them (``GitOps.own_delta_cut``, the merge queue's
+        rule); any other branch from its fork point with main.
+        """
         assert self.worktree is not None and self.artifacts is not None
+        if not self._worktree_external:
+            stack_cut = await self._unlanded_stack_cut()
+            if stack_cut is not None:
+                return stack_cut
         return await own_work_base(
             self.worktree, self.config.git.main_branch, self.artifacts.read_base_commit(),
         )
+
+    async def _unlanded_stack_cut(self) -> str | None:
+        branch = f'{self.config.git.branch_prefix}{self.task_id}'
+        try:
+            return await self.git_ops.own_delta_cut(branch)
+        except StackInspectionError as exc:
+            logger.warning(
+                'Task %s: cannot tell whether %s still carries a stack base (%s); '
+                'its own work is measured from the fork point with main',
+                self.task_id, branch, exc,
+            )
+            return None
 
     async def _context_complete_review_subject(self) -> ReviewSubject:
         """The context-complete reviewer's inputs, from the worktree at its own-work base."""
@@ -13462,11 +13607,17 @@ class TaskWorkflow:
         return MergerDisposition(resolved=True, reason=verdict.get('reason') or '')
 
     async def _settle_conflicting_base(self) -> WorkflowOutcome | None:
-        """Merge main into a resumed branch that conflicts with it, or block: see dispatch_base.py."""
+        """Merge main into a resumed branch that conflicts with it, or block: see dispatch_base.py.
+
+        A branch that is, or may be, stacked on a predecessor is left alone.
+        """
         if self._worktree_external or self._train is not None:
             return None
         assert self.worktree is not None and self.artifacts is not None
+        branch = f'{self.git_ops.config.branch_prefix}{self.task_id}'
         try:
+            if await self._may_be_stacked(branch):
+                return None
             conflict = await find_base_conflict(self.git_ops, self.worktree)
         except Exception:
             logger.warning(
@@ -13485,7 +13636,7 @@ class TaskWorkflow:
             )
         settlement = await settle_base_conflict(
             self.git_ops, self.worktree, conflict,
-            branch=f'{self.git_ops.config.branch_prefix}{self.task_id}',
+            branch=branch,
             merger=self._merger_disposition,
         )
         if not settlement.settled:
@@ -13505,6 +13656,19 @@ class TaskWorkflow:
             ', '.join(conflict.conflicted_paths),
         )
         return None
+
+    async def _may_be_stacked(self, branch: str) -> bool:
+        """Whether the stack-base ledger records, or a failed read may hide, a
+        predecessor base under *branch*: main is never merged into such a branch."""
+        stack = await self.git_ops.stack_base_read(branch)
+        if stack.state is StackRecordState.ABSENT:
+            return False
+        logger.info(
+            'Task %s: not merging main into %s at dispatch start: its stack-base '
+            'record is %s (base %s)%s', self.task_id, branch, stack.state, stack.base,
+            f': {stack.detail}' if stack.detail else '',
+        )
+        return True
 
     def _submit_halt_owning_escalation(self, esc: Escalation) -> None:
         """See ``orchestrator/src/orchestrator/merge_halt_escalation.py::submit_halt_owning_escalation``."""
@@ -18980,7 +19144,7 @@ class TaskWorkflow:
         await a cancelled loop that can never publish; it also drops this
         steward's cost from the report ``harness.py::_run_slot`` reads off
         ``workflow._steward``.  A failing ``stop()`` is suppressed: it must not
-        turn a park or a cleared gate into a workflow crash.
+        turn a park, a cleared gate or an L1 block into a workflow crash.
         """
         if self._steward is not None:
             with contextlib.suppress(Exception):
@@ -19766,6 +19930,8 @@ def build_workflow(
     resume_outcome_sink: ResumeOutcomeSink | None = None,
     task_verify: TaskVerifyPort | None = None,
     task_priority: TaskPriorityLookup | None = None,
+    verify_cache: CacheAccess | None = None,
+    stack_target: StackTarget | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
 
@@ -19803,4 +19969,6 @@ def build_workflow(
         resume_outcome_sink=resume_outcome_sink,
         task_verify=task_verify,
         task_priority=task_priority,
+        verify_cache=verify_cache,
+        stack_target=stack_target,
     )

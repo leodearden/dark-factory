@@ -278,6 +278,50 @@ NON_HUMAN_ORIGIN_IDS: tuple[str, ...] = (
 )
 
 
+SLASH_COMMAND_ARGLESS_TURN = (
+    '<command-message>reflect</command-message>\n<command-name>/reflect</command-name>'
+)
+"""Claude Code's expansion of a slash command typed with no arguments, as
+stored 2026-11-21: message-first, and no ``<command-args>`` tag at all."""
+
+SLASH_COMMAND_EMPTY_ARGS_TURN = (
+    '<command-name>/login</command-name>\n'
+    '            <command-message>login</command-message>\n'
+    '            <command-args></command-args>'
+)
+"""The name-first, indented expansion shape, with an empty args tag."""
+
+SLASH_COMMAND_WITH_ARGS_TURN = (
+    '<command-message>team</command-message>\n'
+    '<command-name>/team</command-name>\n'
+    '<command-args>Should dark-factory split its very large test files?</command-args>'
+)
+"""An expansion whose args a human typed, so it is dialogue."""
+
+LOCAL_COMMAND_STDOUT_TURN = '<local-command-stdout>Compacted </local-command-stdout>'
+"""The client's echo of a local command's output (here ``/compact``)."""
+
+INTERRUPT_MARKER_TURNS: tuple[str, ...] = (
+    '[Request interrupted by user]',
+    '[Request interrupted by user for tool use]',
+)
+"""The two bare interrupt markers Claude Code writes as a whole user turn."""
+
+CLIENT_RENDERED_TURNS: tuple[str, ...] = (
+    SLASH_COMMAND_ARGLESS_TURN,
+    SLASH_COMMAND_EMPTY_ARGS_TURN,
+    LOCAL_COMMAND_STDOUT_TURN,
+    *INTERRUPT_MARKER_TURNS,
+)
+"""Every whole-turn shape the client composes from a UI action, so it holds
+no prose a human typed; parametrize with :data:`CLIENT_RENDERED_IDS`."""
+
+CLIENT_RENDERED_IDS: tuple[str, ...] = (
+    'argless_slash_command', 'empty_args_slash_command', 'local_command_stdout',
+    'interrupt_marker', 'interrupt_marker_for_tool_use',
+)
+
+
 def recon_run_review_text() -> str:
     """Build the text of an injected reconciliation-run-review user turn --
     the literal shape ``ReconciliationJudge._build_review_prompt`` emits

@@ -102,7 +102,7 @@ docs(prd): <one-line goal summary>
 
 <2–3 sentence summary of what this PRD covers + the load-bearing design decisions resolved>
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+<the Co-Authored-By trailer your session's commit-attribution instructions give, if any>
 EOF
 )"
 ```

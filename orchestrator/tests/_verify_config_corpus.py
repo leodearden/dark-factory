@@ -12,8 +12,10 @@ What the corpus is FOR: it is the set of command shapes ``split_chain_tail``'s
 accept/reject gate must classify correctly. The lint chains are SIBLING-CHECKER
 chains — a ruff/pyright invocation followed by independent ``python3 <checker>.py
 <dir>`` clauses that would have run anyway (``fused-memory/scripts/check_*.py``,
-and since task 6230 ``tests/scripts/raw_envelope_literal_guard.py`` ending every
-module's chain) — so the scoper accepts them and preserves the tail. The root
+since task 6230 ``tests/scripts/raw_envelope_literal_guard.py``, and since task
+11476 ``uv run --project shared python tests/scripts/git_history_census.py
+<roots>`` ending every module's chain) — so the scoper accepts them and
+preserves the tail. The root
 type/test chains are cwd-sequenced same-tool fan-outs (``cd a && npx pyright &&
 cd ../b && npx pyright``), where the tail is *more of the same tool in other
 directories*; the scoper rejects those and keeps today's truncation. No live
@@ -164,28 +166,30 @@ def discover_lint_command_modules() -> set[str]:
 # number: line numbers rot, and ``test_verify_config_corpus.py`` now pins each
 # value against its key anyway.
 
-# fused-memory/orchestrator.yaml::lint_command — a 4-segment chain (three
+# fused-memory/orchestrator.yaml::lint_command — a 5-segment chain (four
 # sibling checkers).
 FM_LINT_COMMAND = (
     'uv run --directory fused-memory ruff check src/ tests/'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
     ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
     ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory'
+    ' && uv run --project shared python tests/scripts/git_history_census.py fused-memory/tests'
 )
 
-# dashboard/orchestrator.yaml::lint_command — the SECOND 4-segment chain (three
+# dashboard/orchestrator.yaml::lint_command — the SECOND 5-segment chain (four
 # sibling checkers), alongside FM_LINT_COMMAND above. Task 4485 added the
 # module-local-TestClient checker as dashboard's second leg, which is why
-# dashboard does not fit the 3-segment comprehension below.
+# dashboard does not fit the 4-segment comprehension below.
 DASHBOARD_LINT_COMMAND = (
     'uv run --directory dashboard ruff check src/ tests/'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
     ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
     ' && python3 tests/scripts/raw_envelope_literal_guard.py dashboard'
+    ' && uv run --project shared python tests/scripts/git_history_census.py dashboard/tests'
 )
 
 # cockpit/escalation/orchestrator/sampler/shared
-# orchestrator.yaml::lint_command — each the same 3-segment shape, differing
+# orchestrator.yaml::lint_command — each the same 4-segment shape, differing
 # only in the module name.
 #
 # Deliberately an explicit pinned literal rather than discovery from disk:
@@ -200,18 +204,21 @@ MODULE_LINT_COMMANDS = {
         f'uv run --directory {module} ruff check src/ tests/'
         f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
         f' && python3 tests/scripts/raw_envelope_literal_guard.py {module}'
+        f' && uv run --project shared python tests/scripts/git_history_census.py {module}/tests'
     )
     for module in ('client-feed', 'cockpit', 'escalation', 'orchestrator', 'sampler', 'shared')
 }
 
-# scripts/orchestrator.yaml::lint_command — a 2-segment chain whose one sibling
-# checker is the envelope-literal guard (task 6230; chainless before). It gets a
-# dedicated constant rather than a MODULE_LINT_COMMANDS entry because it does
-# not share that dict's 3-segment shape (same reason FM_LINT_COMMAND is
+# scripts/orchestrator.yaml::lint_command — a 3-segment chain whose sibling
+# checkers are the envelope-literal guard (task 6230; chainless before) and the
+# git-history census over both roots its test_command collects (task 11476). It
+# gets a dedicated constant rather than a MODULE_LINT_COMMANDS entry because it
+# does not share that dict's 4-segment shape (same reason FM_LINT_COMMAND is
 # separate, in the other direction).
 SCRIPTS_LINT_COMMAND = (
     'uv run --project shared ruff check scripts/'
     ' && python3 tests/scripts/raw_envelope_literal_guard.py scripts'
+    ' && uv run --project shared python tests/scripts/git_history_census.py tests/scripts scripts/tests'
 )
 
 

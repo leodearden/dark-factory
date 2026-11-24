@@ -314,16 +314,34 @@ def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
 
 
 @pytest.mark.parametrize('window, bucket_minutes', [('24h', 15), ('7d', 60)])
-def test_the_served_depth_names_the_width_its_labels_are_spaced_at(served_bodies, window, bucket_minutes):
+def test_the_served_depth_labels_are_spaced_at_the_windows_width(served_bodies, window, bucket_minutes):
     depth = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['depth']['value']
     starts = [datetime.fromisoformat(label) for label in depth['labels']]
 
-    assert depth['bucket_minutes'] == bucket_minutes
     assert len(starts) >= 2, (
         "the fixture's merges at 20h and 70h before T0 leave at least two buckets after the leading-zero trim"
     )
     gaps = {later - earlier for earlier, later in zip(starts, starts[1:], strict=False)}
     assert gaps == {timedelta(minutes=bucket_minutes)}
+
+
+@pytest.mark.parametrize('window, bucket_minutes', [('24h', 15), ('7d', 60)])
+def test_the_served_landing_rate_is_a_trailing_rate_ending_at_the_request_instant(
+    served_bodies, window, bucket_minutes,
+):
+    rate = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['landing_rate']
+    assert rate['state'] == 'fresh', 'a readable runs.db landing rate is measured'
+    series = rate['value']
+    instants = [datetime.fromisoformat(label) for label in series['labels']]
+
+    assert series['trailing_minutes'] == 1440
+    assert series['labels'][-1] == T0.isoformat()
+    assert len(instants) >= 2
+    assert {later - earlier for earlier, later in zip(instants, instants[1:], strict=False)} == {
+        timedelta(minutes=bucket_minutes),
+    }
+    assert series['values'][-1] == 2.0, 'the done merges at 2h and 20h land within the day before T0'
+    assert series['window_mean_per_day'] == pytest.approx({'24h': 2.0, '7d': 4 / 7}[window])
 
 
 @pytest.mark.parametrize('generation', sorted(CORPUS_TTL_GENERATIONS))

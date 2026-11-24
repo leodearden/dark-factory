@@ -1,0 +1,252 @@
+{
+  "graphs": [
+    "dark_factory",
+    "reify",
+    "know_live",
+    "market_predictor",
+    "autopilot_video",
+    "pump_web_ui",
+    "scoping_intake",
+    "solar_challenge",
+    "solar_challenge_platform",
+    "stream_touch"
+  ],
+  "sample": {
+    "definition": {
+      "cap": 3,
+      "hash_rule": "sha256(graph:uuid)",
+      "strata": [
+        "temporal_facts",
+        "entities_and_relations",
+        "other_categories"
+      ],
+      "window_end": "2026-11-18T00:00:00Z",
+      "window_start": "2026-08-01T00:00:00Z"
+    },
+    "sizes": {
+      "autopilot_video": {
+        "entities_and_relations": {
+          "episodes": 0
+        },
+        "other_categories": {
+          "episodes": 1
+        },
+        "temporal_facts": {
+          "episodes": 3
+        }
+      },
+      "dark_factory": {
+        "entities_and_relations": {
+          "episodes": 3
+        },
+        "other_categories": {
+          "episodes": 3
+        },
+        "temporal_facts": {
+          "episodes": 3
+        }
+      },
+      "know_live": {
+        "entities_and_relations": {
+          "episodes": 1
+        },
+        "other_categories": {
+          "episodes": 0
+        },
+        "temporal_facts": {
+          "episodes": 3
+        }
+      },
+      "market_predictor": {
+        "entities_and_relations": {
+          "episodes": 0
+        },
+        "other_categories": {
+          "episodes": 0
+        },
+        "temporal_facts": {
+          "episodes": 0
+        }
+      },
+      "pump_web_ui": {
+        "entities_and_relations": {
+          "episodes": 1
+        },
+        "other_categories": {
+          "episodes": 1
+        },
+        "temporal_facts": {
+          "episodes": 1
+        }
+      },
+      "reify": {
+        "entities_and_relations": {
+          "episodes": 3
+        },
+        "other_categories": {
+          "episodes": 2
+        },
+        "temporal_facts": {
+          "episodes": 3
+        }
+      },
+      "scoping_intake": {
+        "entities_and_relations": {
+          "episodes": 2
+        },
+        "other_categories": {
+          "episodes": 2
+        },
+        "temporal_facts": {
+          "episodes": 3
+        }
+      },
+      "solar_challenge": {
+        "entities_and_relations": {
+          "episodes": 3
+        },
+        "other_categories": {
+          "episodes": 0
+        },
+        "temporal_facts": {
+          "episodes": 3
+        }
+      },
+      "solar_challenge_platform": {
+        "entities_and_relations": {
+          "episodes": 3
+        },
+        "other_categories": {
+          "episodes": 1
+        },
+        "temporal_facts": {
+          "episodes": 3
+        }
+      },
+      "stream_touch": {
+        "entities_and_relations": {
+          "episodes": 0
+        },
+        "other_categories": {
+          "episodes": 3
+        },
+        "temporal_facts": {
+          "episodes": 3
+        }
+      }
+    },
+    "window_days": 109.0
+  },
+  "strata": {
+    "autopilot_video": {
+      "entities_and_relations": {
+        "window_population": 0
+      },
+      "other_categories": {
+        "window_population": 1
+      },
+      "temporal_facts": {
+        "window_population": 18
+      }
+    },
+    "dark_factory": {
+      "entities_and_relations": {
+        "window_population": 26
+      },
+      "other_categories": {
+        "window_population": 3
+      },
+      "temporal_facts": {
+        "window_population": 135
+      }
+    },
+    "know_live": {
+      "entities_and_relations": {
+        "window_population": 1
+      },
+      "other_categories": {
+        "window_population": 0
+      },
+      "temporal_facts": {
+        "window_population": 9
+      }
+    },
+    "market_predictor": {
+      "entities_and_relations": {
+        "window_population": 0
+      },
+      "other_categories": {
+        "window_population": 0
+      },
+      "temporal_facts": {
+        "window_population": 0
+      }
+    },
+    "pump_web_ui": {
+      "entities_and_relations": {
+        "window_population": 1
+      },
+      "other_categories": {
+        "window_population": 1
+      },
+      "temporal_facts": {
+        "window_population": 1
+      }
+    },
+    "reify": {
+      "entities_and_relations": {
+        "window_population": 11
+      },
+      "other_categories": {
+        "window_population": 2
+      },
+      "temporal_facts": {
+        "window_population": 65
+      }
+    },
+    "scoping_intake": {
+      "entities_and_relations": {
+        "window_population": 2
+      },
+      "other_categories": {
+        "window_population": 2
+      },
+      "temporal_facts": {
+        "window_population": 12
+      }
+    },
+    "solar_challenge": {
+      "entities_and_relations": {
+        "window_population": 5
+      },
+      "other_categories": {
+        "window_population": 0
+      },
+      "temporal_facts": {
+        "window_population": 29
+      }
+    },
+    "solar_challenge_platform": {
+      "entities_and_relations": {
+        "window_population": 11
+      },
+      "other_categories": {
+        "window_population": 1
+      },
+      "temporal_facts": {
+        "window_population": 16
+      }
+    },
+    "stream_touch": {
+      "entities_and_relations": {
+        "window_population": 0
+      },
+      "other_categories": {
+        "window_population": 6
+      },
+      "temporal_facts": {
+        "window_population": 4
+      }
+    }
+  }
+}

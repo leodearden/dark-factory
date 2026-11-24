@@ -53,7 +53,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_queue_bounce.py',
     'test_merge_queue_c3_submit_identity.py',
     'test_merge_queue_chain_intact.py',
-    'test_merge_queue_concurrent_verify.py',
     'test_merge_queue_conflict_graph.py',
     'test_merge_queue_depth_telemetry.py',
     'test_merge_queue_dry_run_unblock.py',
@@ -95,7 +94,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
     'test_suffix_conflict_tracker.py',
-    'test_task_runtime.py',
     'test_train_integration.py',
     'test_verify_events_units.py',  # debt: task 11025
     'test_verify_phase_rebase.py',

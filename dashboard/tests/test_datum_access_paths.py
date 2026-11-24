@@ -402,7 +402,9 @@ GUARDED_QUALITY_SOURCES = frozenset({
     'merge_finalized', 'train_merged', 'merge_blocked', 'review_completed', 'merge_verify',
     'workflow_verify', 'flake_occurrence', 'flake_debt', 'flake_debt_due',
 })
-GUARDED_QUALITY_READS = frozenset({'landings', 'rows_for', 'recorded_landing_keys'})
+GUARDED_QUALITY_READS = frozenset({
+    'landings', 'rows_for', 'recorded_landing_keys', 'recorded_landing_instants',
+})
 
 
 _QUALITY_SOURCE_WORD = re.compile(r'\b(' + '|'.join(sorted(GUARDED_QUALITY_SOURCES)) + r')\b')
@@ -542,6 +544,11 @@ _QUALITY_GRANTS: tuple[AccessGrant, ...] = (
                 frozenset({'train_merged'}), _MERGE_QUEUE_TRAINS),
     AccessGrant('data/merge_queue.py', 'train_throughput_stats',
                 frozenset({'train_merged'}), _MERGE_QUEUE_TRAINS),
+    AccessGrant(
+        'data/merge_queue.py', '_landing_instants', frozenset({'recorded_landing_instants'}),
+        "the Merge tab's landing-throughput rate counts the landings recorded in its window "
+        'through the shared landing read, the one landing definition (task 10620)',
+    ),
 )
 
 

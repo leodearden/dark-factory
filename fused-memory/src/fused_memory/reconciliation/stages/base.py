@@ -12,7 +12,6 @@ from uuid import uuid4
 
 from shared.config_dir import TaskConfigDir
 from shared.escalation_project_scope import escalation_project_headers
-from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.safe_io import load_json_or_warn
 from shared.transcript_archive import archive_task_transcripts
 
@@ -551,7 +550,7 @@ class BaseStage:
 
 
 def recon_core_mcp_servers(candidates: list[Path] | None = None) -> dict[str, Mapping[str, object]]:
-    """Recon's core MCP servers: fused-memory (HTTP, or stdio) and jcodemunch.
+    """Recon's core MCP servers: fused-memory (HTTP, or stdio).
 
     A stdio fused-memory entry carries ``OPENAI_API_KEY`` from the process env
     unless its own env sets it; an HTTP entry needs no env, since the server
@@ -565,7 +564,7 @@ def recon_core_mcp_servers(candidates: list[Path] | None = None) -> dict[str, Ma
         if 'OPENAI_API_KEY' not in fm_env:
             fm_env['OPENAI_API_KEY'] = os.environ.get('OPENAI_API_KEY', '')
         fm_entry = {'command': fm_config['command'], 'args': fm_config['args'], 'env': fm_env}
-    return {'fused-memory': fm_entry, 'jcodemunch': jcodemunch_server_config()}
+    return {'fused-memory': fm_entry}
 
 
 def _find_fused_memory_server(candidates: list[Path] | None = None) -> dict:

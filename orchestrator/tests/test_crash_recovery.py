@@ -24,6 +24,7 @@ from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.quarantine_provenance import NOT_RELOCATED, QuarantineOutcome
+from orchestrator.slot_lease import SlotLease
 from orchestrator.startup_steps import EntryFailures
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
@@ -359,7 +360,7 @@ async def _drive_session_slot(
                 return MagicMock(value='done')
 
             mock_wf.run = _run
-        await harness._run_slot(assignment, sem)
+        await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
         harness._last_build_workflow_kwargs = MockWorkflow.call_args.kwargs  # type: ignore[attr-defined]
         return MockWorkflow.call_args.kwargs['resume_session_id']
 
@@ -542,7 +543,7 @@ class TestRecoverCrashedTasks:
             )
             MockWorkflow.return_value = mock_wf
 
-            await harness._run_slot(assignment, sem)
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
             # Verify TaskWorkflow was created with the recovered plan
             call_kwargs = MockWorkflow.call_args.kwargs
@@ -570,7 +571,7 @@ class TestRecoverCrashedTasks:
             )
             MockWorkflow.return_value = mock_wf
 
-            await harness._run_slot(assignment, sem)
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
             call_kwargs = MockWorkflow.call_args.kwargs
             assert call_kwargs['initial_plan'] is None
@@ -598,7 +599,7 @@ class TestRecoverCrashedTasks:
             )
             MockWorkflow.return_value = mock_wf
 
-            await harness._run_slot(assignment, sem)
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
         # Marker cleared — _plan() will reuse the worktree on its own and
         # the next reconcile sweep should not see the task as preserved.
@@ -694,7 +695,7 @@ class TestRecoverCrashedTasks:
             )
             MockWorkflow.return_value = mock_wf
 
-            await harness._run_slot(assignment, sem)
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
             call_kwargs = MockWorkflow.call_args.kwargs
             assert call_kwargs['resume_session_id'] is session_dict
@@ -889,7 +890,7 @@ class TestAdoptNonDictSidecar:
                 total_cost_usd=0.0, total_duration_ms=0, agent_invocations=0,
             )
             MockWorkflow.return_value = mock_wf
-            await harness._run_slot(assignment, sem)  # must not raise
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))  # must not raise
 
         assert MockWorkflow.call_args.kwargs['resume_session_id'] is None
 

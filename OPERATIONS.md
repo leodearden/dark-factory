@@ -1999,7 +1999,7 @@ cleanup. What bounds each class:
 |---|---|---|
 | `_merge-<8hex>` worktrees and `.merge_verify_pgids` records on a remote host | a `verify-merge`/`verify-task` killed before its `finally` | task 4196 (pending); until it lands, `scripts/verify_host_hygiene.py`. `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.reap_orphaned_merge_worktrees` runs only where a merge worker runs |
 | `df-verify-*.scope` on a remote host | a verify controller that died while its scope ran | nothing automatic: this tool, or a reboot. 2829's `orchestrator/src/orchestrator/verify.py::reap_leftover_verify_scopes` sweeps only the orchestrator's own host (follow-up ticket `tkt_0RX7YZB882KPFAWE04DKAKQ81X`) |
-| gate checkouts under `dark-factory-gate/` | one per gate sha | 6565's `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.reap_idle_gates`, 7 days idle. `.build-*.lock` files are never reaped, by design |
+| gate checkouts under `dark-factory-gate/` | one per gate sha | 6565's `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.reap_idle_gates`, 7 days idle. A reaped sha's `.build-<sha>.lock` is unlinked with it, under that lock, and a failed ensure unlinks its own (task 8519). Only an ensure killed before its clone creates the sha dir leaves an orphan lock; the protocol is in the header of `orchestrator/src/orchestrator/remote_gate/reap-gates.sh`. |
 | reify `_merge-verify/target` | reify merge verifies | the 7042 trim timer (reify-owned) |
 | `_mainsweep-*` / `_mainprobe-*` | main-tip sweeps and probes | 5584 / 6794, on the workstation warm-lanes pool, not the laptop |
 | numeric task worktrees from 2026-03..04 | one-time residue; no orchestrator runs on the laptop | this tool; no live generator. The tool refuses any repo holding a task store, so it cannot reach a live orchestrator's task worktrees; `--class verify-scope` alone still runs on an orchestrator host |
@@ -2415,7 +2415,14 @@ takes no arguments: it always re-reads that process's own
   `tests/scripts/test_merge_gate_history_leg.py::test_every_test_file_importing_a_history_helper_is_accounted_for`
   on an unmarked test file importing a history-reading helper, and
   `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
-  keeps the leg's segments on the packages that own marked tests. Green-tier
+  keeps the leg's segments on the packages that own marked tests. Every
+  module's `lint_command` also runs `tests/scripts/git_history_census.py` over
+  that module's gate test roots, so an unaccounted history reader, or a
+  registry entry under those roots that is stale or doubles another
+  accounting, fails at task verify and in the pre-commit hook rather than
+  first at the merge gate;
+  the throwaway-repo registry now lives at
+  `tests/scripts/git_history_census.py::READS_ONLY_THROWAWAY_REPOS`. Green-tier
   for the same reason as `merge_gate_history_pure`.
 - `merge_deep.*`, including `chain_cap` and `depth_table` (deep merge-ahead
   chains — see
@@ -4401,7 +4408,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_queued` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
 | A reviewer verdict carried `note_dispositions` that were not applied: the info note is still pending after the review, or was later closed by the router or promoted instead of carrying the reviewer's class | One of four mechanisms. (i) The workflow rejected the entry: `orchestrator/src/orchestrator/escalation_router.py::reviewer_note_refusal` admits only a pending, router-owned info L0 of the reviewed task that is agent-filed, not mechanical, and not already held on a curator ticket, so an unknown id, another task's record, a non-info or eval-lane record, a harness or mechanical notice, or a router-disabled config is refused; a refusal logs the WARNING `info-l0-router: rejected the reviewer disposition` with the reason and emits `info_l0_dispositioned` with class `rejected_disposition`. (ii) `work` never closes a note, by design: it stamps the reviewer mark (triaged_by `reviewer-comprehensive/workflow`) and the exit router converts the note. (iii) The verdict was lost or errored, so nothing was applied: `TaskWorkflow._salvageable_verdict_payload` drops a malformed payload whole, and an ERROR verdict carries no dispositions (`orchestrator/src/orchestrator/review_payload.py::normalize_review`). (iv) Applying raised, which logs an exception and emits class `router-error` | Read the task's `info_l0_dispositioned` events (`class`, `reason`) and the journal WARNING to see which case applied. Nothing needs repairing, and a pending note must not be hand-closed: the exit finalizer, or the orphan reaper or startup amnesty, routes it, which is the designed backstop (`plans/info-l0-disposition-router-prd.md` boundary row 17). A `convert_to_task` L1 under `harness-info-l0-router` with reason `router_error` means the router already dismissed the note (`orchestrator/src/orchestrator/escalation_router.py::_promote` dismisses before it files the L1), so act on that L1, not the note. If the journal shows the ERROR `could not file its fallback L1`, the note is dismissed and its text survives only in that log line. A recurring (i) for the reviewer's own notes points at a briefing/eligibility mismatch; file it against `reviewer_notes` / `reviewer_note_refusal` |
 | A `legibility census commit did not land`, `legibility census refused by its landing gate` or `legibility trickle codebook commit failed` escalation, or one that repeats nightly | The target's pre-commit hook or the census landing gate refused a machine-written legibility write, which was quarantined and rolled back | [§12 Unlanded legibility writes and the quarantine](#unlanded-legibility-writes-and-the-quarantine) |
-| An orchestrator unit restarts every ~100 s | A startup step, or a crash site between steps, raises a process-killing fault on every start (a `BaseException` such as `SystemExit`, or a fatal step's refusal), so systemd's `Restart=` loops the unit. A non-fatal step that raises an ordinary `Exception` is reported on `orchestrator-startup-<step>` and skipped instead, and does not loop | `journalctl --user -u orchestrator-<name>.service` for the traceback. Then `sqlite3 <project_root>/data/orchestrator/runs.db "SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs ORDER BY rowid DESC LIMIT 10"`: `startup_crash:<site>` names the step, or `before-first-step` / `after-<step>` for a crash between steps; `cancelled` is a SIGTERM; a NULL `exit_reason` with `startup_completed_at` set is a start that came up. `cat <project_root>/data/orchestrator/startup_failures.json` shows the current streak. After 3 consecutive crashes at one non-fatal step, the next start skips that step and files the born-at-L2 `orchestrator-startup-crash-loop` (`orchestrator/src/orchestrator/startup_steps.py::page_crash_loop`); a fatal step, or a crash outside any step, still runs and pages the same way. The `finish_startup` of a start that comes up clears the journal, so fix the cause before the next restart. A crash the process cannot record itself (SIGKILL, an import error) is the [§8](#8-fleet-redeploy--watchdog) watchdog's `orchestrator-crash-loop-<unit>` page instead |
+| An orchestrator unit restarts every ~100 s | A startup step, or a crash site between steps, raises a process-killing fault on every start (a `BaseException` such as `SystemExit`, or a fatal step's refusal), so systemd's `Restart=` loops the unit. A non-fatal step that raises an ordinary `Exception` is reported on `orchestrator-startup-<step>` and skipped instead, and does not loop | `journalctl --user -u orchestrator-<name>.service` for the traceback. Then `sqlite3 <project_root>/data/orchestrator/runs.db "SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs ORDER BY rowid DESC LIMIT 10"`: `startup_crash:<site>` names the step, or `before-first-step` / `after-<step>` for a crash between steps; `cancelled` is a SIGTERM; `startup_completed_at` is written the moment startup finishes (`orchestrator/src/orchestrator/run_store.py::RunStore.mark_startup_completed`), so a NULL `exit_reason` with it set is a start that came up: still live, returned cleanly, or killed later (SIGKILL included). Both NULL is a start still in startup, or one killed before it came up, unless the journal shows the WARNING `Failed to record startup completion for run <run_id>`: that start came up but its stamp failed (`orchestrator/src/orchestrator/harness.py::Harness._stamp_startup_completed`). `cat <project_root>/data/orchestrator/startup_failures.json` shows the current streak. After 3 consecutive crashes at one non-fatal step, the next start skips that step and files the born-at-L2 `orchestrator-startup-crash-loop` (`orchestrator/src/orchestrator/startup_steps.py::page_crash_loop`); a fatal step, or a crash outside any step, still runs and pages the same way. The `finish_startup` of a start that comes up clears the journal, so fix the cause before the next restart. A crash the process cannot record itself (SIGKILL, an import error) is the [§8](#8-fleet-redeploy--watchdog) watchdog's `orchestrator-crash-loop-<unit>` page instead |
 
 ---
 
@@ -4489,6 +4496,211 @@ How to read the columns:
 
 ---
 
+## 11a. Verify-result cache
+
+The verify-result cache replays a unit's recorded green instead of re-running
+it, when the unit's spec hash and every keyed input are identical. It never
+narrows a plan: the plan is computed exactly as without the cache, and the
+cache only decides whether a planned unit executes or replays. Design, keys,
+registry and amendments A1–A6 are in
+[`plans/verify-result-cache-prd.md`](plans/verify-result-cache-prd.md); this
+section is the operator surface only.
+
+**Rulings.** R-cache-1 (Leo, 2026-09-19): a per-unit green replay is evidence,
+not a skipped gate. R-cache-2 (Leo, 2026-11-14): greens serve across hosts. The
+ruling text has one home, the PRD's § "Pre-conditions for activating"; read the
+conditions there.
+
+### Modes
+
+`verify_cache` in `dark-factory-orchestrator.yaml`
+(`orchestrator/src/orchestrator/config.py::VerifyCacheConfig`) holds one mode
+per verify role. Each is its own green-tier reload leaf, so
+`mcp__escalation__reload_config` applies a change without a restart.
+
+| Key | Values | Default |
+|---|---|---|
+| `verify_cache.task_mode` | `off` \| `log` \| `on` | `off` |
+| `verify_cache.merge_mode` | `off` \| `log` \| `on` | `off` |
+| `verify_cache.remote_task_mode`, `verify_cache.remote_merge_mode` | `off` \| `log` \| `on` | `off` (arrive with task 9123, γ2) |
+| `verify_cache.remote_candidates_per_unit` | int cap on shipped candidates per unit | arrives with task 9123 |
+
+- `off`: no decision, no recording.
+- `log`: every unit still runs and its green is recorded; a unit whose key
+  matched a recorded green is stamped `would_hit`. A matched unit that then
+  runs red is stamped `ran_red` with the matched green's `evidence_event_id`:
+  a red the cache would have landed
+  (`orchestrator/src/orchestrator/verify_evidence.py::VerifyUnit.would_have_leaked`).
+  Nothing is replayed.
+- `on`: a matching unit is replayed and not run.
+
+Each mode rolls out `off` → `log` for three days → `on`, per role and (once
+γ2 lands) per remote mode, each with its own three-day `log` window.
+
+**Task and merge are independent values.** The task role may go `on` before the
+audit (task 5655) lands while the project's merge gate runs
+`merge_verify_breadth: "full"` (the default): that gate still runs every unit a
+task-role replay skipped, so a task-role false hit cannot land a red on main. A
+project set to `scoped` keeps `task_mode` behind the audit too. The merge role (and `remote_merge_mode`) stays
+behind the audit: `merge_mode: on` waits for task 5655 and task 9094. The audit
+runs test legs only, and
+`orchestrator/src/orchestrator/merge_lane/gates.py::_type_covered_modules`
+counts a `cache_hit` type unit as coverage, so a replayed pyright unit would be
+neither audited nor re-checked by the pre-advance unscoped type gate. Before flipping a role
+to `on`, check its `log` window for a `ran_red` unit carrying an
+`evidence_event_id` for a cause the branch's own diff explains; spurious reds (infra kill, worker crash,
+deploy clock, known load flake) do not block the flip.
+
+A remote dispatch (verify on a `verify_runners` host) runs under the more
+conservative of the role's mode and the remote mode, so a runner never replays
+while the role is still in `log`. A runner's own config cannot turn replay on:
+the mode and the kill-switch state ride the dispatch. The runner decides against
+a view of recorded greens the dispatcher ships; the dispatcher re-reads the
+registry before it uses a returned hit. These keys arrive with task 9123; until
+it lands, a remote dispatch carries no view and every cacheable remote unit
+reports `unavailable` (see "Reading a verify event" for the units that do not).
+
+Current state: `orchestrator verify-cache status --config <path>` prints each
+role's mode, the registry's recorded greens by tier, and the kill switch. It is
+read-only and never creates a registry.
+
+### Reading a verify event
+
+`merge_verify` and `workflow_verify` events carry `plan_hash`, `cache_mode` and
+`units: [{unit, tier, key, outcome, evidence_event_id, reason}]` (shape:
+`orchestrator/src/orchestrator/verify_evidence.py::VerifyUnit.to_dict`). A unit's
+`key`, `evidence_event_id` and `reason` can be null. `plan_hash`, `cache_mode`
+and `units` are all null on a verify with no verdict
+(`orchestrator/src/orchestrator/verify_evidence.py::verify_event_fields`);
+`plan_hash` is also null when no plan ran, and `units` when the result recorded
+none (an older remote's). The pre-merge re-verify emits its own
+`workflow_verify` row, distinguished by its site.
+
+| Unit outcome | Meaning |
+|---|---|
+| `ran_green` / `ran_red` | The unit executed; nothing was replayed. Without an `evidence_event_id` there was no cache involvement (`off` mode, a miss, or a never-cache class), or the red ran under an `unavailable` or `disabled` decision, which the unit's `reason` names. In `log` mode a `ran_red` may carry `evidence_event_id`, naming the green a replay would have served: that unit is a leak the cache would have landed (`VerifyUnit.would_have_leaked`) |
+| `cache_hit` | Replayed, not run. `evidence_event_id` names the verify event whose green it replays; that event names the host that ran it, so a cross-host replay is traceable through it |
+| `would_hit` | `log` mode: the key matched a recorded green, and the unit ran anyway and passed. A matched unit that ran red is a `ran_red` with `evidence_event_id` (row above) |
+| `unavailable` | The cache could not decide, and the unit ran and passed. Causes include no registry on this host, an unreadable registry, a code identity its keys need was missing, a working copy that differed from HEAD, a toolchain (venv, lockfile) that could not be read, and a decision that itself failed (`orchestrator/src/orchestrator/verify_cache/replay.py::plan_replay`, `orchestrator/src/orchestrator/verify_cache/policy.py::decide`). The unit's `reason` names the actual cause and is the authority. A red is `ran_red`, with no `evidence_event_id`. It is never an error |
+| `disabled` | A decision, never an event value. Under the kill switch every unit runs, and a cacheable unit shows as `unavailable` if green or `ran_red` if red, the unit's `reason` naming the disable deadline (`orchestrator/src/orchestrator/verify_cache/policy.py::_decide`) |
+
+Some units are settled before the registry or the kill switch is read, so they
+show plain `ran_green`/`ran_red` under the kill switch and on a host with no
+registry alike:
+
+- every unit of a role in `off`, which decides nothing
+  (`orchestrator/src/orchestrator/verify_cache/replay.py::plan_replay`);
+- a never-cache module's units, settled as misses
+  (`orchestrator/src/orchestrator/verify_cache/policy.py::_decide`);
+- a unit with no planned run, whose `reason` begins `not keyed:`
+  (`orchestrator/src/orchestrator/verify_cache/replay.py::ReplayPlan.settle`).
+
+The last two show `unavailable` only when the whole verify could not be keyed
+(a dirty working copy, an unreadable toolchain, a missing code identity).
+Elsewhere in this section a "cacheable unit" is any other unit.
+
+A **no-verdict naming an unbacked cache hit** (γ2) means a remote runner
+returned a `cache_hit` for a `(unit_id, key)` the dispatcher's registry does
+not hold. The dispatcher refuses the whole result as a no-verdict
+(`orchestrator/src/orchestrator/verify_runner.py::RunnerUnavailable`) and the
+existing re-dispatch path runs it again with a fresh view, so the same unbacked
+hit cannot recur. It needs no action; repeated no-verdicts on one runner are the
+signal to look at that runner's toolchain or registry sync. Arrives with task
+9123 (γ2); until then no green crosses hosts.
+
+### Cross-host replay
+
+A green recorded on any host serves any host whose own computed key is equal
+(R-cache-2, Leo 2026-11-14; PRD § Amendment — 2026-11-14, A6). The runner's name
+is not a keyed input. Each runner computes its keys from its own worktree and
+toolchain, so a host whose interpreter, lockfile, pyright, ruff or `verify_env`
+overlay differs has a different toolchain fingerprint and misses. Whether the
+two hosts' fingerprints are equal today has not been measured; the remote `log`
+window shows it, as a remote `would_hit` unit whose evidence event ran on another
+host. Arrives with task 9123 (γ2); until then no green crosses hosts: a runner
+reaches no registry, so its cacheable units report `unavailable` and nothing it
+runs is recorded.
+
+### Audit and recording lanes
+
+Both are `LaneCommand` entries on `git.offline_lane_commands`, run by the
+offline lane at idle nice against the latest landed head. The lane coalesces:
+heads that land while a pass runs collapse into one re-run at the then-current
+head, so an intermediate head gets no pass of its own
+(`orchestrator/src/orchestrator/offline_lane.py::OfflineLaneWorker`). Both
+commands arrive with the tasks named.
+
+| Lane command | Task | What it does |
+|---|---|---|
+| `verify-cache-audit` | 5655 (ε) | Runs every module's test leg uncached (`DF_VERIFY_CACHE=off`) at the head each lane pass runs from (above). Lint and type legs are not audited until task 9094. A red attributable to a `cache_hit` unit evicts that unit's entries, bumps the streak and returns the leak record as an evidence note; the lane renders it into the fix task it files once the red persists. A repeated pass of the same leak is counted once |
+| the separate recording lane command | 5656 (ζ1) | Records per-test input sets from green runs for the per-test tier. It consumes green runs' coverage only, so it does not wait for the audit |
+
+The audit plugs into the offline lane's red path through the `on_pass_outcome`
+hook ([`plans/offline-lane-red-path-prd.md`](plans/offline-lane-red-path-prd.md)
+§5.7). When the lane files a fix task and when it escalates are decided in that
+PRD (D5, D11); the runbook is "The offline lane's red path" above. A red not
+attributable to a replay (main was red anyway) returns no notes and takes that
+path untouched. The blocker the audit files itself when it trips the kill switch
+is under "Kill switch and re-enabling".
+
+### Kill switch and re-enabling
+
+Two attributable leaks within seven days set `policy_state.disabled_until` (14
+days from the second leak, with a reason and the leak evidence) and file an L2
+blocker naming both. If that filing fails, every later reproduced audit red
+files it from the policy row
+(`orchestrator/src/orchestrator/verify_cache/audit_hook.py::VerifyCacheAuditHook`);
+a green pass asks no hook, so a queue still broken when the audit goes green
+leaves the blocker unfiled until the audit's next reproduced red. An audit with
+no escalation queue wired files on the project's on-disk queue
+(`orchestrator/src/orchestrator/offline_lane_pass.py::lane_pass_outcome_hooks`).
+While `disabled_until` is in the future **both roles run every unit**,
+whatever the modes say, and remote dispatches carry it. A cacheable unit shows
+as `unavailable` (or `ran_red`; see the `disabled` row above). The units settled
+before the switch is read (listed under "Reading a verify event") show plain
+`ran_green`/`ran_red`; seeing them does not mean the switch failed to take
+effect. The switch lives in the
+registry, not in config, so a reload does not clear it.
+
+To re-enable once the leaks are fixed, an operator runs `orchestrator
+verify-cache enable --reason "<why the cache is safe again>" --config <path>`,
+which clears `disabled_until` with that reason and resolves the pending
+blocker. Resolving the blocker by hand (`resolve_issue`) does **not** re-enable
+the cache: while `disabled_until` is in the future, the audit re-files a
+hand-resolved blocker at its next reproduced red. Waiting out `disabled_until`
+also re-enables, and the audit's next reproduced red resolves that disable's
+blocker. `orchestrator verify-cache status` shows the switch meanwhile
+(`policy: DISABLED until …` with the reason and leaks).
+
+### Never cached
+
+- Flake-suppressed greens, truncated sessions and TRIVIAL runs: refused at
+  recording, so they can never serve.
+- Units of a module flagged `verify_cache: never` in the module table: the
+  repo-wide guard module, which runs at every gate.
+- A red: the registry stores and serves greens only.
+- A remote dispatch that carries no view decides nothing; its cacheable units
+  report `unavailable`.
+- An entry recorded under a different spec hash never serves another spec's unit.
+- Per-test tier (arrives with tasks 5656 and 5657, ζ1/ζ2; neither the tier nor
+  the `repo_state` marker exists yet):
+  - Tests marked `repo_state`.
+  - A test whose file or conftest chain differs in object id from the one it
+    was recorded against has no recording and runs.
+
+The registry is derived state in its own sqlite file; deleting it is a cold
+start, not a data loss.
+
+### Pointer table
+
+| Item | Disposition |
+|---|---|
+| R-cache-1 (2026-09-19), R-cache-2 (2026-11-14) | Rulings; text in the PRD § "Pre-conditions for activating" |
+| Task 5294 (duplicate pyright leg) | Superseded by γ (task 5653): γ's unscoped-typecheck consult, `orchestrator/src/orchestrator/merge_lane/gates.py::_type_covered_modules`, is its dedupe. Closing 5294 as superseded is an operator action; its status lives in the task store |
+| Task 5410 (task-leg disjoint-rebase skip) | Cancelled 2026-10-09 (Leo) as superseded: task 6580 removed the merge-phase verify it targeted, and its predicate never fired (0/40 DF, 0/20 reify). The per-test tier (task 5657, ζ2) remains the long-run owner of green reuse. No retirement action remains; the reasoning is in task 5410's `details` |
+
+---
+
 ## 12. Nightly maintenance timers
 
 Recurring maintenance runs as systemd **user** timers, not as orchestrator
@@ -4535,6 +4747,7 @@ declared registry and its `LoadState`-aware detector).
 
 | Slot | Job | Units |
 |---|---|---|
+| 01:30 | Timeout-headroom self-check (per-test ceiling anchors and family leg budgets against the verify archive; files `escalate_info`) | `timeout-headroom-selfcheck.timer` |
 | 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
 | 02:30 | Transcript secret sweep (leo-laptop runs its own copy) | `transcript-secret-sweep.timer` |
@@ -4554,7 +4767,8 @@ All timers carry `Persistent=true` (a night missed to a sleeping laptop is
 caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
-Per-job docs: [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
+Per-job docs: [Timeout headroom self-check (01:30)](#timeout-headroom-self-check-0130)
+for the 01:30 job; [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
 for the 02:00 job; [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
 for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
 02:15 one; the sections below for the 02:30, 03:00, 03:15, 03:45, 04:00 and 05:00 ones,
@@ -4600,6 +4814,72 @@ harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
 reconciliation. Those residual units do **not** collide with the new 04:30 job:
 they carry a different unit name, and a re-armed sweep would merely fail
 `203/EXEC` alongside it rather than contend for anything.
+
+### Timeout headroom self-check (01:30)
+
+Each night this job re-measures the figures that the per-test timeout ceilings
+and the family verify-leg budgets were sized from (task 10940). The script is
+`scripts/timeout_headroom_selfcheck.py`. Its four files are
+`scripts/timeout-headroom-selfcheck.{sh,service,timer}` and
+`scripts/install-timeout-headroom-selfcheck-timer.sh`, which kicks no immediate
+run. Arming it is a separate deploy step: the deterministic `before_done` deploy
+or `scripts/user_timers.py arm`, as described above. This section does not
+claim the timer is armed; `scripts/user_timers.py check` answers that.
+
+- **What it reads.** The main checkout's verify archive,
+  `data/verify-logs/<task>/`: the archived junits, the attempt summaries and
+  the dispatch records. Each junit row is judged at its own run's tree, which
+  is the dispatch's `tip_sha`, else its `base_sha`, else `HEAD`. An xdist
+  worker-crash row and a row pytest-timeout killed carry no duration of their
+  own, so each anchor lists them as `censored` and `timed_out` and never judges
+  them: a hung test's junit time says where the timeout fired, not how long the
+  test takes. A judged worst row names its outcome. Nothing is kept between runs. The archive holds about seven
+  days, so the nightly scan sees every run about seven times before it ages
+  out.
+- **Check 1, per-test headroom.** Each anchor in
+  `shared/src/shared/testing_ceiling_anchors.py::registered_anchors` has a
+  population: the tests whose closest `timeout` mark is spelled through the
+  anchor's constant, or the unmarked tests for the ini default. The worst
+  member's per-test total must not exceed the ceiling divided by
+  `shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR`.
+- **Check 2, leg budget.** A registered verify leg whose tracked tree holds a
+  whole-tree guard family member must declare a `verify_command_timeout_secs`
+  of at least
+  `shared/src/shared/whole_tree_guard_family.py::min_leg_budget_for_family(W)`.
+  W is the leg's longest green `test` command in the archived summaries. A leg
+  with no green run is reported `no_run` and is not judged.
+- **Where findings go.** Each breach is one `escalate_info` (`risk_identified`,
+  agent role `timeout-headroom-selfcheck`). Its opaque `task_id` slot is
+  `timeout-headroom:<kind>:<subject>:<bound>`, where `<kind>` is
+  `per_test_headroom` or `leg_budget`. `<subject>` is the anchor id or the
+  leg's archive infix (`tests/scripts` files as `tests_scripts`), because the
+  escalation server mints `esc-<slot>` files from the slot, so it must be one
+  file-name component. A run skips any slot that has escalation
+  history (archive-inclusive), so an unresized breach is filed once however
+  its 7-day window worst drifts, up or down; the required value travels in the
+  record. A re-size changes `<bound>` and re-arms the check. The info-L0 router turns each record
+  into owned work. Ceiling re-sizing belongs to task 9396; the ini default and
+  the headroom factor belong to task 7013.
+- **The stamp.** A real run writes `data/timeout-headroom-selfcheck/state.json`
+  in the main checkout. It holds `ok`, `measured_at`, `failure`, `findings`,
+  `filed`, `skipped` and the full report of every anchor and leg. A run that
+  could not measure or act records `ok` false with the stage that failed
+  (`config`, `tree`, `archive` or `escalation`, or `unexpected` for an
+  exception none of those anticipated) and exits 2. The wrapper still
+  exits 0, for the reason every §12 job shares, and narrates `selfcheck=<rc>`
+  in `journalctl --user -u timeout-headroom-selfcheck.service`. Nothing
+  watches the stamp's age.
+
+To look now, without filing or stamping anything:
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --no-sync --project shared python scripts/timeout_headroom_selfcheck.py --dry-run          # one line per anchor and leg
+uv run --no-sync --project shared python scripts/timeout_headroom_selfcheck.py --dry-run --json   # the structured report
+```
+
+The default `--project-root` is the main checkout even from a task worktree,
+so a dry run always reads the host's archive.
 
 ### Nightly link-heal sweep (02:15)
 

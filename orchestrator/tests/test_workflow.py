@@ -95,6 +95,7 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
 
     scheduler = MagicMock()
     git_ops = MagicMock()
+    git_ops.own_delta_cut = AsyncMock(return_value=None)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -812,21 +813,38 @@ class TestSubmitToMergeQueueStalePathMessage:
             f'got: {stale_clause!r}'
         )
 
-    async def test_back_compat_wording_when_nothing_is_stale(
+    async def test_an_untouched_live_entry_states_the_measurement_not_a_verdict(
         self, tmp_path: Path, monkeypatch,
     ):
-        """(c) The pre-existing class's wording is untouched."""
+        """(c) A live entry no commit touched is reported as the measurement
+        it is (task 4806): no claim that the work was not delivered, the two
+        common causes named without asserting either, and the checks that tell
+        them apart.  The prefix head and the routing stay as they were.
+        """
+        from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+        from orchestrator.unblock_types import BlockClass, classify_block_reason
+
         wf = _make_workflow(tmp_path=tmp_path)
         wf.plan = {'files': ['a.py']}
         result = PlanFilesTouchedResult(not_touched=['a.py'], missing_from_tree=[])
-        _, _, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
+        _, events, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
-        await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
         reason = self._reason_of(mark_blocked)
+        assert reason.startswith(f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: a.py. ')
         assert self._NEVER_TOUCHED_SENTENCE in reason
-        assert 'has not delivered against the plan' in reason
+        assert 'not delivered' not in reason.lower()
+        for cause in ('missing', 'no change'):
+            assert cause in reason, f'cause {cause!r} not named: {reason!r}'
+        for check in ('subject', 'sibling', 'branch HEAD', 'ancestor'):
+            assert check in reason, f'check {check!r} not named: {reason!r}'
         assert 'does not exist in the tree' not in reason.lower()
+        assert classify_block_reason(reason) is BlockClass.MERGE_VERIFY_RED
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
+        _, kwargs = mark_blocked.call_args
+        assert kwargs.get('escalate_to_human') is True
 
 
 @pytest.mark.asyncio
@@ -836,8 +854,8 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
     ``git rebase`` drops a branch commit whose change main already carries
     (the 3490 cache-buster bump), so the gate's ``base..HEAD`` read sees the
     file untouched.  The gate is handed the branch, attributes the entry to
-    the dropped commit, and the block reason says so instead of claiming
-    "Implementation has not delivered".  Routing is unchanged.  When the
+    the dropped commit, and the block reason says so instead of listing it
+    among the files no commit touched.  Routing is unchanged.  When the
     architect narrowing pass reports a narrowed plan, the gate runs a second
     time, and that re-check is handed the branch too.
     """
@@ -875,7 +893,7 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
         assert 'c2e8f8c14d00' in reason
         assert self._SUBJECT in reason
         assert 'dropped by a rebase' in reason
-        assert 'Implementation has not delivered' not in reason
+        assert 'no commit on the branch touched them' not in reason
         assert outcome == WorkflowOutcome.BLOCKED
         assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
         assert kwargs.get('escalate_to_human') is True

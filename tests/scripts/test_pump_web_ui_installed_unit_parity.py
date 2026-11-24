@@ -201,8 +201,7 @@ def test_installed_unit_file_restart_backoff_effective() -> None:
     correct here because a <unit>.d/ drop-in merges by appending.
 
     The shared helper's own failure message is written for the COMMITTED
-    fleet and points at scripts/jcodemunch-watcher.service.template as the
-    worked example — accurate, but it never mentions re-installing THIS unit
+    fleet — accurate, but it never mentions re-installing THIS unit
     or running daemon-reload, which is the only thing that fixes a drifted
     HOST copy. Since this is the layer an operator hits first, the assertion
     is re-raised with _REMEDIATION appended rather than delegating the

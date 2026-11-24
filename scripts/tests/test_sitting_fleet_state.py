@@ -447,9 +447,12 @@ class TestStandingPolicyRulings:
     def test_folds_the_per_queue_agreement_reports(self, tmp_path):
         first, second = tmp_path / 'a' / 'data' / 'escalations', tmp_path / 'b' / 'data' / 'escalations'
         cls = 'infra_issue_transient_self_cleared'
-        _resolved(first, 'esc-1-1', triage_note=_shadow(cls, 'close_only'), resolution_action='close_only')
-        _resolved(first, 'esc-1-2', triage_note=_shadow(cls, 'close_only'), resolution_action='resume')
-        _resolved(second, 'esc-2-1', triage_note=_shadow(cls, 'close_only'), resolution_action='close_only')
+        _resolved(first, 'esc-1-1', triage_note=_shadow(cls, 'close_only'), resolution_action='close_only',
+                  ruled_by_human=True)
+        _resolved(first, 'esc-1-2', triage_note=_shadow(cls, 'close_only'), resolution_action='resume',
+                  ruled_by_human=True)
+        _resolved(second, 'esc-2-1', triage_note=_shadow(cls, 'close_only'), resolution_action='close_only',
+                  ruled_by_human=True)
         _write_escalation(second, id='esc-2-2', triage_note=_shadow(cls, 'resume'))
 
         measurement = mod.standing_policy_rulings([str(first), str(second)], WINDOW, now=NOW)

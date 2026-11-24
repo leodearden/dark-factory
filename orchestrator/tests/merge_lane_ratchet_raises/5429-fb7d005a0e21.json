@@ -1,0 +1,18 @@
+{
+  "task_id": "5429",
+  "reason": "net-additive guard: branch_tip_landed stops the reconcile sweep re-pending a landed task whose warm-lane ref reads degenerate (reify 6828)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 173,
+      "current": 179
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5319,
+      "current": 5325
+    }
+  ]
+}

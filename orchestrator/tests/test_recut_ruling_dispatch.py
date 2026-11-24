@@ -29,6 +29,7 @@ from orchestrator.recut_ruling import (
     RecutRuling,
 )
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 TID = '2896'
@@ -155,7 +156,7 @@ async def _run(slot: _Slot, metadata: Any, calls: list[str] | None = None):
             return _make_mock_workflow()
 
         build.side_effect = _build
-        report = await slot.harness._run_slot(_assignment(metadata), sem)
+        report = await slot.harness._run_slot(_assignment(metadata), SlotLease(TID, slot.harness.scheduler, sem))
     return report, build
 
 

@@ -164,7 +164,7 @@ def _seed_resolved_gate(queue: EscalationQueue, task_id: str) -> Escalation:
         category='milestone_gate', summary='Ship feature gate', level=2,
     )
     queue.submit(esc)
-    queue.resolve(esc.id, 'human resolved the gate', resolved_by='human')
+    queue.resolve(esc.id, 'human resolved the gate', resolved_by='human', resolution_class='actionable')
     return esc
 
 
@@ -365,7 +365,7 @@ def _seed_escalation(
     )
     queue.submit(esc)
     if resolved:
-        queue.resolve(esc.id, 'resolved for test setup')
+        queue.resolve(esc.id, 'resolved for test setup', resolution_class='actionable')
     return esc
 
 
@@ -1071,7 +1071,7 @@ class TestPureGateResumeHardening:
             category='milestone_gate', summary='Ship feature gate', level=2,
         )
         queue.submit(existing)
-        queue.resolve(existing.id, 'human approved the gate', resolved_by='human')
+        queue.resolve(existing.id, 'human approved the gate', resolved_by='human', resolution_class='actionable')
         # Sanity: resolved record is archived (not pending) but archive-visible.
         assert queue.get_by_task('99', status='pending') == []
         assert len(queue.get_by_task('99', agent_role='orchestrator-deterministic')) == 1
@@ -1945,7 +1945,7 @@ class TestHumanCuratorGateAdjudicationGuard:
         # ── 2. the human does the work, stamps, and resolves the re-ask ─────
         stamp = '2026-07-31T11:15:00+00:00'
         task['metadata']['human_curator_adjudicated_at'] = stamp
-        queue.resolve(re_ask.id, 'reviewed all 13 entries', resolved_by='human')
+        queue.resolve(re_ask.id, 'reviewed all 13 entries', resolved_by='human', resolution_class='actionable')
 
         # ── 3. re-dispatch: closes, citing the GATE record ──────────────────
         assert await runner.run(_make_assignment(task)) == WorkflowOutcome.DONE
@@ -5399,7 +5399,7 @@ class TestFileInfraIssueEscalatedAdvanceFailureConverges:
 
         # A human resolves the (only) escalation — but the phase is still
         # stuck at 'ran', not 'escalated'.
-        queue.resolve(first_pending[0].id, 'human restarted the unit manually')
+        queue.resolve(first_pending[0].id, 'human restarted the unit manually', resolution_class='actionable')
 
         # --- Run 2 (resume): connection recovers. The phase==ESCALATED
         # resolution proof is NOT satisfied (still 'ran'), so this is
@@ -5423,7 +5423,7 @@ class TestFileInfraIssueEscalatedAdvanceFailureConverges:
         )
 
         # A human resolves the second escalation.
-        queue.resolve(second_pending[0].id, 'human confirmed the unit is healthy')
+        queue.resolve(second_pending[0].id, 'human confirmed the unit is healthy', resolution_class='actionable')
 
         # --- Run 3 (resume): phase==ESCALATED + own_escalation_resolved now
         # both hold — converges to done, no further escalation.
@@ -6072,7 +6072,7 @@ class TestBeforeDoneResumeAfterResolution:
             level=2,
         )
         queue.submit(esc)
-        queue.resolve(esc.id, 'human verified the unit manually')
+        queue.resolve(esc.id, 'human verified the unit manually', resolution_class='actionable')
 
     async def test_resume_script_runner_not_called(self, tmp_path: Path):
         """before_done_ran_at set + resolved escalation → script_runner NOT called (I1 no re-run)."""
@@ -11839,7 +11839,7 @@ class TestFileDeterministicEscalation:
 
     def test_a_resolved_own_role_escalation_does_not_skip_the_filing(self, tmp_path):
         queue = EscalationQueue(tmp_path)
-        queue.resolve(self._own_role_record(queue), 'fixed')
+        queue.resolve(self._own_role_record(queue), 'fixed', resolution_class='actionable')
 
         esc_id = self._file(queue)
 

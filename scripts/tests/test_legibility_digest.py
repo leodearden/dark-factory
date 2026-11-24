@@ -34,9 +34,13 @@ from legibility import inventory as inventory_mod
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
+    CLIENT_RENDERED_IDS,
+    CLIENT_RENDERED_TURNS,
     HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
+    SLASH_COMMAND_ARGLESS_TURN,
+    SLASH_COMMAND_WITH_ARGS_TURN,
     TASK_NOTIFICATION_TEXT,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
@@ -2799,6 +2803,61 @@ class TestRunReviewPromptTurnFilter:
         with_report = [_user_text(recon_run_review_text())] + base
 
         assert mod.signal_counts(with_report) == mod.signal_counts(base)
+
+
+# ---------------------------------------------------------------------------
+# Client-rendered turn exclusion (task 7442): a turn the client composed from
+# a UI action -- an arg-less slash command, a local command's output echo, the
+# bare interrupt marker -- holds no prose a human typed, so it is not gold.
+# The interrupt marker stays an INTERRUPT signal and leaves the Interrupts
+# section only.
+# ---------------------------------------------------------------------------
+
+class TestClientRenderedTurnFilter:
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_client_rendered_turn_is_excluded(self, text):
+        assert mod.iter_user_turns([_user_text(text)]) == []
+
+    def test_slash_command_with_typed_args_is_kept_verbatim(self):
+        turns = mod.iter_user_turns([_user_text(SLASH_COMMAND_WITH_ARGS_TURN)])
+
+        assert [t['text'] for t in turns] == [SLASH_COMMAND_WITH_ARGS_TURN]
+
+    def test_genuine_correction_between_client_rendered_turns_keeps_its_index(self):
+        records = [
+            _user_text(SLASH_COMMAND_ARGLESS_TURN),
+            _user_text(_GENUINE_CORRECTION),
+            _user_text('[Request interrupted by user]'),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, _GENUINE_CORRECTION)]
+
+    def test_interrupt_beside_a_tool_result_is_no_gold_turn_but_one_interrupt(self):
+        record = _tool_result('tu-1', 'partial output')
+        record['message']['content'].append(_text('[Request interrupted by user for tool use]'))
+
+        assert mod.iter_user_turns([record]) == []
+        assert len(mod.iter_interrupts([record])) == 1
+
+    def test_render_digest_reflect_then_interrupt_session_has_no_gold_section(self):
+        records = [
+            _with_session_meta(_user_text(SLASH_COMMAND_ARGLESS_TURN)),
+            _with_session_meta(_user_text('[Request interrupted by user]')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' not in digest
+        assert '<command-name>' not in body
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts']['interrupt'] == 1
+        assert '## Interrupts' in body
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 0)
 
 
 class TestRenderDigest:

@@ -82,7 +82,7 @@ PRD-decomposition batches are the canonical use case for `planning_mode=True`. *
 
 The server stamps every `planning_mode` birth with a `planning` deferral record (`metadata.deferral.kind == "planning"`); never pass `metadata.deferral` yourself, `submit_task` refuses it.
 
-**Declare every leaf's execution path.** `planning_mode` bypasses the curator-side routing guards (1898/2225/2085) that would otherwise infer `task_kind`/`execution_class` — so the `submit_task` routing-intent lint runs at this boundary instead: a `task_kind="normal"` leaf whose own title/description/details declare a *different* execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic; no worktree", "escalate to a human instead of implementing") gets flagged (or, in enforce mode, rejected) because it carries no matching declaration. Set `task_kind` explicitly on every leaf (`"normal"` for code_tdd work; `"deterministic"` for a deploy/gate leaf — see `CLAUDE.md` "Deterministic task kind").
+**Declare every leaf's execution path.** `planning_mode` bypasses the curator-side routing guards (1898/2225/2085) that would otherwise infer `task_kind`/`execution_class` — so the `submit_task` routing-intent lint runs at this boundary instead: a `task_kind="normal"` leaf whose own title/description/details declare a *different* execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic; no worktree", "escalate to a human instead of implementing") gets flagged (or, in enforce mode, rejected) because it carries no matching declaration. Set `task_kind` explicitly on every leaf (`"normal"` for code_tdd work; `"deterministic"` for a deploy/gate leaf — see `docs/task-authoring.md` §5 "Deterministic tasks").
 
 **The execution-path question is "agent or human?", never "code or not code?"** A docs/comments/rename leaf — any edit an agent can execute mechanically — is `task_kind="normal"` + `metadata.complexity="simple"` (the fast path; its documented scope names docs edits). Set `metadata.execution_class` to `"operational"` or `"decision"` **only when the leaf genuinely requires a human** (a ruling, an operator action no agent can take): that declaration is converted at submit into a deterministic **always-escalates pure gate** whose sole dispatch action is a born-at-L2 escalation to a human, and human attention is the bottleneck. Multiple independent sessions have mis-filed docs leaves as `"operational"` because they "aren't code" (Leo's 2026-08-24 ruling retyped 4626/4671/4675/4680 out of exactly this; semantics reference: `docs/task-authoring.md` §4, "`execution_class` routes to a HUMAN").
 
@@ -135,7 +135,7 @@ mcp__fused-memory__add_dependency(
 )
 ```
 
-Wire intra-batch (Greek-letter prereqs → the IDs from `submit_task`) and out-of-batch (PRD-declared prereqs → existing task IDs elsewhere). If the decomposition specified `metadata.unblocks` reverse-deps, set those via `update_task`.
+Wire intra-batch (Greek-letter prereqs → the IDs from `submit_task`) and out-of-batch (PRD-declared prereqs → existing task IDs elsewhere). If the decomposition specified `metadata.unblocks` reverse-deps, set those via `update_task`. An out-of-batch edge onto a held follow-up (one that depends on its project's follow-up holder, `docs/task-authoring.md` §3.4) promotes it with `by=dependent` when the dependent reaches `pending`, which for a batch task is its `commit_planning` flip; there is no separate release step.
 
 **Cross-project dependencies** — when a task depends on a task in a *different* project, pass a qualified `"project_id:task_id"` string as `depends_on`:
 
@@ -147,7 +147,7 @@ mcp__fused-memory__add_dependency(
 )
 ```
 
-A qualified `depends_on` (containing `:`) is routed to `metadata.external_deps` on the dependent task rather than the integer `dependencies` table. The foreign target is not verified at write time. At dispatch time the dependent's scheduler resolves each entry via `get_external_statuses` and gates dispatch until every external dep is `done`. A `cancelled` upstream immediately escalates to a human; a persistently-unresolvable dep (`unknown_project`, `unknown_task`, `malformed`) escalates after a grace period. See the Task Routing section of `CLAUDE.md` for the full dispatch policy.
+A qualified `depends_on` (containing `:`) is routed to `metadata.external_deps` on the dependent task rather than the integer `dependencies` table. The foreign target is not verified at write time. At dispatch time the dependent's scheduler resolves each entry via `get_external_statuses` and gates dispatch until every external dep is `done`. A `cancelled` upstream immediately escalates to a human; a persistently-unresolvable dep (`unknown_project`, `unknown_task`, `malformed`) escalates after a grace period. The full dispatch policy is in `docs/task-authoring.md` §3.2 "Cross-project external dependencies".
 
 Do **not** flip anything to `pending` until every edge is in. A partially-wired batch with some tasks already `pending` lets the scheduler grab a leaf whose real prereq hasn't been wired yet.
 
@@ -189,10 +189,10 @@ This stamping is live in `commit_planning` (landed via task 2578, live since 202
 ### Step 6 — Verify
 
 ```
-mcp__fused-memory__get_tasks(project_root="<project_root>")
+mcp__fused-memory__get_task(id="<id>", project_root="<project_root>")
 ```
 
-Confirm every batch task shows up as `pending`, with the expected dependencies and metadata. Print a summary table:
+Call it once for each id in the batch. Confirm every batch task shows up as `pending`, with the expected dependencies and metadata. Print a summary table:
 
 | PRD label | Task ID | Title | Prereqs | Observable signal |
 |---|---|---|---|---|

@@ -890,6 +890,20 @@ class TestPoolStorageAbsentEscalationHelperAndResolver:
             'expected no open L1 after resolve'
         )
 
+    async def test_resolve_classifies_a_parked_record(self, tmp_path: Path):
+        """A watcher's park promotes the L1 to level 2, whose close must be classified."""
+        harness, queue = _make_harness_with_queue(tmp_path)
+        harness._file_pool_storage_absent_escalation()
+        (l1,) = queue.get_by_task(Harness._POOL_STORAGE_ABSENT_SENTINEL, status='pending')
+        queue.park(l1.id, 'parked for a human')
+
+        await harness._resolve_pool_storage_absent_escalation()
+
+        closed = queue.get(l1.id)
+        assert closed is not None
+        assert closed.status != 'pending'
+        assert closed.resolution_class is not None
+
 
 @pytest.mark.asyncio
 class TestWarmLaneGcPassNoEscalationWhenPoolNotInUse:

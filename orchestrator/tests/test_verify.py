@@ -2375,6 +2375,7 @@ class TestExtractTestIdsFromJunit:
         assert ids == (
             ['tests.test_sample::test_error', 'tests.test_sample::test_fail'],
             ['tests.test_sample::test_skip'],
+            4,
         ), ids
         assert ids is not None
         assert verify._extract_failing_test_ids_from_junit(tmp_path / 'junit.xml') == ids.failing
@@ -2387,7 +2388,7 @@ class TestExtractTestIdsFromJunit:
             self._suite('<testcase classname="tests.test_sample" name="test_pass" />'),
         )
 
-        assert ids == ([], [])
+        assert ids == ([], [], 1)
 
     def test_xfail_ran_so_it_is_not_skipped(self, tmp_path: Path):
         """pytest writes an xfail as ``<skipped type="pytest.xfail">``
@@ -2405,7 +2406,7 @@ class TestExtractTestIdsFromJunit:
             ),
         )
 
-        assert ids == ([], ['t::test_skip']), ids
+        assert ids == ([], ['t::test_skip'], 2), ids
 
     def test_strict_xpass_ran_so_it_is_not_skipped(self, tmp_path: Path):
         """A strict XPASS is written as an UNTYPED ``<skipped>`` with a fixed
@@ -2421,7 +2422,7 @@ class TestExtractTestIdsFromJunit:
             ),
         )
 
-        assert ids == ([], ['t::test_module']), ids
+        assert ids == ([], ['t::test_module'], 2), ids
 
     def test_a_testcase_with_a_failure_is_failing_whatever_else_it_records(
         self, tmp_path: Path,
@@ -2437,7 +2438,7 @@ class TestExtractTestIdsFromJunit:
             ),
         )
 
-        assert ids == (['t::test_both'], []), ids
+        assert ids == (['t::test_both'], [], 1), ids
 
     def test_bare_testsuite_root_is_handled(self, tmp_path: Path):
         """A writer that omits the ``<testsuites>`` wrapper must not yield an
@@ -2451,7 +2452,7 @@ class TestExtractTestIdsFromJunit:
             '</testcase></testsuite>\n',
         )
 
-        assert ids == ([], ['tests.test_sample::test_skip'])
+        assert ids == ([], ['tests.test_sample::test_skip'], 1)
 
     def test_both_vectors_share_the_classname_file_name_id_fallback(self, tmp_path: Path):
         """The vectors are set-differenced against each other downstream, so
@@ -2465,7 +2466,7 @@ class TestExtractTestIdsFromJunit:
             ),
         )
 
-        assert ids == (['test_bare'], ['tests/test_x.py::test_by_file']), ids
+        assert ids == (['test_bare'], ['tests/test_x.py::test_by_file'], 2), ids
 
     def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
         ids = self._parse(
@@ -2479,7 +2480,7 @@ class TestExtractTestIdsFromJunit:
             '</testsuites>\n',
         )
 
-        assert ids == ([], ['tests.test_sample::test_skip'])
+        assert ids == ([], ['tests.test_sample::test_skip'], 2)
 
     def test_nonexistent_path_returns_none(self, tmp_path: Path):
         """No junit collected — the B3 degrade signal, and NOT ``([], [])``,
@@ -2715,7 +2716,9 @@ class TestVerifyResultSkippedTestIds:
         failing_sentinel = ['sentinel::failing']
         skipped_sentinel = ['sentinel::skipped']
         parser = MagicMock(
-            return_value=verify._JunitTestIds(failing=failing_sentinel, skipped=skipped_sentinel),
+            return_value=verify._JunitTestIds(
+                failing=failing_sentinel, skipped=skipped_sentinel, testcases=2,
+            ),
         )
 
         with (
@@ -2755,7 +2758,7 @@ class TestVerifyResultSkippedTestIds:
         )
         parser = MagicMock(
             return_value=verify._JunitTestIds(
-                failing=['sentinel::failing'], skipped=['sentinel::skipped'],
+                failing=['sentinel::failing'], skipped=['sentinel::skipped'], testcases=2,
             ),
         )
 

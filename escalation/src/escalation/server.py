@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypeVar, assert_never, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
@@ -34,7 +34,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
-from shared.merge_state import MergeReason, MergeState
+from shared.merge_state import CANCEL_STATES, MergeReason, MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.uuid_prefix_guard import (
@@ -99,7 +99,12 @@ from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
 from escalation.policy_gate import identity_resolve_refusal, perform_claim, queue_kind_of
 from escalation.project_root_guard import ProjectRootGuard
-from escalation.queue import AmendmentOutcome, EscalationQueue, blank_resolve_outcome
+from escalation.queue import (
+    AmendmentOutcome,
+    EscalationQueue,
+    ResolutionClassRequired,
+    blank_resolve_outcome,
+)
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
@@ -1292,6 +1297,26 @@ def _render_store_identity_block(identity: StoreIdentity) -> str:
     )
 
 
+_CANCEL_STATES_PLACEHOLDER = '{CANCEL_STATES}'
+_CANCEL_STATES_WIRE_LIST = ' | '.join(
+    f"'{state}'" for state in MergeState if state in CANCEL_STATES
+)
+
+_Fn = TypeVar('_Fn', bound=Callable[..., Any])
+
+
+def _render_cancel_states(fn: _Fn) -> _Fn:
+    """Write the CANCEL_STATES wire list into *fn*'s docstring, before FastMCP reads it.
+
+    ``str.replace``, never ``str.format``: the docstring holds other braces.
+    """
+    doc = fn.__doc__ or ''
+    if _CANCEL_STATES_PLACEHOLDER not in doc:
+        raise ValueError(f'{fn.__qualname__}: no {_CANCEL_STATES_PLACEHOLDER} in its docstring')
+    fn.__doc__ = doc.replace(_CANCEL_STATES_PLACEHOLDER, _CANCEL_STATES_WIRE_LIST)
+    return fn
+
+
 def create_server(
     queue: EscalationQueue,
     merge_queue: asyncio.Queue | None = None,
@@ -2430,6 +2455,7 @@ def create_server(
         escalate_model: bool = False,
         recut: bool = False,
         terminate: Any = None,
+        ruled_by_human: bool | None = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation.
 
@@ -2538,6 +2564,18 @@ def create_server(
         same code, also with no record change. Written only at resolution —
         never author-supplied otherwise. Not forwarded to the ``park`` action
         (the record stays open at L2, unclassified until eventually resolved).
+        A level-2 close with neither this class nor a non-null resolver default
+        returns ``{'error': ..., 'code': 'resolution_class_required'}`` and
+        changes nothing (plans/instruments-honesty-prd.md decision 8).
+
+        ``ruled_by_human`` is the caller's assertion that a human ruled on THIS
+        record or its sitting docket item and the ``resolution`` text cites
+        that ruling (plans/instruments-honesty-prd.md decision 9). It is stamped
+        on the record and inherited by every cascade member, and not forwarded
+        to ``park``. An identity in ``authority.RULED_BY_HUMAN_FORBIDDEN`` (the
+        executor, the auto-watcher) asserting True gets
+        ``ruled_by_human_forbidden``. Header-less callers are trusted, as for
+        ``resolved_by``; the decision-stream audit checks their assertions.
 
         **A resolve on an ALREADY-AUTO-DISMISSED record does NOT take effect**
         (task 4495).  ``queue.resolve``'s status check is an atomic
@@ -2606,15 +2644,16 @@ def create_server(
         (``invalid_resolution_class``, ``recut_requires_restart``) → the
         connection-capability gate
         (``bad_capability_header`` / ``level_forbidden``) → the policy-table
-        identity gate (``resolution_class_required`` /
-        ``policy_state_unreadable`` / ``level_forbidden`` /
-        ``claimed_by_executor``) → this Table B
+        identity gate (``ruled_by_human_forbidden`` /
+        ``resolution_class_required`` / ``policy_state_unreadable`` /
+        ``level_forbidden`` / ``claimed_by_executor``) → this Table B
         legality gate (``illegal_transition``) → the park-on-info gate
         (``park_on_info``, via ``_park_on_info_refusal``; ``park`` only, on an
         info-severity target, because an info record never pins its task,
         pins.py link 1) → park's early return → the declared-pin gate
-        (``declared_pin_refused``). A caller failing several gates receives the
-        earliest one's error. None of these gates mutates the record, so the
+        (``declared_pin_refused``) → the level-2 class refusal
+        (``resolution_class_required``), raised inside ``queue.resolve``. A
+        caller failing several gates receives the earliest one's error. None of these gates mutates the record, so the
         ordering is an error-reporting precedence only, not a correctness
         difference.
 
@@ -2817,8 +2856,8 @@ def create_server(
             }
         if (refusal := identity_resolve_refusal(
             identity, rec, action=action, resolution=resolution,
-            resolution_class=resolution_class, queue_dir=queue.queue_dir,
-            queue_kind=queue_kind, now=datetime.now(UTC),
+            resolution_class=resolution_class, ruled_by_human=ruled_by_human,
+            queue_dir=queue.queue_dir, queue_kind=queue_kind, now=datetime.now(UTC),
         )) is not None:
             return refusal
         if identity is not None:
@@ -2937,15 +2976,19 @@ def create_server(
 
         dismiss = action in _DISMISS_ACTIONS
         resolve_outcome = blank_resolve_outcome()
-        esc = queue.resolve(
-            escalation_id, resolution, dismiss=dismiss,
-            resolved_by=resolved_by, resolution_turns=resolution_turns,
-            resolution_class=resolution_class,
-            granted_files=granted_files,
-            resolution_action=action,
-            recut=recut,
-            outcome=resolve_outcome,
-        )
+        try:
+            esc = queue.resolve(
+                escalation_id, resolution, dismiss=dismiss,
+                resolved_by=resolved_by, resolution_turns=resolution_turns,
+                resolution_class=resolution_class,
+                granted_files=granted_files,
+                resolution_action=action,
+                recut=recut,
+                outcome=resolve_outcome,
+                ruled_by_human=ruled_by_human,
+            )
+        except ResolutionClassRequired as exc:
+            return {'error': str(exc), 'code': exc.code}
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
 
@@ -5827,6 +5870,7 @@ def create_server(
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
     @mcp.tool()
+    @_render_cancel_states
     async def merge_cancel(request_id: str) -> dict[str, Any]:
         """Cancel an in-flight merge request by its request_id.
 
@@ -5840,16 +5884,8 @@ def create_server(
                                 state verbatim, including its deliberate
                                 forward-compatible passthrough of an unmapped worker
                                 state (escalation/src/escalation/server.py::_map_live_state).
-                                merge-state-vocab:begin partition=CANCEL_STATES
-                                'queued' | 'verifying' | 'gate' | 'finalizing' |
-                                'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' |
-                                'no_record' | 'stale_record' | 'journaled' | 'unknown'
-                                merge-state-vocab:end
-                                Source of truth: shared/src/shared/merge_state.py::CANCEL_STATES.
-                                The span above is machine-pinned to it by
-                                scripts/tests/test_merge_state_vocabulary_consistency.py
-                                (the CONTRIBUTING.md lint-command-mirror convention) — edit
-                                the partition, not this list.
+                                {CANCEL_STATES}
+                                Rendered at import from shared/src/shared/merge_state.py::CANCEL_STATES.
             reason    (str|None) — None on success; non-None string on every other path.
             code      (str)   — the lane's refusal, a MergeCancelRefusal value
                                 ('not_live' | 'finalize_window' | 'train_cancel_unsupported').

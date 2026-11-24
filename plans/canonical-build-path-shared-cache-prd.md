@@ -262,7 +262,21 @@ Exit 126 means "this command cannot run in the mode its build directory requires
   its device and inode equal the worktree root's. Then change directory to
   `CANON/<path relative to the worktree root>`.
 - Otherwise: `/usr/bin/bwrap --dev-bind / / --bind <worktree root> CANON --chdir CANON/<relative>
-  --die-with-parent`, with the outer process's working directory left at the real path.
+  --die-with-parent --info-fd <fd>`, with the outer process's working directory left at the real path.
+  The outer process does not exec bwrap. It stays resident as bwrap's parent, in the caller's process
+  group, and exits with bwrap's status (the command's status, or 128+N for signal N).
+- Signals at the namespace boundary (ruled by Leo 2026-11-23, esc-10418-3, reify task 10418). bwrap is
+  started with TERM, INT and HUP ignored, except a signal the caller already ignored, which stays ignored.
+  Inside, the command runs under `/usr/bin/env --default-signal=<those signals> --`, so it gets the
+  caller's dispositions back. The outer process forwards TERM, INT and HUP to the `child-pid` bwrap writes
+  to the info fd, through a pidfd. A signal that arrives before the pid is known is delivered once it is.
+  The rule: entering the namespace is invisible to whoever kills the command. On every kill path (TERM or
+  INT to the started pid, TERM or INT to its process group, TERM to each descendant, SIGKILL to the pid
+  or the group), the command's own trap runs, or nothing survives, exactly as in real-path mode. A plain
+  exec of bwrap fails this: bwrap dies of the signal and its parent-death signal SIGKILLs the command
+  mid-trap (measured, bwrap 0.9.0). There is one signal policy, in canon_cache.py's supervisor. The
+  namespace parent reuses its forwarder, and the supervisor never leaves the command ignoring a signal
+  the caller did not ignore.
 - `PWD` is set to the new working directory. Arguments and `CARGO_*` values that are paths under the
   worktree's real root are rewritten to CANON (`--manifest-path`, `--target-dir`, `CARGO_TARGET_DIR`).
 - Exported for the command: `REIFY_CANON_ACTIVE` (the tree's device and inode), and
@@ -368,8 +382,12 @@ yaml and never carried in `verify_env`, which the workstation copies to the lapt
   file, that directory is removed first and the fact is logged.
 - **Sandboxed agent launches** (`agents/sandbox_dispatch.py::wrap_command`, reached from
   `agents/invoke.py::_sandbox_wrap`): when `build_canon.root` is set, the command is prefixed, before the
-  landlock helper, with `/usr/bin/bwrap --dev-bind / / --bind <lane> <root> --die-with-parent`. The
-  session's working directory and write-set are unchanged. A bwrap that fails is a failed launch.
+  landlock helper, with `/usr/bin/bwrap --dev-bind / / --bind <lane> <root>`. The session's working
+  directory and write-set are unchanged. A bwrap that fails is a failed launch. There is no
+  `--die-with-parent` (ruled by Leo 2026-11-23, esc-10418-3). Agent sessions are always stopped by their
+  process group (`shared/cli_invoke.py`: TERM to the group, a grace period, then SIGKILL), and bwrap stays
+  in that group. So the session gets TERM directly, as an unwrapped landlock launch does today. Adding the
+  flag would SIGKILL it as soon as bwrap died of that same TERM.
 - **All agent launches** (`workflow.py::TaskWorkflow._build_agent_env`): `PATH` as above.
 - `verify.py::run_main_tip_sweep`'s vanished-worktree detection also recognises `build_canon.root` in error
   text, since compiler errors name CANON for a leg that ran there.
@@ -505,6 +523,7 @@ compiling a C file through `cc`. No row asserts a wall-clock bound.
 | 23 | DF | results in order: 2 degraded; a third; a healthy one; with the L1 closed by hand, 2 more degraded; 10 consecutive; neutral results interleaved; a `real_path` result with and without `expect_canon`; a `read_only_server` result; a `backend none` result under `incremental` policy | L1 at the second; nothing at the third; cleared by the healthy one; refiled; L2 at the tenth with the L1 superseded; neutral changes nothing; `real_path` is degraded only with `expect_canon`; read-only is degraded; `none` under `incremental` is healthy |
 | 24 | DF | a result with `build_cache` `None` | neutral; no observation row |
 | 25 | DF | the lane alarm of the task-verify-lanes PRD after the ladder is extracted | that PRD's own boundary row 20 passes unchanged |
+| 26 | reify | a command at CANON entered through the namespace (C3), whose TERM/INT trap takes 0.3 s; TERM and INT to the started pid and to its group, TERM to each descendant, SIGKILL to the pid and to the group | after a TERM or INT, the trap completes and its status is returned; after a SIGKILL, nothing the command started remains (reify task 10418) |
 
 ## 7. Pre-conditions
 

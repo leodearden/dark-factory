@@ -485,7 +485,7 @@ class TestHeldPhases:
             for r in caplog.records
         )
 
-        queue.resolve(esc_id, 'done write had landed')
+        queue.resolve(esc_id, 'done write had landed', resolution_class='actionable')
         await settler.settle_pass()
 
         assert _phases_written(store) == ['done']
@@ -566,6 +566,6 @@ class TestHeldPhases:
         await settler.settle_pass()
         assert _phases_written(store) == ['failed', 'escalated']
 
-        queue.resolve(esc_id, 'restarted by hand')
+        queue.resolve(esc_id, 'restarted by hand', resolution_class='actionable')
         await settler.settle_pass()
         assert _phases_written(store) == ['failed', 'escalated', 'done']

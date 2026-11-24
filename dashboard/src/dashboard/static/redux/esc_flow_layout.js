@@ -34,10 +34,12 @@ const OTHER_SOURCE = 'other';
 // Canonical resolver-tier display order — duplicated (not imported) from
 // tab_escalation_analytics.jsx's `_RESOLVER_TIERS`: this module must stay
 // Babel/JSX-free and runnable under plain `node --test`, so it cannot import
-// from a .jsx file. A tier outside this list still gets its own node (sorted
+// from a .jsx file. Both mirror escalation/src/escalation/classify.py::RESOLVER_TIERS
+// (dashboard/tests/test_resolver_tier_vocabulary_mirror.py checks each).
+// A tier outside this list still gets its own node (sorted
 // alphabetically after the canonical ones) — only the origin column folds
 // low-volume entries into a shared 'other' bucket; tiers are never folded.
-const TIER_ORDER = ['human', 'cascade', 'auto-watcher', 'steward', 'reaper-sweep', 'unknown', 'other-auto'];
+const TIER_ORDER = ['human-ruled', 'attended-seat', 'cascade', 'auto-watcher', 'steward', 'reaper-sweep', 'unknown', 'other-auto'];
 const CLASS_ORDER = ['benign', 'actionable'];
 
 function sortByCanonicalThenAlpha(ids, canonicalOrder) {

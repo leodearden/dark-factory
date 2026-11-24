@@ -7,7 +7,7 @@ reviewer panel's ``output_schema``/``json.loads`` fallback in
 ``TaskArtifacts.read_verdict(role.name)`` — the same
 clear→invoke→read→defensive-extract→fail-safe shape task 2483 (PRD task γ)
 established for the merger (see ``test_merger_disposition_verdict.py``) — and
-removes the reviewer's now-inert ``mcp__jcodemunch__*`` grant (fold-in κ).
+removes the reviewer's now-inert grant outside its verdict server (fold-in κ).
 
 ``TestRunReviewerVerdictRouting`` cases (a)-(b) (PASS / ISSUES_FOUND payloads
 returned verbatim) fail against the pre-δ structured_output/json.loads
@@ -62,9 +62,10 @@ from orchestrator.workflow_types import RequeueKind, classify_failure
 class TestReviewerGrantSurface:
     """Structural contract for the reviewer's tool grants (fold-in κ)."""
 
-    def test_no_jcodemunch_grant(self):
-        """The reviewer's inert jcodemunch grant has been removed."""
-        assert 'mcp__jcodemunch__*' not in REVIEWER_COMPREHENSIVE.allowed_tools
+    def test_only_mcp_grant_is_verdict_tools(self):
+        """The reviewer's whole MCP grant surface is its verdict server."""
+        mcp_grants = [t for t in REVIEWER_COMPREHENSIVE.allowed_tools if t.startswith('mcp__')]
+        assert mcp_grants == ['mcp__verdict-tools__*']
 
     def test_has_verdict_tools_grant(self):
         """The verdict-tools grant (added by β/task 2482) is present."""

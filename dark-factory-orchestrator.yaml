@@ -1594,6 +1594,12 @@ merge_train_max_members: 3
 # serialized), accepted against the oversubscription-flake churn it removes.
 merge_verify_max_concurrent_modules: 1
 
+# Verify-result cache in log mode for both roles: plans/verify-result-cache-prd.md § Modes and rollout, A3.
+# The code default stays off; merge 'on' waits for epsilon (task 5655).
+verify_cache:
+  task_mode: log
+  merge_mode: log
+
 # ── Lever C (multi-host post-merge verify): laptop runner, prefer_remote ──────
 # ENABLED 2026-09-30 (task 5053 = D1; plans/merge-lane-throughput-prd.md). leo-laptop
 # joins this project's merge-verify pool. It takes effect at the next orchestrator
@@ -1756,6 +1762,14 @@ git:
     - name: warm-lane-bash
       command: "uv run pytest -m warm_lane_bash"
       cwd: "orchestrator"
+      fix_task_priority: "high"
+    # The verify-result cache audit (plans/verify-result-cache-prd.md § Audit, task 5655).
+    # PROJECT_ROOT points the head's own config at the lane worktree, so the
+    # audited module set is the head's. DF_VERIFY_CACHE=off forces both roles'
+    # cache modes off (A3). Its red handler is verify_cache/audit_hook.py.
+    - name: verify-cache-audit
+      command: 'DF_VERIFY_CACHE=off PROJECT_ROOT="$PWD" uv run --project orchestrator orchestrator verify-cache audit-run --config dark-factory-orchestrator.yaml'
+      cwd: "."
       fix_task_priority: "high"
 
 # Variable-depth speculative verify placement (task 2359) — ACTIVATE the deep

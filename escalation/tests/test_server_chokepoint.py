@@ -4394,6 +4394,7 @@ class _RaceQueue(EscalationQueue):
             'Auto-dismissed: stale L0 swept on requeue',
             dismiss=True,
             resolved_by='orchestrator-auto-dismiss',
+            resolution_class='benign',
         )
         return esc_id
 

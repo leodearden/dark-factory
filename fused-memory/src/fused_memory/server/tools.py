@@ -262,6 +262,7 @@ from fused_memory.services.read_telemetry import (
 )
 from fused_memory.services.supersession_mark import mark_superseded
 from fused_memory.utils.clip_disclosure import truncation_fields
+from fused_memory.utils.mem0_content_keys import payload_without_text
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     canonicalize_project_id,
@@ -4594,6 +4595,13 @@ def create_mcp_server(
             a top-level hit.  A record that is neither a child nor has children
             carries no 'grouped' key at all.
 
+            ATTRIBUTION (task 3137).  Every top-level result carries 'agent_id' (the writer),
+            'task_id' (the writer's metadata task_id, as a string) and 'project_id' (the
+            project scope the record is STORED under) beside 'created_at', each null when the
+            store recorded none.  Graphiti results never carry agent_id or task_id.  project_id
+            is the storage scope, not the origin: a rehomed record's origin is still read from
+            metadata.src_project.  Nested 'grouped' entries do not carry these keys.
+
             TOPIC-PINNED RESULTS (task 3111).  Every result carries a
             'topic_anchored' bool.  When True, that result was PROMOTED into
             the window BY RULE rather than earned its place by rank: when a
@@ -4903,7 +4911,7 @@ def create_mcp_server(
         needles: list[str] | None = None,
         filters: dict | None = None,
         exhaustive: bool = False,
-        limit: int | None = None,
+        limit: int | None = 1000,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Scan memory TEXT for literal substrings (deterministic substring match, not semantic).
@@ -4917,24 +4925,31 @@ def create_mcp_server(
         records returned ZERO, and the corpus was structurally unsweepable until this
         tool existed (task 3083).
 
-        Every record returned by the store-side prefilter is RE-VERIFIED in Python
-        with the shared detector (``fused_memory.utils.toolcall_xml_leak``), which is
-        the authoritative verdict — the prefilter is a speed optimisation only.
+        Every walked record is judged in Python, and that is the authoritative
+        verdict: a literal, case-sensitive substring match of your *needles* when
+        given, else the shared tool-call-leak detector
+        (``fused_memory.utils.toolcall_xml_leak``). The store-side prefilter is a
+        speed optimisation only, and it reads only the ``data`` text key. With
+        custom *needles*, a prefiltered scan is complete only while ``data``
+        carries no text index (an index makes the prefilter match whole tokens and
+        skip mid-word needles); ``exhaustive=True`` does not depend on it.
 
         **Mem0/Qdrant-only scope:** This tool scans only memories stored in the
         Mem0/Qdrant backend (categories: observations_and_summaries,
         preferences_and_norms, procedural_knowledge). It does NOT scan Graphiti
         episodes or edges; a leaked episode must be found and remediated separately.
 
-        **No silent caps:** the walk paginates to the end of the collection. When an
-        explicit *limit* stops it early, the response self-discloses this via
-        ``truncated`` (bool) alongside ``scanned`` (the number of records actually
-        examined, and the correct denominator for an incidence rate).
+        **No silent caps:** the walk stops after *limit* records (default 1000,
+        matching ``get_memories_by_metadata``); pass ``limit=null`` to walk to the end
+        of the collection. When the limit stops it early, the response self-discloses
+        this via ``truncated`` (bool) alongside ``scanned`` (the number of records
+        actually examined, and the correct denominator for an incidence rate).
 
-        Example call:
+        Example call (a whole-collection incidence walk):
             scan_memory_content(
                 project_id="dark_factory",
                 exhaustive=True,
+                limit=None,
             )
 
         This tool is intentionally read-only and is NOT included in any DISALLOW_*
@@ -4943,21 +4958,31 @@ def create_mcp_server(
 
         Args:
             project_id: Project scope (required)
-            needles: Literal substrings for the store-side prefilter. Omit (None) to
-                use the shared tool-call-leak sentinels. Ignored when *exhaustive*.
+            needles: Literal substrings to find; a record matches when its text
+                contains one. They also drive the prefilter, which *exhaustive*
+                skips. Omit (None) to scan for the shared tool-call-leak sentinels.
+                An empty-string needle is rejected, since every record contains it.
             filters: Optional exact metadata key-value pairs narrowing the scan
                 (e.g. {'category': 'procedural_knowledge'}). Applies in both modes.
             exhaustive: Skip the prefilter and walk every record. Slower, but the
-                answer then depends on nothing but the Python detector — use this
-                when establishing a true incidence rate.
-            limit: Maximum records to WALK (default: no limit).
+                answer then depends on nothing but the Python verdict, and it also
+                sees text under the ``memory``/``content`` fallback keys — use this
+                when establishing a true incidence rate or a complete literal hunt.
+            limit: Maximum records to WALK (default 1000). ``null`` walks to the end;
+                an early stop is disclosed by ``truncated``.
 
         Returns:
             {'matches': [{'id', 'created_at', 'matched_fragments', 'excerpt',
             'metadata'}, ...], 'scanned': int, 'truncated': bool, 'exhaustive': ...,
             'limit': ..., 'project_id': ...} on success, or {'error': ...,
             'error_type': ...} on failure. An empty ``matches`` list is a SUCCESSFUL
-            scan of a clean corpus, not an error.
+            scan of a clean corpus, not an error. A match's ``excerpt`` is a
+            fixed-width window of its text
+            (``fused_memory/backends/mem0_client.py::_EXCERPT_LEN`` characters)
+            centred where the earliest matched fragment begins, with ``…`` marking
+            each elided side. Its ``metadata``
+            omits the text keys (``data``/``memory``/``content``);
+            ``get_memory_by_id`` returns the full body.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
@@ -4972,7 +4997,10 @@ def create_mcp_server(
             limit=limit,
         )
         return {
-            'matches': result.get('matches', []),
+            'matches': [
+                {**match, 'metadata': payload_without_text(match.get('metadata') or {})}
+                for match in result.get('matches', [])
+            ],
             'scanned': result.get('scanned', 0),
             'truncated': result.get('truncated', False),
             'exhaustive': exhaustive,
@@ -9250,10 +9278,12 @@ def create_mcp_server(
             release_holder: Must be the literal ``true`` for a follow-up holder to go
                 ``done``, ``cancelled`` or ``deferred``; without it that write is refused
                 ``followup_holder_protected`` with the holder's ``held_count``. Releasing the
-                holder releases every held follow-up at once, so it is a human act. Until
-                promotion lands (task 8418), a cancel-release also files one L1 escalation
-                per held follow-up while the orchestrator is live, or blocks each one when
-                it is stopped. Ignored on any other task. See docs/task-authoring.md §3.4.
+                holder releases every held follow-up at once, so it is a human act: each one
+                is promoted by human, with one ``followup_promoted`` event apiece, before
+                targeted reconciliation runs. A promotion failure after the status write is
+                reported in ``post_write_warnings``; passing it again on a holder already at
+                that status releases whatever is still held. Ignored on any other task. See
+                docs/task-authoring.md §3.4.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -10872,8 +10902,14 @@ def create_mcp_server(
 
         ``depends_on`` accepts two forms:
 
-        - **Bare integer** (e.g. ``"5"``): issues an unconditional ``DELETE``
-          from the integer ``dependencies`` table — the original behavior.
+        - **Bare integer** (e.g. ``"5"``): deletes the edge from the integer
+          ``dependencies`` table. One exception: removing a held follow-up's
+          holder edge is a human promotion (``by='human'``,
+          ``ref='remove_dependency'``) that also promotes the task's held
+          dependencies; the result then carries ``promoted`` (the promoted ids),
+          and a registered promotion guard can refuse it with error
+          ``followup_promotion_deferred``, nothing written. See
+          docs/task-authoring.md §3.4.
         - **Qualified** (e.g. ``"dark_factory:13"``): removes the canonical
           entry from the dependent task's ``metadata.external_deps`` list.
           ``'-'`` in the project_id is normalised to ``'_'``.  Idempotent —

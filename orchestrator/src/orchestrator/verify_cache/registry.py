@@ -207,7 +207,7 @@ class Registry:
         return await self._call(_policy_state)
 
     async def write_policy_state(self, state: PolicyState) -> None:
-        """Replace the policy row. The only sanctioned writer is the audit's apply step (I5)."""
+        """Replace the policy row. The sanctioned writers are verify_cache/audit.py::apply and ::enable (I5)."""
         await self._call(lambda conn: _write_policy_state(conn, state))
 
     async def summary(self) -> RegistrySummary:

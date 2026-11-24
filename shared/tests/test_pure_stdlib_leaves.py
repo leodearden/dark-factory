@@ -114,6 +114,7 @@ PURE_STDLIB_LEAVES = (
     'task_timestamp',
     'task_transitions',
     'tasks_db_readonly',
+    'testing_ceiling_anchors',
     'testing_fake_claude',
     'testing_fake_clock',
     'testing_mcp_stub',

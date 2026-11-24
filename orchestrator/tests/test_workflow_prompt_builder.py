@@ -68,6 +68,7 @@ def _make_workflow(tmp_path: Path, *, event_store: _RecordingEventStore | None =
     git_ops = MagicMock()
     git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     git_ops.get_commit_subjects = AsyncMock(return_value=[])
+    git_ops.own_delta_cut = AsyncMock(return_value=None)
 
     briefing = MagicMock()
 

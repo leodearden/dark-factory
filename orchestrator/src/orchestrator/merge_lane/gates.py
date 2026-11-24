@@ -50,6 +50,8 @@ from orchestrator.merge_lane.types import (
 )
 from orchestrator.rebase_drops import DroppedCommit, RebaseDropLedger
 from orchestrator.verify import VerifyResult, run_verification
+from orchestrator.verify_evidence import GREEN_OUTCOMES, Leg, module_leg_name, units_from_wire
+from orchestrator.verify_plan import full_suite_type_check_modules, merge_breadth_is_full
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -88,6 +90,7 @@ async def _run_unscoped_typechecks(
     *,
     block_on_timeout: bool,
     task_id: str | None = None,
+    executed: VerifyResult | None = None,
 ) -> PostMergePyrightResult:
     """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
 
@@ -105,12 +108,19 @@ async def _run_unscoped_typechecks(
             When ``False``, a timed-out module is appended only to
             ``timed_out_subprojects`` (fail-open, for the post-advance check).
         task_id: Optional task identifier for log messages.
+        executed: The scoped verify this gate follows (pre-advance only). At
+            breadth ``'full'`` a module it already type-checked green is not
+            re-run; see :func:`_type_covered_modules`.
 
     Returns:
         :class:`PostMergePyrightResult` with the classification of each
         module's type-check outcome.
     """
-    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    covered = _type_covered_modules(executed, config)
+    active = [
+        mc for mc in module_configs
+        if mc.type_check_command is not None and mc.prefix not in covered
+    ]
     if not active:
         return PostMergePyrightResult()
 
@@ -156,6 +166,24 @@ async def _run_unscoped_typechecks(
         timed_out_subprojects=timed_out_subprojects,
         detail=detail,
     )
+
+
+def _type_covered_modules(executed: VerifyResult | None, config: OrchestratorConfig) -> frozenset[str]:
+    """The modules whose unscoped pyright *executed* already ran green, or replayed.
+
+    Task 5294: the gate consults what the scoped leg ran rather than handing
+    ``LocalRunner`` a second module set (INV-5). Only breadth ``'full'``
+    consults, so ``'scoped'`` is unchanged. A module counts when the executed
+    plan holds a FULL_SUITE pyright run with a command and its type unit is
+    green; a result without units (an older remote) is decided by its plan.
+    """
+    if executed is None or not merge_breadth_is_full(config):
+        return frozenset()
+    planned = full_suite_type_check_modules(executed.plan)
+    if executed.units is None:
+        return planned
+    green = {unit.unit for unit in units_from_wire(executed.units) if unit.outcome in GREEN_OUTCOMES}
+    return frozenset(prefix for prefix in planned if module_leg_name(prefix, Leg.TYPE) in green)
 
 
 def _elapsed_ms(start: float | None) -> int | None:
@@ -371,7 +399,8 @@ class PlanFilesTouchedResult:
             entry is untouched is told by the fields below: a stale path
             (``missing_from_tree``) or a change a rebase dropped
             (``dropped_by_rebase``) is not under-delivery; an entry in
-            neither is.
+            neither class is unexplained by the gate, not proven
+            under-delivery.
         missing_from_tree: Declared entries that do NOT exist in the branch
             tree at ``branch_head`` and for which no rename resolved.
             ALWAYS a subset of ``not_touched`` (a stale entry is reported in
@@ -436,8 +465,9 @@ which is the human-judgement case the gate was built for)."""
 PLAN_FILES_NOT_TOUCHED_REASON_PREFIX = 'Plan files not touched by branch'
 """Prefix of the ``MergeOutcome.reason`` string emitted by the pre-merge
 Decision-1 check.  When the architect declared specific plan files but
-the branch's history (``base..HEAD``) doesn't touch them, the implementation
-hasn't actually delivered against the plan — short-circuit straight to L1
+the branch's own-work range (``base..HEAD``) does not touch them, the gate
+reports that as a measurement, not a verdict on why (see
+:func:`plan_files_not_touched_reason`) — short-circuit straight to L1
 without involving the steward (mutating plan.json to silence the gate
 would defeat its purpose)."""
 
@@ -472,7 +502,15 @@ def _unwritten_clause(entries: list[str]) -> str:
     return (
         f'The architect declared these files but no commit on the branch '
         f'touched them: {", ".join(entries)}.  '
-        f'Implementation has not delivered against the plan.  '
+        'That is what was measured; it does not establish why.  '
+        'Two common causes: the declared work is missing, or the file was '
+        'correctly declared and legitimately needed no change.  '
+        "To tell them apart, check whether each file relates textually to the "
+        "task's subject, whether the branch touched sibling files in the same "
+        'directory, whether the declared path still exists at branch HEAD, and '
+        "whether the branch's own commits are already ancestors of main "
+        '(git merge-base --is-ancestor <commit> main), meaning the work '
+        'already landed.  '
     )
 
 

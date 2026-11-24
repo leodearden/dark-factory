@@ -80,6 +80,8 @@ from fused_memory.models.memory import (
     EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
+    graphiti_hit_attribution,
+    mem0_hit_attribution,
     render_add_memory_message,
 )
 from fused_memory.models.reconciliation import (
@@ -186,6 +188,7 @@ from fused_memory.services.write_journal import (
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
+from fused_memory.utils.mem0_content_keys import mem0_payload_text
 from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentSet,
@@ -303,45 +306,16 @@ _DEPENDENCY_FACT_RE = re.compile(r'\bdepends on\b', re.I)
 # dedup/no-op.
 _MEM0_ADD_INFER_PINNED_FALSE = True
 
-# Canonical order for extracting a memory's human-readable content string from a
-# raw Qdrant payload: mem0 stores the verbatim content under 'data', but older
-# / alternately-written points use 'memory' or 'content'. First non-empty string
-# wins. Kept package-internal here (a deliberate minor duplication of scripts/
-# clear_malformed_empty_memory.py:_CONTENT_KEYS and audit_duplicate_memories.py)
-# rather than importing from scripts/, so the service has no scripts/ dependency.
-_MEM0_CONTENT_KEYS = ('data', 'memory', 'content')
-
-
-def _mem0_content(payload: dict) -> str:
-    """The human-readable text of a RAW Qdrant payload, or ``''``.
-
-    First non-empty string among :data:`_MEM0_CONTENT_KEYS`.  Shared by every
-    caller that turns a raw payload into text — ``get_memory_by_id`` and the
-    topic-anchored pin in :meth:`MemoryService.search` — so the fallback ORDER
-    lives in exactly one place.  A second inline copy of this loop would be a
-    place for the two paths to disagree about which key holds the body (INV-5).
-
-    Note this is the RAW-PAYLOAD path, distinct from the Mem0 *search item*
-    path in ``_search_mem0``: a search item and a scroll payload do not put the
-    text under the same key, which is exactly why guessing one key is wrong.
-    """
-    for key in _MEM0_CONTENT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ''
-
-
 def metadata_row_text(row: Mapping[str, Any]) -> str:
     """The text of one ``get_memories_by_metadata`` row, or ``''``.
 
     That row is ``{'id', 'created_at', 'metadata'}``
     (``backends/mem0_client.py::Mem0Backend._normalise_point``) with no
     top-level text key: the text lives only inside the ``metadata`` payload,
-    where :func:`_mem0_content` owns the key order.
+    read by ``utils/mem0_content_keys.py::mem0_payload_text``.
     """
     payload = row.get('metadata')
-    return _mem0_content(payload) if isinstance(payload, dict) else ''
+    return mem0_payload_text(payload) if isinstance(payload, dict) else ''
 
 
 def _decode_mem0_tombstone(record: ReconLedgerRecord) -> dict | None:
@@ -1595,6 +1569,7 @@ def _graph_search_result(
         )),
         metadata=metadata,
         created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
+        **graphiti_hit_attribution(getattr(edge, 'group_id', None)),
     )
 
 
@@ -7877,12 +7852,13 @@ class MemoryService:
                     # rather than trusting writes to be well-formed.)
                     pinned.insert(pin_at, MemoryResult(
                         id=canonical_id,
-                        content=_mem0_content(payload_meta),
+                        content=mem0_payload_text(payload_meta),
                         category=_mem0_category(custom),
                         source_store=SourceStore.mem0,
                         relevance_score=0.0,
                         metadata=custom,
                         created_at=created_at if isinstance(created_at, str) else None,
+                        **mem0_hit_attribution(managed, custom),
                         topic_anchored=True,
                     ))
                     pin_at += 1
@@ -8104,6 +8080,7 @@ class MemoryService:
                 relevance_score=_rrf_score(rank),
                 metadata=metadata,
                 created_at=item.get('created_at'),
+                **mem0_hit_attribution(item, meta),
             ))
         return results
 
@@ -8616,7 +8593,8 @@ class MemoryService:
         string.
 
         Returns ``{'id', 'content', 'metadata'}`` — where ``content`` is the
-        first non-empty string among the canonical ``_MEM0_CONTENT_KEYS``
+        first non-empty string among the canonical
+        ``utils/mem0_content_keys.py::MEM0_CONTENT_KEYS``
         (``data`` → ``memory`` → ``content``) and ``metadata`` is the FULL
         unprocessed Qdrant payload — or ``None`` on a genuine not-found.
 
@@ -8629,7 +8607,7 @@ class MemoryService:
         payload = await self.mem0.get_point_by_id(memory_id, scope)
         if payload is None:
             return None
-        return {'id': memory_id, 'content': _mem0_content(payload), 'metadata': payload}
+        return {'id': memory_id, 'content': mem0_payload_text(payload), 'metadata': payload}
 
     async def cosine_to_memories(
         self, *, query: str, memory_ids: Sequence[str], project_id: str,

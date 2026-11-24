@@ -159,7 +159,8 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # to the 2026-07-31 measurement) — every tracked path whose final segment
 # contains no '.'.  dark-factory contributes Dockerfile LICENSE pre-commit
 # pre-merge-commit project-checks; reify adds cargo cargo-audit-orphans
-# reference-transaction.  Union = the 8 below.
+# reference-transaction, and sccache (scripts/canon-bin/guard/sccache, reify
+# task 10232, measured on reify main 2026-11-23).  Union = the 9 below.
 #
 # GITLINK EXCLUSION — load-bearing, and a deliberate decision rather than an
 # accident of the sweep: `git ls-files -s` entries with mode 160000 are submodule
@@ -198,8 +199,8 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # Drift guard (this γ copy): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
 # Drift guard (shared copy in shared/locking.py): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
 # Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
-#   sweeps both repos' tracked corpora, so the 9th extension-less file surfaces
-#   as a red test rather than as another LockCharterViolation incident.
+#   sweeps both repos' tracked corpora, so a newly tracked extension-less file
+#   surfaces as a red test rather than as another LockCharterViolation incident.
 # ---------------------------------------------------------------------------
 
 EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset({
@@ -211,6 +212,7 @@ EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset({
     'pre-merge-commit',
     'project-checks',
     'reference-transaction',
+    'sccache',
 })
 
 

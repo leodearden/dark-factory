@@ -17,6 +17,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import DeterministicConfig
 from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 
 # ---------------------------------------------------------------------------
@@ -106,7 +107,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
             mock_dr.return_value = mock_runner
 
-            await harness._run_slot(assignment, _make_sem())
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         # TaskWorkflow must never have been instantiated
         mock_tw.assert_not_called()
@@ -126,7 +127,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
             mock_dr.return_value = mock_runner
 
-            report = await harness._run_slot(assignment, _make_sem())
+            report = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         assert report is not None
         assert report.outcome == WorkflowOutcome.BLOCKED
@@ -146,7 +147,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
             mock_dr.return_value = mock_runner
 
-            report = await harness._run_slot(assignment, _make_sem())
+            report = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         assert report is not None
         assert report.block_reason == 'deterministic_gate'
@@ -166,7 +167,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.DONE)
             mock_dr.return_value = mock_runner
 
-            report = await harness._run_slot(assignment, _make_sem())
+            report = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         assert report is not None
         assert report.outcome == WorkflowOutcome.DONE
@@ -206,7 +207,7 @@ class TestRunSlotRouting:
             mock_wf._steward = None
             mock_tw.return_value = mock_wf
 
-            await harness._run_slot(assignment, _make_sem())
+            await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, _make_sem()))
 
         # DeterministicRunner must NOT have been called
         mock_dr.assert_not_called()

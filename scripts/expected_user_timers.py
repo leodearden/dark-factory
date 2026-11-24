@@ -64,6 +64,7 @@ class ExpectedTimer:
 
 
 EXPECTED_TIMERS: tuple[ExpectedTimer, ...] = (
+    ExpectedTimer('scripts/timeout-headroom-selfcheck.timer', 'scripts/install-timeout-headroom-selfcheck-timer.sh'),
     ExpectedTimer('scripts/shared-repo-git-maintenance.timer', 'scripts/install-shared-repo-git-maintenance-timer.sh'),
     ExpectedTimer('scripts/fused-memory-link-heal.timer', 'scripts/install-link-heal-timer.sh'),
     ExpectedTimer('scripts/transcript-secret-sweep.timer', 'scripts/install-transcript-secret-sweep-timer.sh'),

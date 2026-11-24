@@ -384,8 +384,8 @@ def assert_restart_backoff_effective(path: pathlib.Path) -> None:
         "setting. Ignoring.' at unit load and then drops the cap entirely, so "
         "the backoff this unit advertises never engages — every restart waits "
         "exactly RestartSec and the delay never grows. Add RestartSteps= to "
-        "make the cap effective; scripts/jcodemunch-watcher.service.template "
-        "already carries this fix for the identical restart shape."
+        "make the cap effective, as every other committed unit that declares "
+        "a cap does."
     )
     assert steps.isdigit(), (
         f"could not parse RestartSteps={steps!r} in {path} as an integer; "

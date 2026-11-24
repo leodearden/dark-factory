@@ -8,22 +8,17 @@ closed ``reason`` companion that ``merge_status`` pairs with every EPISTEMIC
 ``status`` field.  They are THREE vocabularies, not one — see
 ``MergeSubmitStatus``'s docstring.
 
-This module supersedes the hand-maintained enumerations previously duplicated
-across:
+This module supersedes hand-maintained enumerations that were duplicated
+across docs and code.  ``merge_cancel``'s tool description renders
+``CANCEL_STATES`` from this module at import.  The docs that still restate a
+vocabulary are listed in
+``scripts/tests/test_merge_state_vocabulary_consistency.py::PINNED_SITES``.
 
-- ``escalation/src/escalation/server.py`` (``merge_cancel``'s and
-  ``merge_status``'s docstring state lists)
-- ``skills/merge-queue/SKILL.md``
-- ``skills/unblock/SKILL.md``
-- ``skills/unblock-low-risk/SKILL.md``
-- ``skills/escalation-watcher/SKILL.md``
-
-Those prose sites keep their value lists INLINE — a runbook an agent executes
-at runtime must show the values, not a pointer to a Python file — but each
-list now sits inside a ``merge-state-vocab`` marked span naming the partition
-it must equal, and ``scripts/tests/test_merge_state_vocabulary_consistency.py``
-asserts set equality between every span and its partition.  Same convention as
-``CONTRIBUTING.md``'s ``lint-command-mirror`` block.
+Those sites keep their value lists INLINE — a doc an agent reads at runtime
+must show the values, not a pointer to a Python file — but each list sits
+inside a ``merge-state-vocab`` marked span naming the partition it must equal,
+and that guard asserts set equality between every span and its partition.
+Same convention as ``CONTRIBUTING.md``'s ``lint-command-mirror`` block.
 
 This module is intentionally PURE: it defines the three vocabularies and the
 poll, reason and submit partitions only.  It holds no mapping between them and no

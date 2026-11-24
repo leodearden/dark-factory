@@ -309,7 +309,7 @@ overlooked, because the deferral was measured; the resolution is appended to it.
   left false). It was deferred with the cost measured, not overlooked:
 
   - The rendered glob
-    `_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_iact-*`
+    `_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_driftcheck-*,_iact-*`
     is behaviourally **indistinguishable** from gc.sh's then-current default
     under any black-box test: `_merge-verify` is already covered by `_merge-*`,
     and `.lane-state`/`.task-meta` are dot-prefixed while gc.sh's candidate loop

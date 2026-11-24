@@ -1163,7 +1163,10 @@ def _report_task_already_done(
 
     The architect calls this when it has determined that the task's work
     is already on main at *commit*.  The workflow validates the claim
-    (commit reachable from main) and sets task status to ``done``.
+    (a full 40-character lowercase hex sha, reachable from main and
+    attributable to this task) and sets task status to ``done``.  Nothing
+    is validated here, so a malformed *commit* is refused only after the
+    session has ended.
     """
     artifacts.write_already_done(commit=commit, evidence=evidence)
     return {'status': 'ok', 'commit': commit}
@@ -1989,8 +1992,10 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
         provenance pointing at ``commit``.
 
         Args:
-            commit: The git SHA on main that contains this task's work.
-                Must be reachable from main; the orchestrator verifies this.
+            commit: The full 40-character lowercase hex SHA (e.g. from
+                ``git log --format=%H``) of the commit on main that contains
+                this task's work; a short hash is refused. Must be reachable
+                from main; the orchestrator verifies this.
             evidence: Brief description of what you found — file/symbol
                 names that match this task's expected output, or why the
                 commit appears to subsume this task's scope.

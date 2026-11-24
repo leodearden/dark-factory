@@ -41,7 +41,6 @@ from shared.cli_invoke import (
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.declared_checks import declared_checks
-from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
@@ -101,6 +100,7 @@ from orchestrator.already_landed_tick_view import (
     read_already_landed_tick_view,
 )
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.auto_eval_redo import redo_submit_text
 from orchestrator.background_service import (
     DEFAULT_BACKOFF_SECS,
     BackgroundService,
@@ -158,6 +158,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     LandingReason,
     branch_is_degenerate,
+    branch_tip_landed,
     branch_work_landed,
     file_unattributed_landing_escalation,
     found_on_main_note,
@@ -233,7 +234,9 @@ from orchestrator.service_restart import (
     schedule_detached_systemd_restart,
 )
 from orchestrator.slot_lease import (
+    LendingRule,
     SlotLease,
+    SlotLendingError,
     SuspendedTask,
     culprit,
     suspended_slot_tasks,
@@ -291,6 +294,7 @@ from orchestrator.task_status import (
 )
 from orchestrator.task_verify_dispatch import TaskVerifyDispatcher, policy_from_config
 from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_hosts import HostPool, remote_runner_factory, task_verify_hosts
 from orchestrator.verify_runner import RunnerUnavailable
@@ -518,8 +522,6 @@ _AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES: frozenset[str] = frozenset(
     {'wip_conflict', 'infra_issue', 'branch_reset'},
 )
 
-_REDO_TITLE_MAX = 200
-
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
 # exit cleanly before the supervisor kills it with a SIGTERM timeout.
@@ -694,6 +696,8 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
+    # Read-only existence lookup for dependency_discovered and workflow_slot_wedged (task 10426)
+    'mcp__fused-memory__search_tasks',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
     # Convert-to-tracked-work filing (task 3726): submit_task files the
@@ -2199,8 +2203,10 @@ class Harness:
             quarantine=self._runner_quarantine,
             on_unavailable=self._bench_verify_host,
         )
+        self._verify_cache = CacheAccess.on_dispatcher(config.project_root, deployed=deployed_sha)
         self._task_verify_dispatcher = TaskVerifyDispatcher(
             self._host_pool, self.git_ops, policy_of=policy_from_config,
+            verify_cache=self._verify_cache,
         )
         self._abandoned_member_sweep = AbandonedMemberSweep()
         # This unit's side of the restart drain (task 5371): steers the merge
@@ -2975,7 +2981,7 @@ class Harness:
             # in a consistent post-startup state.
             self.scheduler.finish_startup()
             journal.clear()
-            startup_completed_at = datetime.now(UTC)
+            startup_completed_at = self._stamp_startup_completed()
 
             statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
@@ -3122,7 +3128,9 @@ class Harness:
                         'slot: every general run slot is held',
                         assignment.task_id,
                     )
-                self._launch_slot(assignment, sem, task_reports)
+                self._launch_slot(
+                    assignment, SlotLease(assignment.task_id, self.scheduler, sem), task_reports,
+                )
 
             self._compute_tallies(task_reports)
 
@@ -3173,8 +3181,7 @@ class Harness:
             if self._run_store and self._run_id:
                 try:
                     self._run_store.finish_run(
-                        self._run_id, self.report,
-                        startup_completed_at=startup_completed_at, exit_reason=exit_reason,
+                        self._run_id, self.report, exit_reason=exit_reason,
                     )
                 except Exception as e:
                     logger.warning(f'Failed to finalize run metrics: {e}')
@@ -6804,35 +6811,6 @@ class Harness:
             return 'converted_to_blocked'
 
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
-            # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
-            # design decision): θ1's _RECOVERY table has no degenerate-branch
-            # guard — a zero-commit branch (tip == branch_base_sha) that is
-            # an ancestor of main classifies ON_MAIN -> MARK_DONE the same as
-            # a genuinely merged branch. Extending θ1's resolver would mean
-            # threading task metadata into _resolve_branch_state, undoing its
-            # reviewed branch-state/task-row concurrency split — so this
-            # thin, sweep-side check downgrades the decision instead. Safe
-            # for journal hits: a genuinely merged branch is never
-            # degenerate, so this never fires for a real MergeProvenance
-            # journal row.
-            if (
-                await self._branch_is_degenerate(branch, metadata)
-                or await self.git_ops.warm_lane_ref_is_degenerate(tid)
-            ):
-                # A degenerate branch carries ZERO task work, so MARK_DONE
-                # would phantom-complete a task that never actually landed
-                # anything. An in-progress incarnation with no live claimant
-                # (already established by recovery_for reaching this action)
-                # is recovered by reverting to pending so the scheduler
-                # re-dispatches it. 'blocked' keeps the leave-alone
-                # discipline: only flip to done on positive evidence, which a
-                # degenerate branch is not — matching pre-migration behavior.
-                if status == 'in-progress':
-                    return await self._revert_in_progress_if_no_live_claimant(
-                        tid, mid_run=mid_run, metadata=metadata, status=status,
-                    )
-                return None
-
             # BranchState docstring invariant (task_ground_truth.py): sha is
             # always populated for ON_MAIN / GONE_WITH_MERGE_MARKER — the
             # only variants that reach MARK_DONE_WITH_PROVENANCE. Guard it
@@ -6851,6 +6829,50 @@ class Harness:
                 f'BranchState invariant violated for task {tid}: kind='
                 f'{report.branch_state.kind!r} carries no sha'
             )
+
+            # The live branch tip feeds both the degenerate veto below and
+            # validate_landing_evidence (where it is diagnostic only —
+            # CANDIDATE mode never reads it for the decision), so it is
+            # resolved once, before a revert reaps the worktree.
+            branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
+
+            # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
+            # design decision): θ1's _RECOVERY table has no degenerate-branch
+            # guard — a zero-commit branch (tip == branch_base_sha) that is
+            # an ancestor of main classifies ON_MAIN -> MARK_DONE the same as
+            # a genuinely merged branch. Extending θ1's resolver would mean
+            # threading task metadata into _resolve_branch_state, undoing its
+            # reviewed branch-state/task-row concurrency split — so this
+            # thin, sweep-side check downgrades the decision instead. The
+            # warm-lane script judges a landed tip by its subject alone, so it
+            # can call a genuinely merged branch degenerate (reify 6828,
+            # uncited `amend:` tips). branch_tip_landed is the veto that still
+            # marks such a branch done; see its docstring. The landing it
+            # consults is BranchState.landing_sha, never a branch tip
+            # (orchestrator/src/orchestrator/task_ground_truth.py::BranchState.landing_sha).
+            if (
+                await self._branch_is_degenerate(branch, metadata)
+                or (
+                    await self.git_ops.warm_lane_ref_is_degenerate(tid)
+                    and not await branch_tip_landed(
+                        self.git_ops, branch, branch_tip_sha,
+                        landing_sha=report.branch_state.landing_sha,
+                    )
+                )
+            ):
+                # A degenerate branch carries ZERO task work, so MARK_DONE
+                # would phantom-complete a task that never actually landed
+                # anything. An in-progress incarnation with no live claimant
+                # (already established by recovery_for reaching this action)
+                # is recovered by reverting to pending so the scheduler
+                # re-dispatches it. 'blocked' keeps the leave-alone
+                # discipline: only flip to done on positive evidence, which a
+                # degenerate branch is not — matching pre-migration behavior.
+                if status == 'in-progress':
+                    return await self._revert_in_progress_if_no_live_claimant(
+                        tid, mid_run=mid_run, metadata=metadata, status=status,
+                    )
+                return None
 
             on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
 
@@ -6872,11 +6894,6 @@ class Harness:
             # a re-derivation clobber rather than a revert. No escalation on
             # reject here by design; the reject is recorded as a
             # landing_evidence_rejected event before any revert (task 4496).
-            #
-            # The live branch tip is diagnostic only — CANDIDATE mode never
-            # reads it for the decision — but it must be captured before a
-            # revert reaps the worktree.
-            branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
             verdict = await validate_landing_evidence(
                 self.git_ops, tid, branch,
                 branch_tip_sha=branch_tip_sha,
@@ -8486,6 +8503,7 @@ class Harness:
                     esc.id,
                     'auto-resolved: pool storage is present again',
                     resolved_by=self._POOL_STORAGE_ABSENT_ROLE,
+                    resolution_class='benign',
                 )
                 logger.info(
                     'Pool-storage-absent: auto-resolved escalation %s', esc.id,
@@ -9013,6 +9031,7 @@ class Harness:
                     esc.id,
                     'auto-resolved: warm-lane base is healthy again',
                     resolved_by=self._WARM_BASE_HARD_DOWN_ROLE,
+                    resolution_class='benign',
                 )
                 logger.info(
                     'Warm-base hard-down: auto-resolved escalation %s', esc.id,
@@ -9135,6 +9154,7 @@ class Harness:
                     esc.id,
                     resolution_reason,
                     resolved_by='orchestrator-no-landings-breaker',
+                    resolution_class='benign',
                 )
                 logger.info(
                     'No-landings breaker: auto-resolved INFO escalation %s', esc.id
@@ -9902,6 +9922,7 @@ class Harness:
                 existing_id,
                 resolution=evidence.value,
                 resolved_by=self._WATCHER_OUTAGE_ALARM.role,
+                resolution_class='benign',
             )
             logger.info(
                 'Resolved watcher-outage L2 escalation %s (watcher recovered, evidence=%s)',
@@ -9959,6 +9980,7 @@ class Harness:
                         esc.id,
                         'tree now clean at startup',
                         resolved_by='orchestrator-dirty-tree-guard',
+                        resolution_class='benign',
                     )
             return
         logger.warning(
@@ -10027,6 +10049,7 @@ class Harness:
                         esc.id,
                         'config now has no unknown keys at startup',
                         resolved_by='orchestrator-config-key-guard',
+                        resolution_class='benign',
                     )
                 return
 
@@ -10122,9 +10145,9 @@ class Harness:
             )
 
     async def _run_slot(
-        self, assignment, sem: asyncio.Semaphore
+        self, assignment, lease: SlotLease
     ) -> TaskReport | None:
-        """Run a single workflow slot."""
+        """Run a single workflow slot on *lease*."""
         report = None
         # Hoisted (task 3172) so the `except asyncio.CancelledError` handler can
         # read the live phase defensively: a cancel landing during slot SETUP
@@ -10136,7 +10159,6 @@ class Harness:
         # preventing the rapid re-block loop where reconciliation immediately
         # re-dispatches the task before it can make progress.
         arm_requeue_cooldown = False
-        lease = SlotLease(assignment.task_id, self.scheduler, sem)
         self._slot_lease_registry()[assignment.task_id] = lease
         try:
             logger.info(
@@ -10625,6 +10647,7 @@ class Harness:
                 cancel_event=cancel_event,
                 task_verify=self._task_verify_dispatcher,
                 task_priority=self._task_priority,
+                verify_cache=self._verify_cache,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
                 # ε (task 3733): the harness IS the sink — it owns the streak,
@@ -11240,20 +11263,17 @@ class Harness:
             'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
-        original_title = str(assignment.task.get('title') or '')
-        title = elide_at_word(f'[auto-eval redo] {original_title}', _REDO_TITLE_MAX)
-        description = (
-            f'Automated full-architect redo of task {original_id} '
-            f'(blocked at phase={report.block_phase} via optimistic path '
-            f'{optimistic_path!r}). Original branch+worktree are renamed to '
-            f'{new_branch} for forensic comparison once this redo is released.'
-            f'\n\nOriginal title: {original_title}'
+        submit_text = redo_submit_text(
+            assignment.task,
+            original_id=original_id,
+            block_phase=report.block_phase,
+            optimistic_path=optimistic_path,
+            new_branch=new_branch,
         )
 
         outcome = await self.scheduler.submit_task({
             'project_root': str(self.config.project_root),
-            'title': title,
-            'description': description,
+            **submit_text,
             'priority': str(assignment.task.get('priority') or 'medium'),
             'metadata': redo_metadata,
             'planning_mode': True,
@@ -12191,6 +12211,19 @@ class Harness:
             except Exception as tag_err:
                 logger.warning(f'Post-review module tagging failed: {tag_err}')
 
+    def _stamp_startup_completed(self) -> datetime:
+        """Record on this run's runs row that startup finished; return the instant."""
+        at = datetime.now(UTC)
+        if self._run_store is not None and self._run_id is not None:
+            try:
+                self._run_store.mark_startup_completed(self._run_id, at)
+            except Exception:
+                logger.warning(
+                    'Failed to record startup completion for run %s', self._run_id,
+                    exc_info=True,
+                )
+        return at
+
     def _checkpoint_stores(self) -> None:
         """Run WAL TRUNCATE checkpoint on each SQLite store — best-effort.
 
@@ -12254,7 +12287,7 @@ class Harness:
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
-        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER, SpeculativeMergeWorker
 
         # K = verify hosts + 1 counts the frontier and sizes the worker's
         # speculation cap (speculation_depth).  Leased verifies are bounded by
@@ -12335,6 +12368,7 @@ class Harness:
             usage_gate=getattr(self, 'usage_gate', None),
             cost_store=getattr(self, 'cost_store', None),
             provenance_conflict_sink=self._provenance_conflict_sink,
+            verifier=PRODUCTION_VERIFIER.joined_to(self._verify_cache),
             deployed_sha=self._deployed_sha,
             verify_hosts=[r.name for r in self.config.verify_runners],
             runner_quarantine=self._runner_quarantine,
@@ -14767,9 +14801,9 @@ class Harness:
             await asyncio.sleep(self.config.idle_poll_secs)
 
     def _launch_slot(
-        self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
+        self, assignment, lease: SlotLease, task_reports: list[TaskReport],
     ) -> asyncio.Task:
-        """Start the slot task for *assignment*, whose *sem* permit is already held."""
+        """Start the slot task for *assignment*, running on *lease*, which holds its permit or borrows one."""
         self._task_modules[assignment.task_id] = list(assignment.modules)
         # Register escalation wake-event BEFORE create_task so Fix #1a
         # (_on_escalation_resolved orphan-flip gate) sees task_id in
@@ -14781,7 +14815,7 @@ class Harness:
         # for, so a reject that brings the task back re-announces.
         self._landing_rejects.release(assignment.task_id)
         task = asyncio.create_task(
-            self._run_slot(assignment, sem),
+            self._run_slot(assignment, lease),
             name=f'workflow-{assignment.task_id}',
         )
         self._live_tasks.add(task)
@@ -14808,7 +14842,35 @@ class Harness:
                 if self._escalation_events.get(tid) is ev else None
             )
         )
+        # Backstop for a slot that never released its lease: cancelled before
+        # its first step, or its finally raised first.  Otherwise a no-op.
+        task.add_done_callback(lambda _t, lease=lease: lease.release(requeued=False))
         return task
+
+    def _launch_borrowing_slot(
+        self, assignment, lender_task_id: str, task_reports: list[TaskReport],
+    ) -> asyncio.Task:
+        """Start *assignment*'s slot on a permit borrowed from *lender_task_id*'s live slot.
+
+        Synchronous, so a caller can make it part of one uninterrupted claim
+        step.  Rules: ``plans/early-start-on-predecessor-branch-prd.md``
+        section 5.3 "Slot".
+        """
+        leases = self._slot_lease_registry()
+        lender = leases.get(lender_task_id)
+        if lender is None:
+            raise SlotLendingError(
+                LendingRule.NO_LIVE_SLOT, lender_task_id=lender_task_id, borrower_task_id=assignment.task_id,
+            )
+        if assignment.task_id in leases:
+            raise SlotLendingError(
+                LendingRule.BORROWER_HAS_SLOT, lender_task_id=lender_task_id, borrower_task_id=assignment.task_id,
+            )
+        slot = self._launch_slot(assignment, lender.lend(assignment.task_id), task_reports)
+        logger.info(
+            'task %s launched on a slot borrowed from task %s', assignment.task_id, lender_task_id,
+        )
+        return slot
 
     def _slot_lease_registry(self) -> dict[str, SlotLease]:
         """The slot-lease registry, lazily created when absent (``_cancel_causes``'s idiom)."""

@@ -370,6 +370,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     ``code_default_config`` fixture runs after this autouse fixture and still
     wins (re-pointing ORCH_CONFIG_PATH at a guaranteed-absent file) for the
     default-asserting tests.
+
+    The audit lane runs this suite with DF_VERIFY_CACHE=off, which forces every cache mode off
+    (verify_cache/modes.py::forced_off), so a test that wants the flag sets it explicitly.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
@@ -377,6 +380,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
     monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
+    from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV
+
+    monkeypatch.delenv(VERIFY_CACHE_ENV, raising=False)
 
 
 @pytest.fixture
@@ -704,6 +710,16 @@ def forbid_live_mcp(monkeypatch, request):
     yield recorder
 
     assert_no_live_attempts(recorder)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mcp_lifecycle_session(monkeypatch):
+    """Every test starts with no McpLifecycle session, and one its own start() makes is undone at teardown.
+
+    ``orchestrator/src/orchestrator/mcp_lifecycle.py::McpLifecycle.start`` assigns that
+    global, only stop() clears it, and ``mcp_call`` prefers it over its url (task 9528).
+    """
+    monkeypatch.setattr('orchestrator.mcp_lifecycle._session', None)
 
 
 @pytest.fixture(autouse=True)

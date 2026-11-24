@@ -172,6 +172,29 @@ class TestEventStore:
         assert rows[0][1] == 0.50
 
 
+
+class TestEmitReturnsTheRowId:
+    def test_emit_returns_the_id_the_row_is_read_back_with(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'test.db', 'run-id')
+
+        first = store.emit(EventType.merge_verify, task_id='1', data={'n': 1})
+        second = store.emit(EventType.merge_verify, task_id='1', data={'n': 2})
+
+        rows = store.fetch_events_by_type(EventType.merge_verify)
+        assert [first, second] == [row['id'] for row in rows]
+        assert isinstance(first, int)
+        assert isinstance(second, int)
+        assert second > first
+
+    def test_a_failed_emit_returns_none_and_does_not_raise(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'test.db'
+        store = EventStore(db_path, 'run-id')
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.execute('DROP TABLE events')
+            conn.commit()
+
+        assert store.emit(EventType.merge_verify, task_id='1', data={'n': 1}) is None
+
 class TestMergeFinalizedEventType:
     """EventType.merge_finalized must exist and round-trip through the event store."""
 

@@ -352,7 +352,7 @@ things about it are not, and both are prose:
    | Site | Acts on `degenerate` by | Cost of a false `landed` |
    |---|---|---|
    | `git_ops.py::_abort_lane_acquisition` | `_delete_branch_if_on_main` | a retained, stale branch |
-   | `harness.py`'s `MARK_DONE_WITH_PROVENANCE` downgrade | revert-and-redispatch instead of marking done | **a phantom-done task** — the exact failure that guard's own comment ("a degenerate branch carries ZERO task work") cites as its reason to exist |
+   | `harness.py`'s `MARK_DONE_WITH_PROVENANCE` downgrade | revert-and-redispatch instead of marking done, only when neither the attributed landing nor the branch's own merge marker brought the tip onto main (that exemption is `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_tip_landed`, task 5429) | **a phantom-done task** — the exact failure that guard's own comment ("a degenerate branch carries ZERO task work") cites as its reason to exist |
 
    The harness site's only degeneracy-specific backstop is the independent
    `_branch_is_degenerate(branch, metadata)` disjunct, which is **fail-open**:
@@ -362,11 +362,18 @@ things about it are not, and both are prose:
    foreign on-main tip whose subject cites task 51 — is precisely the shape
    that would phantom-complete task 51 there.
 
-   The tradeoff still favours the widening: a false `degenerate` costs
-   re-dispatched landed work or a deleted branch on EVERY ref of that shape,
-   and the measured corpus had 81 of them against zero contrived K6-shaped
-   flips. K6 pins the direction of the cost as a KNOWN CONSEQUENCE, not a
-   goal.
+   The tradeoff still favours the widening. At the harness site a false
+   `degenerate` on a landed tip no longer re-dispatches landed work whose
+   landing brought the tip onto main, because `branch_tip_landed` vetoes it.
+   That landing is either an independent landing sha (a journal row, a
+   citation or a merge marker, never the branch tip itself) or the branch's
+   own `Merge task/N into main` marker. Landed work with neither is still
+   reverted: a fast-forward landing of an uncited tip in a citation-disabled
+   project, or a citation that did not introduce the tip on a branch with no
+   merge marker. At the lane-abort site it still costs a
+   deleted, already-on-main branch on EVERY ref of that shape, and the
+   measured corpus had 81 of them against zero contrived K6-shaped flips.
+   K6 pins the direction of the cost as a KNOWN CONSEQUENCE, not a goal.
 
 ### Delta 8 — header comments: own path, subject script, driver line (all eight)
 

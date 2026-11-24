@@ -299,9 +299,12 @@ class EventType(StrEnum):
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
     # A due drift check could not acquire both host slots within its settle
-    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # window, or a warm lane where a pool is configured, so it ran nothing and
+    # re-arms for the next landing.  Producer:
     # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
-    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    # consecutive_deferrals, hosts, cause, detail}, hosts being
+    # HostAllocator.host_states(), cause a DriftDeferralCause value and detail
+    # the cause's own report (why no warm lane could be seeded), else null.
     drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
@@ -1405,12 +1408,15 @@ class EventStore:
         data: dict | None = None,
         cost_usd: float | None = None,
         duration_ms: int | None = None,
-    ) -> None:
-        """Write a single event row.  Never raises."""
+    ) -> int | None:
+        """Write a single event row.  Never raises.
+
+        Returns the inserted row's id, or None when the write failed.
+        """
         try:
             conn = self._connect()
             try:
-                conn.execute(
+                cursor = conn.execute(
                     'INSERT INTO events '
                     '(timestamp, run_id, task_id, event_type, phase, role, '
                     ' data, cost_usd, duration_ms) '
@@ -1428,10 +1434,12 @@ class EventStore:
                     ),
                 )
                 conn.commit()
+                return cursor.lastrowid
             finally:
                 conn.close()
         except Exception:
             logger.warning('event_store.emit failed', exc_info=True)
+            return None
 
     def latest_merge_finalized(
         self,
