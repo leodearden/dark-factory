@@ -3099,6 +3099,7 @@ class TestLanePlanFault(_DualRootLayout):
 
     def test_legacy_single_root_reads_its_own_plan(self, wt):
         legacy = TaskArtifacts(wt)
+        legacy.init('42', 'Legacy', 'desc')
         assert legacy.lane_plan_fault().kind is LanePlanFaultKind.EMPTY
 
         legacy.write_plan(copy.deepcopy(_PLAN))

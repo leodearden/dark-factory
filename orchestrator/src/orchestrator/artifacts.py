@@ -710,6 +710,37 @@ LANE_SYMLINKED_ARTIFACTS: tuple[str, ...] = ('plan.json', 'iterations.jsonl')
 """The task-root artifacts the lane ``.task/`` exposes to agents."""
 
 
+class LanePlanFaultKind(Enum):
+    """How the lane ``.task/plan.json`` fails to read this task's plan."""
+
+    NOT_A_LINK = 'not_a_link'
+    WRONG_TARGET = 'wrong_target'
+    EMPTY = 'empty'
+
+
+_LANE_PLAN_FAULT_MEANINGS: Mapping[LanePlanFaultKind, str] = MappingProxyType({
+    LanePlanFaultKind.NOT_A_LINK: 'is not a symlink (absent, a regular file or a directory)',
+    LanePlanFaultKind.WRONG_TARGET: "is a symlink to something other than this task's plan",
+    LanePlanFaultKind.EMPTY: "reaches this task's plan, which is absent, empty or not a regular file",
+})
+
+
+@dataclass(frozen=True)
+class LanePlanFault:
+    """Why the lane ``.task/plan.json`` does not read this task's plan, and the paths involved."""
+
+    kind: LanePlanFaultKind
+    lane_path: Path
+    resolved_path: Path
+    plan_path: Path
+
+    def describe(self) -> str:
+        return (
+            f'lane plan {self.lane_path} {_LANE_PLAN_FAULT_MEANINGS[self.kind]}: '
+            f'it resolves to {self.resolved_path}; the task plan is {self.plan_path}'
+        )
+
+
 @dataclass
 class ReviewAggregation:
     """Aggregated review results from all reviewers."""
@@ -779,6 +810,15 @@ def _replace_with_symlink(link: Path, target: Path) -> None:
     else:
         link.unlink(missing_ok=True)
     os.symlink(target, link)
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    """Whether *path*, followed through any symlink, is a regular file of at least one byte."""
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(status.st_mode) and status.st_size > 0
 
 
 class TaskArtifacts:
@@ -1068,12 +1108,30 @@ class TaskArtifacts:
         durable path already IS the lane path (legacy single-root mode), where
         a self-referential symlink would be broken.
         """
-        lane_task = self.worktree / '.task'
-        lane_task.mkdir(parents=True, exist_ok=True)
+        (self.worktree / '.task').mkdir(parents=True, exist_ok=True)
         for name in LANE_SYMLINKED_ARTIFACTS:
-            durable = self.artifact_path(name)
-            if durable != lane_task / name:
-                _replace_with_symlink(lane_task / name, durable)
+            link = self._lane_link(name)
+            if link is not None:
+                _replace_with_symlink(link, self.artifact_path(name))
+
+    def _lane_link(self, name: str) -> Path | None:
+        """``<worktree>/.task/<name>``, or None where that path IS ``artifact_path(name)`` (legacy single-root)."""
+        lane = self.worktree / '.task' / name
+        return None if lane == self.artifact_path(name) else lane
+
+    def lane_plan_fault(self) -> LanePlanFault | None:
+        """Why the agent-facing ``.task/plan.json`` does not read this task's non-empty plan, else None; changes nothing."""
+        plan = self.artifact_path('plan.json')
+        lane = self._lane_link('plan.json') or plan
+        if lane != plan and not lane.is_symlink():
+            kind = LanePlanFaultKind.NOT_A_LINK
+        elif os.path.realpath(lane) != os.path.realpath(plan):
+            kind = LanePlanFaultKind.WRONG_TARGET
+        elif not _is_nonempty_file(lane):
+            kind = LanePlanFaultKind.EMPTY
+        else:
+            return None
+        return LanePlanFault(kind, lane, Path(os.path.realpath(lane)), plan)
 
     def write_blocking_dependency(
         self,
