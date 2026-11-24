@@ -319,6 +319,16 @@ def sent_launch(server: FakeT3Server) -> dict[str, Any]:
     return arguments
 
 
+def echoing_launch() -> ToolResponder:
+    """``t3_thread_launch`` answering with the ``modelSelection`` it was sent, as v0.1.6 stores and echoes it."""
+
+    def respond(arguments: Mapping[str, Any]) -> ToolSuccess:
+        sent = arguments.get('modelSelection', THREAD_LAUNCH_JSON['modelSelection'])
+        return ToolSuccess({**THREAD_LAUNCH_JSON, 'modelSelection': sent})
+
+    return respond
+
+
 PROXY_SETTINGS: dict[str, Any] = {
     'defaultModelSelection': {'instanceId': 'claude-proxy', 'model': 'claude-opus-5-5'},
     'providerInstances': {
@@ -602,6 +612,36 @@ class TestLaunch:
 
         assert line.startswith('started ')
         assert sent_launch(t3)['modelSelection'] == {'instanceId': 'claude-proxy', 'model': 'fable'}
+
+    @pytest.mark.parametrize('level', ['low', 'medium', 'high', 'xhigh', 'max'])
+    def test_an_effort_rides_in_the_model_selection_as_its_effort_option(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str], level: str
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        t3.tool_replies['t3_thread_launch'] = echoing_launch()
+
+        line = launch_line(capsys, tmp_path, env.project, '--model', 'fable', '--effort', level)
+
+        assert line.split()[0] == 'started'
+        assert sent_launch(t3)['modelSelection'] == {
+            'instanceId': 'claude-proxy',
+            'model': 'fable',
+            'options': [{'id': 'effort', 'value': level}],
+        }
+
+    def test_an_effort_outside_the_closed_set_is_rejected_by_the_verbs_parser(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path
+    ) -> None:
+        argv = [
+            'launch', '--cwd', str(env.project), '--title', 't', '--prompt-file', prompt_file(tmp_path, 'p'),
+            '--record', '', '--model', 'fable', '--effort', 'turbo',
+        ]
+
+        with pytest.raises(SystemExit) as exited:
+            lane.main(argv)
+
+        assert exited.value.code == 2
+        assert t3.tool_calls('t3_thread_launch') == []
 
     def test_a_disabled_explicit_instance_is_refused_before_any_start(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
