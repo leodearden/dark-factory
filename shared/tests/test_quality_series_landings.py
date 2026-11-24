@@ -20,7 +20,12 @@ from quality_series_fixtures import (
 from shared.project_id import project_id_for_root
 from shared.quality_series import CursorNotOnMain, Landing, UnrecognisedTrainEvent, landings
 from shared.quality_series.git_lines import GitUnavailable
-from shared.quality_series.landings import LandingSource, LinesBase, recorded_landing_keys
+from shared.quality_series.landings import (
+    LandingSource,
+    LinesBase,
+    recorded_landing_instants,
+    recorded_landing_keys,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -359,3 +364,87 @@ class TestRecordedLandingKeys:
 
         with pytest.raises(UnrecognisedTrainEvent):
             recorded_landing_keys(db.conn, recorded_after=None)
+
+
+class TestRecordedLandingInstants:
+    """When each recorded landing landed, in a half-open window; read without git."""
+
+    @pytest.fixture
+    def db(self, tmp_path: Path) -> RunsDbBuilder:
+        """A runs.db outside any git repository; the reader takes the connection and no repo."""
+        return RunsDbBuilder(tmp_path / 'not-a-repo' / 'runs.db')
+
+    def test_a_coalesced_train_lands_once_per_member(self, db: RunsDbBuilder) -> None:
+        db.train_merged(at_hour(1.0), '503', ['501', '502', '503'], 'train-sha', 'base-sha')
+
+        assert recorded_landing_instants(
+            db.conn, after=at_hour(0.0), until=at_hour(2.0),
+        ) == (at_hour(1.0), at_hour(1.0), at_hour(1.0))
+
+    def test_an_attributed_solo_passer_lands_once(self, db: RunsDbBuilder) -> None:
+        db.train_attributed(at_hour(1.0), '601', 'train-x', 'solo-sha')
+
+        assert recorded_landing_instants(
+            db.conn, after=at_hour(0.0), until=at_hour(2.0),
+        ) == (at_hour(1.0),)
+
+    def test_a_done_merge_lands_once_at_its_earliest_event_and_any_other_state_not_at_all(
+        self, db: RunsDbBuilder
+    ) -> None:
+        db.merge_done(at_hour(1.0), '401', 'sha-a')
+        db.merge_done(at_hour(2.0), '401', 'sha-a')
+        db.merge_state(at_hour(3.0), '402', 'blocked')
+        db.merge_state(at_hour(4.0), '403', 'superseded', superseded_by='404')
+
+        assert recorded_landing_instants(
+            db.conn, after=at_hour(0.0), until=at_hour(5.0),
+        ) == (at_hour(1.0),)
+
+    def test_the_window_is_half_open_and_compares_instants_across_offsets(
+        self, db: RunsDbBuilder
+    ) -> None:
+        plus_one = timezone(timedelta(hours=1))
+        db.merge_done(at_hour(9.0), '701', 'before')
+        db.merge_done(at_hour(10.0).astimezone(plus_one).isoformat(), '702', 'at-after')
+        db.merge_done(at_hour(10.5).astimezone(plus_one).isoformat(), '703', 'inside')
+        db.merge_done(at_hour(12.0), '704', 'at-until')
+        db.merge_done(at_hour(12.5), '705', 'beyond-until')
+
+        assert recorded_landing_instants(
+            db.conn,
+            after=at_hour(10.0).astimezone(plus_one),
+            until=at_hour(12.0).astimezone(plus_one),
+        ) == (at_hour(10.5), at_hour(12.0))
+
+    def test_the_instants_are_a_sorted_tuple_of_aware_datetimes(self, db: RunsDbBuilder) -> None:
+        db.merge_done(at_hour(3.0), '903', 'third')
+        db.train_merged(at_hour(1.0), '902', ['901', '902'], 'first', 'base')
+        db.train_attributed(at_hour(2.0), '904', 'train-x', 'second')
+
+        instants = recorded_landing_instants(db.conn, after=at_hour(0.0), until=at_hour(4.0))
+
+        assert isinstance(instants, tuple)
+        assert list(instants) == sorted(instants)
+        assert instants == (at_hour(1.0), at_hour(1.0), at_hour(2.0), at_hour(3.0))
+        assert all(instant.tzinfo is not None for instant in instants)
+
+    @pytest.mark.parametrize(('after', 'until', 'invariant'), [
+        (at_hour(0.0).replace(tzinfo=None), at_hour(1.0), 'carries its offsets'),
+        (at_hour(0.0), at_hour(1.0).replace(tzinfo=None), 'carries its offsets'),
+        (at_hour(2.0), at_hour(1.0), 'ends no earlier than it starts'),
+    ])
+    def test_a_naive_or_inverted_window_is_refused_naming_its_bounds(
+        self, db: RunsDbBuilder, after, until, invariant: str
+    ) -> None:
+        with pytest.raises(ValueError, match=invariant) as excinfo:
+            recorded_landing_instants(db.conn, after=after, until=until)
+        assert repr(after) in str(excinfo.value)
+        assert repr(until) in str(excinfo.value)
+
+    def test_an_unrecognised_train_payload_is_the_same_typed_refusal(
+        self, db: RunsDbBuilder
+    ) -> None:
+        db.event(at_hour(1.0), 'train_merged', '801', {'train_id': 'train-z', 'verdict': 'other'})
+
+        with pytest.raises(UnrecognisedTrainEvent):
+            recorded_landing_instants(db.conn, after=at_hour(0.0), until=at_hour(2.0))

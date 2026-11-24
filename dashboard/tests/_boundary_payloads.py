@@ -146,7 +146,10 @@ MERGE_ATTEMPTS: tuple[MergeAttempt, ...] = (
     MergeAttempt(timedelta(hours=50), 'blocked', 0),
     MergeAttempt(timedelta(hours=70), 'done', 3000),
 )
-"""One project's merges over three days: three inside 24h, all six inside 7d."""
+"""One project's merges over three days: three inside 24h, all six inside 7d.
+
+The done ones land, at 2h, 20h, 30h and 70h before T0.
+"""
 
 ESCALATIONS_FILED = 5
 ESCALATIONS_ARCHIVED = 3
@@ -431,10 +434,15 @@ def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     return bodies
 
 
-def _write_merge_attempts(root: Path) -> None:
-    """*root*'s runs.db, holding :data:`MERGE_ATTEMPTS` as task ids 1, 2, ..."""
+def _write_merge_history(root: Path) -> None:
+    """*root*'s runs.db, holding :data:`MERGE_ATTEMPTS` as task ids 1, 2, ...
+
+    Each done attempt also lands: a ``merge_finalized`` done event at the same
+    instant, under the sha ``sha-<task id>``.
+    """
     store = runs_db_path(root)
     store.parent.mkdir(parents=True)
+    attempts = list(enumerate(MERGE_ATTEMPTS, start=1))
     with closing(sqlite3.connect(store)) as conn:
         conn.executescript(EVENTS_DDL)
         conn.executemany(
@@ -443,7 +451,17 @@ def _write_merge_attempts(root: Path) -> None:
             [
                 ((T0 - attempt.age).isoformat(), f'run-{task_id}', str(task_id),
                  json.dumps({'outcome': attempt.outcome}), attempt.duration_ms)
-                for task_id, attempt in enumerate(MERGE_ATTEMPTS, start=1)
+                for task_id, attempt in attempts
+            ],
+        )
+        conn.executemany(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, data) '
+            "VALUES (?, ?, ?, 'merge_finalized', 'merge', ?)",
+            [
+                ((T0 - attempt.age).isoformat(), f'run-{task_id}', str(task_id),
+                 json.dumps({'state': 'done', 'merge_sha': f'sha-{task_id}'}))
+                for task_id, attempt in attempts
+                if attempt.outcome == 'done'
             ],
         )
         conn.commit()
@@ -457,7 +475,7 @@ def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         bodies['costs_90d'] = _get(client, COSTS, window='90d')
 
     with _canned_roots(client, workdir / 'merge', {'dark-factory': _substrate(REIFY_COUNTS)}):
-        _write_merge_attempts(app.state.config.project_root)
+        _write_merge_history(app.state.config.project_root)
         for window in ('7d', '24h'):
             with installed_clock(app, fixed_clock(T0)):
                 bodies[f'merge_{window}'] = _get(client, MERGE_QUEUE, window=window)
