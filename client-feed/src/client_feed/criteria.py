@@ -17,14 +17,20 @@ from client_feed.contract import (
     CaseOutcome,
     CaseResult,
     CommitSha,
+    CriteriaDeclared,
+    CriteriaResults,
     Criterion,
     CriterionOutcome,
     CriterionResult,
+    FeedState,
+    RunKind,
     UniqueCriteria,
     UtcTimestamp,
     _first_error,
 )
+from client_feed.envelope import Stamp, payload
 from client_feed.feed_io import FeedIoError, read_tail
+from client_feed.redact import redact_paths
 from client_feed.sources.archive import case_id, read_junit_cases
 from client_feed.sources.git import EntryKind, blob_reader, path_entry
 
@@ -256,3 +262,33 @@ def verify_criteria(
     if not reports:
         return None
     return CriteriaRun(commit=commit, run_at=run_at, results=join_criteria(declared, reports))
+
+
+def _redacted(criterion: Criterion) -> Criterion:
+    return criterion.model_copy(
+        update={
+            'statement': redact_paths(criterion.statement),
+            'capability': redact_paths(criterion.capability),
+        }
+    )
+
+
+def declared_event(
+    criteria: Sequence[Criterion], *, state: FeedState, stamp: Stamp, now: datetime
+) -> CriteriaDeclared | None:
+    """The declaration at `now` with its prose paths redacted; None when the state already declares exactly it."""
+    redacted = tuple(map(_redacted, criteria))
+    if {criterion.id: criterion for criterion in redacted} == state.criteria_declared:
+        return None
+    return CriteriaDeclared(**stamp(now), criteria=redacted)
+
+
+def results_event(
+    kind: RunKind, run: CriteriaRun, *, state: FeedState, stamp: Stamp
+) -> CriteriaResults | None:
+    """The run's criteria_results of `kind` at its run_at; None when the state's record of `kind` already says it."""
+    said = {'run_kind': kind, **dict(run)}
+    recorded = state.criteria.get(kind)
+    if recorded is not None and payload(recorded) == said:
+        return None
+    return CriteriaResults(**stamp(run.run_at), **said)
