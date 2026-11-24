@@ -304,9 +304,14 @@ refuse_inputs_the_t3_lane_cannot_honour() {
       "a T3 thread takes no claude CLI arguments; unset it, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
   fi
   if [ -n "${CLAUDE_SPAWN_EFFORT:-}" ] && [ -z "${CLAUDE_SPAWN_MODEL:-}" ]; then
-    t3_lane_refuse "CLAUDE_SPAWN_EFFORT='$CLAUDE_SPAWN_EFFORT' without CLAUDE_SPAWN_MODEL" \
-      "t3 takes an effort only inside a model selection; set CLAUDE_SPAWN_MODEL too, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+    refuse_t3_effort_without_model
   fi
+}
+
+# Also spawn_t3_lane.py launch's `refused reason=effort-needs-model` backstop.
+refuse_t3_effort_without_model() {
+  t3_lane_refuse "CLAUDE_SPAWN_EFFORT='${CLAUDE_SPAWN_EFFORT:-}' without CLAUDE_SPAWN_MODEL" \
+    "t3 takes an effort only inside a model selection; set CLAUDE_SPAWN_MODEL too, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
 }
 
 require_python3_for_the_t3_lane() {
@@ -1388,6 +1393,7 @@ refuse_the_t3_launch() {
   detail=$(verdict_text "$t3_verdict" detail)
   case "$reason" in
     provider-disabled) refuse_disabled_t3_provider ;;
+    effort-needs-model) refuse_t3_effort_without_model ;;
     cwd-not-project-worktree)
       t3_lane_refuse "cwd=$cwd ($reason: $detail)" \
         "T3 does not list it as a worktree of its project; pass the project root or a worktree T3 lists, or set CLAUDE_SPAWN_BACKEND=tmux or wm"

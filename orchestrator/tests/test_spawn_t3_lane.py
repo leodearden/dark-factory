@@ -956,13 +956,13 @@ class TestEffortVet:
         assert line.split()[0] == 'started'
         assert sent_launch(t3)['modelSelection']['options'] == [{'id': 'effort', 'value': 'max'}]
 
-    def test_an_effort_without_a_model_is_launch_failed_without_a_launch(
+    def test_an_effort_without_a_model_is_refused_without_a_launch(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         line = launch_line(capsys, tmp_path, env.project, '--effort', 'xhigh')
 
         word, fields = verdict_tokens(line)
-        assert word == 'launch-failed' and 'needs a model' in fields['detail']
+        assert (word, fields['reason']) == ('refused', 'effort-needs-model')
         assert t3.tool_calls('t3_thread_launch') == []
 
 

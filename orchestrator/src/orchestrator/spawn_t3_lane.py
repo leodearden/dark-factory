@@ -460,8 +460,8 @@ class LaunchedThread:
     thread_id: str
     project_id: str | None
     run_id: str | None
-    model_selection: object
-    """The selection T3 answered it stored for the thread, as sent unless T3 normalised it."""
+    held_effort: str | None
+    """The effort of the selection T3 answered it stored for the thread; None when it names none."""
 
 
 _LOST_REPLY = frozenset({t3_mcp_client.TransportFault.UNREACHABLE, t3_mcp_client.TransportFault.PROTOCOL})
@@ -489,7 +489,10 @@ def _launch_outcome(reply: t3_mcp_client.CallResult, strategy: WorkspaceStrategy
     if not isinstance(thread_id, str) or not thread_id:
         return LaunchFailed('t3_thread_launch answered no threadId')
     return LaunchedThread(
-        thread_id, reply.value.get('projectId'), reply.value.get('runId'), reply.value.get('modelSelection')
+        thread_id,
+        reply.value.get('projectId'),
+        reply.value.get('runId'),
+        spawn_effort.selection_effort(reply.value.get('modelSelection')),
     )
 
 
@@ -592,7 +595,7 @@ def launch(
     skip_permissions: bool,
 ) -> str:
     if effort and not model:
-        return LaunchFailed('an effort needs a model: T3 takes options only inside modelSelection').verdict()
+        return _verdict('refused', reason='effort-needs-model', detail='T3 takes options only inside modelSelection')
     client = _connect(env, t3_mcp_client.CliCodeSource())
     if isinstance(client, NoLauncher):
         return client.verdict()
@@ -625,9 +628,8 @@ def launch(
         return launched.verdict()
     if record_dir:
         _stamp_launched_record(record_dir, title, launched, client.environment_id, _usable_parent(parent))
-    held = spawn_effort.selection_effort(launched.model_selection)
-    if effort and held != effort.value:
-        return _verdict('effort-unconfirmed', thread_id=launched.thread_id, asked=effort.value, got=held)
+    if effort and launched.held_effort != effort.value:
+        return _verdict('effort-unconfirmed', thread_id=launched.thread_id, asked=effort.value, got=launched.held_effort)
     return _verdict(
         'started',
         thread_id=launched.thread_id,
