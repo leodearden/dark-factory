@@ -168,7 +168,7 @@ def _blocker(escalation_id: str, response: LeakResponse) -> Escalation:
 def _blocker_detail(records: Sequence[LeakRecord], response: LeakResponse) -> str:
     streak = frozenset(leak.identity for leak in response.streak_leaks)
     lines = [
-        'The verify-cache audit ran the merge-role command set uncached on the offline lane and reproduced '
+        "The verify-cache audit ran every module's test leg uncached on the offline lane and reproduced "
         'reds on units whose greens the named landings had replayed from the cache.',
         f'Kill switch: disabled until {_until(response.policy)} - {response.policy.reason}',
         'Leak records:',
