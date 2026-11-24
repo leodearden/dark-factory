@@ -592,6 +592,22 @@ class TestRunWithBoundedTeardown:
         assert not guard_fired.is_set(), 'the hang guard, not the watchdog, ended the teardown'
         assert "asyncio.run()'s teardown" in capsys.readouterr().err
 
+    def test_the_watchdog_is_not_armed_while_main_runs(self):
+        before = _shutdown_watchdog_threads()
+        armed_during_main: list[set[threading.Thread]] = []
+
+        async def main():
+            await asyncio.sleep(0)
+            armed_during_main.append(_shutdown_watchdog_threads() - before)
+            return 'report'
+
+        result = cli_module._run_with_bounded_teardown(
+            main, teardown_secs=3600, _exit=lambda _code: None,
+        )
+
+        assert result == 'report'
+        assert armed_during_main == [set()], 'the teardown watchdog was armed before main ended'
+
     def test_a_clean_teardown_disarms_the_watchdog(self):
         exits: list[int] = []
         leftovers: list[asyncio.Task] = []
@@ -1048,7 +1064,12 @@ class TestRunBoundsAsyncioTeardown:
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
         fake_harness = MagicMock()
-        fake_harness.run = harness_run
+
+        async def recording_run(*args, **kwargs):
+            events.append(('harness.run',))
+            return await harness_run(*args, **kwargs)
+
+        fake_harness.run = recording_run
         monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
@@ -1062,6 +1083,7 @@ class TestRunBoundsAsyncioTeardown:
 
         assert result.exit_code == 0, result.output
         assert [e for e in events if e[0] != 'echo' or e == ('echo', 'ok')] == [
+            ('harness.run',),
             ('arm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
             ('disarm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
             ('echo', 'ok'),
@@ -1075,6 +1097,7 @@ class TestRunBoundsAsyncioTeardown:
 
         assert result.exit_code == 130, result.output
         assert [e for e in events if e[0] != 'echo'] == [
+            ('harness.run',),
             ('arm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
             ('disarm', TEARDOWN_WATCHDOG_TIMEOUT_SECS),
             ('arm', SHUTDOWN_WATCHDOG_TIMEOUT_SECS),
