@@ -6702,12 +6702,12 @@ class SpeculativeMergeWorker:
             self._speculation_controller.on_base_invalidated(sha, live_tip)
 
     def _merger_live_tip(self, doomed: Collection[str] = ()) -> LiveTip | None:
-        """The frontier tip the merger may stack on, with its owner, or None;
-        *doomed* commits count as dead.  Reads no main, so
-        :meth:`_record_dead_base` stays synchronous."""
+        """The frozen-prefix tip the §5.3 detector expects, which the merger may
+        stack on, with its owner, or None; *doomed* commits count as dead, and
+        it reads no main (plans/merge-lane-policy-prd.md D1)."""
         frontier = self._verify_frontier_entries()
         tip = choose_remerge_base(
-            '', frontier_tip(frontier) or '', {*self._dead_base_commits, *doomed}, frontier,
+            '', self._newest_frozen_commit() or '', {*self._dead_base_commits, *doomed}, frontier,
             permit_available=True,
         ).tip
         if tip is None:
