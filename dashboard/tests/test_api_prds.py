@@ -20,6 +20,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import aiosqlite
 import pytest
 from _boundary_payloads import (
     LANES_ROOT,
@@ -269,11 +270,12 @@ def test_a_corpus_walk_that_raises_degrades_only_the_view(client, tmp_path, monk
     assert body['PRD_CONTENTION'][ROOT]['state'] == 'fresh'
 
 
-def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_request(
-    client, tmp_path, monkeypatch,
-):
-    """The walk is released only once the first response is back, so that response cannot have waited on it."""
-    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
+def _serve_a_held_corpus_walk(
+    client: TestClient,
+    render: Callable[[datetime], dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The /prds body served while the corpus walk is held, and the view once it has landed."""
     walk = escalation_corpus.walk_corpus
     answered = threading.Event()
 
@@ -282,18 +284,52 @@ def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_requ
         return walk(queues)
 
     monkeypatch.setattr(escalation_corpus, 'walk_corpus', _walk_after_the_first_response)
+    try:
+        first = render(T0)
+    finally:
+        answered.set()
+    later = _render_until_fresh(render, T0 + timedelta(seconds=20))
+    return first, later
+
+
+def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_request(
+    client, tmp_path, monkeypatch,
+):
+    """The walk is released only once the first response is back, so that response cannot have waited on it."""
+    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
     with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
-        try:
-            first = render(T0)
-        finally:
-            answered.set()
-        later = _render_until_fresh(render, T0 + timedelta(seconds=20))
+        first, later = _serve_a_held_corpus_walk(client, render, monkeypatch)
 
     assert first['PRD_VIEW'][ROOT]['state'] == 'unknown'
     assert 'escalations: ' in first['PRD_VIEW'][ROOT]['reason']
     assert first['PRD_CONTENTION'][ROOT]['state'] == 'fresh'
     assert later['state'] == 'fresh'
     assert {state['state'] for state in later['value']['inputs']} == {'fresh'}
+
+
+def test_a_held_corpus_walk_degrades_only_the_view_when_the_run_ledger_opens_cold(
+    client, tmp_path, monkeypatch,
+):
+    """Every run-ledger open completes only once a response is back, so the first render's own
+    open outlasts its request wait at any load."""
+    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
+    with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
+        responded = threading.Event()
+        client.event_hooks['response'].append(lambda response: responded.set())
+        connect = aiosqlite.connect
+
+        async def _connect_once_a_response_is_back(*args, **kwargs):
+            await asyncio.to_thread(responded.wait, _SETTLE_DEADLINE)
+            return await connect(*args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite, 'connect', _connect_once_a_response_is_back)
+        first, later = _serve_a_held_corpus_walk(client, render, monkeypatch)
+
+    contention = first['PRD_CONTENTION'][ROOT]
+    assert contention['state'] == 'fresh', contention['reason']
+    assert first['PRD_VIEW'][ROOT]['state'] == 'unknown'
+    assert 'escalations: ' in first['PRD_VIEW'][ROOT]['reason']
+    assert later['state'] == 'fresh'
 
 
 def test_a_failed_corpus_walk_after_a_good_one_serves_the_last_good_walk(
