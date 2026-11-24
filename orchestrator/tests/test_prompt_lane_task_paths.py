@@ -11,11 +11,11 @@ from unittest.mock import AsyncMock
 import pytest
 from _briefing_helpers import _mcp_search_envelope, memory_transport
 from _briefing_helpers import briefing as briefing
-from _role_splice_contract import assert_nonempty
+from _role_splice_contract import SpliceContract, assert_nonempty, assert_opens_own_section
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.lane_task_guidance import LANE_TASK_LINKS_GUIDANCE
-from orchestrator.agents.roles import ROLES
+from orchestrator.agents.lane_task_guidance import LANE_TASK_LINKS_GUIDANCE, LANE_TASK_LINKS_SECTION
+from orchestrator.agents.roles import ROLES, AgentRole
 from orchestrator.artifacts import LANE_SYMLINKED_ARTIFACTS, TaskArtifacts
 
 _LANE_PATH = re.compile(r'\.task/[A-Za-z0-9_.-]*[A-Za-z0-9_]')
@@ -80,20 +80,25 @@ def test_lane_layout_roles_name_the_linked_artifacts_and_metadata_json(name):
     )
 
 
-def test_every_role_naming_a_lane_link_carries_the_link_guidance_once():
-    assert_nonempty(
-        'LANE_TASK_LINKS_GUIDANCE', LANE_TASK_LINKS_GUIDANCE,
-        remedy='Restore the block in orchestrator/src/orchestrator/agents/lane_task_guidance.py.',
-    )
-    naming = {
-        name for name, role in ROLES.items()
-        if any(path in role.system_prompt for path in _LINKED_PATHS)
-    }
+def _names_a_lane_link(role: AgentRole) -> bool:
+    return any(path in role.system_prompt for path in _LINKED_PATHS)
+
+
+def test_every_role_naming_a_lane_link_carries_the_link_section_once():
+    remedy = 'Restore the block in orchestrator/src/orchestrator/agents/lane_task_guidance.py.'
+    assert_nonempty('LANE_TASK_LINKS_GUIDANCE', LANE_TASK_LINKS_GUIDANCE, remedy=remedy)
+    assert_opens_own_section('LANE_TASK_LINKS_SECTION', LANE_TASK_LINKS_SECTION, remedy=remedy)
+    naming = frozenset(name for name, role in ROLES.items() if _names_a_lane_link(role))
     assert naming, f'no role names any of {_LINKED_PATHS}, so this invariant checks nothing'
-    counts = {name: ROLES[name].system_prompt.count(LANE_TASK_LINKS_GUIDANCE) for name in sorted(naming)}
-    assert all(count == 1 for count in counts.values()), (
-        f'every role that names a .task/ link must carry LANE_TASK_LINKS_GUIDANCE exactly once: {counts}. '
-        'Carry it through roles.py::_TASK_DIR_NEVER_COMMITTED, or splice it once as ARCHITECT does.'
+    SpliceContract(
+        constant_name='LANE_TASK_LINKS_SECTION',
+        constant=LANE_TASK_LINKS_SECTION,
+        roles=naming,
+        role_set_name='the roles naming a .task/ link',
+        capability=_names_a_lane_link,
+        capability_description=f'a mention of {_LINKED_PATHS}',
+    ).assert_spliced_exactly_once(
+        remedy='Splice roles.py\'s LANE_TASK_LINKS_SECTION once into that role, as every carrier does.',
     )
 
 

@@ -1,7 +1,7 @@
 """Role-prompt guidance: how the worktree's `.task/` links behave and how to read them.
 
-`orchestrator/src/orchestrator/agents/roles.py` opens `_TASK_DIR_NEVER_COMMITTED`
-with `LANE_TASK_LINKS_GUIDANCE` and splices it into ARCHITECT on its own.
+`orchestrator/src/orchestrator/agents/roles.py` splices `LANE_TASK_LINKS_SECTION`
+once into every role whose prompt names one of those links.
 """
 
 LANE_TASK_LINKS_GUIDANCE = """\
@@ -17,3 +17,5 @@ the implementer, it checks that `.task/plan.json` reads this task's plan. So
 once a plan exists, a missing or empty `.task/plan.json` is an infra fault:
 escalate it with `category='infra_issue'` rather than searching for the file.
 """
+
+LANE_TASK_LINKS_SECTION = '\n## The .task/ links\n\n' + LANE_TASK_LINKS_GUIDANCE
