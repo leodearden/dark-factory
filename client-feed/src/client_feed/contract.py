@@ -504,28 +504,30 @@ class CriteriaResults(_Envelope):
 class Criterion(_Record):
     """One acceptance criterion as acceptance/criteria.yaml declares it."""
 
-    id: NonEmptyStr
+    id: CriterionId
     prd: RepoPath
     capability: NonEmptyStr
     statement: NonEmptyStr
     kind: CriterionKind
 
 
+def _require_unique_ids(criteria: tuple[Criterion, ...]) -> tuple[Criterion, ...]:
+    duplicates = _duplicates(criterion.id for criterion in criteria)
+    if duplicates:
+        raise ValueError(
+            f'criterion ids must be unique: {", ".join(duplicates)} declared more than once'
+        )
+    return criteria
+
+
+UniqueCriteria = Annotated[tuple[Criterion, ...], AfterValidator(_require_unique_ids)]
+
+
 class CriteriaDeclared(_Envelope):
     """Every acceptance criterion the project declares; each declaration replaces the last."""
 
     type: Literal['criteria_declared'] = 'criteria_declared'
-    criteria: tuple[Criterion, ...]
-
-    @model_validator(mode='after')
-    def _ids_are_unique(self) -> Self:
-        duplicates = _duplicates(criterion.id for criterion in self.criteria)
-        if duplicates:
-            raise ValueError(
-                f'criteria_declared ids must be unique: {", ".join(duplicates)} declared more'
-                f' than once'
-            )
-        return self
+    criteria: UniqueCriteria
 
 
 FeedEvent = Annotated[
@@ -710,10 +712,11 @@ def _json_object(text: str, *, line_no: int | None) -> dict[str, Any]:
     return value
 
 
-def _first_error(exc: ValidationError) -> str:
+def first_error(exc: ValidationError, *, whole: str) -> str:
+    """A validation failure's first error at its location, `whole` standing for the location of the value itself."""
     errors = exc.errors()
     first = errors[0]
-    location = '.'.join(str(part) for part in first['loc']) or '<record>'
+    location = '.'.join(str(part) for part in first['loc']) or whole
     more = f' (and {len(errors) - 1} more)' if len(errors) > 1 else ''
     return f'{location}: {first["msg"]}{more}'
 
@@ -724,7 +727,7 @@ def _validated(
     try:
         return validate(value)
     except ValidationError as exc:
-        raise ContractViolation(line_no=line_no, detail=_first_error(exc)) from exc
+        raise ContractViolation(line_no=line_no, detail=first_error(exc, whole='<record>')) from exc
 
 
 def _require_supported_major(header: EventHeader, *, line_no: int) -> None:

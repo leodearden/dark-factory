@@ -330,7 +330,8 @@ For a publisher configured with root R, output directory O and inbox directory I
 under O is a function of R's git objects, R's `.taskmaster/tasks/tasks.db` rows with `tag='master'`,
 R's `data/orchestrator/runs.db`, R's `data/escalations/` queue-root records, of which only `id`,
 `task_id`, `status`, `level` and `members` are read, R's `data/verify-logs/`, R's `acceptance/criteria.yaml`, the policy,
-and I's `inbox.jsonl` and `engagement.json`, filtered by the policy's visible set. It opens no other
+O's `criteria-staging.json` (written by `client-feed criteria-results`, §7.7), and I's `inbox.jsonl`
+and `engagement.json`, filtered by the policy's visible set. It opens no other
 path. It writes nowhere but O. The portal account reads O and nothing under R.
 
 The client defect filer is a separate process under its own invariant (§14.5); it widens nothing here.
@@ -528,7 +529,7 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     `client-feed/src/client_feed/inbox.py::read_inbox`, with its offset in `Cursor.inbox_offset`.
 - 2026-10-22, from task 7221 (B22). These bind γ (6970) and ε (6972):
   - (a) A test case id reaches the feed through
-    `client-feed/src/client_feed/sources/archive.py::_case_id`, which applies
+    `client-feed/src/client_feed/sources/archive.py::case_id`, which applies
     `client-feed/src/client_feed/redact.py::redact_paths`. γ emits `read_archived_run`'s case ids as
     they are and never re-derives them.
   - (b) ε's `criteria_results` `results[].tests` carries those same ids. The collection map's nodeids
@@ -712,6 +713,45 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     producer drift, any more than the copied DDL can (2026-10-21 (g)). For this seam the boundary test
     does.
 
+- 2026-11-24, from ε (task 6972). These bind ζ (6973), defect-tests ι and the portal:
+  - (a) `criteria_declared` is read every pass from `acceptance/criteria.yaml` at main's head,
+    through git objects and never the working tree
+    (`client-feed/src/client_feed/criteria.py::read_declared`, which reads one path through
+    `client-feed/src/client_feed/sources/git.py::path_entry`). It is emitted when its path-redacted
+    criteria differ from the state's (`client-feed/src/client_feed/criteria.py::declared_event`).
+    That covers the first start and every content change. A removed file emits an empty
+    declaration. An unreadable or invalid file, or a symlink at the path, is `criteria` in
+    `degraded`, and the state's declaration stands. The file's own shape is
+    `client-feed/src/client_feed/criteria.py::CriteriaFile`: `format: 1` and `criteria`, with ids
+    unique (`client-feed/src/client_feed/contract.py::UniqueCriteria`) and each a `CriterionId`
+    (§14.2 decision 12).
+  - (b) `criteria_results{verify}` joins the newest verify run of a pass that has archived junits
+    (`client-feed/src/client_feed/stream_events.py::VerifyReports`). Each junit report is joined
+    with the collection map beside it at
+    `client-feed/src/client_feed/criteria.py::collection_map_path`, over every case read uncapped
+    (`client-feed/src/client_feed/sources/archive.py::read_junit_cases`). So the outcomes never
+    depend on the `test_results` case cap, and a case id in one report never borrows another
+    report's binding. A run none of whose junits has a map records nothing. The event is emitted
+    when its payload differs from the state's
+    (`client-feed/src/client_feed/criteria.py::results_event`), so a later run with unchanged
+    outcomes still moves `run_at`. The `run_kind` records are compared separately, so a staging run
+    never suppresses a verify run or the reverse.
+  - (c) The outcome rule (`client-feed/src/client_feed/criteria.py::join_criteria`): `failed` if any
+    bound case failed or errored; `passed` only if every bound test has cases and all of them
+    passed; otherwise `not_run`. A skipped or absent bound test therefore never reads `passed`.
+    `tests` holds the bound case ids, sorted and unique. A binding to an undeclared criterion is
+    ignored.
+  - (d) `out/criteria-staging.json` is `client-feed/src/client_feed/criteria.py::CriteriaRun`
+    `{commit, run_at, results}`, where `run_at` is the CLI's clock when it joined. It is written by
+    `client-feed criteria-results` (`client-feed/src/client_feed/cli.py::_run_criteria_results`)
+    through `client-feed/src/client_feed/feed_io.py::write_atomically`, the same atomic, group-readable
+    writer as `state.json`. The publisher reads it every pass and emits `criteria_results{staging}`
+    when it differs from the state. The CLI accepts `--run-kind staging` only, and a staging file it
+    cannot write is a named refusal, exit 1. A malformed staging file is `criteria` in `degraded` and
+    does not hold the verify results.
+  - (e) `test_results.cases[].criterion` stays null. Binding it from the same map is left to sit
+    with ι's `cases[].defects`, which reads that map's `defects`
+    (follow-up ticket tkt_0RXBYTA3ZE3K2KQSNATM2CZWS9).
 
 ## 13. Open questions (tactical)
 

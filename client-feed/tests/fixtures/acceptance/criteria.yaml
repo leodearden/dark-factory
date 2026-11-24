@@ -1,0 +1,16 @@
+format: 1
+criteria:
+  - id: CF-1
+    prd: plans/client-feed-prd.md
+    capability: Acceptance criteria
+    statement: >-
+      A criterion reads passed when its bound tests pass, failed when one of them
+      fails, and not_run when no test is bound to it.
+    kind: success
+  - id: CF-2
+    prd: plans/client-feed-prd.md
+    capability: Acceptance criteria
+    statement: >-
+      A criteria file that does not validate is refused by name and never read as
+      declaring no criteria.
+    kind: failure

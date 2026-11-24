@@ -141,7 +141,7 @@ def _temp_prefix(name: str) -> str:
     return f'.{name}.'
 
 
-def _atomic_write(out_dir: Path, name: str, text: str) -> None:
+def write_atomically(out_dir: Path, name: str, text: str) -> None:
     """Replace out_dir/name by a complete, fsynced file of mode FILE_MODE, or leave it as it was."""
     fd, temp = tempfile.mkstemp(dir=out_dir, prefix=_temp_prefix(name), suffix=_TEMP_SUFFIX)
     try:
@@ -460,11 +460,11 @@ class OutDir:
         if events:
             data = ''.join(f'{event.model_dump_json()}\n' for event in events).encode()
             feed_bytes = _append(self._path / FEED_FILENAME, data)
-            _atomic_write(self._path, STATE_FILENAME, state.model_dump_json())
+            write_atomically(self._path, STATE_FILENAME, state.model_dump_json())
         committed = cursor.model_copy(
             update={'through_seq': state.watermark_seq, 'feed_bytes': feed_bytes}
         )
-        _atomic_write(self._path, CURSOR_FILENAME, committed.model_dump_json())
+        write_atomically(self._path, CURSOR_FILENAME, committed.model_dump_json())
         self._state = state
         self._cursor = committed
         self._uncommitted = ()

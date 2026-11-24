@@ -52,11 +52,20 @@ _log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class VerifyReports:
+    """A verify run and the junit reports the archive holds for it, named relative to the root."""
+
+    run: VerifyRun
+    junit_relpaths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
 class StreamOutput:
-    """The feed events of a run of stream rows, and the archive reads that failed."""
+    """The feed events of a run of stream rows, the archive reads that failed, and each tested run's junit reports."""
 
     events: tuple[FeedEvent, ...]
     degraded: tuple[Degradation, ...]
+    reports: tuple[VerifyReports, ...] = ()
 
 
 _EMPTY: Final = StreamOutput(events=(), degraded=())
@@ -76,6 +85,7 @@ def _joined(outputs: Iterable[StreamOutput]) -> StreamOutput:
     return StreamOutput(
         events=tuple(event for output in outputs for event in output.events),
         degraded=tuple(reason for output in outputs for reason in output.degraded),
+        reports=tuple(report for output in outputs for report in output.reports),
     )
 
 
@@ -108,6 +118,10 @@ def _test_results(
     )
 
 
+def _reports(run: VerifyRun, tests: ArchivedTests | None) -> tuple[VerifyReports, ...]:
+    return () if tests is None else (VerifyReports(run=run, junit_relpaths=tests.junit_relpaths),)
+
+
 def _task_run(
     root: Path, exit_: PhaseChange, started_at: datetime, max_cases: int, stamp: Stamp
 ) -> StreamOutput:
@@ -129,7 +143,11 @@ def _task_run(
         commit=None,
         legs=archived.legs,
     )
-    return StreamOutput(events=(run, *_test_results(run, archived.tests, stamp)), degraded=())
+    return StreamOutput(
+        events=(run, *_test_results(run, archived.tests, stamp)),
+        degraded=(),
+        reports=_reports(run, archived.tests),
+    )
 
 
 def _phase_output(
@@ -150,7 +168,7 @@ def _phase_output(
         return StreamOutput(events=(phase,), degraded=())
     started_at = verify_starts.pop(change.task_id, None)
     run = _EMPTY if started_at is None else _task_run(root, change, started_at, max_cases, stamp)
-    return StreamOutput(events=(phase, *run.events), degraded=run.degraded)
+    return StreamOutput(events=(phase, *run.events), degraded=run.degraded, reports=run.reports)
 
 
 def _merge_archive(
@@ -179,7 +197,11 @@ def _merge_run(root: Path, verdict: VerifyVerdict, max_cases: int, stamp: Stamp)
         commit=verdict.commit,
         legs=archived.legs,
     )
-    return StreamOutput(events=(run, *_test_results(run, archived.tests, stamp)), degraded=degraded)
+    return StreamOutput(
+        events=(run, *_test_results(run, archived.tests, stamp)),
+        degraded=degraded,
+        reports=_reports(run, archived.tests),
+    )
 
 
 def _first_landings(stream: Sequence[StreamEvent]) -> dict[str, LandedCommit]:
@@ -293,7 +315,7 @@ def stream_events(
     stamp: Stamp,
     skip_missing_before: datetime | None,
 ) -> StreamOutput:
-    """The feed events of `stream` in id order, less those already `published`.
+    """The feed events of `stream` in id order, less those already `published`; every tested run is reported, published or not.
 
     A workflow_verify verdict adds none: its verify-phase exit reports the run. A GitError or StoreReadError
     reading the landed merges propagates, so the caller holds the whole batch; but a merge the repository
@@ -314,4 +336,5 @@ def stream_events(
     return StreamOutput(
         events=tuple(event for event in built.events if identity(event) not in published),
         degraded=(*_skipped_landings(landed), *built.degraded),
+        reports=built.reports,
     )

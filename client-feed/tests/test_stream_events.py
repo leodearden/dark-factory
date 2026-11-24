@@ -47,7 +47,13 @@ from client_feed.fold import fold
 from client_feed.sources.events import LandedCommit, PhaseChange, StreamEvent, VerifyVerdict
 from client_feed.sources.git import GitError, merge_stats
 from client_feed.sources.store import StoreReadError
-from client_feed.stream_events import Identity, StreamOutput, identity, stream_events
+from client_feed.stream_events import (
+    Identity,
+    StreamOutput,
+    VerifyReports,
+    identity,
+    stream_events,
+)
 
 PROJECT = 'acme'
 BASE = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
@@ -296,6 +302,78 @@ def test_a_merge_verdict_without_a_duration_or_a_task_is_not_windowed(tmp_path: 
     ]
     assert results_of(output) == []
     assert output.degraded == ()
+
+
+def test_a_tested_task_run_reports_its_junit(tmp_path: Path) -> None:
+    write_summary(tmp_path, at(9), commands=RED_TEST)
+    junit = write_junit(tmp_path, at(9), junit_xml(passed('test_a')))
+
+    output = run(tmp_path, verify_enter(20, 0), verify_exit(21, 10))
+
+    (verify,) = verify_runs(output)
+    assert output.reports == (
+        VerifyReports(run=verify, junit_relpaths=(junit.relative_to(tmp_path),)),
+    )
+
+
+def test_a_tested_merge_run_reports_its_junit(tmp_path: Path) -> None:
+    write_summary(tmp_path, at(5), category='passed', commands=GREEN)
+    junit = write_junit(tmp_path, at(5), junit_xml(passed('test_a')))
+
+    output = run(tmp_path, merge_verdict(50, 10))
+
+    (verify,) = verify_runs(output)
+    assert output.reports == (
+        VerifyReports(run=verify, junit_relpaths=(junit.relative_to(tmp_path),)),
+    )
+
+
+def test_a_run_with_no_junit_reports_nothing(tmp_path: Path) -> None:
+    write_summary(tmp_path, at(9), commands=RED_TEST)
+
+    assert run(tmp_path, verify_enter(20, 0), verify_exit(21, 10)).reports == ()
+
+
+def test_an_unwindowed_merge_verdict_reports_nothing(tmp_path: Path) -> None:
+    write_summary(tmp_path, at(5), category='passed', commands=GREEN)
+    write_junit(tmp_path, at(5), junit_xml(passed('test_a')))
+
+    output = run(
+        tmp_path, merge_verdict(50, 10, duration_ms=None), merge_verdict(51, 10, task_id=None)
+    )
+
+    assert output.reports == ()
+
+
+def test_tested_runs_are_reported_in_stream_order(tmp_path: Path) -> None:
+    write_summary(tmp_path, at(9), qualifiers='alpha', commands=RED_TEST)
+    first = write_junit(tmp_path, at(9), junit_xml(red('test_b', 'failure')), qualifiers='alpha')
+    write_summary(tmp_path, at(29), qualifiers='beta', category='passed', commands=GREEN)
+    second = write_junit(tmp_path, at(29), junit_xml(passed('test_b')), qualifiers='beta')
+
+    output = run(
+        tmp_path, verify_enter(20, 0), verify_exit(21, 10), verify_enter(22, 20), verify_exit(23, 30)
+    )
+
+    assert [report.run.run_key for report in output.reports] == ['task-21', 'task-23']
+    assert [report.junit_relpaths for report in output.reports] == [
+        (first.relative_to(tmp_path),),
+        (second.relative_to(tmp_path),),
+    ]
+
+
+def test_a_published_run_is_still_reported(tmp_path: Path) -> None:
+    write_summary(tmp_path, at(9), commands=RED_TEST)
+    junit = write_junit(tmp_path, at(9), junit_xml(passed('test_a')))
+    stream = (verify_enter(20, 0), verify_exit(21, 10))
+    (verify,) = verify_runs(run(tmp_path, *stream))
+
+    again = run(tmp_path, *stream, published=identities(verify))
+
+    assert verify_runs(again) == []
+    assert [(report.run.run_key, report.junit_relpaths) for report in again.reports] == [
+        ('task-21', (junit.relative_to(tmp_path),)),
+    ]
 
 
 def test_a_malformed_junit_degrades_the_archive_and_drops_that_task_run(tmp_path: Path) -> None:

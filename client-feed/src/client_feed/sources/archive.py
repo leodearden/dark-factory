@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import io
 import math
 import os
 import re
@@ -167,7 +168,7 @@ _OUTCOME_TAGS: Final = {
 _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
 
 
-def _case_id(classname: str, name: str) -> str:
+def case_id(classname: str, name: str) -> str:
     """The one spelling of a junit case id as the feed carries it: `classname::name`, paths redacted."""
     return redact_paths(f'{classname}::{name}' if classname else name)
 
@@ -195,7 +196,7 @@ def _case(testcase: ET.Element) -> CaseResult:
     seconds = _seconds(testcase.get('time'))
     outcome, exception_type = _outcome(testcase)
     return CaseResult(
-        id=_case_id(testcase.get('classname', ''), testcase.get('name', '')),
+        id=case_id(testcase.get('classname', ''), testcase.get('name', '')),
         outcome=outcome,
         duration_ms=None if seconds is None else round(seconds * 1000),
         criterion=None,
@@ -209,7 +210,7 @@ class _JunitReport:
     suite_seconds: tuple[float, ...]
 
 
-def _parse_junit(report: gzip.GzipFile) -> _JunitReport:
+def _parse_junit(report: io.BufferedIOBase) -> _JunitReport:
     """Cases and suite times only: no message attribute and no element text is ever read."""
     cases: list[CaseResult] = []
     suite_seconds: list[float] = []
@@ -223,13 +224,19 @@ def _parse_junit(report: gzip.GzipFile) -> _JunitReport:
 
 
 def _read_junit(root: Path, path: Path) -> _JunitReport:
+    """The report at `path`, gzip-compressed when its name ends '.gz' (as every archived one does), else plain XML."""
     try:
-        with gzip.open(path) as report:
+        with gzip.open(path) if path.name.endswith('.gz') else path.open('rb') as report:
             return _parse_junit(report)
     except (OSError, EOFError, zlib.error) as exc:
         raise _failure(root, path, ArchiveProblem.UNREADABLE) from exc
     except (ET.ParseError, ValueError) as exc:
         raise _failure(root, path, ArchiveProblem.MALFORMED_JUNIT) from exc
+
+
+def read_junit_cases(root: Path, relpath: Path) -> tuple[CaseResult, ...]:
+    """Every case of the junit report at root/relpath in report order, never capped; the criteria join's reader."""
+    return _read_junit(root, root / relpath).cases
 
 
 @dataclass(frozen=True)

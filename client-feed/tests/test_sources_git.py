@@ -34,6 +34,7 @@ from client_feed.sources.git import (
     last_changes,
     main_head,
     merge_stats,
+    path_entry,
     repository_toplevel,
     task_branches,
     tree_changes,
@@ -140,6 +141,62 @@ def test_tree_entries_lists_files_symlinks_and_submodules(repo: Repo) -> None:
         path='vendor/lib', kind=EntryKind.SUBMODULE, object_sha='b' * 40, size=None
     )
     assert set(entries) == {'src/a.py', 'bin/run', 'odd name/ünï.txt', 'src/link', 'vendor/lib'}
+
+
+CRITERIA = 'acceptance/criteria.yaml'
+
+
+def test_path_entry_is_the_file_a_commit_holds_at_the_path(repo: Repo) -> None:
+    repo.write(CRITERIA, 'format: 1\n')
+    repo.write('acceptance/other.yaml', 'x\n')
+    commit = repo.commit('one', when=T0)
+
+    assert path_entry(repo.root, commit, CRITERIA) == TreeEntry(
+        path=CRITERIA, kind=EntryKind.FILE, object_sha=repo.rev(f'{commit}:{CRITERIA}'), size=10
+    )
+
+
+def test_path_entry_is_none_when_the_commit_holds_no_such_path(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    commit = repo.commit('one', when=T0)
+
+    assert path_entry(repo.root, commit, CRITERIA) is None
+
+
+def test_path_entry_is_none_when_the_path_is_a_directory(repo: Repo) -> None:
+    repo.write(f'{CRITERIA}/x', 'x\n')
+    commit = repo.commit('one', when=T0)
+
+    assert path_entry(repo.root, commit, CRITERIA) is None
+
+
+def test_path_entry_names_a_committed_symlink(repo: Repo) -> None:
+    repo.symlink(CRITERIA, '/home/someone/secret')
+    commit = repo.commit('one', when=T0)
+
+    entry = path_entry(repo.root, commit, CRITERIA)
+
+    assert entry is not None
+    assert entry.kind is EntryKind.SYMLINK
+
+
+def test_path_entry_reads_the_commit_not_the_working_tree(repo: Repo) -> None:
+    repo.write(CRITERIA, 'format: 1\n')
+    commit = repo.commit('one', when=T0)
+    repo.write(CRITERIA, 'an uncommitted edit\n')
+    repo.write('acceptance/untracked.yaml', 'x\n')
+
+    entry = path_entry(repo.root, commit, CRITERIA)
+
+    assert entry is not None
+    assert entry.object_sha == repo.rev(f'{commit}:{CRITERIA}')
+    assert path_entry(repo.root, commit, 'acceptance/untracked.yaml') is None
+
+
+@pytest.mark.parametrize('bad', ['--output=x', 'HEAD', 'a' * 39, 'A' * 40])
+def test_path_entry_refuses_a_non_hex_commit_before_git_runs(tmp_path: Path, bad: str) -> None:
+    with pytest.raises(ValueError, match='sha'):
+        path_entry(tmp_path / 'missing', bad, CRITERIA)
 
 
 def test_blob_reader_reads_committed_bytes_in_one_session(repo: Repo) -> None:
