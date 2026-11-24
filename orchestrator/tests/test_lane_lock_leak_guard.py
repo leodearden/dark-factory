@@ -2964,14 +2964,22 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         """
         gate = threading.Event()
         obs = self._stub_acquire(monkeypatch, gate, _SENTINEL_FD)
+        running = obs['running']
+        assert isinstance(running, threading.Event)
 
         task = asyncio.create_task(
             GitOps._acquire_lane_flock_off_thread(lane_lock_path(tmp_path / 'lane'), 5.0)
         )
-        assert await wait_until(obs['running'].is_set), (  # type: ignore[union-attr]
-            'the acquire never reached the worker thread — cancelling now '
-            'would prove nothing about a late win'
+        entered = asyncio.ensure_future(asyncio.to_thread(running.wait))
+        done, _ = await asyncio.wait(
+            {task, entered}, return_when=asyncio.FIRST_COMPLETED,
         )
+        if entered not in done:
+            running.set()
+            pytest.fail(
+                'the acquire never reached the worker thread — cancelling now '
+                'would prove nothing about a late win'
+            )
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
