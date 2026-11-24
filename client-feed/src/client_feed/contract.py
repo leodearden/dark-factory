@@ -25,7 +25,7 @@ from pydantic import (
     model_validator,
 )
 
-FEED_VERSION: Final = '1.0'
+FEED_VERSION: Final = '1.1'
 
 
 def feed_major(version: str) -> int:
@@ -112,6 +112,7 @@ class Source(StrEnum):
     CRITERIA = 'criteria'
     ENGAGEMENT = 'engagement'
     INBOX = 'inbox'
+    FILER = 'filer'
 
 
 class SchedulerState(StrEnum):
@@ -530,6 +531,30 @@ class CriteriaDeclared(_Envelope):
     criteria: UniqueCriteria
 
 
+class FiledDefect(_Record):
+    """A client defect report filed as a task, and whether a human gate holds its fix."""
+
+    block: PositiveInt
+    report: PositiveInt
+    task_id: TaskId
+    gated: StrictBool
+
+
+class DefectFiled(_Envelope):
+    """The factory acknowledging a client defect report: the task that carries it, and whether it is gated."""
+
+    type: Literal['defect_filed'] = 'defect_filed'
+    ref: NonEmptyStr
+    block: PositiveInt
+    report: PositiveInt
+    task_id: TaskId
+    gated: StrictBool
+
+    @property
+    def natural_key(self) -> str:
+        return self.ref
+
+
 FeedEvent = Annotated[
     Heartbeat
     | FactoryState
@@ -544,7 +569,8 @@ FeedEvent = Annotated[
     | FileRevealed
     | RevealRefused
     | CriteriaResults
-    | CriteriaDeclared,
+    | CriteriaDeclared
+    | DefectFiled,
     Field(discriminator='type'),
 ]
 FEED_EVENT_ADAPTER: Final = TypeAdapter(FeedEvent)
@@ -599,6 +625,7 @@ class FeedState(_Record):
     revealed: tuple[RevealedFile, ...]
     criteria: dict[RunKind, CriteriaResults]
     criteria_declared: dict[str, Criterion]
+    defects_filed: dict[str, FiledDefect]
     recent: tuple[FeedEvent, ...]
 
     @model_validator(mode='after')
