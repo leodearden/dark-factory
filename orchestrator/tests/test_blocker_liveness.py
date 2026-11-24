@@ -23,9 +23,17 @@ TTL = timedelta(seconds=300)
 HELD, PARKED = BlockerKind.HELD, BlockerKind.PARKED
 
 
-def _task(status: str, *, claimant: str | None = None, beat_secs_ago: float | None = None) -> dict[str, Any]:
+def _task(
+    status: str, *,
+    claimant: str | None = None,
+    beat_secs_ago: float | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     beat = None if beat_secs_ago is None else (NOW - timedelta(seconds=beat_secs_ago)).isoformat()
-    return {'status': status, 'claimant_run_id': claimant, 'heartbeat_at': beat}
+    record: dict[str, Any] = {'status': status, 'claimant_run_id': claimant, 'heartbeat_at': beat}
+    if metadata is not None:
+        record['metadata'] = metadata
+    return record
 
 
 def _running(beat_secs_ago: float = 30) -> dict[str, Any]:
@@ -66,9 +74,12 @@ class TestHeldBlocker:
         _task('blocked', claimant='run-x', beat_secs_ago=10),
         _task('done'),
         _task('cancelled'),
+        _task('in-progress', claimant='run-x', beat_secs_ago=900, metadata={'infra_hold': True}),
+        _task('blocked', metadata={'infra_hold': True}),
     ], ids=[
         'heartbeating', 'dispatched-not-yet-claimed', 'requeued-before-its-claim-clears',
         'blocked-on-its-way-out', 'done-before-release', 'cancelled-before-release',
+        'legacy-infra-held', 'legacy-infra-held-blocked',
     ])
     def test_an_in_flight_owner_with_progress_or_unwinding_is_live(
         self, record: dict[str, Any],
@@ -86,9 +97,12 @@ class TestHeldBlocker:
         (_task('blocked'), HolderState.BLOCKED),
         (_task('pending', claimant='run-x', beat_secs_ago=900), HolderState.NO_LIVE_CLAIMANT),
         (_task('pending', claimant='run-x'), HolderState.NO_LIVE_CLAIMANT),
+        (_task('merge-deferred', claimant='run-x', beat_secs_ago=900), HolderState.NO_LIVE_CLAIMANT),
+        (_task('infra-hold', claimant='run-x', beat_secs_ago=900), HolderState.NO_LIVE_CLAIMANT),
     ], ids=[
         'stale-heartbeat', 'no-claimant', 'no-heartbeat', 'blocked-stale-claimant',
         'blocked-no-claimant', 'requeue-exit-hung', 'requeued-no-heartbeat',
+        'merge-deferred-exit-hung', 'infra-hold-status-exit-hung',
     ])
     def test_an_in_flight_owner_without_a_live_claimant_names_its_blocker(
         self, record: dict[str, Any], reason: HolderState,
