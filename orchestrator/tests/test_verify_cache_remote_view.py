@@ -6,12 +6,17 @@ dispatcher settles what the runner reports."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
+from collections import Counter
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
+from _gate_fixtures import gate_argv, gated_remote_runner
 from _git_fixtures import seed_repo
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from _verify_cache_fixtures import (
@@ -26,11 +31,14 @@ from _verify_cache_fixtures import (
     merge_pool,
     module_legs,
     module_units,
+    outcomes_of,
     ran_legs,
     record_run,
+    row_units,
     task_verify,
     units_by_id,
     use_real_legs,
+    workspace_git,
 )
 from _verify_cache_units import (
     clean_leg,
@@ -42,7 +50,7 @@ from _verify_cache_units import (
 )
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheConfig
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.task_verify_run import run_task_verify_on_worktree
 from orchestrator.task_verify_spec import (
@@ -67,8 +75,12 @@ from orchestrator.verify_cache.replay import CacheAccess, ExecutedModule, Replay
 from orchestrator.verify_evidence import Leg, UnitOutcome, UnitTier
 from orchestrator.verify_runner import (
     MergeVerifySpec,
+    RemoteRunner,
+    RunnerUnavailable,
     UnscopedTypecheckSpec,
+    VerifyRunnerPool,
     build_merge_verify_spec,
+    result_to_json,
     run_merge_verify_on_worktree,
     spec_from_json,
     spec_to_json,
@@ -627,3 +639,289 @@ class TestTheDispatcherSettlesWhatTheRunnerReports:
     def test_a_dispatcher_without_a_registry_settles_nothing_remotely(self, registry):
         assert RemoteCache.of(None, _BOTH_ON) is None
         assert RemoteCache.of(registry, _BOTH_ON) == RemoteCache(registry, _BOTH_ON)
+
+
+_LAPTOP = 'laptop'
+#: Linux MAX_ARG_STRLEN: the remote shell is handed the whole command as one ``-c`` argument.
+_MAX_ARG_STRLEN = 131_072
+
+
+def _flag(words: Sequence[str], flag: str) -> str:
+    return words[words.index(flag) + 1]
+
+
+def _shipped_view(command: str) -> ShippedView | None:
+    """The view the remote verify *command* carries in its ``--spec``."""
+    return spec_from_json(_flag(gate_argv(command), '--spec')).verify_cache
+
+
+class _Laptop:
+    """Host R: a second checkout of the seeded repo that answers RemoteRunner's verify ssh
+    with the real runner entry, in-process, under its own host *modes*. Every push it is
+    sent succeeds; *before_answer* runs after R has decided and before its verdict returns."""
+
+    def __init__(self, checkout: Path, modes: VerifyCacheConfig) -> None:
+        self.checkout = checkout
+        self.modes = modes
+        self.commands: list[str] = []
+        self.before_answer: Callable[[], Awaitable[None]] | None = None
+
+    def runner(self, dispatcher_repo: Path) -> RemoteRunner:
+        return gated_remote_runner(_LAPTOP, 'laptop.local', 'origin', str(dispatcher_repo), run=self.run)
+
+    async def run(self, argv: list[str], *, cwd: Any = None) -> tuple[int, str, str]:
+        if argv[:2] == ['git', 'push']:
+            return (0, '', '')
+        assert argv[0] == 'ssh', argv
+        self.commands.append(argv[-1])
+        words = gate_argv(argv[-1])
+        assert words[0] == 'verify-merge', words
+        sha = _flag(words, '--sha')
+        workspace_git(self.checkout, 'checkout', '-q', '--detach', sha)
+        result = await run_merge_verify_on_worktree(
+            self.checkout, cache_config(self.checkout, self.modes), spec_from_json(_flag(words, '--spec')),
+            merge_sha=sha, run_unscoped=clean_unscoped_gate,
+        )
+        if self.before_answer is not None:
+            await self.before_answer()
+        return (0, result_to_json(result), '')
+
+
+@pytest.fixture
+def laptop_checkout(repo: Path, tmp_path: Path) -> Path:
+    checkout = tmp_path / 'laptop'
+    workspace_git(repo, 'worktree', 'add', '-q', '--detach', str(checkout))
+    return checkout
+
+
+def _pin_interpreter(checkout: Path, version_info: str) -> None:
+    """Give *checkout* a venv of interpreter *version_info*, excluded so its working copy stays clean."""
+    exclude = Path(workspace_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'info/exclude'))
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open('a') as excluded:
+        excluded.write('.venv/\n')
+    (checkout / '.venv').mkdir()
+    (checkout / '.venv' / 'pyvenv.cfg').write_text(
+        f'home = /usr/bin\nimplementation = CPython\nversion_info = {version_info}\n',
+    )
+
+
+def _remote_pool(
+    laptop: _Laptop, repo: Path, registry: Registry, store: EventStore, modes: VerifyCacheConfig,
+) -> VerifyRunnerPool:
+    """A pool of R alone, deciding through and recording into *registry* under the dispatcher's *modes*."""
+    return VerifyRunnerPool(
+        [laptop.runner(repo)], event_store=store, task_id='9123',
+        verify_cache_registry=registry, verify_cache_modes=modes,
+    )
+
+
+def _dispatcher_spec(repo: Path, modules: list[ModuleConfig]) -> MergeVerifySpec:
+    return build_merge_verify_spec(cache_config(repo, _BOTH_ON), modules, None)
+
+
+@pytest.mark.usefixtures('seam')
+class TestARemoteMergeGateThroughTheRealRemoteRunner:
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    @pytest.mark.asyncio
+    async def test_row_21_a_remote_green_is_recorded_then_replayed_and_consumed(
+        self, repo, modules, registry, store, laptop_checkout, markers,
+    ):
+        pool = _remote_pool(_Laptop(laptop_checkout, VerifyCacheConfig()), repo, registry, store, _BOTH_ON)
+        first = await pool.dispatch(head_of(repo), _dispatcher_spec(repo, modules))
+        assert first.passed, first.summary
+        first_entries = await entries_for(registry, first)
+        commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        merge_sha = head_of(repo)
+        clear_markers(markers)
+
+        result = await pool.dispatch(merge_sha, _dispatcher_spec(repo, modules))
+
+        assert result.passed, result.summary
+        first_row, row = store.fetch_events_by_type(EventType.merge_verify)
+        assert (first_row['data']['runner'], row['data']['runner']) == (_LAPTOP, _LAPTOP)
+        units = row_units(row)
+        for unit_id in module_units('alpha'):
+            assert units[unit_id]['outcome'] == 'cache_hit'
+            assert units[unit_id]['evidence_event_id'] == first_entries[unit_id].evidence_event_id == first_row['id']
+        assert {entry.unit_id: entry.entry_id for entry in await registry.consumed_for(merge_sha)} == {
+            unit_id: first_entries[unit_id].entry_id for unit_id in module_units('alpha')
+        }
+        assert ran_legs(markers) == module_legs('beta')
+        recorded = await entries_for(registry, result)
+        for unit_id in module_units('beta'):
+            assert (recorded[unit_id].evidence_event_id, recorded[unit_id].sha) == (row['id'], merge_sha)
+
+    @pytest.mark.asyncio
+    async def test_row_22_a_local_green_replays_on_a_remote_whose_keyed_inputs_agree(
+        self, repo, modules, registry, store, laptop_checkout,
+    ):
+        recorded = await _recorded_then_beta_edited(repo, modules, registry, store)
+        merge_sha = head_of(repo)
+        pool = _remote_pool(_Laptop(laptop_checkout, VerifyCacheConfig()), repo, registry, store, _BOTH_ON)
+
+        result = await pool.dispatch(merge_sha, _dispatcher_spec(repo, modules))
+
+        assert result.passed, result.summary
+        assert outcomes_of(result, module_units('alpha')) == {UnitOutcome.CACHE_HIT}
+        assert {entry.unit_id: entry.entry_id for entry in await registry.consumed_for(merge_sha)} == {
+            unit_id: recorded[unit_id].entry_id for unit_id in module_units('alpha')
+        }
+
+    @pytest.mark.asyncio
+    async def test_row_22_a_local_green_misses_on_a_remote_whose_interpreter_differs(
+        self, repo, modules, registry, store, laptop_checkout,
+    ):
+        await _recorded_then_beta_edited(repo, modules, registry, store)
+        _pin_interpreter(laptop_checkout, '3.99.0.final.0')
+        merge_sha = head_of(repo)
+        pool = _remote_pool(_Laptop(laptop_checkout, VerifyCacheConfig()), repo, registry, store, _BOTH_ON)
+
+        result = await pool.dispatch(merge_sha, _dispatcher_spec(repo, modules))
+
+        assert result.passed, result.summary
+        assert outcomes_of(result, module_units('alpha')) == {UnitOutcome.RAN_GREEN}
+        assert await registry.consumed_for(merge_sha) == ()
+        assert len(await registry.candidates([_ALPHA], per_unit=16)) == 2
+
+    @pytest.mark.asyncio
+    async def test_row_23_a_log_role_runs_every_unit_on_the_remote_and_consumes_nothing(
+        self, repo, modules, registry, store, laptop_checkout, markers,
+    ):
+        recorded = await _recorded_then_beta_edited(repo, modules, registry, store)
+        merge_sha = head_of(repo)
+        modes = _BOTH_ON.model_copy(update={'merge_mode': CacheMode.LOG})
+        pool = _remote_pool(_Laptop(laptop_checkout, _HOST_ON), repo, registry, store, modes)
+        clear_markers(markers)
+
+        result = await pool.dispatch(merge_sha, _dispatcher_spec(repo, modules))
+
+        assert result.passed, result.summary
+        assert ran_legs(markers) == module_legs('alpha') | module_legs('beta')
+        local_row, row = store.fetch_events_by_type(EventType.merge_verify)
+        units = row_units(row)
+        for unit_id in module_units('alpha'):
+            assert units[unit_id]['outcome'] == 'would_hit'
+            assert units[unit_id]['evidence_event_id'] == recorded[unit_id].evidence_event_id == local_row['id']
+        assert local_row['data']['runner'] != row['data']['runner'] == _LAPTOP
+        assert await registry.consumed_for(merge_sha) == ()
+
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    @pytest.mark.asyncio
+    async def test_row_24_a_green_evicted_between_ship_and_answer_is_no_verdict_and_never_reshipped(
+        self, repo, modules, registry, store, laptop_checkout,
+    ):
+        recorded = await _recorded_then_beta_edited(repo, modules, registry, store)
+        evicted = recorded[_ALPHA]
+        merge_sha = head_of(repo)
+        laptop = _Laptop(laptop_checkout, VerifyCacheConfig())
+
+        async def evict_once() -> None:
+            laptop.before_answer = None
+            await registry.evict_key(evicted.key, 'row 24: evicted between ship and answer')
+
+        laptop.before_answer = evict_once
+        pool = _remote_pool(laptop, repo, registry, store, _BOTH_ON)
+
+        with pytest.raises(RunnerUnavailable) as raised:
+            await pool.dispatch(merge_sha, _dispatcher_spec(repo, modules))
+
+        assert raised.value.kind == 'no_verdict'
+        assert _ALPHA in str(raised.value) and evicted.key in str(raised.value)
+        shipped = _shipped_view(laptop.commands[0])
+        assert shipped is not None and evicted.candidate in shipped.candidates
+
+        result = await pool.dispatch(merge_sha, _dispatcher_spec(repo, modules))
+
+        assert result.passed, result.summary
+        reshipped = _shipped_view(laptop.commands[-1])
+        assert reshipped is not None
+        assert evicted.key not in {candidate.key for candidate in reshipped.candidates}
+        assert units_by_id(result)[_ALPHA].outcome is UnitOutcome.RAN_GREEN
+
+
+class _HeldGreens(Registry):
+    """A registry holding *count* greens of each of *unit_ids*, served without writing
+    them: recording them one durable transaction at a time costs ~40 ms each."""
+
+    def __init__(self, path: Path, unit_ids: Sequence[str], count: int) -> None:
+        super().__init__(path)
+        self._greens = {
+            unit_id: tuple(
+                Candidate(
+                    unit_id, hashlib.sha256(f'{unit_id}#{n}'.encode()).hexdigest(),
+                    1_000_000 + index * count + n, 9_000_000 + index * count + n,
+                )
+                for n in range(count)
+            )
+            for index, unit_id in enumerate(unit_ids)
+        }
+
+    async def candidates(self, unit_ids: Sequence[str], *, per_unit: int) -> tuple[Candidate, ...]:
+        return tuple(candidate for unit_id in unit_ids for candidate in self._greens.get(unit_id, ())[:per_unit])
+
+    async def policy_state(self) -> PolicyState:
+        return PolicyState()
+
+
+class _AnswersGreen:
+    """A remote that keeps every verify command it is sent and answers each green."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    async def run(self, argv: list[str], *, cwd: Any = None) -> tuple[int, str, str]:
+        if argv[0] != 'ssh':
+            return (0, '', '')
+        self.commands.append(argv[-1])
+        return (0, result_to_json(verify_result()), '')
+
+
+_THIRTY_UNITS_SPEC = MergeVerifySpec(
+    verify_commands=tuple(
+        VerifyCommand(f'module{n:02d}', test_command='pytest', lint_command='ruff check', type_check_command='pyright')
+        for n in range(10)
+    ),
+    unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+    task_files=('module00/a.py',),
+    verify_env={},
+    cold_timeout_secs=60.0,
+)
+
+
+class TestTheShippedCommandFitsOneArgument:
+    async def _shipped(self, tmp_path: Path, greens: int, modes: VerifyCacheConfig) -> tuple[str, ShippedView]:
+        units = [unit_id for unit_id in planned_unit_ids(_THIRTY_UNITS_SPEC.verify_commands) if unit_id != keys.TREE_UNIT_ID]
+        assert len(units) == 30
+        remote = _AnswersGreen()
+        runner = gated_remote_runner(_LAPTOP, 'laptop.local', 'origin', '/repo', run=remote.run)
+
+        result = await runner.run_merge_verify(
+            'a' * 40, _THIRTY_UNITS_SPEC, verify_cache=RemoteCache(_HeldGreens(tmp_path / 'held.db', units, greens), modes),
+        )
+
+        assert result.passed, result.summary
+        (command,) = remote.commands
+        view = _shipped_view(command)
+        assert view is not None
+        return command, view
+
+    @pytest.mark.asyncio
+    async def test_thirty_units_of_twenty_greens_ship_their_cap_of_sixteen(self, tmp_path):
+        command, view = await self._shipped(tmp_path, 20, _BOTH_ON)
+
+        assert len(command.encode()) <= _MAX_ARG_STRLEN
+        assert view.truncated is True
+        depths = Counter(candidate.unit_id for candidate in view.candidates)
+        assert len(depths) == 30
+        assert set(depths.values()) == {16}
+
+    @pytest.mark.asyncio
+    async def test_a_cap_the_command_cannot_hold_is_trimmed_to_fit_and_says_truncated(self, tmp_path):
+        command, view = await self._shipped(
+            tmp_path, 2000, _BOTH_ON.model_copy(update={'remote_candidates_per_unit': 2000}),
+        )
+
+        assert len(command.encode()) <= _MAX_ARG_STRLEN
+        assert view.truncated is True
+        assert 0 < len(view.candidates) < 30 * 2000

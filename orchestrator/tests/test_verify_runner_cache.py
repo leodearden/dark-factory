@@ -208,11 +208,15 @@ class TestMergeGateRecordsAndConsumes:
         assert (result.passed, result.category, result.summary) == (False, red.category, red.summary)
 
     @pytest.mark.asyncio
-    async def test_a_non_local_runner_records_nothing(self, repo, modules, access, registry, store):
+    async def test_a_non_local_runners_greens_are_recorded_citing_its_row_and_its_replays_left_to_it(
+        self, repo, modules, access, registry, store,
+    ):
         config = cache_config(repo)
+        await merge_pool(repo, config, modules, registry, store).dispatch(head_of(repo), _spec(config, modules))
+        commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
         remote_result = await merge_gate(repo, config, modules, access)
         assert remote_result.passed, remote_result.summary
-        assert remote_result.cache_record is not None
+        assert outcomes_of(remote_result, module_units('alpha')) == {UnitOutcome.CACHE_HIT}
         merge_sha = head_of(repo)
         pool = VerifyRunnerPool(
             [_RemoteDouble(remote_result)], event_store=store, task_id='5653', verify_cache_registry=registry,
@@ -221,5 +225,9 @@ class TestMergeGateRecordsAndConsumes:
         result = await pool.dispatch(merge_sha, _spec(config, modules))
 
         assert result.passed, result.summary
-        assert await entries_for(registry, result) == {}
+        row = store.fetch_events_by_type(EventType.merge_verify)[-1]
+        recorded = await entries_for(registry, result)
+        assert {unit_id for unit_id, entry in recorded.items() if entry.evidence_event_id == row['id']} == (
+            module_units('beta') | {TREE_UNIT_ID}
+        )
         assert await registry.consumed_for(merge_sha) == ()
