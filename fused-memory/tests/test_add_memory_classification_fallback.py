@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from _fm_polling import poll_until
 from _sdk_client_stubs import completion_client, raising_client
+from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.models.enums import ClassificationFallback, MemoryCategory
@@ -79,15 +80,28 @@ def _fails_once_per_fact() -> AsyncMock:
     return AsyncMock(side_effect=add)
 
 
+# Both episode-path drains overran poll_until's 10s default in full-suite xdist verifies (esc-8417-2, task 7715).
+_DRAIN_OVERRAN_UNDER_LOAD_S = 10.0
+_DRAIN_BUDGET_S = _DRAIN_OVERRAN_UNDER_LOAD_S * UNDER_LOAD_HEADROOM_FACTOR
+
+
 async def _drain(service: MemoryService, *, completed: int) -> None:
     queue = service.durable_queue
     assert queue is not None
+    last_counts: dict = {}
 
     async def _done() -> bool:
-        stats = await queue.get_stats()
-        return stats['counts'].get('completed') == completed
+        nonlocal last_counts
+        last_counts = (await queue.get_stats())['counts']
+        return last_counts.get('completed') == completed
 
-    await poll_until(_done, message=f'the queue never completed {completed} item(s)')
+    try:
+        await poll_until(_done, timeout=_DRAIN_BUDGET_S)
+    except AssertionError as exc:
+        raise AssertionError(
+            f'the queue never completed {completed} item(s) within {_DRAIN_BUDGET_S}s; '
+            f'last counts={last_counts}'
+        ) from exc
 
 
 def _add_memory_params(journal: MagicMock) -> list[dict]:
