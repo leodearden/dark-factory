@@ -234,8 +234,9 @@ LEASE_STARTED_TS=""
 # Busy grace of the LEGACY merge-idle gate: 600s = 10m is the settled, permanent
 # value (it was 4500 = 75m until 2026-08-26). Since task 5371 it governs only
 # pre-5371 units and units whose drain request is refused or unwritable, which
-# are deferred while merge-busy and force-restarted once it elapses. A unit with
-# a merge verify in flight is awaited under the two-stage drain above, never
+# are deferred while merge-busy and force-restarted once it elapses. A unit that
+# has acknowledged its drain request and reports a merge verify in flight
+# (verdict verifying) is awaited under the two-stage drain above, never
 # force-restarted at this grace. The collision that motivated shrinking it (a
 # permanently-busy unit stretching every sweep and letting a second redeploy
 # fire) is history: the backstop head start (task 4754) and the in-flight fleet
