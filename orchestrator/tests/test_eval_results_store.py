@@ -460,6 +460,41 @@ class TestLegacyRoleRule:
         assert excinfo.value.path == bad
 
 
+class TestLegacyCliCostUntrustedRule:
+    """A cell persisted before task 9970 stored the cost-trust flag as 'is_local_model'."""
+
+    def test_the_old_key_is_renamed(self):
+        normalized = normalize_legacy_metrics({'is_local_model': True})
+        assert normalized == {
+            'cli_cost_untrusted': True,
+            'role_under_test': RoleUnderTest.IMPLEMENTER,
+        }
+
+    def test_a_cell_with_both_keys_keeps_the_new_value(self):
+        normalized = normalize_legacy_metrics(
+            {'is_local_model': True, 'cli_cost_untrusted': False},
+        )
+        assert normalized['cli_cost_untrusted'] is False
+        assert 'is_local_model' not in normalized
+
+    def test_a_cell_with_neither_key_gains_neither(self):
+        normalized = normalize_legacy_metrics({'cost_usd': 1.0})
+        assert 'cli_cost_untrusted' not in normalized
+        assert 'is_local_model' not in normalized
+
+    def test_the_input_is_not_mutated(self):
+        metrics = {'is_local_model': True}
+        normalize_legacy_metrics(metrics)
+        assert metrics == {'is_local_model': True}
+
+    def test_a_stored_legacy_cell_loads_untrusted_with_no_endpoint_kind(self, store: ResultStore):
+        store.save(_result(metrics={'is_local_model': True}))
+        [loaded] = store.load_all()
+        metrics = EvalMetrics.from_dict(loaded.metrics)
+        assert metrics.cli_cost_untrusted is True
+        assert metrics.endpoint_kind is None
+
+
 def test_the_packaged_store_lives_beside_the_results_module():
     assert ResultStore.packaged().directory == (
         Path(results_module.__file__).parent / 'results'

@@ -1769,7 +1769,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
             model=cfg.models.implementer,
             prices=cfg.prices,
             cli_cost_usd=999.0,           # deliberately wrong CLI figure —
-            is_local_model=True,          # must be IGNORED once price_table hits
+            cli_cost_untrusted=True,          # must be IGNORED once price_table hits
         )
         assert source == 'price_table'
         assert cost != 999.0
