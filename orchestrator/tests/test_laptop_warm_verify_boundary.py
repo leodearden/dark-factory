@@ -46,8 +46,9 @@ import subprocess
 import textwrap
 import uuid
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock
 
 import _verify_boundary_ceilings
@@ -180,15 +181,14 @@ def _swept_test_functions() -> Iterator[tuple[str, ast.FunctionDef | ast.AsyncFu
 
 #: The helpers whose ``timeout`` default now resolves to
 #: :func:`row_discovery_ceiling_secs`, i.e. can spend up to
-#: ROW_DISCOVERY_CEILING_MAX_SECS each.
-_SCALED_DISCOVERY_HELPERS: frozenset[str] = frozenset(
-    {'wait_for_pgid_file', 'wait_pid_tagged', 'wait_subtree_live'}
-)
-
-#: The seams that TOGETHER mean "this call never touches real /proc" -- see
-#: :func:`_scaled_discovery_call_count`.  BOTH are required: either one alone
-#: leaves the other half of the poll tick reading real /proc.
-_DISCOVERY_SEAM_KWARGS: frozenset[str] = frozenset({'_probe_children', '_ppid_map'})
+#: ROW_DISCOVERY_CEILING_MAX_SECS each, mapped to that helper's OWN seams
+#: that TOGETHER mean "this call never touches real /proc" -- see
+#: :func:`_scaled_discovery_call_count`.  None: the helper has no such seams.
+_SCALED_DISCOVERY_HELPERS: Mapping[str, frozenset[str] | None] = MappingProxyType({
+    'wait_for_pgid_file': None,
+    'wait_pid_tagged': frozenset({'_tagged_pids'}),
+    'wait_subtree_live': frozenset({'_probe_children', '_ppid_map'}),
+})
 
 #: Last-resort stand-in for the pytest-timeout budget an unmarked test
 #: inherits, used ONLY when pytest-timeout did not configure this run at all
@@ -258,8 +258,9 @@ def _scaled_discovery_call_count(func_node) -> int:
     ``row_discovery_ceiling_secs()``.  An explicit unscaled value (e.g.
     ``timeout=30.0``) does not count -- it cannot exceed what it names.
 
-    A call passing the FULL private seam set (``_probe_children`` AND
-    ``_ppid_map``) is EXEMPT, and that rule is load-bearing: a fully
+    A call passing its OWN helper's FULL private seam set (for
+    wait_subtree_live, ``_probe_children`` AND ``_ppid_map``) is EXEMPT, and
+    that rule is load-bearing: a fully
     seam-injected call never touches real /proc and returns in microseconds at
     ``interval=0``.  Without it the three deterministic wait_subtree_live
     tests in test_verify_boundary_harness.py would each be told to carry a
@@ -286,8 +287,9 @@ def _scaled_discovery_call_count(func_node) -> int:
             and node.func.id in _SCALED_DISCOVERY_HELPERS
         ):
             continue
+        seams = _SCALED_DISCOVERY_HELPERS[node.func.id]
         # Superset, not intersection: the FULL seam set must be injected.
-        if {kw.arg for kw in node.keywords} >= _DISCOVERY_SEAM_KWARGS:
+        if seams is not None and {kw.arg for kw in node.keywords} >= seams:
             continue
         timeout_arg = next(
             (kw.value for kw in node.keywords if kw.arg == 'timeout'), None
@@ -524,6 +526,25 @@ def test_scaled_discovery_call_count_bills_a_tag_wait():
         'a load-scaled tag wait the discovery-budget sweep does not bill can be '
         'truncated by pytest-timeout instead of failing with its own assertion'
     )
+
+
+@pytest.mark.parametrize(
+    ('call', 'billed'),
+    [
+        ('wait_pid_tagged(pid, tag, _tagged_pids=fake)', 0),
+        ('wait_subtree_live(pid, _probe_children=fake, _ppid_map=fake)', 0),
+        ('wait_subtree_live(pid, _ppid_map=fake)', 1),
+        ('wait_subtree_live(pid, _tagged_pids=fake)', 1),
+        ('wait_for_pgid_file(path, _probe_children=fake, _ppid_map=fake)', 1),
+    ],
+)
+def test_scaled_discovery_call_count_exempts_a_call_only_by_its_own_helpers_full_seam_set(
+    call, billed
+):
+    """A seam exempts only the helper that takes it, and only all of its seams together."""
+    (func,) = ast.parse(f'def test_wait(pid, tag, path, fake):\n    {call}\n').body
+
+    assert _scaled_discovery_call_count(func) == billed
 
 
 #: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
