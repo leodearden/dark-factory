@@ -140,6 +140,14 @@ and OpenCode honours `OPENCODE_CONFIG_CONTENT`- and `OPENCODE_PERMISSION`-style
 overrides. A MiMo equivalent left on the host for interactive use could
 otherwise add MCP servers or relax a deny.
 
+Measured 2026-11-15 with mimo 0.1.16 (`mimo debug config` in a temp
+`MIMOCODE_HOME`): `OPENCODE_CONFIG_CONTENT` and `OPENCODE_PERMISSION` are not
+honoured. `MIMOCODE_CONFIG_CONTENT` (an injected mcp server appeared) and
+`MIMOCODE_PERMISSION` (`bash: deny` appeared) are honoured, and the arm's
+`MIMOCODE_*` scrub
+(`orchestrator/src/orchestrator/agents/mimo_backend.py::mimo_spawn_env`)
+already removes both. So no `OPENCODE_*` scrub is needed.
+
 | variable | value |
 |---|---|
 | `HOME`, `USERPROFILE`, `MIMOCODE_HOME` | the run home |
