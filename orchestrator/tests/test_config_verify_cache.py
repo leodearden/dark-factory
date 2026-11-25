@@ -114,6 +114,82 @@ def test_each_role_mode_is_its_own_reload_leaf():
     assert {'verify_cache.task_mode', 'verify_cache.merge_mode'} <= RELOADABLE_FIELDS
 
 
+class TestRemoteModes:
+    @pytest.mark.usefixtures('code_default_config')
+    def test_remote_replay_defaults_to_off_with_a_cap_of_sixteen(self):
+        modes = OrchestratorConfig().verify_cache
+
+        assert modes.remote_task_mode is CacheMode.OFF
+        assert modes.remote_merge_mode is CacheMode.OFF
+        assert modes.remote_candidates_per_unit == 16
+
+    @pytest.mark.parametrize('cap', [0, -1])
+    def test_a_non_positive_candidate_cap_is_rejected(self, cap):
+        with pytest.raises(ValidationError, match='remote_candidates_per_unit'):
+            VerifyCacheConfig(remote_candidates_per_unit=cap)
+
+    def test_each_remote_leaf_is_its_own_reload_leaf(self):
+        assert {
+            'verify_cache.remote_task_mode',
+            'verify_cache.remote_merge_mode',
+            'verify_cache.remote_candidates_per_unit',
+        } <= RELOADABLE_FIELDS
+
+    @pytest.mark.parametrize(
+        ('role_mode', 'remote_mode', 'expected'),
+        [
+            (CacheMode.ON, CacheMode.LOG, CacheMode.LOG),
+            (CacheMode.LOG, CacheMode.ON, CacheMode.LOG),
+            (CacheMode.OFF, CacheMode.ON, CacheMode.OFF),
+            (CacheMode.ON, CacheMode.ON, CacheMode.ON),
+        ],
+    )
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    def test_the_remote_mode_is_the_more_conservative_of_the_two(self, role, role_mode, remote_mode, expected):
+        modes = VerifyCacheConfig(**{f'{role}_mode': role_mode, f'remote_{role}_mode': remote_mode})
+
+        assert modes.remote_mode_for(role) is expected
+
+    def test_background_has_no_remote_mode(self):
+        modes = VerifyCacheConfig(
+            task_mode=CacheMode.ON, merge_mode=CacheMode.ON,
+            remote_task_mode=CacheMode.ON, remote_merge_mode=CacheMode.ON,
+        )
+
+        assert modes.remote_mode_for('background') is CacheMode.OFF
+
+    def test_the_env_kill_forces_the_remote_mode_off(self, monkeypatch):
+        modes = VerifyCacheConfig(merge_mode=CacheMode.ON, remote_merge_mode=CacheMode.ON)
+        monkeypatch.setenv(VERIFY_CACHE_ENV, 'off')
+
+        assert modes.remote_mode_for('merge') is CacheMode.OFF
+
+
+class TestWithMode:
+    def test_it_replaces_only_the_roles_mode_in_a_new_object(self):
+        original = VerifyCacheConfig(
+            task_mode=CacheMode.ON, merge_mode=CacheMode.OFF,
+            remote_task_mode=CacheMode.LOG, remote_merge_mode=CacheMode.ON,
+            remote_candidates_per_unit=3,
+        )
+
+        pinned = original.with_mode('merge', CacheMode.LOG)
+
+        assert pinned is not original
+        assert pinned.mode_for('merge') is CacheMode.LOG
+        assert (pinned.task_mode, pinned.remote_task_mode, pinned.remote_merge_mode, pinned.remote_candidates_per_unit) == (
+            CacheMode.ON, CacheMode.LOG, CacheMode.ON, 3,
+        )
+        assert original.merge_mode is CacheMode.OFF
+
+    def test_the_task_role_is_pinned_the_same_way(self):
+        assert VerifyCacheConfig().with_mode('task', CacheMode.ON).mode_for('task') is CacheMode.ON
+
+    def test_background_has_no_mode_to_pin(self):
+        with pytest.raises(ValueError, match='background'):
+            VerifyCacheConfig().with_mode('background', CacheMode.ON)
+
+
 @pytest.mark.usefixtures('code_default_config')
 class TestReloadIndependence:
     def test_a_task_mode_edit_applies_alone(self):

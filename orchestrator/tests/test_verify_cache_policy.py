@@ -139,6 +139,53 @@ class TestConsult:
         assert consulted.entries == {(_KEY.unit_id, _KEY.key): entry}
 
 
+    @pytest.mark.asyncio
+    async def test_a_shipped_view_is_answered_as_is_without_io(self):
+        shipped = registry.RegistryView({(_KEY.unit_id, _KEY.key): _ENTRY.candidate}, registry.KillSwitch())
+
+        assert await policy.consult(shipped, [_KEY]) is shipped
+
+
+_CANDIDATE = _ENTRY.candidate
+
+
+def _shipped(*, truncated: bool = False, switch: registry.KillSwitch | None = None, with_entry: bool = True) -> registry.RegistryView:
+    entries = {(_KEY.unit_id, _KEY.key): _CANDIDATE} if with_entry else {}
+    return registry.RegistryView(entries, switch or registry.KillSwitch(), truncated)
+
+
+class TestDecideAgainstAShippedView:
+    def test_an_on_role_replays_the_shipped_candidate(self):
+        decision = _decide(_MERGE_ON, 'merge', _shipped())
+
+        _assert(decision, policy.Decision.HIT, _KEY.unit_id, 'evidence event 7')
+        assert decision.entry == _CANDIDATE
+
+    def test_a_log_role_would_replay_the_shipped_candidate(self):
+        decision = _decide(VerifyCacheConfig(merge_mode=CacheMode.LOG), 'merge', _shipped())
+
+        _assert(decision, policy.Decision.WOULD_HIT)
+        assert decision.entry == _CANDIDATE
+
+    def test_a_shipped_kill_switch_disables(self):
+        until = _NOW + timedelta(days=3)
+
+        decision = _decide(_MERGE_ON, 'merge', _shipped(switch=registry.KillSwitch(until, 'two leaks')))
+
+        _assert(decision, policy.Decision.DISABLED, str(until), 'two leaks')
+
+    def test_a_key_absent_from_a_complete_view_is_a_plain_miss(self):
+        decision = _decide(_MERGE_ON, 'merge', _shipped(with_entry=False))
+
+        _assert(decision, policy.Decision.MISS, 'no recorded green')
+        assert 'truncated' not in decision.reason
+
+    def test_a_key_absent_from_a_truncated_view_says_an_unshipped_green_may_exist(self):
+        decision = _decide(_MERGE_ON, 'merge', _shipped(with_entry=False, truncated=True))
+
+        _assert(decision, policy.Decision.MISS, 'no recorded green', 'truncated')
+
+
 _CLEAN_TEST_LEG = policy.LegResult(
     leg=Leg.TEST, rc=0, timed_out=False, trivial=False, flake_suppressed=False,
     junit_tests=5, collected=5, never_cache=False,

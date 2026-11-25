@@ -43,6 +43,7 @@ from orchestrator.task_verify_spec import (
 )
 from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_admission_gate import AdmissionPlan
+from orchestrator.verify_cache.remote_view import RemoteCache
 from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
@@ -683,6 +684,10 @@ class TaskVerifyDispatcher(DispatchRecords):
             remote = verifying = asyncio.ensure_future(runner.run_task_verify(
                 spec, task_id=call.task_id, archive_root=call.archive_root,
                 event_store=call.event_store,
+                verify_cache=RemoteCache.of(
+                    call.verify_cache.registry if call.verify_cache is not None else None,
+                    call.config.verify_cache,
+                ),
             ))
             return await self._remote_verdict(verifying, host, draft)
         finally:

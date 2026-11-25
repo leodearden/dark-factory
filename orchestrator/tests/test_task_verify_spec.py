@@ -74,6 +74,7 @@ class TestShape:
             'attempt_id',
             'task_id',
             'tip_sha',
+            'verify_cache',
         }
 
     def test_is_frozen(self):
@@ -329,3 +330,34 @@ class TestApply:
         assert config.module_configs_or_empty is original_registry
         assert original_registry == {'host/only': ModuleConfig(prefix='host/only')}
         assert config.verify_cold_preprovision_command == 'host-prep'
+
+
+class TestTheNeverCacheFlagRidesTheSpec:
+    _NEVER = ModuleConfig(prefix='m', test_command='t', verify_cache='never')
+
+    def _spec(self, tmp_path: Path) -> TaskVerifySpec:
+        return build_task_verify_spec(
+            _host_config(tmp_path), [self._NEVER], [],
+            force_workspace=False, attempt_id=1, task_id='9123', tip_sha=_TIP,
+        )
+
+    def test_it_is_carried_not_collapsed(self):
+        assert collapsed_module_overrides([self._NEVER]) == ()
+
+    def test_the_built_spec_carries_it_and_round_trips(self, tmp_path: Path):
+        spec = self._spec(tmp_path)
+
+        assert [vc.verify_cache for vc in spec.verify_commands] == ['never']
+        assert task_spec_from_json(task_spec_to_json(spec)) == spec
+
+    def test_the_applied_modules_carry_it(self, tmp_path: Path):
+        _, modules = apply_task_verify_spec(_host_config(tmp_path), self._spec(tmp_path))
+
+        assert [mc.verify_cache for mc in modules] == ['never']
+
+    def test_a_command_without_it_is_rejected_naming_the_key(self, tmp_path: Path):
+        document = spec_to_dict(self._spec(tmp_path))
+        del document['verify_commands'][0]['verify_cache']
+
+        with pytest.raises(TypeError, match='verify_cache'):
+            spec_from_dict(document)

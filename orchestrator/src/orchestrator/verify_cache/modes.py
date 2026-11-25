@@ -19,6 +19,16 @@ class CacheMode(StrEnum):
     ON = 'on'
 
 
+_CONSERVATIVE_ORDER: tuple[CacheMode, ...] = (CacheMode.OFF, CacheMode.LOG, CacheMode.ON)
+
+
+def most_conservative(*modes: CacheMode) -> CacheMode:
+    """The mode among *modes* that lets the cache act least."""
+    if not modes:
+        raise ValueError('most_conservative needs at least one mode')
+    return min(modes, key=_CONSERVATIVE_ORDER.index)
+
+
 def forced_off(environ: Mapping[str, str] = os.environ) -> bool:
     """Whether *environ* forces every role's mode off; no value can force a mode on."""
     return environ.get(VERIFY_CACHE_ENV, '').strip().lower() == CacheMode.OFF.value

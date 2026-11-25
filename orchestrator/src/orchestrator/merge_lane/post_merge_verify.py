@@ -436,17 +436,20 @@ class _PostMergeVerify:
         job).  Both archive under data/verify-logs/<task_id>/ beside the
         task-verify logs for operator triage (task 1920).
 
-        Only the local pool joins the verify-result cache, through the access
-        the verifier holds; the remote arm waits for gamma2 (task 9123).
+        Both join the verify-result cache through the access the verifier
+        holds: the remote ships a view of its registry under the config's
+        modes, and the pool records either's greens (task 9123).
         """
+        access = self.verifier.verify_cache
         if self.runner is not None:
             return VerifyRunnerPool(
                 [self.runner],
                 event_store=self.event_store,
                 task_id=self.task_id,
                 archive_root=self.archive_root,
+                verify_cache_registry=None if access is None else access.registry,
+                verify_cache_modes=None if access is None else self.req.config.verify_cache,
             )
-        access = self.verifier.verify_cache
         return VerifyRunnerPool(
             [self._local_merge_verify_runner(task_files, access)],
             event_store=self.event_store,

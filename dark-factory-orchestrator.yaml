@@ -1596,9 +1596,12 @@ merge_verify_max_concurrent_modules: 1
 
 # Verify-result cache in log mode for both roles: plans/verify-result-cache-prd.md § Modes and rollout, A3.
 # The code default stays off; merge 'on' waits for epsilon (task 5655).
+# Remote replay logs first (A5.2); 'on' is an operator action after three days in log, and remote_merge_mode on also waits for epsilon (task 5655).
 verify_cache:
   task_mode: log
   merge_mode: log
+  remote_task_mode: log
+  remote_merge_mode: log
 
 # ── Lever C (multi-host post-merge verify): laptop runner, prefer_remote ──────
 # ENABLED 2026-09-30 (task 5053 = D1; plans/merge-lane-throughput-prd.md). leo-laptop

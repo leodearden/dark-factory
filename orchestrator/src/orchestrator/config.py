@@ -59,7 +59,7 @@ from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
-from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off, most_conservative
 
 logger = logging.getLogger(__name__)
 
@@ -1484,29 +1484,58 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class _RoleModeFields(NamedTuple):
+    """The VerifyCacheConfig fields holding one verify role's modes."""
+
+    mode: str
+    remote_mode: str
+
+
+#: The roles the verify cache acts for; it has no mode for any other (background is always OFF).
+_ROLE_MODE_FIELDS: dict[VerifyRole, _RoleModeFields] = {
+    'task': _RoleModeFields('task_mode', 'remote_task_mode'),
+    'merge': _RoleModeFields('merge_mode', 'remote_merge_mode'),
+}
+
+
 class VerifyCacheConfig(BaseModel):
     """How far the verify-result cache may act, per verify role
     (plans/verify-result-cache-prd.md § Amendments, A3: per-role modes).
 
     Each role's mode is its own green-tier reload leaf. The kill switch is not
-    here: it lives in the registry's policy_state.
+    here: it lives in the registry's policy_state. Remote replay has its own
+    per-role mode, never less conservative than the role's (A5.2).
     """
 
     model_config = ConfigDict(extra='forbid')
 
     task_mode: CacheMode = CacheMode.OFF
     merge_mode: CacheMode = CacheMode.OFF
+    remote_task_mode: CacheMode = CacheMode.OFF
+    remote_merge_mode: CacheMode = CacheMode.OFF
+    remote_candidates_per_unit: int = Field(default=16, ge=1)
 
     def mode_for(self, role: VerifyRole) -> CacheMode:
         """*role*'s mode; the cache has no background role, so that is always OFF.
         DF_VERIFY_CACHE=off forces every role OFF (plans/verify-result-cache-prd.md, Amendment A3)."""
-        if forced_off():
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if forced_off() or fields is None:
             return CacheMode.OFF
-        if role == 'task':
-            return self.task_mode
-        if role == 'merge':
-            return self.merge_mode
-        return CacheMode.OFF
+        return getattr(self, fields.mode)
+
+    def remote_mode_for(self, role: VerifyRole) -> CacheMode:
+        """The mode a remote verify of *role* may act under: the role's own mode, capped by its remote mode."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if fields is None:
+            return CacheMode.OFF
+        return most_conservative(self.mode_for(role), getattr(self, fields.remote_mode))
+
+    def with_mode(self, role: VerifyRole, mode: CacheMode) -> 'VerifyCacheConfig':
+        """A validated copy whose *role* acts under *mode*, as a runner pins the mode its dispatcher shipped."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if fields is None:
+            raise ValueError(f'the verify cache has no {role!r} mode to pin')
+        return type(self).model_validate({**self.model_dump(), fields.mode: mode})
 
 
 class DepthRow(NamedTuple):
@@ -3430,6 +3459,11 @@ _OVERRIDABLE_FIELDS = frozenset({
 
 ModuleVerifyCache = Literal['default', 'never']
 
+
+def check_module_verify_cache(owner: str, value: object) -> None:
+    if value not in get_args(ModuleVerifyCache):
+        raise ValueError(f'{owner}: verify_cache is {value!r}, expected one of {get_args(ModuleVerifyCache)}')
+
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
     'node_modules', '__pycache__', 'build', 'target', '.gradle',
@@ -3468,11 +3502,7 @@ class ModuleConfig:
     verify_cache: ModuleVerifyCache = 'default'
 
     def __post_init__(self) -> None:
-        if self.verify_cache not in get_args(ModuleVerifyCache):
-            raise ValueError(
-                f'module {self.prefix!r}: verify_cache is {self.verify_cache!r}, '
-                f'expected one of {get_args(ModuleVerifyCache)}',
-            )
+        check_module_verify_cache(f'module {self.prefix!r}', self.verify_cache)
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:

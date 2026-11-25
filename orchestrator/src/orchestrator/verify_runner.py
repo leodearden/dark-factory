@@ -63,7 +63,7 @@ from typing import (
 from shared.git_async import run_git
 
 from orchestrator import flake_ledger, verify
-from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
+from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyCacheConfig, VerifyHostPolicy
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.event_store import EventType
 from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts, RunnerReason
@@ -92,14 +92,24 @@ from orchestrator.verify import (
     _target_subprocess_env,
     archive_verify_logs,
 )
+from orchestrator.verify_cache.modes import VerifyRole
 from orchestrator.verify_cache.recorder import (
     CacheRecord,
+    ConsumeOutcome,
     VerifyEvidenceRef,
+    cache_report_from_wire,
     consume_replayed,
     record_greens,
 )
 from orchestrator.verify_cache.registry import Registry
+from orchestrator.verify_cache.remote_view import (
+    RemoteCache,
+    ShippedView,
+    never_cache_unit_ids,
+    planned_unit_ids,
+)
 from orchestrator.verify_cache.replay import CacheAccess
+from orchestrator.verify_cache.runner_report import with_cache_report
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
     SSH_SERVER_ALIVE_COUNT_MAX,
@@ -380,6 +390,9 @@ class MergeVerifySpec:
                           read by verify.py::_merge_config_only_diff_forces_full_gate
                           (task 7465). None (a pre-7465 spec) keeps the host's
                           own globs; a carried value, () included, replaces them.
+    verify_cache        : the dispatcher's registry view (A5), merge-deciding like
+                          the task-2822 profile; set only by
+                          RemoteRunner.run_merge_verify. None runs every unit.
 
     Note
     ----
@@ -414,6 +427,7 @@ class MergeVerifySpec:
     scope_cargo: bool | None = None
     # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
     merge_config_only_full_gate_globs: tuple[str, ...] | None = None
+    verify_cache: ShippedView | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -437,6 +451,7 @@ class MergeVerifySpec:
                 if self.merge_config_only_full_gate_globs is not None
                 else None
             ),
+            "verify_cache": self.verify_cache.to_wire() if self.verify_cache is not None else None,
         }
 
     @classmethod
@@ -446,6 +461,7 @@ class MergeVerifySpec:
         # default to None — same d.get idiom as merge_verify_workspace/breadth.
         _gvc = d.get("global_verify_command")
         _globs = d.get("merge_config_only_full_gate_globs")
+        _view = d.get("verify_cache")
         return cls(
             verify_commands=tuple(VerifyCommand.from_dict(vc) for vc in d["verify_commands"]),
             unscoped_typecheck=UnscopedTypecheckSpec.from_dict(d["unscoped_typecheck"]),
@@ -463,6 +479,7 @@ class MergeVerifySpec:
             verify_cold_preprovision_command=d.get("verify_cold_preprovision_command", ""),
             scope_cargo=d.get("scope_cargo"),
             merge_config_only_full_gate_globs=tuple(_globs) if _globs is not None else None,
+            verify_cache=ShippedView.from_wire(_view) if _view is not None else None,
         )
 
 
@@ -482,8 +499,8 @@ def result_to_dict(vr: VerifyResult) -> dict:
     asymmetry is entirely on the READ side; see :func:`result_from_dict`.
 
     Off-wire fields (``remote_gate.wire_fields``) are left out, never walked: a
-    runner's cache record is shipped and recorded only after gamma2 (task 9123)
-    keys ``toolchain.runner``.
+    runner's ``cache_record`` stays on its host, and what it reports to the
+    dispatcher's recorder is the wire field ``cache_report`` (task 9123).
     """
     shipped = {f.name for f in wire_fields(VerifyResult)}
     off_wire = [f.name for f in dataclasses.fields(vr) if f.name not in shipped]
@@ -527,6 +544,9 @@ def result_from_dict(d: dict) -> VerifyResult:
         if raw is not None:
             # Shallow COPY — never mutate the caller's dict, which it may still inspect.
             d = {**d, 'flake_suppression': flake_ledger.flake_suppression_from_wire(raw)}
+        raw_report = d.get('cache_report')
+        if raw_report is not None:
+            d = {**d, 'cache_report': cache_report_from_wire(raw_report)}
     return VerifyResult(**d)
 
 
@@ -603,7 +623,8 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     """Reconstruct a ModuleConfig from a VerifyCommand + shared MergeVerifySpec fields.
 
     This is the exact inverse of build_merge_verify_spec's projection:
-    - prefix + three command fields come from the VerifyCommand
+    - prefix + three command fields come from the VerifyCommand, and so does the
+      module's verify_cache, so a never-cache module stays never-cache here
     - verify_env and cold_timeout_secs are shared spec-level fields threaded into
       each ModuleConfig's verify_env and verify_cold_command_timeout_secs
 
@@ -698,7 +719,7 @@ async def run_merge_verify_on_worktree(
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides=_spec_field_overrides(spec),
+        field_overrides=_spec_field_overrides(spec, config),
         git_field_overrides=_spec_git_field_overrides(spec),
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
@@ -711,21 +732,24 @@ async def run_merge_verify_on_worktree(
         run_scoped=run_scoped,
         run_unscoped=run_unscoped,
         task_id=task_id,
-        # A runner reaches no registry: its units settle UNAVAILABLE, and its
-        # cache record stays off the wire until gamma2 (task 9123).
-        verify_cache=await CacheAccess.on_runner(),
+        # A runner reaches no registry: it decides against the view its
+        # dispatcher shipped, and reports its units for the dispatcher to record (A5).
+        verify_cache=await CacheAccess.on_runner(spec.verify_cache),
     )
-    return await runner.run_merge_verify(merge_sha, spec)
+    return with_cache_report(await runner.run_merge_verify(merge_sha, spec))
 
 
-def _spec_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
-    """The top-level OrchestratorConfig fields the spec decides; a None scope_cargo is not carried."""
+def _spec_field_overrides(spec: MergeVerifySpec, config: OrchestratorConfig) -> dict[str, Any]:
+    """The top-level OrchestratorConfig fields the spec decides; a None scope_cargo is not
+    carried, and a shipped view pins the merge role's cache mode in place of the host's."""
     overrides: dict[str, Any] = {
         'merge_verify_workspace': spec.merge_verify_workspace,
         'merge_verify_breadth': spec.merge_verify_breadth,
     }
     if spec.scope_cargo is not None:
         overrides['scope_cargo'] = spec.scope_cargo
+    if spec.verify_cache is not None:
+        overrides['verify_cache'] = config.verify_cache.with_mode('merge', spec.verify_cache.mode)
     return overrides
 
 
@@ -1029,6 +1053,10 @@ _SSH_BASE_OPTS = [
     '-o', f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}',
     '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
 ]
+
+# Linux MAX_ARG_STRLEN less its NUL: the remote shell is handed the whole verify
+# command as one -c argument, so a shipped cache view is trimmed to fit it (task 9123).
+_MAX_REMOTE_COMMAND_BYTES = 131_072 - 1
 
 # Env probes only: the dispatch sites keep _SSH_BASE_OPTS, because the
 # verify-merge ssh child must own its connection for the heartbeat protocol.
@@ -1777,6 +1805,72 @@ class RemoteRunner:
     def _config_args(self) -> list[str]:
         return ['--config', self._config_path] if self._config_path else []
 
+    def _verify_command(
+        self, subcommand: RemoteVerifySubcommand, sha: str, request_id: str, spec_json: str,
+    ) -> str:
+        """The remote command running verify *subcommand* of *sha* under *request_id* with *spec_json*."""
+        return self._gate_command([
+            subcommand, '--sha', sha, '--request-id', request_id, '--spec', spec_json, *self._config_args(),
+        ])
+
+    async def _shipped_view(
+        self,
+        cache: RemoteCache | None,
+        role: VerifyRole,
+        commands: Sequence[VerifyCommand | None],
+        command_carrying: Callable[[ShippedView], str],
+    ) -> ShippedView | None:
+        """The view of *cache* a *role* verify of *commands* ships, as deep as the remote
+        command *command_carrying* it builds still fits one argument; None outside the cache."""
+        if cache is None:
+            return None
+        return await cache.ship(
+            role, planned_unit_ids(command for command in commands if command is not None),
+            fits=lambda view: len(command_carrying(view).encode()) <= _MAX_REMOTE_COMMAND_BYTES,
+        )
+
+    async def _settled(
+        self,
+        cache: RemoteCache | None,
+        view: ShippedView | None,
+        role: VerifyRole,
+        commands: Sequence[VerifyCommand | None],
+        result: VerifyResult,
+        *,
+        landing_sha: str | None,
+    ) -> VerifyResult:
+        """*result* once *cache* has backed each replay it claims against the live registry,
+        consuming them for *landing_sha* before the verdict returns (I6), carrying the record
+        the dispatcher records its greens from (I8), with the never-cache modules of the
+        dispatcher's own *commands* refused again. Unchanged outside the cache."""
+        if cache is None:
+            return result
+        settlement = await cache.settle(
+            view, role, result.units, result.cache_report,
+            never_cache=never_cache_unit_ids(command for command in commands if command is not None),
+            landing_sha=landing_sha,
+        )
+        if not settlement.outcome.backs_every_hit:
+            result = self._unbacked(result, role, settlement.outcome)
+        return dataclasses.replace(result, cache_record=settlement.record)
+
+    def _unbacked(self, result: VerifyResult, role: VerifyRole, outcome: ConsumeOutcome) -> VerifyResult:
+        """*result*, whose replays *outcome* could not back. Only a green rests on its replays:
+        a red keeps its verdict. A registry error is the dispatcher's own fault, so the green
+        becomes the local no-verdict; a replay of a green no live entry backs is no verdict
+        from this host."""
+        if not result.passed:
+            logger.warning(
+                'RemoteRunner %r: red %s verify keeps its verdict; its replays were not backed: %s',
+                self.name, role, outcome.reason,
+            )
+            return result
+        if outcome.error is not None:
+            return verify.unconsumed_replay_result(result, outcome.reason)
+        raise RunnerUnavailable(
+            f'{self.name!r} replayed greens its dispatcher cannot back: {outcome.reason}', kind='no_verdict',
+        )
+
     async def run_merge_verify(
         self,
         merge_sha: str,
@@ -1785,6 +1879,7 @@ class RemoteRunner:
         task_id: str | None = None,
         archive_root: Path | None = None,
         event_store: Any = None,
+        verify_cache: RemoteCache | None = None,
     ) -> VerifyResult:
         """Run the combined merge-verify bundle on the remote host.
 
@@ -1810,13 +1905,23 @@ class RemoteRunner:
         its stderr, streams and summary exactly as a red does, plus an
         ``attempt-1.remote-<name>.no-verdict-<utc_ts>.json`` record.
         Returns any other VerifyResult unchanged — even passed=False or
-        timed_out=True (PRD §A Invariant 5).
+        timed_out=True (PRD §A Invariant 5) — but for the verify-result cache:
+        with *verify_cache* the spec ships a view of the dispatcher's registry,
+        and the verdict is settled against it (:meth:`_settled`).
         """
         request_id = self._id_factory()
         archive = (
             _RemoteArchiveTarget(archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID, 'merge')
             if archive_root is not None and task_id is not None else None
         )
+        commands = (*spec.verify_commands, spec.global_verify_command)
+        view = await self._shipped_view(
+            verify_cache, 'merge', commands,
+            lambda shipped: self._verify_command(
+                'verify-merge', merge_sha, request_id, spec_to_json(dataclasses.replace(spec, verify_cache=shipped)),
+            ),
+        )
+        spec = dataclasses.replace(spec, verify_cache=view)
         await self._push_main_mirror(task_id=task_id, event_store=event_store)
         outcome = await self._dispatch(
             merge_sha, 'verify-merge', spec_to_json(spec), request_id=request_id,
@@ -1834,7 +1939,7 @@ class RemoteRunner:
                         self.name, spec, result, merge_sha, outcome.duration_ms,
                     ),
                 )
-        return result
+        return await self._settled(verify_cache, view, 'merge', commands, result, landing_sha=merge_sha)
 
     async def run_task_verify(
         self,
@@ -1843,6 +1948,7 @@ class RemoteRunner:
         task_id: str,
         archive_root: Path | None,
         event_store: Any = None,
+        verify_cache: RemoteCache | None = None,
     ) -> VerifyResult:
         """Run a task-role verify of ``spec.tip_sha`` on the remote host (PRD §5.2).
 
@@ -1856,7 +1962,9 @@ class RemoteRunner:
 
         Raises RunnerUnavailable when the host produced no usable verdict.  A
         ``no_verdict`` first archives, with *archive_root*, what a red would
-        plus a ``.no-verdict-<stamp>.json`` record.
+        plus a ``.no-verdict-<stamp>.json`` record.  With *verify_cache* the
+        spec ships a view of the dispatcher's registry and the verdict is
+        settled against it, consuming nothing (:meth:`_settled`).
         """
         if task_id != spec.task_id:
             raise ValueError(
@@ -1867,9 +1975,19 @@ class RemoteRunner:
             _RemoteArchiveTarget(archive_root, task_id, spec.attempt_id, 'task')
             if archive_root is not None else None
         )
+        request_id = self._id_factory()
+        commands = (*spec.verify_commands, spec.global_verify_command)
+        view = await self._shipped_view(
+            verify_cache, 'task', commands,
+            lambda shipped: self._verify_command(
+                'verify-task', spec.tip_sha, request_id,
+                task_spec_to_json(dataclasses.replace(spec, verify_cache=shipped)),
+            ),
+        )
+        spec = dataclasses.replace(spec, verify_cache=view)
         outcome = await self._dispatch(
             spec.tip_sha, 'verify-task', task_spec_to_json(spec),
-            request_id=self._id_factory(), archive=archive,
+            request_id=request_id, archive=archive,
             event_store=event_store, task_id=task_id,
         )
         archived: list[Path] = []
@@ -1884,11 +2002,12 @@ class RemoteRunner:
                     ),
                 )
                 archived = [pass_summary] if pass_summary is not None else []
-        return dataclasses.replace(
+        result = dataclasses.replace(
             outcome.result,
             worktree_log_paths=[],
             archive_log_paths=[str(path) for path in archived],
         )
+        return await self._settled(verify_cache, view, 'task', commands, result, landing_sha=None)
 
     async def _push_main_mirror(self, *, task_id: str | None, event_store: Any) -> None:
         """Step 0 (best-effort): push main FIRST so the remote has a fresh view of it.
@@ -2001,10 +2120,7 @@ class RemoteRunner:
     async def _run_gate_verify(
         self, sha: str, subcommand: RemoteVerifySubcommand, spec_json: str, request_id: str,
     ) -> _DispatchOutcome:
-        remote_cmd = self._gate_command([
-            subcommand, '--sha', sha, '--request-id', request_id,
-            '--spec', spec_json, *self._config_args(),
-        ])
+        remote_cmd = self._verify_command(subcommand, sha, request_id, spec_json)
         if request_id == self._cancelled_request_id:
             raise RunnerUnavailable(
                 f'request {request_id!r} was cancelled before its verify ssh to '
@@ -2534,10 +2650,13 @@ class VerifyRunnerPool:
     the merge worker's bench, which classes it by kind (design D6) — so a
     fallback never swallows one.  None reports nowhere.
 
-    *verify_cache_registry* is the dispatcher's verify-result cache: a local
-    verdict that replayed greens has them consumed for its merge sha before
-    its ``merge_verify`` row is written (I6), and its own admitted greens are
-    recorded citing that row.  None keeps the pool outside the cache.
+    *verify_cache_registry* is the dispatcher's verify-result cache, and the
+    pool its only writer (I8): any verdict's admitted greens are recorded
+    citing its ``merge_verify`` row.  A verdict that replayed greens has them
+    consumed for its merge sha before that row is written (I6): here for a
+    local verdict, inside RemoteRunner for a remote one, which ships a view of
+    the registry under *verify_cache_modes* (A5).  A None registry keeps the
+    pool outside the cache; None modes keep a remote outside it.
     """
 
     def __init__(
@@ -2549,6 +2668,7 @@ class VerifyRunnerPool:
         archive_root: Path | None = None,
         on_unavailable: RunnerUnavailableSink | None = None,
         verify_cache_registry: Registry | None = None,
+        verify_cache_modes: VerifyCacheConfig | None = None,
     ) -> None:
         if not runners:
             raise ValueError('VerifyRunnerPool requires at least one runner')
@@ -2570,6 +2690,9 @@ class VerifyRunnerPool:
         self._quarantined: set[str] = set()
         self._on_unavailable = on_unavailable
         self._verify_cache_registry = verify_cache_registry
+        self._remote_cache = (
+            None if verify_cache_modes is None else RemoteCache.of(verify_cache_registry, verify_cache_modes)
+        )
 
     # ------------------------------------------------------------------
     # ι: quarantine API
@@ -2718,6 +2841,7 @@ class VerifyRunnerPool:
                     task_id=self._task_id,
                     archive_root=self._archive_root,
                     event_store=self._event_store,
+                    verify_cache=self._remote_cache,
                 )
             else:
                 result = await selected.run_merge_verify(merge_sha, spec)
@@ -2820,25 +2944,16 @@ class VerifyRunnerPool:
         merge_sha: str,
         emit: Callable[[VerifyResult], int | None],
     ) -> VerifyResult:
-        """Emit *result*'s row through *emit*: for a local verdict in the cache, after
-        consuming what it replayed (I6), and before recording its greens citing that row.
-
-        Only a green rests on its replays, so only a green whose replays could not be
-        consumed becomes a no-verdict; a red keeps its own verdict."""
+        """Emit *result*'s row through *emit*: for a verdict in the cache, after its
+        replays are consumed (I6), and before recording its greens citing that row (I8).
+        A remote verdict's replays were consumed before RemoteRunner returned it."""
         registry = self._verify_cache_registry
         record = getattr(result, 'cache_record', None)
-        if not runner.is_local or registry is None or not isinstance(record, CacheRecord):
+        if registry is None or not isinstance(record, CacheRecord):
             emit(result)
             return result
-        consumed = await consume_replayed(registry, record, landing_sha=merge_sha)
-        if not consumed.backs_every_hit:
-            if result.passed:
-                result = verify.unconsumed_replay_result(result, consumed.reason)
-            else:
-                logger.warning(
-                    'red merge verify of %s keeps its verdict; its replays were not consumed: %s',
-                    merge_sha, consumed.reason,
-                )
+        if runner.is_local:
+            result = await _consumed_locally(registry, record, result, merge_sha)
         event_id = emit(result)
         if isinstance(event_id, int):
             await record_greens(
@@ -2846,6 +2961,24 @@ class VerifyRunnerPool:
                 evidence=VerifyEvidenceRef(event_id, self._event_store.run_id, merge_sha, result.passed),
             )
         return result
+
+
+async def _consumed_locally(
+    registry: Registry, record: CacheRecord, result: VerifyResult, merge_sha: str,
+) -> VerifyResult:
+    """*result* once the greens its local verify replayed are consumed for *merge_sha*.
+
+    Only a green rests on its replays, so only a green whose replays could not be
+    consumed becomes a no-verdict; a red keeps its own verdict."""
+    consumed = await consume_replayed(registry, record, landing_sha=merge_sha)
+    if consumed.backs_every_hit:
+        return result
+    if result.passed:
+        return verify.unconsumed_replay_result(result, consumed.reason)
+    logger.warning(
+        'red merge verify of %s keeps its verdict; its replays were not consumed: %s', merge_sha, consumed.reason,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

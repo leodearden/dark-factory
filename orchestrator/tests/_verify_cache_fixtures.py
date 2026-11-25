@@ -7,13 +7,14 @@ import os
 import shlex
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from _git_fixtures import RepoSeed
 from _orch_helpers import git_env_with_ceiling
+from _verify_cache_units import recorded_entries
 
 from orchestrator import verify_plan
 from orchestrator.config import (
@@ -23,6 +24,8 @@ from orchestrator.config import (
     VerifyCacheConfig,
 )
 from orchestrator.deployed_sha import DeployedSha
+from orchestrator.event_store import EventStore
+from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.recorder import VerifyEvidenceRef, record_greens
@@ -30,6 +33,7 @@ from orchestrator.verify_cache.registry import Entry, Registry
 from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_evidence import Leg, UnitOutcome, VerifyUnit, module_leg_name
 from orchestrator.verify_plan import VerifyPlan
+from orchestrator.verify_runner import LocalRunner, VerifyRunnerPool
 
 #: Every leg of the fixture appends ``<module>:<leg>`` to the file this names.
 MARKERS_ENV = 'DF_VERIFY_CACHE_TEST_MARKERS'
@@ -195,3 +199,42 @@ CODE_D2 = 'e' * 40
 
 def deployed_at(sha: str = CODE_D1, *, indeterminate: bool = False, dirty_wire_path: bool = False) -> DeployedSha:
     return DeployedSha(sha=sha, indeterminate=indeterminate, dirty_wire_path=dirty_wire_path)
+
+
+async def clean_unscoped_gate(*_args: Any, **_kwargs: Any) -> PostMergePyrightResult:
+    return PostMergePyrightResult()
+
+
+def merge_pool(
+    repo: Path,
+    config: OrchestratorConfig,
+    modules: Sequence[ModuleConfig],
+    registry: Registry,
+    store: EventStore,
+    *,
+    run_scoped: Any = run_scoped_verification,
+    code: str = TEST_CODE,
+) -> VerifyRunnerPool:
+    """A pool of one local merge gate deciding against, and recording into, *registry* under code *code*."""
+    local = LocalRunner(
+        repo, config, list(modules), None,
+        run_scoped=run_scoped, run_unscoped=clean_unscoped_gate,
+        verify_cache=CacheAccess(registry, code),
+    )
+    return VerifyRunnerPool([local], event_store=store, task_id='5653', verify_cache_registry=registry)
+
+
+def head_of(repo: Path) -> str:
+    return workspace_git(repo, 'rev-parse', 'HEAD')
+
+
+def row_units(row: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    return {unit['unit']: unit for unit in row['data']['units']}
+
+
+async def entries_for(registry: Registry, result: VerifyResult) -> dict[str, Entry]:
+    """The live entry of every keyed unit *result* settled, by unit id."""
+    record = result.cache_record
+    assert record is not None
+    settled = (*record.units, *(() if record.tree is None else (record.tree,)))
+    return await recorded_entries(registry, *(unit.key for unit in settled if unit.key is not None))

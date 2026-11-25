@@ -110,6 +110,7 @@ class TestVerifyCommand:
             "test_command": "cargo test",
             "lint_command": None,
             "type_check_command": None,
+            "verify_cache": "default",
         }
 
 
@@ -2228,6 +2229,8 @@ class TestBuildMergeVerifySpec:
         # attr is non-None and truthy, so it would flag every mock module.
         mc.scope_cargo = scope_cargo
         mc.verify_env = None
+        # Task 9123: VerifyCommand carries (and checks) the module's verify_cache.
+        mc.verify_cache = 'default'
         return mc
 
     def _make_config(
@@ -2617,7 +2620,7 @@ class TestRunMergeVerifyOnWorktree:
             run_scoped=run_scoped, run_unscoped=run_unscoped,
         )
 
-        assert result is pass_result
+        assert result == pass_result
 
     async def test_module_configs_reconstructed_from_spec(self):
         """run_scoped is called with module_configs reconstructed from spec."""
@@ -3436,7 +3439,7 @@ class TestRunMergeVerifyOnWorktreeDefaults:
 
         fake_scoped.assert_awaited_once()
         fake_unscoped.assert_awaited_once()
-        assert result is pass_result
+        assert result == pass_result
 
 
 # ---------------------------------------------------------------------------
