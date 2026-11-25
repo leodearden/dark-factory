@@ -59,7 +59,7 @@ import warnings
 from collections.abc import Awaitable, Callable, Mapping
 from collections.abc import Set as AbstractSet
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeVar
 
 from _gate_fixtures import gate_argv
 from _leader_stderr import drain_exited_stderr
@@ -329,11 +329,33 @@ def wait_pid_tagged(
     private seam for the self-tests.
     """
     timeout = row_discovery_ceiling_secs() if timeout is None else timeout
-    deadline = time.monotonic() + timeout
+    return _poll_until_settled(
+        lambda: pid in _tagged_pids(tag), bool, timeout=timeout, interval=interval,
+    )
+
+
+_Probed = TypeVar('_Probed')
+
+
+def _poll_until_settled(
+    probe: Callable[[], _Probed],
+    settled: Callable[[_Probed], bool],
+    *,
+    timeout: float,
+    interval: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> _Probed:
+    """Repeat *probe* until *settled* holds of its result or *timeout* passes; return that result.
+
+    The result is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    deadline = clock() + timeout
     while True:
-        found = pid in _tagged_pids(tag)
-        if found or time.monotonic() >= deadline:
-            return found
+        result = probe()
+        if settled(result) or clock() >= deadline:
+            return result
         time.sleep(interval)
 
 
@@ -840,15 +862,15 @@ def wait_pids_exited(
     descheduled across the deadline never asserts on a stale observation;
     ``timeout=0`` is exactly one probe.
     """
-    deadline = _clock() + timeout
-    while True:
-        running = {
+    def running() -> dict[int, StatFields]:
+        return {
             pid: state for pid in pids
             if (state := _read_state(pid)) is not None and not state.terminated
         }
-        if not running or _clock() >= deadline:
-            return running
-        time.sleep(interval)
+
+    return _poll_until_settled(
+        running, lambda survivors: not survivors, timeout=timeout, interval=interval, clock=_clock,
+    )
 
 
 class PreKillTree(NamedTuple):

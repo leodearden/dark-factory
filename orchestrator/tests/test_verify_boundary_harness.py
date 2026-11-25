@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import signal
 import subprocess
@@ -1486,7 +1487,7 @@ def test_wait_pid_tagged_polls_past_a_snapshot_that_misses_the_pid():
         asked.append(tag)
         return next(probes)
 
-    assert wait_pid_tagged(pid, 'tag-a', timeout=5.0, interval=0, _tagged_pids=fake_tagged_pids)
+    assert wait_pid_tagged(pid, 'tag-a', timeout=math.inf, interval=0, _tagged_pids=fake_tagged_pids)
     assert asked == ['tag-a'] * 3
 
 
