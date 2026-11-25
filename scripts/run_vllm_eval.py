@@ -1446,11 +1446,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Outer subprocess timeout in minutes (the launcher kills the "
             "orchestrator subprocess after this). By default, the cell's own "
             "ceiling (the --orch-timeout-min value, else the fixture's "
-            "timeout_minutes, else "
-            "orchestrator/src/orchestrator/evals/runner.py::WORKFLOW_CELL_TIMEOUT_MINUTES) "
-            "plus OUTER_TIMEOUT_MARGIN_MIN, so the orchestrator hits its own "
-            "ceiling first and writes a result file. An explicit value should "
-            "exceed that ceiling."
+            "timeout_minutes, else the runner's workflow default of "
+            f"{WORKFLOW_CELL_TIMEOUT_MINUTES} min) plus {OUTER_TIMEOUT_MARGIN_MIN} min, "
+            "so the orchestrator hits its own ceiling first and writes a "
+            "result file. An explicit value should exceed that ceiling; one "
+            "that does not is logged as a warning."
         ),
     )
 
@@ -1461,9 +1461,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Inner orchestrator-internal eval timeout in minutes (passed to "
             "`orchestrator eval --timeout`). When unset, the orchestrator "
-            "uses the fixture's timeout_minutes, else "
-            "orchestrator/src/orchestrator/evals/runner.py::WORKFLOW_CELL_TIMEOUT_MINUTES. "
-            "Raise it when 'would-be-done' runs need longer than that ceiling."
+            "uses the fixture's timeout_minutes, else the runner's workflow "
+            f"default of {WORKFLOW_CELL_TIMEOUT_MINUTES} min. Raise it when "
+            "'would-be-done' runs need longer than that ceiling."
         ),
     )
 

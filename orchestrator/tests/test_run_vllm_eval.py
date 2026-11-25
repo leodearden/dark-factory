@@ -833,6 +833,14 @@ class TestOuterTimeoutPairing:
         assert "90" in warning
         assert f"{WORKFLOW_CELL_TIMEOUT_MINUTES} min" in warning
 
+    def test_the_help_states_the_default_ceiling_and_margin_in_minutes(self, capsys):
+        with pytest.raises(SystemExit):
+            launcher.parse_args(["--help"])
+
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert f"{WORKFLOW_CELL_TIMEOUT_MINUTES} min" in help_text
+        assert f"{launcher.OUTER_TIMEOUT_MARGIN_MIN} min" in help_text
+
 
 # ---------------------------------------------------------------------------
 # Per-task log file plumbing
