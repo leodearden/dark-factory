@@ -10,6 +10,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -166,7 +167,12 @@ class TestParams:
     ) -> None:
         bin_dir = tool_shims(tmp_path / 'bin')
         (bin_dir / 'tokei').unlink()
-        monkeypatch.setenv('PATH', os.pathsep.join([str(bin_dir), '/usr/bin', '/bin']))
+        real_git = shutil.which('git')
+        assert real_git is not None
+        git_only = tmp_path / 'git-only'
+        git_only.mkdir()
+        (git_only / 'git').symlink_to(real_git)
+        monkeypatch.setenv('PATH', os.pathsep.join([str(bin_dir), str(git_only)]))
         assert rust_metrics_snapshot.main(['--params', '--rules', str(fixture_rules)]) == 2
         refusal = capsys.readouterr().err
         assert 'tokei' in refusal
