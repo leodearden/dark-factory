@@ -170,10 +170,9 @@ class TestTrackedConfigShipsTheSweepWithWritesOff:
 
 
 @pytest.fixture(params=['tracked-yaml', 'no-yaml'])
-def effective_config(request, monkeypatch) -> FusedMemoryConfig:
+def effective_config(request) -> FusedMemoryConfig:
     if request.param == 'tracked-yaml':
-        assert TRACKED_CONFIG_YAML.is_file(), TRACKED_CONFIG_YAML
-        monkeypatch.setenv('CONFIG_PATH', str(TRACKED_CONFIG_YAML))
+        return request.getfixturevalue('tracked_config')
     return FusedMemoryConfig()
 
 
@@ -209,11 +208,6 @@ class TestEffectiveConfigAdmitsTheLinkHealPrefixOnTheMetadataArmOnly:
 
 
 class TestTheLinkHealPrefixHasOneHome:
-    def test_the_schema_default_admits_link_heal_on_the_metadata_arm_only(self):
-        cfg = Mem0UpdateConfig()
-        assert 'link-heal-' in cfg.metadata_patch_allowed_agent_prefixes
-        assert 'link-heal-' not in cfg.content_amend_allowed_agent_prefixes
-
     def test_the_tracked_config_does_not_restate_the_metadata_arm(self):
         """An active YAML list replaces the schema default wholesale and must then be hand-mirrored."""
         raw = yaml.safe_load(TRACKED_CONFIG_YAML.read_text())
