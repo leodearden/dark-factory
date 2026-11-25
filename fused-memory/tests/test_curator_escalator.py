@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import importlib.util
 import json
 import logging
+import sys
 import threading
 from typing import IO, Any, Literal, overload
 
@@ -1825,3 +1827,20 @@ class TestPersistStateConcurrency:
                 )
         finally:
             handle.close()
+
+
+class TestEscalationPackageIsRequired:
+    """Task 10057: escalation is a declared dependency; its absence is a loud import error, not a silent degrade."""
+
+    def test_import_fails_loudly_without_the_escalation_package(self, monkeypatch):
+        for name in ('escalation', 'escalation.dedupe', 'escalation.models', 'escalation.queue'):
+            monkeypatch.setitem(sys.modules, name, None)
+        spec = importlib.util.spec_from_file_location(
+            '_curator_escalator_without_escalation', curator_escalator.__file__,
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+
+        with pytest.raises(ImportError):
+            spec.loader.exec_module(module)
