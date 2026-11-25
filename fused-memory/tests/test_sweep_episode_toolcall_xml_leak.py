@@ -310,7 +310,8 @@ class TestApplyRedactsOnlyRepairableShapes:
 
         await _mod.run(_args('--apply', '--project-id', 'reify'), service)
 
-        assert service.redact_episode_content.await_args.kwargs['project_id'] == 'reify'
+        (call,) = service.redact_episode_content.await_args_list
+        assert call.kwargs['project_id'] == 'reify'
 
 
 class TestApplyExitCode:

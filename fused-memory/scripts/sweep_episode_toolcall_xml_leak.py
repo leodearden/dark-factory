@@ -37,6 +37,7 @@ from fused_memory.backends.episode_toolcall_leak_scan import (
     EpisodeToolcallLeak,
     EpisodeToolcallLeakScan,
 )
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 from fused_memory.utils.toolcall_xml_leak import (
     LeakShape,
     classify_leak_shape,
@@ -47,9 +48,16 @@ SCRIPT_ID = 'sweep_episode_toolcall_xml_leak'
 logger = logging.getLogger(SCRIPT_ID)
 
 EXIT_OK = 0
+EXIT_NEEDS_HUMAN = 1
 EXIT_ABORTED = 2
 
 REPAIRABLE_SHAPES = frozenset({LeakShape.REPAIRABLE_TAIL, LeakShape.REPAIRABLE_DUPLICATE})
+
+# Per-record outcomes of an --apply that leave the episode for a human. Every
+# producer and resolve_exit_code use these names, so a spelling cannot drift.
+RECORD_ERROR = 'record_error'
+CONTENT_CHANGED_SINCE_SCAN = 'content_changed_since_scan'
+HUMAN_ADJUDICATION_FLAGS: tuple[str, ...] = (RECORD_ERROR, CONTENT_CHANGED_SINCE_SCAN)
 
 _UNSCANNED_SUMMARY: dict[str, Any] = {
     'episodes_in_group': None,
@@ -130,10 +138,24 @@ def report_from_progress(args: Any, progress: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_exit_code(report: dict[str, Any]) -> int:
-    """0 for any dry run: its report is the investigation, whatever it found."""
+    """0 for any dry run: its report is the investigation, whatever it found.
+
+    An --apply exits 1 when it left work for a human: a manual_review episode,
+    an incomplete scan (an unknown share of the group went unswept), or a record
+    carrying one of :data:`HUMAN_ADJUDICATION_FLAGS`.
+    """
     if report['dry_run']:
         return EXIT_OK
-    return EXIT_OK
+    needs_human = (
+        report['counts'][LeakShape.MANUAL_REVIEW] > 0
+        or not report['complete']
+        or any(
+            record.get(flag)
+            for record in report['records']
+            for flag in HUMAN_ADJUDICATION_FLAGS
+        )
+    )
+    return EXIT_NEEDS_HUMAN if needs_human else EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -142,13 +164,67 @@ def resolve_exit_code(report: dict[str, Any]) -> int:
 
 
 async def run(args: Any, memory_service: Any, progress: dict[str, Any] | None = None) -> dict:
-    """Scan the project's episodes and classify every leak. A scan TimeoutError propagates."""
+    """Scan the project's episodes, classify every leak and, under --apply, redact.
+
+    An --apply first proves the store is writable from here, before it scans.
+    Each record joins *progress* before its redaction is attempted, so an
+    abort still reports it. A scan TimeoutError propagates.
+    """
     progress = new_progress() if progress is None else progress
+    if args.apply:
+        assert_store_mutation_allowed(
+            operation=f'{SCRIPT_ID} --apply',
+            logger=logger,
+            extra_detail=(
+                'a redaction writes a Graphiti episode content SET plus a '
+                'write-journal row. Nothing was scanned and nothing was redacted.'
+            ),
+        )
     scan = await memory_service.scan_episode_toolcall_leaks(project_id=args.project_id)
     progress['scan_summary'] = summarize_scan(scan)
     for leak in scan.leaks:
-        progress['records'].append(leak_record(leak))
+        record = leak_record(leak)
+        progress['records'].append(record)
+        if args.apply:
+            await _redact_record(record, leak, memory_service, project_id=args.project_id)
     return report_from_progress(args, progress)
+
+
+async def _redact_record(
+    record: dict[str, Any], leak: EpisodeToolcallLeak, memory_service: Any, *, project_id: str,
+) -> None:
+    """Redact one repairable episode in place, recording the outcome on *record*.
+
+    Any other shape is left untouched. A failed redaction is recorded on its
+    own record and never stops the sweep.
+    """
+    if record['classification'] not in REPAIRABLE_SHAPES:
+        logger.warning(
+            '%s: episode %s is %s; left untouched for a human',
+            SCRIPT_ID, leak.uuid, record['classification'],
+        )
+        return
+    try:
+        result = await memory_service.redact_episode_content(
+            leak.uuid,
+            new_content=record['repaired_content'],
+            project_id=project_id,
+            agent_id=SCRIPT_ID,
+            _source=SCRIPT_ID,
+        )
+    except Exception as exc:
+        record[RECORD_ERROR] = True
+        record['error'] = f'{type(exc).__name__}: {exc}'
+        logger.exception('%s: redacting episode %s failed; the sweep continues', SCRIPT_ID, leak.uuid)
+        return
+    record['redacted'] = True
+    if result.get('old_content') != leak.content:
+        record[CONTENT_CHANGED_SINCE_SCAN] = True
+        logger.warning(
+            '%s: episode %s changed between the scan and its redaction; '
+            'the write journal holds the content it replaced',
+            SCRIPT_ID, leak.uuid,
+        )
 
 
 # ---------------------------------------------------------------------------
