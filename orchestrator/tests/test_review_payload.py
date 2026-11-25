@@ -364,7 +364,10 @@ class TestDefectRulings:
     def test_a_member_that_is_not_a_ruling_is_rejected_at_construction(self):
         with pytest.raises(ReviewPayloadError, match='DefectRuling'):
             ReviewPayload(
-                Verdict.PASS, issues=(), reviewer='r', defect_rulings=(dict(_CLOSURE_RAW),),
+                Verdict.PASS,
+                issues=(),
+                reviewer='r',
+                defect_rulings=(dict(_CLOSURE_RAW),),  # type: ignore[reportArgumentType]
             )
 
     def test_non_list_value_raises_naming_the_value(self):
