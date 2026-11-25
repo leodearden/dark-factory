@@ -208,6 +208,13 @@ def _make(
     )
 
 
+async def _report(f: _Fixture, commit: str, evidence: str = 'ev') -> _Fixture:
+    """Write a ready-to-merge report citing *commit* and run the handler on it."""
+    f.artifacts.write_ready_to_merge(commit=commit, evidence=evidence)
+    f.outcome = await f.wf._handle_ready_to_merge_report()
+    return f
+
+
 # ---------------------------------------------------------------------------
 # C-1 — the happy path: clean FF + verify PASSED + review PASS
 # ---------------------------------------------------------------------------
@@ -218,12 +225,10 @@ class TestReadyToMergeHappyPath:
     """A genuine merge-landing desync enqueues a deterministic merge."""
 
     async def _run(self, tmp_path: Path, **kw) -> _Fixture:
-        f = _make(tmp_path=tmp_path, **kw)
-        f.artifacts.write_ready_to_merge(
-            commit=_TIP, evidence='clean FF of main; verify PASSED; review PASS',
+        return await _report(
+            _make(tmp_path=tmp_path, **kw), _TIP,
+            evidence='clean FF of main; verify PASSED; review PASS',
         )
-        f.outcome = await f.wf._handle_ready_to_merge_report()
-        return f
 
     async def test_enqueues_exactly_one_merge_request(self, tmp_path: Path):
         f = await self._run(tmp_path)
@@ -594,9 +599,7 @@ class TestReadyToMergeAbbreviatedCitation:
         f.git_ops.commits_named = GitOps(
             GitConfig(), git_root or repo.path,
         ).commits_named
-        f.artifacts.write_ready_to_merge(commit=citation, evidence='ev')
-        f.outcome = await f.wf._handle_ready_to_merge_report()
-        return f
+        return await _report(f, citation)
 
     def _cited_commit_reject(self, f: _Fixture) -> dict:
         """The ``measured`` facts of the one ``cited_commit`` reject event."""
