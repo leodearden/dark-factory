@@ -23,6 +23,7 @@ dependencies = [
     "anthropic>=0.52.0",
     "aiosqlite>=0.20.0",
     "dark-factory-shared",
+    "escalation",
 ]
 
 [tool.uv.sources]
@@ -112,7 +113,6 @@ dev = [
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.6.0",
     "ruff>=0.7.1",
-    "escalation",
 ]
 # Eval-only (plans/write-triage-flip-readiness-prd.md ρ1); nothing under src/ imports it.
 reranker = [
