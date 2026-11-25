@@ -709,17 +709,29 @@ def _cell_workflow(
 
 
 async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: float, cell: str) -> str:
-    """The workflow's terminal outcome; a timeout or a raise becomes the cell's outcome."""
+    """The workflow's terminal outcome, where a ceiling that fired or a raise becomes the cell's outcome.
+
+    A workflow absorbs the deadline's cancellation and returns CANCELLED, so the
+    deadline is read from the scope.
+    """
+    deadline = asyncio.timeout(timeout_minutes * 60)
     try:
-        report = await asyncio.wait_for(workflow.run(), timeout=timeout_minutes * 60)
+        async with deadline:
+            report = await workflow.run()
     except TimeoutError:
-        logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
-        return 'timeout'
+        return _timed_out(cell, timeout_minutes)
     except Exception as e:
         logger.error(f'Eval {cell} failed: {e}')
         return WorkflowOutcome.BLOCKED.value
+    if deadline.expired():
+        return _timed_out(cell, timeout_minutes)
     outcome = report.outcome
     return outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome)
+
+
+def _timed_out(cell: str, timeout_minutes: float) -> str:
+    logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
+    return 'timeout'
 
 
 async def _cell_metrics(
