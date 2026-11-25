@@ -80,8 +80,8 @@ if TYPE_CHECKING:
     from fused_memory.config.schema import DedupOutageDetectorConfig
     from fused_memory.middleware.ticket_store import CurationBacklog, DedupHealth, TicketStore
 
-# Defensive import so the janitor degrades to a log-only no-op in minimal
-# envs without the escalation package.
+# Leftover defensive import: escalation is a declared dependency of
+# fused-memory, so the ImportError arm is dead.  Task 11688 removes this guard.
 try:
     from escalation.models import Escalation  # type: ignore[import-untyped,no-redef]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]

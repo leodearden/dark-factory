@@ -57,12 +57,12 @@ Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalato
   of outcome.  This matches the existing esc-2240-series scope_violation
   pattern referenced in task 1088.
 
-Unlike that class, it imports the ``escalation`` workspace package
-defensively.  When the package is missing (minimal envs, tests without
-escalation infra), ``report_rejection`` becomes a logged no-op — the guard's
-own outcome is unaffected (on the FILES-certain path the error dict is still
-returned; on the advisory path the submission still proceeds and still
-carries the stamp), so escalation is purely additive.
+Unlike that class, it still imports the ``escalation`` workspace package
+behind a leftover ``HAS_ESCALATION`` guard.  Escalation is a declared
+dependency of fused-memory, so the guard's no-op arm is dead; task 11688
+removes it.  Filing is purely additive: the guard's own outcome never depends
+on the filing (on the FILES-certain path the error dict is still returned; on the
+advisory path the submission still proceeds and still carries the stamp).
 
 Burst control: :meth:`report_budget_misconfig` applies a per-project dedup
 window (``_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS``) so a sustained per-call
@@ -90,9 +90,8 @@ from shared.project_layout import escalation_queue_dir
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-# Defensive import so the escalator silently no-ops when the escalation
-# package is unavailable (minimal CI / unit-test envs, deployments that
-# haven't installed it yet).
+# Leftover defensive import: escalation is a declared dependency of
+# fused-memory, so the ImportError arm is dead.  Task 11688 removes this guard.
 try:
     from escalation.dedupe import (  # type: ignore[import-untyped]
         DedupeConfig,
