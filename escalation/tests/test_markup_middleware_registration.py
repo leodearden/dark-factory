@@ -1446,3 +1446,75 @@ class TestAResolutionLeakIsForwardedClean:
         assert resolved is not None
         assert resolved.resolution == self.RESOLUTION
         assert resolved.resolved_by == 'steward'
+
+
+# ---------------------------------------------------------------------------
+# A residue the queue cannot take still survives, whole, in the log.
+# ---------------------------------------------------------------------------
+
+
+class _ResidueRefusingQueue(EscalationQueue):
+    """A queue whose disk is full for residue records only."""
+
+    def submit(self, escalation: Escalation) -> str:
+        if escalation.category == RESIDUE_CATEGORY:
+            raise OSError(28, 'No space left on device')
+        return super().submit(escalation)
+
+
+class TestAResidueTheQueueCannotTakeSurvivesInTheLog:
+    """The queue is the residue's first home, never its only chance.
+
+    A residue the queue refuses is written whole to one ERROR line, as text
+    and as data, so the payload is recoverable from the service's journal.
+    """
+
+    @staticmethod
+    def _refused() -> tuple[dict[str, Any], str]:
+        record = specimen(UNREPAIRABLE)
+        return {**REQUIRED, record['param']: record['value']}, record['value']
+
+    @staticmethod
+    def _dropped_slice() -> tuple[dict[str, Any], str]:
+        leaked = _leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE)
+        return {**REQUIRED, 'detail': leaked}, UNTYPABLE_EVIDENCE
+
+    async def _call(
+        self, client: Client, error_type: str, arguments: dict[str, Any]
+    ) -> str | None:
+        """The call's own report of where its residue went."""
+        if error_type == 'mcp_markup_unrepairable':
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool('escalate_info', arguments)
+            return error_payload(excinfo)['escalation_id']
+        result = await client.call_tool('escalate_info', arguments)
+        return result.meta['markup_repair']['unrecovered_residue_id']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('error_type', 'call'),
+        [
+            pytest.param('mcp_markup_unrepairable', _refused, id='refused'),
+            pytest.param('mcp_markup_unrecovered_param', _dropped_slice, id='dropped-slice'),
+        ],
+    )
+    async def test_the_whole_record_is_logged(
+        self, tmp_path: Path, caplog, error_type, call
+    ):
+        arguments, raw = call()
+        queue = _ResidueRefusingQueue(tmp_path / 'esc')
+        server = create_server(queue, startup_sweep=False)
+
+        with caplog.at_level('ERROR', logger='escalation.server'):
+            async with Client(server) as client:
+                preserved_in = await self._call(client, error_type, arguments)
+
+        assert preserved_in is None
+        [line] = [r for r in caplog.records if 'residue_record' in r.__dict__]
+        residue_record = line.__dict__['residue_record']
+        assert residue_record['raw_value'] == raw
+        assert residue_record['error_type'] == error_type
+        assert repr(raw) in line.getMessage()
+        assert line.exc_info is not None
+        assert line.exc_info[0] is OSError
+        assert [e for e in queue.get_pending() if e.category == RESIDUE_CATEGORY] == []
