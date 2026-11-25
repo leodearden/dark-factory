@@ -9,13 +9,13 @@ fake records the merges a test queued as landing mid-review before it answers.
 
 from __future__ import annotations
 
-import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _review_checkpoint_root import review_scratch_root
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from orchestrator.config import OrchestratorConfig, ReviewConfig
@@ -56,13 +56,7 @@ class _Reviewer:
 
 @pytest.fixture
 def checkpoint(tmp_path: Path) -> Iterator[ReviewCheckpoint]:
-    with tempfile.TemporaryDirectory(prefix='df-review-merge-scope-') as scratch:
-        root = Path(scratch) / 'project'
-        root.mkdir()
-        assert '/tmp/pytest' not in str(root), (
-            f'{root} contains "/tmp/pytest", which ReviewCheckpoint._run_review refuses '
-            'as a project_root; this fixture must live outside pytest basetemp'
-        )
+    with review_scratch_root('df-review-merge-scope-') as root:
         config = OrchestratorConfig(
             project_root=root,
             review=ReviewConfig(
