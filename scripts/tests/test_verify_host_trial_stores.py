@@ -9,9 +9,9 @@ import pytest
 from shared.project_layout import runs_db
 from verify_host_trial_fixtures import (
     admission_plan,
+    build_store,
     cap_hit,
     dispatch_deferred,
-    insert_rows,
     invocation,
     lifecycle,
     merge_finalized,
@@ -63,11 +63,7 @@ def store(tmp_path, make_runs_db):
     """Build a project root whose runs.db holds *events* and each table's *rows*; return the root."""
 
     def build(events=(), *, name='dark-factory', **tables):
-        root = project_root(tmp_path, name)
-        path = make_runs_db(events, directory=runs_db(root).parent)
-        for table, rows in tables.items():
-            insert_rows(path, table, rows)
-        return root
+        return build_store(tmp_path, make_runs_db, name, events, **tables)
 
     return build
 

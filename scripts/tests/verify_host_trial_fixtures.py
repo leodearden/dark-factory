@@ -5,25 +5,26 @@ factory, its payload shaped like the live row of that type. Timestamps are
 taken as aware datetimes and stored as aware UTC ISO strings, as the live
 stores hold them. Samples are written by ``MetricSpec.name`` only, so no
 metric name is spelled here. Project roots and samples stores come from
-``resource_report_fixtures``.
+``resource_report_fixtures``; ``build_store`` lays one root's runs.db.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import _checkout as _checkout
 from resource_report_fixtures import HOLD_SAMPLE, project_root, samples_db
 from sampler.metrics import MetricSpec
+from shared.project_layout import runs_db
 
 __all__ = [
     'admission_plan',
-    'at_hours',
+    'build_store',
     'cap_hit',
     'dispatch_deferred',
     'insert_rows',
@@ -196,6 +197,21 @@ def insert_rows(db_path: Path, table: str, rows: Sequence[Mapping[str, Any]]) ->
         conn.close()
 
 
+def build_store(
+    tmp_path: Path,
+    make_runs_db: Callable[..., Path],
+    name: str,
+    events: Iterable[Mapping[str, Any]] = (),
+    **tables: Sequence[Mapping[str, Any]],
+) -> Path:
+    """A project root *name* under *tmp_path* whose runs.db holds *events* and each table's rows."""
+    root = project_root(tmp_path, name)
+    path = make_runs_db(events, directory=runs_db(root).parent)
+    for table, rows in tables.items():
+        insert_rows(path, table, rows)
+    return root
+
+
 def write_samples(db: Path, rows: Sequence[tuple[int, MetricSpec, float]]) -> None:
     """Host-level samples ``(ts, spec, value)``, each written under its spec's name."""
     conn = sqlite3.connect(db)
@@ -208,8 +224,3 @@ def write_samples(db: Path, rows: Sequence[tuple[int, MetricSpec, float]]) -> No
         conn.commit()
     finally:
         conn.close()
-
-
-def at_hours(base: datetime, hours: float) -> datetime:
-    """*base* plus *hours*, for laying rows along a fixture timeline."""
-    return base + timedelta(hours=hours)

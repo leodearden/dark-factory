@@ -10,8 +10,8 @@ from verify_host_trial_allowance import ALLOWANCE_RULE
 from verify_host_trial_blocks import BLOCK_RULE
 from verify_host_trial_decision import DECISION_RULE
 from verify_host_trial_fixtures import (
+    build_store,
     cap_hit,
-    insert_rows,
     invocation,
     lifecycle,
     merge_finalized,
@@ -37,11 +37,7 @@ def day(n: float) -> datetime:
 @pytest.fixture
 def store(tmp_path, make_runs_db):
     def build(name, events=(), **tables):
-        root = project_root(tmp_path, name)
-        path = make_runs_db(events, directory=runs_db(root).parent)
-        for table, rows in tables.items():
-            insert_rows(path, table, rows)
-        return root
+        return build_store(tmp_path, make_runs_db, name, events, **tables)
 
     return build
 
