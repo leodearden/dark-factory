@@ -7,6 +7,7 @@ from pathlib import Path
 from shared.agent_result import extract_agent_verdict
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
 from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
@@ -205,6 +206,7 @@ class CodebaseVerifier:
         scope_hints: list[str] | None = None,
         *,
         codebase_root: Path,
+        ledger: InvocationLedger | None = None,
     ) -> VerificationResult:
         """Verify a factual claim against the codebase rooted at ``codebase_root``.
 
@@ -218,6 +220,8 @@ class CodebaseVerifier:
         ``project_id`` parameter as dead code: the parameter was not the
         mistake, the missing wiring was — and the thing the verifier actually
         needs is a filesystem root, not a logical id.
+
+        ``ledger`` is where the agent's CLI call lands its invocations row; None writes none.
         """
         codebase_root, root_defect = _resolve_codebase_root(codebase_root)
 
@@ -475,6 +479,7 @@ Investigate this claim against the codebase and report your findings.
             # The agent explores the TARGET project (task 4722): its cwd, the
             # root the CLI confines its read tools to, must be that project's.
             cwd=codebase_root,
+            ledger=ledger,
         )
 
         result = await agent.run(prompt)
