@@ -246,6 +246,46 @@ def test_the_cursor_advances_only_when_every_ref_converged(gated: World) -> None
     assert clean_cursor.inbox_offset == gated.inbox_size()
 
 
+def test_an_inbox_replaced_by_a_shorter_one_is_read_again_from_its_start(
+    gated: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    append_inbox(gated.in_dir, reported(2, 3, at=AT), reported(2, 4, at=AT, seq=2))
+    _, past_the_replacement = gated.run()
+    (gated.in_dir / INBOX_FILENAME).unlink()
+    append_inbox(gated.in_dir, reported(2, 5, at=AT))
+    assert past_the_replacement.inbox_offset > gated.inbox_size()
+
+    with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
+        report, cursor = gated.run(past_the_replacement)
+
+    assert (report.offset_from, report.inbox_problem) == (0, None)
+    assert report.converged == (portal_ref(PROJECT, 2, 5),)
+    assert cursor.inbox_offset == gated.inbox_size()
+    assert gated.fix_of(portal_ref(PROJECT, 2, 5))['status'] == 'pending'
+    assert any(PROJECT in record.getMessage() and 'replaced' in record.getMessage() for record in caplog.records)
+
+
+def test_a_symlinked_inbox_is_named_unusable_holds_the_cursor_and_calls_nothing(
+    gated: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    elsewhere = gated.tmp_path / 'elsewhere'
+    append_inbox(elsewhere, reported(2, 3, at=AT))
+    gated.in_dir.mkdir()
+    (gated.in_dir / INBOX_FILENAME).symlink_to(elsewhere / INBOX_FILENAME)
+    held = FilerCursor(inbox_offset=0)
+
+    with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
+        report, cursor = gated.run(held)
+
+    assert report.inbox_problem == 'symlink'
+    assert (report.converged, report.unconverged) == ((), ())
+    assert cursor == held
+    assert gated.fake.calls == ()
+    [warning] = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert PROJECT in warning
+    assert 'symlink' in warning
+
+
 SECRET_OBSERVED = 'SECRET-OBSERVED'
 MARKUP_OBSERVED = 'the page shows </description> verbatim'
 BACKLOG = {'error': 'busy', 'error_type': 'ReconciliationBacklogExceeded'}

@@ -363,6 +363,12 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
     try:
         read, offset_from = _read(policy, cursor.inbox_offset)
     except InboxUnusable as exc:
+        logger.warning(
+            'inbox of %s is unusable (%s); its lines wait at offset %d',
+            policy.project_id,
+            exc.problem,
+            cursor.inbox_offset,
+        )
         unusable = PassReport(
             offset_from=cursor.inbox_offset,
             offset_to=cursor.inbox_offset,
