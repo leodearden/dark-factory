@@ -29,8 +29,7 @@ graph) with Rust-aware instruments:
     couples files through impl blocks, which the use-graph cannot see
   - fix density: fix-grep'd non-merge commits touching the file since the rules' date
 
-Needs tokei, lizard, cargo and git on PATH. There is no --diff yet: the summary says
-there was no previous snapshot.
+There is no --diff yet: the summary says there was no previous snapshot.
 
 The project's rules (domain excludes, area rules, inferred mappings, test-file pattern,
 lizard excludes, fix-density start date) are a TOML file given by --rules, from the
@@ -38,7 +37,13 @@ project overlay (references/project-overlay.md, Path -> area map and Metrics
 instruments); reify's is scripts/rust_metrics_rules/reify.toml. The snapshot records
 them in params.rules so the report can cite them.
 
-Usage: rust_metrics_snapshot.py --rules RULES.toml --root WORKTREE --run-id ID --out DIR
+Needs tokei, cargo and git on PATH; lizard runs as `python -m lizard` under the measuring
+interpreter, which records its version.
+
+    --rules RULES.toml --run-id ID --out DIR --root WORKTREE   measure HEAD
+    --rules RULES.toml --params                                the params a measurement here records
+
+Exit 0 when done; exit 2 on an instrument failure, with the cause named on stderr.
 """
 
 from __future__ import annotations
@@ -47,15 +52,18 @@ import argparse
 import csv
 import dataclasses
 import datetime
+import importlib.metadata
 import io
 import json
 import os
+import platform
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -190,8 +198,60 @@ def load_rules(path: Path) -> RustRules:
     )
 
 
-def sh(cmd, cwd=None, check=True):
-    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=check).stdout
+def _run(command: Sequence[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    """*command* run to completion; else a MetricsError naming it, its exit code and its stderr."""
+    where = f' in {cwd}' if cwd is not None else ''
+    try:
+        completed = subprocess.run(list(command), cwd=cwd, text=True, capture_output=True, check=False)
+    except OSError as exc:
+        raise source_measures.MetricsError(
+            f'could not run `{shlex.join(command)}`{where}: {exc.__class__.__name__}: {exc}'
+        ) from exc
+    if completed.returncode != 0:
+        raise source_measures.MetricsError(
+            f'`{shlex.join(command)}` failed{where} (exit {completed.returncode}): '
+            f'{completed.stderr.strip() or "no stderr"}'
+        )
+    return completed
+
+
+_TOKEI_INSTALL = 'cargo install --locked tokei'
+
+
+def _tokei_version() -> str:
+    try:
+        printed = _run(['tokei', '--version']).stdout
+    except source_measures.MetricsError as exc:
+        raise source_measures.MetricsError(f'{exc} -- tokei counts the prose share; install it with `{_TOKEI_INSTALL}`') from exc
+    found = re.match(r'tokei (\S+)', printed)
+    if found is None:
+        raise source_measures.MetricsError(
+            f'`tokei --version` printed {printed.strip()!r}, not `tokei <version>`; reinstall it with `{_TOKEI_INSTALL}`'
+        )
+    return found.group(1)
+
+
+def _lizard_version() -> str:
+    try:
+        return importlib.metadata.version('lizard')
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise source_measures.MetricsError(
+            f'lizard is not installed for {sys.executable}, and it measures per-function complexity; '
+            'run `uv sync --all-packages` in the factory checkout'
+        ) from exc
+
+
+def measurement_params(rules: RustRules) -> dict[str, Any]:
+    """What a measurement by this interpreter, these tools and these rules records as its params."""
+    return {
+        'tokei_version': _tokei_version(),
+        'lizard_version': _lizard_version(),
+        'python_version': platform.python_version(),
+        'instrument': {'rust_metrics_snapshot': source_measures.blob_sha(Path(__file__).resolve())},
+        'h14_soft_ceiling_lines': H14_SOFT,
+        'h14_alarm_lines': H14_ALARM,
+        'rules': rules.to_json(),
+    }
 
 
 def strip_rust_noise(text):
@@ -391,24 +451,17 @@ class RustModules:
         return None
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--rules', required=True)
-    ap.add_argument('--root', required=True)
-    ap.add_argument('--run-id', required=True)
-    ap.add_argument('--out', required=True)
-    ap.add_argument('--lizard', default='lizard')
-    a = ap.parse_args()
-    rules = load_rules(Path(a.rules))
-    root = Path(a.root).resolve()
-    out = Path(a.out)
+def _measure(args: argparse.Namespace, rules: RustRules) -> int:
+    params = measurement_params(rules)
+    root = Path(args.root).resolve()
+    out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    head = sh(['git', 'rev-parse', 'HEAD'], cwd=root).strip()
-    if sh(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=root).strip():
+    head = source_measures.head_commit(root)
+    if _run(['git', 'status', '--porcelain', '--untracked-files=no'], root).stdout.strip():
         print('dirty domain: tracked changes in the pinned worktree', file=sys.stderr)
         sys.exit(2)
 
-    tracked = sh(['git', 'ls-files'], cwd=root).split('\n')
+    tracked = _run(['git', 'ls-files'], root).stdout.split('\n')
     domain = []
     for p in tracked:
         if not p or rules.excluded(p):
@@ -422,7 +475,7 @@ def main():
     domain = [p for p in domain if rules.area_of(p) is not None]
 
     # ---- cargo members
-    meta = json.loads(sh(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=root))
+    meta = json.loads(_run(['cargo', 'metadata', '--no-deps', '--format-version', '1'], root).stdout)
     members = {}
     for pkg in meta['packages']:
         d = os.path.relpath(os.path.dirname(pkg['manifest_path']), root)
@@ -435,7 +488,7 @@ def main():
             rm.register(p)
 
     # ---- tokei
-    tok = json.loads(sh(['tokei', '-f', '-o', 'json', '.'], cwd=root))
+    tok = json.loads(_run(['tokei', '-f', '-o', 'json', '.'], root).stdout)
     tstats = {}
     for lang, blob in tok.items():
         if lang == 'Total':
@@ -452,11 +505,11 @@ def main():
 
     # ---- lizard
     lz_dirs = sorted({p.split('/')[0] if '/' not in p else p.split('/')[0] for p in domain})
-    lz_cmd = [a.lizard, '--csv', '-t', '8']
+    lz_cmd = [sys.executable, '-m', 'lizard', '--csv', '-t', '8']
     for pattern in rules.lizard_excludes:
         lz_cmd += ['-x', pattern]
     lz_cmd += ['./' + d for d in lz_dirs]
-    lz = subprocess.run(lz_cmd, cwd=root, text=True, capture_output=True)
+    lz = _run(lz_cmd, root)
     fn_rows = defaultdict(list)
     for row in csv.reader(io.StringIO(lz.stdout)):
         if len(row) < 9:
@@ -470,7 +523,7 @@ def main():
         fn_rows[f].append((ccn, row[7], nloc))
 
     # ---- fix density
-    fixlog = sh(
+    fixlog = _run(
         [
             'git',
             'log',
@@ -482,8 +535,8 @@ def main():
             '--format=',
             head,
         ],
-        cwd=root,
-    )
+        root,
+    ).stdout
     fix_density = Counter(name for name in fixlog.split('\n') if name)
 
     # ---- per-file records + Rust imports
@@ -733,17 +786,10 @@ def main():
     snapshot = dict(
         schema='review-all-reify-rust-1',
         instrument='rust_metrics_snapshot.py (lead-authored, Phase 1)',
-        run_id=a.run_id,
+        run_id=args.run_id,
         as_of_sha=head,
         root=str(root),
-        params=dict(
-            h14_soft_ceiling_lines=H14_SOFT,
-            h14_alarm_lines=H14_ALARM,
-            complexity_instrument='lizard 1.24.1 cyclomatic complexity (CCN) per function',
-            prose_instrument='tokei 15.0.0 comments/(code+comments)',
-            fix_density_rule='non-merge commits whose message matches fix|bug|regress|repair|hotfix (case-insensitive) touching the file, since the date, at HEAD',
-            rules=rules.to_json(),
-        ),
+        params=params,
         evidence=dict(
             complete=True,
             unreadable=[],
@@ -772,7 +818,7 @@ def main():
     # ---- summary (<=4k chars)
     s = []
     s.append(
-        f"metrics snapshot {a.run_id} @ {head[:10]} — {len(records)} files, {totals['lines']} lines (prose share {total_prose}), "
+        f"metrics snapshot {args.run_id} @ {head[:10]} — {len(records)} files, {totals['lines']} lines (prose share {total_prose}), "
         f"{totals['functions']} functions, {totals['fns_ccn_over_15']} with CCN>15; files >= {H14_ALARM} lines: {totals['alarm_files']}, {H14_SOFT}-{H14_ALARM}: {totals['soft_files']}; "
         f"module cycles (SCCs>1): {len(cycles)}, hidden: {len(hidden)}; reach-back imports: {totals['reach_back_imports']}; deferred: {totals['deferred_imports']} ({totals['cycle_closing_imports']} close a cycle); re-exports: {totals['reexports']}; test->internal reaches: {totals['patch_targets']}. No previous snapshot; since = none. Instruments: lizard CCN (not cognitive), tokei prose. Line counts set read budgets only (quality doc: Do not steer by)."
     )
@@ -796,7 +842,58 @@ def main():
     print(f"\nunmapped paths: {len(unmapped)}", file=sys.stderr)
     for u in unmapped[:40]:
         print('  ', u, file=sys.stderr)
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Measure a Cargo workspace's tracked Rust, TypeScript, Python and shell at HEAD "
+            'under a project rules file, or print the params such a measurement records. '
+            'A report, never a gate.'
+        ),
+        epilog=(
+            'Exit codes: 0 done; 2 instrument failure (a malformed rules file, a missing '
+            'tool, a failing git, cargo, tokei or lizard, a dirty tree, a moved HEAD) or a '
+            'misused command line.'
+        ),
+    )
+    parser.add_argument('--rules', required=True, help="The project's rules TOML file.")
+    parser.add_argument('--run-id', help="The measuring run's id, recorded as run_id.")
+    parser.add_argument('--out', help='Where to write the snapshot.')
+    parser.add_argument('--root', help='The checkout to measure.')
+    parser.add_argument(
+        '--params',
+        action='store_true',
+        help='Print the params a measurement here would record, as one JSON line; measure nothing.',
+    )
+    return parser
+
+
+def _require_one_mode(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    measuring = (args.run_id, args.out, args.root)
+    if args.params:
+        if measuring != (None, None, None):
+            parser.error('--params takes only --rules')
+    elif None in measuring:
+        parser.error('measuring needs --run-id, --out and --root; otherwise give --params')
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point; see --help for the exit codes."""
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _require_one_mode(parser, args)
+    try:
+        rules = load_rules(Path(args.rules))
+        if args.params:
+            print(json.dumps(measurement_params(rules)))
+            return 0
+        return _measure(args, rules)
+    except source_measures.MetricsError as exc:
+        print(f'rust_metrics_snapshot: {exc}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
