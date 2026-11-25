@@ -1433,14 +1433,19 @@ on S3 ζ, so on S6 μ (behind S6's chain and task 5040), S7 δ, task 5409 and S3
   `orchestrator/tests/test_dry_run_unblock.py`, `orchestrator/tests/test_sandbox_git_config.py`,
   `orchestrator/tests/test_shadow_invocation_sandbox.py`, `orchestrator/tests/test_workflow_task_root.py`,
   `orchestrator/tests/test_landlock.py`, `orchestrator/tests/test_sandbox.py`. Re-measured over the
-  whole tree at `defc45bfa7` (2026-11-25; the `e634cfe658` measurement covered only `orchestrator/`),
-  the callers it missed or that landed since: `orchestrator/src/orchestrator/evals/cell_sandbox.py`
-  (S1 μ, task 9849) and its composition site `orchestrator/src/orchestrator/evals/runner.py`,
-  `scripts/sitting/nightly_prepare.py` (task 6203), and the tests
-  `orchestrator/tests/test_eval_corpus_sandbox.py`, `orchestrator/tests/test_zcode_dotenv_live.py`
-  (task 9541) and `scripts/tests/test_sitting_nightly_prepare.py`. 23 files, above the 15-file review
-  trigger: one process global becomes a parameter, and every site that set, read or reset it changes
-  mechanically.
+  whole tree at `defc45bfa7` (2026-11-25; the `e634cfe658` measurement covered only `orchestrator/`)
+  for the deleted names and for the two resolvers whose signatures change, the callers it missed or
+  that landed since: `orchestrator/src/orchestrator/evals/cell_sandbox.py` (S1 μ, task 9849) and its
+  composition site `orchestrator/src/orchestrator/evals/runner.py`, `scripts/sitting/nightly_prepare.py`
+  (task 6203), and the tests `orchestrator/tests/test_eval_corpus_sandbox.py`,
+  `orchestrator/tests/test_zcode_dotenv_live.py` (task 9541), `scripts/tests/test_sitting_nightly_prepare.py`
+  and `orchestrator/tests/test_agent_cli_guard.py` (task 4701, whose zero-argument
+  `resolve_active_backend` stand-in breaks or goes dead under either shape of the new call). Not
+  counted: the `patch(..., return_value=…)` stand-ins in the `test_invoke*.py` files accept any
+  arguments, and `test_shadow_isolation_probe.py`'s `resolve_backend=` injection keeps its shape
+  because the probe's default binds the backend. 24 files, above the 15-file review trigger: one
+  process global becomes a parameter, and every site that set, read or reset it, or stood in for a
+  resolver with a fixed signature, changes mechanically.
 - Keys: `fk-a97501641592`. Deps: ι2 (same file `harness.py`); S9 ζ1 (`_invoke`) if filed.
 - Deletes: `set_backend`, `get_backend`, `_preferred`, `_escalated_backend_state`, `reset_escalation_dedupe`,
   all three `_restore_sandbox_backend` fixtures (`conftest.py`, `orchestrator/tests/conftest.py`,

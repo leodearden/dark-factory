@@ -681,7 +681,7 @@ tasks:
   - label: "κ1"
     task_id: 9232
     title: "The invocation carries its sandbox backend"
-    note: "Closes fk-a97501641592. The process-global backend becomes a parameter; dry_run_unblock.py and evals/shadow_isolation.py (new readers since d40ba048e9) take it too, as do evals/cell_sandbox.py and scripts/sitting/nightly_prepare.py (whole-tree re-measure 2026-11-25). 23 files, above the 15-file trigger by statement (mechanical)."
+    note: "Closes fk-a97501641592. The process-global backend becomes a parameter; dry_run_unblock.py and evals/shadow_isolation.py (new readers since d40ba048e9) take it too, as do evals/cell_sandbox.py and scripts/sitting/nightly_prepare.py (whole-tree re-measure 2026-11-25 of the deleted names and the two re-signatured resolvers). 24 files, above the 15-file trigger by statement (mechanical)."
     capabilities:
       - name: "process-global-backend-gone"
         binding: "anti-inversion — the backend travels with invoke_agent"
