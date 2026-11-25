@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Any, TypeVar
 
 import _checkout as _checkout
+from resource_report_holds import parse_utc
 from sampler.metrics import ARM_METRICS, MetricSpec
 from shared.project_layout import runs_db
 
@@ -297,7 +298,7 @@ class ProjectRead:
     detail: str | None
     sources: Mapping[Source, SourceRead] = field(default_factory=_no_sources)
     merge_verifies: tuple[MergeVerify, ...] = ()
-    """Every runner's verifies whose start or end falls in the window."""
+    """Every runner's verifies whose [start, end] overlaps the window."""
     first_host_verify_at: datetime | None = None
     """The host's earliest merge_verify start over the whole store."""
     lifecycle: tuple[LifecycleRow, ...] = ()
@@ -389,8 +390,7 @@ def _select(conn: sqlite3.Connection, spec: SourceSpec, window: _Window) -> Iter
 def _at(value: object) -> datetime:
     if not isinstance(value, str):
         raise ValueError(f'timestamp {value!r}')
-    parsed = datetime.fromisoformat(value)
-    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+    return parse_utc(value)
 
 
 def _in_reach(at: datetime, bounds: tuple[datetime | None, datetime | None]) -> bool:
