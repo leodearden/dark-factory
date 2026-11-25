@@ -81,7 +81,9 @@ def _assert_effects_scoped(record: AuditRecord, scope: Scope, port: int) -> None
     assert record.connects
     assert {connected.address for connected in record.connects} == {('127.0.0.1', port)}
     assert record.spawns == ()
-    assert all(path.is_relative_to(scope.state_dir) for mutated in record.mutations for path in mutated.paths)
+    assert all(
+        path.is_relative_to(scope.state_dir) for mutated in record.mutations_outside_runtime() for path in mutated.paths
+    )
 
 
 def _scoped_once(scope: Scope, server: StubMcpServer) -> list[ToolCall]:

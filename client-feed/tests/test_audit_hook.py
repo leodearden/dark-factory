@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from _audit_hook import Connected, Mutated, Opened, recording, runtime_roots
 
 
@@ -71,6 +72,18 @@ def test_opens_of_the_runtime_and_the_ca_bundle_are_left_out(tmp_path: Path) -> 
 
     assert len(rec.opens) == 3
     assert rec.opens_outside_runtime() == (Opened(target, writes=False),)
+
+
+def test_mutations_of_the_runtime_are_left_out(tmp_path: Path) -> None:
+    runtime_cache = Path(json.__file__).with_name('no-such-package') / '__pycache__'
+
+    with recording() as rec:
+        with pytest.raises(FileNotFoundError):
+            os.mkdir(runtime_cache)
+        os.mkdir(tmp_path / 'd')
+
+    assert len(rec.mutations) == 2
+    assert rec.mutations_outside_runtime() == (Mutated('os.mkdir', (tmp_path / 'd',)),)
 
 
 def test_only_events_inside_the_block_are_recorded(tmp_path: Path) -> None:

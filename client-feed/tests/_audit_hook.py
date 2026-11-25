@@ -169,8 +169,17 @@ class AuditRecord:
         return tuple(_spawned(event, args) for event, args in self._raw() if event in _SPAWNS)
 
     def opens_outside_runtime(self) -> tuple[Opened, ...]:
-        roots = tuple({*runtime_roots(), *(root.resolve() for root in runtime_roots())})
+        roots = _resolved_runtime_roots()
         return tuple(opened for opened in self.opens if not _under(opened.path, roots))
+
+    def mutations_outside_runtime(self) -> tuple[Mutated, ...]:
+        """Leaves out the importer's bytecode-cache writes, made on a module's first import from an uncompiled venv."""
+        roots = _resolved_runtime_roots()
+        return tuple(mutated for mutated in self.mutations if not all(_under(path, roots) for path in mutated.paths))
+
+
+def _resolved_runtime_roots() -> tuple[Path, ...]:
+    return tuple({*runtime_roots(), *(root.resolve() for root in runtime_roots())})
 
 
 @contextmanager
