@@ -415,6 +415,28 @@ branch, before any merge submission:
 3. `uv run pyright` in each touched, pyright-configured package — any of the
    eight workspace members the §3 **Type-check** command walks.
 
+**Defect fixes** start from a test that fails without the fix, for a human
+committing directly as much as for an agent. The rule's one home is
+`orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE`, the text the
+factory's fixing agents are given. The excerpt below is rendered
+from it and kept equal to it by `tests/scripts/test_defect_rule_mirror.py`.
+
+<!-- defect-test-rule-mirror:begin  rendered from orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE; pinned by tests/scripts/test_defect_rule_mirror.py -->
+```text
+## Fixing a defect
+
+A defect is wrong runtime behaviour. A defect fix starts from a test that fails
+without the fix and passes with it: write that test first and watch it fail.
+In a pytest project, when the defect is declared, mark that test
+`@pytest.mark.defect("<ref>")` with the defect's ref. A test carrying
+`@pytest.mark.defect` is a defect's reproducing test.
+
+Never weaken a failing test (loosen or delete an assertion, skip it, mark it
+xfail, or delete the test) without stating in the commit message why the test,
+not the code, was wrong.
+```
+<!-- defect-test-rule-mirror:end -->
+
 The inline-suppression ratchet guard,
 `scripts/tests/test_inline_suppression_ratchet.py`, runs with the suite. A
 malformed disposition marker turns it red now. A new `type: ignore`, `noqa`
