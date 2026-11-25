@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -27,6 +28,18 @@ _TOKENS = {
 }
 
 
+def _with_tokens(*, success: bool, **fields: Any) -> AgentResult:
+    return AgentResult(
+        success=success,
+        output='',
+        input_tokens=1200,
+        output_tokens=300,
+        cache_read_tokens=50000,
+        cache_create_tokens=4000,
+        **fields,
+    )
+
+
 async def _run_with_ledger(
     tmp_path: Path, served: AgentResult,
 ) -> tuple[StageResult, list[dict]]:
@@ -49,13 +62,8 @@ async def _run_with_ledger(
 
 
 async def test_successful_stage_lands_one_row_and_carries_its_tokens(tmp_path: Path):
-    served = AgentResult(
-        success=True,
-        output='',
-        structured_output={'summary': 'ok'},
-        cost_usd=0.42,
-        duration_ms=1234,
-        **_TOKENS,
+    served = _with_tokens(
+        success=True, structured_output={'summary': 'ok'}, cost_usd=0.42, duration_ms=1234,
     )
 
     result, rows = await _run_with_ledger(tmp_path, served)
@@ -75,7 +83,7 @@ async def test_successful_stage_lands_one_row_and_carries_its_tokens(tmp_path: P
 
 
 async def test_returned_failure_still_lands_a_row_and_carries_its_tokens(tmp_path: Path):
-    hung = AgentResult(success=False, output='', timed_out=True, duration_ms=60_000, **_TOKENS)
+    hung = _with_tokens(success=False, timed_out=True, duration_ms=60_000)
 
     result, rows = await _run_with_ledger(tmp_path, hung)
 
@@ -102,4 +110,5 @@ async def test_no_ledger_passes_no_cost_store(tmp_path: Path):
         AgentResult(success=True, output='', structured_output={'summary': 'ok'}), tmp_path,
     )
 
+    assert invoke.await_args is not None
     assert invoke.await_args.kwargs.get('cost_store') is None
