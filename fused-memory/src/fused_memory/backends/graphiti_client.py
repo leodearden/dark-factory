@@ -36,6 +36,10 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from openai import AsyncOpenAI
 
+from fused_memory.backends.episode_toolcall_leak_scan import (
+    EpisodeToolcallLeakScan,
+    read_episode_toolcall_leaks,
+)
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_entity_edges import bind_entity_endpoints
@@ -1851,11 +1855,7 @@ class GraphitiBackend:
         ``group_id``, so a uuid belonging to another project's graph can
         neither be read nor redacted through this call.
 
-        NOT PROVIDED HERE: Graphiti-side DISCOVERY — enumerating which
-        episodes across a graph carry a leak. That needs a full episode scan
-        with no payload index to lean on, and is tracked as follow-up work.
-        This is the remediation primitive for an episode you have ALREADY
-        identified, by hand or from the Mem0 sweep's report.
+        Discovery of which episodes carry a leak is :meth:`scan_episode_toolcall_leaks`.
 
         Args:
             episode_uuid: UUID of the EpisodicNode to redact.
@@ -1916,6 +1916,29 @@ class GraphitiBackend:
             'old_content': old_content,
             'new_content': new_content,
         }
+
+    @_canonicalize_group_args
+    async def scan_episode_toolcall_leaks(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    ) -> EpisodeToolcallLeakScan:
+        """Find which of *group_id*'s episodes carry a leaked tool-call fragment.
+
+        Raises:
+            IncompleteEnumerationError: if the candidate read was structurally refused or capped.
+            TimeoutError: if a read outlasts its budget.
+        """
+        scan = await read_episode_toolcall_leaks(
+            self.graph_access.graph(group_id), group_id=group_id, page_size=page_size,
+        )
+        apply_incompleteness_policy(
+            scan.candidates,
+            method='scan_episode_toolcall_leaks',
+            group_id=group_id,
+            returned_count=len(scan.leaks),
+            noun='leaked episodes',
+            consequence='are not an incidence rate and must not drive a redaction sweep',
+        )
+        return scan
 
     @_canonicalize_group_args
     async def remove_edge(self, edge_uuid: str, *, group_id: str) -> None:

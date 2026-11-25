@@ -733,10 +733,69 @@ behind (unlike the Mem0 path, which must delete-then-re-add to re-embed). It
 refuses loudly on a blank replacement, on a replacement that itself still
 carries a leak, and on an absent uuid — a typo can never read as a success.
 
-Graphiti-side **discovery** (enumerating which episodes across a graph carry a
-leak) is deliberately not provided: it needs a full episode scan with no
-payload index to lean on. Tracked as follow-up work. `redact_episode_content`
-is the remediation primitive for an episode you have already identified.
+### Discovery: finding which episodes carry a leak (task 3233)
+
+`MemoryService.scan_episode_toolcall_leaks(project_id)` delegates to
+`GraphitiBackend.scan_episode_toolcall_leaks`, which runs
+`fused-memory/src/fused_memory/backends/episode_toolcall_leak_scan.py::read_episode_toolcall_leaks`
+and applies the shared `apply_incompleteness_policy` to it. The read works in
+four parts:
+
+- **A server-side prefilter that cannot miss a leak.** FalkorDB keeps only the
+  group's episodes whose `content` CONTAINS one of `PREFILTER_NEEDLES`, which
+  are bound as a list parameter. Every match of the shared detector begins
+  with one of those literal closing tags, and CONTAINS is an exact,
+  case-sensitive substring test. So the prefilter is a superset of the
+  detector's matches, and unlike the Qdrant `MatchText` caveat in §7, no index
+  can change that. The server still reads every episode; only the transfer is
+  narrowed, which is why there is no `--exhaustive` mode.
+- **The shared detector as the verdict.** Each candidate is re-checked with
+  `find_toolcall_xml_leak`, and only confirmed leaks come back.
+- **A paged, census-proven read.** Candidates are paged in `uuid` order
+  against a `count(*)` over the identical match. A short read is reported as
+  incomplete, not passed off as a clean group, and a structural refusal raises
+  `IncompleteEnumerationError`.
+- **A denominator.** A census of all the group's episodes comes back as
+  `episodes_in_group`, so the result is an incidence rate.
+
+The operator entry point is `fused-memory/scripts/sweep_episode_toolcall_xml_leak.py`.
+It classifies each leak with the shared `classify_leak_shape`, the same rule
+the Mem0 sweep uses.
+
+- A dry run is the default. It mutates nothing, opens the service for reads
+  only, and exits 0.
+- `--apply` first runs the store-mutation preflight. It then redacts each
+  `repairable_tail` and `repairable_duplicate` episode in place through
+  `redact_episode_content`, writing exactly the repaired body. It never
+  deletes, and it never touches `manual_review` episodes.
+- Under `--apply` the exit code is 1 when something is left for a human: any
+  `manual_review` episode, an incomplete scan, a failed redaction
+  (`record_error`), or content that changed between the scan and its
+  redaction (`content_changed_since_scan`). A `content_changed_since_scan`
+  record carries the text the redaction overwrote as `replaced_content`,
+  beside the scanned `content`. The write journal does not hold that text: it
+  stores only a truncated `new_content`. The printed `--apply` report is the
+  only full copy, so redirect it to a file before adjudicating.
+- Exit 2 means the run aborted. The partial report is printed first. An
+  interrupt (Ctrl-C) prints the partial report too, then propagates.
+
+**Measured 2026-11-25** with read-only queries against production graph
+`dark_factory`:
+
+- 14,456 episodes have `group_id = 'dark_factory'`. The prefilter returned 12
+  candidates in 13-19 ms.
+- Known positives `4d88a40f`, `72c293b3` and `1f588c77` are present. Each
+  content ends with a closing content tag, a newline and a bare closing
+  invoke tag, which is the `repairable_tail` shape.
+- `d12b0eb4` is no longer in the `dark_factory` graph: a uuid lookup returned
+  no row.
+
+**Scope.** The scan covers episodes whose `group_id` equals the graph's
+project. It does not cover cross-graph residue: episodes whose `group_id`
+names another project (76 in the `dark_factory` graph on that date).
+`redact_episode_content` matches on uuid *and* group_id, so it could not
+reach them, and the cross-graph migration owns them. An incidence rate from
+this scan describes the project's own episodes only.
 
 ---
 

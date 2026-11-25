@@ -20,6 +20,7 @@ import httpx
 from graphiti_core.nodes import EpisodeType
 from shared.streak import KeyedStreaks
 
+from fused_memory.backends.episode_toolcall_leak_scan import EpisodeToolcallLeakScan
 from fused_memory.backends.graphiti_client import (
     ActiveEdgesError,
     AmbiguousEntityError,
@@ -8611,6 +8612,11 @@ class MemoryService:
             exhaustive=exhaustive,
             limit=limit,
         )
+
+    async def scan_episode_toolcall_leaks(self, project_id: str) -> EpisodeToolcallLeakScan:
+        """The Graphiti counterpart of :meth:`scan_memory_content`: which of the
+        project's episodes carry a leaked tool-call fragment."""
+        return await self.graphiti.scan_episode_toolcall_leaks(group_id=project_id)
 
     async def get_memories_by_metadata(
         self,
