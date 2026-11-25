@@ -368,12 +368,16 @@ class _SemanticMatch:
 
 def _semantic_lookup(filing: Filing, store: task_store.TaskStore) -> _SemanticMatch:
     """Contract §8 step 2: the top plausible match, read back with get_task;
-    only a live task stops the filing."""
+    only a live task stops the filing. Raises StoreDegraded when the store
+    answered degraded (an outage); any other StoreUnreachable means step 2
+    was not performed, and its note goes on to the curator."""
     try:
         hits = store.search_tasks(filing.project_root, query=filing.query, score_threshold=SEMANTIC_SCORE_THRESHOLD)
         if not hits:
             return _SemanticMatch(None)
         record = store.get_task(filing.project_root, max(hits, key=lambda hit: hit.score).task_id)
+    except task_store.StoreDegraded:
+        raise
     except task_store.StoreUnreachable as exc:
         logger.warning("disposition: §8 step 2 could not run for %r: %s", filing.title, exc)
         return _SemanticMatch(None, f"§8 step 2 could not run: {exc}")
@@ -405,8 +409,14 @@ def _past_step_one(
     submit: Callable[..., Any] | None,
     note: str | None = None,
 ) -> Decision | None:
-    """Contract §8 steps 2 and 3."""
-    match = _semantic_lookup(filing, store)
+    """Contract §8 steps 2 and 3; a degraded step 2 holds the filing,
+    unrouted, so its entry is re-offered next run."""
+    try:
+        match = _semantic_lookup(filing, store)
+    except task_store.StoreDegraded as exc:
+        logger.warning("disposition: §8 step 2's store answered degraded, so %r is held unfiled: %s", filing.title, exc)
+        held = f"held, not filed: §8 step 2's store answered degraded, so the next run retries it: {exc}"
+        return Decision(filing, Step.SEMANTIC, note=_notes(note, held))
     if match.task_id is not None:
         return Decision(
             filing, Step.SEMANTIC, Standing.FILED, task_id=match.task_id, resolution=Resolution.EXISTING, note=note,
