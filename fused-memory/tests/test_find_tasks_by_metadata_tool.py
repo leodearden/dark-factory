@@ -63,6 +63,11 @@ class LookupStack:
             _TOOL, {'project_root': self.root, **args},
         )
 
+    async def get_task(self, task_id: int) -> dict[str, Any]:
+        return await self.server._tool_manager.call_tool(
+            'get_task', {'id': str(task_id), 'project_root': self.root},
+        )
+
     def corrupt(self, task_id: int, raw: str) -> None:
         with contextlib.closing(sqlite3.connect(tasks_db(self.root))) as conn, conn:
             conn.execute('UPDATE tasks SET metadata = ? WHERE id = ?', (raw, task_id))
@@ -567,9 +572,7 @@ async def test_a_lone_over_budget_row_is_elided_and_readable_through_get_task(lo
 
     first = await lookup_stack.call(key='x_blob', include_value=True)
     second = await lookup_stack.call(key='x_blob', include_value=True, offset=1)
-    task = await lookup_stack.server._tool_manager.call_tool(
-        'get_task', {'id': str(big_id), 'project_root': lookup_stack.root},
-    )
+    task = await lookup_stack.get_task(big_id)
 
     assert 'error' not in first
     assert [row['task_id'] for row in first['results']] == [big_id]
@@ -598,12 +601,6 @@ async def test_an_over_budget_row_after_a_fitting_one_starts_the_next_page(looku
     assert [row['task_id'] for row in second['results']] == [big_id]
     assert second['results'][0]['truncated_value'] is True
     assert second['pagination']['has_more'] is False
-
-
-async def _mcp_get_task(lookup_stack, task_id: int) -> dict[str, Any]:
-    return await lookup_stack.server._tool_manager.call_tool(
-        'get_task', {'id': str(task_id), 'project_root': lookup_stack.root},
-    )
 
 
 @pytest.mark.asyncio
@@ -636,7 +633,7 @@ async def test_a_lone_over_budget_row_has_its_metadata_elided(lookup_stack):
 
     first = await lookup_stack.call(key='x_blob', value='v', include_rows=True)
     second = await lookup_stack.call(key='x_blob', value='v', include_rows=True, offset=1)
-    task = await _mcp_get_task(lookup_stack, big_id)
+    task = await lookup_stack.get_task(big_id)
 
     assert 'error' not in first
     assert _ids(first) == [big_id]
@@ -657,7 +654,7 @@ async def test_a_lone_over_budget_row_elides_every_opted_in_payload(lookup_stack
     task_id = await lookup_stack.seed('pending', {'x_pad': pad})
 
     response = await lookup_stack.call(key='x_pad', include_value=True, include_rows=True)
-    task = await _mcp_get_task(lookup_stack, task_id)
+    task = await lookup_stack.get_task(task_id)
 
     row = response['results'][0]
     assert row['matched_value'] == {'_elided': True, 'bytes': _serialized_bytes(pad)}
