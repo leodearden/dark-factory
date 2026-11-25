@@ -37,6 +37,7 @@ from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
@@ -3341,6 +3342,63 @@ class TestRunIdValidation(BaseStageValidationTest):
             )
         assert 'payload' in captured_kwargs
         assert f'run_id: {run_id_value}' in captured_kwargs['payload']
+
+
+class TestStageInvocationLedger(BaseStageValidationTest):
+    """Each stage hands its run's ledger keys to its CLI call and reports its tokens (task 10414)."""
+
+    _STAGES = [
+        pytest.param(MemoryConsolidator, StageId.memory_consolidator, id='stage1'),
+        pytest.param(TaskKnowledgeSync, StageId.task_knowledge_sync, id='stage2'),
+        pytest.param(IntegrityCheck, StageId.integrity_check, id='stage3'),
+    ]
+
+    async def _run_capturing(self, stage) -> tuple[dict, StageReport]:
+        captured: dict = {}
+
+        async def capture_run_stage_via_cli(**kwargs):
+            captured.update(kwargs)
+            return StageResult(
+                success=True,
+                report={'summary': 'ok'},
+                tokens_used=1500,
+                cache_read_tokens=50000,
+                cache_create_tokens=4000,
+            )
+
+        with self._patch_stage(stage, cli_side_effect=capture_run_stage_via_cli):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id=stage.project_id),
+                prior_reports=[],
+                run_id='run-l',
+            )
+        return captured, report
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('stage_cls', 'stage_id'), _STAGES)
+    async def test_stage_passes_its_ledger_and_reports_its_tokens(
+        self, mock_deps, stage_cls, stage_id,
+    ):
+        store = MagicMock(name='cost_store')
+        stage = stage_cls(stage_id, **mock_deps, cost_store=store)
+
+        captured, report = await self._run_capturing(stage)
+
+        assert captured['ledger'] == InvocationLedger(
+            store, LedgerRole.for_stage(stage_id), 'run-l', stage.project_id,
+        )
+        assert report.tokens_used == 1500
+        assert report.cache_read_tokens == 50000
+        assert report.cache_create_tokens == 4000
+
+    @pytest.mark.asyncio
+    async def test_stage_without_store_passes_a_storeless_ledger(self, mock_deps):
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+
+        captured, _report = await self._run_capturing(stage)
+
+        assert captured['ledger'].cost_store is None
 
 
 class TestStage2GuardrailProjectIdGating:

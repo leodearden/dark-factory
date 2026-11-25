@@ -35,6 +35,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.memory_metadata import RECONCILIATION_COMPLETION_ECHO_MARKER
+from fused_memory.models.invocation_ledger import LedgerRole
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     EventSource,
@@ -4739,6 +4740,50 @@ async def test_make_stages_returns_clean_instances(journal, event_buffer, mock_m
     assert stage1.cycle_fence_time is None
     assert stage1.assembled_payload is None
     assert stage2.remediation_mode is False
+
+
+@pytest.mark.asyncio
+async def test_make_stages_hands_the_cost_store_to_every_stage(
+    journal, event_buffer, mock_memory_service,
+):
+    """Every stage's CLI call carries the harness's invocations ledger store (task 10414)."""
+    from fused_memory.models.reconciliation import Watermark
+    from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+    store = MagicMock(name='cost_store')
+    harness = make_harness(
+        journal=journal,
+        event_buffer=event_buffer,
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        cost_store=store,
+    )
+    ledgers = []
+
+    async def capture_run_stage_via_cli(**kwargs):
+        ledgers.append(kwargs['ledger'])
+        return StageResult(success=True, report={'summary': 'ok'})
+
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    for stage in stages:
+        with (
+            patch.object(stage, 'assemble_payload', AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                side_effect=capture_run_stage_via_cli,
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test-project'),
+                prior_reports=[],
+                run_id='run-h',
+            )
+
+    assert [ledger.cost_store for ledger in ledgers] == [store] * len(stages)
+    assert [ledger.role for ledger in ledgers] == [
+        LedgerRole.for_stage(stage.stage_id) for stage in stages
+    ]
 
 
 @pytest.mark.asyncio
