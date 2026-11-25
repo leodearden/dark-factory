@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from _task_db_scan import UNREADABLE_STORE_ERRORS
 from clear_leaked_claimants import (
+    REPAIRABLE_TIERS,
     REREAD_FAILED_DETAIL,
     STILL_VIOLATING_DETAIL,
     UNVERIFIED_DETAIL,
@@ -40,6 +41,7 @@ from clear_leaked_claimants import (
     take_census,
 )
 from cli_subprocess_timeout import cli_timeout_from_env
+from shared.project_layout import scheduler_state_json
 
 NOW = datetime(2026, 10, 11, 12, tzinfo=UTC)
 STALE = NOW - timedelta(hours=2)
@@ -665,7 +667,7 @@ class TestUnreadableStoreMidBatch:
 
 
 def _write_scheduler_state(root: str, text: str) -> None:
-    state = Path(root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+    state = scheduler_state_json(root)
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(text)
 
@@ -745,7 +747,7 @@ class TestHolderPreflight:
 
     @pytest.mark.parametrize(
         'snapshot', ['', '{not json', '[]', '{"current_holders": ["4028"]}'],
-        ids=['torn', 'invalid-json', 'non-object', 'malformed-shape'],
+        ids=['empty', 'invalid-json', 'non-object', 'malformed-shape'],
     )
     def test_an_unreadable_snapshot_refuses_the_whole_project(self, seed_root, snapshot):
         root = seed_root(TIER_TABLE_ROWS)
@@ -768,7 +770,7 @@ class TestHolderPreflight:
 
     def test_a_snapshot_path_that_cannot_be_read_refuses(self, seed_root):
         root = seed_root(TIER_TABLE_ROWS)
-        (Path(root) / 'data' / 'orchestrator' / 'scheduler_state.json').mkdir(parents=True)
+        scheduler_state_json(root).mkdir(parents=True)
         server = _FakeClaimantServer()
 
         report = _apply(take_census(root, NOW), server)
@@ -787,6 +789,16 @@ class TestHolderPreflight:
 
         assert report.refused is False
         assert report.refusal is None
+        assert server.calls == []
+
+    def test_an_unreadable_snapshot_refuses_a_hygiene_only_selection(self, seed_root):
+        root = seed_root([STALE_PENDING])
+        _write_scheduler_state(root, '{not json')
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server, tiers=REPAIRABLE_TIERS)
+
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
         assert server.calls == []
 
 
