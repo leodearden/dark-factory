@@ -375,7 +375,10 @@ def _carries_plugin(cmd: str) -> bool:
 @pytest.mark.xdist_group('defect_plugin_real_pytest')
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestVerifyLegInjectionEndToEnd:
-    @pytest.mark.parametrize('test_command', ['pytest', 'pytest -n 2'])
+    @pytest.mark.parametrize('test_command', [
+        pytest.param('pytest', id='serial'),
+        pytest.param('pytest -n 2', id='xdist'),
+    ])
     def test_shadow_mode_injects_and_the_map_lands_where_verify_looks(
         self, tmp_path, monkeypatch, test_command,
     ):
