@@ -118,15 +118,15 @@ def test_every_call_names_the_policy_root_and_only_the_closed_tools(tmp_path: Pa
 
 
 def test_the_closed_set_is_its_reads_and_its_writes() -> None:
-    assert READ_TOOLS == {'lookup_defect_ref', 'find_tasks_by_metadata', 'get_task'}
-    assert WRITE_TOOLS == {
+    assert {'lookup_defect_ref', 'find_tasks_by_metadata', 'get_task'} == READ_TOOLS
+    assert {
         'submit_task',
         'add_dependency',
         'commit_planning',
         'declare_defect',
         'record_defect_outcome',
         'set_task_status',
-    }
+    } == WRITE_TOOLS
     assert CLOSED_TOOLS == READ_TOOLS | WRITE_TOOLS
 
 
@@ -329,14 +329,14 @@ def test_withheld_writes_forward_reads_and_answer_writes_themselves(tmp_path: Pa
 
 
 def _policy(tmp_path: Path, url: str) -> Policy:
-    return Policy(
-        project_id='acme-widgets',
-        project_root=tmp_path / 'root',
-        out_dir=tmp_path / 'out',
-        in_dir=tmp_path / 'in',
-        visible_globs=('src/**',),
-        filer=FilerPolicy(fused_memory_url=HttpUrl(url), state_dir=tmp_path / 'state'),
-    )
+    return Policy.model_validate({
+        'project_id': 'acme-widgets',
+        'project_root': tmp_path / 'root',
+        'out_dir': tmp_path / 'out',
+        'in_dir': tmp_path / 'in',
+        'visible_globs': ['src/**'],
+        'filer': FilerPolicy(fused_memory_url=HttpUrl(url), state_dir=tmp_path / 'state'),
+    })
 
 
 @pytest.mark.parametrize('variable', ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'])
