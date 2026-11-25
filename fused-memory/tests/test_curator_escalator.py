@@ -1830,5 +1830,8 @@ class TestEscalationPackageIsRequired:
             monkeypatch.setitem(sys.modules, name, None)
         monkeypatch.delitem(sys.modules, curator_escalator.__name__)
 
-        with pytest.raises(ImportError):
+        with pytest.raises(ImportError) as exc_info:
             importlib.import_module(curator_escalator.__name__)
+
+        assert exc_info.value.name is not None
+        assert exc_info.value.name.split('.')[0] == 'escalation'
