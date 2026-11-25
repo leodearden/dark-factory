@@ -76,6 +76,7 @@ from run_vllm_eval import (  # type: ignore[import-not-found]  # noqa: E402
     wait_for_vllm,
 )
 
+from orchestrator.evals.runner import WORKFLOW_CELL_TIMEOUT_MINUTES  # noqa: E402
 from orchestrator.evals.snapshots import eval_worktree_root  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -123,7 +124,7 @@ def _make_args(**overrides) -> argparse.Namespace:
         gpu_type=None,
         concurrency=5,
         verify_baseline_clean="strict",
-        task_timeout_min=70,
+        task_timeout_min=None,
         orch_timeout_min=None,
         stop_on_first_failure=False,
         pod_id=None,
@@ -742,6 +743,91 @@ class TestPodLifecycle:
         assert rc == 0
         assert eval_calls["n"] == 1
         assert fake_client.terminate_calls == ["pod-fake-1"]
+
+
+class TestOuterTimeoutPairing:
+    """The launcher's kill deadline outlasts the ceiling the cell runs under,
+    so the orchestrator hits its own ceiling first and writes a result file.
+    """
+
+    def _run_launcher(
+        self, monkeypatch, tmp_path, *, extra_argv: list[str], fixture_extra: dict
+    ) -> tuple[int, dict[str, Any]]:
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+        fake_tasks = tmp_path / "tasks"
+        fake_tasks.mkdir()
+        (fake_tasks / "df_task_12.json").write_text(
+            json.dumps({"id": "df_task_12", "pre_task_commit": "deadbeef", **fixture_extra})
+        )
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        _patch_pod_infra(monkeypatch)
+        monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
+
+        recorded: dict[str, Any] = {}
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd[:4] == ["uv", "run", "orchestrator", "eval"]:
+                recorded["cmd"] = cmd
+                recorded["timeout"] = kwargs["timeout"]
+                results.mkdir(parents=True, exist_ok=True)
+                config_name = cmd[cmd.index("--config-name") + 1]
+                _write_result(results, "df_task_12", config_name, "r00000001")
+                return SimpleNamespace(returncode=0)
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--task",
+                "df_task_12",
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "1",
+                *extra_argv,
+            ]
+        )
+        return rc, recorded
+
+    @pytest.mark.parametrize(
+        ("extra_argv", "fixture_extra", "inner_minutes"),
+        [
+            ([], {}, WORKFLOW_CELL_TIMEOUT_MINUTES),
+            (["--orch-timeout-min", "360"], {}, 360),
+            ([], {"timeout_minutes": 240}, 240),
+        ],
+        ids=["workflow-default", "orch-timeout-flag", "fixture-ceiling"],
+    )
+    def test_the_default_kill_deadline_outlasts_the_cells_own_ceiling(
+        self, monkeypatch, tmp_path, extra_argv, fixture_extra, inner_minutes
+    ):
+        rc, recorded = self._run_launcher(
+            monkeypatch, tmp_path, extra_argv=extra_argv, fixture_extra=fixture_extra
+        )
+
+        assert rc == 0
+        assert recorded["timeout"] > inner_minutes * 60
+        if extra_argv:
+            timeout_at = recorded["cmd"].index("--timeout")
+            assert recorded["cmd"][timeout_at + 1] == "360"
+        else:
+            assert "--timeout" not in recorded["cmd"]
+
+    def test_an_explicit_kill_deadline_is_honoured(self, monkeypatch, tmp_path):
+        rc, recorded = self._run_launcher(
+            monkeypatch, tmp_path, extra_argv=["--task-timeout-min", "90"], fixture_extra={}
+        )
+
+        assert rc == 0
+        assert recorded["timeout"] == 90 * 60
 
 
 # ---------------------------------------------------------------------------
