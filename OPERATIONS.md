@@ -799,6 +799,95 @@ exists, which bounces the server behind every orchestrator, the dashboard and
 MCP sessions. A clean stop exits 0. A refusal exits 1, and systemd
 retries it with a 5s→60s backoff until the cause is fixed.
 
+#### The defect filer
+
+One `client-feed file-defects --config <policy>` per client project, run as
+`client-feed-filer@<name>.service`. It reads the project's `in/inbox.jsonl`
+and files each portal `defect_reported` line in that project, through
+fused-memory, as a fix task plus the human gate it waits on
+(`plans/client-feed-prd.md` §14). What it may open, connect to and write is
+its isolation invariant, §14.5. `scripts/setup-host.sh` renders the unit from
+`scripts/client-feed-filer.service.template` beside the publisher's, and never
+enables it.
+
+It reads the same policy file as the publisher. That file must carry a
+`filer:` block, whose schema and defaults live in
+`client-feed/src/client_feed/policy.py::FilerPolicy`:
+
+- `state_dir` is required and has no default. Use
+  `~/.local/state/client-feed/<name>/filer/`, owned by Leo. It must lie
+  outside `out_dir`, `in_dir` and `project_root`. That rule is checked again at
+  start with every symlink resolved, before the directory is made (mode 0700)
+  and after. The directory holds only `filer.lock` and `cursor.json`. The
+  cursor is an optimisation: every report is re-derived from the task store,
+  so a deleted cursor re-reads the inbox from its start and files nothing
+  twice.
+- `auto_dispatch` stays `false` until gate σ5 flips it. While it is false,
+  every fix waits on a gate.
+
+The filer runs no git, so unlike the publisher it does not check the
+`project_root` git work tree or `out_dir`. It refuses a policy without a
+`filer:` block, and a `state_dir` that reaches one of the three directories.
+Each refusal exits 1.
+
+One filer holds a state dir at a time, through an exclusive lock on
+`filer.lock`. A second filer on the same policy, the unit or a hand run,
+exits 3 (`client-feed/src/client_feed/cli.py::EXIT_LOCK_HELD`) before it makes
+any request. To run one by hand, stop the instance first.
+
+- `--once` runs one pass and prints its report as JSON. It exits 0 even when
+  a report could not be filed. Such a report is named under `unconverged`, by
+  the refusing tool and its code, and is retried on the next pass. An
+  unreachable fused-memory exits 1. The loop instead counts it as a
+  transient pass and backs off.
+- `--check` is σ4's install check. It takes the lock and handshakes with
+  `fused_memory_url`. It names any tool of the closed set
+  (`client-feed/src/client_feed/filer_tools.py::CLOSED_TOOLS`) the server does
+  not list. It looks up `portal:<project_id>:check:1`, a ref the portal never
+  mints. Then it prints the calls one pass would make over the inbox: reads
+  performed, writes withheld. It writes nothing but the lock file, and stores
+  no cursor. It exits 0 only when every tool is listed and nothing refused.
+
+Before enabling the filer for a live client, Leo confirms σ4's six checks
+(`plans/client-feed-prd.md` §14.8, row σ4):
+
+1. The portal runs as its dedicated account.
+2. P2's check passes on this host.
+3. A probe from the portal account to the fused-memory URL, and to every
+   escalation port named in the registered projects'
+   `dark-factory-orchestrator.yaml`, is refused.
+4. The client project's orchestrator is running and its L2 queue is watched.
+5. Its feed declares criteria.
+6. `client-feed file-defects --config <policy> --check` passes.
+
+Then, from inside the main checkout, as for the publisher:
+
+```bash
+# render client-feed-filer@.service with the arguments setup-host.sh §7a passes; enables nothing.
+# Writes nothing if uv is not on PATH (an empty --uv-path renders an ExecStart systemd rejects):
+command -v uv >/dev/null || { echo 'uv is not on PATH' >&2; false; } \
+  && repo="$(git rev-parse --show-toplevel)" \
+  && python3 "$repo/scripts/render_systemd_unit.py" --unit client-feed-filer \
+       --template "$repo/scripts/client-feed-filer.service.template" \
+       --repo-root "$repo" --uv-path "$(command -v uv)" \
+       --output ~/.config/systemd/user/client-feed-filer@.service \
+  && systemctl --user daemon-reload
+# check the install; it prints its report as JSON and exits 1 on any problem:
+uv run --no-sync --project client-feed client-feed file-defects --config ~/.config/client-feed/<name>.yaml --check
+systemctl --user enable --now client-feed-filer@<name>.service
+journalctl --user -u client-feed-filer@<name>.service
+```
+
+A report Leo rules on in the portal arrives as a `defect_ruled` line
+(decision 14). The filer then acts on its own fix and gate only. While the fix
+is pending, its defect is withdrawn as not a defect, Leo's acceptance is
+recorded, and the fix is cancelled. A fix already started is withdrawn but not
+cancelled, and a done fix is left untouched. The gate is cancelled after the
+fix's step, because cancelling a gate first would release the fix.
+
+A report the filer has not filed in time shows as the `filer` source under
+"Reading the heartbeat's degraded list" below.
+
 #### Reading the heartbeat's degraded list
 
 ```bash

@@ -2,8 +2,11 @@
 
 Authority over a defect's proof and ruling is by tool exposure
 (``plans/defect-tests-prd.md`` decision 7): fused-memory has no authenticated
-caller identity, so the orchestrator workflow and ``scripts/prove_defect.py``
-are meant to be its only callers, and no role's ``allowed_tools`` may grant it.
+caller identity, so its only callers are meant to be three non-dispatched
+writers: the orchestrator workflow, ``scripts/prove_defect.py``, and the client
+defect filer ``client-feed file-defects`` (``client-feed/src/client_feed/filer.py``),
+which records Leo's acceptance when a portal ruling withdraws a client defect.
+No role's ``allowed_tools`` may grant it.
 A grant can be the tool's own name, the whole ``mcp__fused-memory`` server, or
 a glob that matches it; the planted cases below show the predicate catches each
 form, so the guard over ``ROLES`` is not vacuous.
@@ -68,7 +71,8 @@ def test_no_role_grants_record_defect_outcome() -> None:
         if _grants(entry, RECORD_DEFECT_OUTCOME)
     ]
     assert not grants, (
-        f'{RECORD_DEFECT_OUTCOME} is reserved for the orchestrator workflow and '
-        f'scripts/prove_defect.py, but these (role, allowed_tools entry) pairs grant it: '
+        f'{RECORD_DEFECT_OUTCOME} is reserved for the orchestrator workflow, '
+        f'scripts/prove_defect.py and client-feed file-defects (client-feed/src/client_feed/filer.py), '
+        f'but these (role, allowed_tools entry) pairs grant it: '
         f'{grants}'
     )
