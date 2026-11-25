@@ -444,7 +444,7 @@ def _file_then_rule(world: World) -> FilerCursor:
     return cursor
 
 
-def _writes_since(world: World, sent_before: int) -> list[tuple[str, str, str | None]]:
+def _writes_since(world: World, sent_before: int) -> list[tuple[str, Any, Any]]:
     """Each write after the first `sent_before` calls: its tool, the task it names, and the status it sets."""
     return [
         (name, arguments.get('task_id', arguments.get('id')), arguments.get('status'))

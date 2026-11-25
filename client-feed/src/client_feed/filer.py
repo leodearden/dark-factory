@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+from shared.defects import DefectStatus
 
 from client_feed.contract import DefectReported, DefectRuled, TaskStatus
 from client_feed.defect_ref import portal_ref
@@ -20,7 +21,10 @@ from client_feed.filer_tasks import (
     facts_of,
     fix_submission,
     gate_submission,
+    is_filer_withdrawal,
+    operator_acceptance_event,
     requires_gate,
+    withdrawal_event,
 )
 from client_feed.filer_tools import (
     FILER_IDENTITY,
@@ -42,6 +46,9 @@ FALLBACK_AFTER_ATTEMPTS: Final = 5
 MAX_BACKOFF_SECONDS: Final = 300
 
 _DEFERRED: Final = TaskStatus.DEFERRED
+_TERMINAL: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED})
+_CANCELLABLE_FIX: Final = frozenset({TaskStatus.PENDING, TaskStatus.DEFERRED})
+_UNWITHDRAWN: Final = frozenset({DefectStatus.OPEN, DefectStatus.PROVEN})
 
 
 class Unconverged(BaseModel):
@@ -272,6 +279,48 @@ def _unconverged(ref: str, refused: ToolRefused, record: RefRecord | None) -> Un
     )
 
 
+def _pending_on_filer_withdrawal(fix: TaskView, ref: str) -> bool:
+    return any(entry.get('ref') == ref and is_filer_withdrawal(entry) for entry in fix.defects)
+
+
+def _withdraw(tools: ClosedTools, ref: str, fix: TaskView, defect_status: DefectStatus) -> bool:
+    """Withdraw the fix's defect as not a defect and record Leo's acceptance; False once the store says the fix went terminal."""
+    withdraws = defect_status in _UNWITHDRAWN
+    accepts = withdraws or (defect_status is DefectStatus.PENDING and _pending_on_filer_withdrawal(fix, ref))
+    try:
+        if withdraws:
+            tools.declare_withdrawal(fix.task_id, withdrawal_event(ref))
+        if accepts:
+            tools.record_acceptance(fix.task_id, ref, operator_acceptance_event(ref))
+    except ToolRefused as refused:
+        if refused.disposition is not Disposition.ALREADY_DONE:
+            raise
+        return False
+    return True
+
+
+def _withdraw_and_cancel_fix(tools: ClosedTools, ref: str) -> None:
+    """The filer's fix of a ruled ref: its defect withdrawn while the fix is live, and the fix cancelled unless started."""
+    carriers = {carrier.task_id: carrier for carrier in tools.lookup_defect_ref(ref)}
+    fix = _lowest(_filer_tasks(tools, tuple(carriers)), 'fix', ref)
+    if fix is None or fix.status in _TERMINAL:
+        return
+    if _withdraw(tools, ref, fix, carriers[fix.task_id].defect_status) and fix.status in _CANCELLABLE_FIX:
+        tools.cancel(fix.task_id)
+
+
+def converge_ruling(tools: ClosedTools, ref: str, record: RefRecord | None) -> _Outcome:
+    """Carry Leo's portal ruling to the filer's own fix and gate: withdraw and cancel the fix first, since a cancelled gate releases it."""
+    try:
+        _withdraw_and_cancel_fix(tools, ref)
+        for gate in _filer_tasks(tools, tools.find_gates(ref)):
+            if gate.status not in _TERMINAL:
+                tools.cancel(gate.task_id)
+    except ToolRefused as refused:
+        return _Outcome(refused=_unconverged(ref, refused, record), record=record)
+    return _Outcome()
+
+
 def _filer(policy: Policy) -> FilerPolicy:
     if policy.filer is None:
         raise ValueError(f'the policy of {policy.project_id} has no filer block')
@@ -305,10 +354,11 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
         return unusable, cursor
     outcomes: dict[str, _Outcome] = {}
     for ref, state in _ref_states(read, policy.project_id).items():
+        record = cursor.refs.get(ref)
         if state.ruled or state.report is None:
-            outcomes[ref] = _Outcome()
-            continue
-        outcomes[ref] = converge_filing(tools, state.report, ref, policy, cursor.refs.get(ref))
+            outcomes[ref] = converge_ruling(tools, ref, record)
+        else:
+            outcomes[ref] = converge_filing(tools, state.report, ref, policy, record)
     unconverged = tuple(outcome.refused for outcome in outcomes.values() if outcome.refused is not None)
     offset_to = offset_from if unconverged else read.offset
     report = PassReport(
