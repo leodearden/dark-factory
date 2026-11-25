@@ -528,9 +528,11 @@ requirement for a working install — skip this section unless you need it.
   remote checkout has checked out, and git refuses to accept a push to a
   checked-out branch by default. The `RemoteRunner(main_branch=...)`
   argument is always populated from `git.main_branch` in production —
-  `verify_hosts.py::_remote_runner` is the sole production site that
+  `verify_hosts.py::remote_runner_for` is the sole production site that
   constructs a `RemoteRunner` (merge verifies reach it through
-  `build_remote_runners`, task verifies through `remote_runner_factory`), and
+  `build_remote_runners`, task verifies through `remote_runner_factory`, and
+  `orchestrator verify-host-preflight` through
+  `verify_host_preflight.py::production_runner_builder`), and
   it always passes `main_branch=config.git.main_branch` — so this push, and therefore the
   `updateInstead` requirement, is not optional. `RemoteRunner`'s
   `if self._main_branch:` skip exists only for direct construction with
