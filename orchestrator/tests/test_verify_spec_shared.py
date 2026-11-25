@@ -71,7 +71,10 @@ class TestVerifyCommand:
 
     def test_an_unknown_flag_is_rejected_naming_prefix_field_and_value(self):
         with pytest.raises(ValueError, match=r"'m'.*verify_cache.*'sometimes'"):
-            VerifyCommand(prefix='m', verify_cache='sometimes')  # type: ignore[arg-type]
+            VerifyCommand.from_dict({
+                'prefix': 'm', 'test_command': None, 'lint_command': None,
+                'type_check_command': None, 'verify_cache': 'sometimes',
+            })
 
 
 class TestGlobalVerifyCommandFor:
