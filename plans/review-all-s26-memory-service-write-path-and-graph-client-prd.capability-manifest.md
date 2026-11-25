@@ -202,6 +202,7 @@ loading the twin with `shared.capability_manifest.CapabilityManifestDoc`: all 62
 | The policy left the service | producer (ρ): `^(async )?def _apply_memory_metadata_validation\b` absent from `memory_service.py` | PASS (ρ delivers) |
 | The codec has its own module | producer (ρ): `fm/services/store_records.py::metadata_row_text` (with the record decoders and store-error helpers); it imports `mem0_payload_text` from `fm/utils/mem0_content_keys.py`, the content keys' one home since task 4857, and restates no content-key tuple | PASS (ρ delivers) |
 | The codec readers left the service | producer (ρ): `memory_service import .*\bmetadata_row_text\b` absent from `fm/server/tools.py` and `fm/reconciliation/preservation_specimen_guard.py` | PASS (ρ delivers) |
+| The codec left the service | producer (ρ): `^def metadata_row_text\(` absent from `memory_service.py`, so an import of it from there fails even when the readers' line-level grep cannot see it (a parenthesized multi-line import) | PASS (ρ delivers) |
 
 ## τ — Extract GraphMutations over a shared journaled-operations module (S26-2)
 

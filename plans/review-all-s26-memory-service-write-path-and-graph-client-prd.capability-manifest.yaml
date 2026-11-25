@@ -660,6 +660,14 @@ tasks:
           pattern: "memory_service import .*\\bmetadata_row_text\\b"
           paths: ["fused-memory/src/fused_memory/server/tools.py", "fused-memory/src/fused_memory/reconciliation/preservation_specimen_guard.py"]
           expect: absent
+      - name: "codec-left-the-service"
+        binding: "anti-inversion — metadata_row_text is no longer defined in memory_service.py, so an import of it from there fails even where codec-readers-left-the-service's line-level grep cannot see it (a parenthesized multi-line import)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def metadata_row_text\\("
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
   - label: "τ"
     task_id: 9245
     title: "Extract GraphMutations over a shared journaled-operations module"
