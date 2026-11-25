@@ -81,11 +81,11 @@ from _verify_boundary_harness import (
     spawn_verify_merge,
     stderr_tail,
     sweep_tagged,
-    tagged_pids,
     verify_merge_argv,
     wait_for_marker,
     wait_for_marker_stable,
     wait_for_pgid_file,
+    wait_pid_tagged,
     wait_pids_exited,
     wait_subtree_live,
     worktree_base_for,
@@ -182,7 +182,7 @@ def _swept_test_functions() -> Iterator[tuple[str, ast.FunctionDef | ast.AsyncFu
 #: :func:`row_discovery_ceiling_secs`, i.e. can spend up to
 #: ROW_DISCOVERY_CEILING_MAX_SECS each.
 _SCALED_DISCOVERY_HELPERS: frozenset[str] = frozenset(
-    {'wait_for_pgid_file', 'wait_subtree_live'}
+    {'wait_for_pgid_file', 'wait_pid_tagged', 'wait_subtree_live'}
 )
 
 #: The seams that TOGETHER mean "this call never touches real /proc" -- see
@@ -939,10 +939,11 @@ def test_spawned_verify_merge_build_carries_the_holder_tag(tmp_path):
             f'(verify.py::_run_cmd start_new_session), or this test is not '
             f'exercising the escape the sweep exists for'
         )
-        assert build_pid in tagged_pids(holder.tag), (
+        assert wait_pid_tagged(build_pid, holder.tag, timeout=row_discovery_ceiling_secs()), (
             f'the build pid={build_pid} spawned by holder pid={holder.pid} '
-            f'does not carry {HOLDER_TAG_ENV}={holder.tag} -- the target-env '
-            f'scrub dropped it, so kill_holder_tree cannot sweep an orphaned build'
+            f'never carried {HOLDER_TAG_ENV}={holder.tag} within the discovery '
+            f'ceiling -- the target-env scrub dropped it, so kill_holder_tree '
+            f'cannot sweep an orphaned build'
         )
     finally:
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
