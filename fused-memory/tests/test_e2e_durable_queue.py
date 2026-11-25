@@ -731,29 +731,32 @@ async def test_durable_queue_wired_with_terminal_hook(integrated_service):
 # ---------------------------------------------------------------------------
 
 
-@pytest_asyncio.fixture
-async def journaled_service(mock_config, tmp_path):
-    """integrated_service + a real WriteJournal, wired in PRODUCTION order.
+@contextlib.asynccontextmanager
+async def _service_journaled_by(mock_config, journal: WriteJournal):
+    """integrated_service + *journal*, wired in PRODUCTION order.
 
     server/main.py calls initialize() before set_write_journal(), so the queue
     (and its on_terminal hook) is built while the journal is still None.
     """
-    from fused_memory.services.write_journal import WriteJournal
-
     # Same mocked-backend definition as integrated_service — deliberately not a
     # second copy of it.
     svc = mock_memory_backends(MemoryService(mock_config))
-
     await svc.initialize()
-
-    journal = WriteJournal(tmp_path / 'wj_e2e')
     await journal.initialize()
     svc.set_write_journal(journal)
+    try:
+        yield svc
+    finally:
+        await svc.close()
+        await journal.close()
 
-    yield svc, journal
 
-    await svc.close()
-    await journal.close()
+@pytest_asyncio.fixture
+async def journaled_service(mock_config, tmp_path):
+    """integrated_service + a real WriteJournal, wired in production order."""
+    journal = WriteJournal(tmp_path / 'wj_e2e')
+    async with _service_journaled_by(mock_config, journal) as svc:
+        yield svc, journal
 
 
 async def _sole_queue_write_op_id(svc) -> str:
@@ -979,7 +982,7 @@ class TestTerminalOutcomeWrittenBack:
 # The queue's attempt budget bounds a write until it LANDS (task 11800).
 # A journal write slower than the budget AFTER the backend call returned used
 # to cancel the attempt, journal a false backend failure and replay the
-# landed write.
+# landed write. Before landing, the budget still cuts the attempt.
 # ---------------------------------------------------------------------------
 
 _ATTEMPT_BUDGET_SECONDS = 0.2
@@ -1018,20 +1021,6 @@ class _SuccessRowBlockingJournal(WriteJournal):
             self.success_row_entered.set()
             await self._never_set.wait()
         await super().log_backend_op(**kwargs)
-
-
-@contextlib.asynccontextmanager
-async def _service_journaled_by(mock_config, journal: WriteJournal):
-    """journaled_service's build, in its production order, around *journal*."""
-    svc = mock_memory_backends(MemoryService(mock_config))
-    await svc.initialize()
-    await journal.initialize()
-    svc.set_write_journal(journal)
-    try:
-        yield svc
-    finally:
-        await svc.close()
-        await journal.close()
 
 
 @pytest_asyncio.fixture
@@ -1116,6 +1105,79 @@ class TestLandedWriteOutlivesAttemptBudget:
         assert svc.mem0.add.await_count == 1
 
     @pytest.mark.asyncio
+    async def test_slow_journal_write_after_mem0_add_landing_does_not_replay_the_write(
+        self, budget_stalled_service
+    ):
+        """add_memory writes Mem0 synchronously, so a mem0_add row reaches the
+        queue only as a backward-compat row: it is enqueued directly."""
+        svc, journal = budget_stalled_service
+        journal.stall_backend = 'mem0'
+
+        await svc.durable_queue.enqueue(queued('mem0_add', {
+            'content': 'Always format code with black',
+            'project_id': 'test',
+            '_write_op_id': 'mem0-add-op',
+            'metadata': {'category': 'preferences_and_norms'},
+        }))
+
+        async def _completed():
+            row = await journal.get_write_op('mem0-add-op')
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(
+            _completed, timeout=20.0, message='mem0_add never stamped completed'
+        )
+        assert journal.stall_backend is None, 'the mem0 success row never stalled'
+        stats = await svc.durable_queue.get_stats()
+        assert stats['counts'] == {'completed': 1}
+        backend_ops = await journal.get_backend_ops_for_write_op('mem0-add-op')
+        assert [(op['backend'], op['success']) for op in backend_ops] == [('mem0', 1)]
+        assert svc.mem0.add.await_count == 1
+
+
+@pytest.mark.timing(
+    reason='the queue attempt budget is the behaviour under test: it must still cut '
+    'a backend call that has not returned',
+)
+class TestAttemptBudgetCutsAnUnlandedWrite:
+    @pytest.mark.asyncio
+    async def test_graphiti_call_outliving_the_budget_is_cut_and_retried(
+        self, budget_stalled_service
+    ):
+        svc, journal = budget_stalled_service
+        journal.stall_backend = None
+        first_call = True
+
+        async def _first_call_outlives_the_budget(*_args, **_kwargs):
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                await asyncio.sleep(3 * _ATTEMPT_BUDGET_SECONDS)
+
+        svc.graphiti.add_episode.side_effect = _first_call_outlives_the_budget
+
+        await svc.add_episode(
+            content='an episode that lands on its retry', project_id='test'
+        )
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        async def _completed():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(
+            _completed, timeout=20.0, message='write never stamped completed'
+        )
+        backend_ops = await journal.get_backend_ops_for_write_op(write_op_id)
+        assert [(op['backend'], op['success'], op['error']) for op in backend_ops] == [
+            ('graphiti', 0, 'CancelledError: '),
+            ('graphiti', 1, None),
+        ]
+        assert svc.graphiti.add_episode.await_count == 2
+
+
+class TestInterruptedSuccessRowWrite:
+    @pytest.mark.asyncio
     async def test_cancelled_success_row_write_records_no_backend_failure(
         self, success_row_blocked_service
     ):
@@ -1123,7 +1185,7 @@ class TestLandedWriteOutlivesAttemptBudget:
 
         await svc.add_episode(content='an episode that lands', project_id='test')
         write_op_id = await _sole_queue_write_op_id(svc)
-        await poll_until(journal.success_row_entered.is_set, timeout=20.0)
+        await journal.success_row_entered.wait()
 
         await svc.durable_queue.close()
 
