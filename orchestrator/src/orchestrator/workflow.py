@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from enum import Enum
+from enum import Enum, StrEnum
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypeVar, cast
@@ -153,6 +153,7 @@ from orchestrator.exit_contract import (
 from orchestrator.git_ops import (
     BranchResetError,
     GitOps,
+    GitQueryFailed,
     TrainMembership,
     WarmLaneRequeue,
     WorktreeConflictError,
@@ -1305,6 +1306,71 @@ def _is_plausible_sha(value: object) -> bool:
         _MIN_ABBREV_SHA_LEN <= len(text) <= 40
         and all(ch in string.hexdigits for ch in text)
     )
+
+
+class _CitationRefusal(StrEnum):
+    """Why a ready_to_merge report's cited commit does not corroborate the tip."""
+
+    NOT_A_SHA = 'not_a_sha'
+    GIT_ERROR = 'git_error'
+    NO_UNIQUE_COMMIT = 'no_unique_commit'
+    OTHER_COMMIT = 'other_commit'
+
+
+@dataclass(frozen=True)
+class _CitationMismatch:
+    summary: str
+    measured: dict[str, str | None]
+
+
+async def _cited_commit_mismatch(
+    git_ops: GitOps, cited: str, tip: str,
+) -> _CitationMismatch | None:
+    """None when *cited* names the commit *tip*; otherwise why it does not.
+
+    Only a hex SHA, full or abbreviated (:func:`_is_plausible_sha`), counts as
+    a citation. A ref name such as ``HEAD`` or the task branch is refused
+    without asking git: it always resolves to the current tip, so it would
+    corroborate nothing about the tip the reporter saw.
+    """
+    def mismatch(
+        reason: _CitationRefusal, summary: str, **facts: str | None,
+    ) -> _CitationMismatch:
+        return _CitationMismatch(
+            summary,
+            {'cited': cited, 'tip': tip, 'reason': reason.value, **facts},
+        )
+
+    if not _is_plausible_sha(cited):
+        return mismatch(
+            _CitationRefusal.NOT_A_SHA,
+            f'cited {cited[:40]!r} is not a hex SHA of at least '
+            f'{_MIN_ABBREV_SHA_LEN} characters (ref names are refused); cite '
+            f"the branch tip's SHA, which is {tip[:12]}",
+        )
+    try:
+        resolved = (await git_ops.commits_named([cited])).get(cited)
+    except GitQueryFailed as exc:
+        return mismatch(
+            _CitationRefusal.GIT_ERROR,
+            f'git could not resolve the cited commit {cited[:12]}',
+            git_error=str(exc),
+        )
+    if resolved is None:
+        return mismatch(
+            _CitationRefusal.NO_UNIQUE_COMMIT,
+            f'cited {cited[:12]} names no unique commit (missing or ambiguous); '
+            f'the branch tip is {tip[:12]}',
+            resolved=None,
+        )
+    if resolved != tip:
+        return mismatch(
+            _CitationRefusal.OTHER_COMMIT,
+            f'cited {cited[:12]} names {resolved[:12]} but the branch tip is '
+            f'{tip[:12]}',
+            resolved=resolved,
+        )
+    return None
 
 
 def _iteration_entry_is_work(entry: dict) -> bool:
@@ -8200,7 +8266,8 @@ class TaskWorkflow:
         The report is NEVER trusted.  Every predicate is re-derived FIRST-HAND
         here (INV-3 corroborate-before-acting):
 
-        1. the cited ``commit`` equals the branch tip we resolve ourselves;
+        1. the cited ``commit``, a hex SHA either full or abbreviated, names the
+           branch tip we resolve ourselves;
         2. clean fast-forward — main is an ancestor of the tip, and the tip is
            NOT already contained in main (that would be ``already_done``);
         3. verify PASSED on this exact tip
@@ -8286,12 +8353,9 @@ class TaskWorkflow:
                 'the task branch does not resolve',
                 {'branch': branch_name, 'main_sha': main_sha, 'cited': commit},
             )
-        if commit != tip:
-            return await _reject(
-                'cited_commit',
-                f'cited {commit[:12]} but the branch tip is {tip[:12]}',
-                {'cited': commit, 'tip': tip},
-            )
+        mismatch = await _cited_commit_mismatch(self.git_ops, commit, tip)
+        if mismatch is not None:
+            return await _reject('cited_commit', mismatch.summary, mismatch.measured)
 
         main_on_branch = await self.git_ops.is_ancestor(main_sha, tip)
         branch_on_main = await self.git_ops.is_ancestor(tip, main_sha)
