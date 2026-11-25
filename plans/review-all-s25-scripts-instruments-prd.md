@@ -574,7 +574,9 @@ Same-file leaves are chained by real edges.
     `shared/tests/cross_suite_helpers/capability_manifest_corpus.py`,
     `fused-memory/tests/test_manifest_stamping.py`, `scripts/tests/test_audit_delivered_checks.py`,
     `scripts/tests/test_audit_manifest_descriptor_drift.py`,
-    `scripts/tests/test_audit_combine_gate_marker_loss.py`.
+    `scripts/tests/test_audit_combine_gate_marker_loss.py`,
+    `shared/tests/test_capability_manifest.py`,
+    `tests/repo_guards/test_checked_in_capability_manifests.py`.
   - Work:
     - C3 consumers.
     - `_manifest_binding` and `_contained_sidecar_relpath` call `sidecar_for`, and the
@@ -582,8 +584,10 @@ Same-file leaves are chained by real edges.
     - Both audits discover through `tracked_sidecar_paths`. `audit_delivered_checks.AuditCoverage`
       gains a discovery-failed field and a non-clean exit.
     - `audit_combine_gate_marker_loss`'s glob table uses `SIDECAR_SUFFIX`.
-    - `delivered_check_polarity._MANIFEST_SUFFIX` and the corpus helper's `MANIFEST_SUFFIX` use
-      `SIDECAR_SUFFIX`.
+    - `delivered_check_polarity._MANIFEST_SUFFIX` and the corpus helper's `MANIFEST_SUFFIX` are
+      deleted. Their users, including the two test modules that import the corpus helper's, import
+      `SIDECAR_SUFFIX` from `shared.capability_manifest` directly. No alias: `suffix-spellings-gone`
+      refuses `MANIFEST_SUFFIX = SIDECAR_SUFFIX`. No `as` re-export: that check cannot see one.
     - The stamper calls `sidecar_for`.
   - Signal: B6 and B7. Also, `python3 scripts/audit_delivered_checks.py --project-root <non-git dir>`
     prints a discovery-failed coverage row and exits non-zero instead of reporting a clean sweep.
