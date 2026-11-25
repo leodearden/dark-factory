@@ -37,7 +37,7 @@ from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, Taskmas
 from fused_memory.middleware.curator_types import CuratorDecision, PreparedCandidate
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
-from fused_memory.middleware.ticket_store import TicketStore
+from fused_memory.middleware.ticket_store import ResolveReason, TicketStatus, TicketStore
 from fused_memory.models.reconciliation import EventType
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -109,8 +109,18 @@ class Stack:
         """File through submit_task and return the ticket with its resolve_ticket answer."""
         submitted = await self.call('submit_task', **args)
         assert 'ticket' in submitted, submitted
-        resolved = await self.call('resolve_ticket', ticket=submitted['ticket'], timeout_seconds=30)
-        return submitted['ticket'], resolved
+        return submitted['ticket'], await self.resolve(submitted['ticket'])
+
+    async def resolve(self, ticket: str, *, wait_seconds: float | None = None) -> dict[str, Any]:
+        """The first resolve_ticket answer that is not an expired wait.
+
+        The caller rule of ``server/tools.py::resolve_ticket``: an expired wait is not a decision, so
+        ask again with the same ticket and never re-submit. ``None`` is the tool's own default wait.
+        """
+        while True:
+            answer = await self.call('resolve_ticket', ticket=ticket, timeout_seconds=wait_seconds)
+            if (answer.get('status'), answer.get('reason')) != (TicketStatus.PENDING, ResolveReason.WAIT_TIMEOUT):
+                return answer
 
     async def file_normal(self, **args: Any) -> str:
         _ticket, resolved = await self.submit(**args)
