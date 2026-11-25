@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -320,6 +320,28 @@ class WithheldWrites:
             self._submitted += 1
             return {'task_id': f'planned-{self._submitted}', 'status': 'deferred', 'planning_mode': True}
         return {'success': True}
+
+
+OpenTools = Callable[[Policy], AbstractContextManager[ToolCaller]]
+
+
+class SessionUnavailable(Exception):
+    """A session to fused-memory that could not be opened, named by its failure kind only."""
+
+    def __init__(self, kind: RefusalKind) -> None:
+        self.kind = kind
+        super().__init__(f'the fused-memory session did not open ({kind})')
+
+
+@contextmanager
+def closed_tools(policy: Policy, open_tools: OpenTools) -> Iterator[ClosedTools]:
+    """The policy's closed tools over one session from `open_tools`; a failed handshake is SessionUnavailable."""
+    with ExitStack() as stack:
+        try:
+            caller = stack.enter_context(open_tools(policy))
+        except McpCallError as exc:
+            raise SessionUnavailable(RefusalKind(exc.kind.value)) from None
+        yield ClosedTools(caller, policy.project_root)
 
 
 @contextmanager

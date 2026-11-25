@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
+import threading
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Final
 
@@ -12,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from client_feed.contract import DefectReported, DefectRuled, TaskStatus
 from client_feed.defect_ref import portal_ref
-from client_feed.filer_state import FilerCursor, RefRecord, held_state_dir
+from client_feed.filer_state import FilerCursor, RefRecord, StateDir, held_state_dir
 from client_feed.filer_tasks import (
     ClientDefectFacts,
     FilerFallback,
@@ -25,17 +26,20 @@ from client_feed.filer_tools import (
     FILER_IDENTITY,
     ClosedTools,
     Disposition,
+    OpenTools,
     RefusalKind,
+    SessionUnavailable,
     TaskView,
-    ToolCaller,
     ToolRefused,
+    closed_tools,
 )
 from client_feed.inbox import FeedIoProblem, InboxRead, InboxUnusable, read_inbox
 from client_feed.policy import FilerPolicy, Policy
 
 logger = logging.getLogger(__name__)
 
-OpenTools = Callable[[Policy], AbstractContextManager[ToolCaller]]
+FALLBACK_AFTER_ATTEMPTS: Final = 5
+MAX_BACKOFF_SECONDS: Final = 300
 
 _DEFERRED: Final = TaskStatus.DEFERRED
 
@@ -80,6 +84,32 @@ class _Outcome:
 
     refused: Unconverged | None = None
     record: RefRecord | None = None
+
+
+class _Held(Exception):
+    """A refusal that leaves a ref unconverged, with the record the cursor keeps for the ref after it."""
+
+    def __init__(self, refused: ToolRefused, record: RefRecord | None) -> None:
+        self.refused = refused
+        self.record = record
+        super().__init__(str(refused))
+
+
+@contextmanager
+def _holding(record: RefRecord | None) -> Iterator[None]:
+    try:
+        yield
+    except ToolRefused as refused:
+        raise _Held(refused, record) from None
+
+
+@dataclass(frozen=True)
+class _Filed:
+    """A ref's filer fix, the facts it was filed with, and the record its submission left."""
+
+    fix: TaskView
+    facts: ClientDefectFacts
+    record: RefRecord | None
 
 
 def _ref_states(read: InboxRead, project_id: str) -> dict[str, _RefState]:
@@ -166,21 +196,54 @@ def _gate_and_commit(
     tools.commit_planning(held)
 
 
-def _file(
-    tools: ClosedTools, report: DefectReported, ref: str, policy: Policy, filer: FilerPolicy, record: RefRecord | None
-) -> None:
-    carriers = [tools.get_task(carrier.task_id) for carrier in tools.lookup_defect_ref(ref)]
+def _after_refusal(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
+    """The record a refused restated fix leaves: a counted attempt, and the fallback once one applies."""
+    if refused.disposition not in (Disposition.FALLBACK, Disposition.RETRY_THEN_FALLBACK):
+        return record
+    attempts = 1 if record is None else record.attempts + 1
+    falls_back = refused.disposition is Disposition.FALLBACK or attempts >= FALLBACK_AFTER_ATTEMPTS
+    fallback = FilerFallback(kind=refused.kind, code=refused.code) if falls_back else None
+    return RefRecord(attempts=attempts, last_code=refused.code, fallback=fallback)
+
+
+def _submitted(
+    tools: ClosedTools, report: DefectReported, ref: str, filer: FilerPolicy, record: RefRecord | None
+) -> _Filed:
+    fallback = None if record is None else record.fallback
+    with _holding(record):
+        submission = fix_submission(report, ref=ref, priority=filer.fix_priority, fallback=fallback)
+        task_id = tools.submit_planned(submission)
+    return _Filed(_just_submitted(task_id), facts_of(report, fallback), record)
+
+
+def _submit_fix(
+    tools: ClosedTools, report: DefectReported, ref: str, filer: FilerPolicy, record: RefRecord | None
+) -> _Filed:
+    """Submit the fix; a refused restatement falls back to typed facts once its refusal says so, and only once."""
+    if record is not None and record.fallback is not None:
+        return _submitted(tools, report, ref, filer, record)
+    try:
+        return _submitted(tools, report, ref, filer, record)
+    except _Held as held:
+        record = _after_refusal(record, held.refused)
+        if record is None or record.fallback is None:
+            raise _Held(held.refused, record) from None
+    return _submitted(tools, report, ref, filer, record)
+
+
+def _filed_fix(
+    tools: ClosedTools, report: DefectReported, ref: str, filer: FilerPolicy, record: RefRecord | None
+) -> _Filed | None:
+    """The ref's filer fix, submitted if the store holds none; None when the ref was filed by hand."""
+    with _holding(record):
+        carriers = [tools.get_task(carrier.task_id) for carrier in tools.lookup_defect_ref(ref)]
     mine = [view for view in carriers if view.source == FILER_IDENTITY]
     if carriers and not mine:
-        return
-    fallback = None if record is None else record.fallback
+        return None
     fix = _lowest(mine, 'fix', ref)
     if fix is None:
-        submission = fix_submission(report, ref=ref, priority=filer.fix_priority, fallback=fallback)
-        fix, facts = _just_submitted(tools.submit_planned(submission)), facts_of(report, fallback)
-    else:
-        facts = _facts(fix, report, fallback)
-    _gate_and_commit(tools, report, ref, policy, filer, fix, facts)
+        return _submit_fix(tools, report, ref, filer, record)
+    return _Filed(fix, _facts(fix, report, None if record is None else record.fallback), record)
 
 
 def converge_filing(
@@ -189,21 +252,23 @@ def converge_filing(
     """File `ref` as a fix and, unless auto-dispatched clean, its gate; every step re-derived from the store."""
     filer = _filer(policy)
     try:
-        _file(tools, report, ref, policy, filer, record)
-    except ToolRefused as refused:
-        attempts = 0 if record is None else record.attempts
-        return _Outcome(refused=_unconverged(ref, refused, attempts), record=record)
+        filed = _filed_fix(tools, report, ref, filer, record)
+        if filed is not None:
+            with _holding(filed.record):
+                _gate_and_commit(tools, report, ref, policy, filer, filed.fix, filed.facts)
+    except _Held as held:
+        return _Outcome(refused=_unconverged(ref, held.refused, held.record), record=held.record)
     return _Outcome()
 
 
-def _unconverged(ref: str, refused: ToolRefused, attempts: int) -> Unconverged:
+def _unconverged(ref: str, refused: ToolRefused, record: RefRecord | None) -> Unconverged:
     return Unconverged(
         ref=ref,
         tool=refused.tool,
         kind=refused.kind,
         code=refused.code,
         disposition=refused.disposition,
-        attempts=attempts,
+        attempts=0 if record is None else record.attempts,
     )
 
 
@@ -274,8 +339,52 @@ def file_once(policy: Policy, *, open_tools: OpenTools) -> PassReport:
     """One pass under the held state dir, from the stored cursor, storing the cursor it leaves."""
     with held_state_dir(policy) as state:
         cursor = state.read_cursor()
-        with open_tools(policy) as caller:
-            report, next_cursor = run_pass(policy, ClosedTools(caller, policy.project_root), cursor)
+        with closed_tools(policy, open_tools) as tools:
+            report, next_cursor = run_pass(policy, tools, cursor)
         state.write_cursor(next_cursor)
     _log_unconverged(report)
     return report
+
+
+def next_delay(interval: int, transient_streak: int) -> float:
+    """The wait before the next pass: the interval, doubled per consecutive transient pass up to MAX_BACKOFF_SECONDS."""
+    cap = max(interval, MAX_BACKOFF_SECONDS)
+    return float(min(interval * 2 ** min(transient_streak, cap.bit_length()), cap))
+
+
+def _is_transient(report: PassReport) -> bool:
+    return any(item.disposition is Disposition.RETRY for item in report.unconverged)
+
+
+def _stored_pass(policy: Policy, state: StateDir, cursor: FilerCursor, open_tools: OpenTools) -> tuple[bool, FilerCursor]:
+    """One pass over its own session, its cursor stored; whether it was transient, and the cursor it leaves."""
+    try:
+        with closed_tools(policy, open_tools) as tools:
+            report, cursor = run_pass(policy, tools, cursor)
+    except SessionUnavailable as exc:
+        logger.warning('fused-memory of %s is unreachable (%s); the pass is retried', policy.project_id, exc.kind)
+        transient = True
+    else:
+        _log_unconverged(report)
+        transient = _is_transient(report)
+    state.write_cursor(cursor)
+    return transient, cursor
+
+
+def run_until_stopped(
+    policy: Policy,
+    *,
+    open_tools: OpenTools,
+    stop: threading.Event,
+    wait: Callable[[float], object] | None = None,
+) -> None:
+    """Pass after pass under the state dir held for the whole run, backing off while passes are transient, until `stop` is set."""
+    pause = stop.wait if wait is None else wait
+    interval = _filer(policy).interval_seconds
+    streak = 0
+    with held_state_dir(policy) as state:
+        cursor = state.read_cursor()
+        while not stop.is_set():
+            transient, cursor = _stored_pass(policy, state, cursor, open_tools)
+            streak = streak + 1 if transient else 0
+            pause(next_delay(interval, streak))
