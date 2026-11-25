@@ -599,7 +599,7 @@ class TestInflightDedupSkipsDuplicate:
         assert verifier.investigations == [], verifier.investigations
 
 
-async def _lane_repo(tmp_path: Path) -> tuple[GitOps, OrchestratorConfig]:
+def _lane_repo(tmp_path: Path) -> tuple[GitOps, OrchestratorConfig]:
     """A real one-commit repo, its GitOps and a matching config.
 
     The handles contract below is about what the LANE hands the
@@ -668,7 +668,7 @@ class TestLaneHandsItsHandlesToTheInvestigation:
     async def test_a_red_merge_spawns_the_investigation_with_the_lane_handles(
         self, tmp_path: Path,
     ) -> None:
-        git_ops, config = await _lane_repo(tmp_path)
+        git_ops, config = _lane_repo(tmp_path)
         scheduler, mcp = MagicMock(), MagicMock()
         usage_gate, cost_store = MagicMock(), MagicMock()
         verifier = FakeVerifier(
@@ -700,7 +700,7 @@ class TestLaneHandsItsHandlesToTheInvestigation:
         """The git_ops+queue-only construction convention stays green: with no
         scheduler there is nobody to file a proposal with, so the same RED
         merge spawns no investigation."""
-        git_ops, config = await _lane_repo(tmp_path)
+        git_ops, config = _lane_repo(tmp_path)
         verifier = FakeVerifier(
             default=VerifyScript(result=COMPILE_ERROR_RESULT),
         )
