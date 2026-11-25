@@ -44,7 +44,6 @@ from legibility.detectors import (  # noqa: E402  # debt: task 6760
     classify_agent_class,
     dialogue_turn_text,
     error_hits,
-    is_client_rendered_turn,
     message_content,
     record_hits,
 )
@@ -494,12 +493,9 @@ def score_signals(counts: Mapping[str, int], n_user_turns: int) -> float:
 
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return the human user turns, each with its record index: the records
-    :func:`detectors.dialogue_turn_text` keeps, the one rule the classifier's
-    INTERACTIVE also asks. Beyond that shared rule, the gold bucket alone
-    excludes a turn the client composed from a UI action
-    (:func:`detectors.is_client_rendered_turn`): an arg-less slash command, a
-    local command's output echo, and the bare interrupt marker, which stays
-    an interrupt signal the Interrupts section already lists.
+    :func:`detectors.dialogue_turn_text` keeps. That one rule, which the
+    classifier's INTERACTIVE also asks, is the whole filter, client-rendered
+    turns included.
 
     This function is the SINGLE source for both the gold user_corrections
     section and render_digest's n_user_turns score component, so a turn
@@ -513,7 +509,6 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {'index': index, 'text': text}
         for index, record in enumerate(records)
         if (text := dialogue_turn_text(record)) is not None
-        and not is_client_rendered_turn(text)
     ]
 
 
