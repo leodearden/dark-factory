@@ -101,8 +101,8 @@ class TestSplitMatchValidation:
 
     def test_unknown_key_rejected_naming_the_key(self):
         with pytest.raises(ValidationError) as exc_info:
-            SplitMatch(salt='x', buckets=2, bucket=0, arm=1)  # type: ignore[call-arg]
-        assert 'arm' in str(exc_info.value)
+            SplitMatch.model_validate({'salt': 'x', 'buckets': 2, 'bucket': 0, 'arm': 1})
+        assert exc_info.value.errors()[0]['loc'][-1] == 'arm'
 
 
 class TestRoutingConfigDefaults:
