@@ -751,12 +751,17 @@ class TestMainTipSweepSelfHealWiring:
             main_tip_sweep_cold_interval_secs=86400.0,
         )
         h._main_sweep_cold_control = _cold_control_choosing(mode)
-        h.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(return_value=clean_sha)
+        git_ops.is_ancestor = AsyncMock(return_value=True)
+        h.git_ops = git_ops
         esc = _make_esc(
             level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
             task_id='main-sweep-deadbeef1234', esc_id='esc-main-sweep-superseded',
         )
-        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+        queue = MagicMock()
+        queue.get_pending.return_value = [esc]
+        h._escalation_queue = queue
         passing = VerifyResult(
             passed=True, test_output='', lint_output='', type_output='',
             summary='all checks passed',
@@ -767,14 +772,14 @@ class TestMainTipSweepSelfHealWiring:
             await h._run_main_tip_sweep()
 
         assert sweep.call_args.kwargs['seed_mode'] is mode
-        h.git_ops.is_ancestor.assert_awaited_once_with('deadbeef1234', clean_sha)  # type: ignore[attr-defined]
-        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
-        args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        git_ops.is_ancestor.assert_awaited_once_with('deadbeef1234', clean_sha)
+        queue.resolve.assert_called_once()
+        args, kwargs = queue.resolve.call_args
         assert args[0] == esc.id
         assert kwargs.get('dismiss') is True
         assert kwargs.get('resolved_by') == 'harness-main-tip-sweep-selfheal'
         assert kwargs.get('resolution_class') == 'benign'
-        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        queue.submit.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_fail_does_not_invoke_self_heal(self) -> None:
