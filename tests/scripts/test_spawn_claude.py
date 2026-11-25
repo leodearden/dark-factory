@@ -651,16 +651,11 @@ def _run_spawn(
     so this can only lengthen the bound under contention, never shorten
     one.
 
-    scale_timeout=False is the documented opt-out for call sites whose
-    verdict is load-INSENSITIVE (the no-emulator/no-tmux 126 sites, per
-    task 3486's audit) -- there, scaling would only make a genuine
-    regression take longer to report.
-
-    `timeout` must be passed as an UNSCALED base. A caller that already
-    computed a load-adaptive value (e.g. via _set_started_grace or
-    _load_scaled_grace) and adds fixed margin on top -- as the
-    "must-not-be-flagged" family below does (grace + sleep + margin) --
-    must also pass scale_timeout=False, or _spawn_run_budget scales an
+    `timeout` must be passed as an UNSCALED base. scale_timeout=False is
+    the opt-out for a caller that already computed a load-adaptive value
+    (e.g. via _set_started_grace or _load_scaled_grace) and adds fixed
+    margin on top -- as the "must-not-be-flagged" family below does
+    (grace + sleep + margin). Without it _spawn_run_budget scales an
     already-scaled number a second time, discarding that site's own
     derivation under load instead of honoring it.
     """
@@ -700,7 +695,7 @@ def _run_spawn_without_emulator(
     env["PATH"] = f"{bin_dir}:{sys_bin}"
     env.pop("CLAUDE_TERMINAL_CMD", None)
     env.update(extra_env or {})
-    return _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+    return _run_spawn(env, tmp_path)
 
 
 # ===========================================================================
@@ -821,10 +816,6 @@ def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
     """
     monkeypatch.setenv("CLAUDE_SPAWN_BACKEND", "tmux")
 
-    # Task 3599 audit: same no-emulator availability-guard shape as
-    # test_no_emulator_found_yields_126 below -- rc==126 is load-INSENSITIVE
-    # (task 3486), so this stays unscaled rather than inheriting the new
-    # load-scaled default.
     result = _run_spawn_without_emulator(tmp_path)
     stderr = result.stderr.decode()
     assert result.returncode == 126, (
@@ -1057,10 +1048,6 @@ def test_genuine_launcher_failure_yields_127(
 )
 def test_no_emulator_found_yields_126(tmp_path: pathlib.Path) -> None:
     """When no emulator is found, spawn-claude.sh must exit 126."""
-    # Task 3599 audit: rc==126 is load-INSENSITIVE (no emulator on PATH
-    # fails the availability guard immediately; task 3486 measured 0.05s),
-    # so this stays unscaled rather than inheriting the new load-scaled
-    # default.
     result = _run_spawn_without_emulator(tmp_path)
     assert result.returncode == 126, (
         f"No emulator must yield 126, got {result.returncode}\n"
@@ -2070,12 +2057,11 @@ def test_run_spawn_idle_host_timeout_is_byte_identical(
 def test_run_spawn_scale_timeout_false_forwards_base_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """scale_timeout=False is the documented opt-out that preserves task
-    3486's audited decision for the load-INSENSITIVE 126/no-emulator sites
-    (rc==126 is decided by an immediate availability-guard failure; load-
-    scaling would only make a genuine regression take longer to report).
-    Pinned as a contract here rather than left as an undocumented
-    convention, so a future edit to _run_spawn cannot silently drop it.
+    """scale_timeout=False forwards `timeout` unscaled: the opt-out the
+    grace + sleep + margin sites rely on, whose budget is already
+    load-scaled and must not be scaled a second time. Pinned as a contract
+    here rather than left as an undocumented convention, so a future edit
+    to _run_spawn cannot silently drop it.
     """
     monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 32)
@@ -3759,13 +3745,8 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     command-not-found (bash exit 127) -> resolve_detached's launch_rc!=0
     branch -> exit 127, not 126. GREEN after step-8.
     """
-    # Task 3486 audit: SPAWN_LAUNCH_GRACE_SECS="2" and timeout=10 below stay
-    # FIXED on purpose -- rc==126 is load-INSENSITIVE (no tmux/emulator on
-    # PATH fails the availability guard immediately; load-scaling would only
-    # make a genuine regression take longer to report). Measured: 0.05s.
-    # Task 3599 audit: _run_spawn's timeout now load-scales by default, so
-    # the explicit scale_timeout=False below is what keeps this pin FIXED --
-    # both audits are one decision, not a reversal.
+    # SPAWN_LAUNCH_GRACE_SECS stays "2": the availability guard exits 126
+    # before any launch grace is consumed.
     result = _run_spawn_without_emulator(
         tmp_path, {"CLAUDE_SPAWN_BACKEND": "tmux", "SPAWN_LAUNCH_GRACE_SECS": "2"}
     )
