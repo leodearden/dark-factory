@@ -4,11 +4,15 @@ docs/quality-findings-contract.md §8). Every case drives McpTaskStore through
 its injected ``post`` callable."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from fused_memory.middleware import ticket_store as fused_memory_ticket_store
+from fused_memory.middleware.task_curator import CorpusSearchError, TaskCurator
+from fused_memory.middleware.task_interceptor import TaskInterceptor
 from legibility import task_store
 
 _URL = "http://fused-memory.test/mcp"
@@ -142,6 +146,25 @@ def test_a_degraded_search_reply_raises_store_degraded_never_no_match(reply) -> 
     assert "search_tasks" in str(raised.value)
     if "error" in reply:
         assert "insufficient_quota" in str(raised.value)
+
+
+async def _fused_memorys_search_reply_with_qdrant_down() -> dict[str, Any]:
+    curator = MagicMock(spec=TaskCurator)
+    curator.search_corpus.side_effect = CorpusSearchError("p", ConnectionError("qdrant is down"))
+    interceptor = TaskInterceptor(None, None, MagicMock(), curator=curator)
+    try:
+        return await interceptor.search_tasks(_ROOT, "q", score_threshold=0.6)
+    finally:
+        await interceptor.close()
+
+
+def test_fused_memorys_own_outage_reply_is_read_as_store_degraded() -> None:
+    post = _RecordingPost({"search_tasks": [asyncio.run(_fused_memorys_search_reply_with_qdrant_down())]})
+
+    with pytest.raises(task_store.StoreDegraded) as raised:
+        _store(post).search_tasks(_ROOT, query="q", score_threshold=0.6)
+
+    assert "search_tasks" in str(raised.value)
 
 
 def test_a_raising_post_becomes_store_unreachable_chaining_the_original() -> None:
