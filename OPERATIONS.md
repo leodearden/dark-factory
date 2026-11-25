@@ -879,11 +879,20 @@ journalctl --user -u client-feed-filer@<name>.service
 ```
 
 A report Leo rules on in the portal arrives as a `defect_ruled` line
-(decision 14). The filer then acts on its own fix and gate only. While the fix
-is pending, its defect is withdrawn as not a defect, Leo's acceptance is
-recorded, and the fix is cancelled. A fix already started is withdrawn but not
-cancelled, and a done fix is left untouched. The gate is cancelled after the
-fix's step, because cancelling a gate first would release the fix.
+(decision 14). The filer then acts on its own fix and gate only. What it writes
+on the fix's defect depends on where that defect stands:
+
+- A defect still open is withdrawn as not a defect, and Leo's acceptance is
+  recorded.
+- A defect already proven is not withdrawn, and neither is one already exempted
+  or pending on another closure. The state machine lets a closure leave only an
+  open defect, and no closure may follow a proof
+  (`shared/src/shared/defects.py::DEFECT_TRANSITIONS`). So the filer makes no
+  defect write and logs a WARNING naming the ref.
+
+In every case a pending fix is still cancelled, a started fix is left running,
+and a done fix is left untouched. The gate is cancelled after the fix's step,
+because cancelling a gate first would release the fix.
 
 A report the filer has not filed in time shows as the `filer` source under
 "Reading the heartbeat's degraded list" below.
