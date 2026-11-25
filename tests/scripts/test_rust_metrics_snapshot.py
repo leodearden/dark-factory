@@ -245,6 +245,24 @@ class TestTheMeasurement:
         assert graph['cycles'] == [['core', 'core::a']]
         assert graph['hidden_cycles'] == [['core', 'core::a', 'core::b']]
 
+    def test_an_unreadable_domain_file_is_named_and_the_evidence_is_incomplete(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], fixture_rules: Path
+    ) -> None:
+        repo = rust_workspace_repo(tmp_path)
+        gone = 'crates/core/src/gone.rs'
+        (repo / gone).symlink_to('missing.rs')
+        git(repo, 'add', gone)
+        git(repo, '-c', 'user.name=f', '-c', 'user.email=f@e.invalid', 'commit', '--no-verify', '-q', '-m', 'gone')
+        out = tmp_path / 'out' / 'snapshot.json'
+        assert _measure(fixture_rules, repo, out) == 0
+        taken = rust_metrics_snapshot.load_snapshot(out)
+        evidence = taken['evidence']
+        assert (evidence['complete'], evidence['unreadable'], evidence['domain_files']) == (False, [gone], 4)
+        assert gone not in {record['path'] for record in taken['files']}
+        printed = capsys.readouterr()
+        assert f'unreadable: {gone}: ' in printed.err
+        assert f'  {gone}' in printed.out.splitlines()
+
     def test_two_trees_of_one_commit_measure_identically_below_run_id_and_cost(
         self, tmp_path: Path, fixture_rules: Path
     ) -> None:

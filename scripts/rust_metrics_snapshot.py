@@ -712,14 +712,24 @@ def _py_fields(rec: dict[str, Any], raw: str) -> None:
         rec['private_patch_targets'] = sorted(set(re.findall(r'''patch(?:\.object)?\(\s*['"]([\w.]+)['"]''', raw)))
 
 
-def _file_records(root: Path, paths: Sequence[str], inputs: _FileInputs) -> tuple[dict[str, dict[str, Any]], list[_Edge]]:
-    """Per readable domain file, its record; and every import edge between the files."""
+@dataclasses.dataclass(frozen=True)
+class _FileRecords:
+    records: dict[str, dict[str, Any]]
+    edges: list[_Edge]
+    unreadable: tuple[str, ...]  # sorted; their measures are unknown, never zero
+
+
+def _file_records(root: Path, paths: Sequence[str], inputs: _FileInputs) -> _FileRecords:
+    """Per readable domain file, its record; every import edge between the files; the files that could not be read."""
     records = {}
+    unreadable = []
     gathered = _Gathered()
     for p in paths:
         try:
             raw = (root / p).read_text(encoding='utf-8', errors='replace')
-        except OSError:
+        except OSError as exc:
+            unreadable.append(p)
+            print(f'unreadable: {p}: {exc.__class__.__name__}: {exc}', file=sys.stderr)
             continue
         rec = _new_record(p, raw, inputs)
         if p.endswith('.rs'):
@@ -734,7 +744,7 @@ def _file_records(root: Path, paths: Sequence[str], inputs: _FileInputs) -> tupl
         crate = records[p]['module'].split('::')[0]
         reached = sorted(n for n in names if n in gathered.test_tokens_by_crate.get(crate, set()))
         records[p]['private_patch_targets'] = reached
-    return records, gathered.edges
+    return _FileRecords(records=records, edges=gathered.edges, unreadable=tuple(sorted(unreadable)))
 
 
 def _sccs(graph: Mapping[str, set[str]]) -> list[list[str]]:
@@ -952,17 +962,17 @@ def _measure_tree(root: Path, head: str, rules: RustRules) -> _Measured:
         fix_density=_fix_density(root, head, rules),
         domain=frozenset(domain.paths),
     )
-    read, edges = _file_records(root, domain.paths, inputs)
-    graph = _graph_measures(read, edges)
-    records = {path: {**record, **graph.file_figures[path]} for path, record in read.items()}
+    read = _file_records(root, domain.paths, inputs)
+    graph = _graph_measures(read.records, read.edges)
+    records = {path: {**record, **graph.file_figures[path]} for path, record in read.records.items()}
     per_area = _per_area(records, lizard.rows)
     totals: Counter[str] = Counter()
     for c in per_area.values():
         totals.update(c)
     evidence = {
-        'complete': True,
-        'unreadable': [],
-        'domain_files': len(records),
+        'complete': not read.unreadable,
+        'unreadable': list(read.unreadable),
+        'domain_files': len(domain.paths),
         'unmapped_paths': list(domain.unmapped),
         'lizard_stderr': lizard.stderr[-2000:],
     }
@@ -971,7 +981,7 @@ def _measure_tree(root: Path, head: str, rules: RustRules) -> _Measured:
         figures={
             'files': sorted(records.values(), key=lambda r: r['path']),
             'import_graph': {
-                'edges': sorted({(f, t) for f, t, *_ in edges}),
+                'edges': sorted({(f, t) for f, t, *_ in read.edges}),
                 'reach_back': graph.reach_back,
                 'deferred': graph.deferred,
                 'cycles': graph.cycles,
@@ -1042,6 +1052,10 @@ def summary_text(snapshot: Mapping[str, Any]) -> str:
         f"{totals['functions']} functions, {totals['fns_ccn_over_15']} with CCN>15; files >= {H14_ALARM} lines: {totals['alarm_files']}, {H14_SOFT}-{H14_ALARM}: {totals['soft_files']}; "
         f"module cycles (SCCs>1): {len(graph['cycles'])}, hidden: {len(graph['hidden_cycles'])}; reach-back imports: {totals['reach_back_imports']}; deferred: {totals['deferred_imports']} ({totals['cycle_closing_imports']} close a cycle); re-exports: {totals['reexports']}; test->internal reaches: {totals['patch_targets']}. No previous snapshot; since = none. Instruments: lizard CCN (not cognitive), tokei prose. Line counts set read budgets only (quality doc: Do not steer by)."
     )
+    unreadable = snapshot['evidence']['unreadable']
+    if unreadable:
+        s.append('unreadable (measures unknown, never zero):')
+        s.extend(f'  {path}' for path in unreadable)
     s.append(
         'area | files | lines | src/tests/embedded-test lines | prose | fns CCN>15 | alarm/soft files | cycles | reach-back | cycle-closing deferred | re-exports | test reaches'
     )

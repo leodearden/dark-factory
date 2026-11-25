@@ -60,7 +60,7 @@ def _report():
     reports = [
         {'name': f'./{path.as_posix()}', 'stats': _stats(path.read_text(encoding='utf-8'))}
         for path in sorted(Path('.').rglob('*.rs'))
-        if '.git' not in path.parts
+        if '.git' not in path.parts and path.is_file()
     ]
     return {'Rust': {'reports': reports}, 'Total': {}}
 
