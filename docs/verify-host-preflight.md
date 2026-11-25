@@ -22,12 +22,16 @@ It verifies one commit. The default is the tip of `git.main_branch`, and
   the same builder the harness uses. The preflight first calls
   `RemoteRunner.ensure_gate`, timed on its own: this publishes the CLI
   checkout's own sha as the gate and checks the gate's handshake. It then calls
-  `RemoteRunner.run_merge_verify`, which pushes `refs/merge-verify/<id>` and
-  runs `orchestrator verify-merge` over ssh in that gate.
+  `RemoteRunner.run_merge_verify`. That first pushes the project's local
+  `main` to the runner's `git_remote`, force-mirroring it when the host's
+  `main` has diverged. It then pushes `refs/merge-verify/<id>` and runs
+  `orchestrator verify-merge` over ssh in that gate.
 - **Where it runs on the host.** `verify-merge` makes its own ephemeral
   `_merge-<uuid>` worktree. It runs as its own process, separate from any
   orchestrator, so it holds no host slot. On a busy host it is slower, not
-  unsafe.
+  unsafe. But the lane's admission cannot see the preflight's full-gate load,
+  so a production verify running beside it on that host can be pushed toward
+  its own timeout.
 - **Archives.** The runner's red, green and no-verdict archives land in
   `data/verify-logs/preflight/`, beside the records.
 
@@ -88,7 +92,14 @@ These cases are refused with exit 2:
 
 Each runner's record is at `data/verify-logs/preflight/<runner>-<sha>.json`
 under the project root. A later preflight of the same runner at the same sha,
-standalone or as a reference, replaces that file. The fields are:
+standalone or as a reference, replaces that file.
+
+Records share the verify-log archive's retention: a file is deleted after 30
+days, or sooner, oldest first, while the archive is over its 500 MB cap. At
+current churn that is about 9 days. So a gate that cites a record copies the
+record's JSON into its own task record rather than citing the path.
+
+The fields are:
 
 | Field | Meaning |
 |-------|---------|
@@ -101,17 +112,22 @@ standalone or as a reference, replaces that file. The fields are:
 | `ensure_gate_secs` | The first gate ensure alone; null when it raised. |
 | `gate_built` | Whether that ensure had to build the gate; null when it raised. |
 | `summary`, `category` | The verdict's own summary and failure category. |
-| `no_verdict` | `{kind, message}` when the host produced no usable verdict; `kind` is a `RunnerUnavailable` kind (`transport`, `gate`, `unparseable`, `no_verdict`, `wire_shape`). |
+| `no_verdict` | `{kind, message}` when the host produced no usable verdict; `kind` is one of `orchestrator/src/orchestrator/remote_gate.py::RunnerUnavailableKind`. |
 | `modules.<prefix>.failing_test_ids` | That module's failing junit ids; null when they are not attributed, either because the verdict carries no per-module attribution or because the module collected no junit (for example, its test leg never produced a report). null is not zero. |
 | `modules.<prefix>.failing_count` | Their count, or null. |
 | `failing_test_ids` | The run-wide failing ids. |
 | `skipped_test_ids` | The run-wide skipped junit ids, or null when no junit was collected. |
+| `flake_suppression` | `{verdict, test_ids, psi_cpu_some10}` when the host re-ran failing tests isolated and serial; else null. A `passed: true` record whose `verdict` is `passes_in_isolation` was green only after those reruns, so a red on the first pass was not ruled out. |
 | `skip_parity` | With `--reference`, the parity block, written into both runners' records; else null. It names `runner` (the `--runner` side) and `reference`, so on the reference's own record `skip_parity.reference` equals the record's own `runner`. |
 
 The test ids use junit's `classname::name` spelling, for example
 `tests.test_verify_role_integration::test_role_env_propagates_to_reify_verify_plan[merge]`.
 Skipped ids are not attributed per module, because `VerifyResult` carries no
-per-module skip attribution.
+per-module skip attribution. The ids are module-relative, and many test file
+names repeat across workspace modules, so the same id can name different tests
+in two modules. Parity cannot tell them apart: an id skipped in one module on
+the runner and in another module on the reference counts as skipped on both,
+and an exception entry excuses its id in every module.
 
 ## Skip parity
 
