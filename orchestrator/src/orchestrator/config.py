@@ -23,6 +23,7 @@ from pydantic import (
     PrivateAttr,
     TypeAdapter,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -421,6 +422,31 @@ class BackendsConfig(BaseModel):
     simple_task: str = Field(default='claude')
 
 
+class SplitMatch(BaseModel):
+    """One arm of a salted-hash split of the task id, evaluated by
+    ``orchestrator/src/orchestrator/routing.py::_rule_matches`` via
+    ``shared/src/shared/routing_split.py::split_bucket`` and validated at
+    load and reload.
+    """
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    salt: str = Field(min_length=1)
+    buckets: int = Field(ge=2)
+    bucket: int = Field(ge=0)
+
+    @field_validator('bucket')
+    @classmethod
+    def _bucket_within_buckets(cls, value: int, info: ValidationInfo) -> int:
+        buckets = info.data.get('buckets')
+        if buckets is not None and value >= buckets:
+            raise ValueError(
+                f'bucket {value} is out of range for buckets={buckets}; '
+                'a split needs 0 <= bucket < buckets'
+            )
+        return value
+
+
 class RuleMatch(BaseModel):
     """Closed match-condition vocabulary for a RoutingRule (task epsilon,
     plans/adaptive-model-routing-prd.md).
@@ -439,6 +465,9 @@ class RuleMatch(BaseModel):
     silently never match; populate ``metadata['priority']`` explicitly if
     you need this condition to fire. See ``orchestrator.routing.
     _rule_matches``'s docstring for the same note.
+
+    ``split`` (a ``SplitMatch``) matches only the task ids that fall in one
+    arm of a salted-hash split.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -452,6 +481,7 @@ class RuleMatch(BaseModel):
     min_routing_tier: int | None = None
     min_dispatch_count: int | None = None
     simple_saturated: bool | None = None
+    split: SplitMatch | None = None
 
 
 class RuleSet(BaseModel):
