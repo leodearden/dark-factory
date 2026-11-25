@@ -26,7 +26,7 @@ import json
 import sqlite3
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from pathlib import Path
@@ -376,16 +376,17 @@ async def apply_repairs(
     root = census.project_root
     selected = tuple(v for v in census.violations if v.tier in tiers)
     held, holder_set_error = _holder_preflight(root, selected)
-    if held or holder_set_error is not None:
-        return ApplyReport(
-            project_root=root,
-            tiers=_ordered(tiers),
-            holder_intersection=held,
-            holder_set_error=holder_set_error,
-            outcomes=(),
-            verification_census=None,
-            verification_error=None,
-        )
+    preflight = ApplyReport(
+        project_root=root,
+        tiers=_ordered(tiers),
+        holder_intersection=held,
+        holder_set_error=holder_set_error,
+        outcomes=(),
+        verification_census=None,
+        verification_error=None,
+    )
+    if preflight.refused:
+        return preflight
     attempts = {
         violation.key: await _attempt_repair(client, root, violation, clock())
         for violation in selected
@@ -394,11 +395,8 @@ async def apply_repairs(
         verification, verification_error = take_census(root, clock()), None
     except UNREADABLE_STORE_ERRORS as exc:
         verification, verification_error = None, _describe(exc)
-    return ApplyReport(
-        project_root=root,
-        tiers=_ordered(tiers),
-        holder_intersection=(),
-        holder_set_error=None,
+    return replace(
+        preflight,
         outcomes=bucket_outcomes(selected, attempts, verification, tiers),
         verification_census=verification,
         verification_error=verification_error,

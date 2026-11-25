@@ -56,8 +56,8 @@ class SchedulerStateUnreadable(Exception):
     """The snapshot file exists but cannot be read or parsed as a snapshot.
 
     Carries the snapshot :attr:`path`. Deliberately NOT an ``OSError`` or
-    ``ValueError`` subclass, so a broad ``except`` cannot swallow it by
-    accident: a caller that means to tolerate it must name it.
+    ``ValueError`` subclass, so an ``except OSError`` or ``except ValueError``
+    cannot swallow it by accident.
     """
 
     def __init__(self, path: Path, cause: BaseException) -> None:
