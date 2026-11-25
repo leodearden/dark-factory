@@ -1484,6 +1484,20 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class _RoleModeFields(NamedTuple):
+    """The VerifyCacheConfig fields holding one verify role's modes."""
+
+    mode: str
+    remote_mode: str
+
+
+#: The roles the verify cache acts for; it has no mode for any other (background is always OFF).
+_ROLE_MODE_FIELDS: dict[VerifyRole, _RoleModeFields] = {
+    'task': _RoleModeFields('task_mode', 'remote_task_mode'),
+    'merge': _RoleModeFields('merge_mode', 'remote_merge_mode'),
+}
+
+
 class VerifyCacheConfig(BaseModel):
     """How far the verify-result cache may act, per verify role
     (plans/verify-result-cache-prd.md § Amendments, A3: per-role modes).
@@ -1504,27 +1518,24 @@ class VerifyCacheConfig(BaseModel):
     def mode_for(self, role: VerifyRole) -> CacheMode:
         """*role*'s mode; the cache has no background role, so that is always OFF.
         DF_VERIFY_CACHE=off forces every role OFF (plans/verify-result-cache-prd.md, Amendment A3)."""
-        if forced_off():
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if forced_off() or fields is None:
             return CacheMode.OFF
-        if role == 'task':
-            return self.task_mode
-        if role == 'merge':
-            return self.merge_mode
-        return CacheMode.OFF
+        return getattr(self, fields.mode)
 
     def remote_mode_for(self, role: VerifyRole) -> CacheMode:
         """The mode a remote verify of *role* may act under: the role's own mode, capped by its remote mode."""
-        if role == 'task':
-            return most_conservative(self.mode_for(role), self.remote_task_mode)
-        if role == 'merge':
-            return most_conservative(self.mode_for(role), self.remote_merge_mode)
-        return CacheMode.OFF
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if fields is None:
+            return CacheMode.OFF
+        return most_conservative(self.mode_for(role), getattr(self, fields.remote_mode))
 
     def with_mode(self, role: VerifyRole, mode: CacheMode) -> 'VerifyCacheConfig':
-        """A copy whose *role* acts under *mode*, as a runner pins the mode its dispatcher shipped."""
-        if role not in ('task', 'merge'):
+        """A validated copy whose *role* acts under *mode*, as a runner pins the mode its dispatcher shipped."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if fields is None:
             raise ValueError(f'the verify cache has no {role!r} mode to pin')
-        return self.model_copy(update={f'{role}_mode': mode})
+        return type(self).model_validate({**self.model_dump(), fields.mode: mode})
 
 
 class DepthRow(NamedTuple):
