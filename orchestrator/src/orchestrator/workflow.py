@@ -153,6 +153,7 @@ from orchestrator.exit_contract import (
 from orchestrator.git_ops import (
     BranchResetError,
     GitOps,
+    GitQueryFailed,
     TrainMembership,
     WarmLaneRequeue,
     WorktreeConflictError,
@@ -1305,6 +1306,23 @@ def _is_plausible_sha(value: object) -> bool:
         _MIN_ABBREV_SHA_LEN <= len(text) <= 40
         and all(ch in string.hexdigits for ch in text)
     )
+
+
+_HEX_OBJECT_NAME_RE = re.compile(r'[0-9a-fA-F]{4,64}')
+"""A hex object name: git's minimum abbreviation up to a full sha256 id."""
+
+
+async def _resolve_cited_commit(git_ops: GitOps, cited: str) -> str | None:
+    """The full SHA of the commit that *cited* names, or None when it names none.
+
+    Only a hex object name counts as a citation. A ref name such as ``HEAD`` or
+    the task branch is refused without asking git: it always resolves to the
+    current tip, so it would corroborate nothing about the tip the reporter saw.
+    Raises GitQueryFailed when git could not answer.
+    """
+    if not _HEX_OBJECT_NAME_RE.fullmatch(cited):
+        return None
+    return (await git_ops.commits_named([cited])).get(cited)
 
 
 def _iteration_entry_is_work(entry: dict) -> bool:
@@ -8200,7 +8218,8 @@ class TaskWorkflow:
         The report is NEVER trusted.  Every predicate is re-derived FIRST-HAND
         here (INV-3 corroborate-before-acting):
 
-        1. the cited ``commit`` equals the branch tip we resolve ourselves;
+        1. the cited ``commit``, a hex SHA either full or abbreviated, names the
+           branch tip we resolve ourselves;
         2. clean fast-forward — main is an ancestor of the tip, and the tip is
            NOT already contained in main (that would be ``already_done``);
         3. verify PASSED on this exact tip
@@ -8286,11 +8305,25 @@ class TaskWorkflow:
                 'the task branch does not resolve',
                 {'branch': branch_name, 'main_sha': main_sha, 'cited': commit},
             )
-        if commit != tip:
+        try:
+            resolved = await _resolve_cited_commit(self.git_ops, commit)
+        except GitQueryFailed as exc:
             return await _reject(
                 'cited_commit',
-                f'cited {commit[:12]} but the branch tip is {tip[:12]}',
-                {'cited': commit, 'tip': tip},
+                f'git could not resolve the cited commit {commit[:12]}',
+                {'cited': commit, 'tip': tip, 'git_error': str(exc)},
+            )
+        if resolved != tip:
+            summary = (
+                f"cited {commit[:40]!r} names no commit (cite the branch tip's "
+                f'hex SHA, full or abbreviated); the branch tip is {tip[:12]}'
+                if resolved is None
+                else f'cited {commit[:12]} names {resolved[:12]} but the branch '
+                f'tip is {tip[:12]}'
+            )
+            return await _reject(
+                'cited_commit', summary,
+                {'cited': commit, 'resolved': resolved, 'tip': tip},
             )
 
         main_on_branch = await self.git_ops.is_ancestor(main_sha, tip)

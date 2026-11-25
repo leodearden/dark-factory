@@ -2050,8 +2050,10 @@ def _server_with_every_tool(
 
         Args:
             commit: The git SHA of THIS BRANCH's tip that holds the
-                completed work. The orchestrator resolves the branch tip
-                itself and rejects the report if it does not match.
+                completed work, full or an unambiguous abbreviation (at
+                least 4 hex characters). A branch or other ref name is
+                rejected. The orchestrator resolves the branch tip itself
+                and rejects the report if it does not match.
             evidence: Brief description of what you checked — how you
                 established the clean fast-forward, and where the passing
                 verify and review results came from.
