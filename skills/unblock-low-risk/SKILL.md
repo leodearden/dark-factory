@@ -682,7 +682,7 @@ Two refinements to the Procedure for this mode specifically:
   at step 4 aborts in this mode exactly as in every other: this mode never
   resolves conflicts. If the fix
   demands anything beyond that (a logic change, a genuinely new and
-  unrelated test failure, a cross-module edit, a conflict resolution), the investigator's
+  unrelated test failure, a cross-module edit), the investigator's
   labelling guidance (`skills/unblock-auto/SKILL.md`) says that should
   never have been labelled `low` in the first place — treat it as a
   labelling error, not license to proceed: **ABORT**.
