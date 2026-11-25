@@ -10,7 +10,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _gate_fixtures import TEST_DEPLOYED_SHA
+from _gate_fixtures import TEST_DEPLOYED_SHA, gate_argv, gated_remote_runner
 from _git_fixtures import seed_repo
 from _verify_artifact_fixtures import registry_config
 from _verify_host_drive import runner_double
@@ -20,7 +20,12 @@ from shared.governed_exceptions import TaskRef
 from orchestrator import verify_host_preflight as preflight
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import RunnerUnavailable
+from orchestrator.verify_runner import (
+    RemoteRunner,
+    RunnerUnavailable,
+    result_to_json,
+    spec_from_json,
+)
 
 ENSURE_SECS = 7.0
 VERIFY_SECS = 100.0
@@ -547,3 +552,73 @@ class TestSkipParity:
         for double in (box, ref):
             double.ensure_gate.assert_not_awaited()
             double.run_merge_verify.assert_not_awaited()
+
+
+class RecordingTransport:
+    """The project side of a RemoteRunner: git answers rc 0, and verify-merge answers *verdict*."""
+
+    def __init__(self, main_sha: str, verdict: VerifyResult) -> None:
+        self.main_sha = main_sha
+        self.verdict = verdict
+        self.calls: list[list[str]] = []
+
+    async def __call__(self, argv: list[str], *, cwd: Any = None) -> tuple[int, str, str]:
+        self.calls.append(argv)
+        if argv[:2] == ['git', 'rev-parse']:
+            return (0, f'{self.main_sha}\n', '')
+        if argv[:2] == ['git', 'push']:
+            return (0, '', '')
+        if argv[:1] == ['ssh'] and gate_argv(argv[-1])[:1] == ['verify-merge']:
+            return (0, result_to_json(self.verdict), '')
+        return (1, '', f'unexpected call: {argv!r}')
+
+    def verify_merge_argv(self) -> list[str]:
+        [command] = [
+            gate_argv(argv[-1]) for argv in self.calls
+            if argv[:1] == ['ssh'] and gate_argv(argv[-1])[:1] == ['verify-merge']
+        ]
+        return command
+
+
+@pytest.mark.asyncio
+class TestProductionPathFidelity:
+    async def test_a_real_remote_runner_verifies_the_full_gate_and_the_record_holds_its_answer(
+        self, repo: Path,
+    ) -> None:
+        main_sha = rev_parse(repo, 'main')
+        transport = RecordingTransport(main_sha, green_result(skipped_test_ids=['t::remote_skip']))
+
+        def build(rc: VerifyRunnerConfig) -> RemoteRunner:
+            return gated_remote_runner(
+                rc.name, rc.ssh_host, rc.git_remote, repo,
+                run=transport, main_branch='main', gate_built=True,
+            )
+
+        outcome = await preflight.run_preflight(
+            preflight_config(repo), runner='box', sha=None, reference=None,
+            deployed_sha=TEST_DEPLOYED_SHA, build_runner=build,
+        )
+
+        command = transport.verify_merge_argv()
+        assert command[command.index('--sha') + 1] == main_sha
+        spec = spec_from_json(command[command.index('--spec') + 1])
+        assert spec.merge_verify_breadth == 'full'
+        assert spec.task_files is None
+        assert spec.verify_cache is None
+        record = record_of(repo, outcome)
+        assert record['passed'] is True
+        assert record['gate_built'] is True
+        assert record['ensure_gate_secs'] is not None
+        assert record['skipped_test_ids'] == ['t::remote_skip']
+
+    async def test_the_production_builder_builds_a_declared_runner_that_is_not_enabled(
+        self, repo: Path,
+    ) -> None:
+        config = preflight_config(repo)
+        [box] = config.verify_runners
+        assert box.enabled is False
+
+        built = preflight.production_runner_builder(config, TEST_DEPLOYED_SHA)(box)
+
+        assert isinstance(built, RemoteRunner)
+        assert built.name == 'box'
