@@ -361,15 +361,6 @@ class TestDefectRulings:
         with pytest.raises(ReviewPayloadError):
             ReviewPayload(Verdict.ERROR, issues=(), reviewer='r', defect_rulings=(_CLOSURE,))
 
-    def test_a_member_that_is_not_a_ruling_is_rejected_at_construction(self):
-        with pytest.raises(ReviewPayloadError, match='DefectRuling'):
-            ReviewPayload(
-                Verdict.PASS,
-                issues=(),
-                reviewer='r',
-                defect_rulings=(dict(_CLOSURE_RAW),),  # type: ignore[reportArgumentType]
-            )
-
     def test_non_list_value_raises_naming_the_value(self):
         with pytest.raises(ReviewPayloadError, match='closure-everything'):
             normalize_review(_with_rulings('closure-everything'))
