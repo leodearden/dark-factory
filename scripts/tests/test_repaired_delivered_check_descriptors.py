@@ -128,7 +128,34 @@ _REPOINTED_AFTER_RENAME = [
     ),
 ]
 
-_REPAIRED_DESCRIPTORS = [*_REANCHORED, *_RESYNCED_TO_TASK_RECORD, *_REPOINTED_AFTER_RENAME]
+# Each site task 6764 must clear, mapped to the suffix restatement as spelled there.
+_SUFFIX_RESTATEMENT_SITES = {
+    "fused-memory/src/fused_memory/server/manifest_stamping.py":
+        "_SIDECAR_SUFFIX = '.capability-manifest.yaml'",
+    "scripts/audit_delivered_checks.py":
+        'MANIFEST_SUFFIX = ".capability-manifest.yaml"',
+    "scripts/audit_manifest_descriptor_drift.py":
+        '_MANIFEST_SUFFIX = ".capability-manifest.yaml"',
+    "shared/src/shared/delivered_check_polarity.py":
+        "_MANIFEST_SUFFIX = '.capability-manifest.yaml'",
+    "shared/tests/cross_suite_helpers/capability_manifest_corpus.py":
+        "MANIFEST_SUFFIX = '.capability-manifest.yaml'",
+}
+
+# Task 10341: widened to every restatement 6764 removes; the task-record half is
+# task 10341's operational follow-up, ticket tkt_0RXD2YBTT281JRW4KY7F3BF79D.
+_SUFFIX_GATE = (
+    "plans/review-all-s25-scripts-instruments-prd.capability-manifest.yaml",
+    6764, "ι", "suffix-spellings-gone",
+    {"kind": "grep", "pattern": "^_?(SIDECAR|MANIFEST)_SUFFIX = ", "expect": "absent",
+     "paths": list(_SUFFIX_RESTATEMENT_SITES)},
+)
+_WIDENED_TO_EVERY_RESTATEMENT = [_SUFFIX_GATE]
+
+_REPAIRED_DESCRIPTORS = [
+    *_REANCHORED, *_RESYNCED_TO_TASK_RECORD, *_REPOINTED_AFTER_RENAME,
+    *_WIDENED_TO_EVERY_RESTATEMENT,
+]
 
 _RETIRED_TO_MANUAL = [
     (
@@ -230,8 +257,9 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
     )
 
 
-# Rows whose producer is done. The rest of _REANCHORED is left out: it holds a
-# pending producer (5324) whose forward-looking gate legitimately fails at HEAD.
+# Rows whose producer is done. The rest of _REANCHORED and _SUFFIX_GATE are left
+# out: their producers (5324, 6764) are pending, so their forward-looking gates
+# legitimately fail at HEAD.
 _DONE_PRODUCER_HEADS = [
     r[:4] for r in [*_RESYNCED_TO_TASK_RECORD, _QUALITY_BOUNDARY, *_REPOINTED_AFTER_RENAME]
 ]
@@ -314,6 +342,39 @@ def test_kappa_gate_opens_once_only_the_contract_primitives_remain(tmp_path):
     assert outcome is CheckOutcome.PASS, (
         f"κ's delivered_check evaluates {outcome.value} on a tree holding only "
         f"{_CONTRACT_PRIMITIVES}; a retained primitive must not be in the gate."
+    )
+
+
+_SUFFIX_FREE_SITE = "from shared.capability_manifest import SIDECAR_SUFFIX\n"
+
+
+@pytest.mark.parametrize(
+    "survivor", list(_SUFFIX_RESTATEMENT_SITES), ids=lambda path: Path(path).stem,
+)
+def test_suffix_gate_holds_while_any_restatement_survives(tmp_path, sidecar_rows, survivor):
+    """Every restatement 6764 removes is gated, so the gate cannot pass early."""
+    relpath, _task_id, label, capability, _expected = _SUFFIX_GATE
+    row = _the_one_row(sidecar_rows, relpath, label, capability)
+    files = dict.fromkeys(_SUFFIX_RESTATEMENT_SITES, _SUFFIX_FREE_SITE)
+    files[survivor] = f"{_SUFFIX_RESTATEMENT_SITES[survivor]}\n"
+
+    outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "sites", files), ref="HEAD")
+    assert outcome is CheckOutcome.FAIL, (
+        f"task 6764's delivered_check evaluates {outcome.value} on a tree where "
+        f"{survivor} still restates the sidecar suffix; it must gate every restatement."
+    )
+
+
+def test_suffix_gate_opens_once_no_site_restates_the_suffix(tmp_path, sidecar_rows):
+    """A tree free of every restatement delivers, so 6764 can actually finish."""
+    relpath, _task_id, label, capability, _expected = _SUFFIX_GATE
+    row = _the_one_row(sidecar_rows, relpath, label, capability)
+    files = dict.fromkeys(_SUFFIX_RESTATEMENT_SITES, _SUFFIX_FREE_SITE)
+
+    outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "sites", files), ref="HEAD")
+    assert outcome is CheckOutcome.PASS, (
+        f"task 6764's delivered_check evaluates {outcome.value} on a tree where no "
+        f"site restates the sidecar suffix."
     )
 
 
