@@ -19,6 +19,7 @@ widen the merge-time scoped-test selection to the whole owning package).
 from __future__ import annotations
 
 import pytest
+from shared.routing_split import split_bucket
 
 from orchestrator.config import (
     BackendsConfig,
@@ -41,7 +42,6 @@ from orchestrator.routing import (
     RoutingDecision,
     resolve_route,
 )
-from shared.routing_split import split_bucket
 
 pytestmark = pytest.mark.usefixtures("code_default_config")
 
