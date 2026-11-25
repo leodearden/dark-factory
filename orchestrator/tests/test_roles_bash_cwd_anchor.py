@@ -13,7 +13,7 @@ a prose pin, never a regex over wording, never a byte-size figure.
 from __future__ import annotations
 
 import pytest
-from _role_splice_contract import PreambleTailBlock, PreambleTailContractTests
+from _role_splice_contract import MARKDOWN_HEADING, PreambleTailBlock, PreambleTailContractTests
 
 from orchestrator.agents.bash_cwd_guidance import (
     BASH_CWD_ANCHOR_GUIDANCE,
@@ -32,9 +32,12 @@ class TestBashCwdAnchorSplice(PreambleTailContractTests):
         constant_name='BASH_CWD_ANCHOR_GUIDANCE',
         constant=BASH_CWD_ANCHOR_GUIDANCE,
         restore_remedy=(
-            'Restore the task-5971 guidance: without it a Bash-capable role whose '
-            'shell kept an earlier `cd` keeps guessing repo-root-relative paths '
-            'that come back not-found.'
+            'Restore the cwd block, both halves: without the task-5971 rule a '
+            'Bash-capable role whose shell kept an earlier `cd` keeps guessing '
+            'repo-root-relative paths that come back not-found; without the '
+            'task-11554 rule a role that removes the directory its shell stands '
+            'in reads the resulting "Exit code 1" as a failure, or has its next '
+            'call refused unrun.'
         ),
         brace_remedy='Describe any brace form in words; never spell it out.',
         excluded_roles_remedy=(
@@ -78,4 +81,15 @@ class TestBashCwdAnchorSplice(PreambleTailContractTests):
                 f'`+ {name}` term, for example one re-added by a merge '
                 'resolution, survives beside it. Delete the bare term.'
             ),
+        )
+
+    def test_block_opens_exactly_one_section(self) -> None:
+        """The two halves read as ONE section, as the pipeline block's do."""
+        sections = BASH_CWD_ANCHOR_GUIDANCE.count(MARKDOWN_HEADING)
+
+        assert sections == 1, (
+            f'BASH_CWD_ANCHOR_GUIDANCE opens {sections} `##` sections; it must be '
+            'ONE cwd block. Only LINGERING_CD_GUIDANCE opens the section; '
+            'DELETED_CWD_GUIDANCE continues it with a lead paragraph and must '
+            'not reopen one.'
         )
