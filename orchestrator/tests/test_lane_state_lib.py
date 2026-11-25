@@ -1531,7 +1531,9 @@ class TestLaneProtectGlobHonoursTheConfiguredIactBand:
         proc = _run_sourced(
             'lane_protect_glob _lane- _spec-',
             cwd=tmp_path,
-            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'}),
+            env=_sanitized_env_with_test_python3(
+                extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'},
+            ),
             timeout=_BRIDGE_TIMEOUT,
         )
         assert proc.returncode == 0, proc.stderr
@@ -1558,7 +1560,9 @@ class TestLaneProtectGlobHonoursTheConfiguredIactBand:
         proc = _run_sourced(
             'lane_protect_glob',
             cwd=tmp_path,
-            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': ''}),
+            env=_sanitized_env_with_test_python3(
+                extra={'REIFY_WARM_LANE_IACT_PREFIX': ''},
+            ),
             timeout=_BRIDGE_TIMEOUT,
         )
         assert proc.returncode == 0, proc.stderr
