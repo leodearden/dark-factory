@@ -1488,6 +1488,7 @@ class TestAResidueTheQueueCannotTakeSurvivesInTheLog:
                 await client.call_tool('escalate_info', arguments)
             return error_payload(excinfo)['escalation_id']
         result = await client.call_tool('escalate_info', arguments)
+        assert result.meta is not None
         return result.meta['markup_repair']['unrecovered_residue_id']
 
     @pytest.mark.asyncio
