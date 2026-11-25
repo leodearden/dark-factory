@@ -6676,8 +6676,9 @@ class TaskInterceptor:
             ``ConfigurationError`` shape when the curator is disabled. When
             the corpus cannot be searched it returns ``{'results': [],
             'degraded': True, 'error', 'error_type', 'billing_exhausted'}``:
-            the answer is unknown, not "nothing similar", and the ``error``
-            key makes callers that treat any error as a failure fail closed.
+            the answer is unknown, not "nothing similar", and a caller that
+            treats any ``error`` key as a failed call never reads it as
+            "no match".
         """
         curator = await self._get_curator()
         if curator is None:

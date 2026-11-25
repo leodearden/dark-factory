@@ -9980,7 +9980,8 @@ def create_mcp_server(
         outage), the reply is ``{'results': [], 'degraded': true, 'error':
         ..., 'error_type': ..., 'billing_exhausted': <'api_key_credits' or
         null>}``. That reply means the lookup FAILED, not "nothing similar
-        filed", so do not file on it.
+        filed": your duplicate check did not run. What a findings
+        instrument does next is in docs/quality-findings-contract.md §8.
 
         Args:
             project_root: Absolute path to project root.
