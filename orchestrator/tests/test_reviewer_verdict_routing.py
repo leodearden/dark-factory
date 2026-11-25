@@ -187,7 +187,9 @@ class TestRunReviewerVerdictRouting:
         assert result['verdict'] == 'ERROR'
         assert result['reviewer'] == 'reviewer_comprehensive'
 
-    async def test_a_refused_kindless_submission_is_failsafe_error(self, tmp_path: Path):
+    async def test_a_refused_kindless_submission_is_failsafe_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
         """INV-6: a reviewer whose only submission the intake refused for a
         missing kind leaves no verdict, so the gate reads ERROR, never a pass.
         """
@@ -203,7 +205,7 @@ class TestRunReviewerVerdictRouting:
             ))
             return AgentResult(success=True, output='submitted')
 
-        f.wf._invoke = AsyncMock(side_effect=_invoke_submits_kindless_issue)  # type: ignore[method-assign]
+        monkeypatch.setattr(f.wf, '_invoke', AsyncMock(side_effect=_invoke_submits_kindless_issue))
 
         result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
 
