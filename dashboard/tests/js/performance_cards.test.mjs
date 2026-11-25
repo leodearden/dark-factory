@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+import { performanceEntry } from './wire_fixtures.mjs';
 
 const REDUX = '../../src/dashboard/static/redux/';
 const LOAD_CHAIN = ['datum.js', 'performance_cards.js'].map(name => REDUX + name);
@@ -61,14 +62,9 @@ function cardsFor(state = 'fresh') {
   return { ...served(state, CARDS, 'measured before the window'), as_of: LAST_COMPLETION };
 }
 
-// One PERFORMANCE[label] entry: the cards Datum beside its histories.
+// One PERFORMANCE[label] entry: the cards Datum beside its (empty) history.
 function entryWith(cards) {
-  return {
-    cards,
-    time_centiles_history: { labels: [], p50: [], p95: [] },
-    one_pass_history: { labels: [], values: [] },
-    escalation_history: { labels: [], values: [] },
-  };
+  return performanceEntry({ cards });
 }
 
 function perfData(entries, listing, receipt = RECEIPT) {
@@ -126,7 +122,7 @@ test('projectCards: a project without a cards Datum is a reasoned hole naming it
   const malformed = [
     ['an absent project', undefined],
     ['a null entry', null],
-    ['an entry with no cards', { one_pass_history: { labels: [], values: [] } }],
+    ['an entry with no cards', { history_labels: [], one_pass_history: { values: [] } }],
     ['bare cards', entryWith(CARDS)],
   ];
   for (const [label, entry] of malformed) {

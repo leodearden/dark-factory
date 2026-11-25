@@ -1690,6 +1690,46 @@ def test_performance_cards_js_load_order(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: performance_history.js is served, versioned, and loads
+# before the tab that reads it (task 10138)
+#
+# tabs.jsx destructures window.DF_PERFORMANCE_HISTORY at module scope with no
+# fallback, so a missing or late tag blanks PerfTab.
+# ---------------------------------------------------------------------------
+
+_PERFORMANCE_HISTORY_PREFIX = '/static/redux/performance_history.js'
+
+
+def test_performance_history_js_is_served(client) -> None:
+    """GET /static/redux/performance_history.js returns 200."""
+    resp = client.get(_PERFORMANCE_HISTORY_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_PERFORMANCE_HISTORY_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_performance_history_js_has_cache_buster(index_html_body: str) -> None:
+    """performance_history.js is present among the VERSIONED redux assets."""
+    assert re.search(r'/static/redux/performance_history\.js\?v=\d+', index_html_body), (
+        'performance_history.js is not present among the versioned /static/redux/* '
+        'assets in index.html — tabs.jsx destructures window.DF_PERFORMANCE_HISTORY '
+        'at top level with no fallback. Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+def test_performance_history_js_loads_before_tabs(index_html_body: str) -> None:
+    assert_script_loads_before(
+        index_html_body,
+        _PERFORMANCE_HISTORY_PREFIX,
+        _TABS_PREFIX,
+        before_label='performance_history.js',
+        after_label='tabs.jsx',
+        consumer_note='tabs.jsx ' + _READS_AT_MODULE_SCOPE.format(before='performance_history.js'),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: escalation_views.js is served, versioned, and sits between
 # the modules it reads and the two escalation tabs that read it (task 5596,
 # PRD leaf eta)

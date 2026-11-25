@@ -333,6 +333,21 @@ export function projectRow(id) {
   return { id, name: id };
 }
 
+// One PERFORMANCE[label] entry, as data/redux_api.py::shape_performance serves
+// it: the project's cards Datum beside the keys
+// data/performance.py::PerformanceHistory.to_wire() emits, every series on the
+// one history_labels axis. A series left out is 0 at every hour.
+export function performanceEntry({ cards, labels = [], p50, p95, onePass, escalation } = {}) {
+  const series = values => values ?? labels.map(() => 0);
+  return {
+    cards,
+    history_labels: labels,
+    time_centiles_history: { p50: series(p50), p95: series(p95) },
+    one_pass_history: { values: series(onePass) },
+    escalation_history: { values: series(escalation) },
+  };
+}
+
 // The MEMORY_EVALS builders below are not yet checked by
 // boundary_wire_fixtures.test.mjs: no boundary payload serves MEMORY_EVALS.
 
