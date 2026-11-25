@@ -73,6 +73,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "dashboard/dark-factory-dashboard.service",
         "dashboard/dark-factory-load-sampler.service",
         "fused-memory/fused-memory.service.example-systemd-config",
+        "scripts/client-feed-filer.service.template",
         "scripts/client-feed.service.template",
         "scripts/dashboard.service.template",
         "scripts/exception-owner-sweep.service",
