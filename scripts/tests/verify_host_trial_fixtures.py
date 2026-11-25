@@ -151,11 +151,26 @@ def invocation(completed_at: datetime, account: str, cost_usd: float) -> dict[st
     return {'account_name': account, 'cost_usd': cost_usd, 'started_at': stamp, 'completed_at': stamp}
 
 
-def cap_hit(at: datetime, account: str, resets_at: datetime | None) -> dict[str, Any]:
-    """An ``account_events`` cap_hit; *resets_at* None writes the details without one."""
-    details: dict[str, Any] = {'reason': "You've hit your weekly limit"}
+_WEEKLY_CAP_REASON = "You've hit your weekly limit · resets Nov 19, 1pm (Europe/London)"
+"""A live weekly cap_hit reason, as the CLI banner writes it."""
+
+
+def cap_hit(
+    at: datetime,
+    account: str,
+    resets_at: datetime | None,
+    *,
+    reason: str | None = _WEEKLY_CAP_REASON,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """An ``account_events`` cap_hit; a None *resets_at* or *reason* omits that key, a *scope* adds one."""
+    details: dict[str, Any] = {}
+    if reason is not None:
+        details['reason'] = reason
     if resets_at is not None:
         details['resets_at'] = _iso(resets_at)
+    if scope is not None:
+        details['scope'] = scope
     return {'account_name': account, 'event_type': 'cap_hit', 'details': details, 'created_at': _iso(at)}
 
 

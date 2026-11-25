@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 from verify_host_trial_allowance import CYCLE, account_cycles, expired_in_block
 from verify_host_trial_blocks import Block, BlockOrigin, HostState
-from verify_host_trial_stores import CapHit, Invocation
+from verify_host_trial_stores import CapHit, CapKind, Invocation
 
 SINCE = datetime(2026, 11, 11, tzinfo=UTC)
 UNTIL = datetime(2026, 11, 25, tzinfo=UTC)
@@ -19,12 +19,16 @@ def spend(account: str, when: datetime, usd: float) -> Invocation:
     return Invocation(when, account, usd)
 
 
+def weekly(account: str, when: datetime, reset: datetime | None) -> CapHit:
+    return CapHit(account, when, reset, CapKind.WEEKLY)
+
+
 R_A = at(16, 21)
 """max-a's capped reset; its lattice puts the next reset at the 23rd, 21:00."""
 R_B = at(20, 10)
 """max-b's capped reset; its lattice puts the previous reset at the 13th, 10:00."""
 
-TWO_ACCOUNTS_CAPS = (CapHit('max-a', at(15, 10), R_A), CapHit('max-b', at(19, 4), R_B))
+TWO_ACCOUNTS_CAPS = (weekly('max-a', at(15, 10), R_A), weekly('max-b', at(19, 4), R_B))
 TWO_ACCOUNTS_SPEND = (
     spend('max-a', at(12), 1500.0),
     spend('max-a', at(15), 500.0),
@@ -51,7 +55,7 @@ class TestCappedCycles:
         assert cycle.hours_capped == 35.0
 
     def test_one_cap_recorded_by_several_stores_is_one_cycle(self):
-        caps = (*TWO_ACCOUNTS_CAPS, CapHit('max-a', at(15, 11), R_A), CapHit('max-a', at(15, 10), R_A))
+        caps = (*TWO_ACCOUNTS_CAPS, weekly('max-a', at(15, 11), R_A), weekly('max-a', at(15, 10), R_A))
 
         reading = account_cycles(caps, TWO_ACCOUNTS_SPEND, SINCE, UNTIL)
 
@@ -73,7 +77,7 @@ class TestTheLattice:
 
     def test_a_capped_cycle_near_a_lattice_point_replaces_it(self):
         """A reset an hour off the lattice (a clock change) is the same cycle, not a second one."""
-        caps = (CapHit('max-c', at(24, 1), at(24, 21)), CapHit('max-c', at(17, 2), at(17, 20)))
+        caps = (weekly('max-c', at(24, 1), at(24, 21)), weekly('max-c', at(17, 2), at(17, 20)))
 
         reading = account_cycles(caps, (spend('max-c', at(15), 10.0),), SINCE, UNTIL)
 
@@ -81,7 +85,7 @@ class TestTheLattice:
         assert all(cycle.capped for cycle in reading.cycles)
 
     def test_an_account_with_no_activity_near_the_window_is_dormant_and_unplaced(self):
-        caps = (*TWO_ACCOUNTS_CAPS, CapHit('max-old', at(1, 5), at(2, 21)))
+        caps = (*TWO_ACCOUNTS_CAPS, weekly('max-old', at(1, 5), at(2, 21)))
 
         reading = account_cycles(caps, TWO_ACCOUNTS_SPEND, SINCE, UNTIL)
 
@@ -107,7 +111,7 @@ class TestTheEstimate:
         assert cycles_by_reset(reading)['max-a', R_A + CYCLE].expired_usd == 0.0
 
     def test_with_no_capped_cycle_in_the_window_the_estimate_and_expiry_are_unknown(self):
-        caps = (CapHit('max-a', at(1, 5), at(2, 21)),)
+        caps = (weekly('max-a', at(1, 5), at(2, 21)),)
 
         reading = account_cycles(caps, (spend('max-a', at(12), 100.0),), SINCE, UNTIL)
 
@@ -123,7 +127,7 @@ class TestUnplaced:
         assert reading.unplaced_accounts == ('max-z',)
 
     def test_a_cap_hit_without_a_reset_is_counted_as_unplaceable(self):
-        caps = (*TWO_ACCOUNTS_CAPS, CapHit('max-a', at(13), None))
+        caps = (*TWO_ACCOUNTS_CAPS, weekly('max-a', at(13), None))
 
         assert account_cycles(caps, TWO_ACCOUNTS_SPEND, SINCE, UNTIL).unplaceable_cap_hits == 1
 
@@ -139,7 +143,7 @@ class TestExpiredInBlock:
         assert expired_in_block(reading, self.block(at(20), UNTIL)) == 1700.0
 
     def test_one_unknown_cycle_makes_the_block_unknown(self):
-        reading = account_cycles((CapHit('max-a', at(1, 5), at(2, 21)),), (spend('max-a', at(12), 1.0),), SINCE, UNTIL)
+        reading = account_cycles((weekly('max-a', at(1, 5), at(2, 21)),), (spend('max-a', at(12), 1.0),), SINCE, UNTIL)
 
         assert expired_in_block(reading, self.block(SINCE, UNTIL)) is None
 

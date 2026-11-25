@@ -28,6 +28,7 @@ from verify_host_trial_stores import (
     LOCK_CONFLICT_REASONS,
     AdmissionPlan,
     CapHit,
+    CapKind,
     CpuSample,
     Deferral,
     EventType,
@@ -240,10 +241,76 @@ class TestTheOtherSources:
     def test_cap_hits_carry_their_reset_or_none(self, store):
         root = store(account_events=[cap_hit(day(2), 'max-a', day(4)), cap_hit(day(3), 'max-b', None)])
 
-        assert read(root).cap_hits == (CapHit('max-a', day(2), day(4)), CapHit('max-b', day(3), None))
+        assert read(root).cap_hits == (
+            CapHit('max-a', day(2), day(4), CapKind.WEEKLY),
+            CapHit('max-b', day(3), None, CapKind.WEEKLY),
+        )
 
     def test_the_lock_conflict_reasons(self):
         assert {'plan_blast_radius_lock_conflict', 'scope_grant_lock_conflict'} == LOCK_CONFLICT_REASONS
+
+
+FABLE_SCOPE = 'claude-fable-5-1'
+
+
+class TestCapKind:
+    """Each cap_hit is classified at the store boundary; a reason it does not recognise is read, never dropped."""
+
+    @pytest.mark.parametrize(
+        ('reason', 'scope', 'kind'),
+        [
+            pytest.param(
+                "You've hit your weekly limit · resets Nov 19, 1pm (Europe/London)", None, CapKind.WEEKLY, id='weekly'
+            ),
+            pytest.param("You've hit your session limit · resets 3pm (Europe/London)", None, CapKind.SESSION, id='session'),
+            pytest.param("You've hit your 5-hour limit · resets 7pm (Europe/London)", None, CapKind.SESSION, id='5-hour'),
+            pytest.param(
+                "You've hit your Sonnet limit · resets 2pm (Europe/London)", None, CapKind.PER_MODEL, id='model-word'
+            ),
+            pytest.param(
+                "You've hit your Fable limit · resets Nov 25, 10am (Europe/London). Switch to another model to continue.",
+                FABLE_SCOPE,
+                CapKind.PER_MODEL,
+                id='model-word-and-scope',
+            ),
+            pytest.param(
+                "You've hit your weekly limit · resets 1pm (Europe/London)",
+                FABLE_SCOPE,
+                CapKind.PER_MODEL,
+                id='scope-wins-over-weekly',
+            ),
+            pytest.param(
+                "You're out of extra usage · resets 9:40am (Europe/London)", None, CapKind.UNRECOGNISED, id='extra-usage'
+            ),
+            pytest.param("You've hit your org's monthly usage limit", None, CapKind.UNRECOGNISED, id='org-monthly'),
+            pytest.param(
+                "You've hit your limit · resets 11:10pm (Europe/London)", None, CapKind.UNRECOGNISED, id='no-limit-word'
+            ),
+            pytest.param(
+                'Heuristic cap: zero-cost instant exit — Agent produced no output',
+                None,
+                CapKind.UNRECOGNISED,
+                id='heuristic',
+            ),
+            pytest.param(None, None, CapKind.UNRECOGNISED, id='no-reason'),
+        ],
+    )
+    def test_a_live_reason_is_read_with_its_kind(self, store, reason, scope, kind):
+        root = store(account_events=[cap_hit(day(2), 'max-a', day(4), reason=reason, scope=scope)])
+
+        reading = read(root)
+
+        assert reading.cap_hits == (CapHit('max-a', day(2), day(4), kind),)
+        assert reading.skipped[Source.CAP_HIT] == 0
+
+    def test_a_reason_that_is_not_text_is_counted_as_skipped(self, store):
+        malformed = {**cap_hit(day(2), 'max-a', day(4)), 'details': {'reason': 42, 'resets_at': day(4).isoformat()}}
+        root = store(account_events=[malformed, cap_hit(day(3), 'max-b', day(5))])
+
+        reading = read(root)
+
+        assert reading.cap_hits == (CapHit('max-b', day(3), day(5), CapKind.WEEKLY),)
+        assert reading.skipped[Source.CAP_HIT] == 1
 
 
 class TestReadOnly:
