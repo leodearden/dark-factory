@@ -33,8 +33,9 @@ What remains here is what the boundary guard's escalation sink CALLS, plus the
 re-exports ``server/tools.py`` still imports:
 
 * :func:`emit_markup_storm_escalation` — one deduped record per burst (INV-4).
-* :func:`emit_markup_residue_escalation` — one record per unrepairable refusal,
-  deliberately NOT deduped, holding that caller's payload verbatim (INV-7).
+* :func:`emit_markup_residue_escalation` — one record per residue record of
+  either kind, deliberately NOT deduped, holding that caller's payload
+  verbatim (INV-7).
 * ``_MARKUP_STORM_THRESHOLD`` / ``_MARKUP_STORM_WINDOW_SECONDS`` — the ONE
   source for the tuning, read by the guard when it builds the middleware.
 * ``MARKUP_OVERRIDE_KEY``, ``markup_override_requested``,

@@ -1,5 +1,6 @@
 """Tests for ``shared.markup_residue_custody`` — the words every residue sink
-states about a residue record's call and about who still holds its payload.
+states about a residue record's call and about who still holds its payload,
+and the last log floor for a payload no store took.
 """
 
 from __future__ import annotations

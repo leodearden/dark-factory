@@ -1,5 +1,6 @@
-"""Per residue kind, the words every residue sink states about the call and
-about who still holds the payload."""
+"""Custody of a markup residue payload: per residue kind, the words every
+residue sink states about the call and about who still holds the payload,
+plus the last log floor for a payload no store took."""
 
 from __future__ import annotations
 
