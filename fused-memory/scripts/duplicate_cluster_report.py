@@ -45,7 +45,7 @@ import sys
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -247,7 +247,7 @@ class Fitness(_Frozen):
 class Ruling(_Frozen):
     """A dated human ruling, by the escalation that recorded it."""
 
-    ruled_at: str = Field(min_length=1)
+    ruled_at: date
     escalation_id: str = Field(min_length=1)
 
 

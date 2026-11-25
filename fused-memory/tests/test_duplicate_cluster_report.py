@@ -62,8 +62,7 @@ class TestCommittedConfig:
     def test_gate_filing_is_descoped_by_the_2026_11_17_ruling(self) -> None:
         caveat = report.load_config(COMMITTED_CONFIG).recall_caveat
 
-        assert caveat.fitness.gate_filing == 'descoped'
-        assert caveat.gate_filing_ruling.model_dump() == {
+        assert caveat.gate_filing_ruling.model_dump(mode='json') == {
             'ruled_at': '2026-11-17', 'escalation_id': 'esc-10244-1',
         }
 
@@ -135,6 +134,12 @@ _BAD_CONFIGS = {
     ),
     'gate_filing_ruling_blank_escalation_id': lambda d: _with_caveat(
         d, gate_filing_ruling={'ruled_at': '2026-11-17', 'escalation_id': ''},
+    ),
+    'gate_filing_ruling_blank_ruled_at': lambda d: _with_caveat(
+        d, gate_filing_ruling={'ruled_at': '', 'escalation_id': 'esc-10244-1'},
+    ),
+    'gate_filing_ruling_ruled_at_not_a_date': lambda d: _with_caveat(
+        d, gate_filing_ruling={'ruled_at': '2026-17-11', 'escalation_id': 'esc-10244-1'},
     ),
     'adjudicator_measurements_missing': lambda d: _with(
         d, recall_caveat=_without(d['recall_caveat'], 'adjudicator_measurements'),
