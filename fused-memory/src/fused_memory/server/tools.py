@@ -9976,6 +9976,12 @@ def create_mcp_server(
         ``files_to_modify``, ``priority``, ``updated_at``, ``score`` (cosine
         similarity, higher = more similar), and ``status``.
 
+        When the task corpus cannot be searched (an embedder or Qdrant
+        outage), the reply is ``{'results': [], 'degraded': true, 'error':
+        ..., 'error_type': ..., 'billing_exhausted': <'api_key_credits' or
+        null>}``. That reply means the lookup FAILED, not "nothing similar
+        filed", so do not file on it.
+
         Args:
             project_root: Absolute path to project root.
             query: Free-text query (e.g. a paraphrase of the task you're about to file).

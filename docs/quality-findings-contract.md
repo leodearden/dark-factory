@@ -213,8 +213,10 @@ decided each finding:
 3. **Curator.** The ticket path's own `candidate_key` dedup is the last net,
    never the first.
 
-A run that cannot perform step 1 (store unreachable) files nothing and
-says so in its report.
+A run that cannot perform step 1 (store unreachable), or step 2 (a
+`search_tasks` reply carrying `error`, including the `degraded: true` reply
+an embedder or Qdrant outage produces), files nothing and says so in its
+report.
 
 ## 9. Consumption between instruments
 
