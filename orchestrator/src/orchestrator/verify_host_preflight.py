@@ -92,8 +92,8 @@ def refuse_persistent_merge_worktree(config: OrchestratorConfig) -> None:
     """PreflightRefused when the project reuses one merge worktree, which a preflight beside the lane would share."""
     if config.git.persistent_merge_worktree:
         raise PreflightRefused(
-            'git.persistent_merge_worktree is on in this project config: a preflight '
-            'verify would share the lane\'s one merge worktree, so it is refused'
+            'git.persistent_merge_worktree is on in this project config; a preflight '
+            'runs beside the lane only in an ephemeral worktree, so it is refused'
         )
 
 
@@ -472,6 +472,45 @@ def production_runner_builder(config: OrchestratorConfig, deployed_sha: Deployed
     def build(runner_config: VerifyRunnerConfig) -> RemoteRunner:
         return remote_runner_for(config, runner_config, config.project_root, deployed_sha=deployed_sha)
     return build
+
+
+def render_summary(outcome: PreflightOutcome) -> str:
+    """A few human lines for *outcome*; the record files are the machine-readable form."""
+    lines = [*_verdict_lines(outcome.primary)]
+    if outcome.reference is not None:
+        lines.extend(_verdict_lines(outcome.reference))
+    if outcome.parity is not None:
+        lines.append(_parity_line(outcome.parity))
+    lines.extend(f'record: {path}' for path in outcome.record_paths)
+    return '\n'.join(lines)
+
+
+def _verdict_lines(verdict: RunnerVerdict) -> list[str]:
+    status = 'passed' if verdict.passed else 'NOT passed'
+    ensure = 'n/a' if verdict.ensure_gate_secs is None else f'{verdict.ensure_gate_secs:.1f}s'
+    lines = [f'{verdict.runner} @ {verdict.sha}: {status} (wall {verdict.wall_secs:.1f}s, ensure_gate {ensure})']
+    if verdict.no_verdict is not None:
+        lines.append(f'  no verdict ({verdict.no_verdict.kind}): {verdict.no_verdict.message}')
+    if verdict.trivial:
+        lines.append('  trivial pass: the remote ran nothing, so it is not a pass')
+    lines.extend(
+        f'  {prefix}: ' + (
+            'failing ids unattributed' if outcome.failing_count is None
+            else f'{outcome.failing_count} failing'
+        )
+        for prefix, outcome in verdict.modules.items()
+    )
+    skipped = 'unknown' if verdict.skipped_test_ids is None else len(verdict.skipped_test_ids)
+    lines.append(f'  skipped: {skipped}')
+    return lines
+
+
+def _parity_line(parity: SkipParity) -> str:
+    if parity.undetermined is not None:
+        return f'skip parity vs {parity.reference}: undetermined ({parity.undetermined})'
+    if parity.holds:
+        return f'skip parity vs {parity.reference}: holds ({len(parity.excepted)} owned exceptions applied)'
+    return f'skip parity vs {parity.reference}: broken, unexplained {", ".join(parity.unexplained)}'
 
 
 def _archive_root(config: OrchestratorConfig) -> Path:

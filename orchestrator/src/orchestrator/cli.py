@@ -1244,6 +1244,55 @@ def verify_task(sha: str, spec_json: str, config: OrchestratorConfig, request_id
     )
 
 
+@main.command('verify-host-preflight')
+@click.option('--runner', required=True, help='A declared verify runner, enabled or not')
+@click.option('--sha', default=None, help='Commit to verify (default: the tip of git.main_branch)')
+@click.option('--reference', default=None,
+              help='A second declared runner verifying the same commit, for skip parity')
+@click.option('--json', 'as_json', is_flag=True, help="Print the runner's record as JSON")
+@pass_config()
+def verify_host_preflight(
+    runner: str, sha: str | None, reference: str | None, as_json: bool, config: OrchestratorConfig,
+):
+    """Run the full merge gate on one verify host through the production remote path.
+
+    Exit 0 when the gate passed and, with --reference, skip parity holds; 1
+    when the gate is red, vacuous or produced no verdict, or parity is broken
+    or undetermined; 2 when refused before any dispatch.  The record lands in
+    data/verify-logs/preflight/<runner>-<sha>.json; see
+    docs/verify-host-preflight.md.
+    """
+    from orchestrator.deployed_sha import capture_deployed_sha, resolve_code_checkout
+
+    # The gate the preflight builds is this process's own wire path (task 6565 D1).
+    deployed_sha = capture_deployed_sha(
+        resolve_code_checkout(),
+        lambda: importlib.import_module('orchestrator.verify_host_preflight'),
+    )
+    from orchestrator import verify_host_preflight as preflight
+
+    if deployed_sha is None:
+        click.echo(
+            'Error: this process cannot read the commit it runs (no readable git checkout '
+            'above its code), and the remote gate is built from that sha (task 6565)',
+            err=True,
+        )
+        sys.exit(2)
+    try:
+        outcome = asyncio.run(preflight.run_preflight(
+            config, runner=runner, sha=sha, reference=reference, deployed_sha=deployed_sha,
+            build_runner=preflight.production_runner_builder(config, deployed_sha),
+        ))
+    except (preflight.PreflightRefused, preflight.SkipParityExceptionsError) as exc:
+        click.echo(f'Error: {exc}', err=True)
+        sys.exit(2)
+    if as_json:
+        click.echo(json.dumps(preflight.record_dict(outcome.primary, outcome.parity), indent=2, sort_keys=True))
+    else:
+        click.echo(preflight.render_summary(outcome))
+    sys.exit(0 if outcome.ok else 1)
+
+
 def _recorded_merge_worktree_remover(git_ops: 'GitOps') -> Callable[[Path], None]:
     """Return cancel-verify's remover for the worktree a killed run recorded.
 
