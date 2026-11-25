@@ -878,14 +878,13 @@ _IMPORT_GRAPH_NOTE = (
 )
 
 
-def take_snapshot(root: Path, *, run_id: str, rules: RustRules) -> dict[str, Any]:
-    """Measure *root*'s HEAD under *rules* as a SCHEMA_VERSION snapshot."""
-    started = time.monotonic()
-    params = measurement_params(rules)
-    head = source_measures.head_commit(root)
-    if _run(['git', 'status', '--porcelain', '--untracked-files=no'], root).stdout.strip():
-        print('dirty domain: tracked changes in the pinned worktree', file=sys.stderr)
-        sys.exit(2)
+@dataclasses.dataclass(frozen=True)
+class _Measured:
+    evidence: dict[str, Any]
+    figures: dict[str, Any]  # files, import_graph, per_area, cycles_by_area, totals, impl_spread
+
+
+def _measure_tree(root: Path, head: str, rules: RustRules) -> _Measured:
     domain = _domain(root, rules)
     modules = _cargo_modules(root, domain.paths)
     lizard = _lizard_rows(root, domain.paths, rules)
@@ -903,34 +902,75 @@ def take_snapshot(root: Path, *, run_id: str, rules: RustRules) -> dict[str, Any
     totals: Counter[str] = Counter()
     for c in per_area.values():
         totals.update(c)
+    evidence = {
+        'complete': True,
+        'unreadable': [],
+        'domain_files': len(records),
+        'unmapped_paths': list(domain.unmapped),
+        'lizard_stderr': lizard.stderr[-2000:],
+    }
+    return _Measured(
+        evidence=evidence,
+        figures={
+            'files': sorted(records.values(), key=lambda r: r['path']),
+            'import_graph': {
+                'edges': sorted({(f, t) for f, t, *_ in edges}),
+                'reach_back': graph.reach_back,
+                'deferred': graph.deferred,
+                'cycles': graph.cycles,
+                'hidden_cycles': graph.hidden,
+                'typing_cycles': [],
+                'note': _IMPORT_GRAPH_NOTE,
+            },
+            'per_area': {area: dict(c, prose_ratio=_prose_ratio(c)) for area, c in per_area.items()},
+            'cycles_by_area': dict(_cycles_by_area(graph.cycles, modules, records)),
+            'totals': dict(totals, prose_ratio=_prose_ratio(totals)),
+            'impl_spread': [{'files': n, 'crate': c, 'type': t} for n, c, t in graph.impl_spread],
+        },
+    )
+
+
+def _uncommitted_paths(root: Path) -> list[str]:
+    listing = _run(['git', 'status', '--porcelain=v1', '-z', '--untracked-files=no', '--no-renames'], root).stdout
+    return sorted({record[3:] for record in listing.split('\0') if record})
+
+
+def _require_clean_tree(root: Path, as_of: str) -> None:
+    dirty = _uncommitted_paths(root)
+    if dirty:
+        raise source_measures.MetricsError(
+            f'the tree has uncommitted changes, so HEAD ({as_of}) is not what the work tree holds: '
+            f'{", ".join(dirty)}; commit, or measure a clean checkout'
+        )
+
+
+def _require_unmoved_head(root: Path, as_of: str) -> None:
+    now = source_measures.head_commit(root)
+    if now != as_of:
+        raise source_measures.MetricsError(
+            f'HEAD moved from {as_of} to {now} during the measurement (a merge '
+            'landed?); re-run, or measure a pinned worktree'
+        )
+
+
+def take_snapshot(root: Path, *, run_id: str, rules: RustRules) -> dict[str, Any]:
+    """Measure *root*'s HEAD under *rules* as a SCHEMA_VERSION snapshot; refuse a dirty tree or a moved HEAD."""
+    started = time.monotonic()
+    params = measurement_params(rules)
+    as_of = source_measures.head_commit(root)
+    _require_clean_tree(root, as_of)
+    measured = _measure_tree(root, as_of, rules)
+    _require_unmoved_head(root, as_of)
+    _require_clean_tree(root, as_of)
     return {
         'schema_version': SCHEMA_VERSION,
         'instrument': INSTRUMENT,
         'run_id': run_id,
-        'as_of_sha': head,
-        'evidence': {
-            'complete': True,
-            'unreadable': [],
-            'domain_files': len(records),
-            'unmapped_paths': list(domain.unmapped),
-            'lizard_stderr': lizard.stderr[-2000:],
-        },
+        'as_of_sha': as_of,
+        'evidence': measured.evidence,
         'cost': {'wall_clock_s': round(time.monotonic() - started, 1)},
         'params': params,
-        'files': sorted(records.values(), key=lambda r: r['path']),
-        'import_graph': {
-            'edges': sorted({(f, t) for f, t, *_ in edges}),
-            'reach_back': graph.reach_back,
-            'deferred': graph.deferred,
-            'cycles': graph.cycles,
-            'hidden_cycles': graph.hidden,
-            'typing_cycles': [],
-            'note': _IMPORT_GRAPH_NOTE,
-        },
-        'per_area': {area: dict(c, prose_ratio=_prose_ratio(c)) for area, c in per_area.items()},
-        'cycles_by_area': dict(_cycles_by_area(graph.cycles, modules, records)),
-        'totals': dict(totals, prose_ratio=_prose_ratio(totals)),
-        'impl_spread': [{'files': n, 'crate': c, 'type': t} for n, c, t in graph.impl_spread],
+        **measured.figures,
     }
 
 
