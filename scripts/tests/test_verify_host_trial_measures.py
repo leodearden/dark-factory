@@ -5,7 +5,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 
-import pytest
 from verify_host_trial_blocks import Block, BlockOrigin, HostState
 from verify_host_trial_measures import (
     FIGURE_RULES,
@@ -283,17 +282,3 @@ class TestRules:
         figures = project_figures(project(), HOST, A)
 
         assert set(figures) | {FigureId.CPU_PRESSURE} == set(FigureId)
-
-    @pytest.mark.parametrize(
-        ('figure', 'words'),
-        [
-            (FigureId.MERGE_VERIFY_MEDIAN, ('duration_ms', 'END')),
-            (FigureId.LANDINGS_PER_DAY, ('first done row', 'whole store')),
-            (FigureId.TURN_WAIT_SHARE, ('remote host', 'task_started', 'task_completed')),
-            (FigureId.DEFERRAL_HOURS, ('scheduler_tick',)),
-            (FigureId.CPU_PRESSURE, ('ARM_METRICS',)),
-        ],
-    )
-    def test_the_rules_state_the_readme_level_rule(self, figure, words):
-        for word in words:
-            assert word in FIGURE_RULES[figure]

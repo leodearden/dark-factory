@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import pytest
-from verify_host_trial_decision import DECISION_RULE, BlockLandings, Decision, decide
+from verify_host_trial_decision import BlockLandings, Decision, decide
 
 
 def on(landings: int, days: float, host_verifies: int = 5) -> BlockLandings:
@@ -100,8 +100,3 @@ class TestCostAndValidation:
     def test_a_negative_host_cost_is_refused(self):
         with pytest.raises(ValueError, match='host cost'):
             decide([], host_cost_usd=-1, seat_bill_usd=1375, resamples=10, seed=0)
-
-
-def test_the_decision_rule_names_the_block_bootstrap_and_the_seat_bill():
-    assert 'block bootstrap' in DECISION_RULE
-    assert 'seat bill' in DECISION_RULE

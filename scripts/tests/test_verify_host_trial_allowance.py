@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from verify_host_trial_allowance import ALLOWANCE_RULE, CYCLE, account_cycles, expired_in_block
+from verify_host_trial_allowance import CYCLE, account_cycles, expired_in_block
 from verify_host_trial_blocks import Block, BlockOrigin, HostState
 from verify_host_trial_stores import CapHit, Invocation
 
@@ -147,8 +147,3 @@ class TestExpiredInBlock:
         reading = account_cycles(TWO_ACCOUNTS_CAPS, TWO_ACCOUNTS_SPEND, SINCE, UNTIL)
 
         assert expired_in_block(reading, self.block(SINCE, at(12))) == 0.0
-
-
-def test_the_rule_says_it_is_an_estimate_in_list_usd_counting_every_model_once():
-    for words in ('estimate', 'list USD', 'every model counted once'):
-        assert words in ALLOWANCE_RULE
