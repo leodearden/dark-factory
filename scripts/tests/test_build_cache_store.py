@@ -510,11 +510,9 @@ TMPFS = Path("/dev/shm")
 def tmpfs_scratch_root() -> Path | None:
     """A fresh directory on a writable, exec-allowed tmpfs, or None.
 
-    An install pre-creates 4,368 store directories. On the loaded workstation's
-    ext4 that one mkdir took 26-36s (measured 2026-11-19, load average ~130),
-    which pushed installs in the full suite past their timeout; tmpfs takes 0.1s.
-    None sends the world back to tmp_path: the landlock agent sandbox, for one,
-    cannot create entries under /dev (task 7711).
+    An install pre-creates 4,368 store directories, which is slow on a loaded
+    disk. None sends the world back to tmp_path: the landlock agent sandbox,
+    for one, cannot create entries under /dev (task 7711).
     """
     try:
         if os.statvfs(TMPFS).f_flag & (os.ST_NOEXEC | os.ST_RDONLY):
