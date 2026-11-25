@@ -34,6 +34,13 @@ boundary under harness-backend-reconnect-pi).
 Backend NOTE: ``_invoke`` keeps its own inline resolve+record copy for now
 (``workflow.py`` is locked out of this task); a documented follow-up can
 dedupe it onto this helper.
+
+The module also holds ``plan_shape_fields``, the ``PlanShape`` -> recorded
+fields derivation that both recorders (``resolve_and_record_route`` and
+``workflow.py::TaskWorkflow._record_routing_decision``) splat into
+``RoutingDecisionMirror``. It shapes the routing record, not the resolution,
+so it lives here with the record rather than beside ``PlanShape`` in
+``routing.py``.
 """
 
 from __future__ import annotations
