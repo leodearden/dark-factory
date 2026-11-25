@@ -87,7 +87,8 @@ These cases are refused with exit 2:
 ## Reading the record
 
 Each runner's record is at `data/verify-logs/preflight/<runner>-<sha>.json`
-under the project root. The fields are:
+under the project root. A later preflight of the same runner at the same sha,
+standalone or as a reference, replaces that file. The fields are:
 
 | Field | Meaning |
 |-------|---------|
@@ -105,7 +106,7 @@ under the project root. The fields are:
 | `modules.<prefix>.failing_count` | Their count, or null. |
 | `failing_test_ids` | The run-wide failing ids. |
 | `skipped_test_ids` | The run-wide skipped junit ids, or null when no junit was collected. |
-| `skip_parity` | The parity block with `--reference`, else null. |
+| `skip_parity` | With `--reference`, the parity block, written into both runners' records; else null. It names `runner` (the `--runner` side) and `reference`, so on the reference's own record `skip_parity.reference` equals the record's own `runner`. |
 
 The test ids use junit's `classname::name` spelling, for example
 `tests.test_verify_role_integration::test_role_env_propagates_to_reify_verify_plan[merge]`.
@@ -116,9 +117,10 @@ per-module skip attribution.
 
 With `--reference`, the two runners' skipped vectors are compared:
 
-- `skipped_only_on_runner`: ids skipped on the runner and not on the
-  reference;
-- `skipped_only_on_reference`: the reverse.
+- `skipped_only_on_runner`: ids skipped on the block's `runner` and not on
+  its `reference`;
+- `skipped_only_on_reference`: ids skipped on the block's `reference` and not
+  on its `runner`.
 
 Both runners verify the same commit, so they collect the same tests, and
 "skipped on one only" means "skipped on one and run on the other". An id in

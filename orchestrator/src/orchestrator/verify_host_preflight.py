@@ -262,8 +262,9 @@ class RunnerVerdict:
 
 @dataclass(frozen=True)
 class SkipParity:
-    """How a runner's skipped junit ids differ from its reference's on the same commit."""
+    """How *runner*'s skipped junit ids differ from *reference*'s on the same commit."""
 
+    runner: str
     reference: str
     skipped_only_on_runner: tuple[str, ...]
     skipped_only_on_reference: tuple[str, ...]
@@ -283,6 +284,7 @@ class SkipParity:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            'runner': self.runner,
             'reference': self.reference,
             'skipped_only_on_runner': list(self.skipped_only_on_runner),
             'skipped_only_on_reference': list(self.skipped_only_on_reference),
@@ -303,11 +305,13 @@ def compare_skips(
     ours, theirs = runner.comparable_skips, reference.comparable_skips
     if ours is None or theirs is None:
         return SkipParity(
-            reference=reference.runner, skipped_only_on_runner=(), skipped_only_on_reference=(),
+            runner=runner.runner, reference=reference.runner,
+            skipped_only_on_runner=(), skipped_only_on_reference=(),
             excepted=(), undetermined=_incomparable(runner, reference),
         )
     differing = ours ^ theirs
     return SkipParity(
+        runner=runner.runner,
         reference=reference.runner,
         skipped_only_on_runner=tuple(sorted(ours - theirs)),
         skipped_only_on_reference=tuple(sorted(theirs - ours)),
@@ -507,10 +511,10 @@ def _verdict_lines(verdict: RunnerVerdict) -> list[str]:
 
 def _parity_line(parity: SkipParity) -> str:
     if parity.undetermined is not None:
-        return f'skip parity vs {parity.reference}: undetermined ({parity.undetermined})'
+        return f'skip parity {parity.runner} vs {parity.reference}: undetermined ({parity.undetermined})'
     if parity.holds:
-        return f'skip parity vs {parity.reference}: holds ({len(parity.excepted)} owned exceptions applied)'
-    return f'skip parity vs {parity.reference}: broken, unexplained {", ".join(parity.unexplained)}'
+        return f'skip parity {parity.runner} vs {parity.reference}: holds ({len(parity.excepted)} owned exceptions applied)'
+    return f'skip parity {parity.runner} vs {parity.reference}: broken, unexplained {", ".join(parity.unexplained)}'
 
 
 def _archive_root(config: OrchestratorConfig) -> Path:
