@@ -68,6 +68,7 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     text_sha256,
 )
+from fused_memory.models.invocation_ledger import LedgerRole
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
@@ -242,7 +243,7 @@ def env_for(
         census_for=lambda _config: contextlib.nullcontext(census or harness.mem0),
         ledger_dir_for=lambda _config: workspace.ledger_dir,
         home_root_for=lambda _config: str(workspace.home_root),
-        adjudicator_for=lambda _config: adjudicate,
+        adjudicator_for=lambda _config, _ledger: adjudicate,
     )
 
 
@@ -769,6 +770,29 @@ class TestPlanFromAdjudicator:
 
         assert code == 0
         assert sorted(pair.child_text for pair in fake.pairs) == ['cli sighting 100', 'cli sighting 200']
+
+    @pytest.mark.asyncio
+    async def test_the_adjudicator_writes_to_the_run_invocation_ledger(
+        self, harness, workspace, capsys,
+    ):
+        seed_unrated_sightings(harness, 1)
+        fake = always(Verdict.EXTENDS)
+        ledgers = []
+
+        def adjudicator_for(_config, ledger):
+            ledgers.append(ledger)
+            return fake
+
+        env = dataclasses.replace(env_for(harness, workspace), adjudicator_for=adjudicator_for)
+        code, _report = await plan_adjudicated(env, workspace, capsys, '--project', DF)
+
+        assert code == 0
+        (ledger,) = ledgers
+        assert ledger.role is LedgerRole.LINK_ADJUDICATOR
+        assert ledger.project_id == resolve_project_id(str(workspace.home_root))
+        assert ledger.run_id
+        assert ledger.cost_store is not None
+        assert (workspace.ledger_dir / 'curator_events.db').exists()
 
     @pytest.mark.asyncio
     async def test_project_defaults_to_the_home_project(self, harness, workspace, capsys):
