@@ -1100,6 +1100,9 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     from test_offline_lane_infra_integration import (
         _SPAWNS_PER_FIXTURE_COMMIT as _infra_spawns_per_fixture_commit,
     )
+    from test_offline_lane_infra_integration import (
+        _SPAWNS_PER_LANE_PASS_WORST_CASE as _infra_spawns_per_lane_pass_worst_case,
+    )
 
     assert _infra_lane_pass_bound_secs == _LANE_PASS_BOUND_SECS, (
         f"this module's _LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}) has drifted "
@@ -1108,6 +1111,15 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'value in [{floor}, {_MARKERLESS_CEILING_FRACTION} * effective_timeout], so '
         f'only this explicit cross-module equality check catches the two silently '
         f'diverging within that shared range.'
+    )
+    # Task 10732 — the floor multiplier itself: the infra module measures it
+    # over a warm infra red pass, and this module's copy is pinned to it here.
+    assert _infra_spawns_per_lane_pass_worst_case == _SPAWNS_PER_LANE_PASS_WORST_CASE, (
+        f"this module's _SPAWNS_PER_LANE_PASS_WORST_CASE ({_SPAWNS_PER_LANE_PASS_WORST_CASE}) "
+        f"has drifted from test_offline_lane_infra_integration.py's copy "
+        f'({_infra_spawns_per_lane_pass_worst_case}), which that module measures in its '
+        f'test_out_of_bound_spawn_counts_are_measured_not_asserted — so a real divergence '
+        f"here means this module's floor multiplier is a stale hand count."
     )
 
     # Task 4203 — the same anti-drift rationale applies verbatim to the

@@ -727,12 +727,13 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             + _NOTE_MERGE_ALL_BOUND_SECS
         ),
         # Task 4203 (review remediation) — this module's copy of the
-        # sibling's row for the same test: the only row here whose bounded
-        # waits come entirely from `_assert_infra_never_a_gate`, with no
-        # `_LANE_PASS_BOUND_SECS` term at all. Discovered by the net only
-        # once that helper joined `_LANE_PASS_COMPOSING_HELPER_NAMES`.
+        # sibling's row for the same test: `_assert_infra_never_a_gate`'s
+        # pair, discovered by the net only once that helper joined
+        # `_LANE_PASS_COMPOSING_HELPER_NAMES`. Task 10732's warm infra red-pass
+        # measurement adds two `_run_lane`-bounded passes (the cold pass and
+        # the measured warm one).
         test_out_of_bound_spawn_counts_are_measured_not_asserted: (
-            _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS
+            _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS + 2 * _LANE_PASS_BOUND_SECS
         ),
     }
     # Task 4203 — this module's own copy of the sibling's out_of_bound_spawns
@@ -763,11 +764,16 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         # `_SPAWNS_PER_FIXTURE_COMMIT` on, priced at the same seed maximum. Its
         # `_build_infra_worker` / `_wire_lane` setup contributes nothing
         # further — measured to be spawn-free inside that test, not assumed.
+        # Task 10732's warm infra red-pass measurement adds a second stub
+        # commit and two `_drive_advance` rounds; its passes' own spawns sit
+        # inside their `_run_lane` windows.
         test_out_of_bound_spawn_counts_are_measured_not_asserted: (
             2 * _SPAWNS_PER_REPO_FIXTURE
             + _SPAWNS_PER_FIXTURE_COMMIT
             + _SPAWNS_PER_DRIVE_ADVANCE
             + _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE
+            + _SPAWNS_PER_FIXTURE_COMMIT
+            + 2 * _SPAWNS_PER_DRIVE_ADVANCE
         ),
     }
     assert set(worst_case_secs) == set(out_of_bound_spawns), (
@@ -983,15 +989,15 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
 
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 4203 review remediation: this
 # module's twin of the sibling's test of the same name, its requirement derived independently
-# from THIS module's own constants. The only marker-carrying test here composing NO _run_lane
-# pass -- its whole bounded term is _assert_infra_never_a_gate's
-# _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS = 15.5s. Out-of-bound term
-# = 25 spawns: 2 x _SPAWNS_PER_REPO_FIXTURE (6: the repo fixture AND the fresh repo
-# measured against below -- the only doubled fixture term in either module), plus
-# _SPAWNS_PER_FIXTURE_COMMIT (2), _SPAWNS_PER_DRIVE_ADVANCE (4) and
-# _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE (7); 25 x MEASURED_SPAWN_LATENCY_SECS = 117.75s,
-# required = 133.25s. The verify budget clears that
-# requirement, and the value is ENFORCED by this test's row in
+# from THIS module's own constants. Bounded term: _assert_infra_never_a_gate's
+# _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS = 15.5s, plus the two
+# _run_lane-bounded passes of task 10732's warm infra red-pass measurement
+# (2 x _LANE_PASS_BOUND_SECS = 60s) = 75.5s. Out-of-bound term = 35 spawns:
+# 2 x _SPAWNS_PER_REPO_FIXTURE (6: the repo fixture AND the fresh repo measured against
+# below -- the only doubled fixture term in either module), plus 2 x _SPAWNS_PER_FIXTURE_COMMIT
+# (2), 3 x _SPAWNS_PER_DRIVE_ADVANCE (4) and _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE (7);
+# 35 x MEASURED_SPAWN_LATENCY_SECS = 164.85s, required = 240.35s. The verify budget clears
+# that requirement, and the value is ENFORCED by this test's row in
 # test_every_composing_caller_carries_a_timeout_override.
 @pytest.mark.asyncio
 async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
@@ -1017,6 +1023,11 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     sibling's third multiplicand, needed only by
     `test_ib2_infra_run_in_flight_never_gates_merge`'s `out_of_bound_spawns`
     row. Measured under the SAME counting wrapper.
+
+    Task 10732 also measures `_SPAWNS_PER_LANE_PASS_WORST_CASE`, the floor
+    multiplier for `_LANE_PASS_BOUND_SECS`, over one WARM infra red pass: its
+    git spawns under the same counting wrapper plus the detect and confirm
+    `run_all.sh` sub-runs its pass record keeps.
 
     Deliberately calls `_assert_infra_never_a_gate` WITHOUT first driving it
     through `test_ib2_infra_run_in_flight_never_gates_merge`'s full
@@ -1058,11 +1069,12 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     further respect the sibling's was not: the footprint it enumerated (one
     `_drive_advance` plus one fresh repo seed) omitted the `repo`
     fixture's OWN seed, undercounting by a further
-    `_SPAWNS_PER_REPO_FIXTURE`. Actual: 15.5s of bounded waits
-    (`_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS`) and 25
-    out-of-bound spawns, ~2.5x
+    `_SPAWNS_PER_REPO_FIXTURE`. Actual, since task 10732's warm infra
+    red-pass measurement: 75.5s of bounded waits
+    (`_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS` + 2 x
+    `_LANE_PASS_BOUND_SECS`) and 35 out-of-bound spawns, 3.5x
     the real-git work of the ib1 test (10: the `repo` fixture plus one
-    `_drive_advance`), for a `required_timeout_secs` of 133.25s. See the
+    `_drive_advance`), for a `required_timeout_secs` of 240.35s. See the
     marker comment above for the
     derivation; the value is enforced by
     `test_every_composing_caller_carries_a_timeout_override`'s row for this
@@ -1152,6 +1164,33 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
         f'out_of_bound_spawns multiplicand '
         f'test_ib2_infra_run_in_flight_never_gates_merge needs beyond its '
         f'own _drive_advance call.'
+    )
+
+    # Task 10732 — measure one WARM infra red pass, the floor multiplier for
+    # `_LANE_PASS_BOUND_SECS`. The cold pass and the warm pass's arming run
+    # outside the counter; its sub-runs are read off the pass record.
+    lane = await _red_infra_lane(harness, git_ops, tmp_path)
+    await _drive_infra_pass(lane, 'red')
+    (lane.control / _X).write_text('red')
+    lane.clock.advance(minutes=30)
+    await _drive_advance(harness, lane.project_root)
+
+    calls.clear()
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await _run_one_lane_pass(lane.worker)
+
+    pass_id = lane.record().last_pass_id
+    assert pass_id is not None, 'the engine records every pass it observes'
+    record = lane.worker.records.load_pass(LEGACY_INFRA_COMMAND, pass_id)
+    assert record is not None, f'pass {pass_id} has no readable record'
+    sub_runs = sum(run is not None for run in (record.detect, record.confirm))
+    assert len(calls) + sub_runs == _SPAWNS_PER_LANE_PASS_WORST_CASE, (
+        f'a warm infra red pass spawned {len(calls)} real git subprocess(es) '
+        f'({calls}) plus {sub_runs} run_all.sh sub-run(s), not the pinned '
+        f'_SPAWNS_PER_LANE_PASS_WORST_CASE = {_SPAWNS_PER_LANE_PASS_WORST_CASE}. '
+        f'This count is the floor multiplier for _LANE_PASS_BOUND_SECS: a drift '
+        f'here mis-sizes that bound in both offline-lane modules.'
     )
 
 
