@@ -21,7 +21,7 @@ from _review_fixtures import review_aggregation, review_issue
 from _review_payloads import blocking_review, pass_review
 from escalation.disposition import ReviewerDisposition
 from shared import safe_io
-from shared.defects import RulingSubject, mint_review_ref
+from shared.defects import IssueKind, IssueKindFlag, RulingSubject, mint_review_ref
 
 from orchestrator.artifacts import (
     LANE_SYMLINKED_ARTIFACTS,
@@ -39,6 +39,7 @@ from orchestrator.artifacts import (
     ReviewsRootMissing,
     TaskArtifacts,
     _normalize_plan,
+    format_issue_section,
     iteration_entry_written_by_orchestrator,
     plan_task_text_fp,
 )
@@ -1465,6 +1466,35 @@ class TestReviews:
     def test_format_for_escalation_without_suggestions_equals_replan(self):
         agg = self._aggregation([])
         assert agg.format_for_escalation() == agg.format_for_replan()
+
+    @staticmethod
+    def _kind_line(text: str) -> str:
+        [line] = [line for line in text.splitlines() if line.startswith('**Kind:**')]
+        return line
+
+    def test_an_issue_kind_is_rendered_as_written(self):
+        issue = {**review_issue('alpha', 'blocking'), 'kind': IssueKind.DOCS.value}
+
+        text = format_issue_section('# Feedback\n', [issue])
+
+        assert self._kind_line(text) == f'**Kind:** {IssueKind.DOCS.value}'
+
+    @pytest.mark.parametrize(
+        ('kind', 'flag'),
+        [
+            pytest.param(None, IssueKindFlag.MISSING, id='missing'),
+            pytest.param('bug', IssueKindFlag.UNRECOGNISED, id='unrecognised'),
+        ],
+    )
+    def test_a_kind_read_fail_closed_is_rendered_with_its_flag(self, kind, flag):
+        issue = review_issue('alpha', 'blocking')
+        if kind is not None:
+            issue['kind'] = kind
+
+        line = self._kind_line(review_aggregation([issue], []).format_for_replan())
+
+        assert line.startswith(f'**Kind:** {IssueKind.DEFECT.value}')
+        assert flag.value in line
 
     def test_format_for_replan_stays_blocking_only(self):
         agg = self._aggregation(['alpha', 'beta'])
