@@ -322,7 +322,8 @@ def wait_pid_tagged(
     One :func:`tagged_pids` snapshot is not a verdict on a process that may
     still be exec'ing: its environ reads 0 bytes across the exec (measured,
     esc-6179-4), so a :func:`sleeper_spec` build, which publishes its pid
-    before ``exec sleep``, can be missed.  ``timeout=0`` is exactly one probe.
+    before ``exec sleep``, can be missed.  The verdict and the ``timeout=0``
+    case are :func:`_poll_until_settled`'s.
 
     *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
     the wait starts, as in :func:`wait_for_pgid_file`.  *_tagged_pids* is a
@@ -332,31 +333,6 @@ def wait_pid_tagged(
     return _poll_until_settled(
         lambda: pid in _tagged_pids(tag), bool, timeout=timeout, interval=interval,
     )
-
-
-_Probed = TypeVar('_Probed')
-
-
-def _poll_until_settled(
-    probe: Callable[[], _Probed],
-    settled: Callable[[_Probed], bool],
-    *,
-    timeout: float,
-    interval: float,
-    clock: Callable[[], float] = time.monotonic,
-) -> _Probed:
-    """Repeat *probe* until *settled* holds of its result or *timeout* passes; return that result.
-
-    The result is always the probe of the returning iteration, so a caller
-    descheduled across the deadline never asserts on a stale observation;
-    ``timeout=0`` is exactly one probe.
-    """
-    deadline = clock() + timeout
-    while True:
-        result = probe()
-        if settled(result) or clock() >= deadline:
-            return result
-        time.sleep(interval)
 
 
 def spawn_verify_merge(
@@ -842,6 +818,31 @@ def read_proc_state(pid: int) -> StatFields | None:
     return read_stat_fields(Path('/proc') / str(pid), skip_malformed=False)
 
 
+_Probed = TypeVar('_Probed')
+
+
+def _poll_until_settled(
+    probe: Callable[[], _Probed],
+    settled: Callable[[_Probed], bool],
+    *,
+    timeout: float,
+    interval: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> _Probed:
+    """Repeat *probe* until *settled* holds of its result or *timeout* passes; return that result.
+
+    The result is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    deadline = clock() + timeout
+    while True:
+        result = probe()
+        if settled(result) or clock() >= deadline:
+            return result
+        time.sleep(interval)
+
+
 def wait_pids_exited(
     pids: AbstractSet[int],
     *,
@@ -858,9 +859,7 @@ def wait_pids_exited(
     code under test's -- the same criterion as
     ``shared/src/shared/proc_group.py::pid_running`` (task 3955).
 
-    The verdict is always the probe of the returning iteration, so a caller
-    descheduled across the deadline never asserts on a stale observation;
-    ``timeout=0`` is exactly one probe.
+    The verdict and the ``timeout=0`` case are :func:`_poll_until_settled`'s.
     """
     def running() -> dict[int, StatFields]:
         return {
