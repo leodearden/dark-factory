@@ -140,7 +140,12 @@ from orchestrator.flake_debt_drain import (
 )
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
-from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
+from orchestrator.fleet_heartbeat import (
+    build_heartbeat_payload,
+    is_bare_unit_name,
+    resolve_fleet_dir,
+    write_heartbeat,
+)
 from orchestrator.fm_retry import is_fm_null_sentinel
 from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.l0_promotion import promote_l0_to_l1
@@ -13085,10 +13090,11 @@ class Harness:
         The ``pass_fn`` of the merge-heartbeat service, so it refreshes on
         its own cadence whatever the dispatch loop is doing (task 5344).
         Fail-open: any exception (state read or disk write) is swallowed and
-        logged.
+        logged; the WARNING names ``ORCH_UNIT`` and its expected shape only
+        when that value fails ``is_bare_unit_name``.
         """
+        unit = os.environ.get('ORCH_UNIT', '')
         try:
-            unit = os.environ.get('ORCH_UNIT', '')
             reading = await self._drain_participant.on_heartbeat_pass()
             queue_empty = self._merge_queue.empty()
             if reading.depth is None:
@@ -13109,10 +13115,18 @@ class Harness:
             )
             await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
         except Exception:
-            logger.warning(
-                'merge heartbeat write failed; continuing (fail-open)',
-                exc_info=True,
-            )
+            if is_bare_unit_name(unit):
+                logger.warning(
+                    'merge heartbeat write failed; continuing (fail-open)', exc_info=True,
+                )
+            else:
+                logger.warning(
+                    'merge heartbeat write failed; continuing (fail-open). ORCH_UNIT '
+                    "was %r, but it must be this orchestrator's systemd unit, e.g. "
+                    'orchestrator-dark-factory.service; set it on that unit.',
+                    unit,
+                    exc_info=True,
+                )
 
     def _announce_deployed_sha(self) -> None:
         """Log the deployed sha; warn and emit an event when it is flagged (6565 D1).
