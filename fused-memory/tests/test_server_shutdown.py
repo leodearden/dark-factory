@@ -255,6 +255,40 @@ class TestGracefulShutdownQuiescesCuratorGate:
         curator_usage_gate.shutdown.assert_awaited_once()
 
 
+class TestGracefulShutdownClosesCostStoreAfterHarness:
+    """The recon stages, judge and verify loop write their invocations rows through
+    curator_cost_store until the harness loop stops (task 10414)."""
+
+    @pytest.mark.asyncio
+    async def test_cost_store_closes_after_the_harness_loop_stops(self):
+        call_order: list[str] = []
+        started = asyncio.Event()
+
+        async def _recon_loop():
+            started.set()
+            try:
+                await asyncio.sleep(9999)
+            except asyncio.CancelledError:
+                call_order.append('harness_stopped')
+                raise
+
+        harness_loop_task = asyncio.create_task(_recon_loop())
+        await started.wait()
+        curator_cost_store = MagicMock(
+            close=AsyncMock(side_effect=lambda: call_order.append('store_close'))
+        )
+
+        await _graceful_shutdown(
+            memory_service=MagicMock(close=AsyncMock()),
+            task_interceptor=None,
+            harness_loop_task=harness_loop_task,
+            recon_journal=None,
+            curator_cost_store=curator_cost_store,
+        )
+
+        assert call_order == ['harness_stopped', 'store_close']
+
+
 class TestGracefulShutdownClosesTaskInterceptor:
     @pytest.mark.asyncio
     async def test_shutdown_closes_task_interceptor(self):
