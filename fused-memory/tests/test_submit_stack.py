@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import socket
 from typing import Any
 
 import pytest
+from _curator_helpers import hold_first_prepare
 from _submit_stack import Stack
 from _submit_stack import curator_creates as curator_creates
 from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
@@ -48,3 +50,22 @@ async def test_the_stack_curates_over_an_in_process_corpus(
     [bundle] = curator_creates
     assert bundle.corpus_error is None
     assert bundle.withheld is not None and bundle.withheld.unavailable_streams == ()
+
+
+@pytest.mark.asyncio
+async def test_resolve_waits_again_while_the_ticket_is_still_pending(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    release = hold_first_prepare(stack.curator)
+    try:
+        submitted = await stack.call('submit_task', **_followup('Tidy the a module'))
+        assert 'ticket' in submitted, submitted
+        resolving = asyncio.create_task(stack.resolve(submitted['ticket'], wait_seconds=0))
+        expired = await stack.call('resolve_ticket', ticket=submitted['ticket'], timeout_seconds=0)
+    finally:
+        release.set()
+    answer = await resolving
+
+    assert (expired['status'], expired['reason']) == ('pending', 'wait_timeout')
+    assert answer['status'] == 'created'
+    assert 'task_id' in answer
