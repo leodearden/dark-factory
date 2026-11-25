@@ -25,6 +25,7 @@ from _verify_boundary_harness import (
     tagged_pids,
     wait_for_marker_stable,
     wait_for_pgid_file,
+    wait_pid_tagged,
     wait_pids_exited,
     wait_subtree_live,
 )
@@ -1473,3 +1474,30 @@ def test_tagged_pids_finds_a_session_escaped_grandchild_and_nothing_else():
         bystander.wait(timeout=5)
         if leader.stdout is not None:
             leader.stdout.close()
+
+
+def test_wait_pid_tagged_polls_past_a_snapshot_that_misses_the_pid():
+    """One environ snapshot can miss a live process mid-exec (esc-6179-4), so a miss must not end the poll."""
+    pid, other_pid = 7, 8
+    asked: list[str] = []
+    probes = iter([set(), {other_pid}, {pid, other_pid}])
+
+    def fake_tagged_pids(tag: str) -> set[int]:
+        asked.append(tag)
+        return next(probes)
+
+    assert wait_pid_tagged(pid, 'tag-a', timeout=5.0, interval=0, _tagged_pids=fake_tagged_pids)
+    assert asked == ['tag-a'] * 3
+
+
+def test_wait_pid_tagged_returns_the_final_probes_miss_at_the_deadline():
+    """timeout=0 is exactly one probe, and its miss is the verdict."""
+    pid, other_pid = 7, 8
+    asked: list[str] = []
+
+    def fake_tagged_pids(tag: str) -> set[int]:
+        asked.append(tag)
+        return {other_pid}
+
+    assert wait_pid_tagged(pid, 'tag-a', timeout=0, _tagged_pids=fake_tagged_pids) is False
+    assert asked == ['tag-a']
