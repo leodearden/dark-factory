@@ -214,7 +214,10 @@ decided each finding:
    never the first.
 
 A run that cannot perform step 1 (store unreachable) files nothing and
-says so in its report.
+says so in its report. A `search_tasks` reply carrying `error`, including
+the `degraded: true` reply an embedder or Qdrant outage produces, means
+step 2 was not performed, never "no match": the finding goes on to step 3,
+and the report records against that finding that step 2 did not run.
 
 ## 9. Consumption between instruments
 

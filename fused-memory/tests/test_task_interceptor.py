@@ -15959,9 +15959,17 @@ class TestZotDuplicateSweepWiring:
             scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
             search_error=RuntimeError('qdrant down'),
         )
-        assert outcome[0] == 'created'
+        status, _task_id, _reason, result_dict = outcome
+        assert status == 'created'
         assert _stamp_calls(zot_taskmaster) == []
         stub_escalator.report_zot_duplicate.assert_not_awaited()
+        assert result_dict is not None
+        sweep_warnings = [
+            w for w in result_dict.get('post_create_warnings', [])
+            if w['stage'] == 'zot_duplicate_sweep'
+        ]
+        assert sweep_warnings
+        assert 'qdrant down' in sweep_warnings[0]['error']
 
     @pytest.mark.asyncio
     async def test_stamp_failure_is_a_post_create_warning(

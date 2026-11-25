@@ -11,6 +11,8 @@ from typing import Any, NoReturn
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import make_insufficient_quota_error
+from qdrant_client import AsyncQdrantClient
 from shared.cli_invoke import AgentResult
 
 from fused_memory.backends.task_backend_types import MetadataLookupResult
@@ -24,6 +26,7 @@ from fused_memory.middleware.curator_types import (
     empty_pool_sizes,
     is_combine_eligible_status,
 )
+from fused_memory.middleware.task_curator import CorpusEmbedder, TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 
 
@@ -165,6 +168,47 @@ def invoke_by_role(*, single: InvokeArm, batch: InvokeArm) -> AsyncMock:
 def must_not_invoke() -> AsyncMock:
     """An ``invoke_with_cap_retry`` stand-in for paths that must never reach the LLM."""
     return AsyncMock(side_effect=tripwire('the curator must not call the LLM'))
+
+
+class ExhaustibleEmbedder:
+    """A corpus embedder that embeds every input to one unit vector until :meth:`exhaust`.
+
+    After that each call raises the credits-exhausted ``openai.RateLimitError``
+    of :func:`_fm_helpers.make_insufficient_quota_error`.
+    """
+
+    def __init__(self, dimensions: int) -> None:
+        self._vector = [1.0] + [0.0] * (dimensions - 1)
+        self._exhausted = False
+
+    def exhaust(self) -> None:
+        self._exhausted = True
+
+    async def create(self, input_data: str) -> list[float]:
+        if self._exhausted:
+            raise make_insufficient_quota_error()
+        return self._vector
+
+
+def exhaustible_embedder() -> ExhaustibleEmbedder:
+    """An :class:`ExhaustibleEmbedder` sized to :func:`make_config`'s embedder."""
+    return ExhaustibleEmbedder(make_config().embedder.dimensions)
+
+
+def in_memory_corpus_curator(
+    embedder: CorpusEmbedder, config: FusedMemoryConfig | None = None,
+) -> TaskCurator:
+    """A real TaskCurator over an in-memory Qdrant corpus embedded by *embedder*.
+
+    It never calls the LLM. The caller awaits ``curator.close()``.
+    """
+    return TaskCurator(
+        config=config or make_config(),
+        taskmaster=None,
+        invoke=must_not_invoke(),
+        embedder=embedder,
+        qdrant_client=AsyncQdrantClient(location=':memory:'),
+    )
 
 
 def zot_agent_result() -> AgentResult:

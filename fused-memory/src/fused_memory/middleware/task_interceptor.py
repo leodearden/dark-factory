@@ -191,7 +191,7 @@ from fused_memory.middleware.task_creation_journal import (
     CreationAttribution,
     creation_operation_for,
 )
-from fused_memory.middleware.task_curator import TaskCurator, flatten_task_tree
+from fused_memory.middleware.task_curator import CorpusSearchError, TaskCurator, flatten_task_tree
 from fused_memory.middleware.ticket_store import OPEN_TICKET_STATUSES, ResolveReason, TicketStatus
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -5272,22 +5272,33 @@ class TaskInterceptor:
 
         Advisory and best-effort: the task already exists, so a failure here is
         a ``post_create_warnings`` entry and never changes the ticket status.
+        A sweep that could not run is such a warning, never "no duplicate".
         Runs outside the write lock; only the stamp itself takes it.
         """
         curator_cfg = self._config.curator if self._config is not None else CuratorConfig()
         if not curator_cfg.zot_duplicate_sweep_enabled:
             return
-        finding = await sweep_zot_duplicate(
-            curator,
-            project_id=project_id,
-            task_id=task_id,
-            title=candidate.title,
-            description=candidate.description,
-            files_to_modify=candidate.files_to_modify,
-            read_statuses=lambda ids: tm.get_statuses(project_root, ids=ids),
-            threshold=curator_cfg.zot_duplicate_score_threshold,
-            limit=curator_cfg.zot_duplicate_search_limit,
-        )
+        try:
+            finding = await sweep_zot_duplicate(
+                curator,
+                project_id=project_id,
+                task_id=task_id,
+                title=candidate.title,
+                description=candidate.description,
+                files_to_modify=candidate.files_to_modify,
+                read_statuses=lambda ids: tm.get_statuses(project_root, ids=ids),
+                threshold=curator_cfg.zot_duplicate_score_threshold,
+                limit=curator_cfg.zot_duplicate_search_limit,
+            )
+        except Exception as exc:
+            logger.warning(
+                '_flag_zot_duplicate: duplicate sweep for %s could not run; '
+                'duplicate status unknown', task_id, exc_info=True,
+            )
+            result_dict.setdefault('post_create_warnings', []).append(
+                {'stage': 'zot_duplicate_sweep', 'error': str(exc)}
+            )
+            return
         if finding is None:
             return
         logger.info(
@@ -6662,7 +6673,12 @@ class TaskInterceptor:
         Returns:
             ``{'results': [...]}`` on success, where each hit carries a
             ``status`` key (``None`` if the task no longer exists). Returns a
-            ``ConfigurationError`` shape when the curator is disabled.
+            ``ConfigurationError`` shape when the curator is disabled. When
+            the corpus cannot be searched it returns ``{'results': [],
+            'degraded': True, 'error', 'error_type', 'billing_exhausted'}``:
+            the answer is unknown, not "nothing similar", and a caller that
+            treats any ``error`` key as a failed call never reads it as
+            "no match".
         """
         curator = await self._get_curator()
         if curator is None:
@@ -6672,9 +6688,22 @@ class TaskInterceptor:
                 'results': [],
             }
         project_id = resolve_project_id(project_root)
-        hits = await curator.search_corpus(
-            query, project_id, limit=limit, score_threshold=score_threshold,
-        )
+        try:
+            hits = await curator.search_corpus(
+                query, project_id, limit=limit, score_threshold=score_threshold,
+            )
+        except CorpusSearchError as exc:
+            logger.warning(
+                'search_tasks: corpus search failed for %s; answering degraded',
+                project_id, exc_info=True,
+            )
+            return {
+                'results': [],
+                'degraded': True,
+                'error': str(exc),
+                'error_type': exc.error_type,
+                'billing_exhausted': exc.billing_exhausted,
+            }
         # Enrich with live status via a single status read for the whole set.
         statuses = await self.get_statuses(project_root)
         for hit in hits:

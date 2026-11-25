@@ -9976,6 +9976,14 @@ def create_mcp_server(
         ``files_to_modify``, ``priority``, ``updated_at``, ``score`` (cosine
         similarity, higher = more similar), and ``status``.
 
+        When the task corpus cannot be searched (an embedder or Qdrant
+        outage), the reply is ``{'results': [], 'degraded': true, 'error':
+        ..., 'error_type': ..., 'billing_exhausted': <a
+        provider_billing.BillingSource value, e.g. 'api_key_credits', or
+        null>}``. That reply means the lookup FAILED, not "nothing similar
+        filed": your duplicate check did not run. What a findings
+        instrument does next is in docs/quality-findings-contract.md §8.
+
         Args:
             project_root: Absolute path to project root.
             query: Free-text query (e.g. a paraphrase of the task you're about to file).

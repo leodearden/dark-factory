@@ -10,16 +10,15 @@ excluding the new task, and names the best surviving near-duplicate.
 Detection only. Nothing here combines, cancels or deletes; the caller stamps
 the new task and files an operator-visible escalation.
 
-Fail-SAFE direction: an uncertain or errored read is never reported as a
-duplicate, because a false duplicate costs human attention. A hit whose status
-cannot be confirmed as a live ``TaskStatus`` (an orphan corpus point, the
-backend's NULL sentinel) is dropped, and any search or status-read error
-yields no finding.
+Fail-SAFE direction: an uncertain hit is never reported as a duplicate,
+because a false duplicate costs human attention. A hit whose status cannot be
+confirmed as a live ``TaskStatus`` (an orphan corpus point, the backend's NULL
+sentinel) is dropped. An errored search or status read is not reported as
+"no duplicate" either: it raises, so the caller records the sweep as not run.
 """
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,8 +27,6 @@ from typing import Any, Protocol
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curator_types import embedding_text
-
-logger = logging.getLogger(__name__)
 
 DUPLICATE_METADATA_KEY = 'x_zot_duplicate_candidate'
 
@@ -87,6 +84,12 @@ def select_near_duplicate(
 
 
 class CorpusSearcher(Protocol):
+    """A searchable task corpus.
+
+    An empty list means "searched, nothing found". A corpus that cannot be
+    searched raises (``TaskCurator`` raises ``CorpusSearchError``).
+    """
+
     async def search_corpus(
         self,
         query: str,
@@ -112,30 +115,23 @@ async def sweep_zot_duplicate(
     """Search the curator corpus for a near-duplicate of a ZOT-degraded create.
 
     Statuses are read only for the non-self hit ids, so a sweep with nothing
-    to flag performs no status read. Any error other than cancellation yields
-    ``None``: an errored read is never evidence of a duplicate.
+    to flag performs no status read. ``None`` means the corpus was searched
+    and nothing flaggable was found; any read failure propagates.
     """
-    try:
-        hits = await curator.search_corpus(
-            embedding_text(title, description, files_to_modify),
-            project_id,
-            limit=limit,
-            score_threshold=threshold,
-        )
-        candidate_ids = sorted({
-            str(hit['task_id'])
-            for hit in hits
-            if hit.get('task_id') and str(hit['task_id']) != str(task_id)
-        })
-        if not candidate_ids:
-            return None
-        statuses = await read_statuses(candidate_ids)
-    except Exception:
-        logger.warning(
-            'zot duplicate sweep failed for project=%s task=%s; reporting no finding',
-            project_id, task_id, exc_info=True,
-        )
+    hits = await curator.search_corpus(
+        embedding_text(title, description, files_to_modify),
+        project_id,
+        limit=limit,
+        score_threshold=threshold,
+    )
+    candidate_ids = sorted({
+        str(hit['task_id'])
+        for hit in hits
+        if hit.get('task_id') and str(hit['task_id']) != str(task_id)
+    })
+    if not candidate_ids:
         return None
+    statuses = await read_statuses(candidate_ids)
     return select_near_duplicate(
         hits, self_task_id=task_id, statuses=statuses, threshold=threshold,
     )
