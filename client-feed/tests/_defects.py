@@ -7,21 +7,45 @@ from datetime import datetime
 
 from _stores import TasksDb
 
-from client_feed.contract import DefectReported, DefectRuled, Restated, Restater, RulingKind
+from client_feed.contract import (
+    DefectReported,
+    DefectRuled,
+    Quarantined,
+    QuarantineReason,
+    Restated,
+    Restater,
+    RulingKind,
+)
 from client_feed.defect_ref import parse_portal_ref
 from client_feed.sources.tasks import TASK_TAG, DefectCarrier
 
 
-def reported(block: int, report: int, *, at: datetime, seq: int = 1) -> DefectReported:
-    """A defect_reported inbox line against criterion C-1, restated."""
+def restated(observed: str = 'o', expected: str = 'e', steps: tuple[str, ...] = ('s',)) -> Restated:
+    return Restated(observed=observed, expected=expected, steps=steps)
+
+
+def quarantined(*reasons: QuarantineReason) -> Quarantined:
+    return Quarantined(reasons=reasons)
+
+
+def reported(
+    block: int,
+    report: int,
+    *,
+    at: datetime,
+    seq: int = 1,
+    criterion_id: str = 'C-1',
+    outcome: Restated | Quarantined | None = None,
+) -> DefectReported:
+    """A defect_reported inbox line; restated as restated() writes it unless `outcome` says otherwise."""
     return DefectReported(
         seq=seq,
         at=at,
         block=block,
         report=report,
-        criterion_id='C-1',
+        criterion_id=criterion_id,
         restater=Restater(prompt_version='restate-v1'),
-        outcome=Restated(observed='o', expected='e', steps=('s',)),
+        outcome=restated() if outcome is None else outcome,
     )
 
 
