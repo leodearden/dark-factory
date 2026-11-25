@@ -648,6 +648,12 @@ class TestTrailingWindow:
 # ---------------------------------------------------------------------------
 
 
+def _end_tick(store, now: int) -> None:
+    """The store calls that close a tick, in ``__main__.main``'s order."""
+    store.cleanup_old(now)
+    store.maybe_vacuum(now)
+
+
 class TestRetentionAndVacuum:
     def test_cleanup_old_removes_old_rows(self, tmp_path: Path):
         from sampler.store import LoadSampleStore
@@ -700,7 +706,7 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         # Call again at now + 1 (less than 86400s later) -> should be False
         assert store.should_vacuum(now + 1) is False
 
@@ -710,7 +716,7 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         assert store.should_vacuum(now + 86400) is True
 
     def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path):
@@ -761,9 +767,9 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         # Second call on same day should be a no-op (no error)
-        store.maybe_vacuum(now + 3600)
+        _end_tick(store, now + 3600)
 
         # should_vacuum still False (only 1h elapsed)
         assert store.should_vacuum(now + 3600) is False
@@ -1273,9 +1279,11 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
 
-        store.maybe_vacuum(1_000_000)
+        _end_tick(store, 1_000_000)
 
-        assert spy.opened, 'the connect spy never fired, so the absence below pins nothing'
+        assert store.should_vacuum(1_000_000 + 1) is False, (
+            'the vacuum gate was never evaluated, so the absence below pins nothing'
+        )
         assert not [sql for sql in spy.executed if _is_vacuum(sql)], (
             'VACUUM rewrote a file with no free pages'
         )
@@ -1294,7 +1302,7 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
 
-        store.maybe_vacuum(1_000_000)
+        _end_tick(store, 1_000_000)
 
         assert store.should_vacuum(1_000_000 + 1) is False
         assert store.should_vacuum(1_000_000 + 86400) is True
@@ -1317,6 +1325,34 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         )
         assert spy.vacuums_ran_on() == [True]
         assert store.db_path.stat().st_size < size_before
+
+    def test_a_prune_spread_over_several_ticks_is_judged_whole(self, tmp_path: Path):
+        """Ticks run as ``__main__.main`` does: ``cleanup_old`` then ``maybe_vacuum``."""
+        from sampler.store import LoadSampleStore
+
+        spy = ConnectSpy()
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        chunk = 1_000
+
+        tick = now
+        while store.cleanup_old(tick, retain_seconds=100, max_rows=chunk) == chunk:
+            store.maybe_vacuum(tick)
+            tick += 5
+
+        assert tick > now, 'the prune fit one chunk, so this is not a multi-tick sweep'
+        assert _meta(store.db_path, 'last_vacuum_ts') is None, (
+            'the vacuum gate was evaluated, and its clock stamped, mid-sweep'
+        )
+        assert not [sql for sql in spy.executed if _is_vacuum(sql)], 'compacted mid-sweep'
+
+        store.maybe_vacuum(tick)
+
+        assert spy.vacuums_ran_on() == [True], (
+            'the finished prune left the file mostly free pages, yet it was not compacted'
+        )
+        assert _meta(store.db_path, 'last_vacuum_ts') == str(tick)
 
 
 # ---------------------------------------------------------------------------

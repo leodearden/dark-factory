@@ -49,7 +49,8 @@ which stamps it; so a backlog drains over successive ticks and no tick does
 more than one chunk. Its DELETE (``RETENTION_DELETE_SQL``) is two range
 searches of idx_samples_ts, not a table scan. ``maybe_vacuum`` runs at most once a day,
 and only when the reclaimable fraction of the file is worth a whole-file
-rewrite. Both gates treat a stamp in the future as due.
+rewrite; it waits out an unfinished sweep, so it judges the whole prune. Both
+gates treat a stamp in the future as due.
 
 Trailing window
 ---------------
@@ -549,12 +550,16 @@ class LoadSampleStore:
         ``reclaimable_fraction`` reaches ``_VACUUM_MIN_RECLAIMABLE_FRACTION``,
         as after a retention change or a bulk prune.
 
+        While a retention sweep is still due (``should_cleanup``) it is not
+        evaluated and its clock is left alone, so a prune spread over several
+        ticks is judged whole, once it finishes.
+
         A skip stamps the clock: finding nothing to reclaim is a successful
         evaluation. A VACUUM stamps it only on success, and a failure, opening
         the connection included, is logged and retried on the next eligible
         tick.
         """
-        if not self.should_vacuum(now):
+        if not self.should_vacuum(now) or self.should_cleanup(now):
             return
         if self.reclaimable_fraction() < _VACUUM_MIN_RECLAIMABLE_FRACTION:
             self._set_meta('last_vacuum_ts', str(now))
