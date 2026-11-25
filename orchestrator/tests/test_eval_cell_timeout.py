@@ -198,6 +198,26 @@ class _EndsCancelledWorkflow:
         return SimpleNamespace(outcome=WorkflowOutcome.CANCELLED)
 
 
+class _FailsWhileCancelledWorkflow:
+    """Runs until cancelled, then raises while finalising the cancellation."""
+
+    async def run(self) -> SimpleNamespace:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError('finalising the cancellation failed') from None
+        raise AssertionError('the event is never set')
+
+
+class _InnerBoundExpiresWorkflow:
+    """Hits a bound of its own, far short of the cell's ceiling."""
+
+    async def run(self) -> SimpleNamespace:
+        async with asyncio.timeout(60):
+            await asyncio.Event().wait()
+        raise AssertionError('the event is never set')
+
+
 @virtual_clock_test
 async def test_a_workflow_that_absorbs_the_deadline_reports_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -232,3 +252,25 @@ async def test_a_workflow_that_ends_cancelled_before_its_ceiling_stays_cancelled
     result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
 
     assert result.outcome == 'cancelled'
+
+
+@virtual_clock_test
+async def test_a_workflow_that_fails_after_its_ceiling_fired_reports_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _stub_cell(monkeypatch, _task(tmp_path), _FailsWhileCancelledWorkflow())
+
+    result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
+
+    assert result.outcome == 'timeout'
+
+
+@virtual_clock_test
+async def test_a_bound_of_the_workflows_own_expiring_before_the_ceiling_reports_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _stub_cell(monkeypatch, _task(tmp_path), _InnerBoundExpiresWorkflow())
+
+    result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
+
+    assert result.outcome == 'blocked'

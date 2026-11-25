@@ -711,16 +711,17 @@ def _cell_workflow(
 async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: float, cell: str) -> str:
     """The workflow's terminal outcome, where a ceiling that fired or a raise becomes the cell's outcome.
 
-    A workflow absorbs the deadline's cancellation and returns CANCELLED, so the
-    deadline is read from the scope.
+    A workflow absorbs the deadline's cancellation and returns CANCELLED, or
+    raises while finalising it, so whether the ceiling fired is read from the
+    scope and never from the exception's type.
     """
     deadline = asyncio.timeout(timeout_minutes * 60)
     try:
         async with deadline:
             report = await workflow.run()
-    except TimeoutError:
-        return _timed_out(cell, timeout_minutes)
     except Exception as e:
+        if deadline.expired():
+            return _timed_out(cell, timeout_minutes)
         logger.error(f'Eval {cell} failed: {e}')
         return WorkflowOutcome.BLOCKED.value
     if deadline.expired():
