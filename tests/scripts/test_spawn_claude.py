@@ -796,16 +796,16 @@ def test_spawn_omits_wm_title_export_when_ambient_wm_title_leaks(
 def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Proves the OTHER `dict(os.environ)` sites in this file are hermetic
-    too, not just `_base_env`: an ambient CLAUDE_SPAWN_BACKEND=tmux must not
-    reroute this no-emulator scenario down the tmux lane.
+    """Proves _run_spawn_without_emulator's env construction is hermetic, not
+    just _base_env's: an ambient CLAUDE_SPAWN_BACKEND=tmux must not reroute
+    this no-emulator scenario down the tmux lane.
 
     Both leak paths exit 126 (spawn-claude.sh's "tmux not found" branch vs.
     its "no terminal emulator found" branch), so an exit-code-only assertion
-    can't discriminate between them -- confirmed empirically that
+    can't discriminate between them -- before the hermetic fix,
     `CLAUDE_SPAWN_BACKEND=tmux pytest ...::test_no_emulator_found_yields_126`
-    passes today despite taking the wrong branch. This test asserts on
-    stderr content instead.
+    was confirmed to pass despite taking the wrong branch. This test asserts
+    on stderr content instead.
 
     RED before this file's own _hermetic_environ() fix: a raw
     `dict(os.environ)` passes the ambient CLAUDE_SPAWN_BACKEND straight
@@ -1996,6 +1996,9 @@ def _capture_run_timeout(
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
     invoke()
+    assert "timeout" in captured, (
+        f"{invoke!r} never called subprocess.run, so there is no bound to capture"
+    )
     return captured["timeout"]
 
 
@@ -3745,8 +3748,8 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     command-not-found (bash exit 127) -> resolve_detached's launch_rc!=0
     branch -> exit 127, not 126. GREEN after step-8.
     """
-    # SPAWN_LAUNCH_GRACE_SECS stays "2": the availability guard exits 126
-    # before any launch grace is consumed.
+    # Bounds the launch-grace wait (script default 5s) should the tmux
+    # availability guard regress; unused on the passing path.
     result = _run_spawn_without_emulator(
         tmp_path, {"CLAUDE_SPAWN_BACKEND": "tmux", "SPAWN_LAUNCH_GRACE_SECS": "2"}
     )
