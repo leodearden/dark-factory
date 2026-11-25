@@ -131,7 +131,11 @@ from fused_memory.services.classification_fallback_alarm import (
     journal_params,
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
-from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
+from fused_memory.services.durable_queue import (
+    DeadLetterEvent,
+    DurableWriteQueue,
+    release_attempt_budget,
+)
 from fused_memory.services.mem0_add_outcome import (
     RAISED_MEM0_ADD,
     Mem0AddOutcome,
@@ -2659,6 +2663,7 @@ class MemoryService:
         *,
         token_probe: Callable[[], contextlib.AbstractAsyncContextManager[TokenMeasurement]]
         | None = None,
+        on_landed: Callable[[], None] | None = None,
     ) -> Any:
         """Execute a backend call and log to write journal.
 
@@ -2667,7 +2672,9 @@ class MemoryService:
         per-call-site opt-in. A ``token_probe`` window wraps only the awaited
         call, and the LLM tokens it measured are journaled with the row. A
         probe that fails to open is journaled as this call's failure, and
-        ``coro`` is closed unawaited.
+        ``coro`` is closed unawaited. ``on_landed`` lets a queue executor
+        declare the moment its write landed: it runs once the call returns,
+        before its success row is journaled.
         """
         measurement = TokenMeasurement()
         result = None
@@ -2679,6 +2686,8 @@ class MemoryService:
             ) as measurement:
                 result = await coro
             duration_ms = _elapsed_ms_since(started)
+            if on_landed is not None:
+                on_landed()
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -6048,6 +6057,7 @@ class MemoryService:
                 # spend no LLM, so they stay unprobed rather than journaling a
                 # zero that reads like a measurement.
                 token_probe=self.graphiti.token_probe,
+                on_landed=release_attempt_budget,
             )
             reconcile_stats = await self._reconcile_episode_identity(
                 result, group_id=group_id, referents=referents.refs,
@@ -6166,6 +6176,7 @@ class MemoryService:
                 coro=self.mem0.add(
                     content=value.content, scope=scope, metadata=metadata
                 ),
+                on_landed=release_attempt_budget,
             )
             succeeded = True
             return result
@@ -6246,6 +6257,7 @@ class MemoryService:
             operation='add',
             payload={'content': fact_text[:200]},
             coro=self.mem0.add(content=fact_text, scope=scope, metadata=metadata),
+            on_landed=release_attempt_budget,
         )
         # Only once the write has landed: a failed write is retried through this
         # whole executor, and a retry must not count the same fact again.
