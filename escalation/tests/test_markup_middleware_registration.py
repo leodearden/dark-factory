@@ -52,11 +52,13 @@ import pytest
 from _escalation_http import escalation_http_call
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import (
-    MARKUP_RECURRENCE_ROUTING,
+from shared.markup_residue_custody import (
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
+)
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
     residue_header_lines,

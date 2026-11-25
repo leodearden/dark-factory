@@ -713,38 +713,6 @@ MARKUP_RECURRENCE_ROUTING = (
     '(DF 3083 is done and closed to appends, so not against 3083)'
 )
 
-#: All a ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE`` residue record can say about
-#: its call's outcome. :meth:`MarkupGuardMiddleware._handle_markup` files the
-#: dropped slice BEFORE it forwards the call, so no sink can know whether the
-#: call then succeeded.
-MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT = (
-    'This record was filed BEFORE the call ran, so whether the call then '
-    'succeeded is not known here; if it did, whatever it stored is missing '
-    'this value.'
-)
-
-#: All a ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE`` residue record can say about
-#: custody of its payload. Unlike a refusal, nothing bounced the caller, and
-#: the drop rode only on the forwarded result's ``markup_repair`` meta.
-MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT = (
-    'Nothing bounced the caller: its call went through, and the drop was '
-    'reported only in the result metadata, which an agent may never read. Do '
-    'not wait on a resend of this value; the payload below is the only copy '
-    'this boundary holds.'
-)
-
-#: All a ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` residue record can say about
-#: custody of its payload. The guard refuses at the boundary and reads nothing
-#: back, so it knows the call wrote nothing and that its caller was told to
-#: resend, never whether the caller did.
-MARKUP_REFUSAL_CUSTODY_CAVEAT = (
-    'This call wrote nothing, and its caller was told to resend from its own '
-    'copy. Whether it did resend is not known here: a refusal proves one '
-    'failed call, not lost data. Before recovering this payload, look at the '
-    "call's destination for a later write of the same content, because "
-    'recovering an already-resent payload writes a duplicate.'
-)
-
 #: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
 #: otherwise have no way to learn that its arguments were altered.
 _FORWARD_HINT = (
@@ -1641,7 +1609,8 @@ class MarkupGuardMiddleware(Middleware):
             # FULL and VERBATIM, deliberately unlike build_markup_block's
             # 200-char content_excerpt. That excerpt is a diagnostic; this is
             # the server's only copy of a payload its caller was told to
-            # resend but may not have (MARKUP_REFUSAL_CUSTODY_CAVEAT).
+            # resend but may not have
+            # (shared/src/shared/markup_residue_custody.py::MARKUP_REFUSAL_CUSTODY_CAVEAT).
             'raw_value': value,
             # What the record CARRIES, never where it went: it is built before
             # any sink runs, and a host that preserves it nowhere dumps it to a
@@ -1754,7 +1723,7 @@ class MarkupGuardMiddleware(Middleware):
                 # differ in the one way that matters to whoever reads the queue:
                 # this call is FORWARDED, lossily, and no caller is bounced — so
                 # nobody is waiting on a retry
-                # (MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT).
+                # (shared/src/shared/markup_residue_custody.py::MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT).
                 'error_type': MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
                 'category': _ESCALATION_CATEGORY,
                 'owner': _ESCALATION_OWNER,

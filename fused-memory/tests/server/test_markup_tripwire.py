@@ -34,9 +34,9 @@ from types import SimpleNamespace
 
 import pytest
 from shared import toolcall_markup
+from shared.markup_residue_custody import MARKUP_REFUSAL_CUSTODY_CAVEAT
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
     OUTCOMES,
     residue_header_lines,
 )

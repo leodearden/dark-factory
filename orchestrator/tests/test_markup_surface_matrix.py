@@ -42,10 +42,12 @@ from escalation.queue import EscalationQueue
 from escalation.server import create_server as create_escalation_server
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import (
+from shared.markup_residue_custody import (
     MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
+)
+from shared.mcp_markup_middleware import (
     residue_header_lines,
 )
 from shared.project_layout import escalation_queue_dir

@@ -37,15 +37,17 @@ from pathlib import Path
 from typing import Any
 
 from shared.eval_lane import eval_lane_provenance
+from shared.markup_residue_custody import (
+    MARKUP_REFUSAL_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
+)
 from shared.mcp_markup_middleware import (
     MARKUP_BOUNDARY_STORM_CATEGORY,
     MARKUP_RECURRENCE_ROUTING,
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
     residue_header_lines,
 )

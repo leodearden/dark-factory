@@ -55,9 +55,9 @@ import ast
 import logging
 from typing import Any
 
+from shared.markup_residue_custody import MARKUP_REFUSAL_CUSTODY_CAVEAT
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
     residue_header_lines,
 )
 

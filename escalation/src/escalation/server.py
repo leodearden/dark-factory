@@ -22,15 +22,17 @@ from shared.eval_lane import eval_lane_provenance
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
 # not pull fastmcp into every consumer of the base layer.
+from shared.markup_residue_custody import (
+    MARKUP_REFUSAL_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
+)
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
     MARKUP_RECURRENCE_ROUTING,
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
     HostAttribution,
     MarkupGuardMiddleware,
