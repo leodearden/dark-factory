@@ -31,6 +31,9 @@ from rust_snapshot_fixtures import (
     tool_shims,
     write_fixture_rules,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 REIFY_RULES = REPO_ROOT / 'scripts' / 'rust_metrics_rules' / 'reify.toml'
