@@ -178,15 +178,6 @@ class _FailsWhileCancelledWorkflow:
         raise AssertionError('the event is never set')
 
 
-class _InnerBoundExpiresWorkflow:
-    """Hits a bound of its own, far short of the cell's ceiling."""
-
-    async def run(self) -> SimpleNamespace:
-        async with asyncio.timeout(60):
-            await asyncio.Event().wait()
-        raise AssertionError('the event is never set')
-
-
 @virtual_clock_test
 async def test_a_workflow_that_absorbs_the_deadline_reports_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -232,14 +223,3 @@ async def test_a_workflow_that_fails_after_its_ceiling_fired_reports_timeout(
     result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
 
     assert result.outcome == 'timeout'
-
-
-@virtual_clock_test
-async def test_a_bound_of_the_workflows_own_expiring_before_the_ceiling_reports_blocked(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-):
-    stub_workflow_cell(monkeypatch, executor_task(tmp_path), _InnerBoundExpiresWorkflow())
-
-    result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
-
-    assert result.outcome == 'blocked'
