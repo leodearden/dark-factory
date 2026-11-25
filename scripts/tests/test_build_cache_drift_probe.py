@@ -10,8 +10,8 @@ slvs header) are small scratch trees named by the probe's REIFY_PROBE_*
 variables, so no run reads the real ones. The scratch reify checkout carries a
 fixture Cargo.lock whose registry crates have sources under the scratch
 $HOME/.cargo/registry/src: two with [package.metadata.system-deps] entries,
-x11-dl with its build.rs probe list, one with neither, and one whose source is
-not on the host.
+one whose entries are target-scoped cfg tables, x11-dl with its build.rs probe
+list, one with neither, and one whose source is not on the host.
 """
 from __future__ import annotations
 
@@ -39,7 +39,18 @@ REQUIRED_LINES = {
     "dpkg.toolchain",
 }
 
-FIXTURE_MODULES = {"glib-2.0", "gobject-2.0", "gtk+-3.0", "gtk-3.0-fallback", "x11", "xscrnsaver", "zlib"}
+FIXTURE_MODULES = {
+    "glib-2.0",
+    "gobject-2.0",
+    "gtk+-3.0",
+    "gtk-3.0-fallback",
+    "x11",
+    "xscrnsaver",
+    "zlib",
+    "xdg-portal-1",
+    "xdg-portal",
+    "cocoa-bridge",
+}
 
 _REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 _CARGO_LOCK = f"""\
@@ -53,6 +64,11 @@ source = "{_REGISTRY}"
 [[package]]
 name = "gtk-sys"
 version = "0.18.2"
+source = "{_REGISTRY}"
+
+[[package]]
+name = "portal-sys"
+version = "0.1.0"
 source = "{_REGISTRY}"
 
 [[package]]
@@ -104,6 +120,21 @@ zlib = "1.2"
 name = "gtk+-3.0"
 fallback-names = ["gtk-3.0-fallback"]
 version = "3.22"
+""",
+    },
+    "portal-sys-0.1.0": {
+        "Cargo.toml": """\
+[package]
+name = "portal-sys"
+version = "0.1.0"
+
+[package.metadata.system-deps.'cfg(unix)'.portal]
+name = "xdg-portal-1"
+fallback-names = ["xdg-portal"]
+version = "1.0"
+
+[package.metadata.system-deps.'cfg(target_os = "macos")']
+cocoa-bridge = "2"
 """,
     },
     "x11-dl-2.21.0": {
@@ -352,6 +383,14 @@ class TestDriftProbe:
         assert lines["pkg-config.glib-2.0"] == "2.80.0; libdir=/usr/lib/glib-2.0"
         assert lines["pkg-config.xscrnsaver"] == "ABSENT"
         assert lines["#info.cargo.registry-sources-missing"] == "winapi-0.3.9"
+
+    def test_a_target_scoped_table_contributes_its_modules_not_its_cfg_key(
+        self, world: ProbeWorld
+    ) -> None:
+        lines = world.probe()
+        assert lines["pkg-config.xdg-portal-1"] == "ABSENT"
+        assert "pkg-config.cocoa-bridge" in lines
+        assert not [name for name in lines if name.startswith("pkg-config.cfg(")]
 
     def test_a_fetched_source_without_system_deps_changes_no_compared_line(
         self, world: ProbeWorld
