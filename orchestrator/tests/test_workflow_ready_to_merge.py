@@ -601,8 +601,9 @@ class TestReadyToMergeAbbreviatedCitation:
         ).commits_named
         return await _report(f, citation)
 
-    def _cited_commit_reject(self, f: _Fixture) -> dict:
-        """The ``measured`` facts of the one ``cited_commit`` reject event."""
+    def _cited_commit_reject(self, f: _Fixture, reason: str) -> dict:
+        """The ``measured`` facts of the one ``cited_commit`` reject event,
+        which must carry *reason*."""
         assert f.outcome == WorkflowOutcome.BLOCKED
         assert f.merge_queue.qsize() == 0
         rows = f.event_store.fetch_events_by_type_all_runs(
@@ -612,13 +613,18 @@ class TestReadyToMergeAbbreviatedCitation:
         data = rows[0].get('data') or {}
         assert data['decision'] == 'rejected'
         assert data['predicate'] == 'cited_commit'
+        assert data['measured']['reason'] == reason
         return data['measured']
 
+    @pytest.mark.parametrize(
+        'cite', [lambda sha: sha[:10], lambda sha: sha[:10].upper()],
+        ids=['lowercase', 'uppercase'],
+    )
     async def test_abbreviated_tip_sha_is_accepted(
-        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo, cite,
     ):
         repo = two_commit_repo
-        f = await self._run(tmp_path, repo, repo.tip[:10])
+        f = await self._run(tmp_path, repo, cite(repo.tip))
 
         assert f.merge_queue.qsize() == 1
         assert f.merge_queue.get_nowait().snapshot_tip == repo.tip
@@ -630,7 +636,8 @@ class TestReadyToMergeAbbreviatedCitation:
         repo = two_commit_repo
         f = await self._run(tmp_path, repo, repo.other[:10])
 
-        assert self._cited_commit_reject(f)['resolved'] == repo.other
+        measured = self._cited_commit_reject(f, 'other_commit')
+        assert measured['resolved'] == repo.other
 
     async def test_ref_name_is_rejected_although_it_names_the_tip(
         self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
@@ -639,16 +646,26 @@ class TestReadyToMergeAbbreviatedCitation:
         assert _git_out(two_commit_repo.path, 'rev-parse', 'HEAD') == two_commit_repo.tip
         f = await self._run(tmp_path, two_commit_repo, 'HEAD')
 
-        self._cited_commit_reject(f)
+        measured = self._cited_commit_reject(f, 'not_a_sha')
+        assert 'resolved' not in measured
+        assert 'ref names are refused' in f.mark_blocked.await_args.args[0]
+
+    async def test_prefix_shorter_than_git_default_abbreviation_is_rejected(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        f = await self._run(tmp_path, two_commit_repo, two_commit_repo.tip[:6])
+
+        self._cited_commit_reject(f, 'not_a_sha')
 
     async def test_unresolvable_hex_prefix_is_rejected(
         self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
     ):
         f = await self._run(tmp_path, two_commit_repo, 'deadbeef0')
 
-        measured = self._cited_commit_reject(f)
+        measured = self._cited_commit_reject(f, 'no_unique_commit')
         assert 'resolved' in measured
         assert measured['resolved'] is None
+        assert 'missing or ambiguous' in f.mark_blocked.await_args.args[0]
 
     async def test_git_failure_is_a_reject_carrying_the_error(
         self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
@@ -659,7 +676,7 @@ class TestReadyToMergeAbbreviatedCitation:
             tmp_path, two_commit_repo, two_commit_repo.tip[:10], git_root=plain,
         )
 
-        assert self._cited_commit_reject(f)['git_error']
+        assert self._cited_commit_reject(f, 'git_error')['git_error']
 
 
 # ---------------------------------------------------------------------------
