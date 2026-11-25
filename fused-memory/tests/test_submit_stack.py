@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import socket
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
 from _curator_helpers import hold_first_prepare
+from _fm_sockets import refused_port
 from _submit_stack import Stack
 from _submit_stack import curator_creates as curator_creates
 from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
@@ -17,16 +18,15 @@ from fused_memory.middleware.curator_types import PreparedCandidate
 
 
 @pytest.fixture(autouse=True)
-def unreachable_corpus_services(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the tracked config's Qdrant and OpenAI URLs at a loopback port nothing listens on.
+def unreachable_corpus_services(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Point the tracked config's Qdrant and OpenAI URLs at a loopback port that refuses connects.
 
     Autouse, so the redirect is in place before ``stack`` builds its ``FusedMemoryConfig()``.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(('127.0.0.1', 0))
-        port = probe.getsockname()[1]
-    monkeypatch.setenv('QDRANT_URL', f'http://127.0.0.1:{port}')
-    monkeypatch.setenv('OPENAI_API_URL', f'http://127.0.0.1:{port}/v1')
+    with refused_port() as port:
+        monkeypatch.setenv('QDRANT_URL', f'http://127.0.0.1:{port}')
+        monkeypatch.setenv('OPENAI_API_URL', f'http://127.0.0.1:{port}/v1')
+        yield
 
 
 def _followup(title: str) -> dict[str, Any]:
