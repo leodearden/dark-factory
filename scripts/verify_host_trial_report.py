@@ -332,7 +332,10 @@ def _allowance_lines(reading: allowance.AllowanceReading) -> list[str]:
     if reading.dormant_accounts:
         lines.append(f'  dormant accounts (no spend or cap near the window): {", ".join(reading.dormant_accounts)}')
     if reading.unplaceable_cap_hits:
-        lines.append(f'  cap hits without a reset: {reading.unplaceable_cap_hits}')
+        lines.append(f'  weekly cap hits without a reset: {reading.unplaceable_cap_hits}')
+    if reading.other_caps:
+        counts = ', '.join(f'{kind} {count}' for kind, count in reading.other_caps.items())
+        lines.append(f'  caps that place no cycle: {counts}')
     return lines
 
 
