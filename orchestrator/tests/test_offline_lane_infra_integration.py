@@ -90,6 +90,13 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeOccurrenceRow,
+    FlakeVerdict,
+    ledger_db_path,
+    read_occurrences,
+)
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
@@ -188,6 +195,9 @@ _SPAWNS_PER_FIXTURE_COMMIT = 2
 # into GitConfig(...) type-checks cleanly regardless of which fields a
 # caller-supplied git_overrides sets.
 _DEFAULT_INFRA_GIT_OVERRIDES: dict[str, Any] = {'offline_lane_infra_enabled': True}
+
+# The project id a red pass's flake-ledger rows are written under.
+_PROJECT_ID = 'offline_lane_infra_integration'
 
 # ---------------------------------------------------------------------------
 # Shared end-to-end scaffolding (prerequisite P1)
@@ -532,6 +542,9 @@ class _RedLane:
 
     def episode(self, node: str = _X) -> Episode:
         return self.record().episodes[node]
+
+    def ledger_rows(self) -> list[FlakeOccurrenceRow]:
+        return read_occurrences(ledger_db_path(self.project_root))
 
     def unlanded(self) -> list[Escalation]:
         """The pending D11 records on the infra leg's sentinel id."""
@@ -1406,13 +1419,16 @@ async def test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_file
 
     first = await _drive_infra_pass(lane, 'red')
 
+    reproduction = (_X, FlakeVerdict.fails_in_isolation, FlakeCallSite.offline_lane, _PROJECT_ID)
     assert first.outcome == _intersected(reproduced=[_X])
     assert first.effect['tasks_filed'] == []
     assert lane.client.submitted == []
     assert lane.episode().counted_passes == (first.pass_id,)
+    assert [(r.test_id, r.verdict, r.call_site, r.project_id) for r in lane.ledger_rows()] == [reproduction]
 
     second = await _drive_infra_pass(lane, 'red')
 
+    assert [(r.test_id, r.verdict, r.call_site, r.project_id) for r in lane.ledger_rows()] == [reproduction] * 2
     (arguments,) = lane.client.submitted
     episode = lane.episode()
     assert episode.covering_task_id is not None

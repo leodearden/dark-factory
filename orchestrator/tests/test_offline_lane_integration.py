@@ -82,6 +82,13 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeOccurrenceRow,
+    FlakeVerdict,
+    ledger_db_path,
+    read_occurrences,
+)
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
@@ -266,6 +273,10 @@ def harness(git_config: GitConfig, git_ops: GitOps, mock_orch_config) -> Harness
     h.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
     h._service_restart_coordinators = []
     return h
+
+
+# The project id a red pass's flake-ledger rows are written under.
+_PROJECT_ID = 'offline_lane_integration'
 
 
 def _build_worker(
@@ -635,6 +646,9 @@ class _RedLane:
 
     def episode(self, node: str = _TARGET) -> Episode:
         return self.record().episodes[node]
+
+    def ledger_rows(self) -> list[FlakeOccurrenceRow]:
+        return read_occurrences(ledger_db_path(self.project_root))
 
     def unlanded(self) -> list[Escalation]:
         """The pending D11 records on the command's sentinel id."""
@@ -1591,13 +1605,16 @@ async def test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_t
 
     first = await _drive_lane_pass(lane, 'red')
 
+    reproduction = (_TARGET, FlakeVerdict.fails_in_isolation, FlakeCallSite.offline_lane, _PROJECT_ID)
     assert first.outcome == _confirmed(reproduced=[_TARGET])
     assert first.effect['tasks_filed'] == []
     assert lane.client.submitted == []
     assert lane.episode().counted_passes == (first.pass_id,)
+    assert [(r.test_id, r.verdict, r.call_site, r.project_id) for r in lane.ledger_rows()] == [reproduction]
 
     second = await _drive_lane_pass(lane, 'red')
 
+    assert [(r.test_id, r.verdict, r.call_site, r.project_id) for r in lane.ledger_rows()] == [reproduction] * 2
     (arguments,) = lane.client.submitted
     episode = lane.episode()
     assert episode.covering_task_id is not None
