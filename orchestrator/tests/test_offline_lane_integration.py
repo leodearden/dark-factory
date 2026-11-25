@@ -138,14 +138,14 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 
 # The measured worst-case count of subprocess spawns inside a single
 # `_run_lane` window -- the multiplier `_LANE_PASS_BOUND_SECS`'s floor check
-# is sized against. Measured in the SIBLING infra module's
-# `test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task`: 3 git
-# spawns from `_run_once` plus 2 real infra `run_all.sh` spawns. In THIS
-# module only B1-B3's injected-seam passes sit inside a `_run_lane` window;
-# red-path passes are awaited unbounded through `await_lane_passes`. See
-# `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` for the
-# full derivation.
-_SPAWNS_PER_LANE_PASS_WORST_CASE = 5
+# is sized against. The shared worst case lives in the SIBLING infra module,
+# whose `test_out_of_bound_spawn_counts_are_measured_not_asserted` measures it
+# over a warm infra red pass; this module's
+# `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` pins this
+# copy to that one by equality. In THIS module only B1-B3's injected-seam
+# passes sit inside a `_run_lane` window; red-path passes are awaited
+# unbounded through `await_lane_passes`.
+_SPAWNS_PER_LANE_PASS_WORST_CASE = 6
 
 # Task 4203 — the multiplicands `_orch_helpers.py::required_timeout_secs` prices at
 # `MEASURED_SPAWN_LATENCY_SECS` per spawn. The `repo` fixture is one seed_repo
@@ -1020,26 +1020,27 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     FLOOR — `_LANE_PASS_BOUND_SECS` must be at least
     `_SPAWNS_PER_LANE_PASS_WORST_CASE`x `MEASURED_SPAWN_LATENCY_SECS` (task
     3451's measured worst-case happy-path subprocess spawn latency: n=3,
-    2.13/3.10/4.71s, load-per-core 6.6). The multiplier is DERIVED, not
-    guessed: it is the measured worst-case count of subprocess spawns that
-    occur INSIDE a single `_run_lane` window, and that worst case lives in
-    the SIBLING infra module (``test_offline_lane_infra_integration.py``'s
-    `test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task`):
-    `_run_once`'s 3 git spawns (`get_main_sha`, `worktree list`, `worktree
-    add`) plus the real infra seam spawning `run_all.sh` twice (the initial
-    run and the isolated confirmation re-run). Later passes swap `worktree
-    add` for `reset --hard` + `clean -xfd` — 4 spawns, still under 5. In
+    2.13/3.10/4.71s, load-per-core 6.6). The multiplier is MEASURED, not
+    guessed: it is the worst-case count of subprocess spawns that occur
+    INSIDE a single `_run_lane` window, and that worst case lives in the
+    SIBLING infra module (``test_offline_lane_infra_integration.py``), whose
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted` is its
+    executable pin. A warm infra red pass is `_run_once`'s 4 git spawns
+    (`get_main_sha`, `worktree list`, `reset --hard`, `clean -xfd`) plus the
+    real infra seam spawning `run_all.sh` twice (the detect run and the
+    confirm re-run) = 6; the cold first pass, whose `worktree add` stands in
+    for the reset and the clean, is 5. 6 is the multiplier. In
     this module `_LANE_PASS_BOUND_SECS` bounds only B1-B3's passes, which
     sit well under that shared worst case (the numeric `suite_runner` seam
     there is a bare injected callable, never a real subprocess); its
     red-path passes run real sub-runs and are awaited unbounded through
-    `await_lane_passes`. The floor is still asserted here, AND additionally
-    checked for equality against the infra module's own copy immediately
-    below — the floor/ceiling relation alone permits any value in
-    [5x measured spawn latency, 0.6x effective timeout] for EACH module
-    independently, so only the explicit equality check actually prevents
-    the two modules' `_LANE_PASS_BOUND_SECS` from silently diverging within
-    that shared range.
+    `await_lane_passes`. The floor is still asserted here, AND both the
+    bound and this multiplier are additionally checked for equality against
+    the infra module's own copies immediately below — the floor/ceiling
+    relation alone permits any value in [6x measured spawn latency, 0.6x
+    effective timeout] for EACH module independently, so only the explicit
+    equality check actually prevents the two modules' `_LANE_PASS_BOUND_SECS`
+    from silently diverging within that shared range.
 
     CEILING — the marker-less worst case (one `_LANE_PASS_BOUND_SECS`, since
     steps 2/4 of task 4030 covered every test that composes past a single
@@ -1082,10 +1083,10 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'subprocess spawn latency ({MEASURED_SPAWN_LATENCY_SECS}s, task 3451: n=3 '
         f'2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The '
         f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}-spawn multiplier is the measured worst-case '
-        f'count of subprocess spawns inside a single _run_lane window (see '
-        f'test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task in '
-        f'test_offline_lane_infra_integration.py: 3 git spawns from _run_once plus 2 '
-        f'real infra run_all.sh spawns).'
+        f'count of subprocess spawns inside a single _run_lane window, measured by '
+        f'test_offline_lane_infra_integration.py::test_out_of_bound_spawn_counts_are_measured_not_asserted: '
+        f'a warm infra red pass is 4 git spawns from _run_once (get_main_sha, worktree list, '
+        f'reset --hard, clean -xfd) plus the detect and confirm run_all.sh sub-runs.'
     )
 
     from test_offline_lane_infra_integration import (

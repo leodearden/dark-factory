@@ -143,12 +143,14 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 
 # The measured worst-case count of subprocess spawns inside a single
 # `_run_lane` window -- the multiplier `_LANE_PASS_BOUND_SECS`'s floor check
-# is sized against. Measured IN THIS MODULE's
-# `test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task`: 3 git
-# spawns from `_run_once` plus 2 real infra `run_all.sh` spawns. See
+# is sized against. MEASURED by this module's
+# `test_out_of_bound_spawn_counts_are_measured_not_asserted` (task 10732): a
+# warm red pass is `get_main_sha`, `worktree list`, `reset --hard`,
+# `clean -xfd`, plus the detect and confirm `run_all.sh` sub-runs = 6. The
+# cold `worktree add` pass is 5. See
 # `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` for the
 # full derivation.
-_SPAWNS_PER_LANE_PASS_WORST_CASE = 5
+_SPAWNS_PER_LANE_PASS_WORST_CASE = 6
 
 # Task 4203 — a multiplicand `_orch_helpers.py::required_timeout_secs` prices at
 # `MEASURED_SPAWN_LATENCY_SECS` per spawn. The `repo` fixture is one seed_repo
@@ -862,15 +864,16 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     FLOOR — `_LANE_PASS_BOUND_SECS` must be at least
     `_SPAWNS_PER_LANE_PASS_WORST_CASE`x `MEASURED_SPAWN_LATENCY_SECS` (task
     3451's measured worst-case happy-path subprocess spawn latency: n=3,
-    2.13/3.10/4.71s, load-per-core 6.6). The multiplier is DERIVED, not
-    guessed, and the measurement lives IN THIS MODULE:
-    `test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task`
-    below is the measured worst-case count of subprocess spawns inside a
-    single `_run_lane` window — `_run_once`'s 3 git spawns (`get_main_sha`,
-    `worktree list`, `worktree add`) plus the real infra seam spawning
-    `run_all.sh` twice (the initial run and the isolated confirmation
-    re-run). Later passes swap `worktree add` for `reset --hard` + `clean
-    -xfd` — 4 spawns, still under 5. The sibling numeric module
+    2.13/3.10/4.71s, load-per-core 6.6). The multiplier is MEASURED, not
+    guessed, and the measurement lives IN THIS MODULE: the worst-case count
+    of subprocess spawns inside a single `_run_lane` window is a warm infra
+    red pass's — `_run_once`'s 4 git spawns (`get_main_sha`, `worktree list`,
+    `reset --hard`, `clean -xfd`) plus the real infra seam spawning
+    `run_all.sh` twice (the detect run and the confirm re-run) = 6. The cold
+    first pass, whose `worktree add` stands in for the reset and the clean,
+    is 5. 6 is the multiplier, and
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted` below is its
+    executable pin. The sibling numeric module
     (``test_offline_lane_integration.py``) asserts this SAME relation AND
     additionally imports this module's `_LANE_PASS_BOUND_SECS` to assert
     equality against its own copy — see that module's version of this test
@@ -919,9 +922,10 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'subprocess spawn latency ({MEASURED_SPAWN_LATENCY_SECS}s, task 3451: n=3 '
         f'2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The '
         f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}-spawn multiplier is the measured worst-case '
-        f'count of subprocess spawns inside a single _run_lane window (see '
-        f'test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task below: 3 '
-        f'git spawns from _run_once plus 2 real infra run_all.sh spawns).'
+        f'count of subprocess spawns inside a single _run_lane window, measured by '
+        f'test_out_of_bound_spawn_counts_are_measured_not_asserted below: a warm infra '
+        f'red pass is 4 git spawns from _run_once (get_main_sha, worktree list, reset '
+        f'--hard, clean -xfd) plus the detect and confirm run_all.sh sub-runs.'
     )
 
     global_timeout = _effective_per_test_timeout(pytestconfig)
