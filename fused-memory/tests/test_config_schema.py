@@ -928,12 +928,13 @@ class TestMem0UpdateConfig:
             'recon-stage-', 'curator-',
         ]
 
-    def test_default_metadata_patch_allowlist_is_recon_stage_and_curator(self):
+    def test_default_metadata_patch_allowlist_is_recon_stage_curator_and_link_heal(self):
         """curator- deliberately holds BOTH arms: gate 3200's retain-and-tag
         stamps retained peers via metadata-only patches, so content_amend alone
-        would be the destructive half without the preserving half."""
+        would be the destructive half without the preserving half. link-heal-
+        holds the metadata arm only (plans/write-triage-link-healing-prd.md H1)."""
         assert Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes == [
-            'recon-stage-', 'curator-',
+            'recon-stage-', 'curator-', 'link-heal-',
         ]
 
     def test_default_storm_threshold_is_20(self):
@@ -1038,8 +1039,8 @@ class TestMem0UpdateConfig:
         )
 
     def test_default_sanctioned_use_documents_link_heal(self):
-        """config.yaml grants link-heal- on the metadata arm without overriding
-        the map, so its role text has to ship in the schema default."""
+        """The schema default grants link-heal- on the metadata arm, so its
+        role text ships in the same default."""
         uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
         assert isinstance(uses.get('link-heal-'), str)
         assert uses['link-heal-'].strip()

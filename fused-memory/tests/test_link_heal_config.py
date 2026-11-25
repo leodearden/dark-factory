@@ -17,6 +17,7 @@ import types
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from fused_memory.config.reload import RELOADABLE_FIELDS, diff_config
@@ -168,39 +169,52 @@ class TestTrackedConfigShipsTheSweepWithWritesOff:
         }
 
 
-class TestTrackedConfigAdmitsTheLinkHealPrefixOnTheMetadataArmOnly:
-    def test_metadata_arm_lists_recon_curator_and_link_heal(self, tracked_config):
-        prefixes = tracked_config.mem0_update.metadata_patch_allowed_agent_prefixes
+@pytest.fixture(params=['tracked-yaml', 'no-yaml'])
+def effective_config(request, monkeypatch) -> FusedMemoryConfig:
+    if request.param == 'tracked-yaml':
+        assert TRACKED_CONFIG_YAML.is_file(), TRACKED_CONFIG_YAML
+        monkeypatch.setenv('CONFIG_PATH', str(TRACKED_CONFIG_YAML))
+    return FusedMemoryConfig()
+
+
+class TestEffectiveConfigAdmitsTheLinkHealPrefixOnTheMetadataArmOnly:
+    def test_metadata_arm_lists_recon_curator_and_link_heal(self, effective_config):
+        prefixes = effective_config.mem0_update.metadata_patch_allowed_agent_prefixes
         for prefix in ('recon-stage-', 'curator-', 'link-heal-'):
             assert prefix in prefixes
 
-    def test_metadata_arm_keeps_every_schema_default_prefix(self, tracked_config):
-        """The YAML list replaces the schema default, so a prefix added there must be mirrored."""
-        listed = set(tracked_config.mem0_update.metadata_patch_allowed_agent_prefixes)
-        default = set(Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes)
-        assert default <= listed, f'missing from config.yaml: {sorted(default - listed)}'
+    def test_content_amend_arm_stays_at_the_schema_default(self, effective_config):
+        prefixes = effective_config.mem0_update.content_amend_allowed_agent_prefixes
+        assert prefixes == Mem0UpdateConfig().content_amend_allowed_agent_prefixes
+        assert 'link-heal-' not in prefixes
 
-    def test_content_amend_arm_stays_at_the_schema_default(self, tracked_config):
-        assert (
-            tracked_config.mem0_update.content_amend_allowed_agent_prefixes
-            == Mem0UpdateConfig().content_amend_allowed_agent_prefixes
-        )
-
-    def test_a_link_heal_agent_may_patch_metadata(self, tracked_config):
+    def test_a_link_heal_agent_may_patch_metadata(self, effective_config):
         decision = resolve_mem0_update_authorization(
-            types.SimpleNamespace(config=tracked_config),
+            types.SimpleNamespace(config=effective_config),
             agent_id='link-heal-0123abcd',
             content_amend=False,
             metadata_patch=True,
         )
         assert decision.allowed, decision
 
-    def test_a_link_heal_agent_may_not_amend_content(self, tracked_config):
+    def test_a_link_heal_agent_may_not_amend_content(self, effective_config):
         decision = resolve_mem0_update_authorization(
-            types.SimpleNamespace(config=tracked_config),
+            types.SimpleNamespace(config=effective_config),
             agent_id='link-heal-0123abcd',
             content_amend=True,
             metadata_patch=False,
         )
         assert not decision.allowed
         assert decision.error_type == 'Mem0UpdateNotAuthorized'
+
+
+class TestTheLinkHealPrefixHasOneHome:
+    def test_the_schema_default_admits_link_heal_on_the_metadata_arm_only(self):
+        cfg = Mem0UpdateConfig()
+        assert 'link-heal-' in cfg.metadata_patch_allowed_agent_prefixes
+        assert 'link-heal-' not in cfg.content_amend_allowed_agent_prefixes
+
+    def test_the_tracked_config_does_not_restate_the_metadata_arm(self):
+        """An active YAML list replaces the schema default wholesale and must then be hand-mirrored."""
+        raw = yaml.safe_load(TRACKED_CONFIG_YAML.read_text())
+        assert 'metadata_patch_allowed_agent_prefixes' not in (raw.get('mem0_update') or {})
