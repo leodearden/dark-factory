@@ -2672,40 +2672,22 @@ class MemoryService:
         per-call-site opt-in. A ``token_probe`` window wraps only the awaited
         call, and the LLM tokens it measured are journaled with the row. A
         probe that fails to open is journaled as this call's failure, and
-        ``coro`` is closed unawaited. ``on_landed`` lets a queue executor
-        declare the moment its write landed: it runs once the call returns,
-        before its success row is journaled.
+        ``coro`` is closed unawaited. Only a failed or cancelled BACKEND call
+        is journaled as a failure: an interrupted success-row write journals
+        nothing rather than a false failure. ``on_landed`` lets a queue
+        executor declare the moment its write landed: it runs once the call
+        returns, before its success row is journaled.
         """
         measurement = TokenMeasurement()
-        result = None
-        duration_ms: float | None = None
         started = time.perf_counter()
         try:
             async with (
                 token_probe() if token_probe is not None else contextlib.nullcontext(measurement)
             ) as measurement:
                 result = await coro
-            duration_ms = _elapsed_ms_since(started)
-            if on_landed is not None:
-                on_landed()
-            if self._write_journal:
-                await self._write_journal.log_backend_op(
-                    write_op_id=write_op_id,
-                    causation_id=causation_id,
-                    backend=backend,
-                    operation=operation,
-                    payload=payload,
-                    result_summary=str(result)[:500] if result else None,
-                    success=True,
-                    duration_ms=duration_ms,
-                    llm_tokens=measurement.usage,
-                )
-            return result
         except (Exception, asyncio.CancelledError) as e:
             if asyncio.iscoroutine(coro):
                 coro.close()
-            if duration_ms is None:
-                duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2715,10 +2697,26 @@ class MemoryService:
                     payload=payload,
                     success=False,
                     error=f'{type(e).__name__}: {e}',
-                    duration_ms=duration_ms,
+                    duration_ms=_elapsed_ms_since(started),
                     llm_tokens=measurement.usage,
                 )
             raise
+        duration_ms = _elapsed_ms_since(started)
+        if on_landed is not None:
+            on_landed()
+        if self._write_journal:
+            await self._write_journal.log_backend_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend=backend,
+                operation=operation,
+                payload=payload,
+                result_summary=str(result)[:500] if result else None,
+                success=True,
+                duration_ms=duration_ms,
+                llm_tokens=measurement.usage,
+            )
+        return result
 
     async def _record_queue_terminal_outcome(
         self,
