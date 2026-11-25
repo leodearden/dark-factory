@@ -1,7 +1,8 @@
-"""A recorder of the process's file opens, filesystem mutations, socket connects and spawns, from every thread.
+"""A recorder of the process's file and database opens, filesystem mutations, socket connects and spawns, from every thread.
 
-B30 (plans/client-feed-prd.md §14.5) scopes the filer with it: every effect of a filer run lies under its state dir,
-its policy and its inbox, or in the Python runtime and CA bundle every process reads.
+B1 (plans/client-feed-prd.md §8) confines the publisher with it: every effect of a pass lies under its project root,
+its out and in dirs and its policy, or in the interpreter. B30 (§14.5) scopes the filer with it: every effect of a
+filer run lies under its state dir, its policy and its inbox, or in the Python runtime and CA bundle every process reads.
 """
 
 from __future__ import annotations
@@ -11,14 +12,17 @@ import site
 import ssl
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import unquote, urlsplit
 
 _OPEN: Final = 'open'
 _CONNECT: Final = 'socket.connect'
+_DATABASE: Final = 'sqlite3.connect'
+_POPEN: Final = 'subprocess.Popen'
 _MUTATIONS: Final = frozenset({
     'os.mkdir',
     'os.rename',
@@ -32,7 +36,7 @@ _MUTATIONS: Final = frozenset({
     'os.utime',
 })
 _SPAWNS: Final = frozenset({
-    'subprocess.Popen',
+    _POPEN,
     'os.system',
     'os.exec',
     'os.posix_spawn',
@@ -40,8 +44,10 @@ _SPAWNS: Final = frozenset({
     'os.fork',
     'os.forkpty',
 })
-_RECORDED: Final = frozenset({_OPEN, _CONNECT, *_MUTATIONS, *_SPAWNS})
+_RECORDED: Final = frozenset({_OPEN, _CONNECT, _DATABASE, *_MUTATIONS, *_SPAWNS})
 _BYTECODE_CACHE: Final = '__pycache__'
+_URI_SCHEME: Final = 'file:'
+_PATHLESS_DATABASES: Final = frozenset({'', ':memory:'})
 _WRITE_FLAGS: Final = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
 
 _lock = threading.RLock()
@@ -67,9 +73,18 @@ class Connected:
 
 
 @dataclass(frozen=True)
+class DatabaseOpened:
+    """A sqlite connect; `path` is None for a database with no file, such as ':memory:'."""
+
+    path: Path | None
+
+
+@dataclass(frozen=True)
 class Spawned:
     event: str
     target: str | None
+    cwd: Path | None = None
+    args: tuple[str, ...] = ()
 
 
 def _hook(event: str, args: tuple[Any, ...]) -> None:
@@ -115,10 +130,33 @@ def _mutated(event: str, args: tuple[Any, ...]) -> Mutated:
     return Mutated(event, tuple(path for path in map(_path, named) if path is not None))
 
 
+def _database_opened(args: tuple[Any, ...]) -> DatabaseOpened:
+    text = _text(args[0]) if args else None
+    if text is None or text in _PATHLESS_DATABASES:
+        return DatabaseOpened(None)
+    if not text.startswith(_URI_SCHEME):
+        return DatabaseOpened(_path(text))
+    path = unquote(urlsplit(text).path)
+    return DatabaseOpened(Path(os.path.abspath(path)) if path else None)
+
+
+def _argv(value: object) -> tuple[str, ...]:
+    single = _text(value)
+    if single is not None:
+        return (single,)
+    if isinstance(value, Sequence):
+        return tuple(_text(item) or repr(item) for item in value)
+    return ()
+
+
 def _spawned(event: str, args: tuple[Any, ...]) -> Spawned:
     offset = 1 if event == 'os.spawn' else 0
     target = args[offset] if len(args) > offset else None
-    return Spawned(event, None if target is None else _text(target) or repr(target))
+    spawned = Spawned(event, None if target is None else _text(target) or repr(target))
+    if event != _POPEN:
+        return spawned
+    _executable, argv, cwd = (*args, None, None, None)[:3]
+    return Spawned(spawned.event, spawned.target, cwd=_path(cwd), args=_argv(argv))
 
 
 def _ca_bundles() -> list[str]:
@@ -131,11 +169,19 @@ def _ca_bundles() -> list[str]:
     return [*bundles, certifi.where()]
 
 
+def _roots(paths: Sequence[str]) -> tuple[Path, ...]:
+    return tuple(dict.fromkeys(Path(os.path.abspath(path)) for path in paths))
+
+
+def interpreter_roots() -> tuple[Path, ...]:
+    """Where the interpreter and its installed packages live: the sys prefixes and the site-packages dirs."""
+    prefixes = [sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix]
+    return _roots([*prefixes, *site.getsitepackages(), site.getusersitepackages()])
+
+
 def runtime_roots() -> tuple[Path, ...]:
     """Where the Python runtime and the CA bundle live: what any process opens, so no scope rule is about them."""
-    prefixes = {sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix}
-    sites = [*site.getsitepackages(), site.getusersitepackages()]
-    return tuple(dict.fromkeys(Path(os.path.abspath(path)) for path in (*prefixes, *sites, *_ca_bundles())))
+    return _roots([*map(str, interpreter_roots()), *_ca_bundles()])
 
 
 def _under(path: Path, roots: tuple[Path, ...]) -> bool:
@@ -171,18 +217,30 @@ class AuditRecord:
         return tuple(Connected(args[1]) for event, args in self._raw() if event == _CONNECT)
 
     @property
+    def database_opens(self) -> tuple[DatabaseOpened, ...]:
+        return tuple(_database_opened(args) for event, args in self._raw() if event == _DATABASE)
+
+    @property
     def spawns(self) -> tuple[Spawned, ...]:
         return tuple(_spawned(event, args) for event, args in self._raw() if event in _SPAWNS)
 
+    def opens_outside(self, roots: tuple[Path, ...]) -> tuple[Opened, ...]:
+        """Leaves out reads under `roots` and writes into a bytecode cache under them; any other write is kept."""
+        resolved = _resolved(roots)
+        return tuple(opened for opened in self.opens if not _runtime_open(opened, resolved))
+
+    def mutations_outside(self, roots: tuple[Path, ...]) -> tuple[Mutated, ...]:
+        """Leaves out the importer's bytecode-cache writes under `roots`; any other mutation under them is kept."""
+        resolved = _resolved(roots)
+        return tuple(mutated for mutated in self.mutations if not _runtime_cache_write(mutated, resolved))
+
     def opens_outside_runtime(self) -> tuple[Opened, ...]:
         """Leaves out reads of the runtime and the CA bundle, and the importer's bytecode-cache writes; any other write is kept."""
-        roots = _resolved_runtime_roots()
-        return tuple(opened for opened in self.opens if not _runtime_open(opened, roots))
+        return self.opens_outside(runtime_roots())
 
     def mutations_outside_runtime(self) -> tuple[Mutated, ...]:
         """Leaves out the importer's bytecode-cache writes, made on a module's first import from an uncompiled venv; any other mutation of the runtime is kept."""
-        roots = _resolved_runtime_roots()
-        return tuple(mutated for mutated in self.mutations if not _runtime_cache_write(mutated, roots))
+        return self.mutations_outside(runtime_roots())
 
 
 def _runtime_open(opened: Opened, roots: tuple[Path, ...]) -> bool:
@@ -193,13 +251,13 @@ def _runtime_cache_write(mutated: Mutated, roots: tuple[Path, ...]) -> bool:
     return bool(mutated.paths) and all(_in_runtime_cache(path, roots) for path in mutated.paths)
 
 
-def _resolved_runtime_roots() -> tuple[Path, ...]:
-    return tuple({*runtime_roots(), *(root.resolve() for root in runtime_roots())})
+def _resolved(roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    return tuple({*roots, *(root.resolve() for root in roots)})
 
 
 @contextmanager
 def recording() -> Iterator[AuditRecord]:
-    """Record every open, mutation, connect and spawn raised in this process until the block exits."""
+    """Record every open, database open, mutation, connect and spawn raised in this process until the block exits."""
     global _active
     _install()
     events: list[tuple[str, tuple[Any, ...]]] = []
