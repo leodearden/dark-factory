@@ -15,12 +15,20 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory.backends.episode_toolcall_leak_scan import (
     EpisodeToolcallLeak,
@@ -28,6 +36,7 @@ from fused_memory.backends.episode_toolcall_leak_scan import (
 )
 from fused_memory.backends.paged_read import INCOMPLETE_SHORT_READ, PagedRead
 from fused_memory.maintenance import _utils as maintenance_utils
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 from fused_memory.utils.toolcall_xml_leak import (
     LeakShape,
     find_toolcall_xml_leak,
@@ -36,6 +45,15 @@ from fused_memory.utils.toolcall_xml_leak import (
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'sweep_episode_toolcall_xml_leak.py'
 _mod = load_script_module(SCRIPT_PATH, mod_name='sweep_episode_toolcall_xml_leak')
+
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it scans (task 3233),
+    because an --apply redaction writes the Graphiti content SET plus a write
+    journal row. This suite is MOCK-unit (a stub service, no live FalkorDB).
+    ``TestApplyStoreMutationPreflight`` re-rigs it to refuse, so the guard's own
+    behaviour is still pinned.""",
+)
 
 PROJECT = 'dark_factory'
 
@@ -94,10 +112,15 @@ class StubService:
 
     __slots__ = ('redact_episode_content', 'scan', 'scan_calls')
 
-    def __init__(self, scan: EpisodeToolcallLeakScan | BaseException) -> None:
+    def __init__(
+        self,
+        scan: EpisodeToolcallLeakScan | BaseException,
+        *,
+        redact: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
         self.scan = scan
         self.scan_calls: list[dict[str, Any]] = []
-        self.redact_episode_content = AsyncMock(side_effect=self._redacted)
+        self.redact_episode_content = AsyncMock(side_effect=redact or self._redacted)
 
     async def scan_episode_toolcall_leaks(self, **kwargs: Any) -> EpisodeToolcallLeakScan:
         self.scan_calls.append(kwargs)
@@ -252,3 +275,133 @@ class TestMainReportsAnAbort:
         report = json.loads(capsys.readouterr().out)
         assert report['aborted'] is True
         assert report['records'] == []
+
+
+# ---------------------------------------------------------------------------
+# --apply
+# ---------------------------------------------------------------------------
+
+
+def _redacted_uuids(service: StubService) -> list[str]:
+    return [call.args[0] for call in service.redact_episode_content.await_args_list]
+
+
+class TestApplyRedactsOnlyRepairableShapes:
+    @pytest.mark.asyncio
+    async def test_redacts_each_repairable_episode_with_its_repair(self) -> None:
+        scan = _three_shapes()
+        service = StubService(scan)
+
+        report = await _mod.run(_args('--apply'), service)
+
+        assert _redacted_uuids(service) == ['tail', 'dup']
+        for call in service.redact_episode_content.await_args_list:
+            leak = next(leak for leak in scan.leaks if leak.uuid == call.args[0])
+            assert call.kwargs['new_content'] == repair_leaked_text(leak.content)
+            assert call.kwargs['project_id'] == PROJECT
+        assert _record(report, 'tail')['redacted'] is True
+        assert _record(report, 'dup')['redacted'] is True
+        assert not _record(report, 'manual').get('redacted')
+        assert report['redacted'] == 2
+
+    @pytest.mark.asyncio
+    async def test_redacts_into_the_requested_project(self) -> None:
+        service = StubService(_scan(_leak('tail', TAIL_CONTENT)))
+
+        await _mod.run(_args('--apply', '--project-id', 'reify'), service)
+
+        assert service.redact_episode_content.await_args.kwargs['project_id'] == 'reify'
+
+
+class TestApplyExitCode:
+    @pytest.mark.asyncio
+    async def test_a_clean_complete_fully_redacted_apply_exits_zero(self) -> None:
+        scan = _scan(_leak('tail', TAIL_CONTENT), _leak('dup', DUPLICATE_CONTENT))
+
+        report = await _mod.run(_args('--apply'), StubService(scan))
+
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_any_manual_review_exits_one(self) -> None:
+        report = await _mod.run(_args('--apply'), StubService(_three_shapes()))
+
+        assert _mod.resolve_exit_code(report) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_scan_exits_one(self) -> None:
+        scan = _scan(
+            _leak('tail', TAIL_CONTENT), expected_rows=4, incomplete_kind=INCOMPLETE_SHORT_READ,
+        )
+
+        report = await _mod.run(_args('--apply'), StubService(scan))
+
+        assert _mod.resolve_exit_code(report) == 1
+
+    @pytest.mark.parametrize('flag', _mod.HUMAN_ADJUDICATION_FLAGS)
+    def test_any_human_adjudication_flag_exits_one(self, flag: str) -> None:
+        report = _mod.build_report(
+            project_id=PROJECT,
+            dry_run=False,
+            scan_summary=_mod.summarize_scan(_scan(_leak('tail', TAIL_CONTENT))),
+            records=[{'uuid': 'tail', 'classification': LeakShape.REPAIRABLE_TAIL, flag: True}],
+        )
+
+        assert _mod.resolve_exit_code(report) == 1
+
+
+class TestApplyRecordsPerEpisodeFailures:
+    @pytest.mark.asyncio
+    async def test_a_failed_redact_is_recorded_and_the_sweep_continues(self) -> None:
+        scan = _scan(_leak('first', TAIL_CONTENT), _leak('second', DUPLICATE_CONTENT))
+
+        def _redact(episode_uuid: str, **kwargs: Any) -> dict[str, Any]:
+            if episode_uuid == 'first':
+                raise RuntimeError('FalkorDB write timed out')
+            return {'old_content': DUPLICATE_CONTENT, 'new_content': kwargs['new_content']}
+
+        report = await _mod.run(_args('--apply'), StubService(scan, redact=_redact))
+
+        first = _record(report, 'first')
+        assert first[_mod.RECORD_ERROR] is True
+        assert 'FalkorDB write timed out' in first['error']
+        assert not first.get('redacted')
+        assert _record(report, 'second')['redacted'] is True
+        assert _mod.resolve_exit_code(report) == 1
+
+    @pytest.mark.asyncio
+    async def test_content_that_changed_since_the_scan_is_flagged(self) -> None:
+        scan = _scan(_leak('tail', TAIL_CONTENT))
+
+        def _redact(episode_uuid: str, **kwargs: Any) -> dict[str, Any]:
+            return {'old_content': 'someone rewrote it', 'new_content': kwargs['new_content']}
+
+        report = await _mod.run(_args('--apply'), StubService(scan, redact=_redact))
+
+        assert _record(report, 'tail')[_mod.CONTENT_CHANGED_SINCE_SCAN] is True
+        assert _mod.resolve_exit_code(report) == 1
+
+
+class TestApplyStoreMutationPreflight:
+    @pytest.mark.asyncio
+    async def test_a_denied_preflight_refuses_before_the_scan(self, monkeypatch, caplog) -> None:
+        deny(_mod, monkeypatch)
+        service = StubService(_three_shapes())
+
+        with caplog.at_level(logging.ERROR), pytest.raises(StoreMutationUnavailable, match=SENTINEL):
+            await _mod.run(_args('--apply'), service)
+
+        assert service.scan_calls == []
+        service.redact_episode_content.assert_not_awaited()
+        (record,) = fail_closed_records(caplog, 'sweep_episode_toolcall_xml_leak')
+        assert SENTINEL in record.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch) -> None:
+        deny(_mod, monkeypatch)
+        service = StubService(_three_shapes())
+
+        report = await _mod.run(_args(), service)
+
+        assert report['dry_run'] is True
+        assert len(report['records']) == 3
