@@ -771,7 +771,11 @@ the Mem0 sweep uses.
 - Under `--apply` the exit code is 1 when something is left for a human: any
   `manual_review` episode, an incomplete scan, a failed redaction
   (`record_error`), or content that changed between the scan and its
-  redaction (`content_changed_since_scan`).
+  redaction (`content_changed_since_scan`). A `content_changed_since_scan`
+  record carries the text the redaction overwrote as `replaced_content`,
+  beside the scanned `content`. The write journal does not hold that text: it
+  stores only a truncated `new_content`. The printed `--apply` report is the
+  only full copy, so redirect it to a file before adjudicating.
 - Exit 2 means the run aborted. The partial report is printed first.
 
 **Measured 2026-11-25** with read-only queries against production graph
