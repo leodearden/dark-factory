@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _defects import carrier_for, carrying, declared, gate_for
 from _stores import EscalationQueueDir, RunsDb, TasksDb
 from shared.project_layout import tasks_db
 
@@ -13,10 +14,12 @@ from client_feed.contract import Source, TaskStatus, WaitingOn
 from client_feed.sources.escalations import OpenEscalations, read_open_escalations
 from client_feed.sources.store import StoreProblem, StoreReadError
 from client_feed.sources.tasks import (
+    DefectCarrier,
     SkippedTask,
     TaskRow,
     TaskSkipReason,
     TasksRead,
+    read_defect_carriers,
     read_tasks,
     waiting_on,
 )
@@ -337,5 +340,201 @@ class TestStore:
         before = tasks.path.read_bytes()
 
         read_all(root)
+
+        assert tasks.path.read_bytes() == before
+
+
+PROJECT = 'acme'
+FIX = 'portal:acme:2:1'
+FOREIGN_REFS = ('review:7:0123456789ab', 'followup:7:abc123', 'portal:other-client:2:1')
+
+
+def carriers_of(root: Path) -> tuple[DefectCarrier, ...]:
+    return read_defect_carriers(root, project_id=PROJECT)
+
+
+def carrier(task_id: int, *, ref: str = FIX, gated: bool = False) -> DefectCarrier:
+    return carrier_for(ref, project_id=PROJECT, task_id=task_id, gated=gated)
+
+
+class TestDefectCarriers:
+    def test_a_carrier_carries_exactly_the_acknowledged_fields(self) -> None:
+        assert {field.name for field in dataclasses.fields(DefectCarrier)} == {
+            'ref', 'block', 'report', 'task_id', 'gated',
+        }
+
+    def test_a_pending_task_holding_a_portal_ref_reads_as_its_carrier(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(
+            6,
+            title='SECRET-TITLE',
+            updated_at=LATE,
+            description='SECRET-DESC',
+            metadata={**carrying(FIX), 'files': ['SECRET-FILE']},
+        )
+
+        read = carriers_of(root)
+
+        assert read == (DefectCarrier(ref=FIX, block=2, report=1, task_id=6, gated=False),)
+        assert 'SECRET-' not in repr(read)
+
+    def test_carriers_come_sorted_by_ref(self, root: Path, tasks: TasksDb) -> None:
+        tasks.add(3, updated_at=LATE, metadata=carrying('portal:acme:3:1'))
+        tasks.add(4, updated_at=LATE, metadata=carrying('portal:acme:2:7', 'portal:acme:10:2'))
+
+        assert [c.ref for c in carriers_of(root)] == [
+            'portal:acme:10:2', 'portal:acme:2:7', 'portal:acme:3:1',
+        ]
+
+    @pytest.mark.parametrize('status', [s for s in TaskStatus if s is not TaskStatus.DEFERRED])
+    def test_every_status_but_deferred_makes_a_carrier(
+        self, root: Path, tasks: TasksDb, status: TaskStatus
+    ) -> None:
+        tasks.add(6, status=status, updated_at=LATE, metadata=carrying(FIX))
+
+        assert carriers_of(root) == (carrier(6),)
+
+    @pytest.mark.parametrize('status', ['deferred', 'archived'])
+    def test_a_deferred_or_unknown_status_is_no_carrier(
+        self, root: Path, tasks: TasksDb, status: str
+    ) -> None:
+        tasks.add(6, status=status, updated_at=LATE, metadata=carrying(FIX))
+
+        assert carriers_of(root) == ()
+
+    @pytest.mark.parametrize('gate_status', ['pending', 'done', 'cancelled', 'deferred'])
+    def test_a_carrier_depending_on_the_gate_for_its_ref_is_gated_whatever_the_gates_status(
+        self, root: Path, tasks: TasksDb, gate_status: str
+    ) -> None:
+        tasks.add(5, status=gate_status, updated_at=LATE, metadata=gate_for(FIX))
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
+
+        assert carriers_of(root) == (carrier(6, gated=True),)
+
+    def test_a_gate_for_another_ref_does_not_gate(self, root: Path, tasks: TasksDb) -> None:
+        tasks.add(5, updated_at=LATE, metadata=gate_for('portal:acme:2:9'))
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
+
+        assert carriers_of(root) == (carrier(6),)
+
+    def test_a_gate_without_an_edge_does_not_gate(self, root: Path, tasks: TasksDb) -> None:
+        tasks.add(5, updated_at=LATE, metadata=gate_for(FIX))
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX))
+
+        assert carriers_of(root) == (carrier(6),)
+
+    def test_an_edge_to_a_task_that_is_no_gate_does_not_gate(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(4, updated_at=LATE, metadata={'source': 'client-defect-filer'})
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(4,))
+
+        assert carriers_of(root) == (carrier(6),)
+
+    def test_of_several_holders_the_lowest_task_id_carries(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(9, updated_at=LATE, metadata=carrying(FIX))
+        tasks.add(6, status='done', updated_at=LATE, metadata=carrying(FIX))
+
+        assert carriers_of(root) == (carrier(6),)
+
+    def test_a_deferred_lower_id_yields_to_a_pending_higher_one(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(6, status='deferred', updated_at=LATE, metadata=carrying(FIX))
+        tasks.add(9, updated_at=LATE, metadata=carrying(FIX))
+
+        assert carriers_of(root) == (carrier(9),)
+
+    def test_no_carrier_comes_from_a_ref_this_project_would_not_mint(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        review, followup, other_project = FOREIGN_REFS
+        tasks.add(1, updated_at=LATE, metadata={'defects': [declared(review, origin='review')]})
+        followup_entry = declared(followup, origin='agent_followup')
+        tasks.add(2, updated_at=LATE, metadata={'defects': [followup_entry]})
+        tasks.add(3, updated_at=LATE, metadata=carrying(other_project))
+        tasks.add(4, updated_at=LATE, metadata=carrying('portal:acme:check:1'))
+        tasks.add(5, updated_at=LATE, metadata=gate_for(other_project))
+
+        assert carriers_of(root) == ()
+
+    def test_a_task_holding_a_foreign_ref_and_this_projects_yields_only_this_projects(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(5, updated_at=LATE, metadata=gate_for(FOREIGN_REFS[2]))
+        tasks.add(
+            6,
+            updated_at=LATE,
+            metadata={'defects': [declared(ref) for ref in (*FOREIGN_REFS, FIX)]},
+            depends_on=(5,),
+        )
+
+        read = carriers_of(root)
+
+        assert read == (carrier(6),)
+        assert not any(ref in repr(read) for ref in FOREIGN_REFS)
+        assert 'other-client' not in repr(read)
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            '{not json',
+            {'defects': FIX},
+            {'defects': {'ref': FIX}},
+            {'defects': [FIX]},
+            {'defects': [declared(21)]},
+            {'defects': [declared(None)]},
+            {'defects': [{'origin': 'client'}]},
+        ],
+        ids=[
+            'not-json',
+            'defects-a-string',
+            'defects-an-object',
+            'entry-a-string',
+            'ref-a-number',
+            'ref-null',
+            'no-ref',
+        ],
+    )
+    def test_metadata_off_the_shape_yields_no_carrier_and_raises_nothing(
+        self, root: Path, tasks: TasksDb, metadata: dict[str, object] | str
+    ) -> None:
+        tasks.add(6, updated_at=LATE, metadata=metadata)
+
+        assert carriers_of(root) == ()
+
+    def test_a_gate_whose_metadata_is_not_json_does_not_gate(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(5, updated_at=LATE, metadata='{not json')
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
+
+        assert carriers_of(root) == (carrier(6),)
+
+    def test_another_tags_rows_are_never_read(self, root: Path, tasks: TasksDb) -> None:
+        tasks.add(5, updated_at=LATE)
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
+        tasks.add(5, updated_at=LATE, tag='feature', metadata=gate_for(FIX))
+        tasks.add(6, updated_at=LATE, tag='feature', metadata=carrying(FIX), depends_on=(5,))
+        tasks.add(7, updated_at=LATE, tag='feature', metadata=carrying('portal:acme:3:1'))
+
+        assert carriers_of(root) == (carrier(6),)
+
+    def test_a_missing_store_is_refused_and_never_created(self, root: Path) -> None:
+        with pytest.raises(StoreReadError) as caught:
+            carriers_of(root)
+
+        assert (caught.value.source, caught.value.problem) == (Source.TASKS, StoreProblem.MISSING)
+        assert not tasks_db(root).exists()
+
+    def test_a_read_leaves_the_store_bytes_unchanged(self, root: Path, tasks: TasksDb) -> None:
+        tasks.add(5, updated_at=LATE, metadata=gate_for(FIX))
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
+        before = tasks.path.read_bytes()
+
+        carriers_of(root)
 
         assert tasks.path.read_bytes() == before

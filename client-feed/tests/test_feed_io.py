@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 from _git_repo import make_repo
+from pydantic import ValidationError
 
 from client_feed.contract import (
     FEED_VERSION,
@@ -132,9 +133,44 @@ def test_an_empty_out_dir_opens_at_the_start(out_dir: Path) -> None:
         head=None,
         inbox_offset=0,
         line_counts=None,
+        defect_scan_offset=0,
+        pending_reports={},
     )
     assert out.uncommitted == ()
     assert out.next_seq == 1
+
+
+def test_the_defect_scan_starts_at_the_inbox_start_with_nothing_pending() -> None:
+    assert (Cursor().defect_scan_offset, Cursor().pending_reports) == (0, {})
+
+
+def test_pending_reports_round_trip_through_cursor_json() -> None:
+    cursor = Cursor(defect_scan_offset=412, pending_reports={'portal:acme:2:1': at(3)})
+
+    assert Cursor.model_validate_json(cursor.model_dump_json()) == cursor
+
+
+def test_a_cursor_written_before_feed_1_1_opens_with_the_defect_scan_at_its_defaults(
+    out_dir: Path,
+) -> None:
+    out = OutDir.open(out_dir, project_id=PROJECT)
+    out.commit(three_events(out), Cursor(events_id=12, inbox_offset=40))
+    committed = stored_cursor(out_dir)
+    feed_1_0_shape = committed.model_dump_json(exclude={'defect_scan_offset', 'pending_reports'})
+    assert 'pending_reports' not in feed_1_0_shape
+    (out_dir / 'cursor.json').write_text(feed_1_0_shape)
+
+    reopened = OutDir.open(out_dir, project_id=PROJECT)
+
+    assert reopened.cursor == committed
+    assert (reopened.cursor.events_id, reopened.cursor.inbox_offset) == (12, 40)
+    assert (reopened.cursor.defect_scan_offset, reopened.cursor.pending_reports) == (0, {})
+
+
+@pytest.mark.parametrize('when', ['2026-10-21T12:00:00+02:00', '2026-10-21T12:00:00'])
+def test_a_pending_report_time_that_is_not_utc_is_refused(when: str) -> None:
+    with pytest.raises(ValidationError, match='pending_reports'):
+        Cursor.model_validate({'pending_reports': {'portal:acme:2:1': when}})
 
 
 def test_a_stamp_allocates_seq_in_call_order(out_dir: Path) -> None:

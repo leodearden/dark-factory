@@ -1,6 +1,16 @@
-"""The flake-debt DRAIN: files the de-flake owners an observation owes, after it.
+"""The flake ledger's off-merge-path settlement against the live task store.
 
-plans/offline-lane-red-path-prd.md D6, §5.8 and §14 item 24 (task 6934, ε0).  An
+Two passes, each a harness background service bounded to 50 rows and five minutes:
+
+- the DRAIN (:func:`run_drain_pass`, ``flake-debt-drain``, every
+  :data:`DRAIN_INTERVAL_SECS`) files the de-flake owners an observation owes, after it;
+- the RESOLUTION SWEEP (:class:`DebtResolutionSweep`, ``flake-debt-resolution``, every
+  :data:`RESOLUTION_INTERVAL_SECS`) closes every open debt cycle whose owner reads back
+  live-done (plans/flake-ledger-prd.md task θ, task 8409), stopping at the first
+  unreadable owner, so a fixed test's row need not wait for a suppression its fix
+  prevents.
+
+THE DRAIN.  plans/offline-lane-red-path-prd.md D6, §5.8 and §14 item 24 (task 6934, ε0).  An
 observation writes its occurrence rows and one due item per suppressed test in ONE
 local transaction (``orchestrator/src/orchestrator/flake_ledger.py::enqueue_debt``), so
 nothing on the merge path waits on fused-memory.  This module turns each item into
@@ -22,9 +32,10 @@ background service.  A pass:
 A failed attempt backs off 5 minutes, doubling to an hour.  Nothing caps how many owners
 a burst files.  The drain never raises.
 
-The drain's own ledger calls run off the event-loop thread (INV-8);
-:func:`~orchestrator.flake_ledger.open_debt`'s internal sqlite stays on it, unchanged,
-bounded by that function's connection count and by 50 calls per pass.
+Both passes' own ledger calls run off the event-loop thread (INV-8); the internal sqlite
+of :func:`~orchestrator.flake_ledger.open_debt` and
+:func:`~orchestrator.flake_ledger.resolve_debt` stays on it, unchanged, bounded by those
+functions' connection counts and by 50 calls per pass.
 
 Import discipline: ``flake_ledger`` and ``shared`` only, and ``escalation.models`` lazily.
 Never a lane module or ``git_ops``: the ancestry read arrives through
@@ -66,7 +77,9 @@ from orchestrator.flake_ledger import (
     open_debt,
     read_debt,
     read_due_items,
+    read_open_debt,
     record_failed_due_attempt,
+    resolve_debt,
     resolving_commit,
     summarize_due,
 )
@@ -77,6 +90,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DRAIN_INTERVAL_SECS: Final = 30.0
+RESOLUTION_INTERVAL_SECS: Final = 3600.0
 STALE_DUE_ESCALATION_SENTINEL: Final = '__flake_debt_due_stale__'
 STALE_DUE_ESCALATION_ROLE: Final = 'orchestrator-flake-debt-drain'
 
@@ -110,10 +124,12 @@ class DueFailure(StrEnum):
 
 
 class DrainStop(StrEnum):
-    """Why a pass ended before the items it read."""
+    """Why a pass, the drain's or the resolution sweep's, ended before the work it read,
+    or read none: a failed ledger read is not an empty ledger."""
 
     TASK_CLIENT_FAILED = 'task_client_failed'
     BUDGET = 'budget'
+    LEDGER_UNREADABLE = 'ledger_unreadable'
 
 
 @dataclass(frozen=True)
@@ -726,7 +742,7 @@ async def run_drain_pass(
         )
         if items is None:
             logger.warning('flake_debt_drain: could not read the due list; pass skipped')
-            return DrainPassReport(0, 0, 0, None)
+            return DrainPassReport(0, 0, 0, DrainStop.LEDGER_UNREADABLE)
         waiting: set[str] = set()
         for item in items:
             if item.test_id in waiting:
@@ -751,3 +767,111 @@ async def run_drain_pass(
     except Exception:
         logger.warning('flake_debt_drain: the pass failed', exc_info=True)
     return DrainPassReport(attempted, settled, failed, stop)
+
+
+# ---------------------------------------------------------------------------
+# The eager resolution sweep (plans/flake-ledger-prd.md task θ, task 8409)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResolutionPassReport:
+    """What one resolution pass did: owned open rows examined, cycles it closed, whether
+    it hit an unreadable owner, and why it ended early, if it did.
+
+    ``owner_unreadable`` is 0 or 1, never a count of the backlog's unreadable owners: the
+    pass stops at the first one.
+    """
+
+    examined: int
+    resolved: int
+    owner_unreadable: int
+    stop: DrainStop | None
+
+    def event_data(self) -> dict[str, int | str | None]:
+        return {
+            'examined': self.examined,
+            'resolved': self.resolved,
+            'owner_unreadable': self.owner_unreadable,
+            'stop': None if self.stop is None else self.stop.value,
+        }
+
+
+class DebtResolutionSweep:
+    """Closes every open debt cycle whose stored owner reads back live-done.
+
+    It is the EAGER caller :func:`~orchestrator.flake_ledger.resolve_debt` names: each
+    owned open row goes through that function, whose live read, done-only rule and
+    compare-and-set stamp are the whole rule; the sweep adds only the caller.
+
+    It keeps one cursor, the last ``test_id`` a pass examined, and resumes after it, so
+    rows whose owners stay open cannot starve the rows behind them.  The cursor lives in
+    memory only: a restart starts again from the first row.
+    """
+
+    def __init__(self) -> None:
+        self._after: str | None = None
+
+    def _next_window(self, rows: list[DebtRow]) -> tuple[list[DebtRow], bool]:
+        """The owned *rows* after the cursor in ``test_id`` order, one pass's worth, and
+        whether that window reaches the last of them."""
+        after = self._after
+        remaining = sorted(
+            (r for r in rows if r.owner_task_id and (after is None or r.test_id > after)),
+            key=lambda r: r.test_id,
+        )
+        return remaining[:_ITEMS_PER_PASS], len(remaining) <= _ITEMS_PER_PASS
+
+    async def run_pass(
+        self,
+        db_path: Path,
+        project_id: str,
+        *,
+        task_client: FlakeLedgerTaskClient,
+        clock: Callable[[], datetime] = _utc_now,
+    ) -> ResolutionPassReport:
+        """One pass over the ledger at *db_path*: at most 50 owned rows in five minutes of
+        *clock*, stopping at the first unreadable owner (INV-4).  A missing task reads
+        back as an absence, so a failed read means fused-memory is failing, and each
+        further row would spend its own read budget on the same failure.  A failed ledger
+        read examines nothing and keeps the cursor.
+
+        ``resolved_at`` is stamped with the ledger's own wall clock (§5.4), never *clock*.
+        Never raises; a cancellation propagates.
+        """
+        examined = resolved = owner_unreadable = 0
+        stop: DrainStop | None = None
+        try:
+            started = clock()
+            rows = await asyncio.to_thread(read_open_debt, db_path)
+            if rows is None:
+                stop = DrainStop.LEDGER_UNREADABLE
+                rows = []
+            window, reaches_end = self._next_window(rows)
+            for row in window:
+                if clock() - started >= _PASS_BUDGET:
+                    stop = DrainStop.BUDGET
+                    break
+                client = _WatchedTaskClient(task_client)
+                closed = await resolve_debt(db_path, project_id, row.test_id, task_client=client)
+                examined += 1
+                self._after = row.test_id
+                if closed:
+                    resolved += 1
+                if client.failed:
+                    owner_unreadable += 1
+                    stop = DrainStop.TASK_CLIENT_FAILED
+                    break
+            if stop is None and reaches_end:
+                self._after = None
+        except Exception:
+            logger.warning('flake_debt_drain: the resolution pass failed', exc_info=True)
+        logger.info(
+            'flake_debt_drain: resolution pass examined %d, resolved %d, owner unreadable '
+            '%d, stop=%s',
+            examined,
+            resolved,
+            owner_unreadable,
+            stop,
+        )
+        return ResolutionPassReport(examined, resolved, owner_unreadable, stop)

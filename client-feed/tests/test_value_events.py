@@ -4,11 +4,13 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _defects import carrier_for
 
 from client_feed.contract import (
     FEED_VERSION,
     Branch,
     BranchSnapshot,
+    DefectFiled,
     FactoryState,
     FeedEvent,
     FeedState,
@@ -28,11 +30,12 @@ from client_feed.fold import fold
 from client_feed.sources.escalations import OpenEscalation, OpenEscalations
 from client_feed.sources.events import FactoryStatus
 from client_feed.sources.prds import PrdText
-from client_feed.sources.tasks import TaskRow
+from client_feed.sources.tasks import DefectCarrier, TaskRow
 from client_feed.sources.tree import LineCounts, VisibleTree
 from client_feed.value_events import (
     branch_event,
     budget_event,
+    defect_filed_events,
     factory_event,
     prd_events,
     task_events,
@@ -461,3 +464,74 @@ def test_an_unchanged_budget_or_a_state_without_a_tree_emits_nothing() -> None:
 
     assert budget_event(BUDGET, state=state, stamp=stamp(), now=NOW) is None
     assert budget_event(SPENT, state=state_of(), stamp=stamp(), now=NOW) is None
+
+
+def defect_carrier(ref: str = 'portal:acme:2:1', *, task_id: int = 6, gated: bool = False) -> DefectCarrier:
+    return carrier_for(ref, project_id=PROJECT, task_id=task_id, gated=gated)
+
+
+def filed(carrier: DefectCarrier, seq: int, *, when: datetime = NOW) -> DefectFiled:
+    return DefectFiled(
+        seq=seq, at=when, project_id=PROJECT, feed_version=FEED_VERSION, **asdict(carrier)
+    )
+
+
+def test_a_carrier_the_state_does_not_hold_is_filed_at_now_with_the_next_seq() -> None:
+    carrier = defect_carrier(gated=True)
+
+    events = defect_filed_events([carrier], state=state_of(), stamp=stamp(), now=NOW)
+
+    assert events == (
+        DefectFiled(
+            seq=100,
+            at=NOW,
+            project_id=PROJECT,
+            feed_version=FEED_VERSION,
+            ref='portal:acme:2:1',
+            block=2,
+            report=1,
+            task_id=6,
+            gated=True,
+        ),
+    )
+
+
+def test_a_filing_the_state_already_says_emits_nothing_whatever_its_envelope() -> None:
+    carrier = defect_carrier()
+    state = state_of(filed(carrier, 5, when=at(-30)))
+
+    assert defect_filed_events([carrier], state=state, stamp=stamp(), now=NOW) == ()
+
+
+@pytest.mark.parametrize(
+    'changes', [{'gated': True}, {'task_id': 9}], ids=['gated-turns-true', 'another-task']
+)
+def test_a_filing_differing_from_the_state_is_filed_again(changes: dict[str, object]) -> None:
+    state = state_of(filed(defect_carrier(), 5, when=at(-30)))
+    changed = replace(defect_carrier(), **changes)
+
+    assert defect_filed_events([changed], state=state, stamp=stamp(), now=NOW) == (
+        filed(changed, 100),
+    )
+
+
+def test_several_new_carriers_are_filed_in_ref_order_with_consecutive_seqs() -> None:
+    carriers = [
+        defect_carrier('portal:acme:3:1', task_id=8),
+        defect_carrier('portal:acme:2:1', task_id=6),
+        defect_carrier('portal:acme:10:4', task_id=12, gated=True),
+    ]
+
+    events = defect_filed_events(carriers, state=state_of(), stamp=stamp(), now=NOW)
+
+    assert [(event.ref, event.seq) for event in events] == [
+        ('portal:acme:10:4', 100),
+        ('portal:acme:2:1', 101),
+        ('portal:acme:3:1', 102),
+    ]
+
+
+def test_a_filing_no_carrier_names_any_more_is_never_retracted() -> None:
+    state = state_of(filed(defect_carrier(), 5, when=at(-30)))
+
+    assert defect_filed_events([], state=state, stamp=stamp(), now=NOW) == ()

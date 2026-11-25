@@ -34,7 +34,9 @@ from _escalation_server_capture import create_server_kwargs
 from _startup_harness import journal_merge_request, merge_lane_harness_factory
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
+from shared.task_submit import SubmitOutcome, SubmittedTask
 
+from orchestrator import flake_debt_drain
 from orchestrator.background_service import BackgroundService, ManagedService
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
@@ -44,6 +46,8 @@ from orchestrator.flake_ledger import (
     FlakeCallSite,
     enqueue_debt,
     ledger_db_path,
+    open_debt,
+    read_debt,
     read_due_items,
     record_failed_due_attempt,
 )
@@ -57,7 +61,8 @@ from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionPolicy, g
 # merge worker constructed, not running; task 8268); the remaining bespoke adapter (offline-lane)
 # and the eight BackgroundService sweeps follow, then the always-on services
 # that keep their cadence whatever the dispatch loop does (task 5344; the
-# verify-admission watch, task 5628; the flake-debt drain, task 6934).
+# verify-admission watch, task 5628; the flake-debt drain, task 6934; the
+# flake-debt resolution sweep, task 8409).
 _CANONICAL_ORDER = [
     'loop-stall-monitor',
     'escalation-server',
@@ -76,6 +81,7 @@ _CANONICAL_ORDER = [
     'merge-heartbeat',
     'verify-admission-watch',
     'flake-debt-drain',
+    'flake-debt-resolution',
 ]
 
 
@@ -424,6 +430,106 @@ class TestFlakeDebtDrainPass:
         [record] = fresh.get_by_task(STALE_DUE_ESCALATION_SENTINEL, status='pending')
         assert record.level == 1
         assert record.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
+# task 8409: the flake-debt resolution sweep closes a done owner's cycle and
+# records one event per pass
+# ---------------------------------------------------------------------------
+
+_FLAKY_TEST = 'tests/test_flaky.py::test_x'
+
+
+class _FilingClient:
+    """A ``flake_ledger.FlakeLedgerTaskClient`` that files one pending de-flake task."""
+
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
+        return SubmittedTask('deflake-1', 'pending')
+
+    async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        return {'deflake-1': 'pending'}, None
+
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        return {'id': 'deflake-1', 'status': 'pending', 'metadata': {}}, None
+
+    async def commit_planning(self, task_ids: list[str]) -> None:
+        return None
+
+
+class TestFlakeDebtResolutionPass:
+    """The registered ``flake-debt-resolution`` pass reads owners through the harness's
+    scheduler and writes its report to the harness's event store, when one is wired."""
+
+    @staticmethod
+    async def _seeded_harness(tmp_path: Path) -> Harness:
+        config = OrchestratorConfig(project_root=tmp_path)
+        h = Harness(config)
+        await open_debt(
+            ledger_db_path(tmp_path), config.fused_memory.project_id, _FLAKY_TEST,
+            task_client=_FilingClient(),
+        )
+        row = read_debt(ledger_db_path(tmp_path), _FLAKY_TEST)
+        assert row is not None and row.owner_task_id == 'deflake-1'
+        return h
+
+    @staticmethod
+    async def _run_registered_pass(h: Harness) -> None:
+        h._build_lifecycle_registry()
+        assert h._lifecycle is not None
+        [service] = [
+            s for s in h._lifecycle.services
+            if isinstance(s, BackgroundService) and s.name == 'flake-debt-resolution'
+        ]
+        assert service.interval_secs == flake_debt_drain.RESOLUTION_INTERVAL_SECS
+        done = {'id': 'deflake-1', 'status': 'done', 'metadata': {}}
+        with patch.object(h.scheduler, 'dispatch_tool', AsyncMock(return_value=done)):
+            await service.pass_fn()
+
+    @staticmethod
+    def _resolved(tmp_path: Path) -> bool:
+        row = read_debt(ledger_db_path(tmp_path), _FLAKY_TEST)
+        assert row is not None
+        return row.resolved_at is not None
+
+    @pytest.mark.asyncio
+    async def test_pass_closes_a_done_owners_cycle_and_emits_one_event(
+        self, tmp_path: Path,
+    ) -> None:
+        h = await self._seeded_harness(tmp_path)
+        h.event_store = EventStore(tmp_path / 'events.db', run_id='t')
+
+        await self._run_registered_pass(h)
+
+        assert self._resolved(tmp_path)
+        [event] = h.event_store.fetch_events_by_type(EventType.flake_debt_resolution_pass)
+        assert event['data'] == {
+            'examined': 1, 'resolved': 1, 'owner_unreadable': 0, 'stop': None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_pass_over_an_empty_ledger_still_emits_its_event(
+        self, tmp_path: Path,
+    ) -> None:
+        """An hour with no event must mean the service is not running, never that it
+        found nothing to examine."""
+        h = Harness(OrchestratorConfig(project_root=tmp_path))
+        h.event_store = EventStore(tmp_path / 'events.db', run_id='t')
+
+        await self._run_registered_pass(h)
+
+        [event] = h.event_store.fetch_events_by_type(EventType.flake_debt_resolution_pass)
+        assert event['data'] == {
+            'examined': 0, 'resolved': 0, 'owner_unreadable': 0, 'stop': None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_pass_without_an_event_store_still_resolves(self, tmp_path: Path) -> None:
+        h = await self._seeded_harness(tmp_path)
+        h.event_store = None
+
+        await self._run_registered_pass(h)
+
+        assert self._resolved(tmp_path)
 
 
 # ---------------------------------------------------------------------------

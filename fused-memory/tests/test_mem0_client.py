@@ -3,18 +3,17 @@
 import asyncio
 import contextlib
 import logging
-import uuid
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_qdrant_live import (
-    EPHEMERAL_COLLECTION_PREFIX,
-    QDRANT_URL,
-    assert_reapable,
-    collection_vector_size,
-    qdrant_skipif,
+from _fm_qdrant_live import QDRANT_URL, assert_reapable, qdrant_skipif
+from _mem0_live_probe import (
+    build_stub_embedder_backend,
+    isolated_run,
+    probe_collection,
+    reapable_config,
 )
 from _qdrant_responses import missing_collection_404
 from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
@@ -22,10 +21,9 @@ from mem0 import AsyncMemory
 from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
-from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
 
 from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
-from fused_memory.config.schema import FusedMemoryConfig, Mem0BackendConfig
+from fused_memory.config.schema import Mem0BackendConfig
 from fused_memory.models.scope import Scope
 
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
@@ -2101,73 +2099,9 @@ class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
             await backend.close()
 
 
-# ---------------------------------------------------------------------------
-# Live-Qdrant probe harness, shared by the add_system_record probe and the
-# scan_payload_text tripwire below.
-#
-# A probe's collection is shared by every xdist worker and session and reused
-# across runs; scripts/cleanup_test_collections.py reaps it, and each run is
-# isolated by its own run_id.
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def _reapable_config(mock_config):
-    """``mock_config`` with the collection prefix scripts/cleanup_test_collections.py reaps."""
-    config = mock_config.model_copy(deep=True)
-    config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
-    return config
-
-
-def _probe_collection(scope: Scope, config: FusedMemoryConfig) -> str:
-    return scope.mem0_collection_name(config.mem0.collection_prefix)
-
-
-def _isolated_run(scope: Scope, config: FusedMemoryConfig, label: str) -> Iterator[str]:
-    """Yield a fresh run_id, then best-effort delete that run's points; the collection stays."""
-    run_id = f'{label}-{uuid.uuid4().hex}'
-    yield run_id
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(Exception):
-        client.delete(
-            collection_name=_probe_collection(scope, config),
-            points_selector=FilterSelector(
-                filter=Filter(
-                    must=[FieldCondition(key='run_id', match=MatchValue(value=run_id))],
-                ),
-            ),
-        )
-    client.close()
-
-
-async def _build_stub_embedder_backend(
-    scope: Scope, config: FusedMemoryConfig, monkeypatch,
-) -> Mem0Backend:
-    """Construct a real Mem0Backend with a stubbed constant-vector embedder.
-
-    Refuses, before anything is written, a config whose collection the reaper
-    would not reclaim. Mirrors test_recon_dedup_premise._build_recon_backend's
-    hermetic (non-real-embedder) path.
-    """
-    collection = _probe_collection(scope, config)
-    assert_reapable(collection)
-    monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
-
-    backend = Mem0Backend(config.model_copy(deep=True))
-    inst = await backend._get_instance(scope)
-
-    # Race-safe vector-dim read: under `-n auto` load the just-created
-    # collection can transiently 404 before it is durably readable, so retry
-    # the read via the shared bounded-poll helper rather than a single get.
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    try:
-        dim = await collection_vector_size(client, collection)
-    finally:
-        client.close()
-    stub_vector = [0.1] * dim
-    inst.embedding_model.embed = lambda *a, **kw: stub_vector
-
-    return backend
+    return reapable_config(mock_config)
 
 
 # ---------------------------------------------------------------------------
@@ -2192,14 +2126,14 @@ def _asr_scope() -> Scope:
 
 @pytest.fixture
 def _asr_run_id(_asr_scope, _reapable_config):
-    yield from _isolated_run(_asr_scope, _reapable_config, 'task-2222-add-system-record-probe')
+    yield from isolated_run(_asr_scope, _reapable_config, 'task-2222-add-system-record-probe')
 
 
 def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
     _reapable_config, _asr_scope,
 ):
     """The probe collection outlives a run by design, so it must be one the reaper deletes."""
-    assert_reapable(_probe_collection(_asr_scope, _reapable_config))
+    assert_reapable(probe_collection(_asr_scope, _reapable_config))
 
 
 class TestMem0BackendAddSystemRecordIntegration:
@@ -2217,7 +2151,7 @@ class TestMem0BackendAddSystemRecordIntegration:
     async def test_identical_calls_all_land_distinct(
         self, _reapable_config, _asr_scope, _asr_run_id, monkeypatch,
     ):
-        backend = await _build_stub_embedder_backend(_asr_scope, _reapable_config, monkeypatch)
+        backend = await build_stub_embedder_backend(_asr_scope, _reapable_config, monkeypatch)
         run_id = _asr_run_id
         metadata = {'kind': 'cycle_summary', 'run_id': run_id}
         n = 6
@@ -3251,14 +3185,14 @@ def _spt_scope() -> Scope:
 
 @pytest.fixture
 def _spt_run_id(_spt_scope, _reapable_config):
-    yield from _isolated_run(_spt_scope, _reapable_config, 'task-3083-scan-payload-text-probe')
+    yield from isolated_run(_spt_scope, _reapable_config, 'task-3083-scan-payload-text-probe')
 
 
 def test_the_scan_payload_text_probe_collection_is_one_the_reaper_can_reclaim(
     _reapable_config, _spt_scope,
 ):
     """The tripwire's collection outlives a run by design, so it must be one the reaper deletes."""
-    assert_reapable(_probe_collection(_spt_scope, _reapable_config))
+    assert_reapable(probe_collection(_spt_scope, _reapable_config))
 
 
 class TestMem0BackendScanPayloadTextIntegration:
@@ -3270,7 +3204,7 @@ class TestMem0BackendScanPayloadTextIntegration:
     async def test_matchtext_prefilter_is_a_literal_substring_match(
         self, _reapable_config, _spt_scope, _spt_run_id, monkeypatch,
     ):
-        backend = await _build_stub_embedder_backend(_spt_scope, _reapable_config, monkeypatch)
+        backend = await build_stub_embedder_backend(_spt_scope, _reapable_config, monkeypatch)
         run_id = _spt_run_id
         try:
             await backend.add_system_record(

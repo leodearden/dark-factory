@@ -154,6 +154,13 @@ PAYLOADS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    'defect_filed': {
+        'ref': 'portal:demo-client:2:1',
+        'block': 2,
+        'report': 1,
+        'task_id': 6,
+        'gated': True,
+    },
 }
 
 MODEL_NAMES: dict[str, str] = {
@@ -171,6 +178,7 @@ MODEL_NAMES: dict[str, str] = {
     'reveal_refused': 'RevealRefused',
     'criteria_results': 'CriteriaResults',
     'criteria_declared': 'CriteriaDeclared',
+    'defect_filed': 'DefectFiled',
 }
 
 EMPTY_STATE: dict[str, Any] = {
@@ -190,6 +198,7 @@ EMPTY_STATE: dict[str, Any] = {
     'revealed': [],
     'criteria': {},
     'criteria_declared': {},
+    'defects_filed': {},
     'recent': [],
 }
 
@@ -205,6 +214,7 @@ DEFECT_REPORTED: dict[str, Any] = {
     'restater': {'prompt_version': 'restate-v1'},
     'outcome': RESTATED,
 }
+FILED_DEFECT: dict[str, Any] = {'block': 2, 'report': 1, 'task_id': 6, 'gated': True}
 DEFECT_RULED: dict[str, Any] = {
     'seq': 3,
     'at': AT,
@@ -247,6 +257,7 @@ NESTED_SAMPLES: list[tuple[str, dict[str, Any]]] = [
     ('RevealBudget', PAYLOADS['tree_snapshot']['budget']),
     ('CriterionResult', PAYLOADS['criteria_results']['results'][0]),
     ('Criterion', PAYLOADS['criteria_declared']['criteria'][0]),
+    ('FiledDefect', FILED_DEFECT),
     ('InFlightTask', {'task_id': 7, 'phase': 'plan', 'since': AT}),
     ('RevealedFile', {'path': 'src/ledger.py', 'commit': SHA, 'lines': 30}),
     ('RevealRequested', {'seq': 1, 'at': AT, 'type': 'reveal_requested', 'path': 'src/a.py'}),
@@ -274,8 +285,8 @@ def test_event_models_cover_exactly_the_named_wire_types() -> None:
         assert contract.EVENT_MODELS[wire_type] is getattr(contract, name)
 
 
-def test_feed_version_is_one_dot_zero_and_its_major_is_derived() -> None:
-    assert contract.FEED_VERSION == '1.0'
+def test_feed_version_is_one_dot_one_and_its_major_is_derived() -> None:
+    assert contract.FEED_VERSION == '1.1'
     assert contract.FEED_MAJOR == contract.feed_major(contract.FEED_VERSION) == 1
     assert contract.feed_major('2.7') == 2
 
@@ -578,6 +589,31 @@ def test_defect_reported_outcome_is_the_model_its_kind_names() -> None:
     assert isinstance(defect_reported(outcome=RESTATED).outcome, contract.Restated)
 
 
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('block', 0),
+        ('report', 0),
+        ('task_id', 0),
+        ('ref', ''),
+        ('gated', 1),
+        ('gated', 'true'),
+        ('surprise', 1),
+    ],
+    ids=['zero-block', 'zero-report', 'zero-task', 'empty-ref', 'int-gated', 'text-gated', 'extra-key'],
+)
+def test_defect_filed_refuses_a_bad_field_naming_it(field: str, value: object) -> None:
+    with pytest.raises(ValidationError, match=field):
+        build('defect_filed', **{field: value})
+
+
+@pytest.mark.parametrize('extra', [{'surprise': 1}, {'ref': 'portal:demo-client:2:1'}], ids=['extra', 'ref'])
+def test_a_filed_defect_record_refuses_a_key_it_does_not_hold(extra: dict[str, Any]) -> None:
+    (key,) = extra
+    with pytest.raises(ValidationError, match=key):
+        contract.FiledDefect.model_validate({**FILED_DEFECT, **extra})
+
+
 @pytest.mark.parametrize(('wire_type', 'field'), [('verify_run', 'legs'), ('merge_landed', 'review')])
 def test_not_recorded_is_the_one_accepted_string(wire_type: str, field: str) -> None:
     event = build(wire_type, **{field: 'not_recorded'})
@@ -617,7 +653,10 @@ def test_task_status_vocabulary_matches_the_factory() -> None:
 @pytest.mark.parametrize(
     ('enum_name', 'values'),
     [
-        ('Source', {'tasks', 'events', 'git', 'archive', 'prds', 'criteria', 'engagement', 'inbox'}),
+        (
+            'Source',
+            {'tasks', 'events', 'git', 'archive', 'prds', 'criteria', 'engagement', 'inbox', 'filer'},
+        ),
         ('SchedulerState', {'running', 'paused'}),
         ('WaitingOn', {'factory', 'leo'}),
         ('VerifyKind', {'task', 'merge'}),
@@ -652,10 +691,11 @@ def test_feed_state_round_trips_with_every_section_filled() -> None:
     task = event_dict('task_upserted', seq=4)
     prd = event_dict('prd_upserted', seq=3)
     criteria = event_dict('criteria_results', seq=9)
+    filed = event_dict('defect_filed', seq=10)
     state = contract.FeedState.model_validate(
         {
             **EMPTY_STATE,
-            'watermark_seq': 9,
+            'watermark_seq': 10,
             'as_of': AT,
             'head': SHA,
             'engagement_version': 3,
@@ -669,15 +709,18 @@ def test_feed_state_round_trips_with_every_section_filled() -> None:
             'revealed': [{'path': 'src/ledger.py', 'commit': SHA, 'lines': 30}],
             'criteria': {'verify': criteria},
             'criteria_declared': {'C-1': PAYLOADS['criteria_declared']['criteria'][0]},
-            'recent': [prd, task, event_dict('reveal_refused', seq=8), criteria],
+            'defects_filed': {'portal:demo-client:2:1': FILED_DEFECT},
+            'recent': [prd, task, event_dict('reveal_refused', seq=8), criteria, filed],
         }
     )
     assert contract.FeedState.model_validate_json(state.model_dump_json()) == state
+    assert state.defects_filed == {'portal:demo-client:2:1': contract.FiledDefect(**FILED_DEFECT)}
     assert [type(event).__name__ for event in state.recent] == [
         'PrdUpserted',
         'TaskUpserted',
         'RevealRefused',
         'CriteriaResults',
+        'DefectFiled',
     ]
 
 
@@ -707,6 +750,7 @@ def test_feed_state_refuses_a_key_that_names_another_record(
         ('verify_run', 'task-5-verify-1'),
         ('merge_landed', SHA),
         ('test_results', 'task-5-verify-1'),
+        ('defect_filed', 'portal:demo-client:2:1'),
     ],
 )
 def test_keyed_events_expose_their_natural_key(wire_type: str, key: object) -> None:

@@ -64,7 +64,6 @@ from fused_memory.middleware.curator_types import (
     PoolWithheld,
     PreparedCandidate,
     clip_for_prompt,
-    embedding_text,
     empty_pool_sizes,
     exception_summary,
     is_combine_eligible_status,
@@ -336,22 +335,6 @@ class TestClipForPrompt:
 
     def test_empty_text_fits_a_zero_cap_unchanged(self):
         assert clip_for_prompt('', 0) == ''
-
-
-class TestEmbeddingText:
-    """`embedding_text` is the single owner of the curator corpus embedding text."""
-
-    def test_title_alone(self):
-        assert embedding_text('Fix the bug', '', []) == 'Fix the bug'
-
-    def test_title_and_description_join_with_blank_line(self):
-        assert embedding_text('T', 'D', []) == 'T\n\nD'
-
-    def test_files_are_their_own_newline_block(self):
-        assert embedding_text('T', 'D', ['a.py', 'b.py']) == 'T\n\nD\n\na.py\nb.py'
-
-    def test_empty_description_contributes_nothing(self):
-        assert embedding_text('T', '', ['a.py']) == 'T\n\na.py'
 
 
 class TestTrimPool:

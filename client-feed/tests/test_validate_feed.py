@@ -1,9 +1,11 @@
 """validate-feed on the committed boundary fixtures (PRD B4, B5) and on altered copies of them.
 
 The fixtures are what the portal repo vendors. feed-v1/state.json is the fold of feed-v1/feed.jsonl at
-seq 28; feed-v1-foreign-project/state.json is the fold of that feed's lines 1 and 3. Regenerate feed-v1's
-only after a deliberate feed change, from client-feed/:
+seq 28; feed-v1-foreign-project/state.json is the fold of that feed's lines 1 and 3. feed-v1.1 is the 1.1
+fixture the portal vendors in its ξ1: two passes acknowledging client defect reports, its state.json the
+fold of its feed at seq 5. Regenerate a state.json only after a deliberate feed change, from client-feed/:
 uv run python -c "from pathlib import Path; from client_feed.contract import parse_feed_line as p, split_jsonl; from client_feed.fold import fold; d = Path('tests/fixtures/feed-v1'); d.joinpath('state.json').write_text(fold([p(t, line_no=i) for i, t in enumerate(split_jsonl(d.joinpath('feed.jsonl').read_text()), 1)], project_id='demo-client', upto_seq=28).model_dump_json(indent=2) + '\\n')"
+uv run python -c "from pathlib import Path; from client_feed.contract import parse_feed_line as p, split_jsonl; from client_feed.fold import fold; d = Path('tests/fixtures/feed-v1.1'); d.joinpath('state.json').write_text(fold([p(t, line_no=i) for i, t in enumerate(split_jsonl(d.joinpath('feed.jsonl').read_text()), 1)], project_id='demo-client', upto_seq=5).model_dump_json(indent=2) + '\\n')"
 """
 
 import json
@@ -23,12 +25,15 @@ from client_feed.contract import (
     EVENT_MODELS,
     FEED_FILENAME,
     STATE_FILENAME,
+    Degradation,
     EventHeader,
     FeedLine,
     FeedState,
+    FiledDefect,
     FileRevealed,
     Heartbeat,
     RunKind,
+    Source,
     WaitingOn,
     parse_feed_line,
     split_jsonl,
@@ -40,7 +45,9 @@ from client_feed.value_events import prd_events
 
 FIXTURES = Path(__file__).parent / 'fixtures'
 FEED_V1 = FIXTURES / 'feed-v1'
+FEED_V1_1 = FIXTURES / 'feed-v1.1'
 FOREIGN = FIXTURES / 'feed-v1-foreign-project'
+BOUNDARY_FIXTURES = pytest.mark.parametrize('fixture', [FEED_V1, FEED_V1_1], ids=lambda p: p.name)
 
 
 def feed_texts(out_dir: Path) -> tuple[str, ...]:
@@ -81,26 +88,34 @@ def test_every_fixture_line_parses() -> None:
     assert len(feed_lines(FEED_V1)) == len(feed_texts(FEED_V1)) == 31
 
 
-def test_the_fixture_carries_every_known_type_and_one_unknown() -> None:
+def test_the_fixture_carries_every_known_type_but_the_one_1_1_added_and_one_unknown() -> None:
     lines = feed_lines(FEED_V1)
-    assert {ln.type for ln in lines if not isinstance(ln, EventHeader)} == set(EVENT_MODELS)
+    known = {ln.type for ln in lines if not isinstance(ln, EventHeader)}
+    assert known == set(EVENT_MODELS) - {'defect_filed'}
     assert sum(isinstance(ln, EventHeader) for ln in lines) == 1
 
 
-def test_the_committed_state_is_the_fold_at_its_watermark() -> None:
-    state = committed_state(FEED_V1)
-    assert fold(feed_lines(FEED_V1), project_id='demo-client', upto_seq=state.watermark_seq) == state
+@BOUNDARY_FIXTURES
+def test_the_committed_state_is_the_fold_at_its_watermark(fixture: Path) -> None:
+    state = committed_state(fixture)
+    assert fold(feed_lines(fixture), project_id='demo-client', upto_seq=state.watermark_seq) == state
 
 
-def test_every_heartbeat_of_the_fixture_carries_the_watermark_the_previous_pass_committed() -> None:
-    heartbeats = pass_ends(feed_lines(FEED_V1))
+@BOUNDARY_FIXTURES
+def test_every_heartbeat_of_the_fixture_carries_the_watermark_the_previous_pass_committed(
+    fixture: Path,
+) -> None:
+    heartbeats = pass_ends(feed_lines(fixture))
     committed_before_each = [0, *(hb.seq for hb in heartbeats[:-1])]
     assert [hb.watermark_seq for hb in heartbeats] == committed_before_each
 
 
-def test_every_pass_of_the_fixture_ends_with_each_prd_counting_its_tasks_as_the_publisher_would() -> None:
-    lines = feed_lines(FEED_V1)
-    assert committed_state(FEED_V1).watermark_seq in {hb.seq for hb in pass_ends(lines)}
+@BOUNDARY_FIXTURES
+def test_every_pass_of_the_fixture_ends_with_each_prd_counting_its_tasks_as_the_publisher_would(
+    fixture: Path,
+) -> None:
+    lines = feed_lines(fixture)
+    assert committed_state(fixture).watermark_seq in {hb.seq for hb in pass_ends(lines)}
     for hb in pass_ends(lines):
         folded = fold(lines, project_id='demo-client', upto_seq=hb.seq)
         corrections = prd_events(
@@ -116,11 +131,55 @@ def test_every_pass_of_the_fixture_ends_with_each_prd_counting_its_tasks_as_the_
         )
 
 
-def test_the_watermark_leaves_lines_for_a_resuming_reader() -> None:
-    state = committed_state(FEED_V1)
-    lines = feed_lines(FEED_V1)
+@BOUNDARY_FIXTURES
+def test_the_watermark_leaves_lines_for_a_resuming_reader(fixture: Path) -> None:
+    state = committed_state(fixture)
+    lines = feed_lines(fixture)
     assert state.watermark_seq < lines[-1].seq
     assert fold(lines, project_id='demo-client') != state
+
+
+def test_every_line_of_the_1_1_fixture_parses_at_1_1() -> None:
+    lines = feed_lines(FEED_V1_1)
+    assert len(lines) == len(feed_texts(FEED_V1_1))
+    assert {ln.feed_version for ln in lines} == {'1.1'}
+
+
+def test_the_two_boundary_fixtures_together_carry_every_known_type() -> None:
+    v1_1_types = {ln.type for ln in feed_lines(FEED_V1_1)}
+    v1_types = {ln.type for ln in feed_lines(FEED_V1) if not isinstance(ln, EventHeader)}
+    assert 'defect_filed' in v1_1_types
+    assert v1_types | v1_1_types == set(EVENT_MODELS)
+
+
+def test_the_committed_1_1_state_holds_one_gated_filing_and_the_report_still_unfiled() -> None:
+    state = committed_state(FEED_V1_1)
+    assert state.defects_filed == {
+        'portal:demo-client:2:1': FiledDefect(block=2, report=1, task_id=6, gated=True)
+    }
+    assert state.degraded == (
+        Degradation(
+            source=Source.FILER,
+            reason='1 defect report(s) unfiled past 600s: portal:demo-client:2:2',
+        ),
+    )
+    assert set(state.tasks) == {5, 6}
+    assert state.tasks[6].depends_on == (5,)
+
+
+def test_the_resuming_reader_of_the_1_1_fixture_sees_the_second_filing_and_the_filer_clear() -> None:
+    whole = fold(feed_lines(FEED_V1_1), project_id='demo-client')
+    assert whole.defects_filed == {
+        'portal:demo-client:2:1': FiledDefect(block=2, report=1, task_id=6, gated=True),
+        'portal:demo-client:2:2': FiledDefect(block=2, report=2, task_id=8, gated=True),
+    }
+    assert whole.degraded == ()
+
+
+def test_the_1_1_fixture_validates() -> None:
+    report = validate_out_dir(FEED_V1_1)
+    assert report.ok, report.problems
+    assert main(['validate-feed', '--out-dir', str(FEED_V1_1)]) == 0
 
 
 def test_the_committed_state_holds_the_facts_the_feed_was_written_to_show() -> None:
@@ -305,16 +364,17 @@ def test_a_missing_out_dir_argument_is_a_usage_error() -> None:
     assert caught.value.code == 2
 
 
-def test_the_installed_console_script_validates_both_fixtures() -> None:
+def test_the_installed_console_script_validates_every_fixture() -> None:
     script = Path(sys.executable).with_name('client-feed')
     assert script.is_file(), f'console script not installed at {script}; run uv sync --all-packages'
-    valid = subprocess.run(
-        [str(script), 'validate-feed', '--out-dir', str(FEED_V1)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert valid.returncode == 0, valid.stdout + valid.stderr
+    for fixture in (FEED_V1, FEED_V1_1):
+        valid = subprocess.run(
+            [str(script), 'validate-feed', '--out-dir', str(fixture)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert valid.returncode == 0, fixture.name + valid.stdout + valid.stderr
     foreign = subprocess.run(
         [str(script), 'validate-feed', '--out-dir', str(FOREIGN)],
         capture_output=True,

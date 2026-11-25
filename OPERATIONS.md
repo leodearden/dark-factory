@@ -272,11 +272,11 @@ project that has none, and it will not add the flake tables to a
 `runs.db` that lacks them — it prints `NO LEDGER` / `NO FLAKE TABLES`
 and exits 0 instead. On a ledger that predates the due list, its first read adds that one empty table, as every ledger entry point does.
 
-**The due list and `filing pending`.** A suppressed test no longer gets its de-flake task during the merge. The merge writes the test's occurrence row and one item on the ledger's due list (`flake_debt_due`, in the same `runs.db`) in one local transaction, and the orchestrator's `flake-debt-drain` background service files the owner afterwards, every 30 seconds, through the same `open_debt` rule as before. Until that filing completes, an open debt row with no owner and an item on the due list reads `filing pending since <time>` (its oldest item's enqueue time): expected, and normally gone within a minute. An ownerless row with no item still reads `*** NO OWNER (invariant breach) ***`. The `due list:` line gives the list's size and the age of its oldest item, and says `PAST THE 30-MINUTE BOUND` once that item has waited longer. A failed filing is retried after 5 minutes, then 10, 20, 40, and hourly after that; nothing is dropped, and nothing caps how many de-flake tasks a burst files. A suppression at a merge sha that does not contain a finished de-flake task's fix closes that task's cycle without a regression escalation.
+**The due list and `filing pending`.** A suppressed test no longer gets its de-flake task during the merge. The merge writes the test's occurrence row and one item on the ledger's due list (`flake_debt_due`, in the same `runs.db`) in one local transaction, and the orchestrator's `flake-debt-drain` background service files the owner afterwards, every 30 seconds, through the same `open_debt` rule as before. Beside it, the `flake-debt-resolution` service closes, hourly, the cycle of every open row whose owner reads back done (see `OWNER DONE` below). Until that filing completes, an open debt row with no owner and an item on the due list reads `filing pending since <time>` (its oldest item's enqueue time): expected, and normally gone within a minute. An ownerless row with no item still reads `*** NO OWNER (invariant breach) ***`. The `due list:` line gives the list's size and the age of its oldest item, and says `PAST THE 30-MINUTE BOUND` once that item has waited longer. A failed filing is retried after 5 minutes, then 10, 20, 40, and hourly after that; nothing is dropped, and nothing caps how many de-flake tasks a burst files. A suppression at a merge sha that does not contain a finished de-flake task's fix closes that task's cycle without a regression escalation.
 
 **Owner markers.** A stored owner is only a pointer, so the report reads every open row's owner live and marks the row when no live task owns the test. Each marker is a §5.9 breach, and the non-convergence line counts them as `owner_done=` and `owner_closed=`.
 
-- `OWNER DONE, DEBT CYCLE NOT CLOSED`: the de-flake task finished, but the ledger never closed its cycle. Closing is lazy today: the test's next suppression closes it, and θ's sweep will once task 3792 lands. If the marker is still there after a later suppression, the orchestrator log's `could not read owner` warning says why `get_task` keeps failing.
+- `OWNER DONE, DEBT CYCLE NOT CLOSED`: the de-flake task finished, but the ledger has not closed its cycle yet. The orchestrator's `flake-debt-resolution` background service closes such cycles hourly, as does the test's next suppression. Each pass writes one `flake_debt_resolution_pass` event (`examined`, `resolved`, `owner_unreadable`, `stop`), an empty pass included, so an hour with no event means the service is not running. A pass reads at most 50 owned rows, resuming where the last pass stopped, so a larger backlog takes more than one pass. It stops at the first owner it cannot read, so `owner_unreadable` is 0 or 1, never a count, and `stop` is then `task_client_failed`; `stop` is `ledger_unreadable` when `runs.db` could not be read, which is not an empty backlog. The first pass runs an hour after the orchestrator starts, and the resume point lives in memory, so a restart starts the walk again from the first row. A marker that survives a pass that reached its row means `get_task` kept failing, and the orchestrator log's `could not read owner` warning says why.
 - `OWNER CANCELLED OR GONE`: the next suppression files a replacement.
 - `(deferred: filed, never released)` is a note, not a breach.
 - `owner liveness: READ FAILED`: no row carries a marker because nothing could be read, not because the owners are healthy, and both counts read `n/a`.
@@ -813,7 +813,15 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
 §12:
 
 - `engagement`: reveals are disabled for the pass (δ entry (d)).
-- `inbox`: the inbox offset is held (δ entry (e)).
+- `inbox`: the inbox offset is held (δ entry (e)), and so is the defect
+  scan's `defect_scan_offset`. `pending_reports` gains no new report, but it
+  still loses any report whose carrier appears.
+- `filer`: a `defect_reported` line older than `filer_grace_seconds`
+  (`client-feed/src/client_feed/policy.py::Policy`, default 600) still has no
+  non-deferred carrier. The reason names each such ref, and the report waits
+  in `cursor.json`'s `pending_reports` until its carrier appears or a
+  `defect_ruled` line rules it. It is raised while the engagement is unusable,
+  and while `tasks` is degraded, too.
 - `git`: a merge commit git cannot read holds the landing batch (γ entry (f)).
   Unparseable git output and a timed-out `git cat-file --batch` read degrade
   `git` too (task 7484 entry (c)).
@@ -822,6 +830,27 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
   `skipped N rows: …` (γ entry (f)).
 
 The same failures are WARNING lines in the unit's journal.
+
+#### Rolling back to feed 1.0
+
+1.0 code refuses a 1.1 `cursor.json`, because `Cursor` is `extra='forbid'`
+(`client-feed/src/client_feed/feed_io.py::Cursor`), and then restarts every
+source from the beginning. So before starting 1.0 code, stop the instance and
+delete the `defect_scan_offset` and `pending_reports` keys from
+`out/cursor.json`, keeping the file 0640. Rewriting it in place keeps its mode
+and owner:
+
+```bash
+systemctl --user stop client-feed@<name>.service
+python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("defect_scan_offset", None); c.pop("pending_reports", None); open(p, "w").write(json.dumps(c))' <out>/cursor.json
+```
+
+1.0 code refolds the `state.json` a 1.1 publisher wrote from the feed. A
+`defect_filed` line is an unknown type to it and is skipped. A heartbeat whose
+`degraded` names `filer` is not skipped: `filer` is not a 1.0 `Source`, so 1.0
+code refuses to open a feed holding one, with a contract violation at that
+line. Roll back only while `grep -c '"source":"filer"' <out>/feed.jsonl`
+prints 0; once a heartbeat has named `filer`, fix forward instead.
 
 #### The isolation check
 

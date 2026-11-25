@@ -100,6 +100,13 @@ MINIMAL_PAYLOADS: dict[str, dict[str, Any]] = {
     'reveal_refused': {'path': '/etc/passwd', 'reason': 'not_in_tree'},
     'criteria_results': {'run_kind': 'staging', 'commit': None, 'run_at': AT, 'results': []},
     'criteria_declared': {'criteria': []},
+    'defect_filed': {
+        'ref': 'portal:demo-client:2:1',
+        'block': 2,
+        'report': 1,
+        'task_id': 6,
+        'gated': False,
+    },
 }
 
 REVEAL_REQUEST: dict[str, Any] = {'seq': 1, 'at': AT, 'type': 'reveal_requested', 'path': '../x'}
@@ -368,6 +375,7 @@ def test_a_state_parses_and_a_bad_one_is_a_whole_file_violation() -> None:
         'revealed': [],
         'criteria': {},
         'criteria_declared': {},
+        'defects_filed': {},
         'recent': [],
     }
     assert parse_state(json.dumps(state)).project_id == 'demo-client'

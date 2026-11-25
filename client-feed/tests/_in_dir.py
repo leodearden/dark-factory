@@ -9,6 +9,7 @@ from client_feed.contract import (
     ENGAGEMENT_FILENAME,
     INBOX_FILENAME,
     EngagementProjection,
+    InboxLine,
     RevealRequested,
 )
 
@@ -46,3 +47,10 @@ def request_reveals(in_dir: Path, *paths: str, at: datetime) -> None:
     )
     with inbox.open('a') as handle:
         handle.write(lines)
+
+
+def append_inbox(in_dir: Path, *lines: InboxLine) -> None:
+    """Each line appended to in/inbox.jsonl as the portal writes it."""
+    in_dir.mkdir(parents=True, exist_ok=True)
+    with (in_dir / INBOX_FILENAME).open('a') as handle:
+        handle.write(''.join(line.model_dump_json() + '\n' for line in lines))

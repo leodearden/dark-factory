@@ -7,7 +7,8 @@ behind other work does not, so a host too crowded to run the child fails the
 wait only at its wall-clock limit. A wait that sees the child exit leaves the
 exit status for the child's Popen to collect. A command run to its exit under
 such a wait gives back its exit status and everything it wrote, and is killed
-if the wait fails. The wait's contract runs on a scripted host, so no verdict
+if the wait fails. A clock on a child reads its own time since the clock was
+made. The wait's and the clock's contracts run on a scripted host, so no verdict
 depends on how busy the real one is; real processes check only what the real
 host provides, and what a run gives back.
 """
@@ -30,6 +31,7 @@ import pytest
 from shared.testing_own_time import (
     LINUX_HOST,
     ChildSnapshot,
+    OwnTimeClock,
     OwnTimeExceeded,
     Reading,
     WallLimitExceeded,
@@ -415,6 +417,61 @@ def test_a_failed_wait_reports_only_what_its_child_spent_since_the_wait_began() 
     reading = raised.value.reading
     assert reading.on_cpu == pytest.approx(reading.elapsed / 4)
     assert reading.run_delay == pytest.approx(reading.elapsed / 2)
+
+
+def test_a_clock_leaves_out_a_queue_stint_the_kernel_has_not_credited() -> None:
+    """The child is runnable and its times never move, which is one queue stint
+    that the kernel credits only once it ends, so none of it is the child's own
+    time however long it lasts."""
+    host = _ScriptedHost(state="R")
+    clock = OwnTimeClock(_ANY_PID, host=host)
+
+    readings = []
+    for _ in range(4):
+        host.sleep(1.0)
+        readings.append(clock())
+
+    assert readings == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_a_clock_leaves_out_run_delay_credited_to_a_child_not_runnable() -> None:
+    """The child, seen not runnable, is on a CPU for an eighth of the time and
+    credited the rest as run delay, so 8 s hold 1 s of its own time."""
+    host = _ScriptedHost(on_cpu_share=1 / 8, run_delay_share=7 / 8, state="S")
+    clock = OwnTimeClock(_ANY_PID, host=host)
+
+    host.sleep(8.0)
+
+    assert clock() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("state", ["S", "D"])
+def test_a_clock_counts_all_the_time_a_blocked_child_spends_without_progress(
+    state: str,
+) -> None:
+    """A blocked child is in no queue stint, so its still times are its own,
+    time blocked in the kernel (state D) included."""
+    host = _ScriptedHost(state=state)
+    clock = OwnTimeClock(_ANY_PID, host=host)
+
+    host.sleep(2.0)
+
+    assert clock() == pytest.approx(2.0)
+
+
+def test_a_clock_counts_only_from_when_it_was_made() -> None:
+    """The child had been credited half of its first 100 s as run delay when
+    the clock was made, so a reading 2 s later holds those 2 s alone: 1 s of
+    run delay and 1 s of its own, not the 50 s of its whole life."""
+    host = _ScriptedHost(run_delay_share=1 / 2, state="S", now=100.0)
+    clock = OwnTimeClock(_ANY_PID, host=host)
+
+    host.sleep(2.0)
+
+    assert clock.reading() == Reading(
+        elapsed=2.0, on_cpu=0.0, run_delay=1.0, state="S", uncredited=0.0
+    )
+    assert clock() == pytest.approx(1.0)
 
 
 def test_a_reading_never_reports_a_negative_own_time() -> None:

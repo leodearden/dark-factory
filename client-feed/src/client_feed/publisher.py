@@ -22,6 +22,7 @@ from client_feed.contract import (
     CriteriaDeclared,
     CriteriaResults,
     Criterion,
+    DefectFiled,
     Degradation,
     EngagementProjection,
     EventHeader,
@@ -65,12 +66,14 @@ from client_feed.sources.events import (
 from client_feed.sources.git import GitError, main_head, task_branches
 from client_feed.sources.prds import PrdText, read_prds
 from client_feed.sources.store import StoreReadError
-from client_feed.sources.tasks import TasksRead, read_tasks
+from client_feed.sources.tasks import TasksRead, read_defect_carriers, read_tasks
 from client_feed.sources.tree import VisibleTree, visible_tree
 from client_feed.stream_events import Identity, StreamOutput, identity, stream_events
+from client_feed.unfiled import still_unfiled, unfiled_degradation
 from client_feed.value_events import (
     branch_event,
     budget_event,
+    defect_filed_events,
     factory_event,
     prd_events,
     task_events,
@@ -462,6 +465,51 @@ def _tree_snapshot(
     return tree_event(tree, budget=budget, stamp=stamp, now=now)
 
 
+@dataclass(frozen=True)
+class _Acknowledgement:
+    """The defect_filed events of one pass, and where the defect scan of the inbox stands after it."""
+
+    events: tuple[DefectFiled, ...]
+    defect_scan_offset: int
+    pending_reports: dict[str, datetime]
+
+
+def _acknowledgement_unit(
+    policy: Policy,
+    cursor: Cursor,
+    view: FeedState,
+    stamp: Stamp,
+    now: datetime,
+    degraded: list[Degradation],
+) -> _Acknowledgement:
+    """Each carrier filing the state does not say yet; each report read with no carrier waits, and names `filer` past the grace.
+
+    The inbox is scanned whatever the engagement, from its own offset; its rejected lines are the reveal tail's to count.
+    """
+    scan = _guarded(lambda: read_inbox(policy.in_dir, offset=cursor.defect_scan_offset), degraded)
+    carriers = _guarded(
+        lambda: read_defect_carriers(policy.project_root, project_id=policy.project_id), degraded
+    )
+    events = defect_filed_events(
+        () if carriers is None else carriers, state=view, stamp=stamp, now=now
+    )
+    pending = still_unfiled(
+        cursor.pending_reports,
+        () if scan is None else scan.lines,
+        project_id=policy.project_id,
+        filed=None if carriers is None else {carrier.ref for carrier in carriers},
+    )
+    filer = unfiled_degradation(pending, now=now, grace_seconds=policy.filer_grace_seconds)
+    if filer is not None:
+        _log.warning('source %s %s', filer.source, filer.reason)
+        degraded.append(filer)
+    return _Acknowledgement(
+        events=events,
+        defect_scan_offset=cursor.defect_scan_offset if scan is None else scan.offset,
+        pending_reports=pending,
+    )
+
+
 def _advanced(
     cursor: Cursor,
     *,
@@ -470,13 +518,17 @@ def _advanced(
     tree: VisibleTree | None,
     inbox: InboxRead | None,
     reveals: RevealOutput | None,
+    acknowledgement: _Acknowledgement,
 ) -> Cursor:
     """Each source position past what this pass read, where its unit succeeded; head and line counts move with the tree.
 
     The inbox offset, reveals_head and added-line counts move with a reveal unit that ran; an inbox read holding no
-    request moves its offset alone.
+    request moves its offset alone. The defect scan's offset and pending reports move as the acknowledgement left them.
     """
-    update: dict[str, object] = {}
+    update: dict[str, object] = {
+        'defect_scan_offset': acknowledgement.defect_scan_offset,
+        'pending_reports': acknowledgement.pending_reports,
+    }
     if events_id is not None:
         update['events_id'] = events_id
     if tasks is not None:
@@ -497,9 +549,11 @@ def _advanced(
 def run_pass(
     policy: Policy, out: OutDir, *, now: datetime, rescan_tasks: bool = True
 ) -> PassReport:
-    """Read every source, append what is news in the order tasks, stream, factory, branches, reveals, tree, PRDs, criteria, heartbeat.
+    """Read every source, append what is news in the order tasks, stream, factory, branches, reveals, tree, PRDs, criteria, defects filed, heartbeat.
 
-    A source that cannot be read is named in the heartbeat's degraded and holds only its own cursor fields.
+    A source that cannot be read is named in the heartbeat's degraded, and holds only its own cursor fields. Units
+    that fail it with the same reason name it once; different reasons, such as two inbox tails at different offsets,
+    each name it.
     """
     root = policy.project_root
     cursor = out.cursor
@@ -550,13 +604,14 @@ def run_pass(
     criteria = _criteria_events(
         policy, git=git, stream=stream, view=view, stamp=stamp, now=now, degraded=degraded
     )
+    acknowledgement = _acknowledgement_unit(policy, cursor, view, stamp, now, degraded)
     heartbeat = Heartbeat(
         **stamp(now),
         head=None if git is None else git.head,
         as_of=now,
         engagement_version=None if engagement is None else engagement.engagement_version,
         watermark_seq=out.state.watermark_seq,
-        degraded=tuple(degraded),
+        degraded=tuple(dict.fromkeys(degraded)),
     )
     events: list[FeedEvent] = [
         *upserts,
@@ -566,11 +621,18 @@ def run_pass(
         *(() if snapshot is None else (snapshot,)),
         *prds,
         *criteria,
+        *acknowledgement.events,
         heartbeat,
     ]
     events_id = None if store is None or stream is None else store.cursor
     advanced = _advanced(
-        cursor, events_id=events_id, tasks=tasks, tree=tree, inbox=inbox, reveals=reveals
+        cursor,
+        events_id=events_id,
+        tasks=tasks,
+        tree=tree,
+        inbox=inbox,
+        reveals=reveals,
+        acknowledgement=acknowledgement,
     )
     out.commit(events, advanced)
     return PassReport(

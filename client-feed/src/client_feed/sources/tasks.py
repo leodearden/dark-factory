@@ -1,11 +1,16 @@
-"""The task store's allowlisted projection, and the rule for whom an unfinished task waits on.
+"""The task store's allowlisted projection, the rule for whom an unfinished task waits on, and the carriers of this project's client defect reports.
 
 Only the allowlisted columns and metadata keys are selected; the rest of a task never enters the process.
+The carrier read adds exactly the two fields of plans/client-feed-prd.md §14.3: each `metadata.defects[].ref`
+and `metadata.x_client_defect_gate_for` that begins with this project's portal ref prefix. Every other ref,
+of another origin or another project, is never selected.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+import sqlite3
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -16,6 +21,7 @@ from pydantic import TypeAdapter, ValidationError
 from shared.project_layout import tasks_db
 
 from client_feed.contract import CommitSha, RepoPath, Source, TaskStatus, WaitingOn
+from client_feed.defect_ref import PortalReport, parse_portal_ref, portal_ref_prefix
 from client_feed.redact import redact_paths
 from client_feed.sources.escalations import OpenEscalations
 from client_feed.sources.store import read_only
@@ -73,22 +79,27 @@ class TasksRead:
     cursor: str | None
 
 
-def _metadata_text(path: str) -> str:
-    """The metadata string at `path`, NULL when metadata is not JSON or the value is not a string."""
+def _json_at(document: str, path: str, *, json_type: str, guard: str) -> str:
+    """The value at `path` in `document`, NULL unless `guard` holds and the value is of `json_type`."""
     return (
-        'CASE WHEN json_valid(metadata) THEN'
-        f" CASE WHEN json_type(metadata, '{path}') = 'text' THEN json_extract(metadata, '{path}') END"
+        f'CASE WHEN {guard} THEN'
+        f" CASE WHEN json_type({document}, '{path}') = '{json_type}' THEN json_extract({document}, '{path}') END"
         ' END'
     )
+
+
+def _metadata_at(path: str, *, json_type: str = 'text') -> str:
+    """The metadata value at `path`, NULL when metadata is not JSON or the value is not of `json_type`."""
+    return _json_at('metadata', path, json_type=json_type, guard='json_valid(metadata)')
 
 
 _UPDATED_AFTER: Final = 'tag = ? AND (? IS NULL OR updated_at > ?)'
 
 _TASKS_SQL: Final = (
     'SELECT id, title, status, updated_at,'
-    f" {_metadata_text('$.prd_path')},"
-    f" {_metadata_text('$.prd_task_label')},"
-    f" {_metadata_text('$.done_provenance.commit')}"
+    f" {_metadata_at('$.prd_path')},"
+    f" {_metadata_at('$.prd_task_label')},"
+    f" {_metadata_at('$.done_provenance.commit')}"
     f' FROM tasks WHERE {_UPDATED_AFTER} ORDER BY updated_at, id'
 )
 
@@ -191,4 +202,95 @@ def read_tasks(root: Path, *, since: str | None, escalations: OpenEscalations) -
         rows=tuple(item for item in projected if isinstance(item, TaskRow)),
         skipped=tuple(item for item in projected if isinstance(item, SkippedTask)),
         cursor=_cursor(rows, projected, since),
+    )
+
+
+@dataclass(frozen=True)
+class DefectCarrier:
+    """The task carrying a client defect report of this project, and whether a human gate holds it."""
+
+    ref: str
+    block: int
+    report: int
+    task_id: int
+    gated: bool
+
+
+_PREFIXED: Final = 'substr(ref, 1, length(:prefix)) = :prefix'
+
+_DEFECTS_ARRAY: Final = _metadata_at('$.defects', json_type='array')
+
+_ENTRY_REF: Final = _json_at('entry.value', '$.ref', json_type='text', guard="entry.type = 'object'")
+
+_HELD_REFS_SQL: Final = (
+    'SELECT id, status, ref FROM ('
+    f'SELECT tasks.id AS id, tasks.status AS status, {_ENTRY_REF} AS ref'
+    f' FROM tasks, json_each({_DEFECTS_ARRAY}) AS entry WHERE tasks.tag = :tag'
+    f') WHERE {_PREFIXED}'
+)
+
+_AMONG_TASK_IDS: Final = 'IN (SELECT value FROM json_each(:task_ids))'
+
+_CARRIER_DEPENDENCIES_SQL: Final = (
+    f'SELECT task_id, depends_on FROM dependencies WHERE tag = :tag AND task_id {_AMONG_TASK_IDS}'
+)
+
+_GATES_SQL: Final = (
+    f"SELECT id, ref FROM (SELECT id, {_metadata_at('$.x_client_defect_gate_for')} AS ref"
+    f' FROM tasks WHERE tag = :tag AND id {_AMONG_TASK_IDS}) WHERE {_PREFIXED}'
+)
+
+
+def _carries(status: str) -> bool:
+    """A task carries its reports in any status but deferred; an unknown status carries nothing."""
+    try:
+        return TaskStatus(status) is not TaskStatus.DEFERRED
+    except ValueError:
+        return False
+
+
+def _lowest_holders(
+    held: list[tuple[int, str, str]], *, project_id: str
+) -> dict[str, tuple[int, PortalReport]]:
+    """Each ref of `project_id` a carrying task holds, with the lowest such task id: the first filing."""
+    lowest: dict[str, tuple[int, PortalReport]] = {}
+    for task_id, status, ref in held:
+        named = parse_portal_ref(ref, project_id=project_id)
+        if named is not None and _carries(status):
+            lowest[ref] = min(lowest.get(ref, (task_id, named)), (task_id, named))
+    return lowest
+
+
+def _by_task_id(
+    conn: sqlite3.Connection, sql: str, task_ids: Iterable[int], **params: str
+) -> list[tuple[Any, ...]]:
+    """The rows `sql` selects for `task_ids` of the pinned tag, bound as one JSON array however many ids."""
+    bound = {'tag': TASK_TAG, 'task_ids': json.dumps(sorted(set(task_ids))), **params}
+    return conn.execute(sql, bound).fetchall()
+
+
+def read_defect_carriers(root: Path, *, project_id: str) -> tuple[DefectCarrier, ...]:
+    """Every client defect report of `project_id` some task carries, sorted by ref.
+
+    Read in full every pass: a same-project add_dependency inserts the gate edge without bumping the
+    task's updated_at, so no updated_at cursor would see `gated` turn true. Only the held refs scan
+    every task's metadata; the carriers' edges and their gates are looked up by task id.
+    """
+    prefix = portal_ref_prefix(project_id)
+    with read_only(root, tasks_db(root), source=Source.TASKS) as conn:
+        held = conn.execute(_HELD_REFS_SQL, {'tag': TASK_TAG, 'prefix': prefix}).fetchall()
+        lowest = _lowest_holders(held, project_id=project_id)
+        carriers = (task_id for task_id, _ in lowest.values())
+        depends_on = _grouped(_by_task_id(conn, _CARRIER_DEPENDENCIES_SQL, carriers))
+        dependencies = (dependency for edges in depends_on.values() for dependency in edges)
+        gate_for = dict(_by_task_id(conn, _GATES_SQL, dependencies, prefix=prefix))
+    return tuple(
+        DefectCarrier(
+            ref=ref,
+            block=named.block,
+            report=named.report,
+            task_id=task_id,
+            gated=any(gate_for.get(dependency) == ref for dependency in depends_on.get(task_id, ())),
+        )
+        for ref, (task_id, named) in sorted(lowest.items())
     )

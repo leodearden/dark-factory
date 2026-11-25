@@ -577,8 +577,26 @@ def item_count_of(metadata: Mapping[str, Any]) -> int:
     return len(followup_items_of(metadata))
 
 
+# text-embedding-3-* accept 8,192 tokens, and a byte-level BPE token covers at
+# least one UTF-8 byte, so text of at most this many bytes is at most this many
+# tokens whatever it contains.
+EMBEDDING_INPUT_MAX_BYTES: Final = 8_000
+
+
+def clip_for_embedding(text: str) -> str:
+    """Cut *text* to at most ``EMBEDDING_INPUT_MAX_BYTES`` UTF-8 bytes, never splitting a character.
+
+    The one bound every curator embedding input goes through: stored and query
+    vectors are comparable only if both sides are cut alike. Never raises, and
+    always drops a lone surrogate, which UTF-8 cannot encode and the OpenAI
+    client refuses before sending, however short the text.
+    """
+    encoded = text.encode('utf-8', 'ignore')
+    return encoded[:EMBEDDING_INPUT_MAX_BYTES].decode('utf-8', 'ignore')
+
+
 def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:
-    """Compose the text every curator corpus embedding is computed over.
+    """Compose the text every curator corpus embedding is computed over, bounded by :func:`clip_for_embedding`.
 
     Single owner: a caller comparing cosine scores against stored tasks must
     compose its query with this, or the scores are not comparable.
@@ -588,7 +606,7 @@ def embedding_text(title: str, description: str, files_to_modify: list[str]) -> 
         parts.append(description)
     if files_to_modify:
         parts.append('\n'.join(files_to_modify))
-    return '\n\n'.join(parts)
+    return clip_for_embedding('\n\n'.join(parts))
 
 
 def clip_for_prompt(text: str, cap: int) -> str:

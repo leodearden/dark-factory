@@ -1,8 +1,17 @@
-"""The one ref rule for a client's defect report (plans/client-feed-prd.md §14.2 decision 11), kept out of the vendorable contract."""
+"""The one ref rule for a client's defect report (plans/client-feed-prd.md §14.2 decision 11): portal_ref mints it, parse_portal_ref and portal_ref_prefix read it back; kept out of the vendorable contract."""
 
 from __future__ import annotations
 
-from shared.defects import DefectOrigin, MalformedDefectRef, mint_portal_ref
+from typing import NamedTuple
+
+from shared.defects import DefectOrigin, MalformedDefectRef, mint_portal_ref, parse_ref
+
+
+class PortalReport(NamedTuple):
+    """The block and report a portal ref names."""
+
+    block: int
+    report: int
 
 
 def portal_ref(project_id: str, block: int, report: int) -> str:
@@ -16,3 +25,23 @@ def portal_ref(project_id: str, block: int, report: int) -> str:
             value=block,
         )
     return mint_portal_ref(project_id, str(block), report)
+
+
+def parse_portal_ref(ref: str, *, project_id: str) -> PortalReport | None:
+    """The report a portal ref of `project_id` names; None for any ref portal_ref would not mint for this project."""
+    try:
+        parsed = parse_ref(ref)
+    except MalformedDefectRef:
+        return None
+    if parsed.origin is not DefectOrigin.CLIENT or parsed.component('project') != project_id:
+        return None
+    block = parsed.component('block')
+    if not (block.isascii() and block.isdecimal()):
+        return None
+    named = PortalReport(block=int(block), report=int(parsed.component('n')))
+    return named if named.block >= 1 and portal_ref(project_id, *named) == ref else None
+
+
+def portal_ref_prefix(project_id: str) -> str:
+    """The text every portal ref of `project_id` begins with: what a store query pre-filters on before parse_portal_ref confirms each value."""
+    return portal_ref(project_id, 1, 1).removesuffix('1:1')

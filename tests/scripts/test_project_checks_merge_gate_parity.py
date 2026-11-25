@@ -17,6 +17,7 @@ import dataclasses
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -288,12 +289,17 @@ def _eventually(condition: Callable[[], bool], timeout_secs: float) -> bool:
     return True
 
 
-def _start_commit(repo: HookRepo, hook_tmp: Path, out_path: Path) -> subprocess.Popen[bytes]:
+def _start_commit(
+    repo: HookRepo, hook_tmp: Path, out_path: Path, *, bin_dir: Path | None = None,
+) -> subprocess.Popen[bytes]:
+    env = {**repo.env, 'TMPDIR': str(hook_tmp)}
+    if bin_dir is not None:
+        env['PATH'] = f'{bin_dir}{os.pathsep}{repo.env["PATH"]}'
     with out_path.open('w', encoding='utf-8') as out:
         return subprocess.Popen(
             ['git', 'commit', '-m', 't'],
             cwd=repo.root,
-            env={**repo.env, 'TMPDIR': str(hook_tmp)},
+            env=env,
             stdout=out,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -306,11 +312,13 @@ class _Unit:
     pgid: int
 
 
+def _written(path: Path) -> bool:
+    return path.is_file() and path.read_text().strip() != ''
+
+
 def _await_written(path: Path, out_path: Path) -> str:
     """What a unit wrote to *path*, once it has written anything."""
-    assert _eventually(lambda: path.is_file() and path.read_text().strip() != '', 120), (
-        out_path.read_text(encoding='utf-8')
-    )
+    assert _eventually(lambda: _written(path), 120), out_path.read_text(encoding='utf-8')
     return path.read_text()
 
 
@@ -339,6 +347,23 @@ def _hook_pid(git_pid: int) -> int:
     return int(children[0])
 
 
+def _wchan(pid: int) -> str:
+    """The kernel function *pid* sleeps in, or '' once it has exited."""
+    try:
+        return Path(f'/proc/{pid}/wchan').read_text(encoding='utf-8')
+    except OSError:
+        return ''
+
+
+def _path_stub(bin_dir: Path, name: str, body: str) -> Path:
+    """*bin_dir*, holding an executable *name* that shadows the real one once *bin_dir* leads PATH."""
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / name
+    stub.write_text(body, encoding='utf-8')
+    stub.chmod(0o755)
+    return bin_dir
+
+
 def _ctrl_c(git_pid: int) -> None:
     os.killpg(git_pid, signal.SIGINT)
 
@@ -349,6 +374,18 @@ def _terminate_the_hook(git_pid: int) -> None:
 
 def _hang_up(git_pid: int) -> None:
     os.killpg(git_pid, signal.SIGHUP)
+
+
+HELD_MKTEMP = """#!/bin/sh
+trap '' INT
+made=$({real} "$@") || exit
+echo "$made"
+grep -q '^  running ' {out} || exit 0
+exec >&-
+: > {held}
+until [ -e {release} ]; do sleep 0.05; done
+exit 0
+"""
 
 
 @pytest.mark.parametrize(
@@ -434,3 +471,79 @@ def test_an_interrupted_commit_stops_what_an_uncollected_unit_left_when_its_shel
         'module:escalation:type', 'module:m1:type', 'module:shared:type',
     ], 'the orphan must come from a unit launched after the blocker and before the last unit'
     assert stopped, f'pid {pid}, left running by a unit whose shell had exited, outlived the interrupted commit'
+
+
+def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_launched_unit(tmp_path: Path) -> None:
+    """Guards the hook's rule against a command substitution once its traps are armed, for mktemp only.
+
+    The stub mktemp holds only when the hook calls it after launching a unit, which is where the
+    per-unit ``$(mktemp)`` used to run. A command substitution of any other helper, or of a builtin,
+    in the launch loop or in gate_collect_next is not caught here.
+    """
+    blocker_pid_file = tmp_path / 'blocker.pid'
+    last_unit_file = tmp_path / 'last_unit.pid'
+    commands = {
+        'escalation': f'sh -c {shlex.quote(f"echo $$ > {blocker_pid_file}; exec sleep 300")}',
+        'shared': f'echo $$ > {shlex.quote(str(last_unit_file))}',
+    }
+    repo = make_hook_repo(tmp_path, _type_only_modules(commands.__getitem__))
+    before = repo.head()
+    repo.stage('shared/src/x.py', 'x = 1\n')
+    hook_tmp = tmp_path / 'hook_tmp'
+    hook_tmp.mkdir()
+    out_path = tmp_path / 'commit.out'
+    held = tmp_path / 'mktemp.held'
+    release = tmp_path / 'mktemp.release'
+    real_mktemp = shutil.which('mktemp')
+    assert real_mktemp is not None
+    held_bin = _path_stub(tmp_path / 'held_bin', 'mktemp', HELD_MKTEMP.format(
+        real=shlex.quote(real_mktemp), out=shlex.quote(str(out_path)),
+        held=shlex.quote(str(held)), release=shlex.quote(str(release)),
+    ))
+
+    commit = _start_commit(repo, hook_tmp, out_path, bin_dir=held_bin)
+    units: list[_Unit] = []
+    try:
+        units.append(_started_unit(blocker_pid_file, out_path))
+        hook = _hook_pid(commit.pid)
+        assert _eventually(
+            lambda: (held.exists() or _written(last_unit_file)) and _wchan(hook) == 'do_wait',
+            120,
+        ), out_path.read_text(encoding='utf-8')
+        _ctrl_c(commit.pid)
+        release.touch()
+        commit.wait(timeout=60)
+        stopped = _eventually(lambda: not _pid_alive(units[0].pid), 30)
+        logs_removed = _eventually(lambda: not any(hook_tmp.iterdir()), 30)
+    finally:
+        release.touch()
+        _kill_leftovers(commit, units)
+
+    assert repo.head() == before
+    assert stopped, (
+        f'blocker pid {units[0].pid} outlived a Ctrl-C that landed while the hook was reaping a helper mid-launch'
+    )
+    assert logs_removed, sorted(path.name for path in hook_tmp.iterdir())
+    assert not held.exists(), 'the hook ran mktemp after launching a unit'
+
+
+def test_a_unit_log_directory_that_cannot_be_made_refuses_the_commit_before_any_unit_runs(tmp_path: Path) -> None:
+    repo = make_hook_repo(tmp_path, _type_only_modules(lambda prefix: 'true'))
+    before = repo.head()
+    repo.stage('shared/src/x.py', 'x = 1\n')
+    hook_tmp = tmp_path / 'hook_tmp'
+    hook_tmp.mkdir()
+    out_path = tmp_path / 'commit.out'
+    failing_bin = _path_stub(tmp_path / 'failing_bin', 'mktemp', "#!/bin/sh\necho 'mktemp stub: refused' >&2; exit 1\n")
+
+    commit = _start_commit(repo, hook_tmp, out_path, bin_dir=failing_bin)
+    try:
+        rc = commit.wait(timeout=60)
+    finally:
+        _kill_leftovers(commit, [])
+
+    output = out_path.read_text(encoding='utf-8')
+    assert rc != 0, output
+    assert repo.head() == before
+    assert re.findall(r'^  running ', output, re.MULTILINE) == [], output
+    assert 'unit log directory' in output, output

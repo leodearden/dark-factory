@@ -21,6 +21,7 @@ from client_feed.contract import (
     Restated,
     RevealRefused,
     RevealRequested,
+    Source,
     parse_inbox_line,
     split_jsonl,
 )
@@ -171,7 +172,7 @@ def test_a_publisher_pass_answers_both_requests_and_counts_nothing_under_inbox(
 ) -> None:
     report = run_pass(policy, OutDir.open(policy.out_dir, project_id=PROJECT), now=NOW)
 
-    assert report.degraded == ()
+    assert [degradation.source for degradation in report.degraded] == [Source.FILER]
     answers = [
         (line.type, line.path)
         for line in read_feed_lines(policy.out_dir)
@@ -192,7 +193,7 @@ def test_a_pass_over_an_inbox_of_only_defect_reports_moves_the_offset_past_them(
 
     report = run_pass(policy, OutDir.open(policy.out_dir, project_id=PROJECT), now=NOW)
 
-    assert report.degraded == ()
+    assert [degradation.source for degradation in report.degraded] == [Source.FILER]
     assert not any(
         isinstance(line, FileRevealed | RevealRefused) for line in read_feed_lines(policy.out_dir)
     )
