@@ -68,7 +68,7 @@ def build_remote_runners(
     """
     code_checkout = resolve_code_checkout()
     return [
-        _remote_runner(config, r, cwd, deployed_sha=deployed_sha, code_checkout=code_checkout)
+        remote_runner_for(config, r, cwd, deployed_sha=deployed_sha, code_checkout=code_checkout)
         for r in config.enabled_verify_runners
         if quarantine is None or r.name not in quarantine
     ]
@@ -114,21 +114,25 @@ def remote_runner_factory(
         )
         if runner_config is None:
             raise ValueError(f'{name!r} is not an enabled verify runner')
-        return _remote_runner(
+        return remote_runner_for(
             config, runner_config, cwd, deployed_sha=deployed_sha, code_checkout=code_checkout,
         )
 
     return build
 
 
-def _remote_runner(
+def remote_runner_for(
     config: OrchestratorConfig,
     runner_config: VerifyRunnerConfig,
     cwd: str | Path,
     *,
     deployed_sha: DeployedSha,
-    code_checkout: str | Path | None,
+    code_checkout: str | Path | None = None,
 ) -> RemoteRunner:
+    """The RemoteRunner for one declared runner, enabled or not; the one place config maps to one.
+
+    Raises ValueError, naming the runner, when it has no usable gate paths.
+    """
     gate = runner_config.gate_paths()
     return RemoteRunner(
         name=runner_config.name,
