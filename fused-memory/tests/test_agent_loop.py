@@ -11,6 +11,7 @@ from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.reconciliation.agent_loop import (
     CLI_WARNING_ORIGINS,
     AgentLoop,
@@ -1267,3 +1268,23 @@ async def test_cli_scoping_survives_forwarding_to_invoke_claude_agent(tmp_path):
     assert kwargs['strict_mcp_config'] is True
     assert kwargs['output_schema'] == _P
     assert kwargs['cwd'] == target
+
+
+@pytest.mark.asyncio
+async def test_cli_run_writes_its_ledger_keys_and_counts_input_plus_output():
+    store = MagicMock(name='cost_store')
+    agent = _cli_agent(ledger=InvocationLedger(store, LedgerRole.RECON_VERIFY, 'r', 'p'))
+
+    _payload, mock_invoke = await _run_cli(
+        agent,
+        _verdict_result(
+            input_tokens=30, output_tokens=12, cache_read_tokens=9000, cache_create_tokens=700,
+        ),
+    )
+
+    kwargs = mock_invoke.call_args.kwargs
+    assert kwargs['cost_store'] is store
+    assert kwargs['role'] == 'recon_verify'
+    assert kwargs['run_id'] == 'r'
+    assert kwargs['project_id'] == 'p'
+    assert agent.token_count == 42
