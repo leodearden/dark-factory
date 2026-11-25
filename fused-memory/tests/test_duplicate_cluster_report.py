@@ -59,6 +59,14 @@ class TestCommittedConfig:
     def test_cycle_summaries_are_declared_machine_written(self) -> None:
         assert 'cycle_summary' in report.load_config(COMMITTED_CONFIG).machine_written_kinds
 
+    def test_gate_filing_is_descoped_by_the_2026_11_17_ruling(self) -> None:
+        caveat = report.load_config(COMMITTED_CONFIG).recall_caveat
+
+        assert caveat.fitness.gate_filing == 'descoped'
+        assert caveat.gate_filing_ruling.model_dump() == {
+            'ruled_at': '2026-11-17', 'escalation_id': 'esc-10244-1',
+        }
+
 
 def _without(data: dict, key: str) -> dict:
     return {k: v for k, v in data.items() if k != key}
@@ -120,6 +128,14 @@ _BAD_CONFIGS = {
     'zero_detector_timeout': lambda d: _with(d, detector_timeout_secs=0),
     'zero_resweep_interval': lambda d: _with_cadence(d, resweep_interval_days=0),
     'fitness_outside_its_vocabulary': lambda d: _with_fitness(d, gate_filing='maybe'),
+    'gate_filing_retired_blocked_state': lambda d: _with_fitness(d, gate_filing='blocked'),
+    'gate_filing_owner_task_retired': lambda d: _with_caveat(d, gate_filing_owner_task=4916),
+    'gate_filing_ruling_missing': lambda d: _with(
+        d, recall_caveat=_without(d['recall_caveat'], 'gate_filing_ruling'),
+    ),
+    'gate_filing_ruling_blank_escalation_id': lambda d: _with_caveat(
+        d, gate_filing_ruling={'ruled_at': '2026-11-17', 'escalation_id': ''},
+    ),
     'adjudicator_measurements_missing': lambda d: _with(
         d, recall_caveat=_without(d['recall_caveat'], 'adjudicator_measurements'),
     ),
@@ -979,12 +995,14 @@ class TestWriteReport:
         )
         summary = summary_path.read_text(encoding='utf-8')
         caveat = config.recall_caveat
+        ruling = caveat.gate_filing_ruling
 
         assert 'dark_factory' in summary
         assert _CUR in summary
         assert (
             f'regrowth measurement: {caveat.fitness.regrowth_measurement}; '
-            f'gate filing: {caveat.fitness.gate_filing} (task {caveat.gate_filing_owner_task})'
+            f'gate filing: {caveat.fitness.gate_filing} '
+            f'(ruling {ruling.escalation_id}, {ruling.ruled_at})'
         ) in summary
         (pk_line,) = [line for line in summary.splitlines() if line.strip().startswith(_PK)]
         assert '1 cluster' in pk_line
