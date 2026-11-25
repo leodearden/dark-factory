@@ -57,6 +57,22 @@ class TestVerifyCommand:
             prefix='m', test_command='t', lint_command='l', type_check_command='y',
         )
 
+    def test_a_never_cache_flag_rides_the_command_to_the_rebuilt_module(self):
+        vc = VerifyCommand.from_module_config(ModuleConfig(prefix='m', test_command='t', verify_cache='never'))
+
+        assert vc == VerifyCommand(prefix='m', test_command='t', verify_cache='never')
+        assert VerifyCommand.from_dict(vc.to_dict()).verify_cache == 'never'
+        assert module_config_from_command(vc).verify_cache == 'never'
+
+    def test_a_command_document_from_before_the_flag_decodes_to_default(self):
+        legacy = {'prefix': 'm', 'test_command': 't', 'lint_command': None, 'type_check_command': None}
+
+        assert VerifyCommand.from_dict(legacy).verify_cache == 'default'
+
+    def test_an_unknown_flag_is_rejected_naming_prefix_field_and_value(self):
+        with pytest.raises(ValueError, match=r"'m'.*verify_cache.*'sometimes'"):
+            VerifyCommand(prefix='m', verify_cache='sometimes')  # type: ignore[arg-type]
+
 
 class TestGlobalVerifyCommandFor:
     def test_zero_modules_with_global_commands_ships_them(self, tmp_path: Path):

@@ -110,6 +110,7 @@ class TestVerifyCommand:
             "test_command": "cargo test",
             "lint_command": None,
             "type_check_command": None,
+            "verify_cache": "default",
         }
 
 
