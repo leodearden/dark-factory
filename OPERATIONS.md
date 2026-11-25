@@ -3033,8 +3033,9 @@ restart:
   passes its own deadline (a per-unit cap and a sweep-wide ceiling bound the
   wait). Units still on pre-5371 code, and units that refuse the request, keep
   the legacy merge-idle gate: defer while busy, then force-restart after
-  `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` (10 minutes since 2026-08-26, 75
-  minutes before that). The script stamps the clock only
+  `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` (10 minutes, the settled default of
+  that legacy gate; it was 75 minutes until 2026-08-26, and the script's
+  sweep-wide verify ceiling is derived counting it). The script stamps the clock only
   once the restart is fully verified (the script exits 0). Note this env
   knob is a *different* setting from the coordinator's
   `orchestrator_restart_force_fire_after_secs` config field below, despite
