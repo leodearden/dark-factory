@@ -39,8 +39,8 @@ def _errors_by_check(manifest: ScreenManifest) -> dict[str, str]:
 
 
 def test_the_key_sets_are_the_documented_shape():
-    assert MANIFEST_TOP_KEYS == frozenset({'checks'})
-    assert CHECK_KEYS == frozenset({'id', 'module', 'node_ids'})
+    assert frozenset({'checks'}) == MANIFEST_TOP_KEYS
+    assert frozenset({'id', 'module', 'node_ids'}) == CHECK_KEYS
 
 
 def test_a_well_formed_doc_parses_every_check_in_file_order():
