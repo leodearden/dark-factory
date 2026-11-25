@@ -90,18 +90,22 @@ async def _drain(service: MemoryService, *, completed: int) -> None:
     assert queue is not None
     last_counts: dict = {}
 
-    async def _done() -> bool:
+    async def _reached_or_unreachable() -> bool:
         nonlocal last_counts
         last_counts = (await queue.get_stats())['counts']
-        return last_counts.get('completed') == completed
+        return last_counts.get('completed', 0) >= completed or bool(last_counts.get('dead'))
 
     try:
-        await poll_until(_done, timeout=_DRAIN_BUDGET_S)
+        await poll_until(_reached_or_unreachable, timeout=_DRAIN_BUDGET_S)
     except AssertionError as exc:
         raise AssertionError(
             f'the queue never completed {completed} item(s) within {_DRAIN_BUDGET_S}s; '
             f'last counts={last_counts}'
         ) from exc
+    assert last_counts.get('completed') == completed, (
+        f'the queue can no longer complete exactly {completed} item(s); '
+        f'last counts={last_counts}'
+    )
 
 
 def _add_memory_params(journal: MagicMock) -> list[dict]:
@@ -141,7 +145,12 @@ def service(llm_config, journal, failing_client) -> MemoryService:
 
 @pytest_asyncio.fixture
 async def queued_service(llm_config, journal, failing_client, tmp_path):
-    """The service over a REAL durable queue, so add_episode's facts run as queued writes."""
+    """The service over a REAL durable queue, so add_episode's facts run as queued writes.
+
+    Its per-write timeout is widened to the drain budget, so load can slow a
+    write but never turn it into a timeout retry that the tests would count.
+    """
+    llm_config.queue.write_timeout_seconds = _DRAIN_BUDGET_S
     svc = _service(llm_config, journal, failing_client)
     svc.graphiti = MagicMock()
     svc.graphiti.initialize = AsyncMock()
