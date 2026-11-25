@@ -65,11 +65,18 @@ async def test_a_granted_server_lists_and_dispatches_only_its_grant(artifacts):
     assert _step_deviations(artifacts) == []
 
 
-def test_an_unknown_grant_is_refused(artifacts):
-    with pytest.raises(ValueError, match='no_such_tool'):
-        plan_tools.create_server(
+@pytest.mark.asyncio
+async def test_an_unknown_grant_is_dropped_with_a_warning(artifacts, caplog):
+    with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+        server = plan_tools.create_server(
             artifacts, granted_tools=frozenset({'mark_step_done', 'no_such_tool'}),
         )
+
+    assert await _listed(server) == ['mark_step_done']
+    assert any(
+        record.levelno == logging.WARNING and 'no_such_tool' in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -129,25 +136,6 @@ async def test_the_cli_exposes_exactly_the_granted_tools(tmp_path, marker):
     assert await _listed(plan_tools.server_from_argv(argv)) == [
         'mark_step_done', 'record_step_deviation',
     ]
-
-
-@pytest.mark.asyncio
-async def test_a_cli_grant_naming_an_unregistered_tool_is_dropped_with_a_warning(
-    tmp_path, caplog,
-):
-    argv = [
-        *_lane_argv(tmp_path), '--grants-enforced',
-        '--grant', 'mark_step_done', '--grant', 'renamed_away',
-    ]
-
-    with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
-        server = plan_tools.server_from_argv(argv)
-
-    assert await _listed(server) == ['mark_step_done']
-    assert any(
-        record.levelno == logging.WARNING and 'renamed_away' in record.getMessage()
-        for record in caplog.records
-    )
 
 
 @pytest.mark.parametrize('python_executable', ['/venv/bin/python', None])
