@@ -207,6 +207,20 @@ def test_b29_every_crash_point_converges_to_one_gated_fix(
     _assert_filed_and_gated(gated)
 
 
+def test_a_fix_released_ahead_of_its_gate_has_the_gate_released(gated: World) -> None:
+    append_inbox(gated.in_dir, reported(2, 3, at=AT))
+    gated.fake.crash_before('commit_planning', 1)
+    with pytest.raises(SimulatedCrash):
+        gated.run()
+    [fix] = gated.fixes()
+    gated.fake.set_status(fix['id'], 'pending')
+
+    report, _ = gated.run()
+
+    _assert_filed_and_gated(gated)
+    assert (report.converged, report.unconverged) == ((REF,), ())
+
+
 def test_a_hand_filed_carrier_counts_as_filed(gated: World) -> None:
     gated.fake.seed_task(metadata={'defects': [declared(REF)]})
     append_inbox(gated.in_dir, reported(2, 3, at=AT))

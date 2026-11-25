@@ -189,11 +189,17 @@ def _gate_and_commit(
     fix: TaskView,
     facts: ClientDefectFacts,
 ) -> None:
-    """Gate a fix still held deferred, then release it; a released fix is never gated after the fact."""
-    if fix.status is not _DEFERRED:
-        return
+    """Gate a fix still held deferred, then release it; a released fix is never gated after the fact.
+
+    A fix released ahead of its gate (a per-id commit refusal, a crash mid-batch, a hand release)
+    still has that gate released, so nothing the filer planned is left deferred.
+    """
     gate = _lowest(_filer_tasks(tools, tools.find_gates(ref)), 'gate', ref)
     gate_id, gate_status = (None, None) if gate is None else (gate.task_id, gate.status)
+    if fix.status is not _DEFERRED:
+        if gate_id is not None and gate_status is _DEFERRED:
+            tools.commit_planning([gate_id])
+        return
     if gate_id is None and requires_gate(facts, auto_dispatch=filer.auto_dispatch):
         submission = gate_submission(
             report,
