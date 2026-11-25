@@ -28,9 +28,12 @@ class StoreUnreachable(Exception):
 
 
 class StoreDegraded(StoreUnreachable):
-    """The store answered ``degraded: true``: a backing service it needs (an
-    embedder or Qdrant) is out, an outage rather than a refusal of this call,
-    so the same call may answer on a later run."""
+    """The store answered ``degraded: true``, its report that a backing service
+    (an embedder or Qdrant) is out, so the same call may answer on a later run.
+    That is not guaranteed: the corpus search behind it
+    (fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator.search_corpus)
+    reports every failure as degraded, so a failure deterministic for one
+    query answers degraded on every run."""
 
 
 class _MalformedReply(ValueError):
