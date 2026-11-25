@@ -486,8 +486,11 @@ class LoadSampleStore:
         DELETE searches idx_samples_ts from each end, so it costs the rows it
         removes rather than the table.
 
-        Returns the rows deleted, 0 when no sweep is due.
+        Returns the rows deleted, 0 when no sweep is due. ``max_rows`` below 1
+        raises ValueError, whether or not a sweep is due.
         """
+        if max_rows < 1:
+            raise ValueError(f'cleanup_old: max_rows must be at least 1, got {max_rows}')
         if not self.should_cleanup(now, interval_seconds=interval_seconds):
             return 0
         conn = self._connect()
