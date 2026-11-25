@@ -20,6 +20,7 @@ from orchestrator.merge_lane.types import (
     RealMergeItem,
 )
 from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+from orchestrator.remote_gate import EnsureReport, local_gate_identity
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
@@ -81,20 +82,30 @@ def runner_double(
     is_local: bool,
     result: VerifyResult | None = None,
     error: BaseException | None = None,
+    gate_built: bool = False,
+    ensure_error: BaseException | None = None,
 ) -> MagicMock:
     """A verify host that reports *result*, or raises *error* when dispatched.
 
     The pool and the drift detector ask a runner only for ``name``,
-    ``is_local``, ``health()`` and ``run_merge_verify()``, and the reprobe
-    sweep reaps its idle gates — so a host is an injectable collaborator and
-    no module attribute has to be substituted to decide what a verify on it
-    does.
+    ``is_local``, ``health()`` and ``run_merge_verify()``, the reprobe
+    sweep reaps its idle gates, and a preflight ensures its gate first — so a
+    host is an injectable collaborator and no module attribute has to be
+    substituted to decide what a verify on it does.  ``ensure_gate()``
+    reports a gate of the test deployed sha, *gate_built* when it had to
+    build one, or raises *ensure_error*.
     """
     runner = MagicMock()
     runner.name = name
     runner.is_local = is_local
     runner.health = AsyncMock(return_value=True)
     runner.reap_idle_gates = AsyncMock()
+    if ensure_error is not None:
+        runner.ensure_gate = AsyncMock(side_effect=ensure_error)
+    else:
+        runner.ensure_gate = AsyncMock(return_value=EnsureReport(
+            built=gate_built, identity=local_gate_identity('d' * 40),
+        ))
     if error is not None:
         runner.run_merge_verify = AsyncMock(side_effect=error)
     else:
