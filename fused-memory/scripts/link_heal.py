@@ -431,7 +431,7 @@ class _Session:
     ledger: LinkHealLedger
     ledger_dir: Path
     server_url: str
-    invocation_ledger: InvocationLedger
+    invocation_run_id: str
 
     @property
     def limits(self) -> RunLimits:
@@ -440,6 +440,20 @@ class _Session:
     @property
     def home_root(self) -> str:
         return self.env.home_root_for(self.config)
+
+    @contextlib.asynccontextmanager
+    async def adjudicator(self) -> AsyncIterator[LinkAdjudicator]:
+        """The run's adjudicator, each call it makes landing a row in the invocations ledger.
+
+        Only the commands that adjudicate open that ledger.
+        """
+        async with CostStore(invocations_ledger_path(self.ledger_dir)) as cost_store:
+            yield self.env.adjudicator_for(self.config, InvocationLedger(
+                cost_store,
+                LedgerRole.LINK_ADJUDICATOR,
+                run_id=self.invocation_run_id,
+                project_id=resolve_project_id(self.home_root),
+            ))
 
     async def probe(self, first_project: str | None) -> None:
         """Refuse unless the server reads the run's first project, else its own."""
@@ -494,9 +508,12 @@ async def _plan_from_adjudicator(args: argparse.Namespace, session: _Session) ->
     plan_path_for = _plan_path_for(args.out, session.ledger_dir)
     projects = _named_projects(args, session)
     await session.probe(projects[0])
-    async with session.env.census_for(session.config) as census:
+    async with (
+        session.env.census_for(session.config) as census,
+        session.adjudicator() as adjudicate,
+    ):
         return await run_adjudicator_plan(
-            adjudicate=session.env.adjudicator_for(session.config, session.invocation_ledger),
+            adjudicate=adjudicate,
             store=session.store,
             census=census,
             ledger=session.ledger,
@@ -601,9 +618,12 @@ async def _sweep(args: argparse.Namespace, session: _Session) -> CommandOutcome:
     since = _since(args.since, now)
     settings = _sweep_settings(args, session)
     await session.probe(settings.projects[0])
-    async with session.env.census_for(session.config) as census:
+    async with (
+        session.env.census_for(session.config) as census,
+        session.adjudicator() as adjudicate,
+    ):
         report = await run_sweep(
-            adjudicate=session.env.adjudicator_for(session.config, session.invocation_ledger),
+            adjudicate=adjudicate,
             store=session.store,
             census=census,
             ledger=session.ledger,
@@ -637,16 +657,17 @@ def _calibration_input(ratings: Path, items: Path) -> tuple[tuple[CalibrationIte
 
 async def _calibrate(args: argparse.Namespace, session: _Session) -> CommandOutcome:
     population, population_sha256 = _calibration_input(args.ratings, args.items)
-    report = await run_calibration(
-        population,
-        adjudicate=session.env.adjudicator_for(session.config, session.invocation_ledger),
-        ledger=session.ledger,
-        settings=CalibrationSettings.from_config(session.config.link_heal),
-        filer=FoldedEscapeFiler(session.home_root),
-        reports_dir=session.env.reports_dir_for(session.config),
-        population_sha256=population_sha256,
-        now=session.env.now(),
-    )
+    async with session.adjudicator() as adjudicate:
+        report = await run_calibration(
+            population,
+            adjudicate=adjudicate,
+            ledger=session.ledger,
+            settings=CalibrationSettings.from_config(session.config.link_heal),
+            filer=FoldedEscapeFiler(session.home_root),
+            reports_dir=session.env.reports_dir_for(session.config),
+            population_sha256=population_sha256,
+            now=session.env.now(),
+        )
     return CommandOutcome(calibration_document(report), EXIT_OK if report.passed else EXIT_FAILED)
 
 
@@ -669,16 +690,9 @@ _RUN_COMMANDS: Mapping[str, _RunCommand] = {
 }
 
 
-def _invocation_ledger(
-    args: argparse.Namespace, config: FusedMemoryConfig, env: LinkHealEnv, cost_store: CostStore,
-) -> InvocationLedger:
-    """Where this run's adjudicator calls land, under a run id minted for the run."""
-    return InvocationLedger(
-        cost_store,
-        LedgerRole.LINK_ADJUDICATOR,
-        run_id=f'link-heal-{args.command}-{env.now():%Y%m%dT%H%M%SZ}-{os.getpid()}',
-        project_id=resolve_project_id(env.home_root_for(config)),
-    )
+def _invocation_run_id(args: argparse.Namespace, env: LinkHealEnv) -> str:
+    """The run id this run's adjudicator calls are written under in the invocations ledger."""
+    return f'link-heal-{args.command}-{env.now():%Y%m%dT%H%M%SZ}-{os.getpid()}'
 
 
 async def _run_command(
@@ -689,10 +703,7 @@ async def _run_command(
     with RunLock(ledger_dir / LOCK_FILENAME):
         ledger = LinkHealLedger(ledger_dir / LEDGER_FILENAME)
         try:
-            async with (
-                CostStore(invocations_ledger_path(ledger_dir)) as cost_store,
-                env.tool_caller_for(server_url) as tool_caller,
-            ):
+            async with env.tool_caller_for(server_url) as tool_caller:
                 session = _Session(
                     config=config,
                     env=env,
@@ -700,7 +711,7 @@ async def _run_command(
                     ledger=ledger,
                     ledger_dir=ledger_dir,
                     server_url=server_url,
-                    invocation_ledger=_invocation_ledger(args, config, env, cost_store),
+                    invocation_run_id=_invocation_run_id(args, env),
                 )
                 return await _RUN_COMMANDS[args.command](args, session)
         finally:

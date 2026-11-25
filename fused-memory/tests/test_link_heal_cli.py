@@ -68,9 +68,10 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     text_sha256,
 )
-from fused_memory.models.invocation_ledger import LedgerRole
+from fused_memory.models.invocation_ledger import LedgerRole, invocations_ledger_path
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
+from fused_memory.server.main import _resolve_curator_cost_store_path
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'link_heal.py'
 
@@ -364,6 +365,20 @@ class TestStatus:
 
         assert str(workspace.data_dir.resolve() / LEDGER_FILENAME) in capsys.readouterr().out
 
+    def test_adjudicator_rows_land_in_the_servers_invocations_ledger_from_any_cwd(
+        self, workspace, monkeypatch,
+    ):
+        workspace.config_path.write_text(yaml.safe_dump({
+            'reconciliation': {'data_dir': 'data/reconciliation'},
+        }))
+        monkeypatch.chdir(workspace.root)
+
+        config = cli.load_config(str(workspace.config_path))
+
+        assert invocations_ledger_path(cli.config_ledger_dir(config)) == (
+            _resolve_curator_cost_store_path(config)
+        )
+
 
 class TestPlan:
     @pytest.mark.asyncio
@@ -609,6 +624,18 @@ class TestApplyAndUndo:
         assert undone['outcome'] == 'complete'
 
     @pytest.mark.asyncio
+    async def test_commands_that_never_adjudicate_never_open_the_invocations_ledger(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        await plan_from(env, workspace, seed_corpus(harness, workspace, 2), capsys)
+        _code, applied = await apply(env, workspace, capsys)
+
+        assert await run_cli(env, workspace, 'undo', '--run', applied['run_id']) == 0
+
+        assert not invocations_ledger_path(workspace.ledger_dir).exists()
+
+    @pytest.mark.asyncio
     async def test_config_is_read_afresh_at_every_run(self, harness, workspace, capsys):
         env = env_for(harness, workspace)
         await plan_from(env, workspace, seed_corpus(harness, workspace, 4), capsys)
@@ -792,7 +819,7 @@ class TestPlanFromAdjudicator:
         assert ledger.project_id == resolve_project_id(str(workspace.home_root))
         assert ledger.run_id
         assert ledger.cost_store is not None
-        assert (workspace.ledger_dir / 'curator_events.db').exists()
+        assert invocations_ledger_path(workspace.ledger_dir).exists()
 
     @pytest.mark.asyncio
     async def test_project_defaults_to_the_home_project(self, harness, workspace, capsys):
