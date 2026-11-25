@@ -1553,15 +1553,55 @@ NodeIdStatus = Literal['pass', 'fail', 'error', 'skipped']
 _NODE_ID_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'skipped', 'pass')
 
 
-def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
-    """``{junit id: status}`` for every testcase of the report at *path*; ``None`` when no report parsed.
+#: Bound on a ``NodeIdResult.detail``: a long traceback keeps its head, where
+#: the assertion message is.
+_NODE_ID_DETAIL_MAX_CHARS = 4000
+
+
+@dataclass(frozen=True)
+class NodeIdResult:
+    """One node id's outcome from ``run_node_id_results``.
+
+    ``detail`` is the junit ``<failure>``/``<error>`` message attribute and
+    text, which carry the assertion message and traceback, bounded by
+    ``_NODE_ID_DETAIL_MAX_CHARS``; ``''`` for a pass, a skip, or an id no
+    testcase reported. It is NOT pytest's captured stdout/stderr:
+    ``junit_logging`` is not enabled.
+    """
+
+    status: NodeIdStatus
+    detail: str = ''
+
+
+def _by_node_id_precedence(result: NodeIdResult) -> int:
+    return _NODE_ID_STATUS_PRECEDENCE.index(result.status)
+
+
+def _junit_outcome_detail(outcome: ET.Element) -> str:
+    parts = (outcome.get('message', ''), (outcome.text or '').strip())
+    return '\n'.join(part for part in parts if part)[:_NODE_ID_DETAIL_MAX_CHARS]
+
+
+def _junit_testcase_result(testcase: ET.Element) -> NodeIdResult:
+    failure = testcase.find('failure')
+    if failure is not None:
+        return NodeIdResult('fail', _junit_outcome_detail(failure))
+    error = testcase.find('error')
+    if error is not None:
+        return NodeIdResult('error', _junit_outcome_detail(error))
+    return NodeIdResult('skipped' if _junit_testcase_never_ran(testcase) else 'pass')
+
+
+def _junit_testcase_results(path: Path) -> dict[str, NodeIdResult] | None:
+    """``{junit id: result}`` for every testcase of the report at *path*; ``None`` when no report parsed.
 
     A ``<failure>`` is ``'fail'``. An ``<error>`` without one, a setup or
     teardown error, is ``'error'``: the test got no verdict. A test that never
     executed is ``'skipped'``; any other testcase ran and passed. Ids use the
     spelling of :func:`_extract_test_ids_from_junit`. pytest writes a test that
     fails and then errors in teardown as two testcases with one id; repeats
-    fold by ``_NODE_ID_STATUS_PRECEDENCE``, so that test stays ``'fail'``.
+    fold by ``_NODE_ID_STATUS_PRECEDENCE``, keeping the winning testcase's
+    detail, so that test stays ``'fail'`` with its failure text.
     """
     try:
         root = ET.parse(path).getroot()
@@ -1569,22 +1609,13 @@ def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
         return None
     if root is None:
         return None
-    statuses: dict[str, NodeIdStatus] = {}
+    results: dict[str, NodeIdResult] = {}
     for testcase in root.iter('testcase'):
-        if testcase.find('failure') is not None:
-            status: NodeIdStatus = 'fail'
-        elif testcase.find('error') is not None:
-            status = 'error'
-        elif _junit_testcase_never_ran(testcase):
-            status = 'skipped'
-        else:
-            status = 'pass'
         testcase_id = _junit_testcase_id(testcase)
-        prior = statuses.get(testcase_id)
-        statuses[testcase_id] = status if prior is None else _NODE_ID_STATUS_PRECEDENCE[min(
-            _NODE_ID_STATUS_PRECEDENCE.index(prior), _NODE_ID_STATUS_PRECEDENCE.index(status),
-        )]
-    return statuses
+        result = _junit_testcase_result(testcase)
+        prior = results.get(testcase_id)
+        results[testcase_id] = result if prior is None else min(prior, result, key=_by_node_id_precedence)
+    return results
 
 
 def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
@@ -11619,32 +11650,35 @@ def _node_id_test_config(
 #: hung test is bounded by it rather than by the verify command timeout.
 _NODE_ID_RUN_TIMEOUT_SECS: int = 300
 
+#: An id no testcase reported: no verdict and no failure text.
+_NODE_ID_UNREPORTED = NodeIdResult('error')
 
-def _node_id_statuses(
+
+def _node_id_results(
     report: Path, prefix: str, qualified_by_id: Mapping[str, str],
-) -> dict[str, NodeIdStatus] | None:
-    """The status of each id the junit *report* records; ``None`` when no report parsed.
+) -> dict[str, NodeIdResult] | None:
+    """The result of each id the junit *report* records; ``None`` when no report parsed.
 
     An id names the testcase spelled from its qualified id with the rootdir at
     the tree root or at the module dir, and a function id without parameters
     names every parametrization of it. An id that names no testcase is left out.
     """
-    testcases = _junit_testcase_statuses(report)
+    testcases = _junit_testcase_results(report)
     if testcases is None:
         return None
-    statuses: dict[str, NodeIdStatus] = {}
+    results: dict[str, NodeIdResult] = {}
     for node_id, qualified in qualified_by_id.items():
         spellings = {
             _junit_spelling(qualified),
             _junit_spelling(qualified.removeprefix(f'{prefix}/')),
         }
-        named: list[NodeIdStatus] = [
-            status for testcase, status in testcases.items()
+        named = [
+            result for testcase, result in testcases.items()
             if spellings & {testcase, testcase.partition('[')[0]}
         ]
         if named:
-            statuses[node_id] = min(named, key=_NODE_ID_STATUS_PRECEDENCE.index)
-    return statuses
+            results[node_id] = min(named, key=_by_node_id_precedence)
+    return results
 
 
 async def _node_id_run(
@@ -11653,7 +11687,7 @@ async def _node_id_run(
     module_config: ModuleConfig,
     qualified_by_id: Mapping[str, str],
     report: Path,
-) -> dict[str, NodeIdStatus] | None:
+) -> dict[str, NodeIdResult] | None:
     """One run of *qualified_by_id* into *report*, read back per reported id; ``None`` when no report was read."""
     try:
         await run_verification(
@@ -11670,16 +11704,16 @@ async def _node_id_run(
             list(qualified_by_id), module_config.prefix, exc_info=True,
         )
         return None
-    return _node_id_statuses(report, module_config.prefix, qualified_by_id)
+    return _node_id_results(report, module_config.prefix, qualified_by_id)
 
 
-_NodeIdSubsetRun = Callable[[Sequence[str]], Awaitable[dict[str, NodeIdStatus] | None]]
+_NodeIdSubsetRun = Callable[[Sequence[str]], Awaitable[dict[str, NodeIdResult] | None]]
 
 
 async def _bisect_refused_run(
     run: _NodeIdSubsetRun, refused: Sequence[str],
-) -> dict[str, NodeIdStatus]:
-    """The statuses of the *refused* ids, a run that reported none of them, found by bisection.
+) -> dict[str, NodeIdResult]:
+    """The results of the *refused* ids, a run that reported none of them, found by bisection.
 
     The halves run in turn, and a half that reports nothing is split again.
     When the first half reports, the cause lies in the second, so the second
@@ -11702,7 +11736,7 @@ async def _run_node_id_group(
     module_config: ModuleConfig,
     qualified_by_id: Mapping[str, str],
     report: Path | None,
-) -> dict[str, NodeIdStatus]:
+) -> dict[str, NodeIdResult]:
     """Every id of one module's group, run together into *report*, which is removed afterwards.
 
     A run whose written report records none of its ids is bisected.
@@ -11712,20 +11746,20 @@ async def _run_node_id_group(
             'run_node_ids: no junit report path in %s for module %r — %s each read error',
             tree, module_config.prefix, list(qualified_by_id),
         )
-        return {node_id: 'error' for node_id in qualified_by_id}
+        return {node_id: _NODE_ID_UNREPORTED for node_id in qualified_by_id}
 
-    async def run(node_ids: Sequence[str]) -> dict[str, NodeIdStatus] | None:
+    async def run(node_ids: Sequence[str]) -> dict[str, NodeIdResult] | None:
         subset = {node_id: qualified_by_id[node_id] for node_id in node_ids}
         return await _node_id_run(tree, config, module_config, subset, report)
 
     try:
-        statuses = await run(list(qualified_by_id))
-        if statuses == {}:
-            statuses = await _bisect_refused_run(run, list(qualified_by_id))
+        results = await run(list(qualified_by_id))
+        if results == {}:
+            results = await _bisect_refused_run(run, list(qualified_by_id))
     finally:
         _clear_junit_report(report)
-    reported = statuses or {}
-    return {node_id: reported.get(node_id, 'error') for node_id in qualified_by_id}
+    reported = results or {}
+    return {node_id: reported.get(node_id, _NODE_ID_UNREPORTED) for node_id in qualified_by_id}
 
 
 def _node_ids_by_module(
@@ -11751,7 +11785,22 @@ async def run_node_ids(
     *,
     concurrent_groups: bool = False,
 ) -> Mapping[str, NodeIdStatus]:
-    """Run exactly the pytest node *ids* in *tree*; return each one's status, keyed as given.
+    """Each id's status alone: the projection of :func:`run_node_id_results`, the one node-id runner (INV-5)."""
+    results = await run_node_id_results(
+        tree, config, module_configs, ids, concurrent_groups=concurrent_groups,
+    )
+    return MappingProxyType({node_id: result.status for node_id, result in results.items()})
+
+
+async def run_node_id_results(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_configs: Sequence[ModuleConfig],
+    ids: Collection[str],
+    *,
+    concurrent_groups: bool = False,
+) -> Mapping[str, NodeIdResult]:
+    """Run exactly the pytest node *ids* in *tree*; return each one's result, keyed as given.
 
     ``'pass'`` and ``'fail'`` are verdicts on the test. ``'skipped'`` means it
     never ran, which is not a pass: SKIP is not ALLOW. ``'error'`` means no
@@ -11782,25 +11831,30 @@ async def run_node_ids(
 
     *concurrent_groups* runs the module groups at once, each writing its own
     report; the serial default is what an isolation-sensitive caller needs.
+
+    Each result's ``detail`` is its junit failure or error text (see
+    :class:`NodeIdResult`): the assertion message, never captured output.
+    An id that got no testcase, including every unmappable one, has
+    ``detail == ''``.
     """
     mc_by_prefix = {mc.prefix: mc for mc in module_configs}
     qualified_by_prefix = _node_ids_by_module(tree, mc_by_prefix, ids)
     token = uuid.uuid4().hex
 
-    def run_group(prefix: str) -> Awaitable[dict[str, NodeIdStatus]]:
+    def run_group(prefix: str) -> Awaitable[dict[str, NodeIdResult]]:
         return _run_node_id_group(
             tree, config, mc_by_prefix[prefix], qualified_by_prefix[prefix],
             _prepare_junit_report_path(tree, prefix, group=f'node-ids-{token}'),
         )
 
     if concurrent_groups:
-        group_statuses = await gather_unwound(*map(run_group, qualified_by_prefix))
+        group_results = await gather_unwound(*map(run_group, qualified_by_prefix))
     else:
-        group_statuses = [await run_group(prefix) for prefix in qualified_by_prefix]
-    statuses: dict[str, NodeIdStatus] = {}
-    for one_group in group_statuses:
-        statuses.update(one_group)
-    return MappingProxyType({node_id: statuses.get(node_id, 'error') for node_id in ids})
+        group_results = [await run_group(prefix) for prefix in qualified_by_prefix]
+    results: dict[str, NodeIdResult] = {}
+    for one_group in group_results:
+        results.update(one_group)
+    return MappingProxyType({node_id: results.get(node_id, _NODE_ID_UNREPORTED) for node_id in ids})
 
 
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
