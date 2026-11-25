@@ -20,7 +20,7 @@ from _eval_refusal import refused_agent_result
 
 from orchestrator.evals.judge import PlanQualityVerdict
 from orchestrator.evals.measurement import Scored
-from orchestrator.evals.metrics import RoleUnderTest
+from orchestrator.evals.metrics import EndpointKind, RoleUnderTest
 
 # ---------------------------------------------------------------------------
 # Architect cell records the plan judge's spend (step-5/6, eval-revival υ)
@@ -187,6 +187,26 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
 
         assert result.metrics['cli_cost_untrusted'] is False
         assert mocks['save'].call_args.args[0].metrics['cli_cost_untrusted'] is False
+
+    async def test_a_vendor_candidate_persists_its_declared_endpoint_kind(self):
+        result, mocks = await run_architect_eval_hermetic(
+            self._cfg(
+                env_overrides={'ANTHROPIC_BASE_URL': 'https://token-plan-ams.xiaomimimo.com/anthropic'},
+                endpoint_kind=EndpointKind.VENDOR_CLOUD,
+            ),
+            produced_plan=well_formed_plan(),
+        )
+
+        assert result.metrics['endpoint_kind'] == 'vendor_cloud'
+        assert mocks['save'].call_args.args[0].metrics['endpoint_kind'] == 'vendor_cloud'
+
+    async def test_a_native_candidate_persists_a_native_endpoint_kind(self):
+        result, mocks = await run_architect_eval_hermetic(
+            self._cfg(env_overrides={}), produced_plan=well_formed_plan(),
+        )
+
+        assert result.metrics['endpoint_kind'] == 'native_anthropic'
+        assert mocks['save'].call_args.args[0].metrics['endpoint_kind'] == 'native_anthropic'
 
 
 @pytest.mark.asyncio

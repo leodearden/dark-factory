@@ -8,9 +8,15 @@ reliable about where the model runs.
 
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from orchestrator.evals import configs
+import pytest
+from _campaign_gate_helpers import eval_base_config
+from _eval_workflow_cell import executor_task, stub_workflow_cell
+
+from orchestrator.evals import configs, runner
 from orchestrator.evals.configs import (
     ARCHITECT_EVAL_CONFIGS,
     EVAL_CONFIGS,
@@ -24,7 +30,9 @@ from orchestrator.evals.configs import (
     mimo_code_candidates,
     zcode_candidates,
 )
-from orchestrator.evals.metrics import EndpointKind
+from orchestrator.evals.metrics import EndpointKind, EvalMetrics
+from orchestrator.evals.results import ResultStore
+from orchestrator.workflow import WorkflowOutcome
 
 # The two FINAL_RUN_CONFIGS entries that re-run the native cloud baselines
 # beside the vLLM final-run configs.
@@ -117,3 +125,63 @@ def test_every_harness_other_than_claude_and_pi_runs_against_a_vendor_cloud():
 
 def test_a_bare_config_defaults_to_native_anthropic():
     assert EvalConfig('x', 'claude', 'opus', 'high').endpoint_kind is EndpointKind.NATIVE_ANTHROPIC
+
+
+_TASK_PATH = Path('/fake/task.json')
+
+
+def _resolve(name: str) -> EvalConfig:
+    cfg = get_config_by_name(name)
+    assert cfg is not None, name
+    return cfg
+
+
+def _stub_done_cell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow = MagicMock()
+
+    async def run():
+        return SimpleNamespace(outcome=WorkflowOutcome.DONE)
+
+    workflow.run = run
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path), workflow)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('name', 'expected'), [
+    ('mimo-v2.6-pro-mimocode', EndpointKind.VENDOR_CLOUD),
+    ('mimo-v2.6-pro-endpoint', EndpointKind.VENDOR_CLOUD),
+    ('qwen3-coder-30b-q4', EndpointKind.SELF_HOSTED_VLLM),
+    ('claude-sonnet-max', EndpointKind.NATIVE_ANTHROPIC),
+])
+async def test_an_implementer_cell_persists_the_endpoint_kind_its_config_declared(
+    name: str, expected: EndpointKind, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _stub_done_cell(tmp_path, monkeypatch)
+    store = ResultStore(tmp_path / 'results')
+
+    result = await runner.run_eval(
+        _TASK_PATH, _resolve(name), eval_base_config(tmp_path), usage_gate=None, store=store,
+    )
+
+    assert result.metrics['endpoint_kind'] == expected.value
+    [persisted] = store.load_all()
+    assert EvalMetrics.from_dict(persisted.metrics).endpoint_kind is expected
+
+
+@pytest.mark.asyncio
+async def test_an_end_to_end_cell_persists_the_implementers_endpoint_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _stub_done_cell(tmp_path, monkeypatch)
+    store = ResultStore(tmp_path / 'results')
+    architect = ARCHITECT_EVAL_CONFIGS[0]
+    assert architect.endpoint_kind is EndpointKind.NATIVE_ANTHROPIC
+
+    result = await runner.run_end_to_end(
+        _TASK_PATH, architect, _resolve('mimo-v2.6-pro-mimocode'), eval_base_config(tmp_path),
+        usage_gate=None, store=store,
+    )
+
+    assert result.metrics['endpoint_kind'] == 'vendor_cloud'
+    [persisted] = store.load_all()
+    assert EvalMetrics.from_dict(persisted.metrics).endpoint_kind is EndpointKind.VENDOR_CLOUD

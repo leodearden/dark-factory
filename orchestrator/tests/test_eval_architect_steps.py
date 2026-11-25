@@ -61,7 +61,7 @@ from orchestrator.evals.measurement import (
     Unmeasured,
     UnmeasuredCause,
 )
-from orchestrator.evals.metrics import DECLINE_KINDS, DECLINE_READERS, RoleUnderTest
+from orchestrator.evals.metrics import DECLINE_KINDS, DECLINE_READERS, EndpointKind, RoleUnderTest
 from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
 from orchestrator.evals.results import CellName, ResultStore
 
@@ -347,6 +347,13 @@ class TestAssembleMetrics:
         assert metrics.cli_cost_untrusted is True
         assert metrics.tokens_per_second == round(3_000 / (4567 / 1000), 2)
 
+    def test_the_endpoint_kind_is_copied_from_the_attempt(self):
+        metrics = assemble_metrics(
+            _attempt(endpoint_kind=EndpointKind.SELF_HOSTED_VLLM), PlanScoring.FLOORED, None,
+        )
+
+        assert metrics.endpoint_kind is EndpointKind.SELF_HOSTED_VLLM
+
     def test_a_zero_duration_attempt_reports_zero_tokens_per_second(self):
         metrics = assemble_metrics(
             _attempt(usage=ArchitectUsage(output_tokens=3_000, duration_ms=0)),
@@ -626,12 +633,13 @@ def _cell(
 async def _invoke(
     cell: _Cell,
     *,
+    config: EvalConfig = _CFG,
     build_orch_config: Callable[[], OrchestratorConfig] | None = None,
     timeout_minutes: float = 60,
     usage_gate: eval_gate.InjectedGate = eval_gate.GATE_UNSET,
 ) -> ArchitectAttempt:
     return await invoke_architect(
-        cell.task, _CFG, cell.deps,
+        cell.task, config, cell.deps,
         build_orch_config=build_orch_config or cell.orch_config,
         usage_gate=usage_gate,
         timeout_minutes=timeout_minutes,
@@ -669,6 +677,15 @@ class TestInvokeArchitectExits:
         assert attempt.cli_cost_untrusted is False
         assert attempt.address == CellName('df_task_2605', _CFG.name, 'run-abc')
         assert attempt.worktree == cell.worktree
+        assert attempt.endpoint_kind is EndpointKind.NATIVE_ANTHROPIC
+
+    async def test_the_attempt_carries_the_endpoint_kind_its_config_declared(self, tmp_path: Path):
+        cell = _cell(tmp_path, plan=_scorable_plan())
+        vendor = dataclasses.replace(_CFG, endpoint_kind=EndpointKind.VENDOR_CLOUD)
+
+        attempt = await _invoke(cell, config=vendor)
+
+        assert attempt.endpoint_kind is EndpointKind.VENDOR_CLOUD
 
     async def test_the_artifacts_are_opened_at_the_worktree_for_the_task(
         self, tmp_path: Path,

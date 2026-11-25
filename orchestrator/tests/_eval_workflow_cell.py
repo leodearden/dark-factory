@@ -28,8 +28,13 @@ async def fake_create_worktree(*_a, **_k) -> tuple[Path, str]:
     return Path('/fake/wt'), 'run-cell'
 
 
-async def fake_collect(_wf, _wt, _task, *, role, replay_frame, sandbox_backend) -> EvalMetrics:
-    return EvalMetrics(role_under_test=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend)
+async def fake_collect(
+    _wf, _wt, _task, *, role, replay_frame, sandbox_backend, endpoint_kind,
+) -> EvalMetrics:
+    return EvalMetrics(
+        role_under_test=role, replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
+    )
 
 
 def stub_workflow_cell(

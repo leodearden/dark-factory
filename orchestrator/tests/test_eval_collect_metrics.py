@@ -11,7 +11,7 @@ from _eval_diff_repo import repo_with_commit
 
 from orchestrator.config import PriceEntry
 from orchestrator.evals.cell_sandbox import CellSandbox
-from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+from orchestrator.evals.metrics import EndpointKind, EvalMetrics, RoleUnderTest
 from orchestrator.evals.runner import collect_metrics
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.verify import VerifyResult
@@ -45,6 +45,7 @@ async def _collect(
     replay_frame: str | None = None,
     workflow: MagicMock | None = None,
     sandbox_backend: CellSandbox = 'landlock',
+    endpoint_kind: EndpointKind = EndpointKind.NATIVE_ANTHROPIC,
 ) -> EvalMetrics:
     verification = VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='',
@@ -53,6 +54,7 @@ async def _collect(
         return await collect_metrics(
             workflow or _workflow(), worktree, {'id': 't', 'pre_task_commit': base_commit},
             role=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend,
+            endpoint_kind=endpoint_kind,
         )
 
 
@@ -80,6 +82,31 @@ async def test_collect_metrics_stamps_the_sandbox_backend(tmp_path: Path):
     m = await _collect(repo, base, sandbox_backend='bwrap')
 
     assert m.sandbox_backend == 'bwrap'
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_stamps_the_endpoint_kind(tmp_path: Path):
+    repo, base = repo_with_commit(tmp_path / 'repo', {})
+
+    m = await _collect(repo, base, endpoint_kind=EndpointKind.SELF_HOSTED_VLLM)
+
+    assert m.endpoint_kind is EndpointKind.SELF_HOSTED_VLLM
+
+
+@pytest.mark.asyncio
+async def test_the_cost_trust_flag_follows_the_env_not_the_endpoint_kind(tmp_path: Path):
+    repo, base = repo_with_commit(tmp_path / 'repo', {})
+    proxied = _workflow()
+    proxied.config.env_overrides = {
+        'ANTHROPIC_BASE_URL': 'https://token-plan-ams.xiaomimimo.com/anthropic',
+    }
+
+    vendor = await _collect(repo, base, workflow=proxied, endpoint_kind=EndpointKind.VENDOR_CLOUD)
+    native = await _collect(repo, base)
+
+    assert vendor.cli_cost_untrusted is True
+    assert vendor.endpoint_kind is EndpointKind.VENDOR_CLOUD
+    assert native.cli_cost_untrusted is False
 
 
 @pytest.mark.asyncio
