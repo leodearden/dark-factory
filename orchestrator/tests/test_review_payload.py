@@ -11,6 +11,13 @@ from pathlib import Path
 
 import pytest
 from escalation.disposition import ReviewerDisposition
+from shared.defects import (
+    MalformedDefectRef,
+    RulingSubject,
+    mint_redmain_ref,
+    mint_review_ref,
+    parse_ref,
+)
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals import compare
@@ -19,11 +26,13 @@ from orchestrator.evals.results import EvalResult
 from orchestrator.evals.scoring import quality_from_review_artifact
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.review_payload import (
+    DefectRuling,
     NoteDisposition,
     ReviewPayload,
     ReviewPayloadError,
     Verdict,
     normalize_review,
+    parse_defect_rulings,
     parse_note_dispositions,
 )
 
@@ -302,6 +311,136 @@ class TestNoteDispositions:
         pytest.raises(
             dataclasses.FrozenInstanceError, setattr, _ADDRESSED, 'rationale', 'other',
         )
+
+
+_REVIEW_REF = mint_review_ref(7048, 'a.py:1', 'x is wrong')
+_REDMAIN_REF = mint_redmain_ref('sig-1')
+_CLOSURE_RAW = {'ref': _REVIEW_REF, 'subject': 'closure', 'accepted': True}
+_RETIREMENT_RAW = {'ref': _REDMAIN_REF, 'subject': 'retirement', 'accepted': False}
+_CLOSURE = DefectRuling(_REVIEW_REF, RulingSubject.CLOSURE, True)
+_RETIREMENT = DefectRuling(_REDMAIN_REF, RulingSubject.RETIREMENT, False)
+
+
+def _with_rulings(raw: object, verdict: str = 'PASS') -> dict:
+    return {**_payload(verdict, issues=[]), 'defect_rulings': raw}
+
+
+def _parse_ref_message(value: object) -> str:
+    with pytest.raises(MalformedDefectRef) as raised:
+        parse_ref(value)
+    return str(raised.value)
+
+
+class TestDefectRulings:
+    @pytest.mark.parametrize('shape', ['flat', 'envelope'])
+    def test_rulings_normalise_to_typed_values_in_order(self, shape: str):
+        payload = _with_rulings([dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW)])
+        artifact = (
+            payload if shape == 'flat'
+            else _verdict_tools._envelope(_REVIEWER, 'sid', payload)
+        )
+
+        assert normalize_review(artifact).defect_rulings == (_CLOSURE, _RETIREMENT)
+
+    def test_the_parser_reads_the_wire_shape_in_order(self):
+        assert parse_defect_rulings(
+            [dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW)], reviewer=_REVIEWER,
+        ) == (_CLOSURE, _RETIREMENT)
+
+    def test_absent_or_null_rulings_are_empty(self):
+        assert normalize_review(_payload('PASS', issues=[])).defect_rulings == ()
+        assert normalize_review(_with_rulings(None)).defect_rulings == ()
+        assert parse_defect_rulings(None) == ()
+
+    def test_error_verdict_drops_rulings(self):
+        payload = normalize_review(_with_rulings([dict(_CLOSURE_RAW)], verdict='ERROR'))
+
+        assert payload.defect_rulings == ()
+
+    def test_error_payload_with_rulings_is_rejected_at_construction(self):
+        with pytest.raises(ReviewPayloadError):
+            ReviewPayload(Verdict.ERROR, issues=(), reviewer='r', defect_rulings=(_CLOSURE,))
+
+    def test_a_member_that_is_not_a_ruling_is_rejected_at_construction(self):
+        with pytest.raises(ReviewPayloadError, match='DefectRuling'):
+            ReviewPayload(
+                Verdict.PASS, issues=(), reviewer='r', defect_rulings=(dict(_CLOSURE_RAW),),
+            )
+
+    def test_non_list_value_raises_naming_the_value(self):
+        with pytest.raises(ReviewPayloadError, match='closure-everything'):
+            normalize_review(_with_rulings('closure-everything'))
+
+    @pytest.mark.parametrize(
+        ('entry', 'named'),
+        [
+            pytest.param(_REVIEW_REF, 'str', id='entry-not-a-mapping'),
+            pytest.param({'subject': 'closure', 'accepted': True}, 'None', id='missing-ref'),
+            pytest.param(
+                {**_CLOSURE_RAW, 'ref': 'not-a-ref'}, 'not-a-ref', id='malformed-ref',
+            ),
+            pytest.param({**_CLOSURE_RAW, 'subject': 'closed'}, 'closed', id='unknown-subject'),
+            pytest.param(
+                {'ref': _REVIEW_REF, 'subject': 'closure'}, 'accepted', id='missing-accepted',
+            ),
+            pytest.param({**_CLOSURE_RAW, 'accepted': 1}, '1', id='int-accepted'),
+            pytest.param({**_CLOSURE_RAW, 'accepted': 'true'}, "'true'", id='str-accepted'),
+        ],
+    )
+    def test_malformed_entry_raises_naming_its_index_and_value(self, entry: object, named: str):
+        with pytest.raises(ReviewPayloadError, match=named) as raised:
+            normalize_review(_with_rulings([dict(_RETIREMENT_RAW), entry]))
+
+        assert 'defect_rulings entry 1' in str(raised.value)
+        assert _REVIEWER in str(raised.value)
+
+    @pytest.mark.parametrize('ref', [None, 'not-a-ref', 'review:7048'])
+    def test_a_bad_ref_is_refused_in_parse_refs_own_words(self, ref: object):
+        with pytest.raises(ReviewPayloadError) as raised:
+            parse_defect_rulings([{**_CLOSURE_RAW, 'ref': ref}], reviewer=_REVIEWER)
+
+        assert _parse_ref_message(ref) in str(raised.value)
+
+    def test_unknown_subject_lists_the_valid_values(self):
+        with pytest.raises(ReviewPayloadError) as raised:
+            parse_defect_rulings([{**_CLOSURE_RAW, 'subject': 'closed'}], reviewer=_REVIEWER)
+
+        for subject in RulingSubject:
+            assert repr(subject.value) in str(raised.value)
+
+    def test_a_duplicated_ref_and_subject_names_both_indices(self):
+        duplicate = {**_CLOSURE_RAW, 'accepted': False}
+
+        with pytest.raises(ReviewPayloadError, match=_REVIEW_REF) as raised:
+            parse_defect_rulings(
+                [dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW), duplicate], reviewer=_REVIEWER,
+            )
+
+        assert 'entries 0 and 2' in str(raised.value)
+
+    def test_one_ref_may_be_ruled_under_each_subject(self):
+        retirement = {**_CLOSURE_RAW, 'subject': 'retirement'}
+
+        assert parse_defect_rulings([dict(_CLOSURE_RAW), retirement]) == (
+            _CLOSURE, DefectRuling(_REVIEW_REF, RulingSubject.RETIREMENT, True),
+        )
+
+    def test_to_record_carries_rulings_and_round_trips(self):
+        payload = normalize_review(_with_rulings([dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW)]))
+        record = payload.to_record()
+
+        assert record['defect_rulings'] == [_CLOSURE_RAW, _RETIREMENT_RAW]
+        assert type(record['defect_rulings'][0]['subject']) is str
+        json.dumps(record)
+        assert normalize_review(record) == payload
+
+    def test_to_record_without_rulings_has_no_rulings_key(self):
+        record = normalize_review(_payload('PASS', issues=[])).to_record()
+
+        assert 'defect_rulings' not in record
+
+    def test_defect_ruling_is_frozen(self):
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, _CLOSURE, 'accepted', False)
 
 
 def _task_artifacts(root: Path) -> TaskArtifacts:
