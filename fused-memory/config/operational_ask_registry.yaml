@@ -42,8 +42,14 @@
 #   - Use a tight title anchor: prefer the specific script/tool/namespace name
 #     (e.g. "prune_recon_cycle_summaries", "merge_entities") over generic
 #     phrasing to minimize false positives. A title-only gate is never enough
-#     on its own — always pair it with specific description_substrings (the
-#     store name, "--apply", "live", "production").
+#     on its own — always pair it with specific description_substrings
+#     (see the next bullet for which tokens qualify).
+#   - Never use a bare token the script's own code or tests carry (a CLI flag
+#     such as --apply, a metadata value such as cycle_summary, a backend name
+#     such as FalkorDB) as a description anchor: code tasks about that script
+#     carry it too. Prefer a phrase only the live-data ask uses ("untagged",
+#     "production FalkorDB"). Pinned by
+#     tests/test_operational_ask_registry.py::TestSeedOperationalAskRegistry.
 #   - Only add an entry once an operational ask of that shape has RECURRED —
 #     a one-off ask should go through the architect's normal
 #     unactionable-report path so a human can decide whether it deserves a
@@ -73,9 +79,8 @@
   title_substrings:
     - "prune_recon_cycle_summaries"
   description_substrings:
-    - "--apply"
-    - "cycle-summary"
-    - "cycle_summary"
+    - "untagged"
+    - "pre-existing pile"
 
 - name: merge_entities_live_graph
   reason: >
@@ -90,7 +95,8 @@
     - "merge_entities"
     - "live"
   description_substrings:
-    - "FalkorDB"
+    - "live FalkorDB"
+    - "production FalkorDB"
     - "production graph"
 
 - name: rebuild_entity_summaries_project_wide
