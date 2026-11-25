@@ -2174,7 +2174,7 @@ cannot see `tailscaled.service` or `network-online.target`, so the unit has no
 `After=`. Until tailscaled assigns its address, rclone fails to bind it, and
 that failure takes the loopback address down too. The unit retries every 2 s,
 and `StartLimitIntervalSec=0` keeps a slow tailscale start from tripping the
-start limit.
+start limit. Why one process serves both addresses: PRD open question 10.
 
 ### The host configuration file
 
@@ -2309,6 +2309,11 @@ Each executing host has the sentinel `__build_cache_degraded__<host>`, category
 `infra_issue`. Its ladder is PRD decision 18's, and "degraded" is defined by
 C10. When it fires: run `--check` on the workstation and
 `--check --host-config` on the host, then read that host's latest rows.
+
+When the store is unreachable on the workstation, check `tailscale ip -4`
+first. The store is one rclone process bound to both addresses, so with no
+tailscale address it serves neither, and the workstation's own builds fall
+back too (PRD open question 10).
 
 ### Pruning
 

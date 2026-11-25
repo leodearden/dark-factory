@@ -742,3 +742,10 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
    the two. Passing it as a cargo `--config` argument would not. Decide at β2.
 9. **How the observer reaches `VerifyRunnerPool.dispatch`.** A late-bound process-wide sink avoids editing
    the pool's five construction sites; decide at η against what task 10737 does for its own alarm.
+10. **One store process for both addresses.** One rclone binds 127.0.0.1 and the tailscale address. When
+    the workstation has no tailscale address, its own builds lose the store too, fall back to
+    `local_fallback`, and fire the degraded alarm. Accepted (task 10969): two listener processes over one
+    directory each keep their own directory cache, and a key PUT through one read 404 through the other
+    after that process had looked it up (measured 2026-11-25, rclone v1.75.0, default flags), so
+    splitting the listeners would split the cache between the hosts. Trigger to revisit: a workstation
+    degraded alarm whose cause was tailscale, not the store.
