@@ -615,14 +615,10 @@ def _new_record(p: str, raw: str, inputs: _FileInputs) -> dict[str, Any]:
         fix_density=inputs.fix_density.get(p, 0),
         embedded_test_lines=0,
         module=None,
-        fan_in_src=0,
-        fan_out=0,
-        reach_back_imports=0,
-        deferred_imports=0,
-        cycle_closing_imports=0,
         reexport_names=[],
         private_patch_targets=[],
         internal_pub_items=0,
+        impl_types={},
     )
 
 
@@ -761,6 +757,77 @@ def _sccs(graph: Mapping[str, set[str]]) -> list[list[str]]:
     return sorted(result)
 
 
+#: The figures the import graph measures of each file, merged into its record by _measure_tree.
+_GRAPH_COUNTS = ('fan_in_src', 'fan_out', 'reach_back_imports', 'deferred_imports', 'cycle_closing_imports')
+
+
+@dataclasses.dataclass(frozen=True)
+class _EdgePass:
+    top_edges: Mapping[str, set[str]]
+    all_edges: Mapping[str, set[str]]
+    reach_back: list[dict[str, Any]]
+    deferred: list[_Edge]
+    counts: Mapping[str, Counter[str]]  # per module: fan_in_src, fan_out, reach_back_imports, deferred_imports
+
+
+def _reaches_back(frm: str, to: str) -> bool:
+    """Whether *frm*, a module outside a crate's tests, benches and examples, imports its strict ancestor *to*."""
+    frm_segs, to_segs = frm.split('::'), to.split('::')
+    is_test_crate = len(frm_segs) > 1 and frm_segs[1] in ('tests', 'benches', 'examples')
+    return not is_test_crate and len(to_segs) < len(frm_segs) and frm_segs[: len(to_segs)] == to_segs
+
+
+def _edge_pass(edges: Sequence[_Edge], kind_of: Mapping[str, str]) -> _EdgePass:
+    """Top-level and all edges, reach-back entries and deferred edges; per module, its fan-in from src, fan-out and counts."""
+    top_edges: defaultdict[str, set[str]] = defaultdict(set)
+    all_edges: defaultdict[str, set[str]] = defaultdict(set)
+    fan_in: defaultdict[str, set[str]] = defaultdict(set)
+    reach_back = []
+    deferred = []
+    counts: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for edge in edges:
+        frm, to, names, line, is_def, _is_pub = edge
+        all_edges[frm].add(to)
+        if not is_def:
+            top_edges[frm].add(to)
+        if kind_of.get(frm) == 'src':
+            fan_in[to].add(frm)
+        if _reaches_back(frm, to):
+            reach_back.append({'from': frm, 'to': to, 'names': names[:8], 'line': line})
+            counts[frm]['reach_back_imports'] += 1
+        if is_def:
+            deferred.append(edge)
+            counts[frm]['deferred_imports'] += 1
+    for module, importers in fan_in.items():
+        counts[module]['fan_in_src'] = len(importers)
+    for module, imported in all_edges.items():
+        counts[module]['fan_out'] = len(imported)
+    return _EdgePass(top_edges=top_edges, all_edges=all_edges, reach_back=reach_back, deferred=deferred, counts=counts)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ImplSpread:
+    widest: list[tuple[int, str, str]]  # (files, crate, type) of each type whose impl blocks span 4+ src files, widest first
+    per_path: Mapping[str, tuple[int, str | None]]  # each record's widest-spread impl type: (files, type)
+
+
+def _impl_spread(records: Mapping[str, Mapping[str, Any]]) -> _ImplSpread:
+    """Per (crate, Type), the src files holding an impl block of it; per record, its widest-spread such type."""
+    impl_files: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    for r in records.values():
+        if r['impl_types'] and r['kind'] == 'src' and r['module']:
+            crate = r['module'].split('::')[0]
+            for t in r['impl_types']:
+                impl_files[(crate, t)].add(r['path'])
+    per_path = {}
+    for path, r in records.items():
+        crate = r['module'].split('::')[0] if r['module'] and path.endswith('.rs') else None
+        spread = {t: len(impl_files.get((crate, t), ())) for t in r['impl_types']} if crate else {}
+        per_path[path] = (max(spread.values(), default=0), max(spread, key=lambda t: spread[t]) if spread else None)
+    widest = sorted(((len(v), k[0], k[1]) for k, v in impl_files.items() if len(v) >= 4), reverse=True)
+    return _ImplSpread(widest=widest, per_path=per_path)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Graph:
     cycles: list[list[str]]
@@ -768,82 +835,53 @@ class _Graph:
     reach_back: list[dict[str, Any]]
     deferred: list[dict[str, Any]]
     impl_spread: list[tuple[int, str, str]]  # (files, crate, type), widest first
+    file_figures: Mapping[str, Mapping[str, Any]]  # per path: the _GRAPH_COUNTS, impl_spread and impl_spread_type
 
 
-def _edge_pass(
-    edges: Sequence[_Edge], mod_of: Mapping[str, dict[str, Any]]
-) -> tuple[defaultdict[str, set[str]], defaultdict[str, set[str]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Top-level and all edges; reach-back and deferred entries; each record's fan-in, fan-out and counts."""
-    top_edges = defaultdict(set)
-    all_edges = defaultdict(set)
-    reach_back = []
-    deferred = []
-    fan_in = defaultdict(set)
-    fan_out = defaultdict(set)
-    for frm, to, names, line, is_def, _is_pub in edges:
-        all_edges[frm].add(to)
-        if not is_def:
-            top_edges[frm].add(to)
-        fan_out[frm].add(to)
-        if mod_of.get(frm, {}).get('kind') == 'src':
-            fan_in[to].add(frm)
-        frm_segs, to_segs = frm.split('::'), to.split('::')
-        is_test_crate = len(frm_segs) > 1 and frm_segs[1] in ('tests', 'benches', 'examples')
-        if not is_test_crate and len(to_segs) < len(frm_segs) and frm_segs[: len(to_segs)] == to_segs and '::' in frm:
-            reach_back.append(dict(**{'from': frm, 'to': to, 'names': names[:8], 'line': line}))
-            if frm in mod_of:
-                mod_of[frm]['reach_back_imports'] += 1
-        if is_def:
-            deferred.append(dict(**{'from': frm, 'to': to, 'line': line, 'imports': names[:8], 'closes_cycle': False}))
-            if frm in mod_of:
-                mod_of[frm]['deferred_imports'] += 1
-    for m, r in mod_of.items():
-        r['fan_in_src'] = len(fan_in.get(m, ()))
-        r['fan_out'] = len(fan_out.get(m, ()))
-    return top_edges, all_edges, reach_back, deferred
+def _deferred_entry(edge: _Edge, comp_of: Mapping[str, int]) -> dict[str, Any]:
+    frm, to, names, line, _is_def, _is_pub = edge
+    closes = comp_of.get(frm) is not None and comp_of.get(frm) == comp_of.get(to)
+    return {'from': frm, 'to': to, 'line': line, 'imports': names[:8], 'closes_cycle': closes}
 
 
-def _impl_spread(records: Mapping[str, dict[str, Any]]) -> list[tuple[int, str, str]]:
-    """Per record, its widest-spread impl type; overall, each (crate, Type) whose impl blocks span 4+ src files."""
-    impl_files = defaultdict(set)
-    for r in records.values():
-        if r.get('impl_types') and r['kind'] == 'src' and r['module']:
-            crate = r['module'].split('::')[0]
-            for t in r['impl_types']:
-                impl_files[(crate, t)].add(r['path'])
-    for r in records.values():
-        r.setdefault('impl_types', {})
-        crate = r['module'].split('::')[0] if r.get('module') and r['path'].endswith('.rs') else None
-        spread = {t: len(impl_files[(crate, t)]) for t in r['impl_types']} if crate else {}
-        r['impl_spread'] = max(spread.values(), default=0)
-        r['impl_spread_type'] = max(spread, key=lambda t: spread[t]) if spread else None
-    return sorted(((len(v), k[0], k[1]) for k, v in impl_files.items() if len(v) >= 4), reverse=True)
+def _file_figures(counts: Counter[str], widest_impl: tuple[int, str | None]) -> dict[str, Any]:
+    return {**{key: counts[key] for key in _GRAPH_COUNTS}, 'impl_spread': widest_impl[0], 'impl_spread_type': widest_impl[1]}
 
 
-def _graph_measures(records: Mapping[str, dict[str, Any]], edges: Sequence[_Edge]) -> _Graph:
-    mod_of = {}
-    for r in records.values():
-        if r['module']:
-            mod_of[r['module']] = r
-    top_edges, all_edges, reach_back, deferred = _edge_pass(edges, mod_of)
-    cycles = _sccs(top_edges)
-    full_cycles = _sccs(all_edges)
+def _graph_measures(records: Mapping[str, Mapping[str, Any]], edges: Sequence[_Edge]) -> _Graph:
+    """The import graph's cycles and listed edges and the widest impl spreads; per file, what they measure of it.
+
+    Files sharing a module (a crate's lib.rs and main.rs) do not split its counts: the last one holds them.
+    """
+    owner = {r['module']: path for path, r in records.items() if r['module']}
+    passed = _edge_pass(edges, {module: records[path]['kind'] for module, path in owner.items()})
+    cycles = _sccs(passed.top_edges)
+    full_cycles = _sccs(passed.all_edges)
     top_sets = [set(c) for c in cycles]
-    hidden = [c for c in full_cycles if not any(set(c) <= s for s in top_sets)]
     comp_of = {m: number for number, c in enumerate(full_cycles) for m in c}
-    for d in deferred:
-        if comp_of.get(d['from']) is not None and comp_of.get(d['from']) == comp_of.get(d['to']):
-            d['closes_cycle'] = True
-            if d['from'] in mod_of:
-                mod_of[d['from']]['cycle_closing_imports'] += 1
-    return _Graph(cycles=cycles, hidden=hidden, reach_back=reach_back, deferred=deferred, impl_spread=_impl_spread(records))
+    deferred = [_deferred_entry(edge, comp_of) for edge in passed.deferred]
+    closing = Counter(d['from'] for d in deferred if d['closes_cycle'])
+    counts = {
+        path: passed.counts.get(module, Counter()) + Counter(cycle_closing_imports=closing[module])
+        for module, path in owner.items()
+    }
+    spread = _impl_spread(records)
+    return _Graph(
+        cycles=cycles,
+        hidden=[c for c in full_cycles if not any(set(c) <= s for s in top_sets)],
+        reach_back=passed.reach_back,
+        deferred=deferred,
+        impl_spread=spread.widest,
+        file_figures={path: _file_figures(counts.get(path, Counter()), spread.per_path[path]) for path in records},
+    )
 
 
 def _prose_ratio(counts: Mapping[str, int]) -> float | None:
     return round(counts['comments'] / (counts['code'] + counts['comments']), 3) if (counts['code'] + counts['comments']) else None
 
 
-def _per_area(records: Mapping[str, dict[str, Any]], fn_rows: Mapping[str, list[_FunctionRow]]) -> dict[str, Counter[str]]:
+def _per_area(records: Mapping[str, Mapping[str, Any]], fn_rows: Mapping[str, list[_FunctionRow]]) -> dict[str, Counter[str]]:
+    """Per area, its files' sums; each record must already hold its graph figures (_GRAPH_COUNTS)."""
     per_area: defaultdict[str, Counter[str]] = defaultdict(Counter)
     for r in records.values():
         c = per_area[r['area']]
@@ -896,8 +934,9 @@ def _measure_tree(root: Path, head: str, rules: RustRules) -> _Measured:
         fix_density=_fix_density(root, head, rules),
         domain=frozenset(domain.paths),
     )
-    records, edges = _file_records(root, domain.paths, inputs)
-    graph = _graph_measures(records, edges)
+    read, edges = _file_records(root, domain.paths, inputs)
+    graph = _graph_measures(read, edges)
+    records = {path: {**record, **graph.file_figures[path]} for path, record in read.items()}
     per_area = _per_area(records, lizard.rows)
     totals: Counter[str] = Counter()
     for c in per_area.values():
