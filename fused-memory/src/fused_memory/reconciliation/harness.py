@@ -86,6 +86,7 @@ from fused_memory.reconciliation.overreach_flags import (
 )
 from fused_memory.reconciliation.predecessor_drain_recovery import recover_predecessor_drains
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
+from fused_memory.reconciliation.recon_usage_gate import build_reconciliation_usage_gate
 from fused_memory.reconciliation.reserve_step_aside import ReserveStepAside, StepAsideSite
 from fused_memory.reconciliation.scope_freshness import (
     ScopeFreshnessResult,
@@ -939,9 +940,9 @@ class ReconciliationHarness:
 
         # Usage gate (multi-account cap failover): the injected one, else one from config.
         # Either way the harness owns it and shuts it down with itself.
-        self.usage_gate: UsageGate | None = usage_gate
-        if self.usage_gate is None and hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
-            self.usage_gate = UsageGate(self.config.usage_cap)
+        self.usage_gate: UsageGate | None = (
+            usage_gate if usage_gate is not None else build_reconciliation_usage_gate(self.config)
+        )
         self._reserve_step_aside = ReserveStepAside(self.usage_gate)
         # The invocations ledger the stages and judge write their LLM calls to; not the gate's.
         self._cost_store = cost_store
