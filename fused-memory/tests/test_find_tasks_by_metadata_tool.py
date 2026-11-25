@@ -502,6 +502,9 @@ async def test_the_default_omits_values_and_applies_no_byte_cut(lookup_stack):
     for row in response['results']:
         assert 'matched_value' not in row
         assert 'truncated_value' not in row
+        assert 'metadata' not in row
+        assert 'dependencies' not in row
+        assert 'truncated_row' not in row
 
 
 @pytest.mark.asyncio
@@ -518,7 +521,7 @@ async def test_a_store_error_is_an_error_payload_never_an_empty_page(lookup_stac
     assert 'results' not in response
 
 
-# ── MCP face: the include_value page budget ─────────────────────────────
+# ── MCP face: the page budget ───────────────────────────────────────────
 
 
 def _serialized_bytes(obj: Any) -> int:
@@ -595,3 +598,69 @@ async def test_an_over_budget_row_after_a_fitting_one_starts_the_next_page(looku
     assert [row['task_id'] for row in second['results']] == [big_id]
     assert second['results'][0]['truncated_value'] is True
     assert second['pagination']['has_more'] is False
+
+
+async def _mcp_get_task(lookup_stack, task_id: int) -> dict[str, Any]:
+    return await lookup_stack.server._tool_manager.call_tool(
+        'get_task', {'id': str(task_id), 'project_root': lookup_stack.root},
+    )
+
+
+@pytest.mark.asyncio
+async def test_include_rows_pages_are_cut_by_the_budget_and_still_tile(lookup_stack):
+    pads = {
+        await lookup_stack.seed('pending', {'x_blob': 'v', 'x_pad': pad}): pad
+        for pad in [f'{i}-'.ljust(10_000, 'x') for i in range(10)]
+    }
+
+    first = await lookup_stack.call(key='x_blob', value='v', include_rows=True, limit=10)
+    rows = await _page_through(
+        lookup_stack, key='x_blob', value='v', include_rows=True, limit=10,
+    )
+
+    assert first['pagination']['returned'] < 10
+    assert first['pagination']['has_more'] is True
+    assert first['pagination']['page_size'] == 10
+    assert _serialized_bytes(first['results']) <= RESULT_BYTE_BUDGET
+    assert [row['task_id'] for row in rows] == sorted(pads)
+    assert {row['task_id']: row['metadata']['x_pad'] for row in rows} == pads
+    assert not any('truncated_row' in row for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_lone_over_budget_row_has_its_metadata_elided(lookup_stack):
+    prerequisite = await lookup_stack.seed()
+    big_id = await lookup_stack.seed('pending', {'x_blob': 'v', 'x_pad': 'a' * 60_000})
+    small_id = await lookup_stack.seed('pending', {'x_blob': 'v'})
+    await lookup_stack.backend.add_dependency(str(big_id), str(prerequisite), lookup_stack.root)
+
+    first = await lookup_stack.call(key='x_blob', value='v', include_rows=True)
+    second = await lookup_stack.call(key='x_blob', value='v', include_rows=True, offset=1)
+    task = await _mcp_get_task(lookup_stack, big_id)
+
+    assert 'error' not in first
+    assert _ids(first) == [big_id]
+    row = first['results'][0]
+    assert row['truncated_row'] is True
+    assert row['metadata'] == {'_elided': True, 'bytes': _serialized_bytes(task['metadata'])}
+    assert row['dependencies'] == [prerequisite]
+    assert 'truncated_value' not in row
+    assert first['pagination']['has_more'] is True
+    assert _ids(second) == [small_id]
+    assert second['results'][0]['metadata']['x_blob'] == 'v'
+    assert 'truncated_row' not in second['results'][0]
+
+
+@pytest.mark.asyncio
+async def test_a_lone_over_budget_row_elides_every_opted_in_payload(lookup_stack):
+    pad = 'a' * 60_000
+    task_id = await lookup_stack.seed('pending', {'x_pad': pad})
+
+    response = await lookup_stack.call(key='x_pad', include_value=True, include_rows=True)
+    task = await _mcp_get_task(lookup_stack, task_id)
+
+    row = response['results'][0]
+    assert row['matched_value'] == {'_elided': True, 'bytes': _serialized_bytes(pad)}
+    assert row['truncated_value'] is True
+    assert row['metadata'] == {'_elided': True, 'bytes': _serialized_bytes(task['metadata'])}
+    assert row['truncated_row'] is True
