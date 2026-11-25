@@ -371,7 +371,7 @@ class TestVerifyPremiseRefuted:
     """Tests for verify_premise_refuted() from
     fused_memory.middleware.recon_code_fix_premise_guard.
 
-    source_root is a tmp_path standing in for the fused-memory server cwd;
+    source_root is a tmp_path standing in for the curator's source root;
     each SourceAssertion.file is relative to it.
     """
 
@@ -626,47 +626,47 @@ class TestPremiseRefutedEntry:
 
 class TestSeedRegistryRealSource:
     """Loads the SHIPPED fused-memory/config/recon_code_fix_premise_registry.yaml
-    and re-verifies its entries against the REAL fused-memory source root — not
-    a tmp_path fixture.
+    and re-verifies its entries against the real source root the deployed
+    curator verifies against (the repo root) — not a tmp_path fixture.
 
     The COUNT is deliberately not stated here: it lives in exactly one place,
     `test_shipped_registry_has_five_entries`, which reds when the registry grows
     rather than going quietly stale the way a prose count does.
 
     Confirmed base-branch facts (see task-1972 analysis):
-    - src/fused_memory/services/memory_service.py contains "invalid_at".
-    - tests/test_stages.py contains
+    - fused-memory/src/fused_memory/services/memory_service.py contains "invalid_at".
+    - fused-memory/tests/test_stages.py contains
       "test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2".
-    - src/fused_memory/server/recon_report.py does NOT contain "max_length".
+    - fused-memory/src/fused_memory/server/recon_report.py does NOT contain "max_length".
 
     Confirmed facts for the fourth entry (task 3023):
-    - ../escalation/src/escalation/queue.py contains "def get_by_task" and
+    - escalation/src/escalation/queue.py contains "def get_by_task" and
       "_iter_archive_paths" — the archive-inclusive scan that refutes the
       "escalation record was never written" premise.
-    - src/fused_memory/reconciliation/prompts/__init__.py contains
+    - fused-memory/src/fused_memory/reconciliation/prompts/__init__.py contains
       "_GATE_CLOSURE_ARCHIVE_GUIDANCE" and "get_task_escalations" — the shared
       guidance prose naming the disconfirming tool. The literal tool name lives
       HERE, not in the stage modules, because the guidance is a constant
       interpolated into each stage's f-string.
-    - src/fused_memory/reconciliation/prompts/stage2.py contains
+    - fused-memory/src/fused_memory/reconciliation/prompts/stage2.py contains
       "render_escalation_boundary_note(can_escalate=True)" — the guidance is
       wired into the stage that files remediation tasks. It rides along with
       the shared escalation-store boundary note (rendered as a subsection of
       it), so that render call is the wiring token, not the constant name.
 
     Confirmed facts for the expired_at entry (task 4984):
-    - src/fused_memory/backends/graphiti_client.py contains
+    - fused-memory/src/fused_memory/backends/graphiti_client.py contains
       "_ALL_VALID_EDGES_MATCH", "def get_valid_edges_for_node" and
       "WHERE e.invalid_at IS NULL", and does NOT contain "e.expired_at IS NULL"
       — the absence being what makes the premise refuted AND self-correcting.
-    - src/fused_memory/services/memory_service.py contains
+    - fused-memory/src/fused_memory/services/memory_service.py contains
       "_restore_falsely_superseded_sibling_edges" and "clear_invalid_at=True" —
       the restore hooks an expired_at filter would re-hide the edges of.
     """
 
-    # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/
-    SOURCE_ROOT = Path(__file__).resolve().parent.parent
-    REGISTRY_PATH = SOURCE_ROOT / "config" / "recon_code_fix_premise_registry.yaml"
+    # tests/ -> fused-memory/ -> repo root, the TaskCurator cwd in the deployed unit
+    SOURCE_ROOT = Path(__file__).resolve().parents[2]
+    REGISTRY_PATH = SOURCE_ROOT / "fused-memory" / "config" / "recon_code_fix_premise_registry.yaml"
 
     def _load_entries(self):
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
@@ -1061,7 +1061,7 @@ class TestSeedRegistryRealSource:
             "the copied tree must reproduce the live verdict before it is edited"
         )
 
-        client = tmp_path / "src/fused_memory/backends/graphiti_client.py"
+        client = tmp_path / "fused-memory/src/fused_memory/backends/graphiti_client.py"
         client.write_text(
             client.read_text(encoding="utf-8")
             + "\n_FUTURE = 'WHERE e.invalid_at IS NULL AND e.expired_at IS NULL'\n",
