@@ -57,6 +57,7 @@ REPAIRABLE_SHAPES = frozenset({LeakShape.REPAIRABLE_TAIL, LeakShape.REPAIRABLE_D
 # producer and resolve_exit_code use these names, so a spelling cannot drift.
 RECORD_ERROR = 'record_error'
 CONTENT_CHANGED_SINCE_SCAN = 'content_changed_since_scan'
+REPLACED_CONTENT = 'replaced_content'
 HUMAN_ADJUDICATION_FLAGS: tuple[str, ...] = (RECORD_ERROR, CONTENT_CHANGED_SINCE_SCAN)
 
 _UNSCANNED_SUMMARY: dict[str, Any] = {
@@ -196,7 +197,9 @@ async def _redact_record(
     """Redact one repairable episode in place, recording the outcome on *record*.
 
     Any other shape is left untouched. A failed redaction is recorded on its
-    own record and never stops the sweep.
+    own record and never stops the sweep. A record whose episode changed since
+    the scan keeps the text the redaction overwrote, and the printed report is
+    that text's only full copy.
     """
     if record['classification'] not in REPAIRABLE_SHAPES:
         logger.warning(
@@ -220,10 +223,11 @@ async def _redact_record(
     record['redacted'] = True
     if result.get('old_content') != leak.content:
         record[CONTENT_CHANGED_SINCE_SCAN] = True
+        record[REPLACED_CONTENT] = result.get('old_content')
         logger.warning(
             '%s: episode %s changed between the scan and its redaction; '
-            'the write journal holds the content it replaced',
-            SCRIPT_ID, leak.uuid,
+            "the text the redaction overwrote is kept in this record's %s field",
+            SCRIPT_ID, leak.uuid, REPLACED_CONTENT,
         )
 
 
