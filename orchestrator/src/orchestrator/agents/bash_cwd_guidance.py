@@ -1,11 +1,17 @@
-"""Role-prompt guidance: an earlier `cd` can move every later relative path.
+"""Role-prompt guidance: an earlier `cd` can move every later relative path, or strand the shell in a deleted directory.
 
 `orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `BASH_CWD_ANCHOR_GUIDANCE` into every role holding unqualified `Bash`.
 It is a leaf module, imported downward by harness_guidance.py. Provenance:
-reify #7924 via task 5971; dark_factory codebook entry-cand-20260729-4.
+reify #7924 via task 5971; dark_factory codebook entry-cand-20260729-4;
+codebook entry-cand-20261118-2 via task 11554.
 
-The mechanical half is
+The block is one section built from two named halves.
+`LINGERING_CD_GUIDANCE` covers a `cd` that outlives its call and moves every
+later relative path. `DELETED_CWD_GUIDANCE` covers a call that removes the
+directory its own shell stands in, which strands the shell.
+
+The mechanical counterpart is
 `orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`.
 This prose is written to hold whether or not the shell is reset: non-Claude
 backends ignore that env var, and an operator may opt out.
@@ -14,11 +20,11 @@ backends ignore that env var, and an operator may opt out.
 owns RECOVERING a not-found path by search; this block owns the CWD cause and
 its prevention.
 
-`orchestrator/tests/test_roles_bash_cwd_anchor.py` checks the block's shape
-and its splice, never its wording.
+`orchestrator/tests/test_roles_bash_cwd_anchor.py` checks the block's shape,
+its composition and its splice, never its wording.
 """
 
-BASH_CWD_ANCHOR_GUIDANCE = """
+LINGERING_CD_GUIDANCE = """
 ## An earlier `cd` can move every later relative path
 
 You are dispatched with your working directory at the ROOT of your checkout.
@@ -50,3 +56,30 @@ behaviour:
   you back at <dir>, and the `cd` in that call did not carry over. Its absence
   proves nothing: the reset can also be silent.
 """
+
+DELETED_CWD_GUIDANCE = """
+LEAVE A DIRECTORY BEFORE YOU DELETE IT. A call that `cd`s into a scratch
+directory (a `mktemp -d` dir, a throwaway `git worktree add`) and then removes
+it leaves the shell standing in a directory that no longer exists. Measured
+2026-11-25 (Claude Code CLI 2.1.330, dispatched session):
+`D=$(mktemp -d) && cd "$D" && rm -rf "$D"; echo after` printed `after`, then
+"pwd: error retrieving current directory: getcwd: cannot access parent
+directories: No such file or directory". The call reported "Exit code 1",
+although every command in it succeeded. Where the `cd` persists, the NEXT call
+is refused unrun with "Working directory ... no longer exists, so this command
+was not run", even a call that opens with an absolute `cd`; the shell is then
+put back at its launch directory (observed 2026-11-18, CLI 2.1.325).
+
+- Run the entered part in a subshell, `( cd "$D" && <command> )`, so the `cd`
+  ends with it. Or pass the directory instead of entering it: `git -C "$D"`,
+  `uv run --project "$D"`, absolute paths.
+- Before removing a directory you may be inside, `cd` to an absolute path
+  outside it. `cd ..` from a subdirectory of it does not get you out. Nor does
+  `cd "$(git rev-parse --show-toplevel)"` from inside a scratch worktree: that
+  answers with the scratch worktree itself.
+- A getcwd line or "Exit code 1" straight after such a removal is the stranded
+  shell, not a failure of your commands: read their own output. A call refused
+  as "not run" did nothing, so re-issue it.
+"""
+
+BASH_CWD_ANCHOR_GUIDANCE = LINGERING_CD_GUIDANCE + DELETED_CWD_GUIDANCE
