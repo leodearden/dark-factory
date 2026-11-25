@@ -311,7 +311,7 @@ class TestReportedRecord:
         record, _keys = await _runner_record(registry)
         report = report_of(record, flake_suppressed=False)
 
-        rebuilt = report.record('merge', MERGE_ON)
+        rebuilt = report.record('merge', MERGE_ON, never_cache=frozenset())
 
         assert (rebuilt.role, rebuilt.modes, rebuilt.legs) == ('merge', MERGE_ON, ())
         assert [unit.admission for unit in rebuilt.units] == [reported.admission for reported in report.units]
@@ -323,7 +323,7 @@ class TestReportedRecord:
         runner_registry = Registry(tmp_path / 'runner-view.db')
         dispatcher = Registry(tmp_path / 'verify_cache.db')
         record, keys_ = await _runner_record(runner_registry, refused_leg=True)
-        rebuilt = report_of(record, flake_suppressed=False).record('merge', MERGE_ON)
+        rebuilt = report_of(record, flake_suppressed=False).record('merge', MERGE_ON, never_cache=frozenset())
 
         await record_greens(dispatcher, rebuilt, flake_suppressed=True, evidence=_evidence(21))
 
@@ -338,7 +338,7 @@ class TestReportedRecord:
     async def test_the_tree_is_recorded_over_a_passing_verdict_of_admitted_or_replayed_units(self, tmp_path, passed):
         dispatcher = Registry(tmp_path / 'verify_cache.db')
         record, _keys = await _runner_record(Registry(tmp_path / 'runner-view.db'))
-        rebuilt = report_of(record, flake_suppressed=False).record('merge', MERGE_ON)
+        rebuilt = report_of(record, flake_suppressed=False).record('merge', MERGE_ON, never_cache=frozenset())
 
         await record_greens(dispatcher, rebuilt, flake_suppressed=False, evidence=_evidence(passed=passed))
 
