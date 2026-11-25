@@ -23,6 +23,11 @@ from shared.cli_invoke import (
 )
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import (
+    InvocationLedger,
+    input_output_tokens,
+    ledger_invoke_kwargs,
+)
 from fused_memory.reconciliation import (
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
@@ -123,6 +128,7 @@ class AgentLoop:
         usage_gate=None,
         cwd: Path | None = None,
         cli_tools: Sequence[str] = (),
+        ledger: InvocationLedger | None = None,
     ):
         self.config = config
         self.system_prompt = system_prompt
@@ -132,6 +138,7 @@ class AgentLoop:
         self.llm_call_count: int = 0
         self.token_count: int = 0
         self._usage_gate = usage_gate
+        self._ledger = ledger
         # Task 4722 / PRD D5: the codebase root this agent runs in.  The
         # verifier now supplies the TASK's own project root per call; every
         # other construction site passes nothing and keeps the process-global
@@ -368,11 +375,12 @@ class AgentLoop:
             timeout_seconds=float(self.config.agent_cli_timeout_seconds),
             cwd=self.cwd,
             cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            **ledger_invoke_kwargs(self._ledger),
         )
         # Counted before the failure guard: a failed or refused result still
         # reached the model and was billed.
         self.llm_call_count += 1
-        self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
+        self.token_count += input_output_tokens(result)
 
         if not result.success:
             origin = _CLI_FAILURE_ORIGINS.get(classify_agent_failure(result).kind)

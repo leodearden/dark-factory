@@ -819,6 +819,62 @@ async def test_stage_reports_roundtrip(journal):
     assert loaded.stage_reports['memory_consolidator'].llm_calls == 3
 
 
+async def _start_test_run(journal) -> str:
+    run_id = str(uuid.uuid4())
+    await journal.start_run(
+        ReconciliationRun(
+            id=run_id,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=datetime.now(UTC),
+            status=RunStatus.running,
+        )
+    )
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_stage_report_cache_tokens_roundtrip(journal):
+    run_id = await _start_test_run(journal)
+    now = datetime.now(UTC)
+    report = StageReport(
+        stage=StageId.task_knowledge_sync,
+        started_at=now,
+        completed_at=now,
+        tokens_used=1500,
+        cache_read_tokens=50000,
+        cache_create_tokens=4000,
+    )
+    await journal.update_run_stage_reports(run_id, {'task_knowledge_sync': report})
+
+    loaded = (await journal.get_run(run_id)).stage_reports['task_knowledge_sync']
+
+    assert loaded.tokens_used == 1500
+    assert loaded.cache_read_tokens == 50000
+    assert loaded.cache_create_tokens == 4000
+
+
+@pytest.mark.asyncio
+async def test_legacy_stage_report_without_cache_tokens_reads_zero(journal):
+    run_id = await _start_test_run(journal)
+    now = datetime.now(UTC).isoformat()
+    legacy = {
+        'stage': 'task_knowledge_sync',
+        'started_at': now,
+        'completed_at': now,
+        'llm_calls': 4,
+        'tokens_used': 0,
+    }
+    await journal.update_run_stage_reports(run_id, {'task_knowledge_sync': legacy})
+
+    loaded = (await journal.get_run(run_id)).stage_reports['task_knowledge_sync']
+
+    assert loaded.llm_calls == 4
+    assert loaded.cache_read_tokens == 0
+    assert loaded.cache_create_tokens == 0
+
+
 @pytest.mark.asyncio
 async def test_add_run_action(journal):
     run_id = str(uuid.uuid4())

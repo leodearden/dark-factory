@@ -1319,7 +1319,13 @@ That latency is faster than any real model call.
   A missing CLI binary raises before any call is recorded. So no
   `invocations` rows next to a steady ticket rate is itself the signal. The
   ledger is written only while `usage_cap.enabled`; without it the table
-  stays empty whatever the curator does, so skip this check.
+  stays empty whatever the curator does, so skip this check. The same table
+  also carries `recon_stage_memory_consolidator`,
+  `recon_stage_task_knowledge_sync`, `recon_stage_integrity_check`,
+  `recon_judge`, `recon_verify` and `link_adjudicator` rows (task 10414). The
+  recon roles are written by the server, under the same `usage_cap.enabled`
+  caveat; `link_adjudicator` rows come from the operator-run
+  `fused-memory/scripts/link_heal.py`, which opens the file itself.
 - **It does not fire during an all-accounts-capped period, by design.** Capped
   tickets park as `awaiting_curation` (outside the window), and a later
   verdict's latency includes the parked time. Caps show in `get_curator_state` and on

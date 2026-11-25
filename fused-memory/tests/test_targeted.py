@@ -6,7 +6,7 @@ import re
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -22,6 +22,7 @@ from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.memory_metadata import is_completion_record
 from fused_memory.middleware.recall_annotation import Binding, bind_tasks
 from fused_memory.models.enums import SourceStore
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
@@ -4921,6 +4922,21 @@ async def test_on_task_done_passes_scope_project_root_as_codebase_root(reconcile
     assert call_kwargs['codebase_root'] == Path(project_root), (
         f'Expected codebase_root={project_root!r}, got '
         f'{call_kwargs.get("codebase_root")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_verifies_under_the_run_ledger(make_reconciler, journal):
+    """The verify call's invocations row is keyed by the targeted run (task 10414)."""
+    store = MagicMock(name='cost_store')
+    reconciler = make_reconciler(cost_store=store)
+
+    await _run_done_transition(reconciler)
+
+    runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(runs) == 1
+    assert reconciler.verifier.verify.call_args.kwargs['ledger'] == InvocationLedger(
+        store, LedgerRole.RECON_VERIFY, runs[0].id, 'test-project',
     )
 
 

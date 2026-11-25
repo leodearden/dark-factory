@@ -43,6 +43,7 @@ from shared.neutral_cwd import neutral_cli_cwd
 from shared.streak import KeyedStreaks
 
 from fused_memory.maintenance.link_heal import Verdict
+from fused_memory.models.invocation_ledger import InvocationLedger, ledger_invoke_kwargs
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import LinkHealConfig
@@ -370,7 +371,8 @@ Invoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
 
 class ClaudeShardAsker:
     """Asks one shard of the Claude CLI with the rater brief as its instructions:
-    *brief_text* when given, else the brief at *brief_path* read afresh per shard."""
+    *brief_text* when given, else the brief at *brief_path* read afresh per shard.
+    Each shard's call writes one row to *ledger*; None writes none."""
 
     def __init__(
         self,
@@ -381,6 +383,7 @@ class ClaudeShardAsker:
         timeout_seconds: float = _SHARD_TIMEOUT_SECONDS,
         max_budget_usd: float = _SHARD_MAX_BUDGET_USD,
         max_turns: int = _MAX_TURNS,
+        ledger: InvocationLedger | None = None,
     ) -> None:
         self._brief_text = brief_text
         self._brief_path = brief_path
@@ -388,6 +391,7 @@ class ClaudeShardAsker:
         self._timeout_seconds = timeout_seconds
         self._max_budget_usd = max_budget_usd
         self._max_turns = max_turns
+        self._ledger = ledger
 
     async def __call__(self, shard: Shard) -> ShardReply:
         try:
@@ -410,6 +414,7 @@ class ClaudeShardAsker:
                 permission_mode='bypassPermissions',
                 timeout_seconds=self._timeout_seconds,
                 cap_wait_sanity_secs=_CAP_WAIT_SANITY_SECONDS,
+                **ledger_invoke_kwargs(self._ledger),
             )
         except Exception as exc:  # a failed call is a failed shard
             return ShardReply(success=False, detail=f'{type(exc).__name__}: {exc}')
@@ -478,12 +483,13 @@ def configured_adjudicator(
     brief_text: str | None = None,
     brief_path: Path = RATER_BRIEF_PATH,
     invoke: Invoke = invoke_with_cap_retry,
+    ledger: InvocationLedger | None = None,
 ) -> ConfiguredAdjudicator:
     """The ``link_heal`` leaves and the brief, both read now, bound for a run.
 
     *brief_text* defaults to the brief at *brief_path*, read once here; *ask*
     defaults to a :class:`ClaudeShardAsker` over that same text, calling the CLI
-    through *invoke*.
+    through *invoke* and writing each call's row to *ledger* (unused with *ask*).
     """
     brief = brief_path.read_text(encoding='utf-8') if brief_text is None else brief_text
     return ConfiguredAdjudicator(
@@ -492,5 +498,5 @@ def configured_adjudicator(
         shard_size=config.shard_size,
         field_chars=config.field_chars,
         failure_streak=config.shard_failure_streak,
-        ask=ClaudeShardAsker(brief_text=brief, invoke=invoke) if ask is None else ask,
+        ask=ClaudeShardAsker(brief_text=brief, invoke=invoke, ledger=ledger) if ask is None else ask,
     )

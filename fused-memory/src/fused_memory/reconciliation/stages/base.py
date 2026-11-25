@@ -16,6 +16,7 @@ from shared.safe_io import load_json_or_warn
 from shared.transcript_archive import archive_task_transcripts
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
@@ -40,6 +41,7 @@ from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from shared.cost_store import CostStore
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.models.scope import ProjectScope
@@ -81,6 +83,7 @@ class BaseStage:
         known_projects: dict[str, str] | None = None,
         recon_report_port: int = 8003,
         recon_report_state=None,
+        cost_store: CostStore | None = None,
     ):
         self.stage_id = stage_id
         self.memory = memory_service
@@ -96,6 +99,7 @@ class BaseStage:
         # scope demands.  Empty until the harness sets it per cycle.
         self.known_projects: dict[str, str] = known_projects or {}
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._escalation_url: str | None = None
         self._escalation_queue: EscalationQueue | None = None
         # PRD γ: recon_report channel threading
@@ -286,6 +290,9 @@ class BaseStage:
                 output_schema=effective_output_schema,
                 session_id=session_id,
                 config_dir=config_dir,
+                ledger=InvocationLedger.or_none(
+                    self._cost_store, LedgerRole.for_stage(self.stage_id), run_id, self.project_id,
+                ),
             )
         finally:
             self._archive_stage_transcripts(config_dir, run_id)
@@ -455,6 +462,8 @@ class BaseStage:
             stats=_stats,
             llm_calls=stage_result.llm_calls,
             tokens_used=stage_result.tokens_used,
+            cache_read_tokens=stage_result.cache_read_tokens,
+            cache_create_tokens=stage_result.cache_create_tokens,
             agent_outcome=stage_result.outcome,
         )
 

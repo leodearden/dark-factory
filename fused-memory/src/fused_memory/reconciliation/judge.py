@@ -23,7 +23,7 @@ from shared.cli_invoke import (
     transcript_evidence_for_session,
 )
 from shared.config_dir import ambient_config_dir
-from shared.cost_store import CapReason
+from shared.cost_store import CapReason, CostStore
 from shared.phantom_verdict import (
     UNPARSEABLE_ISSUE_PREFIX,
     UNPARSEABLE_VERDICT_CODE,
@@ -33,6 +33,11 @@ from shared.phantom_verdict import (
 from shared.streak import KeyedStreaks
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import (
+    InvocationLedger,
+    LedgerRole,
+    ledger_invoke_kwargs,
+)
 from fused_memory.models.reconciliation import (
     JudgeInvocation,
     JudgeVerdict,
@@ -339,6 +344,7 @@ class Judge:
         usage_gate=None,
         *,
         on_unhalt_cb: UnhaltCallback | None = None,
+        cost_store: CostStore | None = None,
     ):
         self.config = config
         self.journal = journal
@@ -362,6 +368,7 @@ class Judge:
         # answerable across restarts — both observed incidents spanned one.
         self._halted_at: dict[str, datetime] = {}
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._on_unhalt_cb = on_unhalt_cb
 
     async def initialize(self) -> None:
@@ -434,7 +441,9 @@ class Judge:
 
             prompt = self._build_review_prompt(run, recent_verdicts, combined_actions)
             try:
-                response_text = await self._call_llm(prompt, run_id=run_id)
+                response_text = await self._call_llm(
+                    prompt, run_id=run_id, project_id=run.project_id,
+                )
             except JudgeInfraError as err:
                 # Transport/infra failure (cap-storm CLI failure, timeout,
                 # api_error, cap-wait exhaustion, …) carries NO verdict. Do NOT
@@ -675,7 +684,9 @@ class Judge:
 Review this run and provide your verdict as JSON.
 """
 
-    async def _call_llm(self, prompt: str, *, run_id: str) -> dict | str:
+    async def _call_llm(
+        self, prompt: str, *, run_id: str, project_id: str | None = None,
+    ) -> dict | str:
         """Single LLM call (not an agent loop).
 
         Returns a ``dict`` for the ``claude_cli`` provider (the schema-validated
@@ -683,9 +694,12 @@ Review this run and provide your verdict as JSON.
         ``openai`` providers, which call their SDKs directly and therefore have no
         ``--json-schema`` mechanism — prose is all they can return.
         ``_parse_verdict`` dispatches on the type.
+
+        Only the ``claude_cli`` call writes an invocations row (see
+        ``_invocation_ledger``).
         """
         if self.config.judge_llm_provider == 'claude_cli':
-            return await self._call_judge_cli(prompt, run_id=run_id)
+            return await self._call_judge_cli(prompt, run_id=run_id, project_id=project_id)
         elif self.config.judge_llm_provider == 'anthropic':
             import anthropic
 
@@ -711,7 +725,21 @@ Review this run and provide your verdict as JSON.
                 )
             return response.choices[0].message.content or ''
 
-    async def _call_judge_cli(self, prompt: str, *, run_id: str) -> dict | str:
+    def _invocation_ledger(self, run_id: str, project_id: str | None) -> InvocationLedger | None:
+        """Where the judge's CLI call for *run_id* lands its invocations row.
+
+        None, so no row is written, when the judge holds no store or the caller
+        names no project.
+        """
+        if project_id is None:
+            return None
+        return InvocationLedger.or_none(
+            self._cost_store, LedgerRole.RECON_JUDGE, run_id, project_id,
+        )
+
+    async def _call_judge_cli(
+        self, prompt: str, *, run_id: str, project_id: str | None = None,
+    ) -> dict | str:
         """Delegate to shared.cli_invoke.invoke_with_cap_retry for judge evaluation.
 
         Returns the schema-validated verdict payload (a ``dict``) on success.  The
@@ -776,6 +804,7 @@ Review this run and provide your verdict as JSON.
                 env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
                 cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
                 work_class=RECONCILIATION_WORK_CLASS,
+                **ledger_invoke_kwargs(self._invocation_ledger(run_id, project_id)),
             )
         except AllAccountsCappedException as e:
             # Cap-wait exhaustion (all accounts capped past the 1800s recon
@@ -852,7 +881,7 @@ Review this run and provide your verdict as JSON.
             #
             # Why the raise lives HERE and not in _parse_verdict's dict branch:
             # review_run's ``except JudgeInfraError`` -> _record_no_verdict_failure
-            # diversion wraps ONLY the ``await self._call_llm(prompt, run_id=run_id)`` call.
+            # diversion wraps ONLY the ``await self._call_llm(...)`` call.
             # _parse_verdict runs OUTSIDE that inner try, so a JudgeInfraError
             # raised from there would fall through to the broad
             # ``except Exception`` and be counted as a REVIEW_ERROR, halting

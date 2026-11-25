@@ -131,6 +131,8 @@ from fused_memory.services.orchestrator_detector import (
 )
 
 if TYPE_CHECKING:
+    from shared.cost_store import CostStore
+
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.overreach_shadow import OverreachFlagPage
 
@@ -829,6 +831,7 @@ class ReconciliationHarness:
         full_cycle_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
         escalation_queue: EscalationQueue | None = None,
         usage_gate: UsageGate | None = None,
+        cost_store: CostStore | None = None,
     ):
         self.memory = memory_service
         # systemd-held listening socket for the escalation port, so it stays
@@ -940,6 +943,8 @@ class ReconciliationHarness:
         if self.usage_gate is None and hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
         self._reserve_step_aside = ReserveStepAside(self.usage_gate)
+        # The invocations ledger the stages and judge write their LLM calls to; not the gate's.
+        self._cost_store = cost_store
 
         # Judge — receives a callback that clears _halt_escalated so a
         # subsequent halt in the same process re-fires the escalation.
@@ -948,6 +953,7 @@ class ReconciliationHarness:
                 self.config, journal,
                 usage_gate=self.usage_gate,
                 on_unhalt_cb=self._on_judge_unhalt,
+                cost_store=self._cost_store,
             )
             if self.config.judge_enabled else None
         )
@@ -1268,6 +1274,7 @@ class ReconciliationHarness:
             scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
+            cost_store=self._cost_store,
         )
         stage2 = TaskKnowledgeSync(
             StageId.task_knowledge_sync, self.memory, self.taskmaster, self.journal,
@@ -1275,6 +1282,7 @@ class ReconciliationHarness:
             scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
+            cost_store=self._cost_store,
         )
         stage3 = IntegrityCheck(
             StageId.integrity_check, self.memory, self.taskmaster, self.journal,
@@ -1282,6 +1290,7 @@ class ReconciliationHarness:
             scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
+            cost_store=self._cost_store,
         )
         stages = [stage1, stage2, stage3]
         self._propagate_escalation_queue(stages)
