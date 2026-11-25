@@ -87,6 +87,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'chart_marks.js': 'DF_CHART_MARKS',
   'quality_view.js': 'DF_QUALITY_VIEW',
   'asset_skew.js': 'DF_ASSET_SKEW',
+  'host_load_card.js': 'DF_HOST_LOAD_CARD',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an
