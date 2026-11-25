@@ -100,7 +100,6 @@ from orchestrator.verify_cache.recorder import (
     cache_report_from_wire,
     consume_replayed,
     record_greens,
-    report_of,
 )
 from orchestrator.verify_cache.registry import Registry
 from orchestrator.verify_cache.remote_view import (
@@ -110,6 +109,7 @@ from orchestrator.verify_cache.remote_view import (
     planned_unit_ids,
 )
 from orchestrator.verify_cache.replay import CacheAccess
+from orchestrator.verify_cache.runner_report import with_cache_report
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
     SSH_SERVER_ALIVE_COUNT_MAX,
@@ -736,18 +736,7 @@ async def run_merge_verify_on_worktree(
         # dispatcher shipped, and reports its units for the dispatcher to record (A5).
         verify_cache=await CacheAccess.on_runner(spec.verify_cache),
     )
-    return runner_reported(await runner.run_merge_verify(merge_sha, spec))
-
-
-def runner_reported(result: VerifyResult) -> VerifyResult:
-    """*result* carrying the report of its units a runner ships its dispatcher, since
-    its cache record stays off the wire (A5); None when the cache settled nothing."""
-    record = result.cache_record
-    report = (
-        report_of(record, flake_suppressed=result.flake_suppression is not None)
-        if isinstance(record, CacheRecord) else None
-    )
-    return dataclasses.replace(result, cache_report=report)
+    return with_cache_report(await runner.run_merge_verify(merge_sha, spec))
 
 
 def _spec_field_overrides(spec: MergeVerifySpec, config: OrchestratorConfig) -> dict[str, Any]:

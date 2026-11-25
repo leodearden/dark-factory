@@ -12,7 +12,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.task_verify_spec import TaskVerifySpec, apply_task_verify_spec
 from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_cache.replay import CacheAccess
-from orchestrator.verify_runner import runner_reported
+from orchestrator.verify_cache.runner_report import with_cache_report
 
 
 def prepare_task_verify_worktree(worktree: Path) -> None:
@@ -59,4 +59,4 @@ async def run_task_verify_on_worktree(
         role='task',
         verify_cache=await CacheAccess.on_runner(spec.verify_cache),
     )
-    return dataclasses.replace(runner_reported(result), worktree_log_paths=[], archive_log_paths=[])
+    return dataclasses.replace(with_cache_report(result), worktree_log_paths=[], archive_log_paths=[])
