@@ -83,13 +83,12 @@ from _offline_lane_drive import await_lane_passes
 from _orch_helpers import (
     MEASURED_SPAWN_LATENCY_SECS,
     VERIFY_CLI_PER_TEST_TIMEOUT,
-    pydantic_spec,
     required_timeout_secs,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import FusedMemoryConfig, GitConfig, OrchestratorConfig
 from orchestrator.flake_ledger import (
     FlakeCallSite,
     FlakeOccurrenceRow,
@@ -306,12 +305,14 @@ def _build_infra_worker(
     :func:`_default_green_suite_runner`.  ``infra_runner`` left ``None`` is the
     worker's own default seam, which IB3-IB6 run over their committed stub;
     a red-path row (:func:`_red_infra_lane`) also passes the fake task store,
-    a real escalation queue and the clock it spaces passes with.
+    a real escalation queue and the clock it spaces passes with. The config is
+    real, with a declared project id, so a red pass's flake-ledger write
+    succeeds.
     """
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.project_root = git_ops.project_root
-    config.git = GitConfig(
-        **(git_overrides if git_overrides is not None else _DEFAULT_INFRA_GIT_OVERRIDES)
+    config = OrchestratorConfig(
+        project_root=git_ops.project_root,
+        git=GitConfig(**(git_overrides if git_overrides is not None else _DEFAULT_INFRA_GIT_OVERRIDES)),
+        fused_memory=FusedMemoryConfig(project_id=_PROJECT_ID),
     )
     return OfflineLaneWorker(
         git_ops,
