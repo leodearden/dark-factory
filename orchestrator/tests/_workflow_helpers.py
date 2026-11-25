@@ -1106,6 +1106,7 @@ class AgentStub:
                     so.get('reviewer'), so.get('verdict'),
                     so.get('issues'), so.get('summary'),
                     note_dispositions=so.get('note_dispositions'),
+                    defect_rulings=so.get('defect_rulings'),
                 )
             return result
         elif role == 'merger':

@@ -53,7 +53,9 @@ from orchestrator.review_issue_contract import (
 )
 from orchestrator.review_payload import (
     ReviewPayloadError,
+    defect_rulings_record,
     note_dispositions_record,
+    parse_defect_rulings,
     parse_note_dispositions,
 )
 
@@ -83,7 +85,7 @@ def _envelope(role: str, session_id: str, payload: dict) -> dict:
 #
 # Only _submit_review_verdict has constrained/validated fields (the
 # reviewer==role identity check, the verdict enum, the note_dispositions
-# shape below, and each issue's severity, kind and other fields checked
+# and defect_rulings shapes below, and each issue's severity, kind and other fields checked
 # against the contract in orchestrator/review_issue_contract.py) — the
 # other three payloads (completion/triage/merge) have no enum-like fields
 # today, so they write whatever they receive. Booleans and lists are still
@@ -113,6 +115,7 @@ def _submit_review_verdict(
     issues: list[dict],
     summary: str,
     note_dispositions: list[dict] | None = None,
+    defect_rulings: list[dict] | None = None,
 ) -> dict[str, Any]:
     if reviewer != role:
         return {
@@ -130,6 +133,7 @@ def _submit_review_verdict(
         }
     try:
         parsed_notes = parse_note_dispositions(note_dispositions, reviewer=reviewer)
+        parsed_rulings = parse_defect_rulings(defect_rulings, reviewer=reviewer)
     except ReviewPayloadError as exc:
         return {'status': 'error', 'message': str(exc)}
     intake = check_issues(issues)
@@ -141,6 +145,7 @@ def _submit_review_verdict(
         'issues': list(intake.issues),
         'summary': summary,
         **note_dispositions_record(parsed_notes),
+        **defect_rulings_record(parsed_rulings),
     }
     ack = _write_and_ack(artifacts, role, session_id, payload)
     if intake.normalised:
@@ -566,6 +571,7 @@ def create_server(
             issues: list[dict],
             summary: str,
             note_dispositions: list[dict] | None = None,
+            defect_rulings: list[dict] | None = None,
         ) -> dict[str, Any]:
             """Submit a reviewer's verdict for this task.
 
@@ -586,10 +592,16 @@ def create_server(
                     "work", rationale}. Omit it when the briefing lists no
                     notes. A malformed list is rejected (status: error)
                     rather than written.
+                defect_rulings: One entry per defect closure or defect-test
+                    retirement your briefing asks you to rule on, each
+                    {ref, subject: "closure" | "retirement", accepted: true |
+                    false}. Omit it when the briefing asks for none. A
+                    malformed list is rejected (status: error) rather than
+                    written.
             """
             response = _submit_review_verdict(
                 artifacts, role, session_id, reviewer, verdict, issues, summary,
-                note_dispositions,
+                note_dispositions, defect_rulings,
             )
             if 'issue_contract' in response:
                 await fact_journal({
