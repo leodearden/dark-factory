@@ -26,7 +26,7 @@ from fused_memory.middleware.curator_types import (
     empty_pool_sizes,
     is_combine_eligible_status,
 )
-from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.middleware.task_curator import CorpusEmbedder, TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 
 
@@ -196,7 +196,7 @@ def exhaustible_embedder() -> ExhaustibleEmbedder:
 
 
 def in_memory_corpus_curator(
-    embedder: Any, config: FusedMemoryConfig | None = None,
+    embedder: CorpusEmbedder, config: FusedMemoryConfig | None = None,
 ) -> TaskCurator:
     """A real TaskCurator over an in-memory Qdrant corpus embedded by *embedder*.
 

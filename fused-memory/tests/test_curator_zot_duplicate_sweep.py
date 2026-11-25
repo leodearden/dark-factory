@@ -263,7 +263,7 @@ class TestSweepZotDuplicate:
     async def test_search_error_propagates(self):
         curator = _FakeSearchCurator(raises=RuntimeError('qdrant down'))
         reader = _RecordingStatusReader()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match='qdrant down'):
             await _sweep(curator, reader)
         assert reader.calls == []
 
@@ -271,7 +271,7 @@ class TestSweepZotDuplicate:
     async def test_status_read_error_propagates(self):
         curator = _FakeSearchCurator([_hit('42', 0.9)])
         reader = _RecordingStatusReader(raises=RuntimeError('db locked'))
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match='db locked'):
             await _sweep(curator, reader)
 
     @pytest.mark.asyncio
