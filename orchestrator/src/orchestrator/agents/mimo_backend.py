@@ -327,6 +327,7 @@ def parse_mimo_sessions(
         cost_basis=ProcessCostBasis.USAGE_ESTIMATE,
         duration_ms=run.duration_ms,
         turns=len(steps),
+        transcript_turns=len(steps),
         session_id=named_id or str(_session_info(root or {}).get('id') or ''),
         subtype=subtype,
         stderr=run.stderr,
