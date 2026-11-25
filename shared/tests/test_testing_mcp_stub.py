@@ -387,6 +387,25 @@ class TestToolsHandler:
         assert "KeyError" in str(excinfo.value)
 
 
+class TestListedTools:
+    """``listed_tools=`` is what tools/list answers, as fused-memory lists its tools."""
+
+    TOOLS_LIST = _request("tools/list", request_id=3)
+
+    @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
+    def test_each_listed_name_is_a_tool_with_an_input_schema(self, stateful):
+        with StubMcpServer(stateful=stateful, listed_tools=("get_task", "submit_task")) as server:
+            session_id = _open_session(server)
+            result = decode_mcp_response_body(_post(server, self.TOOLS_LIST, session_id=session_id))["result"]
+        assert [tool["name"] for tool in result["tools"]] == ["get_task", "submit_task"]
+        assert all(tool["inputSchema"] == {"type": "object"} for tool in result["tools"])
+
+    def test_by_default_no_tool_is_listed(self):
+        with StubMcpServer(stateful=False) as server:
+            resp = _post(server, self.TOOLS_LIST)
+        assert resp.json()["result"] == {"tools": []}
+
+
 class TestToolReplyBody:
     """``tool_reply_body`` is the very body the stub serves for an OK tools/call."""
 
