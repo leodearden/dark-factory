@@ -90,7 +90,7 @@ The axes are orthogonal — don't couple them reflexively ("opus so high, sonnet
 1. the goal in one sentence, and why it matters to the whole (so the seat can tell a blocker from a detail);
 2. exact inputs — paths, symbols, commands, prior seats' outputs — never "the module we discussed";
 3. the deliverable's exact shape — including, for each derived, normalised or aggregated figure in it, a field carrying the rule that figure was computed under: what was counted, what was excluded, over what population, one such field per figure rather than one for the seat;
-4. boundaries: what not to touch, and an instruction to report an under-specified brief, a blocker or a question precisely in its deliverable to you, then stop. It must not guess, widen scope or put the question to the human itself;
+4. boundaries: what not to touch, and an instruction to report an under-specified brief, a blocker or a question precisely in its deliverable to you, then stop — the seat must not guess, widen scope or put the question to the human itself;
 5. the verification the seat must run before returning;
 6. cross-file references as `path/to/module.py::symbol`.
 
@@ -106,4 +106,4 @@ Large results (a Workflow return or a completion notification arrives truncated 
 
 ## 5. Report
 
-End with the roster-and-outcome table — seat, model, effort, tokens and minutes where known, one-line outcome — followed by what was dropped, unverified or degraded (a lane that failed twice, a seat skipped, a claim you could not check). This table is what lets the user recalibrate the routing next time: a `sonnet`/`medium` seat that had to be redone at `opus`/`high` is a routing lesson worth more than the task's own answer. Then give the task's answer as you would for any other piece of work, written to stand alone for a human who may not have read your brief (see *Your human may not have read your brief* above).
+End with the roster-and-outcome table — seat, model, effort, tokens and minutes where known, one-line outcome — followed by what was dropped, unverified or degraded (a lane that failed twice, a seat skipped, a claim you could not check). This table is what lets the user recalibrate the routing next time: a `sonnet`/`medium` seat that had to be redone at `opus`/`high` is a routing lesson worth more than the task's own answer. Then give the task's answer as you would for any other piece of work. The whole report, table and seat names included, must stand alone for a human who may not have read your brief (see *Your human may not have read your brief* above).
