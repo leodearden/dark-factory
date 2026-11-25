@@ -442,11 +442,7 @@ class Judge:
             prompt = self._build_review_prompt(run, recent_verdicts, combined_actions)
             try:
                 response_text = await self._call_llm(
-                    prompt,
-                    run_id=run_id,
-                    ledger=InvocationLedger(
-                        self._cost_store, LedgerRole.RECON_JUDGE, run_id, run.project_id,
-                    ),
+                    prompt, run_id=run_id, project_id=run.project_id,
                 )
             except JudgeInfraError as err:
                 # Transport/infra failure (cap-storm CLI failure, timeout,
@@ -689,7 +685,7 @@ Review this run and provide your verdict as JSON.
 """
 
     async def _call_llm(
-        self, prompt: str, *, run_id: str, ledger: InvocationLedger | None = None,
+        self, prompt: str, *, run_id: str, project_id: str | None = None,
     ) -> dict | str:
         """Single LLM call (not an agent loop).
 
@@ -699,10 +695,11 @@ Review this run and provide your verdict as JSON.
         ``--json-schema`` mechanism — prose is all they can return.
         ``_parse_verdict`` dispatches on the type.
 
-        Only the ``claude_cli`` call writes *ledger*'s invocations row.
+        Only the ``claude_cli`` call writes an invocations row (see
+        ``_invocation_ledger``).
         """
         if self.config.judge_llm_provider == 'claude_cli':
-            return await self._call_judge_cli(prompt, run_id=run_id, ledger=ledger)
+            return await self._call_judge_cli(prompt, run_id=run_id, project_id=project_id)
         elif self.config.judge_llm_provider == 'anthropic':
             import anthropic
 
@@ -728,8 +725,20 @@ Review this run and provide your verdict as JSON.
                 )
             return response.choices[0].message.content or ''
 
+    def _invocation_ledger(self, run_id: str, project_id: str | None) -> InvocationLedger | None:
+        """Where the judge's CLI call for *run_id* lands its invocations row.
+
+        None, so no row is written, when the judge holds no store or the caller
+        names no project.
+        """
+        if project_id is None:
+            return None
+        return InvocationLedger.or_none(
+            self._cost_store, LedgerRole.RECON_JUDGE, run_id, project_id,
+        )
+
     async def _call_judge_cli(
-        self, prompt: str, *, run_id: str, ledger: InvocationLedger | None = None,
+        self, prompt: str, *, run_id: str, project_id: str | None = None,
     ) -> dict | str:
         """Delegate to shared.cli_invoke.invoke_with_cap_retry for judge evaluation.
 
@@ -795,7 +804,7 @@ Review this run and provide your verdict as JSON.
                 env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
                 cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
                 work_class=RECONCILIATION_WORK_CLASS,
-                **ledger_invoke_kwargs(ledger),
+                **ledger_invoke_kwargs(self._invocation_ledger(run_id, project_id)),
             )
         except AllAccountsCappedException as e:
             # Cap-wait exhaustion (all accounts capped past the 1800s recon

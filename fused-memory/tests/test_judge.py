@@ -3932,7 +3932,7 @@ class TestJudgeInvocationLedger:
         assert outcome.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
 
     @pytest.mark.asyncio
-    async def test_judge_without_store_passes_none(self, tmp_path, mock_journal):
+    async def test_judge_without_store_writes_no_row(self, tmp_path, mock_journal):
         self._seed_run(mock_journal)
         judge = Judge(config=self._config(tmp_path), journal=mock_journal)
         invoke = AsyncMock(return_value=AgentResult(
@@ -3942,5 +3942,5 @@ class TestJudgeInvocationLedger:
         with patch('fused_memory.reconciliation.judge.invoke_with_cap_retry', new=invoke):
             await judge.review_run('run-j')
 
-        assert invoke.call_args.kwargs['cost_store'] is None
-        assert invoke.call_args.kwargs['role'] == 'recon_judge'
+        assert 'cost_store' not in invoke.call_args.kwargs
+        assert 'role' not in invoke.call_args.kwargs

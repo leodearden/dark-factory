@@ -44,6 +44,18 @@ class TestLedgerRole:
         assert len({LedgerRole.for_stage(stage) for stage in StageId}) == len(StageId)
 
 
+class TestOrNone:
+    def test_a_store_gives_its_ledger(self):
+        store = MagicMock(name='cost_store')
+
+        assert InvocationLedger.or_none(store, LedgerRole.RECON_VERIFY, 'r1', 'p1') == (
+            InvocationLedger(store, LedgerRole.RECON_VERIFY, 'r1', 'p1')
+        )
+
+    def test_no_store_gives_no_ledger(self):
+        assert InvocationLedger.or_none(None, LedgerRole.RECON_VERIFY, 'r1', 'p1') is None
+
+
 class TestLedgerInvokeKwargs:
     def test_spreads_every_key(self):
         store = MagicMock(name='cost_store')

@@ -3393,12 +3393,12 @@ class TestStageInvocationLedger(BaseStageValidationTest):
         assert report.cache_create_tokens == 4000
 
     @pytest.mark.asyncio
-    async def test_stage_without_store_passes_a_storeless_ledger(self, mock_deps):
+    async def test_stage_without_store_passes_no_ledger(self, mock_deps):
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
 
         captured, _report = await self._run_capturing(stage)
 
-        assert captured['ledger'].cost_store is None
+        assert captured['ledger'] is None
 
 
 class TestStage2GuardrailProjectIdGating:

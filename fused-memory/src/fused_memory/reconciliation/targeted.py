@@ -841,7 +841,7 @@ class TargetedReconciler:
                     # projects, every one of them verified against the wrong
                     # tree.
                     codebase_root=Path(scope.project_root),
-                    ledger=InvocationLedger(
+                    ledger=InvocationLedger.or_none(
                         self._cost_store, LedgerRole.RECON_VERIFY, run_id, scope.project_id,
                     ),
                 )

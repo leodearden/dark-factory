@@ -54,12 +54,24 @@ _STAGE_ROLES: dict[StageId, LedgerRole] = {
 
 @dataclass(frozen=True)
 class InvocationLedger:
-    """The store one LLM call's row lands in, and the keys it is written under."""
+    """The store one LLM call's row lands in, and the keys it is written under.
 
-    cost_store: CostStore | None
+    A call that writes no row is given no ledger (None), never one without a store.
+    """
+
+    cost_store: CostStore
     role: LedgerRole
     run_id: str
     project_id: str
+
+    @classmethod
+    def or_none(
+        cls, cost_store: CostStore | None, role: LedgerRole, run_id: str, project_id: str,
+    ) -> InvocationLedger | None:
+        """The ledger over *cost_store*; None, so no row is written, when there is no store."""
+        if cost_store is None:
+            return None
+        return cls(cost_store, role, run_id, project_id)
 
 
 def ledger_invoke_kwargs(ledger: InvocationLedger | None) -> dict[str, Any]:

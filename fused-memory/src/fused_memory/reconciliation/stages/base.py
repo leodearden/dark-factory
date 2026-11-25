@@ -290,7 +290,7 @@ class BaseStage:
                 output_schema=effective_output_schema,
                 session_id=session_id,
                 config_dir=config_dir,
-                ledger=InvocationLedger(
+                ledger=InvocationLedger.or_none(
                     self._cost_store, LedgerRole.for_stage(self.stage_id), run_id, self.project_id,
                 ),
             )
