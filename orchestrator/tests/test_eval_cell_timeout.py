@@ -181,3 +181,54 @@ async def test_a_fixture_ceiling_overrides_the_architect_default(tmp_path: Path)
 
     assert hang.minutes_run == pytest.approx(45)
     assert result.timeout_minutes == 45
+
+
+class _PropagatingWorkflow:
+    """Runs until cancelled and lets the cancellation propagate."""
+
+    async def run(self) -> SimpleNamespace:
+        await asyncio.Event().wait()
+        raise AssertionError('the event is never set')
+
+
+class _EndsCancelledWorkflow:
+    """Ends CANCELLED at once, long before any ceiling."""
+
+    async def run(self) -> SimpleNamespace:
+        return SimpleNamespace(outcome=WorkflowOutcome.CANCELLED)
+
+
+@virtual_clock_test
+async def test_a_workflow_that_absorbs_the_deadline_reports_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    store = ResultStore(tmp_path / 'results')
+    _stub_cell(monkeypatch, _task(tmp_path), _CutOffWorkflow())
+
+    result = await _run_executor('run_eval', tmp_path, store)
+
+    assert result.outcome == 'timeout'
+    [persisted] = store.load_all()
+    assert persisted.outcome == 'timeout'
+
+
+@virtual_clock_test
+async def test_a_workflow_that_propagates_the_deadline_reports_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _stub_cell(monkeypatch, _task(tmp_path), _PropagatingWorkflow())
+
+    result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
+
+    assert result.outcome == 'timeout'
+
+
+@virtual_clock_test
+async def test_a_workflow_that_ends_cancelled_before_its_ceiling_stays_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _stub_cell(monkeypatch, _task(tmp_path), _EndsCancelledWorkflow())
+
+    result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
+
+    assert result.outcome == 'cancelled'
