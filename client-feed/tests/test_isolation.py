@@ -5,13 +5,18 @@ is not the client's to see. client_feed.cli is imported here, at module level, s
 loaded before a recorded span opens.
 """
 
+import json
 import subprocess
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Final
 
 import pytest
 from _audit_hook import AuditRecord, interpreter_roots, recording
 from _call_watch import watching
-from _two_projects import Project, TwoProjects, build_two_projects
+from _in_dir import request_reveals
+from _two_projects import CANARY_A_DESC, Project, TwoProjects, build_two_projects
 from shared.project_layout import (
     KNOWN_PROJECT_ROOTS_ENV,
     default_project_root,
@@ -21,10 +26,20 @@ from shared.project_layout import (
 )
 
 from client_feed.cli import main
-from client_feed.contract import ENGAGEMENT_FILENAME, INBOX_FILENAME
+from client_feed.contract import (
+    ENGAGEMENT_FILENAME,
+    FEED_FILENAME,
+    INBOX_FILENAME,
+    FileRevealed,
+    RefusalReason,
+    RevealRefused,
+)
+from client_feed.feed_io import read_feed_lines
 from client_feed.publisher import PassReport
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
+FORBIDDEN_KEYS: Final = frozenset({'description', 'details', 'test_strategy', 'metadata'})
+REQUESTED_AT: Final = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -116,3 +131,76 @@ def test_no_client_feed_source_names_default_project_root() -> None:
     )
 
     assert (found.returncode, found.stdout) == (1, ''), found.stdout + found.stderr
+
+
+def _keys(value: Any) -> Iterator[str]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield from _keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _keys(item)
+
+
+def _json_documents(path: Path, text: str) -> list[Any]:
+    if path.suffix == '.jsonl':
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    return [json.loads(text)] if path.suffix == '.json' else []
+
+
+def _leaks(
+    out_dir: Path, *, needles: tuple[str, ...], forbidden_keys: frozenset[str] = FORBIDDEN_KEYS
+) -> list[tuple[str, str]]:
+    """(file, finding) for each needle in a file's name or text, and each forbidden key in its JSON documents.
+
+    Keys are walked, never grepped for: a tree path may well contain the word 'description'.
+    """
+    found: list[tuple[str, str]] = []
+    for path in sorted(item for item in out_dir.rglob('*') if item.is_file()):
+        name = path.relative_to(out_dir).as_posix()
+        text = path.read_bytes().decode('utf-8', errors='replace')
+        found += [(name, f'needle {needle!r}') for needle in needles if needle in name or needle in text]
+        found += [
+            (name, f'key {key!r}')
+            for document in _json_documents(path, text)
+            for key in sorted(forbidden_keys & set(_keys(document)))
+        ]
+    return found
+
+
+def test_b2_a_snapshot_of_a_carries_nothing_of_b_and_nothing_a_hides(
+    projects: TwoProjects, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a, b = projects.a, projects.b
+
+    assert _snapshot(a, capsys).degraded == ()
+
+    assert _leaks(a.out_dir, needles=(projects.canary_b, 'CANARY-B', CANARY_A_DESC)) == []
+    assert _snapshot(b, capsys).degraded == ()
+    assert projects.canary_b in (b.out_dir / FEED_FILENAME).read_text()
+
+
+def test_b15_hostile_reveal_requests_are_refused_and_never_opened(
+    projects: TwoProjects, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a = projects.a
+    assert a.tracked_symlink is not None and a.untracked is not None
+    decoy = a.root.parent / 'x'
+    decoy.write_text('decoy\n')
+    hostile = ('../x', '/etc/passwd', a.tracked_symlink, a.untracked)
+    request_reveals(a.in_dir, *hostile, at=REQUESTED_AT)
+
+    with recording() as record:
+        _snapshot(a, capsys)
+
+    lines = read_feed_lines(a.out_dir)
+    refused = [(line.path, line.reason) for line in lines if isinstance(line, RevealRefused)]
+    assert refused == list(zip(hostile, (
+        RefusalReason.NOT_IN_TREE, RefusalReason.NOT_IN_TREE, RefusalReason.SYMLINK, RefusalReason.NOT_IN_TREE,
+    ), strict=True))
+    assert not [line for line in lines if isinstance(line, FileRevealed) and line.path in hostile]
+    assert _breaches(record, a) == []
+    never_opened = {decoy, Path('/etc/passwd'), (a.root / a.tracked_symlink).resolve(), a.root / a.untracked}
+    opened = {form for opened in record.opens for form in (opened.path, opened.path.resolve())}
+    assert never_opened.isdisjoint(opened)
