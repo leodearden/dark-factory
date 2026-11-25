@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from orchestrator.config import VerifyCacheConfig
 from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.registry import Candidate, Entry, Registry, RegistryView
+from orchestrator.verify_cache.wire import typed_field, wire_fields
 from orchestrator.verify_evidence import Leg
 
 logger = logging.getLogger(__name__)
@@ -104,6 +106,15 @@ class LegResult:
 class Admission:
     admitted: bool
     reason: str
+
+    @classmethod
+    def from_wire(cls, raw: object, *, where: str = 'Admission') -> Admission:
+        """The admission *raw* encodes; TypeError naming the field it breaks."""
+        fields = wire_fields(raw, _ADMISSION_FIELDS, where)
+        return cls(typed_field(fields, 'admitted', bool, where), typed_field(fields, 'reason', str, where))
+
+
+_ADMISSION_FIELDS = frozenset(f.name for f in dataclasses.fields(Admission))
 
 
 def admissible(modes: VerifyCacheConfig, role: VerifyRole, leg: LegResult) -> Admission:

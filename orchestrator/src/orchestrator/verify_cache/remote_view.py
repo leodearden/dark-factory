@@ -4,6 +4,7 @@ Amendments A5 and A6)."""
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -17,8 +18,9 @@ from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.recorder import (
     CacheRecord,
     CacheReport,
+    CitedReplay,
     ConsumeOutcome,
-    UnbackedReplay,
+    ReportedUnit,
     consume_replayed,
 )
 from orchestrator.verify_cache.registry import Candidate, KillSwitch, Registry, RegistryView
@@ -33,9 +35,6 @@ from orchestrator.verify_evidence import (
 from orchestrator.verify_spec_shared import VerifyCommand
 
 logger = logging.getLogger(__name__)
-
-_VIEW_FIELDS = frozenset({'mode', 'disabled_until', 'disabled_reason', 'candidates', 'truncated'})
-
 
 @dataclass(frozen=True)
 class ShippedView:
@@ -83,6 +82,9 @@ class ShippedView:
             ),
             truncated=typed_field(fields, 'truncated', bool, 'ShippedView'),
         )
+
+
+_VIEW_FIELDS = frozenset(f.name for f in dataclasses.fields(ShippedView))
 
 
 def planned_unit_ids(commands: Iterable[VerifyCommand]) -> tuple[str, ...]:
@@ -167,14 +169,15 @@ class RemoteCache:
         """Back every replay among *units* against the live registry, consuming the backing
         entries for *landing_sha* when there is one (I6), and rebuild the record of *report*
         under the mode *view* shipped. This is also the dispatcher's own check of the
-        never-cache rule: a unit of *never_cache*, and the tree beside any, neither replays
-        nor records, whatever the runner reports. Never raises; the caller maps the outcome
-        to a verdict."""
+        never-cache rule: a unit of *never_cache*, and the tree beside any the verify
+        settled (the set the runner decided over), neither replays nor records, whatever
+        the runner reports. Never raises; the caller maps the outcome to a verdict."""
+        in_verify = never_cache & _settled_unit_ids(units, report)
         record = None if view is None or report is None else report.record(
-            role, self.modes.with_mode(role, view.mode), never_cache=never_cache,
+            role, self.modes.with_mode(role, view.mode), never_cache=in_verify,
         )
-        claimed = _claimed_replays(units, report)
-        refused = _refused(view, role, claimed, never_cache)
+        claims = _claims(units, report)
+        refused = _refused(view, role, claims, in_verify)
         if refused is not None:
             return RemoteSettlement(record, refused)
         if record is None:
@@ -182,42 +185,84 @@ class RemoteCache:
         return RemoteSettlement(record, await consume_replayed(self.registry, record, landing_sha=landing_sha))
 
 
-def _claimed_replays(units: Sequence[VerifyUnit] | None, report: CacheReport | None) -> tuple[UnbackedReplay, ...]:
-    """Each unit the verdict replays, with the entry the runner's report cites for it."""
-    reported = {} if report is None else {
-        unit.unit.unit: unit for unit in (*report.units, *(() if report.tree is None else (report.tree,)))
-    }
+@dataclass(frozen=True)
+class _Claim:
+    """A unit the verdict replays, and what the runner's report says of it; None when it says nothing."""
 
-    def cited(unit_id: str) -> tuple[str, str] | None:
-        unit = reported.get(unit_id)
-        if unit is None or unit.unit.outcome is not UnitOutcome.CACHE_HIT or unit.entry is None:
+    verdict: VerifyUnit
+    reported: ReportedUnit | None
+
+    @property
+    def citation(self) -> Candidate | None:
+        """The green the report cites for this replay; None when it cites none."""
+        if self.reported is None or self.reported.unit.outcome is not UnitOutcome.CACHE_HIT:
             return None
-        return (unit.entry.unit_id, unit.entry.key)
+        return self.reported.entry
 
+    @property
+    def cites_its_own_unit(self) -> bool:
+        """Whether the cited green is this unit's own, or the tree's that replays every unit."""
+        citation = self.citation
+        return citation is not None and citation.unit_id in (self.verdict.unit, TREE_UNIT_ID)
+
+    @property
+    def report_agrees(self) -> bool:
+        """Whether the report names the evidence event the verdict does (the one its event row records)."""
+        return self.reported is not None and self.reported.unit.evidence_event_id == self.verdict.evidence_event_id
+
+    @property
+    def replay(self) -> CitedReplay:
+        citation = self.citation
+        return CitedReplay(self.verdict.unit, None if citation is None else (citation.unit_id, citation.key))
+
+
+def _reported_units(report: CacheReport | None) -> tuple[ReportedUnit, ...]:
+    if report is None:
+        return ()
+    return (*report.units, *(() if report.tree is None else (report.tree,)))
+
+
+def _settled_unit_ids(units: Sequence[VerifyUnit] | None, report: CacheReport | None) -> frozenset[str]:
+    """Every unit the runner settled, in its verdict or its report."""
+    return frozenset({unit.unit for unit in units or ()} | {unit.unit.unit for unit in _reported_units(report)})
+
+
+def _claims(units: Sequence[VerifyUnit] | None, report: CacheReport | None) -> tuple[_Claim, ...]:
+    """Each unit the verdict replays, with what the runner's report says of it."""
+    reported = {unit.unit.unit: unit for unit in _reported_units(report)}
     return tuple(
-        UnbackedReplay(unit.unit, cited(unit.unit)) for unit in units or () if unit.outcome is UnitOutcome.CACHE_HIT
+        _Claim(unit, reported.get(unit.unit)) for unit in units or () if unit.outcome is UnitOutcome.CACHE_HIT
     )
 
 
 def _refused(
-    view: ShippedView | None, role: VerifyRole, claimed: Sequence[UnbackedReplay], never_cache: frozenset[str],
+    view: ShippedView | None, role: VerifyRole, claims: Sequence[_Claim], never_cache: frozenset[str],
 ) -> ConsumeOutcome | None:
-    """Why no replay among *claimed* can be backed, whatever the registry holds; None when each may be."""
-    if not claimed:
+    """Why no replay among *claims* can be backed, whatever the registry holds; None when each may be."""
+    if not claims:
         return None
+    replays = [claim.replay for claim in claims]
     never = [
-        replay for replay in claimed
+        replay for replay in replays
         if replay.unit_id in never_cache or (never_cache and replay.unit_id == TREE_UNIT_ID)
     ]
     if never:
         return ConsumeOutcome.refused(never, 'a never-cache module cannot replay')
     if view is None:
-        return ConsumeOutcome.refused(claimed, f'no view was shipped to the {role} verify, so it could replay nothing')
+        return ConsumeOutcome.refused(replays, f'no view was shipped to the {role} verify, so it could replay nothing')
     if view.mode is not CacheMode.ON:
-        return ConsumeOutcome.refused(claimed, f'the {role} view was shipped in {view.mode} mode, which replays nothing')
-    uncited = [replay for replay in claimed if replay.cited is None]
+        return ConsumeOutcome.refused(replays, f'the {role} view was shipped in {view.mode} mode, which replays nothing')
+    uncited = [claim.replay for claim in claims if claim.citation is None]
     if uncited:
         return ConsumeOutcome.refused(uncited, 'the runner reported no recorded green for the replay of')
+    foreign = [claim.replay for claim in claims if not claim.cites_its_own_unit]
+    if foreign:
+        return ConsumeOutcome.refused(foreign, "the runner cited another unit's green for the replay of")
+    disagreeing = [claim.replay for claim in claims if not claim.report_agrees]
+    if disagreeing:
+        return ConsumeOutcome.refused(
+            disagreeing, 'the runner reported another evidence event than its verdict for the replay of',
+        )
     return None
 
 

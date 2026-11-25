@@ -112,12 +112,15 @@ class VerifyEvidenceRef:
 
 @dataclass(frozen=True)
 class RecordOutcome:
+    """The greens recorded, why, and the verdict on recording the tree's."""
+
     recorded: tuple[Entry, ...]
     reason: str
+    tree: Admission
 
 
-class UnbackedReplay(NamedTuple):
-    """A replayed unit no live entry backs, and the ``(unit_id, key)`` of the entry it cited; None when it cited none."""
+class CitedReplay(NamedTuple):
+    """A replayed unit, and the ``(unit_id, key)`` of the entry it cites; None when it cites none."""
 
     unit_id: str
     cited: tuple[str, str] | None
@@ -133,12 +136,12 @@ class ConsumeOutcome:
     """The entries consumed for a landing, the replayed units no live entry backs, and any registry error."""
 
     consumed: tuple[Entry, ...]
-    unbacked: tuple[UnbackedReplay, ...]
+    unbacked: tuple[CitedReplay, ...]
     error: str | None
     reason: str
 
     @classmethod
-    def refused(cls, unbacked: Sequence[UnbackedReplay], why: str) -> ConsumeOutcome:
+    def refused(cls, unbacked: Sequence[CitedReplay], why: str) -> ConsumeOutcome:
         """Nothing consumed, because *why* holds for each of *unbacked*."""
         return cls((), tuple(unbacked), None, f'{why}: {", ".join(replay.described() for replay in unbacked)}')
 
@@ -181,7 +184,8 @@ async def record_greens(
 ) -> RecordOutcome:
     """Record every admitted green of *record*, citing *evidence*; never raises."""
     if evidence is None:
-        return RecordOutcome((), 'no verify evidence event id: the store returned no row for a green to cite')
+        uncited = 'no verify evidence event id: the store returned no row for a green to cite'
+        return RecordOutcome((), uncited, Admission(False, uncited))
     admissions = [(unit, _admission(record, unit, flake_suppressed=flake_suppressed)) for unit in record.units]
     keys = [unit.key for unit, admission in admissions if admission.admitted and unit.key is not None]
     tree = _tree_admission(record, admissions, evidence)
@@ -194,14 +198,15 @@ async def record_greens(
         ])
     except Exception as exc:
         logger.warning('verify_cache.record_greens failed: %s: %s', type(exc).__name__, exc)
-        return RecordOutcome((), f'registry unwritable: {type(exc).__name__}: {exc}')
+        return RecordOutcome((), f'registry unwritable: {type(exc).__name__}: {exc}', tree)
     refused = '; '.join(f'{unit.unit.unit}: {admission.reason}' for unit, admission in admissions if not admission.admitted)
-    return RecordOutcome(recorded, f'recorded {len(recorded)}; refused [{refused}]; tree: {tree.reason}')
+    return RecordOutcome(recorded, f'recorded {len(recorded)}; refused [{refused}]; tree: {tree.reason}', tree)
 
 
 async def consume_replayed(registry: Registry, record: CacheRecord, *, landing_sha: str | None) -> ConsumeOutcome:
-    """Check that a live entry backs every replayed unit of *record*, and write those entries
-    as consumed for *landing_sha* (I6); with no landing, only check. Never raises."""
+    """Check that a live entry backs every replayed unit of *record*, naming the evidence event
+    the unit names, and write those entries as consumed for *landing_sha* (I6); with no
+    landing, only check. Never raises."""
     hits = [unit for unit in (*record.units, *_tree_of(record)) if unit.unit.outcome is UnitOutcome.CACHE_HIT]
     if not hits:
         return ConsumeOutcome((), (), None, 'no replayed unit to consume')
@@ -210,9 +215,15 @@ async def consume_replayed(registry: Registry, record: CacheRecord, *, landing_s
         live = {
             pair: entry for pair, entry in (await registry.view_of(cited)).entries.items() if isinstance(entry, Entry)
         }
-        unbacked = [UnbackedReplay(unit.unit.unit, _cited(unit)) for unit in hits if _cited(unit) not in live]
+        unbacked = [_replay_of(unit) for unit in hits if _cited(unit) not in live]
         if unbacked:
             return ConsumeOutcome.refused(unbacked, 'no live entry backs the replay of')
+        elsewhere = [
+            _replay_of(unit) for unit in hits
+            if (pair := _cited(unit)) is not None and live[pair].evidence_event_id != unit.unit.evidence_event_id
+        ]
+        if elsewhere:
+            return ConsumeOutcome.refused(elsewhere, 'the live entry cites another evidence event than the replay of')
         backing = tuple(live[pair] for pair in cited)
         if landing_sha is None:
             return ConsumeOutcome((), (), None, f'{len(backing)} live entries back every replay; no landing consumes them')
@@ -226,6 +237,10 @@ async def consume_replayed(registry: Registry, record: CacheRecord, *, landing_s
 
 def _cited(unit: RecordedUnit) -> tuple[str, str] | None:
     return None if unit.entry is None else (unit.entry.unit_id, unit.entry.key)
+
+
+def _replay_of(unit: RecordedUnit) -> CitedReplay:
+    return CitedReplay(unit.unit.unit, _cited(unit))
 
 
 def _admission(record: CacheRecord, unit: RecordedUnit, *, flake_suppressed: bool) -> Admission:
@@ -271,10 +286,10 @@ def _reported(unit: RecordedUnit, admission: Admission | None) -> ReportedUnit:
     return ReportedUnit(unit.unit, unit.key, admission, entry)
 
 
-_REPORT_FIELDS = frozenset({'units', 'tree'})
-_REPORTED_FIELDS = frozenset({'unit', 'key', 'admission', 'entry'})
-_KEY_FIELDS = frozenset({'unit_id', 'tier', 'key', 'spec_hash', 'inputs'})
-_ADMISSION_FIELDS = frozenset({'admitted', 'reason'})
+# A report is encoded field by field (``dataclasses.asdict``), so its keys are its fields.
+_REPORT_FIELDS = frozenset(f.name for f in dataclasses.fields(CacheReport))
+_REPORTED_FIELDS = frozenset(f.name for f in dataclasses.fields(ReportedUnit))
+_KEY_FIELDS = frozenset(f.name for f in dataclasses.fields(UnitKey))
 
 
 def _reported_from_wire(raw: object, where: str) -> ReportedUnit:
@@ -283,7 +298,7 @@ def _reported_from_wire(raw: object, where: str) -> ReportedUnit:
     return ReportedUnit(
         unit=VerifyUnit.from_dict(typed_field(fields, 'unit', dict, where)),
         key=None if key is None else _key_from_wire(key, f'{where}.key'),
-        admission=None if admission is None else _admission_from_wire(admission, f'{where}.admission'),
+        admission=None if admission is None else Admission.from_wire(admission, where=f'{where}.admission'),
         entry=None if entry is None else Candidate.from_wire(entry, where=f'{where}.entry'),
     )
 
@@ -298,8 +313,3 @@ def _key_from_wire(raw: object, where: str) -> UnitKey:
         spec_hash=typed_field(fields, 'spec_hash', str, where),
         inputs=tuple((str(name), str(value)) for name, value in inputs),
     )
-
-
-def _admission_from_wire(raw: object, where: str) -> Admission:
-    fields = wire_fields(raw, _ADMISSION_FIELDS, where)
-    return Admission(typed_field(fields, 'admitted', bool, where), typed_field(fields, 'reason', str, where))

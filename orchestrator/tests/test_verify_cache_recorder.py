@@ -25,9 +25,9 @@ from orchestrator.verify_cache.policy import Admission, Decision
 from orchestrator.verify_cache.recorder import (
     CacheRecord,
     CacheReport,
+    CitedReplay,
     LegRun,
     ReportedUnit,
-    UnbackedReplay,
     VerifyEvidenceRef,
     consume_replayed,
     record_greens,
@@ -209,8 +209,22 @@ class TestConsumeReplayed:
 
         assert not outcome.backs_every_hit
         evicted = entries['module:alpha:lint']
-        assert outcome.unbacked == (UnbackedReplay('module:alpha:lint', ('module:alpha:lint', evicted.key)),)
+        assert outcome.unbacked == (CitedReplay('module:alpha:lint', ('module:alpha:lint', evicted.key)),)
         assert evicted.key in outcome.reason
+        assert await registry.consumed_for('land-1') == ()
+
+    @pytest.mark.asyncio
+    async def test_a_hit_whose_key_was_recorded_again_since_is_unbacked(self, registry):
+        key = unit_key('module:alpha:test')
+        entry = await record_entry(registry, key, evidence=7)
+        _units, record = merge_replay({'module:alpha:test': unit_decision(Decision.HIT, entry, key=key)}).settle((), ())
+        await registry.evict_key(key.key, 'test eviction')
+        await record_entry(registry, key, evidence=8)
+
+        outcome = await consume_replayed(registry, record, landing_sha='land-1')
+
+        assert outcome.unbacked == (CitedReplay('module:alpha:test', ('module:alpha:test', key.key)),)
+        assert 'another evidence event' in outcome.reason
         assert await registry.consumed_for('land-1') == ()
 
     @pytest.mark.asyncio

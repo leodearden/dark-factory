@@ -4,6 +4,7 @@ cold start, never an error (plans/verify-result-cache-prd.md § Registry)."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import sqlite3
@@ -140,7 +141,7 @@ class Candidate:
         )
 
 
-_CANDIDATE_FIELDS = frozenset({'unit_id', 'key', 'entry_id', 'evidence_event_id'})
+_CANDIDATE_FIELDS = frozenset(f.name for f in dataclasses.fields(Candidate))
 
 
 @dataclass(frozen=True)
