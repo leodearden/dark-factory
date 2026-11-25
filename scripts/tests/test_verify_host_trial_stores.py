@@ -257,10 +257,11 @@ class TestReadOnly:
             conn.close()
 
     def test_a_read_leaves_the_store_byte_identical(self, store):
-        path = runs_db(store([merge_verify(day(2), HOST, 600, '7'), scheduler_tick(day(1))]))
+        root = store([merge_verify(day(2), HOST, 600, '7'), scheduler_tick(day(1))])
+        path = runs_db(root)
         before = path.read_bytes()
 
-        read(path.parents[2])
+        read(root)
 
         assert path.read_bytes() == before
 
