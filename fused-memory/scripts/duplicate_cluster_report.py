@@ -10,8 +10,8 @@ diffs it against the project's previous report: cluster lineage by member
 overlap, regrowth split by member age, and per-category comparability.
 
 The report measures regrowth. It is ``authoritative: false`` and files
-nothing: gate filing is blocked on the detector's paraphrase recall, and its
-wiring belongs to task 4916. ``recall_caveat`` in
+nothing: gate filing from it is descoped by ruling
+(``recall_caveat.gate_filing_ruling``). ``recall_caveat`` in
 ``fused-memory/config/duplicate-audit.yaml`` states which bar each number
 clears, and every report carries it.
 
@@ -241,7 +241,14 @@ class AdjudicatorMeasurement(_Frozen):
 
 class Fitness(_Frozen):
     regrowth_measurement: Literal['supported', 'unsupported']
-    gate_filing: Literal['blocked', 'cleared']
+    gate_filing: Literal['descoped']
+
+
+class Ruling(_Frozen):
+    """A dated human ruling, by the escalation that recorded it."""
+
+    ruled_at: str = Field(min_length=1)
+    escalation_id: str = Field(min_length=1)
 
 
 class RecallCaveat(_Frozen):
@@ -257,7 +264,7 @@ class RecallCaveat(_Frozen):
     auc_true_vs_hard_negative: float
     source: str = Field(min_length=1)
     fitness: Fitness
-    gate_filing_owner_task: int
+    gate_filing_ruling: Ruling
     adjudicator_measurements: tuple[AdjudicatorMeasurement, ...]
 
 
@@ -895,9 +902,11 @@ def stderr_log_path(out_root: Path, project_id: str, stamp: str, category: str) 
 
 def _fitness_line(caveat: Mapping[str, Any]) -> str:
     fitness = caveat['fitness']
+    ruling = caveat['gate_filing_ruling']
     return (
         f"regrowth measurement: {fitness['regrowth_measurement']}; "
-        f"gate filing: {fitness['gate_filing']} (task {caveat['gate_filing_owner_task']})"
+        f"gate filing: {fitness['gate_filing']} "
+        f"(ruling {ruling['escalation_id']}, {ruling['ruled_at']})"
     )
 
 

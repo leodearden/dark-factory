@@ -58,13 +58,19 @@ recall_caveat:
     # Re-emissions are near-verbatim, which the detector catches, so the
     # consecutive-run regrowth diff is supported.
     regrowth_measurement: supported
-    # Paraphrase recall is too low to enumerate a gate's members from.
-    gate_filing: blocked
-  gate_filing_owner_task: 4916
+    # No consolidation gate is filed from this report, by ruling
+    # (gate_filing_ruling below). Duplicate detection stays with
+    # reconciliation Stage 1 (plans/memory-auto-consolidation-prd.md D1).
+    gate_filing: descoped
+  # This ruling descoped gate filing and reversed the 2026-08-30 D18 ruling.
+  gate_filing_ruling:
+    ruled_at: '2026-11-17'
+    escalation_id: 'esc-10244-1'
   # Dated adjudicator-over-ANN measurements on the same fixture, written by
   # fused-memory/scripts/measure_duplicate_detector_recall.py. An entry's
-  # meets_proposed_gate is judged against an UNRATIFIED proposal; task 10244
-  # ratifies it and sets fitness.gate_filing.
+  # meets_proposed_gate is judged against a proposal that was never ratified
+  # (the 2026-11-17 ruling declined it); each entry stays as a dated
+  # measurement.
   adjudicator_measurements:
     # The 2026-11-16 report's calibrated-ann baseline, re-embedded, caught
     # 27/301 at AUC 0.2540, not the 25/301 and 0.2534 above. The ANN cutoffs
