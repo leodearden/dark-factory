@@ -1047,13 +1047,21 @@ def _open_task_log(task_id: str, config_name: str):
 
 
 def outer_timeout_min(spec: dict, args: argparse.Namespace) -> float:
-    """The launcher's kill deadline for one cell: --task-timeout-min, else the cell's own ceiling plus OUTER_TIMEOUT_MARGIN_MIN."""
-    if args.task_timeout_min is not None:
-        return args.task_timeout_min
-    return (
-        cell_timeout_minutes(spec, args.orch_timeout_min, WORKFLOW_CELL_TIMEOUT_MINUTES)
-        + OUTER_TIMEOUT_MARGIN_MIN
-    )
+    """The launcher's kill deadline for one cell: --task-timeout-min, else the cell's own ceiling plus OUTER_TIMEOUT_MARGIN_MIN.
+
+    An explicit deadline that does not outlast the ceiling is honoured with a
+    warning: the launcher may kill the cell before it writes a result file.
+    """
+    ceiling = cell_timeout_minutes(spec, args.orch_timeout_min, WORKFLOW_CELL_TIMEOUT_MINUTES)
+    if args.task_timeout_min is None:
+        return ceiling + OUTER_TIMEOUT_MARGIN_MIN
+    if args.task_timeout_min <= ceiling:
+        log(
+            f"WARNING: {spec['id']}: --task-timeout-min {args.task_timeout_min} does not "
+            f"exceed the cell's own ceiling of {ceiling} min, so the launcher may kill "
+            "the cell before it writes a result file"
+        )
+    return args.task_timeout_min
 
 
 def run_one_task(

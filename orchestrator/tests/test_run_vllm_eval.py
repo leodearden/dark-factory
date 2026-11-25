@@ -806,13 +806,32 @@ class TestOuterTimeoutPairing:
         assert recorded["timeout"] > inner_minutes * 60
         assert _flag_value(recorded["cmd"], "--timeout") == forwarded_timeout
 
-    def test_an_explicit_kill_deadline_is_honoured(self, monkeypatch, tmp_path):
+    def test_an_explicit_kill_deadline_past_the_ceiling_is_honoured_quietly(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        rc, recorded = self._run_launcher(
+            monkeypatch, tmp_path, extra_argv=["--task-timeout-min", "240"]
+        )
+
+        assert rc == 0
+        assert recorded["timeout"] == 240 * 60
+        assert "--task-timeout-min" not in capsys.readouterr().out
+
+    def test_an_explicit_kill_deadline_within_the_ceiling_is_honoured_with_a_warning(
+        self, monkeypatch, tmp_path, capsys
+    ):
         rc, recorded = self._run_launcher(
             monkeypatch, tmp_path, extra_argv=["--task-timeout-min", "90"]
         )
 
         assert rc == 0
         assert recorded["timeout"] == 90 * 60
+        [warning] = [
+            line for line in capsys.readouterr().out.splitlines() if "--task-timeout-min" in line
+        ]
+        assert "WARNING" in warning
+        assert "90" in warning
+        assert f"{WORKFLOW_CELL_TIMEOUT_MINUTES} min" in warning
 
 
 # ---------------------------------------------------------------------------
