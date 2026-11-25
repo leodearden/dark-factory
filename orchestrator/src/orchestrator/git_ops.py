@@ -681,6 +681,14 @@ _SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
 # no env override), monkeypatchable in tests via the module global.
 _RESET_WARM_LANE_LOCK_WAIT_SECS: int = 30
 
+#: Bounded wait for a merge screen lane's flock. Short on purpose: a contended
+#: lane falls back to a cold ephemeral worktree rather than stalling the merger.
+SCREEN_LANE_LOCK_WAIT_SECS: float = 5.0
+
+#: What a screen lane keeps across resets, beyond the configured artifact dirs:
+#: the warmth that makes the lane cheaper than a cold worktree.
+SCREEN_LANE_RETAINED: tuple[str, ...] = ('.venv/', '__pycache__/')
+
 # flock's --conflict-exit-code (-E) for _SEED_WARM_LANE_LOCK_WAIT_SECS above.
 # Deliberately mirrors timeout(1)'s well-known 124 "command timed out"
 # convention so the sentinel is self-documenting in logs, and is chosen
@@ -934,6 +942,34 @@ class WorktreeKind(Enum):
     MAIN_PROBE = '_mainprobe-'
     MAIN_SWEEP = '_mainsweep-'
     DRIFT_CHECK = '_driftcheck-'
+    MERGE_SCREEN = '_mergescreen-'
+
+
+class ScreenLane(Enum):
+    """The merge screen's persistent warm lanes, held through :meth:`GitOps.screen_lane`.
+
+    Each value is the lane's exact worktree name under ``worktree_base`` AND
+    its :data:`PROTECTED_PREFIXES` key, as with :class:`WorktreeKind`. Both
+    names stay outside the ``_merge-*`` band, so
+    :meth:`GitOps._iter_merge_worktrees`, :meth:`GitOps.prune_stale_merge_worktrees`
+    and the merge worker's ledger audits never see a lane.
+    """
+
+    MERGER = '_screen-merger'
+    CHAIN = '_screen-chain'
+
+
+class ScreenLaneUnavailable(RuntimeError):
+    """A screen lane's flock was not won within the wait; the lane is untouched."""
+
+    def __init__(self, lane: ScreenLane, lock_path: Path, wait_secs: float) -> None:
+        super().__init__(
+            f'merge screen lane {lane.value} is unavailable: its flock {lock_path} '
+            f'was not acquired within {wait_secs}s, so the lane was left untouched'
+        )
+        self.lane = lane
+        self.lock_path = lock_path
+        self.wait_secs = wait_secs
 
 
 # Band-ownership registry for worktree_base's ephemeral-worktree namespace
@@ -962,6 +998,9 @@ PROTECTED_PREFIXES: dict[str, str] = {
     WorktreeKind.MAIN_PROBE.value: 'verify-main-probe',
     WorktreeKind.MAIN_SWEEP.value: 'verify-main-sweep',
     WorktreeKind.DRIFT_CHECK.value: 'merge-drift-check',
+    ScreenLane.MERGER.value: 'merge-screen-lane',
+    ScreenLane.CHAIN.value: 'merge-screen-lane',
+    WorktreeKind.MERGE_SCREEN.value: 'merge-screen-fallback',
 }
 
 
@@ -14575,57 +14614,10 @@ class GitOps:
                 holder_facts=_lane_lock_holder_facts(lock_path, holder_pids),
             )
         try:
-            if not await self._is_registered_worktree(warm_path):
-                # Create-once branch — self-heal a stale unregistered directory first.
-                # A previous run may have left the directory on disk without a git
-                # worktree registration (e.g. worktree metadata pruned after a crash).
-                # `git worktree add` refuses a non-empty directory, permanently
-                # wedging the warm path until manual cleanup.  Removing the orphaned
-                # directory here mirrors the stale-directory removal in create_worktree
-                # and makes the create-once path self-healing.
-                if warm_path.exists():
-                    logger.warning(
-                        'Persistent merge worktree path %s exists on disk but is not '
-                        'a registered git worktree; removing stale directory to allow '
-                        'fresh creation (self-heal)',
-                        warm_path,
-                    )
-                    await remove_tree(warm_path)
-                warm_path.parent.mkdir(parents=True, exist_ok=True)
-                rc, _, err = await _run(
-                    ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    raise RuntimeError(
-                        f'Failed to create persistent merge worktree at {warm_path}: {err}'
-                    )
-                logger.info(
-                    'Created persistent merge worktree at %s (HEAD=%s)',
-                    warm_path, merge_commit[:8],
-                )
-            else:
-                # Reset-in-place branch (added in step-6)
-                rc, _, err = await _run(
-                    ['git', 'reset', '--hard', merge_commit],
-                    cwd=warm_path,
-                )
-                if rc != 0:
-                    raise RuntimeError(
-                        f'Failed to reset persistent merge worktree {warm_path} '
-                        f'to {merge_commit}: {err}'
-                    )
-                ok, err = await self._clean_lane_retaining_artifacts(
-                    warm_path, caller='reset_persistent_merge_worktree',
-                )
-                if not ok:
-                    raise RuntimeError(
-                        f'Failed to clean persistent merge worktree {warm_path}: {err}'
-                    )
-                logger.info(
-                    'Reset persistent merge worktree %s to HEAD=%s',
-                    warm_path, merge_commit[:8],
-                )
+            await self._create_or_reset_persistent_worktree(
+                warm_path, merge_commit,
+                label='persistent merge worktree', caller='reset_persistent_merge_worktree',
+            )
         finally:
             # Paired with the guarded acquire above (task 3081) so the
             # in-process held-fd registry stays symmetric — a hold this method
@@ -14660,58 +14652,99 @@ class GitOps:
         :meth:`reset_persistent_merge_worktree`).
         """
         warm_path = self.persistent_offline_deep_worktree_path
+        # The reset retains this worktree's OWN target/, never touching or
+        # seeding from the merge lane's target/ (C5).
+        await self._create_or_reset_persistent_worktree(
+            warm_path, merge_commit,
+            label='persistent offline-deep worktree',
+            caller='reset_persistent_offline_deep_worktree',
+        )
+        return warm_path
 
-        if not await self._is_registered_worktree(warm_path):
-            # Create-once branch — self-heal a stale unregistered directory first.
-            # See reset_persistent_merge_worktree for rationale (a previous run
-            # may have left the directory on disk without a git worktree
-            # registration, e.g. worktree metadata pruned after a crash).
-            if warm_path.exists():
-                logger.warning(
-                    'Persistent offline-deep worktree path %s exists on disk but '
-                    'is not a registered git worktree; removing stale directory '
-                    'to allow fresh creation (self-heal)',
-                    warm_path,
-                )
-                await remove_tree(warm_path)
-            warm_path.parent.mkdir(parents=True, exist_ok=True)
-            rc, _, err = await _run(
-                ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
-                cwd=self.project_root,
+    @contextlib.asynccontextmanager
+    async def screen_lane(
+        self, lane: ScreenLane, sha: str, *, lock_wait_secs: float = SCREEN_LANE_LOCK_WAIT_SECS,
+    ) -> AsyncIterator[Path]:
+        """Yield merge screen *lane* checked out at *sha*, holding its flock for the whole body.
+
+        The flock is the lane's ``<lane>.lock``
+        (:func:`~orchestrator.verify_cancel.lane_lock_path`), the one
+        warm-lane-gc and the seed scripts take, held across the body and not
+        just the reset, so nothing mutates the tree under test. The lane is
+        created once or reset in place to *sha*, keeping
+        :data:`SCREEN_LANE_RETAINED` warm across screens.
+
+        Raises :exc:`ScreenLaneUnavailable`, with the lane untouched, when the
+        flock is not won within *lock_wait_secs*: the caller falls back to
+        :meth:`ephemeral_worktree` with ``WorktreeKind.MERGE_SCREEN``. Raises
+        :exc:`RuntimeError` on a git failure.
+        """
+        path = self.worktree_base / lane.value
+        lock_path = lane_lock_path(path)
+        fd = await self._acquire_lane_flock_off_thread(lock_path, lock_wait_secs)
+        if fd is None:
+            raise ScreenLaneUnavailable(lane, lock_path, lock_wait_secs)
+        try:
+            await self._create_or_reset_persistent_worktree(
+                path, sha, label=f'merge screen lane {lane.value}', caller='screen_lane',
+                also_retain=SCREEN_LANE_RETAINED,
             )
-            if rc != 0:
-                raise RuntimeError(
-                    f'Failed to create persistent offline-deep worktree at {warm_path}: {err}'
-                )
-            logger.info(
-                'Created persistent offline-deep worktree at %s (HEAD=%s)',
-                warm_path, merge_commit[:8],
+            yield path
+        finally:
+            self._release_lane_flock(fd)
+
+    async def _create_or_reset_persistent_worktree(
+        self, path: Path, sha: str, *, label: str, caller: str, also_retain: tuple[str, ...] = (),
+    ) -> None:
+        """Create the persistent worktree at *path* once, or reset it in place, at *sha*.
+
+        Create-once: ``git worktree add --detach``. Reset-in-place:
+        ``git reset --hard`` then :meth:`_clean_lane_retaining_artifacts`
+        (its *caller* and *also_retain*), so the source is bit-identical to a
+        fresh checkout of *sha* while the artifact dirs stay warm (PRD §10
+        invariant 1). *label* names the worktree in log and error text.
+        Raises :exc:`RuntimeError` on a git failure. Callers own any locking.
+        """
+        if await self._is_registered_worktree(path):
+            await self._reset_persistent_worktree(
+                path, sha, label=label, caller=caller, also_retain=also_retain,
             )
         else:
-            # Reset-in-place branch — retains this worktree's OWN target/,
-            # never touching or seeding from the merge lane's target/ (C5).
-            rc, _, err = await _run(
-                ['git', 'reset', '--hard', merge_commit],
-                cwd=warm_path,
-            )
-            if rc != 0:
-                raise RuntimeError(
-                    f'Failed to reset persistent offline-deep worktree {warm_path} '
-                    f'to {merge_commit}: {err}'
-                )
-            ok, err = await self._clean_lane_retaining_artifacts(
-                warm_path, caller='reset_persistent_offline_deep_worktree',
-            )
-            if not ok:
-                raise RuntimeError(
-                    f'Failed to clean persistent offline-deep worktree {warm_path}: {err}'
-                )
-            logger.info(
-                'Reset persistent offline-deep worktree %s to HEAD=%s',
-                warm_path, merge_commit[:8],
-            )
+            await self._create_persistent_worktree(path, sha, label=label)
 
-        return warm_path
+    async def _create_persistent_worktree(self, path: Path, sha: str, *, label: str) -> None:
+        # Self-heal a stale unregistered directory first: a previous run may have
+        # left it on disk without a git worktree registration (e.g. worktree
+        # metadata pruned after a crash), and `git worktree add` refuses a
+        # non-empty directory, wedging the path until manual cleanup. Mirrors
+        # the stale-directory removal in create_worktree.
+        if path.exists():
+            logger.warning(
+                '%s path %s exists on disk but is not a registered git worktree; '
+                'removing stale directory to allow fresh creation (self-heal)',
+                label.capitalize(), path,
+            )
+            await remove_tree(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(path), sha], cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(f'Failed to create {label} at {path}: {err}')
+        logger.info('Created %s at %s (HEAD=%s)', label, path, sha[:8])
+
+    async def _reset_persistent_worktree(
+        self, path: Path, sha: str, *, label: str, caller: str, also_retain: tuple[str, ...],
+    ) -> None:
+        rc, _, err = await _run(['git', 'reset', '--hard', sha], cwd=path)
+        if rc != 0:
+            raise RuntimeError(f'Failed to reset {label} {path} to {sha}: {err}')
+        ok, err = await self._clean_lane_retaining_artifacts(
+            path, caller=caller, also_retain=also_retain,
+        )
+        if not ok:
+            raise RuntimeError(f'Failed to clean {label} {path}: {err}')
+        logger.info('Reset %s %s to HEAD=%s', label, path, sha[:8])
 
     async def _iter_merge_worktrees(self):
         """Yield ``(wt_path, wt_resolved)`` pairs for registered ``_merge-*`` worktrees.
