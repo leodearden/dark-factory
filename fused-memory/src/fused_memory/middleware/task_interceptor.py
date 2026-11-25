@@ -5272,22 +5272,33 @@ class TaskInterceptor:
 
         Advisory and best-effort: the task already exists, so a failure here is
         a ``post_create_warnings`` entry and never changes the ticket status.
+        A sweep that could not run is such a warning, never "no duplicate".
         Runs outside the write lock; only the stamp itself takes it.
         """
         curator_cfg = self._config.curator if self._config is not None else CuratorConfig()
         if not curator_cfg.zot_duplicate_sweep_enabled:
             return
-        finding = await sweep_zot_duplicate(
-            curator,
-            project_id=project_id,
-            task_id=task_id,
-            title=candidate.title,
-            description=candidate.description,
-            files_to_modify=candidate.files_to_modify,
-            read_statuses=lambda ids: tm.get_statuses(project_root, ids=ids),
-            threshold=curator_cfg.zot_duplicate_score_threshold,
-            limit=curator_cfg.zot_duplicate_search_limit,
-        )
+        try:
+            finding = await sweep_zot_duplicate(
+                curator,
+                project_id=project_id,
+                task_id=task_id,
+                title=candidate.title,
+                description=candidate.description,
+                files_to_modify=candidate.files_to_modify,
+                read_statuses=lambda ids: tm.get_statuses(project_root, ids=ids),
+                threshold=curator_cfg.zot_duplicate_score_threshold,
+                limit=curator_cfg.zot_duplicate_search_limit,
+            )
+        except Exception as exc:
+            logger.warning(
+                '_flag_zot_duplicate: duplicate sweep for %s could not run; '
+                'duplicate status unknown', task_id, exc_info=True,
+            )
+            result_dict.setdefault('post_create_warnings', []).append(
+                {'stage': 'zot_duplicate_sweep', 'error': str(exc)}
+            )
+            return
         if finding is None:
             return
         logger.info(
