@@ -673,6 +673,36 @@ def _run_spawn(
     )
 
 
+def _run_spawn_without_emulator(
+    tmp_path: pathlib.Path, extra_env: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    """Invoke spawn-claude.sh on a PATH holding a fake `claude` plus only
+    bash, mktemp, sleep, cat, rm and uname: no terminal emulator, no tmux,
+    so every backend fails its availability guard with exit 126.
+
+    python3 is deliberately absent too, which makes the session-registry
+    `launching` write no-op, so no CLAUDE_FLEET_ROOT isolation is needed.
+
+    The env is built from _hermetic_environ() at call time, so a test's
+    monkeypatched os.environ is honoured -- and scrubbed -- here.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+
+    sys_bin = tmp_path / "sys_bin"
+    sys_bin.mkdir()
+    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
+        src = shutil.which(util)
+        if src:
+            (sys_bin / util).symlink_to(src)
+
+    env = _hermetic_environ()
+    env["PATH"] = f"{bin_dir}:{sys_bin}"
+    env.pop("CLAUDE_TERMINAL_CMD", None)
+    env.update(extra_env or {})
+    return _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+
+
 # ===========================================================================
 # task-3062: hermetic environment scrub for CLAUDE_SPAWN_* ambient leakage
 # ===========================================================================
@@ -783,38 +813,19 @@ def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
     stderr content instead.
 
     RED before this file's own _hermetic_environ() fix: a raw
-    `dict(os.environ)` (this test's own construction, mirroring
-    test_no_emulator_found_yields_126 and test_tmux_backend_missing_tmux_
-    yields_126 below) passes the ambient CLAUDE_SPAWN_BACKEND straight
+    `dict(os.environ)` passes the ambient CLAUDE_SPAWN_BACKEND straight
     through, so the run takes the tmux branch and stderr says "tmux not
-    found" instead of "no terminal emulator found".
+    found" instead of "no terminal emulator found". The env under test is
+    _run_spawn_without_emulator's, the one construction all three 126 sites
+    share, so this proves every one of them hermetic.
     """
-    import shutil as _shutil
-
     monkeypatch.setenv("CLAUDE_SPAWN_BACKEND", "tmux")
-
-    bin_dir = _make_bin_dir(tmp_path)
-    _write_fake_claude(bin_dir, exit_code=0)
-
-    # Minimal system-bin with only the utilities the script needs -- NO
-    # tmux, NO terminal emulator (mirrors test_no_emulator_found_yields_126's
-    # sys_bin exactly).
-    sys_bin = tmp_path / "sys_bin"
-    sys_bin.mkdir()
-    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
-        src = _shutil.which(util)
-        if src:
-            (sys_bin / util).symlink_to(src)
-
-    env = _hermetic_environ()
-    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
-    env.pop("CLAUDE_TERMINAL_CMD", None)
 
     # Task 3599 audit: same no-emulator availability-guard shape as
     # test_no_emulator_found_yields_126 below -- rc==126 is load-INSENSITIVE
     # (task 3486), so this stays unscaled rather than inheriting the new
     # load-scaled default.
-    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+    result = _run_spawn_without_emulator(tmp_path)
     stderr = result.stderr.decode()
     assert result.returncode == 126, (
         f"expected 126, got {result.returncode}\nstderr: {stderr}"
@@ -1046,31 +1057,11 @@ def test_genuine_launcher_failure_yields_127(
 )
 def test_no_emulator_found_yields_126(tmp_path: pathlib.Path) -> None:
     """When no emulator is found, spawn-claude.sh must exit 126."""
-    import shutil as _shutil
-
-    bin_dir = _make_bin_dir(tmp_path)
-    _write_fake_claude(bin_dir, exit_code=0)
-
-    # Build a minimal system-bin that has only the utilities the script needs
-    # but NOT any terminal emulator (gnome-terminal/konsole/kitty/xterm).
-    # We look up each utility by its absolute path using the full system PATH
-    # so we get the real binary, then symlink it in our minimal dir.
-    sys_bin = tmp_path / "sys_bin"
-    sys_bin.mkdir()
-    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
-        src = _shutil.which(util)
-        if src:
-            (sys_bin / util).symlink_to(src)
-
-    env = _hermetic_environ()
-    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
-    env.pop("CLAUDE_TERMINAL_CMD", None)
-
     # Task 3599 audit: rc==126 is load-INSENSITIVE (no emulator on PATH
     # fails the availability guard immediately; task 3486 measured 0.05s),
     # so this stays unscaled rather than inheriting the new load-scaled
     # default.
-    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+    result = _run_spawn_without_emulator(tmp_path)
     assert result.returncode == 126, (
         f"No emulator must yield 126, got {result.returncode}\n"
         f"stderr: {result.stderr.decode()}"
@@ -3745,26 +3736,6 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     command-not-found (bash exit 127) -> resolve_detached's launch_rc!=0
     branch -> exit 127, not 126. GREEN after step-8.
     """
-    import shutil as _shutil
-
-    bin_dir = _make_bin_dir(tmp_path)
-    _write_fake_claude(bin_dir, exit_code=0)
-
-    # Minimal system-bin with only the utilities the script needs -- NO
-    # tmux, NO terminal emulator (mirrors test_no_emulator_found_yields_126's
-    # sys_bin exactly, including the deliberate exclusion of python3, which
-    # makes the session-registry `launching` write no-op so this test needs
-    # no CLAUDE_FLEET_ROOT isolation).
-    sys_bin = tmp_path / "sys_bin"
-    sys_bin.mkdir()
-    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
-        src = _shutil.which(util)
-        if src:
-            (sys_bin / util).symlink_to(src)
-
-    env = _hermetic_environ()
-    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
-    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
     # Task 3486 audit: SPAWN_LAUNCH_GRACE_SECS="2" and timeout=10 below stay
     # FIXED on purpose -- rc==126 is load-INSENSITIVE (no tmux/emulator on
     # PATH fails the availability guard immediately; load-scaling would only
@@ -3772,10 +3743,9 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     # Task 3599 audit: _run_spawn's timeout now load-scales by default, so
     # the explicit scale_timeout=False below is what keeps this pin FIXED --
     # both audits are one decision, not a reversal.
-    env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
-    env.pop("CLAUDE_TERMINAL_CMD", None)
-
-    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+    result = _run_spawn_without_emulator(
+        tmp_path, {"CLAUDE_SPAWN_BACKEND": "tmux", "SPAWN_LAUNCH_GRACE_SECS": "2"}
+    )
     assert result.returncode == 126, (
         f"missing tmux in tmux-backend mode must yield 126, got "
         f"{result.returncode}\nstderr: {result.stderr.decode()}"
