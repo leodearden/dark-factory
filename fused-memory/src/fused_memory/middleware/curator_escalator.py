@@ -66,6 +66,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from escalation.dedupe import (  # type: ignore[import-untyped]
+    DedupeConfig,
+    compute_content_fingerprint,
+    submit_or_dedupe,
+)
+from escalation.models import Escalation  # type: ignore[import-untyped]
+from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware.curator_types import CuratorFailureError
@@ -78,26 +85,7 @@ from fused_memory.services.orchestrator_detector import is_orchestrator_lock_hel
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
     from fused_memory.middleware.curator_registry import RegistryHealth
-
-# ``escalation`` is a sibling workspace package. The main reconciliation
-# harness also imports it defensively (harness.py:38-46) because historical
-# deployments could lack the package. Mirror that pattern here so the
-# curator still functions (without escalation routing) in minimal envs.
-try:
-    from escalation.dedupe import (  # type: ignore[import-untyped]
-        DedupeConfig,
-        compute_content_fingerprint,
-        submit_or_dedupe,
-    )
-    from escalation.models import Escalation  # type: ignore[import-untyped,no-redef]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover - exercised only in minimal envs
-    HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -205,12 +193,12 @@ def _file_folding_escalation(
         summary=summary,
         detail=detail,
         root_cause=root_cause,
-        dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
+        dedupe_fingerprint=compute_content_fingerprint(
             category, fold_key, affected_ids=[f'project:{project_id}'],
         ),
     )
-    config = DedupeConfig.for_content_fingerprint(category)  # type: ignore[possibly-unbound]  # debt: ticket tkt_0RWZE9H0GAK9MW40F76GWJFFJQ
-    response = submit_or_dedupe(queue, escalation, config)  # type: ignore[possibly-unbound]
+    config = DedupeConfig.for_content_fingerprint(category)
+    response = submit_or_dedupe(queue, escalation, config)
     return _FoldingOutcome(escalation_id=response['id'], folded=response['status'] == 'dedup_skipped')
 
 
@@ -554,16 +542,6 @@ class CuratorEscalator:
         diagnosable. Burst suppression is exactly what made the original outage
         read as sporadic "1 of 3" blips.
         """
-        if not HAS_ESCALATION:
-            # No escalation package available — fall back to a loud raise so
-            # operators don't miss a silent curator outage.
-            raise CuratorFailureError(
-                f'TaskCurator LLM failed and escalation package is unavailable. '
-                f'No dedupe was applied for project {project_id!r}. '
-                f'justification={justification!r} candidate_title={candidate_title!r}',
-                zero_output_timeout=zero_output_timeout,
-            )
-
         if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
             raise CuratorFailureError(
                 f'TaskCurator LLM failed and no orchestrator is running for '
@@ -702,15 +680,13 @@ class CuratorEscalator:
         ``stamped`` says whether the finding landed on the new task's metadata;
         the record must not point a human at metadata that was never written.
 
-        Unlike ``report_failure`` this never raises on the no-orchestrator or
-        no-escalation-package gates: it runs after the task already exists, so
-        raising could only turn a missed notice into noise on a successful write.
+        Unlike ``report_failure`` this never raises on the no-orchestrator gate:
+        it runs after the task already exists, so raising could only turn a
+        missed notice into noise on a successful write.
         """
-        if not HAS_ESCALATION or not await asyncio.to_thread(
-            is_orchestrator_lock_held, project_root,
-        ):
+        if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
             logger.warning(
-                'curator_escalator: no orchestrator/escalation queue for project %s; '
+                'curator_escalator: no orchestrator for project %s; '
                 'post-ZOT duplicate %s ~ %s (score %.3f) not escalated',
                 project_id, finding.task_id, finding.duplicate_task_id, finding.score,
             )
@@ -856,15 +832,6 @@ class CuratorEscalator:
         evidence. A folded run's own cause may be a different class, so it is
         logged at ERROR, as loudly as the first filing.
         """
-        if not HAS_ESCALATION:
-            logger.warning(
-                'curator_escalator: %d consecutive degraded curations for project '
-                '%s (threshold %d) but the escalation package is unavailable — '
-                'alarm not queued. last_justification=%r candidate_title=%r',
-                streak, project_id, threshold, last_justification, candidate_title,
-            )
-            return
-
         if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
             logger.error(
                 'curator_escalator: %d consecutive degraded curations for project '
@@ -956,15 +923,6 @@ class CuratorEscalator:
         Like :meth:`report_consecutive_degraded`: never raises (the caller is
         curator startup) and never touches ``_failure_log``.
         """
-        if not HAS_ESCALATION:
-            logger.warning(
-                'curator_escalator: curator backend binary %r does not resolve '
-                '(PATH=%s) and the escalation package is unavailable — alarm '
-                'not queued for project %s',
-                binary_spec, search_path, project_id,
-            )
-            return
-
         if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
             logger.error(
                 'curator_escalator: curator backend binary %r does not resolve '
@@ -1038,14 +996,6 @@ class CuratorEscalator:
         and registry label, so a restart re-running the self-check counts as a
         recurrence instead of a new record.
         """
-        if not HAS_ESCALATION:
-            logger.warning(
-                'curator_escalator: %s registry failed to load (%s) and the '
-                'escalation package is unavailable — alarm not queued for project %s',
-                health.label, health.error, project_id,
-            )
-            return
-
         if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
             logger.error(
                 'curator_escalator: %s registry failed to load (%s) and no '

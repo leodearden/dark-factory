@@ -1376,6 +1376,7 @@ dependencies = [
     { name = "aiosqlite" },
     { name = "anthropic" },
     { name = "dark-factory-shared" },
+    { name = "escalation" },
     { name = "graphiti-core", extra = ["falkordb"] },
     { name = "mcp" },
     { name = "mem0ai" },
@@ -1388,7 +1389,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "escalation" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1407,6 +1407,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "anthropic", specifier = ">=0.52.0" },
     { name = "dark-factory-shared", editable = "shared" },
+    { name = "escalation", editable = "escalation" },
     { name = "graphiti-core", extras = ["falkordb"], specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=1.9.4" },
     { name = "mem0ai", specifier = ">=1.0.10" },
@@ -1419,7 +1420,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "escalation", editable = "escalation" },
     { name = "pyright", specifier = ">=1.1.404" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.21.0" },
