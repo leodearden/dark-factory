@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING, Protocol
 from shared.safe_io import atomic_write_text
 
 from orchestrator.verify_hosts import remote_runner_for
-from orchestrator.verify_runner import MergeVerifySpec, RemoteRunner, build_merge_verify_spec
+from orchestrator.verify_runner import (
+    MergeVerifySpec,
+    RemoteRunner,
+    RunnerUnavailable,
+    build_merge_verify_spec,
+)
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
@@ -71,11 +76,27 @@ def resolve_commit(project_root: Path, rev: str) -> str:
     return completed.stdout.strip()
 
 
+def refuse_persistent_merge_worktree(config: OrchestratorConfig) -> None:
+    """PreflightRefused when the project reuses one merge worktree, which a preflight beside the lane would share."""
+    if config.git.persistent_merge_worktree:
+        raise PreflightRefused(
+            'git.persistent_merge_worktree is on in this project config: a preflight '
+            'verify would share the lane\'s one merge worktree, so it is refused'
+        )
+
+
 def preflight_targets(
     config: OrchestratorConfig, runner: str, reference: str | None,
 ) -> tuple[VerifyRunnerConfig, VerifyRunnerConfig | None]:
-    """The declared runner configs for *runner* and *reference*, enabled or not."""
-    return _declared(config, runner), (None if reference is None else _declared(config, reference))
+    """The declared runner configs for *runner* and *reference*, enabled or not, each one a usable target."""
+    primary = _declared(config, runner)
+    if reference == runner:
+        raise PreflightRefused(f'the reference runner must differ from the runner, both are {runner!r}')
+    secondary = None if reference is None else _declared(config, reference)
+    for target in (primary, secondary):
+        if target is not None:
+            _require_usable(target)
+    return primary, secondary
 
 
 def _declared(config: OrchestratorConfig, name: str) -> VerifyRunnerConfig:
@@ -85,6 +106,17 @@ def _declared(config: OrchestratorConfig, name: str) -> VerifyRunnerConfig:
             f'{name!r} is not a declared verify runner; declared: {[r.name for r in config.verify_runners]!r}'
         )
     return found
+
+
+def _require_usable(target: VerifyRunnerConfig) -> None:
+    try:
+        target.gate_paths()
+    except ValueError as exc:
+        raise PreflightRefused(f'verify runner {target.name!r} cannot be gated: {exc}') from exc
+    if target.name in ('', '.', '..') or '/' in target.name:
+        raise PreflightRefused(
+            f'verify runner name {target.name!r} is not one path segment, so it cannot name a record file'
+        )
 
 
 @dataclass(frozen=True)
@@ -105,6 +137,17 @@ class ModuleOutcome:
 
 
 @dataclass(frozen=True)
+class NoVerdict:
+    """Why a runner produced no verdict: its RunnerUnavailable kind and message."""
+
+    kind: str
+    message: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {'kind': self.kind, 'message': self.message}
+
+
+@dataclass(frozen=True)
 class RunnerVerdict:
     """What one runner's preflight verify answered, as its record states it."""
 
@@ -118,6 +161,7 @@ class RunnerVerdict:
     summary: str
     category: str
     trivial: bool
+    no_verdict: NoVerdict | None
     modules: Mapping[str, ModuleOutcome]
     failing_test_ids: tuple[str, ...] | None
     skipped_test_ids: tuple[str, ...] | None
@@ -134,6 +178,7 @@ class RunnerVerdict:
             'summary': self.summary,
             'category': self.category,
             'trivial': self.trivial,
+            'no_verdict': None if self.no_verdict is None else self.no_verdict.to_dict(),
             'modules': {prefix: outcome.to_dict() for prefix, outcome in self.modules.items()},
             'failing_test_ids': _listed(self.failing_test_ids),
             'skipped_test_ids': _listed(self.skipped_test_ids),
@@ -177,12 +222,20 @@ class _Dispatch:
     clock: Callable[[], float]
 
     async def on(self, name: str, runner: PreflightRunner) -> RunnerVerdict:
+        """*runner*'s verdict; a RunnerUnavailable becomes a no-verdict record, anything else propagates."""
         start = self.clock()
-        report = await runner.ensure_gate()
-        ensured = _Ensured(secs=self.clock() - start, built=report.built)
-        result = await runner.run_merge_verify(
-            self.sha, self.spec, task_id=PREFLIGHT_ARCHIVE_KEY, archive_root=self.archive_root,
-        )
+        ensured: _Ensured | None = None
+        try:
+            report = await runner.ensure_gate()
+            ensured = _Ensured(secs=self.clock() - start, built=report.built)
+            result = await runner.run_merge_verify(
+                self.sha, self.spec, task_id=PREFLIGHT_ARCHIVE_KEY, archive_root=self.archive_root,
+            )
+        except RunnerUnavailable as exc:
+            return self._unavailable(
+                name, NoVerdict(kind=exc.kind, message=str(exc)),
+                wall_secs=self.clock() - start, ensured=ensured,
+            )
         return self._verdict(name, result, wall_secs=self.clock() - start, ensured=ensured)
 
     def _verdict(
@@ -190,12 +243,29 @@ class _Dispatch:
     ) -> RunnerVerdict:
         return RunnerVerdict(
             runner=name, sha=self.sha, gate=self.gate,
-            passed=result.passed,
+            passed=result.passed and not result.trivial,
             wall_secs=wall_secs, ensure_gate_secs=ensured.secs, gate_built=ensured.built,
             summary=result.summary, category=result.category, trivial=result.trivial,
+            no_verdict=None,
             modules=self._modules(result.failing_test_ids_by_module),
             failing_test_ids=_tupled(result.failing_test_ids),
             skipped_test_ids=_tupled(result.skipped_test_ids),
+        )
+
+    def _unavailable(
+        self, name: str, no_verdict: NoVerdict, *, wall_secs: float, ensured: _Ensured | None,
+    ) -> RunnerVerdict:
+        return RunnerVerdict(
+            runner=name, sha=self.sha, gate=self.gate,
+            passed=False,
+            wall_secs=wall_secs,
+            ensure_gate_secs=None if ensured is None else ensured.secs,
+            gate_built=None if ensured is None else ensured.built,
+            summary='', category='', trivial=False,
+            no_verdict=no_verdict,
+            modules=self._modules(None),
+            failing_test_ids=None,
+            skipped_test_ids=None,
         )
 
     def _modules(self, by_module: dict[str, list[str]] | None) -> dict[str, ModuleOutcome]:
@@ -217,7 +287,11 @@ async def run_preflight(
     build_runner: BuildRunner,
     clock: Callable[[], float] = time.monotonic,
 ) -> PreflightOutcome:
-    """Verify one commit (default: the main tip) at full breadth on *runner*, and record the verdict."""
+    """Verify one commit (default: the main tip) at full breadth on *runner*, and record the verdict.
+
+    Every PreflightRefused is raised before any runner is built or awaited.
+    """
+    refuse_persistent_merge_worktree(config)
     primary_config, _reference_config = preflight_targets(config, runner, reference)
     dispatch = _Dispatch(
         sha=resolve_commit(config.project_root, sha or config.git.main_branch),
