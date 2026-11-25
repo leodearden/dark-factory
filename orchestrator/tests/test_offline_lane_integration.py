@@ -83,7 +83,6 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import FusedMemoryConfig, GitConfig, LaneCommand, OrchestratorConfig
 from orchestrator.flake_ledger import (
     FlakeCallSite,
-    FlakeOccurrenceRow,
     FlakeVerdict,
     ledger_db_path,
     read_occurrences,
@@ -136,15 +135,15 @@ _NOTE_MERGE_ALL_BOUND_SECS = 15.0
 # for the full derivation.
 _MARKERLESS_CEILING_FRACTION = 0.6
 
-# The measured worst-case count of subprocess spawns inside a single
-# `_run_lane` window -- the multiplier `_LANE_PASS_BOUND_SECS`'s floor check
-# is sized against. The shared worst case lives in the SIBLING infra module,
-# whose `test_out_of_bound_spawn_counts_are_measured_not_asserted` measures it
+# The measured worst-case count of subprocess spawns inside a single lane
+# pass -- the multiplier `_LANE_PASS_BOUND_SECS`'s floor check is sized
+# against. The shared worst case lives in the SIBLING infra module, whose
+# `test_a_warm_infra_red_pass_is_the_lane_pass_floor_multiplier` measures it
 # over a warm infra red pass; this module's
 # `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` pins this
-# copy to that one by equality. In THIS module only B1-B3's injected-seam
-# passes sit inside a `_run_lane` window; red-path passes are awaited
-# unbounded through `await_lane_passes`.
+# copy to that one by equality. It prices the pass alone, not a whole
+# `_run_lane` window: B3's window also holds the caller's own
+# `_assert_never_a_gate` work, which this floor does not cover.
 _SPAWNS_PER_LANE_PASS_WORST_CASE = 6
 
 # Task 4203 — the multiplicands `_orch_helpers.py::required_timeout_secs` prices at
@@ -649,8 +648,10 @@ class _RedLane:
     def episode(self, node: str = _TARGET) -> Episode:
         return self.record().episodes[node]
 
-    def ledger_rows(self) -> list[FlakeOccurrenceRow]:
-        return read_occurrences(ledger_db_path(self.project_root))
+    def ledger_observations(self) -> list[tuple[str, str, str, str]]:
+        """Each flake-ledger row as ``(test_id, verdict, call_site, project_id)``."""
+        rows = read_occurrences(ledger_db_path(self.project_root))
+        return [(r.test_id, r.verdict, r.call_site, r.project_id) for r in rows]
 
     def unlanded(self) -> list[Escalation]:
         """The pending D11 records on the command's sentinel id."""
@@ -1021,20 +1022,21 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     `_SPAWNS_PER_LANE_PASS_WORST_CASE`x `MEASURED_SPAWN_LATENCY_SECS` (task
     3451's measured worst-case happy-path subprocess spawn latency: n=3,
     2.13/3.10/4.71s, load-per-core 6.6). The multiplier is MEASURED, not
-    guessed: it is the worst-case count of subprocess spawns that occur
-    INSIDE a single `_run_lane` window, and that worst case lives in the
-    SIBLING infra module (``test_offline_lane_infra_integration.py``), whose
-    `test_out_of_bound_spawn_counts_are_measured_not_asserted` is its
-    executable pin. A warm infra red pass is `_run_once`'s 4 git spawns
-    (`get_main_sha`, `worktree list`, `reset --hard`, `clean -xfd`) plus the
-    real infra seam spawning `run_all.sh` twice (the detect run and the
-    confirm re-run) = 6; the cold first pass, whose `worktree add` stands in
-    for the reset and the clean, is 5. 6 is the multiplier. In
-    this module `_LANE_PASS_BOUND_SECS` bounds only B1-B3's passes, which
-    sit well under that shared worst case (the numeric `suite_runner` seam
-    there is a bare injected callable, never a real subprocess); its
-    red-path passes run real sub-runs and are awaited unbounded through
-    `await_lane_passes`. The floor is still asserted here, AND both the
+    guessed: it is the worst-case count of subprocess spawns inside a single
+    lane pass, and that worst case lives in the SIBLING infra module
+    (``test_offline_lane_infra_integration.py``), whose
+    `test_a_warm_infra_red_pass_is_the_lane_pass_floor_multiplier` measures
+    a warm infra red pass spawn by spawn. In this module
+    `_LANE_PASS_BOUND_SECS` bounds only B1-B3's `_run_lane` windows, whose
+    passes spawn fewer (the numeric `suite_runner` seam there is a bare
+    injected callable, never a real subprocess); its red-path passes run
+    real sub-runs and are awaited unbounded through `await_lane_passes`.
+    The floor prices ONE LANE PASS, not every window: B3 holds its pass in
+    flight while `_assert_never_a_gate` runs its own
+    `_SPAWNS_PER_ASSERT_NEVER_A_GATE` git spawns and its
+    `_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS` of
+    bounded waits inside that same window, and this floor does not cover
+    them. The floor is still asserted here, AND both the
     bound and this multiplier are additionally checked for equality against
     the infra module's own copies immediately below — the floor/ceiling
     relation alone permits any value in [6x measured spawn latency, 0.6x
@@ -1083,10 +1085,9 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'subprocess spawn latency ({MEASURED_SPAWN_LATENCY_SECS}s, task 3451: n=3 '
         f'2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The '
         f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}-spawn multiplier is the measured worst-case '
-        f'count of subprocess spawns inside a single _run_lane window, measured by '
-        f'test_offline_lane_infra_integration.py::test_out_of_bound_spawn_counts_are_measured_not_asserted: '
-        f'a warm infra red pass is 4 git spawns from _run_once (get_main_sha, worktree list, '
-        f'reset --hard, clean -xfd) plus the detect and confirm run_all.sh sub-runs.'
+        f'count of subprocess spawns inside a single lane pass, a warm infra red pass, '
+        f'measured by test_offline_lane_infra_integration.py::'
+        f'test_a_warm_infra_red_pass_is_the_lane_pass_floor_multiplier.'
     )
 
     from test_offline_lane_infra_integration import (
@@ -1119,7 +1120,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f"this module's _SPAWNS_PER_LANE_PASS_WORST_CASE ({_SPAWNS_PER_LANE_PASS_WORST_CASE}) "
         f"has drifted from test_offline_lane_infra_integration.py's copy "
         f'({_infra_spawns_per_lane_pass_worst_case}), which that module measures in its '
-        f'test_out_of_bound_spawn_counts_are_measured_not_asserted — so a real divergence '
+        f'test_a_warm_infra_red_pass_is_the_lane_pass_floor_multiplier — so a real divergence '
         f"here means this module's floor multiplier is a stale hand count."
     )
 
@@ -1625,11 +1626,11 @@ async def test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_t
     assert first.effect['tasks_filed'] == []
     assert lane.client.submitted == []
     assert lane.episode().counted_passes == (first.pass_id,)
-    assert [(r.test_id, r.verdict, r.call_site, r.project_id) for r in lane.ledger_rows()] == [reproduction]
+    assert lane.ledger_observations() == [reproduction]
 
     second = await _drive_lane_pass(lane, 'red')
 
-    assert [(r.test_id, r.verdict, r.call_site, r.project_id) for r in lane.ledger_rows()] == [reproduction] * 2
+    assert lane.ledger_observations() == [reproduction] * 2
     (arguments,) = lane.client.submitted
     episode = lane.episode()
     assert episode.covering_task_id is not None

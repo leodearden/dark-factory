@@ -1,8 +1,4 @@
-"""Drive a real OfflineLaneWorker's run loop until a counted number of passes complete.
-
-Imported by bare module name by the two offline-lane integration modules,
-``test_offline_lane_integration.py`` and ``test_offline_lane_infra_integration.py``.
-"""
+"""Drive a real OfflineLaneWorker's run loop until a counted number of passes complete."""
 
 from __future__ import annotations
 
