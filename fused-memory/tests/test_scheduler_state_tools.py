@@ -24,8 +24,13 @@ from orchestrator.pause_policy import PauseClass
 from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import Scheduler
 from shared.project_layout import scheduler_state_json
+from shared.scheduler_state import SchedulerStateSnapshot
 
-from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from fused_memory.mcp_tools.scheduler_state import (
+    SchedulerStateUnreadable,
+    read_scheduler_state,
+    read_scheduler_state_strict,
+)
 from fused_memory.server.tools import create_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -302,6 +307,45 @@ class TestGetSchedulerStateTool:
         assert result['park_stacks'] == _PARK_STACKS_FIXTURE, (
             f'Expected park_stacks surfaced end-to-end, got {result.get("park_stacks")!r}'
         )
+
+
+class TestReadSchedulerStateStrict:
+    """The strict reader tells an absent snapshot from one it cannot read."""
+
+    def test_an_absent_snapshot_reads_as_none(self, tmp_path):
+        assert read_scheduler_state_strict(tmp_path) is None
+
+    def test_a_present_snapshot_is_returned_with_its_holders(self, tmp_path):
+        _write_snapshot(
+            tmp_path, {'current_holders': {'m/src': '42'}, 'held_by_task': {'7': ['m/src']}},
+        )
+
+        result = read_scheduler_state_strict(tmp_path)
+
+        assert result is not None
+        assert result.holder_task_ids() == frozenset({'42', '7'})
+
+    @pytest.mark.parametrize(
+        'body', ['', '{not json', '[]', '{"lock_depth": true}'],
+        ids=['empty', 'invalid-json', 'non-object', 'malformed-shape'],
+    )
+    def test_an_unparseable_snapshot_raises_naming_the_path(self, tmp_path, body):
+        _write_snapshot_text(tmp_path, body)
+
+        with pytest.raises(SchedulerStateUnreadable) as exc:
+            read_scheduler_state_strict(tmp_path)
+
+        assert exc.value.path == scheduler_state_json(tmp_path)
+        assert str(scheduler_state_json(tmp_path)) in str(exc.value)
+        assert read_scheduler_state(tmp_path) == SchedulerStateSnapshot.empty()
+
+    def test_an_unreadable_path_raises_rather_than_reading_as_absent(self, tmp_path):
+        scheduler_state_json(tmp_path).mkdir(parents=True)
+
+        with pytest.raises(SchedulerStateUnreadable):
+            read_scheduler_state_strict(tmp_path)
+
+        assert read_scheduler_state(tmp_path) == SchedulerStateSnapshot.empty()
 
 
 # ===========================================================================
