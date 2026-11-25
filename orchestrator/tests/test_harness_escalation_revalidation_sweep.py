@@ -41,6 +41,7 @@ from escalation.models import Escalation
 
 from orchestrator.config import RELOADABLE_FIELDS, OrchestratorConfig, diff_config
 from orchestrator.harness import EventType, Harness
+from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -718,28 +719,61 @@ def _make_main_tip_harness(*, main_sha: str) -> Harness:
     return h
 
 
+def _cold_control_choosing(mode: SweepSeedMode) -> MainSweepColdControl:
+    """A ledger-less cold control whose next ``seed_mode()`` is *mode*:
+    a cold verdict just recorded keeps it WARM, no history makes it COLD."""
+    control = MainSweepColdControl(None, 'dark_factory')
+    if mode is SweepSeedMode.WARM:
+        control.record_verdict(SweepSeedMode.COLD, 'a' * 40)
+    return control
+
+
 class TestMainTipSweepSelfHealWiring:
-    """step-9: _run_main_tip_sweep invokes the self-heal ONLY on a real PASS."""
+    """step-9: _run_main_tip_sweep invokes the self-heal ONLY on a real PASS,
+    of either seed mode: a warm (CoW-seeded) pass is accepted close evidence
+    (Leo ruling 2026-10-09, esc-5812-4 option C; task 6574)."""
 
     @pytest.mark.asyncio
-    async def test_pass_invokes_self_heal_with_clean_sha(self) -> None:
+    @pytest.mark.parametrize(
+        'mode', [SweepSeedMode.WARM, SweepSeedMode.COLD], ids=['warm', 'cold'],
+    )
+    async def test_pass_closes_superseded_escalation_in_either_seed_mode(
+        self, mode: SweepSeedMode,
+    ) -> None:
         from orchestrator import verify as verify_module
 
         clean_sha = 'c' * 40
         h = _make_main_tip_harness(main_sha=clean_sha)
-        h._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
+        # kwargs pin (task 4481): both fields decide whether the close runs
+        # and which seed mode the control picks
+        h.config = OrchestratorConfig(
+            escalation_revalidation_enabled=True,
+            main_tip_sweep_cold_interval_secs=86400.0,
+        )
+        h._main_sweep_cold_control = _cold_control_choosing(mode)
+        h.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-main-sweep-superseded',
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
         passing = VerifyResult(
             passed=True, test_output='', lint_output='', type_output='',
             summary='all checks passed',
         )
+        sweep = AsyncMock(return_value=(clean_sha, passing))
 
-        with patch.object(
-            verify_module, 'run_main_tip_sweep',
-            new=AsyncMock(return_value=(clean_sha, passing)),
-        ):
+        with patch.object(verify_module, 'run_main_tip_sweep', new=sweep):
             await h._run_main_tip_sweep()
 
-        h._close_superseded_main_sweep_escalations.assert_awaited_once_with(clean_sha)  # type: ignore[attr-defined]
+        assert sweep.call_args.kwargs['seed_mode'] is mode
+        h.git_ops.is_ancestor.assert_awaited_once_with('deadbeef1234', clean_sha)  # type: ignore[attr-defined]
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert args[0] == esc.id
+        assert kwargs.get('dismiss') is True
+        assert kwargs.get('resolved_by') == 'harness-main-tip-sweep-selfheal'
+        assert kwargs.get('resolution_class') == 'benign'
         h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
 
     @pytest.mark.asyncio
