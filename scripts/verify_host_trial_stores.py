@@ -136,6 +136,11 @@ class SourceSpec:
         return frozenset({*self.columns, self.time_column, *filter(None, [self.kind_column])})
 
     @property
+    def whole_store(self) -> bool:
+        """Whether the source reads every row of the store, whatever the window."""
+        return self.reach == _WHOLE_STORE
+
+    @property
     def producer(self) -> str:
         """The rows the source reads, as the report names them: event types, or the table and its kind."""
         if self.kind_column == 'event_type':

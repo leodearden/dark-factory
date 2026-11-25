@@ -212,6 +212,24 @@ def test_a_root_without_a_runs_db_is_named_and_the_others_still_report(capsys, t
     assert '+100.0%' in decision_line(text)
 
 
+def test_unparseable_rows_of_a_whole_store_source_are_labelled_whole_store(capsys, store, samples):
+    plain_text_details = {**cap_hit(day(-180), 'max-a', None), 'details': 'Escalation watcher (auto)'}
+    root = store(
+        'dark-factory',
+        account_events=[plain_text_details],
+        invocations=[{**invocation(day(1), 'max-a', 1.0), 'cost_usd': 'n/a'}],
+    )
+
+    text = lines(run(capsys, [root], samples))
+    (project,) = json.loads(run(capsys, [root], samples, '--json'))['projects']
+
+    assert 'unparseable rows skipped: invocations 1, cap_hit 1 (whole store)' in text
+    assert {source: project['sources'][source] for source in ('invocations', 'cap_hit')} == {
+        'invocations': {'state': 'read', 'reason': None, 'skipped': 1, 'whole_store': False},
+        'cap_hit': {'state': 'read', 'reason': None, 'skipped': 1, 'whole_store': True},
+    }
+
+
 def test_json_allowance_places_cycles_at_weekly_caps_only_and_counts_the_others(capsys, store, samples):
     weekly_reset = day(4)
     five_hour_reset = day(6) + timedelta(hours=5)

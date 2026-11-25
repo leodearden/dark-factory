@@ -277,10 +277,14 @@ def decision_words(verdict: decision.Decision) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _skipped_words(source: stores.Source, count: int) -> str:
+    return f'{source} {count} (whole store)' if stores.SOURCES[source].whole_store else f'{source} {count}'
+
+
 def _project_lines(project: stores.ProjectRead) -> list[str]:
     line = f'project {_project_name(project)}: {project.status} ({project.runs_db})'
     lines = [line if project.detail is None else f'{line}: {project.detail}']
-    skipped = ', '.join(f'{source} {count}' for source, count in project.skipped.items() if count)
+    skipped = ', '.join(_skipped_words(source, count) for source, count in project.skipped.items() if count)
     return lines + ([f'  unparseable rows skipped: {skipped}'] if skipped else [])
 
 
@@ -389,7 +393,10 @@ def _project_json(project: stores.ProjectRead) -> dict[str, Any]:
         'status': project.status,
         'detail': project.detail,
         'lifecycle_ever_written': project.lifecycle_ever_written,
-        'sources': _jsonable(project.sources),
+        'sources': {
+            source: {**_jsonable(read), 'whole_store': stores.SOURCES[source].whole_store}
+            for source, read in project.sources.items()
+        },
     }
 
 
