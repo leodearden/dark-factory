@@ -488,10 +488,19 @@ def _outcome_line(outcome: RowOutcome) -> str:
     return format_kv_line(pairs, indent='    ')
 
 
+def _refusal_line(report: ApplyReport) -> str:
+    if report.refusal is RefusalReason.HOLDER_SET_UNREADABLE:
+        return (
+            '  apply: refused, nothing was written; the scheduler lock-holder set '
+            f'could not be read: {report.holder_set_error}'
+        )
+    held = ' '.join(str(task_id) for task_id in report.holder_intersection)
+    return f'  apply: refused, nothing was written; current lock holders among the selected rows: {held}'
+
+
 def _apply_lines(report: ApplyReport) -> list[str]:
     if report.refused:
-        held = ' '.join(str(task_id) for task_id in report.holder_intersection)
-        return [f'  apply: refused, nothing was written; current lock holders among the selected rows: {held}']
+        return [_refusal_line(report)]
     lines = [format_kv_line(list(report.counts().items()), indent='  buckets: ')]
     lines.extend(_outcome_line(outcome) for outcome in report.outcomes)
     if report.verification_census is not None:
@@ -547,7 +556,9 @@ def _apply_json(report: ApplyReport) -> dict[str, Any]:
     verification = report.verification_census
     return {
         'refused': report.refused,
+        'refusal_reason': report.refusal,
         'holder_intersection': list(report.holder_intersection),
+        'holder_set_error': report.holder_set_error,
         'counts': report.counts(),
         'buckets': {
             bucket: [_outcome_json(o) for o in report.outcomes if o.bucket is bucket]
@@ -584,6 +595,7 @@ class ExitCode(IntEnum):
     NOTHING_READ = 3
     SERVER_UNREACHABLE = 4
     HOLDER_REFUSED = 5
+    HOLDER_SET_UNREADABLE = 6
 
 
 _EXIT_CODE_MEANINGS = {
@@ -596,6 +608,10 @@ _EXIT_CODE_MEANINGS = {
         '--apply refused a project because a selected row is a current lock holder; '
         'that project was not written'
     ),
+    ExitCode.HOLDER_SET_UNREADABLE: (
+        '--apply refused a project because its scheduler_state.json exists but could not be read '
+        'as a snapshot, so the lock-holder pre-flight could not check; that project was not written'
+    ),
 }
 
 
@@ -604,9 +620,11 @@ def exit_conditions(result: SweepResult) -> tuple[ExitCode, ...]:
     if not result.projects:
         return (ExitCode.NOTHING_READ,)
     reports = [project.apply for project in result.projects if project.apply is not None]
+    refusals = {report.refusal for report in reports}
     conditions = {
         ExitCode.REPAIR_FAILED: any(report.counts()[Bucket.FAILED] for report in reports),
-        ExitCode.HOLDER_REFUSED: any(report.refused for report in reports),
+        ExitCode.HOLDER_SET_UNREADABLE: RefusalReason.HOLDER_SET_UNREADABLE in refusals,
+        ExitCode.HOLDER_REFUSED: RefusalReason.HOLDERS_IN_SELECTION in refusals,
     }
     return tuple(code for code, present in conditions.items() if present)
 
