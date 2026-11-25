@@ -1175,22 +1175,29 @@ class TestRetentionIsBoundedPerTick:
         assert store.cleanup_old(now + 5, max_rows=10) == 0
         assert _meta(db_path, 'last_cleanup_ts') == str(now + 5)
 
+    @pytest.mark.parametrize('sweep_due', [True, False], ids=['due', 'not-due'])
     @pytest.mark.parametrize('bad', [0, -1])
-    def test_a_budget_below_one_row_is_refused(self, tmp_path: Path, bad: int):
+    def test_a_budget_below_one_row_is_refused(
+        self, tmp_path: Path, bad: int, sweep_due: bool
+    ):
         """0 would never finish a sweep; -1 is an unbounded LIMIT in SQLite."""
         from sampler.store import LoadSampleStore
 
         db_path = tmp_path / 'db.sqlite'
         store = LoadSampleStore(db_path)
         now = 10_000_000
+        if not sweep_due:
+            store.cleanup_old(now - 5)
+        stamp = _meta(db_path, 'last_cleanup_ts')
+        assert store.should_cleanup(now) is sweep_due
         stale = now - THIRTY_DAYS - 60
         store.insert_sample(stale, RUNQ, 1.0)
 
-        with pytest.raises(ValueError, match=rf'max_rows.*{bad}'):
+        with pytest.raises(ValueError, match=rf'max_rows .* got {bad}$'):
             store.cleanup_old(now, max_rows=bad)
 
         assert _count_at(db_path, stale) == 1
-        assert _meta(db_path, 'last_cleanup_ts') is None
+        assert _meta(db_path, 'last_cleanup_ts') == stamp
 
 
 # ---------------------------------------------------------------------------
