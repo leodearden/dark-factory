@@ -59,12 +59,13 @@ from types import SimpleNamespace
 from typing import Literal, cast
 
 import pytest
+from _git_fixtures import seed_repo
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
 from _merge_lane_fakes import FakeVerifier, lane_scene_config
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import worker as merge_queue
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import InflightEntry, MergeRequest, SpeculativeMergeWorker
@@ -105,26 +106,10 @@ def git_ops(git_config: GitConfig, tmp_path) -> GitOps:
 # to git, so they keep using the bare-tmp_path git_ops/config fixtures above.
 
 
-async def _setup_e2e_repo(repo: Path) -> None:
-    """Initialise a minimal real git repo with one initial commit on main.
-
-    Mirrors test_merge_queue.py's module-level ``_setup_repo``.
-    """
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def e2e_git_repo(tmp_path: Path) -> Path:
     """Real initialised git repo for the step-07 end-to-end conformance test."""
-    repo = tmp_path / 'e2e-repo'
-    repo.mkdir()
-    asyncio.run(_setup_e2e_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'e2e-repo')
 
 
 @pytest.fixture

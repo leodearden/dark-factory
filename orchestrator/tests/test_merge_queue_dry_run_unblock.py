@@ -27,6 +27,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config, make_lane
 from _orch_helpers import wait_responsive
 from test_dry_run_unblock import _init_git_repo, _make_agent_result, _RecordingScheduler
@@ -44,7 +45,6 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import investigation_task_name
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.git_ops import _run as _run_git
 from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
 from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 from orchestrator.merge_lane.verify_failure_outcome import (
@@ -607,14 +607,7 @@ async def _lane_repo(tmp_path: Path) -> tuple[GitOps, OrchestratorConfig]:
     in, MergeOutcome out) over a real repository -- the idiom
     test_merge_lane_package.py established for the ports.
     """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    await _run_git(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run_git(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run_git(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run_git(['git', 'add', '-A'], cwd=repo)
-    await _run_git(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    repo = seed_repo(tmp_path / 'repo')
 
     git_config = GitConfig(
         main_branch='main', branch_prefix='task/', remote='origin',
