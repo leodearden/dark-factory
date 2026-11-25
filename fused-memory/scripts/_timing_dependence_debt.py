@@ -85,7 +85,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_lane_verify_dispatch.py': 5,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 5,
     'orchestrator/tests/test_merge_skew_tripwire.py': 5,
-    'orchestrator/tests/test_offline_lane_outage_probe.py': 5,
+    'orchestrator/tests/test_offline_lane_outage_probe.py': 3,
     'orchestrator/tests/test_workflow_operator_merge_cancel.py': 5,
     'orchestrator/tests/test_artifacts.py': 4,
     'orchestrator/tests/test_atomic_train_merge.py': 4,
