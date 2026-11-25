@@ -15,6 +15,7 @@ from _git_fixtures import seed_repo
 from _verify_artifact_fixtures import registry_config
 from _verify_host_drive import runner_double
 from _verify_result_doubles import real_verify_result
+from shared.governed_exceptions import TaskRef
 
 from orchestrator import verify_host_preflight as preflight
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, VerifyRunnerConfig
@@ -326,3 +327,79 @@ class TestRefusals:
         config = preflight_config(repo, runners=[declared_runner(name)])
 
         await self.assert_refused(config, runner=name)
+
+
+TRACKED_EXCEPTIONS = (
+    Path(__file__).resolve().parents[2] / 'config' / 'verify-host-skip-parity-exceptions.yaml'
+)
+REIFY_GUARD = 'tests.test_verify_role_integration::test_role_env_propagates_to_reify_verify_plan'
+
+
+def exceptions_file(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / 'exceptions.yaml'
+    path.write_text(text)
+    return path
+
+
+class TestSkipParityExceptions:
+    def test_the_tracked_file_loads_and_every_entry_is_owned(self) -> None:
+        loaded = preflight.load_skip_parity_exceptions(TRACKED_EXCEPTIONS)
+
+        assert loaded
+        owners = {e.test_id: e.owner for e in loaded}
+        assert owners[f'{REIFY_GUARD}[merge]'] == TaskRef(7030)
+        assert owners[f'{REIFY_GUARD}[task]'] == TaskRef(7030)
+
+    def test_an_entry_with_no_owner_is_refused_by_test_id(self, tmp_path: Path) -> None:
+        path = exceptions_file(tmp_path, (
+            'exceptions:\n'
+            '  - test_id: "t::orphan"\n'
+            '    reason: needs a thing\n'
+        ))
+
+        with pytest.raises(preflight.SkipParityExceptionsError) as raised:
+            preflight.load_skip_parity_exceptions(path)
+
+        assert str(path) in str(raised.value)
+        assert 't::orphan' in str(raised.value)
+
+    @pytest.mark.parametrize('owner', ['7030', '{type: task, id: 0}', '{type: person, id: leo}'])
+    def test_an_owner_that_is_not_an_owner_record_is_refused(
+        self, tmp_path: Path, owner: str,
+    ) -> None:
+        path = exceptions_file(tmp_path, (
+            'exceptions:\n'
+            '  - test_id: "t::bad_owner"\n'
+            f'    owner: {owner}\n'
+            '    reason: needs a thing\n'
+        ))
+
+        with pytest.raises(preflight.SkipParityExceptionsError) as raised:
+            preflight.load_skip_parity_exceptions(path)
+
+        assert 't::bad_owner' in str(raised.value)
+
+    @pytest.mark.parametrize('entries', [
+        '  - owner: {type: task, id: 7030}\n    reason: r\n',
+        '  - test_id: "t::a"\n    owner: {type: task, id: 7030}\n    reason: "  "\n',
+        '  - test_id: "t::a"\n    owner: {type: task, id: 7030}\n',
+        ('  - test_id: "t::a"\n    owner: {type: task, id: 7030}\n    reason: r\n'
+         '  - test_id: "t::a"\n    owner: {type: ticket, id: tkt_01ABC}\n    reason: r\n'),
+    ], ids=['missing-test-id', 'blank-reason', 'missing-reason', 'duplicate-test-id'])
+    def test_an_incomplete_or_duplicated_entry_is_refused(
+        self, tmp_path: Path, entries: str,
+    ) -> None:
+        path = exceptions_file(tmp_path, 'exceptions:\n' + entries)
+
+        with pytest.raises(preflight.SkipParityExceptionsError):
+            preflight.load_skip_parity_exceptions(path)
+
+    @pytest.mark.parametrize('text', ['[]\n', 'exceptions: {}\n', 'other: []\n', '- 1\n'])
+    def test_a_top_level_that_is_not_an_exceptions_list_is_refused(
+        self, tmp_path: Path, text: str,
+    ) -> None:
+        with pytest.raises(preflight.SkipParityExceptionsError):
+            preflight.load_skip_parity_exceptions(exceptions_file(tmp_path, text))
+
+    def test_an_absent_file_means_no_exceptions(self, tmp_path: Path) -> None:
+        assert preflight.load_skip_parity_exceptions(tmp_path / 'absent.yaml') == ()
