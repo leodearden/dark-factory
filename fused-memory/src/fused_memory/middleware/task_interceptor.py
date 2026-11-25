@@ -6725,12 +6725,13 @@ class TaskInterceptor:
         offset: int = 0,
         tag: str | None = None,
         include_value: bool = False,
+        include_rows: bool = False,
     ) -> MetadataLookupResult:
         tm = await self._ensure_taskmaster()
         return await tm.find_tasks_by_metadata(
             project_root, key, value,
             statuses=statuses, limit=limit, offset=offset, tag=tag,
-            include_value=include_value,
+            include_value=include_value, include_rows=include_rows,
         )
 
     async def apply_defect_events(

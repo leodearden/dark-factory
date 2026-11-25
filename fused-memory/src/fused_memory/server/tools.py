@@ -583,7 +583,7 @@ Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (keep page_size <= 2000 — larger pages can exceed the MCP tool-response transport limit and be rejected wholesale), with auto_paginate=True as an opt-in one-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
-- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value
+- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value; include_rows=True adds metadata and dependencies (echoed as include_rows)
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
@@ -1359,10 +1359,13 @@ def _validate_fields(fields: Any) -> dict[str, Any] | None:
     return None
 
 
-# find_tasks_by_metadata's page-size cap, and its include_value page budget in
-# serialized bytes of ``results`` (plans/task-metadata-lookup-prd.md decision 6).
+# find_tasks_by_metadata's page-size cap, and the page budget its include_value
+# and include_rows pages share, in serialized bytes of ``results``
+# (plans/task-metadata-lookup-prd.md decision 6).
 METADATA_LOOKUP_LIMIT_CAP = 100
 RESULT_BYTE_BUDGET = 48_000
+# Each opt-in payload field a lone over-budget row elides, and the flag marking it.
+_ELIDABLE_FIELDS = (('matched_value', 'truncated_value'), ('metadata', 'truncated_row'))
 
 
 def _json_bytes(obj: Any) -> int:
@@ -1371,8 +1374,12 @@ def _json_bytes(obj: Any) -> int:
 
 
 def _elided_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    elided = {'_elided': True, 'bytes': _json_bytes(row['matched_value'])}
-    return {**row, 'matched_value': elided, 'truncated_value': True}
+    elided = dict(row)
+    for field, flag in _ELIDABLE_FIELDS:
+        if field in row:
+            elided[field] = {'_elided': True, 'bytes': _json_bytes(row[field])}
+            elided[flag] = True
+    return elided
 
 
 def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -1380,7 +1387,7 @@ def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, 
 
     Sizes add up exactly as ``json.dumps`` of the list: ``[]`` plus each row
     plus a ``', '`` between rows. A first row too big to fit alone comes back
-    as the only row, with its value elided.
+    as the only row, with every opted-in payload elided.
     """
     size = len('[]')
     for count, row in enumerate(rows):
@@ -10020,6 +10027,7 @@ def create_mcp_server(
         offset: int = 0,
         tag: str | None = None,
         include_value: Any = False,
+        include_rows: Any = False,
     ) -> dict[str, Any]:
         """Exact lookup of the tasks whose top-level ``metadata[key]`` matches ``value``.
 
@@ -10039,13 +10047,19 @@ def create_mcp_server(
             offset: Zero-based index into the matches, ordered by task id.
             tag: Tag context (optional).
             include_value: True adds ``matched_value``, the whole ``metadata[key]``.
+            include_rows: True adds ``metadata`` (the whole top-level object) and
+                ``dependencies`` (ids ascending, ``[]`` when none); ``description``
+                is never returned.
 
         Returns ``results`` (``task_id``, ``title``, ``status``, ``priority``,
         ``updated_at``), ``tasks_with_key`` (how many tasks in the searched
         statuses carry ``key``), ``pagination`` (page on ``has_more`` with
         ``offset += returned``), ``malformed_metadata_ids`` when some task's
-        metadata is not a JSON object, and the echoed arguments. An ``error``
-        payload means the lookup failed; it never means "no match".
+        metadata is not a JSON object, and the echoed arguments, ``include_rows``
+        among them. With either opt-in a page fits ``RESULT_BYTE_BUDGET``; a lone
+        over-budget row carries ``truncated_value`` / ``truncated_row`` with its
+        payload elided, so read it with ``get_task``. An ``error`` payload means
+        the lookup failed; it never means "no match".
         """
         paging_error = _validate_paging(limit, offset, size_arg='limit')
         if paging_error is not None:
@@ -10056,7 +10070,8 @@ def create_mcp_server(
         page_size = min(limit, METADATA_LOOKUP_LIMIT_CAP)
         try:
             validate_metadata_query(
-                key=key, value=value, statuses=statuses, include_value=include_value,
+                key=key, value=value, statuses=statuses,
+                include_value=include_value, include_rows=include_rows,
             )
         except InvalidMetadataLookupError as e:
             return {'error': str(e), 'error_type': 'ValidationError'}
@@ -10066,9 +10081,12 @@ def create_mcp_server(
         found = await task_interceptor.find_tasks_by_metadata(
             normalized, key, value,
             statuses=statuses, limit=page_size, offset=offset, tag=tag,
-            include_value=include_value,
+            include_value=include_value, include_rows=include_rows,
         )
-        results = _fit_rows_to_budget(found['results']) if include_value else found['results']
+        results = (
+            _fit_rows_to_budget(found['results'])
+            if include_value or include_rows else found['results']
+        )
         pid = resolve_project_id(normalized)
         response: dict[str, Any] = {
             'project_id': pid,
@@ -10076,6 +10094,7 @@ def create_mcp_server(
             'key': key,
             'value': value,
             'statuses': statuses,
+            'include_rows': include_rows,
             'results': results,
             'tasks_with_key': found['tasks_with_key'],
             'pagination': _pagination_meta(
