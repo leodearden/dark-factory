@@ -128,7 +128,8 @@ _SPLIT_LEGACY_KEYS_SQL = (
 # A VACUUM is worth its whole-file rewrite only past this share of free pages.
 _VACUUM_MIN_RECLAIMABLE_FRACTION = 0.10
 
-# Keeps one tick's share of a retention sweep well inside the 5 s tick interval.
+# Keeps one tick's share of a retention sweep well inside the tick interval
+# (dashboard/dark-factory-load-sampler.timer::OnUnitActiveSec).
 _RETENTION_ROWS_PER_TICK = 20_000
 
 # Samples a trailing window spans, current value included. One home for it, so
