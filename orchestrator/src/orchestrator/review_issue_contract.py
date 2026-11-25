@@ -4,8 +4,7 @@ An issue is one object in a reviewer verdict's ``issues`` list. The prompt that
 states the contract, the verdict-tools intake that normalises against it and
 the review gate that reads it all take the vocabulary from here. The
 per-invocation verdict-tools stdio server imports it on its startup path, so
-its one dependency beyond the stdlib is the shared defect vocabulary, about
-0.1 s on top of the fastmcp/pydantic imports that server already pays.
+its one dependency beyond the stdlib is the shared defect vocabulary.
 """
 
 from __future__ import annotations

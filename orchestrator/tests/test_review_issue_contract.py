@@ -11,7 +11,7 @@ import logging
 
 import pytest
 from _review_issue_fixtures import ON_CONTRACT_VALUES, contract_issue, contract_issue_without
-from shared.defects import IssueKind
+from shared.defects import IssueKind, IssueKindFlag, IssueKindReading, issue_kind_of
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.review_issue_contract import (
@@ -158,6 +158,29 @@ class TestKindVocabulary:
                 recorded_as=None,
             ),
         )
+
+    @pytest.mark.parametrize(
+        ('received', 'member'),
+        [
+            *((kind.value, kind) for kind in IssueKind),
+            (' Docs ', IssueKind.DOCS),
+            ('TEST_QUALITY', IssueKind.TEST_QUALITY),
+        ],
+    )
+    def test_issue_kind_of_reads_every_kind_the_intake_records_unflagged(
+        self, received, member,
+    ):
+        [recorded] = check_issues([contract_issue(kind=received)]).issues
+
+        assert issue_kind_of(recorded) == IssueKindReading(member)
+
+    def test_the_intake_canonicalises_a_variant_issue_kind_of_alone_would_flag(self):
+        received = contract_issue(kind=' Docs ')
+
+        [recorded] = check_issues([received]).issues
+
+        assert issue_kind_of(received).flag is IssueKindFlag.UNRECOGNISED
+        assert issue_kind_of(recorded) == IssueKindReading(IssueKind.DOCS)
 
     @pytest.mark.parametrize(
         'issue',

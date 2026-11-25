@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -164,7 +164,12 @@ class IssueIntakeOutcome(StrEnum):
     REFUSED = 'refused'
 
 
-_REQUIRED_FIELDS_TEXT = ', '.join(str(field) for field in REQUIRED_ISSUE_FIELDS)
+def _in_prose(names: Sequence[str]) -> str:
+    *leading, last = names
+    return f'{", ".join(leading)} and {last}' if leading else last
+
+
+_REQUIRED_FIELDS_TEXT = _in_prose([str(field) for field in REQUIRED_ISSUE_FIELDS])
 
 
 def _issue_contract_refusal(intake: IssueIntake) -> dict[str, Any]:
@@ -173,10 +178,10 @@ def _issue_contract_refusal(intake: IssueIntake) -> dict[str, Any]:
         'status': 'error',
         'message': (
             'nothing was written: every issue must be an object carrying a '
-            f'valid {_REQUIRED_FIELDS_TEXT}, and these are not: '
+            f'{_REQUIRED_FIELDS_TEXT}. These are not: '
             + '; '.join(deviations) + '. Call submit_review_verdict again with '
-            f'a valid {_REQUIRED_FIELDS_TEXT} on every issue (or drop the '
-            'issue) and the verdict will land.'
+            f'a {_REQUIRED_FIELDS_TEXT} on every issue, as the contract '
+            'states (or drop the issue), and the verdict will land.'
         ),
         'issue_contract': {'outcome': IssueIntakeOutcome.REFUSED, 'deviations': deviations},
     }
@@ -594,8 +599,8 @@ def create_server(
                     rather than written.
                 defect_rulings: One entry per defect closure or defect-test
                     retirement your briefing asks you to rule on, each
-                    {ref, subject: "closure" | "retirement", accepted: true |
-                    false}. Omit it when the briefing asks for none. A
+                    shaped as the reviewer contract in your instructions
+                    states. Omit it when the briefing asks for none. A
                     malformed list is rejected (status: error) rather than
                     written.
             """
