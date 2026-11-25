@@ -243,13 +243,14 @@ def test_an_unreachable_step_two_goes_to_the_curator_and_says_so(store) -> None:
     assert "search_tasks" in decision.note
 
 
-_DEGRADED = task_store.StoreDegraded("search_tasks: degraded: RateLimitError: insufficient_quota")
+def _degraded() -> task_store.StoreDegraded:
+    return task_store.StoreDegraded("search_tasks: degraded: RateLimitError: insufficient_quota")
 
 
 @pytest.mark.parametrize("submit", [_Submit(), None], ids=["filing", "dry-run"])
 def test_a_degraded_step_two_holds_the_finding_unfiled_for_the_next_run(submit) -> None:
     filing = _filing()
-    store = FakeTaskStore(search_hits={filing.title: _DEGRADED})
+    store = FakeTaskStore(search_hits={filing.title: _degraded()})
 
     disposal = disposition.dispose([filing], store=store, submit=submit)
 
@@ -868,7 +869,7 @@ def test_a_refused_ticket_says_so_with_the_reason() -> None:
 
 def test_a_held_finding_renders_open_with_why_and_when_it_is_retried() -> None:
     filing = _filing()
-    store = FakeTaskStore(search_hits={filing.title: _DEGRADED})
+    store = FakeTaskStore(search_hits={filing.title: _degraded()})
 
     (row,) = _table(_filed(_record(*_disposed_and_resolved([filing], store))))
 
@@ -1667,6 +1668,21 @@ def test_a_present_finding_whose_done_task_is_found_by_meaning_after_step_1c_is_
 
     assert submit.calls == []
     assert (decision.step, decision.task_id) == (Step.SEMANTIC, 88)
+
+
+def test_a_present_finding_held_at_a_degraded_step_two_keeps_its_step_1c_note() -> None:
+    filing = _present(_filing())
+    store = FakeTaskStore(metadata_hits=_key_hits(_hit(40, "done")), search_hits={filing.title: _degraded()})
+    submit = _Submit()
+
+    decision = _only(disposition.dispose([filing], store=store, submit=submit))
+
+    assert submit.calls == []
+    assert decision.step is Step.SEMANTIC
+    assert decision.routed is False
+    assert decision.note is not None
+    assert "§8 step 1c" in decision.note
+    assert "next run" in decision.note
 
 
 def test_a_filing_that_already_supersedes_a_task_keeps_it_when_its_key_finds_another_done_task() -> None:
