@@ -12,6 +12,7 @@ import asyncio
 import collections
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,6 +32,7 @@ from fused_memory.models.memory import Mem0WriteState, render_add_memory_message
 from fused_memory.reconciliation.stage_stats import derive_stage_stats
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.queued_writes import QueueOperation
+from fused_memory.services.write_journal import WriteJournal
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -970,6 +972,118 @@ class TestTerminalOutcomeWrittenBack:
         # clobbering it.
         assert row['terminal_status'] == 'completed'
         assert row['terminal_error'] is None
+
+
+# ---------------------------------------------------------------------------
+# The queue's attempt budget bounds a write until it LANDS (task 11800).
+# A journal write slower than the budget AFTER the backend call returned used
+# to cancel the attempt, journal a false backend failure and replay the
+# landed write.
+# ---------------------------------------------------------------------------
+
+_ATTEMPT_BUDGET_SECONDS = 0.2
+
+
+@pytest.mark.timing(reason='models a journal write slower than the queue attempt budget')
+class _SuccessRowStallingJournal(WriteJournal):
+    """A WriteJournal whose next success row for ``stall_backend`` stalls first.
+
+    The stall sleeps on the event loop's clock, the clock the queue's budget
+    runs on, so the earlier deadline always fires first.
+    """
+
+    def __init__(self, data_dir: Path, *, stall_seconds: float) -> None:
+        super().__init__(data_dir)
+        self.stall_seconds = stall_seconds
+        self.stall_backend: str | None = 'graphiti'
+
+    async def log_backend_op(self, **kwargs: Any) -> None:
+        if kwargs['success'] and kwargs['backend'] == self.stall_backend:
+            self.stall_backend = None
+            await asyncio.sleep(self.stall_seconds)
+        await super().log_backend_op(**kwargs)
+
+
+@pytest_asyncio.fixture
+async def budget_stalled_service(mock_config, tmp_path):
+    """journaled_service with a narrowed attempt budget and a stalling journal."""
+    mock_config.queue.write_timeout_seconds = _ATTEMPT_BUDGET_SECONDS
+    svc = mock_memory_backends(MemoryService(mock_config))
+    await svc.initialize()
+
+    journal = _SuccessRowStallingJournal(
+        tmp_path / 'wj_e2e', stall_seconds=3 * _ATTEMPT_BUDGET_SECONDS,
+    )
+    await journal.initialize()
+    svc.set_write_journal(journal)
+
+    yield svc, journal
+
+    await svc.close()
+    await journal.close()
+
+
+@pytest.mark.timing(
+    reason='the queue attempt budget is the behaviour under test: a landed write must outlive it',
+)
+class TestLandedWriteOutlivesAttemptBudget:
+    @pytest.mark.asyncio
+    async def test_slow_journal_write_after_graphiti_landing_does_not_replay_the_write(
+        self, budget_stalled_service
+    ):
+        svc, journal = budget_stalled_service
+
+        await svc.add_episode(content='an episode that lands', project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        async def _completed():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(
+            _completed, timeout=20.0, message='write never stamped completed'
+        )
+        assert journal.stall_backend is None, 'the graphiti success row never stalled'
+        backend_ops = await journal.get_backend_ops_for_write_op(write_op_id)
+        assert [(op['backend'], op['success']) for op in backend_ops] == [
+            ('graphiti', 1)
+        ]
+        assert svc.graphiti.add_episode.await_count == 1
+        row = await journal.get_write_op(write_op_id)
+        assert row['terminal_error'] is None
+
+    @pytest.mark.asyncio
+    async def test_slow_journal_write_after_mem0_fact_landing_does_not_replay_the_write(
+        self, budget_stalled_service
+    ):
+        svc, journal = budget_stalled_service
+        episode = MagicMock()
+        episode.edges = [
+            MagicMock(
+                fact='Always format code with black',
+                source_node_uuid='',
+                target_node_uuid='',
+            )
+        ]
+        svc.graphiti.add_episode.return_value = episode
+        journal.stall_backend = 'mem0'
+
+        await svc.add_episode(
+            content='User discussed formatting preferences', project_id='test'
+        )
+
+        async def _both_completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 2 else None
+
+        stats = await poll_until(
+            _both_completed,
+            timeout=20.0,
+            message='timed out waiting for the episode and mem0 fact items to complete',
+        )
+        assert journal.stall_backend is None, 'the mem0 success row never stalled'
+        assert stats['counts'] == {'completed': 2}
+        assert svc.mem0.add.await_count == 1
 
 
 class TestAddMemoryReportsGraphitiQueued:
