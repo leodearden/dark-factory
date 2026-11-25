@@ -892,6 +892,7 @@ async def run_server():
         if taskmaster is not None and taskmaster.connected:
             targeted = TargetedReconciler(
                 memory_service, taskmaster, recon_journal, config, event_buffer,
+                cost_store=curator_cost_store,
             )
             # Wire the planned episode registry so _on_task_done can promote planned
             # episodes when tasks complete (otherwise the promotion code is dead code).
@@ -1000,6 +1001,7 @@ async def run_server():
             escalation_listener=_claim_listener(
                 systemd_listeners, config.reconciliation.escalation_port,
             ),
+            cost_store=curator_cost_store,
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -2012,8 +2014,15 @@ async def _build_recon_ledger_store(data_dir: Path) -> ReconLedgerStore:
 
 
 def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
-    """Return the SQLite path for the curator CostStore, under :func:`resolve_data_dir`."""
-    return resolve_data_dir(config) / 'curator_events.db'
+    """The process's one invocations ledger, under :func:`resolve_data_dir`.
+
+    The curator family and recon (stages, judge, verify loop) write it through
+    the server's store; the operator script link_heal.py writes its link
+    adjudicator rows to the same file.
+    """
+    from fused_memory.models.invocation_ledger import invocations_ledger_path
+
+    return invocations_ledger_path(resolve_data_dir(config))
 
 
 def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
@@ -2538,15 +2547,16 @@ async def _graceful_shutdown(
     2. Close task_interceptor (release curator's Qdrant client).
     3. Shutdown curator_usage_gate (cancel resume-probe + drain background
        cost-event tasks, so no write lands on a closed connection).
-    4. Close curator_cost_store (independent SQLite connection; slotted near
-       task_interceptor to keep curator-lifecycle cleanup together; only safe
-       after gate.shutdown() has drained all in-flight save_account_event tasks).
-    5. Cancel SQLite watchdog (purely observational; close before drainer so
+    4. Cancel SQLite watchdog (purely observational; close before drainer so
        the wedge-detection logic doesn't trip during a legitimate shutdown drain).
-    6. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
+    5. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
        Must happen BEFORE memory_service.close(), because the drainer writes
        into the SQLite event buffer that memory_service owns.
-    7. Cancel harness loop task (stops background reconciliation + escalation server).
+    6. Cancel harness loop task (stops background reconciliation + escalation server).
+    7. Close curator_cost_store (independent SQLite connection). Only safe after
+       gate.shutdown() has drained all in-flight save_account_event tasks, and
+       after the harness loop has stopped: the recon stages, judge and verify
+       loop write their invocations rows through it.
     8. Close Taskmaster supervisor (cleanly tears down the Node child after
        harness/interceptor stop generating new requests). Done before
        memory_service.close() because MemoryService still holds a reference.
@@ -2573,9 +2583,6 @@ async def _graceful_shutdown(
     if curator_usage_gate is not None:
         await _run_shielded('curator_usage_gate.shutdown', curator_usage_gate.shutdown)
 
-    if curator_cost_store is not None:
-        await _run_shielded('curator_cost_store.close', curator_cost_store.close)
-
     if sqlite_watchdog is not None:
         await _run_shielded('sqlite_watchdog.close', sqlite_watchdog.close)
 
@@ -2594,6 +2601,9 @@ async def _graceful_shutdown(
             _await_harness,
             timeout=_HARNESS_CANCEL_TIMEOUT,
         )
+
+    if curator_cost_store is not None:
+        await _run_shielded('curator_cost_store.close', curator_cost_store.close)
 
     if taskmaster is not None:
         await _run_shielded('taskmaster.close', taskmaster.close)
