@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Any, ClassVar
 
 from escalation.disposition import ReviewerDisposition
+from shared.defects import MalformedDefectRef, RulingSubject, parse_ref
 
 from orchestrator.review_issue_contract import IssueField, IssueSeverity, parse_severity
 
@@ -91,12 +92,73 @@ def parse_note_dispositions(
 
 
 @dataclass(frozen=True)
+class DefectRuling:
+    ref: str
+    subject: RulingSubject
+    accepted: bool
+
+    def to_record(self) -> dict[str, Any]:
+        return {'ref': self.ref, 'subject': self.subject.value, 'accepted': self.accepted}
+
+
+def defect_rulings_record(rulings: Iterable[DefectRuling]) -> dict[str, Any]:
+    records = [ruling.to_record() for ruling in rulings]
+    return {'defect_rulings': records} if records else {}
+
+
+def _defect_ruling(entry: object, index: int, reviewer: object) -> DefectRuling:
+    where = f'defect_rulings entry {index} of the review from {reviewer!r}'
+    if not isinstance(entry, Mapping):
+        raise ReviewPayloadError(f'{where} is a {type(entry).__name__}, not a mapping: {entry!r}')
+    try:
+        ref = parse_ref(entry.get('ref')).ref
+    except MalformedDefectRef as exc:
+        raise ReviewPayloadError(f'{where} has a malformed ref: {exc}') from None
+    raw_subject = entry.get('subject')
+    try:
+        subject = RulingSubject(raw_subject)
+    except ValueError:
+        raise ReviewPayloadError(
+            f'{where} has subject {raw_subject!r}; '
+            f'expected one of {[s.value for s in RulingSubject]}'
+        ) from None
+    accepted = entry.get('accepted')
+    if type(accepted) is not bool:
+        raise ReviewPayloadError(f'{where} has accepted {accepted!r}; expected true or false')
+    return DefectRuling(ref, subject, accepted)
+
+
+def parse_defect_rulings(
+    raw: object, *, reviewer: object = None,
+) -> tuple[DefectRuling, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ReviewPayloadError(
+            f'review from {reviewer!r} has defect_rulings {raw!r} '
+            f'({type(raw).__name__}); expected a list'
+        )
+    parsed = tuple(_defect_ruling(entry, index, reviewer) for index, entry in enumerate(raw))
+    first_index: dict[tuple[str, RulingSubject], int] = {}
+    for index, ruling in enumerate(parsed):
+        key = (ruling.ref, ruling.subject)
+        if key in first_index:
+            raise ReviewPayloadError(
+                f'defect_rulings entries {first_index[key]} and {index} of the review from '
+                f'{reviewer!r} both rule on the {ruling.subject} of {ruling.ref!r}'
+            )
+        first_index[key] = index
+    return parsed
+
+
+@dataclass(frozen=True)
 class ReviewPayload:
     verdict: Verdict
     issues: tuple[dict[str, Any], ...]
     reviewer: str | None
     summary: str = ''
     note_dispositions: tuple[NoteDisposition, ...] = ()
+    defect_rulings: tuple[DefectRuling, ...] = ()
 
     __hash__: ClassVar[None] = None
 
@@ -133,6 +195,17 @@ class ReviewPayload:
                     f'note disposition {index} of the review from {self.reviewer!r} is a '
                     f'{type(note).__name__}, not a NoteDisposition: {note!r}'
                 )
+        if self.verdict is Verdict.ERROR and self.defect_rulings:
+            raise ReviewPayloadError(
+                f'ERROR review from {self.reviewer!r} carries '
+                f'{len(self.defect_rulings)} defect ruling(s); an ERROR review carries none'
+            )
+        for index, ruling in enumerate(self.defect_rulings):
+            if not isinstance(ruling, DefectRuling):
+                raise ReviewPayloadError(
+                    f'defect ruling {index} of the review from {self.reviewer!r} is a '
+                    f'{type(ruling).__name__}, not a DefectRuling: {ruling!r}'
+                )
 
     @property
     def blocking_issues(self) -> tuple[dict[str, Any], ...]:
@@ -149,6 +222,7 @@ class ReviewPayload:
             'issues': list(self.issues),
             'summary': self.summary,
             **note_dispositions_record(self.note_dispositions),
+            **defect_rulings_record(self.defect_rulings),
         }
 
 
@@ -200,6 +274,10 @@ def normalize_review(artifact: object) -> ReviewPayload:
         () if verdict is Verdict.ERROR
         else parse_note_dispositions(payload.get('note_dispositions'), reviewer=reviewer)
     )
+    defect_rulings = (
+        () if verdict is Verdict.ERROR
+        else parse_defect_rulings(payload.get('defect_rulings'), reviewer=reviewer)
+    )
     summary = payload.get('summary')
     return ReviewPayload(
         verdict=verdict,
@@ -207,4 +285,5 @@ def normalize_review(artifact: object) -> ReviewPayload:
         reviewer=reviewer,
         summary='' if summary is None else summary,
         note_dispositions=note_dispositions,
+        defect_rulings=defect_rulings,
     )

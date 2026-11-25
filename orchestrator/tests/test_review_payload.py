@@ -314,7 +314,7 @@ class TestNoteDispositions:
 
 
 _REVIEW_REF = mint_review_ref(7048, 'a.py:1', 'x is wrong')
-_REDMAIN_REF = mint_redmain_ref('sig-1')
+_REDMAIN_REF = mint_redmain_ref('0123456789abcdef')
 _CLOSURE_RAW = {'ref': _REVIEW_REF, 'subject': 'closure', 'accepted': True}
 _RETIREMENT_RAW = {'ref': _REDMAIN_REF, 'subject': 'retirement', 'accepted': False}
 _CLOSURE = DefectRuling(_REVIEW_REF, RulingSubject.CLOSURE, True)
