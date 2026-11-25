@@ -76,6 +76,7 @@ from _verify_boundary_harness import (
     git_push_succeeds,
     kill_holder_tree,
     loopback_ssh_run,
+    read_proc_state,
     sleeper_spec,
     snapshot_pre_kill_tree,
     spawn_ssh_heartbeat_dispatcher,
@@ -101,6 +102,7 @@ from _verify_host_drive import (
 from _verify_merge_cli_fixtures import _setup_verify_repo
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
+from shared.proc_group import StatFields
 
 import orchestrator.cli_config as cli_config
 from orchestrator.cli import main
@@ -934,6 +936,42 @@ def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree
     )
 
 
+def _untagged_build_diagnosis(state: StatFields | None) -> str:
+    """Why a build never matched its holder's tag, judged from its last /proc *state*.
+
+    tagged_pids skips a vanished pid and reads a zombie's environ as empty, so
+    a build that exited misses every probe just as a live untagged one does.
+    """
+    if state is None:
+        return 'the build has no /proc entry: it exited, a harness or leader failure'
+    if state.terminated:
+        return (
+            f'the build is a zombie (state {state.state}): it exited, a harness or '
+            f'leader failure'
+        )
+    return (
+        f'the build is alive (state {state.state}, ppid {state.ppid}) yet untagged: '
+        f'verify.py::_target_subprocess_env dropped the tag, so kill_holder_tree '
+        f'cannot sweep an orphaned build'
+    )
+
+
+@pytest.mark.parametrize(
+    ('state', 'exited'),
+    [
+        (None, True),
+        (StatFields(comm='sleep', state='Z', ppid=1, pgrp=4242), True),
+        (StatFields(comm='sleep', state='S', ppid=1, pgrp=4242), False),
+    ],
+)
+def test_untagged_build_diagnosis_blames_the_scrub_only_for_a_live_build(state, exited):
+    """A build that exited is a harness failure, never reported as a scrub regression."""
+    diagnosis = _untagged_build_diagnosis(state)
+
+    assert ('it exited' in diagnosis) is exited
+    assert ('_target_subprocess_env' in diagnosis) is not exited
+
+
 @pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
 def test_spawned_verify_merge_build_carries_the_holder_tag(tmp_path):
     """The real CLI's session-escaped build inherits its holder's tag.
@@ -963,8 +1001,7 @@ def test_spawned_verify_merge_build_carries_the_holder_tag(tmp_path):
         assert wait_pid_tagged(build_pid, holder.tag, timeout=row_discovery_ceiling_secs()), (
             f'the build pid={build_pid} spawned by holder pid={holder.pid} '
             f'never carried {HOLDER_TAG_ENV}={holder.tag} within the discovery '
-            f'ceiling -- the target-env scrub dropped it, so kill_holder_tree '
-            f'cannot sweep an orphaned build'
+            f'ceiling; {_untagged_build_diagnosis(read_proc_state(build_pid))}'
         )
     finally:
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
