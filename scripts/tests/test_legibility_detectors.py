@@ -653,15 +653,19 @@ class TestDialogueTurnText:
     def test_a_gui_client_human_turn_is_its_text(self, text, entrypoint):
         assert detectors.dialogue_turn_text(sdk_prompt(text, entrypoint=entrypoint)) == text
 
-    def test_the_digests_user_turns_are_the_dialogue_turns_less_client_rendered_ones(self):
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_a_client_rendered_turn_has_no_dialogue_text(self, text):
+        assert detectors.dialogue_turn_text(user_record(text)) is None
+
+    def test_the_digests_user_turns_are_exactly_the_dialogue_turns(self):
         records = [
             user_record('a'), sdk_prompt('b'), user_record('c', isMeta=True),
             user_record(briefing_text()), user_record(SLASH_COMMAND_ARGLESS_TURN), user_record('d'),
         ]
         dialogue = [text for record in records if (text := detectors.dialogue_turn_text(record)) is not None]
 
-        assert dialogue == ['a', SLASH_COMMAND_ARGLESS_TURN, 'd']
-        assert [turn['text'] for turn in digest.iter_user_turns(records)] == ['a', 'd']
+        assert dialogue == ['a', 'd']
+        assert [turn['text'] for turn in digest.iter_user_turns(records)] == dialogue
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +875,18 @@ class TestClassifyAgentClass:
 
     def test_a_session_whose_only_turn_is_harness_injected_is_unattended(self):
         assert _classify(user_record(briefing_text())) is AgentClass.UNATTENDED
+
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_a_session_whose_only_turns_are_client_rendered_is_unattended(self, text):
+        assert _classify(user_record(text), assistant_record(text_block('ok'))) is AgentClass.UNATTENDED
+
+    def test_prose_after_a_client_rendered_turn_is_interactive(self):
+        records = [user_record(SLASH_COMMAND_ARGLESS_TURN), user_record('why did that fail?')]
+
+        assert _classify(*records) is AgentClass.INTERACTIVE
+
+    def test_a_slash_command_with_typed_args_is_interactive(self):
+        assert _classify(user_record(SLASH_COMMAND_WITH_ARGS_TURN)) is AgentClass.INTERACTIVE
 
     def test_records_without_any_user_turn_are_unattended(self):
         assert _classify(tool_result_record('tu-1', 'ok')) is AgentClass.UNATTENDED
@@ -1112,6 +1128,15 @@ _SHAPES = [
             assistant_record(text_block('{"new": [], "re_observed": []}')),
         ],
         'legibility-instrument', id='census_synthesis_session',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record(SLASH_COMMAND_ARGLESS_TURN),
+            user_record('[Request interrupted by user]'),
+            assistant_record(text_block('ok')),
+        ],
+        'unattended', id='client_rendered_only',
     ),
 ]
 
