@@ -207,8 +207,7 @@ then treat a ZCode wall-clock kill as a no-progress timeout
 (`is_zero_output_timeout`'s legacy fallback). ZCode's sqlite session store at
 `<run home>/.zcode/cli/db/db.sqlite` (tables `session`/`message`/`part`)
 outlives the kill but is removed with the run home. Counting turns from it is
-not established; task 9953 filed the follow-up as ticket
-`tkt_0RXDHXD9TZ15EW4PBW78ZC8A8X`.
+not established; task 10154 owns that follow-up.
 
 ## Upstream caveat
 

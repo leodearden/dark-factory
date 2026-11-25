@@ -691,7 +691,7 @@ class TestProgressTimeoutResumePrompt:
 class TestProgressTimeoutOnANonResumingBackend:
     """A progress kill on an implementer backend the resume lifecycle cannot continue.
 
-    MiMo reports its stored steps as transcript_turns, so its wall-clock kill is a
+    MiMo reports its answered steps as transcript_turns, so its wall-clock kill is a
     progress timeout, but no MiMo session survives for _invoke to resume. Such a
     kill re-dispatches fresh through the counter-resetting branch.
     """
