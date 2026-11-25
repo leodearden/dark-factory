@@ -28,7 +28,7 @@ from _queued_write_fixtures import (
 from shared.async_sqlite_base import CheckpointResult
 
 import fused_memory.services.durable_queue as dq_module
-from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.services.durable_queue import DurableWriteQueue, release_attempt_budget
 from fused_memory.services.queued_writes import (
     QueueCallback,
     QueueDecodeError,
@@ -205,6 +205,57 @@ class TestTimeout:
         assert call_count >= 2  # at least one retry after timeout
         assert stats['counts'].get('completed', 0) == 1
         await q.close()
+
+    @pytest.mark.timing(
+        reason='the attempt budget is the behaviour under test: a post-landing tail '
+        'outliving it must not replay the landed write',
+    )
+    @pytest.mark.asyncio
+    async def test_landed_write_outlives_attempt_budget(self, tmp_path):
+        budget = 0.1
+        call_count = 0
+        outcomes: list = []
+
+        async def landing_then_slow_tail(value):
+            nonlocal call_count
+            call_count += 1
+            release_attempt_budget()
+            await asyncio.sleep(3 * budget)
+            return {'ok': True}
+
+        async def on_terminal(write_op_id, status, error):
+            outcomes.append((write_op_id, status, error))
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=landing_then_slow_tail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            transient_max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=budget,
+            on_terminal=on_terminal,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(queued(
+                'add_episode',
+                {'content': 'test', 'group_id': 'proj1', 'name': 'ep', '_write_op_id': 'W1'},
+                group_id='proj1',
+            ))
+            await poll_until(lambda: outcomes, timeout=20.0)
+            stats = await q.get_stats()
+        finally:
+            await q.close()
+
+        assert outcomes == [('W1', 'completed', None)]
+        assert call_count == 1
+        assert stats['counts'] == {'completed': 1}
+
+    @pytest.mark.asyncio
+    async def test_release_attempt_budget_outside_an_attempt_is_a_no_op(self):
+        assert release_attempt_budget() is None
 
 
 class TestDeadLetter:
