@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _invocation_ledger import invocation_rows
+from _invocation_tokens import LEDGER_TOKENS, agent_result_with_tokens
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, looks_like_capacity_banner
 from shared.claude_endpoint import ClaudeEndpoint
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
@@ -672,28 +673,11 @@ class TestConfiguredAdjudicator:
 class TestAdjudicatorInvocationLedger:
     """Each shard's CLI call lands one invocations row under the run's keys (task 10414)."""
 
-    _TOKENS = {
-        'input_tokens': 7000,
-        'output_tokens': 800,
-        'cache_read_tokens': 20000,
-        'cache_create_tokens': 1500,
-    }
-
-    @staticmethod
-    def _with_tokens(*, success: bool, **fields: Any) -> AgentResult:
-        return AgentResult(
-            success=success,
-            output='',
-            input_tokens=7000,
-            output_tokens=800,
-            cache_read_tokens=20000,
-            cache_create_tokens=1500,
-            **fields,
-        )
-
     @pytest.mark.asyncio
     async def test_each_shard_lands_one_row(self, tmp_path):
-        served = self._with_tokens(success=True, structured_output=_ONE_SAME_ANSWER, cost_usd=0.3)
+        served = agent_result_with_tokens(
+            success=True, structured_output=_ONE_SAME_ANSWER, cost_usd=0.3,
+        )
         db_path = tmp_path / 'curator_events.db'
         async with CostStore(db_path) as store:
             adjudicate = configured_adjudicator(
@@ -711,11 +695,11 @@ class TestAdjudicatorInvocationLedger:
             assert row['role'] == 'link_adjudicator'
             assert row['run_id'] == 'lh-run'
             assert row['project_id'] == 'proj-h'
-            assert {key: row[key] for key in self._TOKENS} == self._TOKENS
+            assert {key: row[key] for key in LEDGER_TOKENS} == LEDGER_TOKENS
 
     @pytest.mark.asyncio
     async def test_a_failed_shard_still_lands_a_row(self, tmp_path):
-        failed = self._with_tokens(success=False, timed_out=True)
+        failed = agent_result_with_tokens(success=False, timed_out=True)
         db_path = tmp_path / 'curator_events.db'
         async with CostStore(db_path) as store:
             ask = ClaudeShardAsker(

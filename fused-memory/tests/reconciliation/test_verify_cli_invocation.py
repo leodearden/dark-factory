@@ -7,12 +7,12 @@ REAL verifier and patch only the CLI seam,
 ``fused_memory.reconciliation.agent_loop.invoke_with_cap_retry``.
 """
 
-from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _git_root_helper import make_git_root
 from _invocation_ledger import invocation_rows
+from _invocation_tokens import LEDGER_TOKENS, agent_result_with_tokens
 from shared.cli_invoke import AgentResult
 from shared.cost_store import CostStore
 
@@ -132,26 +132,6 @@ async def test_no_ambient_settings_file_can_widen_the_read_confinement(git_root)
     assert not kwargs.get('allowed_tools')
 
 
-_LEDGER_TOKENS = {
-    'input_tokens': 2000,
-    'output_tokens': 400,
-    'cache_read_tokens': 60000,
-    'cache_create_tokens': 5000,
-}
-
-
-def _with_tokens(*, success: bool, **fields: Any) -> AgentResult:
-    return AgentResult(
-        success=success,
-        output='',
-        input_tokens=2000,
-        output_tokens=400,
-        cache_read_tokens=60000,
-        cache_create_tokens=5000,
-        **fields,
-    )
-
-
 async def _verify_with_ledger(tmp_path, git_root, served: AgentResult):
     config = ReconciliationConfig(agent_llm_provider='claude_cli')
     db_path = tmp_path / 'curator_events.db'
@@ -166,7 +146,7 @@ async def _verify_with_ledger(tmp_path, git_root, served: AgentResult):
 
 @pytest.mark.asyncio
 async def test_a_verify_lands_one_invocations_row(tmp_path, git_root):
-    served = _with_tokens(
+    served = agent_result_with_tokens(
         success=True,
         structured_output={'verdict': 'confirmed', 'confidence': 0.9, 'evidence': [], 'summary': 's'},
         cost_usd=0.11,
@@ -181,12 +161,12 @@ async def test_a_verify_lands_one_invocations_row(tmp_path, git_root):
     assert row['run_id'] == 'run-v'
     assert row['project_id'] == 'proj-v'
     assert row['model'] == config.agent_llm_model
-    assert {key: row[key] for key in _LEDGER_TOKENS} == _LEDGER_TOKENS
+    assert {key: row[key] for key in LEDGER_TOKENS} == LEDGER_TOKENS
 
 
 @pytest.mark.asyncio
 async def test_an_audited_max_turns_failure_still_lands_a_row(tmp_path, git_root):
-    exhausted = _with_tokens(success=False, subtype='error_max_turns')
+    exhausted = agent_result_with_tokens(success=False, subtype='error_max_turns')
 
     _config, result, rows = await _verify_with_ledger(tmp_path, git_root, exhausted)
 

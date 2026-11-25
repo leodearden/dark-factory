@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _invocation_ledger import invocation_rows
+from _invocation_tokens import LEDGER_TOKENS, agent_result_with_tokens
 from shared.cli_invoke import AgentResult
 from shared.cost_store import CostStore
 
@@ -20,24 +20,12 @@ from reconciliation.stubbed_stage_cli import run_stage_answered_by
 pytestmark = pytest.mark.asyncio
 
 _CONFIG = ReconciliationConfig(sandbox_recon_agents=False)
-_TOKENS = {
-    'input_tokens': 1200,
-    'output_tokens': 300,
-    'cache_read_tokens': 50000,
-    'cache_create_tokens': 4000,
-}
 
 
-def _with_tokens(*, success: bool, **fields: Any) -> AgentResult:
-    return AgentResult(
-        success=success,
-        output='',
-        input_tokens=1200,
-        output_tokens=300,
-        cache_read_tokens=50000,
-        cache_create_tokens=4000,
-        **fields,
-    )
+def _assert_carries_the_served_tokens(result: StageResult) -> None:
+    assert result.tokens_used == LEDGER_TOKENS['input_tokens'] + LEDGER_TOKENS['output_tokens']
+    assert result.cache_read_tokens == LEDGER_TOKENS['cache_read_tokens']
+    assert result.cache_create_tokens == LEDGER_TOKENS['cache_create_tokens']
 
 
 async def _run_with_ledger(
@@ -62,7 +50,7 @@ async def _run_with_ledger(
 
 
 async def test_successful_stage_lands_one_row_and_carries_its_tokens(tmp_path: Path):
-    served = _with_tokens(
+    served = agent_result_with_tokens(
         success=True, structured_output={'summary': 'ok'}, cost_usd=0.42, duration_ms=1234,
     )
 
@@ -74,25 +62,21 @@ async def test_successful_stage_lands_one_row_and_carries_its_tokens(tmp_path: P
     assert row['run_id'] == 'run-s'
     assert row['project_id'] == 'proj-s'
     assert row['model'] == _CONFIG.agent_llm_model
-    assert {key: row[key] for key in _TOKENS} == _TOKENS
+    assert {key: row[key] for key in LEDGER_TOKENS} == LEDGER_TOKENS
     assert row['cost_usd'] == 0.42
     assert row['capped'] == 0
-    assert result.tokens_used == 1500
-    assert result.cache_read_tokens == 50000
-    assert result.cache_create_tokens == 4000
+    _assert_carries_the_served_tokens(result)
 
 
 async def test_returned_failure_still_lands_a_row_and_carries_its_tokens(tmp_path: Path):
-    hung = _with_tokens(success=False, timed_out=True, duration_ms=60_000)
+    hung = agent_result_with_tokens(success=False, timed_out=True, duration_ms=60_000)
 
     result, rows = await _run_with_ledger(tmp_path, hung)
 
     assert len(rows) == 1
     assert result.success is False
     assert result.outcome is not StageAgentOutcome.completed
-    assert result.tokens_used == 1500
-    assert result.cache_read_tokens == 50000
-    assert result.cache_create_tokens == 4000
+    _assert_carries_the_served_tokens(result)
 
 
 async def test_unreported_tokens_are_zero(tmp_path: Path):

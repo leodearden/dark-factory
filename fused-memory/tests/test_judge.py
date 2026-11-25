@@ -3,11 +3,11 @@
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _invocation_ledger import invocation_rows
+from _invocation_tokens import LEDGER_TOKENS, agent_result_with_tokens
 from _sdk_client_stubs import sdk_client_double
 from shared.cli_invoke import AgentResult
 from shared.cost_store import CostStore
@@ -3854,25 +3854,6 @@ class TestJudgeCapRetryResumeKeepsVerdictContract:
 class TestJudgeInvocationLedger:
     """The judge's CLI call lands one invocations row under its run's keys (task 10414)."""
 
-    _TOKENS = {
-        'input_tokens': 900,
-        'output_tokens': 120,
-        'cache_read_tokens': 30000,
-        'cache_create_tokens': 2500,
-    }
-
-    @staticmethod
-    def _with_tokens(*, success: bool, **fields: Any) -> AgentResult:
-        return AgentResult(
-            success=success,
-            output='',
-            input_tokens=900,
-            output_tokens=120,
-            cache_read_tokens=30000,
-            cache_create_tokens=2500,
-            **fields,
-        )
-
     @staticmethod
     def _config(tmp_path) -> ReconciliationConfig:
         return _make_judge_config(
@@ -3906,7 +3887,7 @@ class TestJudgeInvocationLedger:
 
     @pytest.mark.asyncio
     async def test_review_lands_one_row_under_the_run_keys(self, tmp_path, mock_journal):
-        served = self._with_tokens(
+        served = agent_result_with_tokens(
             success=True, structured_output={'severity': 'ok', 'findings': []}, cost_usd=0.07,
         )
 
@@ -3919,11 +3900,11 @@ class TestJudgeInvocationLedger:
         assert row['run_id'] == 'run-j'
         assert row['project_id'] == 'proj-j'
         assert row['model'] == self._config(tmp_path).judge_llm_model
-        assert {key: row[key] for key in self._TOKENS} == self._TOKENS
+        assert {key: row[key] for key in LEDGER_TOKENS} == LEDGER_TOKENS
 
     @pytest.mark.asyncio
     async def test_returned_failure_still_lands_a_row(self, tmp_path, mock_journal):
-        hung = self._with_tokens(success=False, timed_out=True)
+        hung = agent_result_with_tokens(success=False, timed_out=True)
 
         outcome, rows = await self._review_with_store(tmp_path, mock_journal, hung)
 
