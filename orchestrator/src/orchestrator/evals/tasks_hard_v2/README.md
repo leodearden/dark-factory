@@ -94,9 +94,16 @@ resolves this path by default.
 
 Every fixture in here carries `max_architect_turns` and `timeout_minutes`
 overlaid from `_meta/curation.json`'s `ceilings` block. Both keys are read
-straight off the task record by `evals/runner.py` (`task.get(...)` with 50 /
-60 defaults), so pinning them is pure data — no runner change. The derivation
-of `timeout_minutes` and its headroom multiples are recorded in `CURATION.md`.
+straight off the task record, so pinning them is pure data — no runner change.
+A fixture without them falls back to the code defaults: for
+`max_architect_turns`, the one in
+`orchestrator/src/orchestrator/evals/architect_eval.py::architect_invocation`;
+for `timeout_minutes`,
+`orchestrator/src/orchestrator/evals/runner.py::WORKFLOW_CELL_TIMEOUT_MINUTES`
+for a workflow cell and
+`orchestrator/src/orchestrator/evals/runner.py::ARCHITECT_CELL_TIMEOUT_MINUTES`
+for an architect cell. The derivation of `timeout_minutes` and its headroom
+multiples are recorded in `CURATION.md`.
 
 ## Two mint modes
 

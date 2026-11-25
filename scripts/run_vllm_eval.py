@@ -41,6 +41,7 @@ from orchestrator.evals.configs import (
     get_config_by_name,
 )
 from orchestrator.evals.results import ResultStore
+from orchestrator.evals.runner import WORKFLOW_CELL_TIMEOUT_MINUTES, cell_timeout_minutes
 from orchestrator.evals.snapshots import eval_worktree_root
 from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
 from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
@@ -62,6 +63,9 @@ RESULT_STORE = ResultStore.packaged()
 # (unlike /tmp which is tmpfs); chosen so a mid-batch crash leaves logs
 # behind for forensics.
 EVAL_LOG_DIR = Path("/var/tmp/dark-factory-evals")
+
+OUTER_TIMEOUT_MARGIN_MIN = 20
+"""Room past the cell's own ceiling for worktree setup, uv startup and writing the result file."""
 
 
 def _load_runpod_api_key() -> str:
@@ -1042,6 +1046,24 @@ def _open_task_log(task_id: str, config_name: str):
     return path, open(path, "w")
 
 
+def outer_timeout_min(spec: dict, args: argparse.Namespace) -> float:
+    """The launcher's kill deadline for one cell: --task-timeout-min, else the cell's own ceiling plus OUTER_TIMEOUT_MARGIN_MIN.
+
+    An explicit deadline that does not outlast the ceiling is honoured with a
+    warning: the launcher may kill the cell before it writes a result file.
+    """
+    ceiling = cell_timeout_minutes(spec, args.orch_timeout_min, WORKFLOW_CELL_TIMEOUT_MINUTES)
+    if args.task_timeout_min is None:
+        return ceiling + OUTER_TIMEOUT_MARGIN_MIN
+    if args.task_timeout_min <= ceiling:
+        log(
+            f"WARNING: {spec['id']}: --task-timeout-min {args.task_timeout_min} does not "
+            f"exceed the cell's own ceiling of {ceiling} min, so the launcher may kill "
+            "the cell before it writes a result file"
+        )
+    return args.task_timeout_min
+
+
 def run_one_task(
     spec: dict,
     cfg: EvalConfig,
@@ -1143,6 +1165,7 @@ def run_one_task(
     if args.orch_timeout_min is not None:
         eval_cmd.extend(["--timeout", str(args.orch_timeout_min)])
 
+    outer_min = outer_timeout_min(spec, args)
     t0 = time.monotonic()
 
     try:
@@ -1150,7 +1173,7 @@ def run_one_task(
             eval_cmd,
             cwd=str(ORCHESTRATOR_DIR),
             env=env,
-            timeout=args.task_timeout_min * 60,
+            timeout=outer_min * 60,
             stdout=stdout_target,
             stderr=stderr_target,
         )
@@ -1158,7 +1181,7 @@ def run_one_task(
     except subprocess.TimeoutExpired:
         log(
             f"EVAL TIMEOUT: {task_id} exceeded "
-            f"{args.task_timeout_min} min subprocess limit"
+            f"{outer_min} min subprocess limit"
         )
         rc = -1
     finally:
@@ -1418,12 +1441,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--task-timeout-min",
         type=int,
-        default=70,
+        default=None,
         help=(
             "Outer subprocess timeout in minutes (the launcher kills the "
-            "orchestrator subprocess after this). Should be > "
-            "--orch-timeout-min so the orchestrator hits its own timeout "
-            "first and produces a clean result file."
+            "orchestrator subprocess after this). By default, the cell's own "
+            "ceiling (the --orch-timeout-min value, else the fixture's "
+            "timeout_minutes, else the runner's workflow default of "
+            f"{WORKFLOW_CELL_TIMEOUT_MINUTES} min) plus {OUTER_TIMEOUT_MARGIN_MIN} min, "
+            "so the orchestrator hits its own ceiling first and writes a "
+            "result file. An explicit value should exceed that ceiling; one "
+            "that does not is logged as a warning."
         ),
     )
 
@@ -1434,8 +1461,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Inner orchestrator-internal eval timeout in minutes (passed to "
             "`orchestrator eval --timeout`). When unset, the orchestrator "
-            "uses the per-task spec value (default 60 min). Set this much "
-            "higher (e.g. 360) so 'would-be-done' runs have time to finish."
+            "uses the fixture's timeout_minutes, else the runner's workflow "
+            f"default of {WORKFLOW_CELL_TIMEOUT_MINUTES} min. Raise it when "
+            "'would-be-done' runs need longer than that ceiling."
         ),
     )
 

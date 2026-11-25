@@ -37,6 +37,8 @@ class EvalResult:
     wall_clock_ms: int = 0
     run_id: str = ''
     trial: int = 1
+    timeout_minutes: float | None = None
+    """The wall-clock ceiling the cell ran under; None for a cell persisted before this field."""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -395,6 +395,18 @@ def _corpus_profile() -> CellProfile:
     return CellProfile(build_eval_orch_config, fixture_task_gate)
 
 
+WORKFLOW_CELL_TIMEOUT_MINUTES = 180
+"""A workflow cell verifies cold, and on a loaded host completed cells took 74 to 106 min."""
+
+ARCHITECT_CELL_TIMEOUT_MINUTES = 60
+"""A plan-only architect cell runs no verify."""
+
+
+def cell_timeout_minutes(task: dict, timeout_override: float | None, default: float) -> float:
+    """The cell's wall-clock ceiling: the caller's override, else the fixture's timeout_minutes, else *default*."""
+    return timeout_override or task.get('timeout_minutes', default)
+
+
 async def run_eval(
     task_path: Path,
     config: EvalConfig,
@@ -484,6 +496,7 @@ async def run_architect_eval(
             'where an injected deps persists the cell'
         )
     task = load_task(task_path)
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, ARCHITECT_CELL_TIMEOUT_MINUTES)
     deps = deps or ArchitectEvalDeps(store=store or ResultStore.packaged())
     label = cell_label(task, config)
     logger.info(f'Starting architect eval: {label} (trial {trial})')
@@ -494,7 +507,7 @@ async def run_architect_eval(
             config, task, base_config, memory_endpoint=memory_endpoint,
         ),
         usage_gate=usage_gate,
-        timeout_minutes=timeout_override or task.get('timeout_minutes', 60),
+        timeout_minutes=timeout_minutes,
     )
     reference_diff = await read_reference_diff(task, deps)
     scoring = classify_attempt(attempt)
@@ -513,6 +526,7 @@ async def run_architect_eval(
         wall_clock_ms=wall_clock_ms,
         run_id=attempt.address.run_id,
         trial=trial,
+        timeout_minutes=timeout_minutes,
     )
     deps.store.save(result)
     log_architect_cell(label, scoring, metrics, wall_clock_ms)
@@ -588,6 +602,7 @@ async def _run_workflow_cell(
     (docs/eval-replay-frame.md). The wall clock includes worktree setup.
     """
     cell = f'{task["id"]} × {label}'
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, WORKFLOW_CELL_TIMEOUT_MINUTES)
     logger.info(f'Starting eval: {cell} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
     worktree, run_id = await _open_cell_worktree(task, worktree)
@@ -600,9 +615,7 @@ async def _run_workflow_cell(
             task, orch_config, worktree, initial_plan,
             replay_framed=replay_framed, usage_gate=gate, task_gate=task_gate,
         )
-        outcome = await _await_outcome(
-            workflow, timeout_override or task.get('timeout_minutes', 60), cell,
-        )
+        outcome = await _await_outcome(workflow, timeout_minutes, cell)
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
@@ -617,6 +630,7 @@ async def _run_workflow_cell(
             wall_clock_ms=wall_clock_ms,
             run_id=address.run_id,
             trial=trial,
+            timeout_minutes=timeout_minutes,
         )
         store.save(result)
     logger.info(
@@ -694,18 +708,33 @@ def _cell_workflow(
     return workflow
 
 
-async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: int, cell: str) -> str:
-    """The workflow's terminal outcome; a timeout or a raise becomes the cell's outcome."""
+async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: float, cell: str) -> str:
+    """The workflow's terminal outcome, where a ceiling that fired or a raise becomes the cell's outcome.
+
+    A workflow can absorb the deadline's cancellation and return CANCELLED, or
+    raise while finalising it, so a fired ceiling is read from the scope and
+    not only from a TimeoutError.
+    """
+    deadline = asyncio.timeout(timeout_minutes * 60)
     try:
-        report = await asyncio.wait_for(workflow.run(), timeout=timeout_minutes * 60)
+        async with deadline:
+            report = await workflow.run()
     except TimeoutError:
-        logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
-        return 'timeout'
+        return _timed_out(cell, timeout_minutes)
     except Exception as e:
+        if deadline.expired():
+            return _timed_out(cell, timeout_minutes)
         logger.error(f'Eval {cell} failed: {e}')
         return WorkflowOutcome.BLOCKED.value
+    if deadline.expired():
+        return _timed_out(cell, timeout_minutes)
     outcome = report.outcome
     return outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome)
+
+
+def _timed_out(cell: str, timeout_minutes: float) -> str:
+    logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
+    return 'timeout'
 
 
 async def _cell_metrics(
