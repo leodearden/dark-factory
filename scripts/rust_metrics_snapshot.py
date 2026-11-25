@@ -249,17 +249,35 @@ def _lizard_version() -> str:
         ) from exc
 
 
+@dataclasses.dataclass(frozen=True)
+class _Params:
+    """A measurement's params: with as_of_sha, its identity (plans/quality-dashboard-prd.md decision 17)."""
+
+    tokei_version: str
+    lizard_version: str
+    python_version: str
+    instrument: dict[str, str]
+    h14_soft_ceiling_lines: int
+    h14_alarm_lines: int
+    rules: dict[str, Any]
+
+
+_PARAMS_KEYS = tuple(field.name for field in dataclasses.fields(_Params))
+
+
 def measurement_params(rules: RustRules) -> dict[str, Any]:
     """What a measurement by this interpreter, these tools and these rules records as its params."""
-    return {
-        'tokei_version': _tokei_version(),
-        'lizard_version': _lizard_version(),
-        'python_version': platform.python_version(),
-        'instrument': {'rust_metrics_snapshot': source_measures.blob_sha(Path(__file__).resolve())},
-        'h14_soft_ceiling_lines': H14_SOFT,
-        'h14_alarm_lines': H14_ALARM,
-        'rules': rules.to_json(),
-    }
+    return dataclasses.asdict(
+        _Params(
+            tokei_version=_tokei_version(),
+            lizard_version=_lizard_version(),
+            python_version=platform.python_version(),
+            instrument={'rust_metrics_snapshot': source_measures.blob_sha(Path(__file__).resolve())},
+            h14_soft_ceiling_lines=H14_SOFT,
+            h14_alarm_lines=H14_ALARM,
+            rules=rules.to_json(),
+        )
+    )
 
 
 def strip_rust_noise(text):
@@ -1040,17 +1058,6 @@ def summary_text(snapshot: Mapping[str, Any]) -> str:
     )
     s.append('  ' + '; '.join(f"{e['crate']} {e['type']} {e['files']}" for e in snapshot['impl_spread'][:12]))
     return '\n'.join(s)
-
-
-_PARAMS_KEYS = (
-    'tokei_version',
-    'lizard_version',
-    'python_version',
-    'instrument',
-    'h14_soft_ceiling_lines',
-    'h14_alarm_lines',
-    'rules',
-)
 
 
 class OtherSchemaError(source_measures.MetricsError):
