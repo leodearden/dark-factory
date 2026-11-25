@@ -13,13 +13,17 @@ from pathlib import Path
 from typing import Any, Final
 
 import pytest
+import yaml
 from _audit_hook import AuditRecord, interpreter_roots, recording
 from _call_watch import watching
-from _in_dir import request_reveals
+from _git_repo import Repo, clone_of_checkout
+from _in_dir import request_reveals, write_engagement
+from _live_slice import copy_live_slice, live_titles
 from _two_projects import CANARY_A_DESC, Project, TwoProjects, build_two_projects
 from shared.project_layout import (
     KNOWN_PROJECT_ROOTS_ENV,
     default_project_root,
+    main_checkout_of,
     runs_db,
     tasks_db,
     verify_logs_dir,
@@ -30,16 +34,28 @@ from client_feed.contract import (
     ENGAGEMENT_FILENAME,
     FEED_FILENAME,
     INBOX_FILENAME,
+    STATE_FILENAME,
     FileRevealed,
     RefusalReason,
     RevealRefused,
+    TaskUpserted,
+    TreeSnapshot,
+    parse_state,
 )
 from client_feed.feed_io import read_feed_lines
+from client_feed.fold import fold
+from client_feed.policy import matches_any
 from client_feed.publisher import PassReport
+from client_feed.redact import redact_paths
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
 FORBIDDEN_KEYS: Final = frozenset({'description', 'details', 'test_strategy', 'metadata'})
 REQUESTED_AT: Final = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
+CLIENT_FEED_PRD: Final = 'plans/client-feed-prd.md'
+SNAPSHOT_PROJECT: Final = 'dark-factory'
+SNAPSHOT_VISIBLE_GLOBS: Final = ('*/src/**', '*/tests/**')
+SNAPSHOT_FIXTURE_MAX_CASES: Final = 20
+SNAPSHOT_REVEALED: Final = 'client-feed/src/client_feed/envelope.py'
 
 
 @pytest.fixture
@@ -51,8 +67,8 @@ def projects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TwoProjects:
     return built
 
 
-def _snapshot(project: Project, capsys: pytest.CaptureFixture[str]) -> PassReport:
-    code = main(['snapshot', '--config', str(project.policy)])
+def _snapshot(policy: Path, capsys: pytest.CaptureFixture[str]) -> PassReport:
+    code = main(['snapshot', '--config', str(policy)])
     captured = capsys.readouterr()
     assert code == 0, captured.err
     return PassReport.model_validate_json(captured.out)
@@ -105,7 +121,7 @@ def test_b1_a_snapshot_touches_only_its_own_root_out_and_in_dirs_and_policy(
     a = projects.a
 
     with recording() as record, watching(default_project_root) as calls:
-        report = _snapshot(a, capsys)
+        report = _snapshot(a.policy, capsys)
 
     assert report.degraded == ()
     databases = {database.path for database in record.database_opens}
@@ -174,10 +190,10 @@ def test_b2_a_snapshot_of_a_carries_nothing_of_b_and_nothing_a_hides(
 ) -> None:
     a, b = projects.a, projects.b
 
-    assert _snapshot(a, capsys).degraded == ()
+    assert _snapshot(a.policy, capsys).degraded == ()
 
     assert _leaks(a.out_dir, needles=(projects.canary_b, 'CANARY-B', CANARY_A_DESC)) == []
-    assert _snapshot(b, capsys).degraded == ()
+    assert _snapshot(b.policy, capsys).degraded == ()
     assert projects.canary_b in (b.out_dir / FEED_FILENAME).read_text()
 
 
@@ -192,7 +208,7 @@ def test_b15_hostile_reveal_requests_are_refused_and_never_opened(
     request_reveals(a.in_dir, *hostile, at=REQUESTED_AT)
 
     with recording() as record:
-        _snapshot(a, capsys)
+        _snapshot(a.policy, capsys)
 
     lines = read_feed_lines(a.out_dir)
     refused = [(line.path, line.reason) for line in lines if isinstance(line, RevealRefused)]
@@ -204,3 +220,54 @@ def test_b15_hostile_reveal_requests_are_refused_and_never_opened(
     never_opened = {decoy, Path('/etc/passwd'), (a.root / a.tracked_symlink).resolve(), a.root / a.untracked}
     opened = {form for opened in record.opens for form in (opened.path, opened.path.resolve())}
     assert never_opened.isdisjoint(opened)
+
+
+def _prd_title(repo: Repo) -> str:
+    markdown = repo.git('show', f'main:{CLIENT_FEED_PRD}')
+    return next(line.removeprefix('# ').strip() for line in markdown.splitlines() if line.startswith('# '))
+
+
+def test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    live = main_checkout_of(CHECKOUT_ROOT)
+    if not tasks_db(live).is_file():
+        pytest.skip(f'no live task store at {tasks_db(live)}')
+    repo = clone_of_checkout(CHECKOUT_ROOT, tmp_path / 'clone')
+    ids = copy_live_slice(live, repo.root, prd_path=CLIENT_FEED_PRD, marker=CANARY_A_DESC)
+    in_dir, out_dir, policy = tmp_path / 'in', tmp_path / 'out', tmp_path / 'policy.yaml'
+    write_engagement(in_dir, project_id=SNAPSHOT_PROJECT, delivered=None)
+    request_reveals(in_dir, SNAPSHOT_REVEALED, '../x', at=REQUESTED_AT)
+    out_dir.mkdir()
+    policy.write_text(yaml.safe_dump({
+        'project_id': SNAPSHOT_PROJECT,
+        'project_root': str(repo.root),
+        'out_dir': str(out_dir),
+        'in_dir': str(in_dir),
+        'visible_globs': list(SNAPSHOT_VISIBLE_GLOBS),
+        'max_cases_per_run': SNAPSHOT_FIXTURE_MAX_CASES,
+    }))
+
+    _snapshot(policy, capsys)
+
+    validated = main(['validate-feed', '--out-dir', str(out_dir), '--project-id', SNAPSHOT_PROJECT])
+    assert validated == 0, capsys.readouterr().out
+    lines = read_feed_lines(out_dir)
+    state = parse_state((out_dir / STATE_FILENAME).read_text())
+    assert state == fold(lines, project_id=SNAPSHOT_PROJECT)
+    assert state.prds
+    assert state.prds[CLIENT_FEED_PRD].title == _prd_title(repo)
+    upserts = [line for line in lines if isinstance(line, TaskUpserted)]
+    assert upserts
+    assert {line.task_id for line in upserts} <= set(ids)
+    titles = live_titles(live, ids)
+    assert [(line.task_id, line.title) for line in upserts] == [
+        (line.task_id, redact_paths(titles[line.task_id])) for line in upserts
+    ]
+    assert [line.path for line in lines if isinstance(line, FileRevealed)] == [SNAPSHOT_REVEALED]
+    refused = [(line.path, line.reason) for line in lines if isinstance(line, RevealRefused)]
+    assert refused == [('../x', RefusalReason.NOT_IN_TREE)]
+    trees = [line for line in lines if isinstance(line, TreeSnapshot)]
+    assert trees and trees[-1].files
+    assert all(matches_any(SNAPSHOT_VISIBLE_GLOBS, file.path) for tree in trees for file in tree.files)
+    assert _leaks(out_dir, needles=(CANARY_A_DESC, '/home/', str(tmp_path))) == []

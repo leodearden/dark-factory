@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 import yaml
-from _git_repo import Repo, make_repo
+from _git_repo import make_repo
 from _in_dir import write_engagement
 from _stores import EscalationQueueDir, RunsDb, TasksDb
 
@@ -25,19 +25,12 @@ from client_feed.contract import (
     FEED_FILENAME,
     STATE_FILENAME,
     MergeLanded,
-    TaskUpserted,
-    TreeSnapshot,
-    parse_state,
 )
 from client_feed.feed_io import read_feed_lines
 from client_feed.fold import fold
-from client_feed.policy import matches_any
 from client_feed.publisher import PassReport
 
 SCRIPT = Path(sys.executable).with_name('client-feed')
-CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
-CLIENT_FEED_PRD = 'plans/client-feed-prd.md'
-FORBIDDEN_KEYS = frozenset({'description', 'details', 'test_strategy', 'metadata'})
 WAIT_SECS = 30
 BASE = datetime(2026, 10, 21, 10, 0, tzinfo=UTC)
 
@@ -290,75 +283,3 @@ def test_a_publisher_killed_mid_run_is_recovered_by_the_next_snapshot(
     assert validates(capsys, out_dir)
     landed = merge_landings(out_dir)
     assert landed and set(landed.values()) == {1}
-
-
-def keys(value: Any) -> Iterator[str]:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            yield key
-            yield from keys(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from keys(item)
-
-
-def json_documents(path: Path) -> list[Any]:
-    if path.suffix == '.jsonl':
-        return [json.loads(text) for text in path.read_text().splitlines()]
-    return [json.loads(path.read_text())]
-
-
-def clone_of_this_checkout(tmp_path: Path) -> Repo:
-    """A shared, unchecked-out clone whose main is the commit under test, so no live ref or store is read."""
-    commit = Repo(CHECKOUT_ROOT).rev('HEAD^{commit}')
-    clone = tmp_path / 'clone'
-    Repo(tmp_path).git('clone', '--quiet', '--shared', '--no-checkout', str(CHECKOUT_ROOT), str(clone))
-    repo = Repo(clone)
-    repo.git('update-ref', 'refs/heads/main', commit)
-    return repo
-
-
-def prd_title(repo: Repo) -> str:
-    markdown = repo.git('show', f'main:{CLIENT_FEED_PRD}')
-    return next(line.removeprefix('# ').strip() for line in markdown.splitlines() if line.startswith('# '))
-
-
-def test_a_snapshot_of_this_checkout_is_a_valid_feed_that_leaks_nothing(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    repo = clone_of_this_checkout(tmp_path)
-    tasks = TasksDb.create(repo.root)
-    tasks.add(
-        1, title='Write the contract for /home/leo/x', status='done',
-        updated_at='2026-10-21T09:00:00.000Z', description='SECRET-DESCRIPTION',
-        details='SECRET-DETAILS', test_strategy='SECRET-STRATEGY',
-        metadata={'prd_path': CLIENT_FEED_PRD, 'dry_run_proposals': 'SECRET-METADATA'},
-    )
-    tasks.add(
-        2, title='Publish the feed from ~/feeds', status='in-progress',
-        updated_at='2026-10-21T09:30:00.000Z', metadata={'prd_path': CLIENT_FEED_PRD},
-    )
-    RunsDb.create(repo.root).emit('phase_enter', at=at(0), task_id=2, phase='implement')
-    EscalationQueueDir.create(repo.root)
-    visible = ['*/src/**', '*/tests/**']
-    (tmp_path / 'out').mkdir()
-    config = write_config(tmp_path, repo.root, visible_globs=visible)
-
-    code, _, err = cli(capsys, 'snapshot', '--config', str(config))
-
-    assert code == 0, err
-    out_dir = tmp_path / 'out'
-    assert validates(capsys, out_dir)
-    lines = read_feed_lines(out_dir)
-    state = parse_state((out_dir / STATE_FILENAME).read_text())
-    assert state == fold(lines, project_id='acme')
-    assert state.prds[CLIENT_FEED_PRD].title == prd_title(repo)
-    titles = {line.task_id: line.title for line in lines if isinstance(line, TaskUpserted)}
-    assert titles == {1: 'Write the contract for [path]', 2: 'Publish the feed from [path]'}
-    for path in sorted(out_dir.iterdir()):
-        assert '/home/' not in path.read_text(), path.name
-        for document in json_documents(path):
-            assert not FORBIDDEN_KEYS & set(keys(document)), path.name
-    trees = [line for line in lines if isinstance(line, TreeSnapshot)]
-    assert trees and trees[-1].files
-    assert all(matches_any(visible, file.path) for tree in trees for file in tree.files)
