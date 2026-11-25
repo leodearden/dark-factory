@@ -38,6 +38,9 @@ from fused_memory.embedder.endpoint_probe import (  # noqa: E402  # debt: task 1
 from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
     RebuildResult,
 )
+from fused_memory.models.invocation_ledger import (  # noqa: E402  # debt: task 10130
+    invocations_ledger_path,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
 )
@@ -743,7 +746,7 @@ async def run_server():
     # The helper closes the CostStore if UsageGate construction fails, so the
     # open aiosqlite connection never leaks even though this runs before the
     # try/finally that wraps transport.serve().
-    curator_cost_store, curator_usage_gate = await _setup_curator_usage_gate(config)
+    invocations_store, curator_usage_gate = await _setup_curator_usage_gate(config)
 
     # Stage-2 LLM adjudicator for path-scope guard (task 1822): wired only in
     # multi-project mode when config.path_scope_adjudicator.enabled is True.
@@ -757,7 +760,7 @@ async def run_server():
         path_scope_adjudicator = PathScopeAdjudicator(
             config.path_scope_adjudicator,
             usage_gate=curator_usage_gate,
-            cost_store=curator_cost_store,
+            cost_store=invocations_store,
             cwd=Path(_primary_root) if _primary_root else None,
             scope_violation_escalator=scope_violation_escalator,
         )
@@ -892,7 +895,7 @@ async def run_server():
         if taskmaster is not None and taskmaster.connected:
             targeted = TargetedReconciler(
                 memory_service, taskmaster, recon_journal, config, event_buffer,
-                cost_store=curator_cost_store,
+                cost_store=invocations_store,
             )
             # Wire the planned episode registry so _on_task_done can promote planned
             # episodes when tasks complete (otherwise the promotion code is dead code).
@@ -922,7 +925,7 @@ async def run_server():
             event_queue=event_queue,
             backlog_policy=backlog_policy,
             usage_gate=curator_usage_gate,
-            cost_store=curator_cost_store,
+            cost_store=invocations_store,
             ticket_store=ticket_store,
             bulk_reset_guard=bulk_reset_guard,
             prefix_registry=prefix_registry,
@@ -1001,7 +1004,7 @@ async def run_server():
             escalation_listener=_claim_listener(
                 systemd_listeners, config.reconciliation.escalation_port,
             ),
-            cost_store=curator_cost_store,
+            cost_store=invocations_store,
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -1020,7 +1023,7 @@ async def run_server():
             taskmaster, None, event_buffer,
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
-            cost_store=curator_cost_store,
+            cost_store=invocations_store,
             ticket_store=ticket_store,
             prefix_registry=prefix_registry,
             scope_violation_escalator=scope_violation_escalator,
@@ -1395,7 +1398,7 @@ async def run_server():
             event_queue=event_queue,
             sqlite_watchdog=sqlite_watchdog,
             taskmaster=taskmaster,
-            curator_cost_store=curator_cost_store,
+            invocations_store=invocations_store,
             curator_usage_gate=curator_usage_gate,
             recon_ledger=recon_ledger,
         )
@@ -2020,8 +2023,6 @@ def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
     the server's store; the operator script link_heal.py writes its link
     adjudicator rows to the same file.
     """
-    from fused_memory.models.invocation_ledger import invocations_ledger_path
-
     return invocations_ledger_path(resolve_data_dir(config))
 
 
@@ -2120,15 +2121,15 @@ async def _setup_curator_usage_gate(
     from shared.usage_gate import UsageGate
 
     db_path = _resolve_curator_cost_store_path(config)
-    curator_cost_store = CostStore(db_path)
-    await curator_cost_store.open()
-    logger.info(f'  Curator cost store: {db_path}')
+    invocations_store = CostStore(db_path)
+    await invocations_store.open()
+    logger.info(f'  Invocations ledger: {db_path}')
 
     curator_usage_gate: UsageGate | None = None
     try:
         curator_usage_gate = UsageGate(config.usage_cap)
         curator_usage_gate.run_id = run_id or _mint_curator_run_id()
-        curator_usage_gate.attach_cost_store(curator_cost_store)
+        curator_usage_gate.attach_cost_store(invocations_store)
         logger.info(
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',
@@ -2140,12 +2141,12 @@ async def _setup_curator_usage_gate(
             except BaseException:
                 logger.exception('UsageGate shutdown failed during rollback')
         try:
-            await asyncio.shield(curator_cost_store.close())
+            await asyncio.shield(invocations_store.close())
         except BaseException:
             logger.exception('CostStore close failed during UsageGate init rollback')
         raise
 
-    return (curator_cost_store, curator_usage_gate)
+    return (invocations_store, curator_usage_gate)
 
 
 def _install_safe_tool_wrapper(mcp: Any) -> None:
@@ -2536,7 +2537,7 @@ async def _graceful_shutdown(
     event_queue: EventQueue | None = None,
     sqlite_watchdog: SqliteWatchdog | None = None,
     taskmaster: Any = None,
-    curator_cost_store: CostStore | None = None,
+    invocations_store: CostStore | None = None,
     curator_usage_gate: UsageGate | None = None,
     recon_ledger: ReconLedgerStore | None = None,
 ) -> None:
@@ -2553,7 +2554,7 @@ async def _graceful_shutdown(
        Must happen BEFORE memory_service.close(), because the drainer writes
        into the SQLite event buffer that memory_service owns.
     6. Cancel harness loop task (stops background reconciliation + escalation server).
-    7. Close curator_cost_store (independent SQLite connection). Only safe after
+    7. Close invocations_store (independent SQLite connection). Only safe after
        gate.shutdown() has drained all in-flight save_account_event tasks, and
        after the harness loop has stopped: the recon stages, judge and verify
        loop write their invocations rows through it.
@@ -2602,8 +2603,8 @@ async def _graceful_shutdown(
             timeout=_HARNESS_CANCEL_TIMEOUT,
         )
 
-    if curator_cost_store is not None:
-        await _run_shielded('curator_cost_store.close', curator_cost_store.close)
+    if invocations_store is not None:
+        await _run_shielded('invocations_store.close', invocations_store.close)
 
     if taskmaster is not None:
         await _run_shielded('taskmaster.close', taskmaster.close)
