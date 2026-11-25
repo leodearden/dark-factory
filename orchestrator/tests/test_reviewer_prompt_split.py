@@ -8,7 +8,7 @@ RED until ``orchestrator.agents.roles`` defines ``REVIEWER_COMPREHENSIVE.prompt_
 The frozen CONTRACT tokens asserted below are exactly what the verdict-tools
 server + ``read_verdict`` parse: the ``submit_review_verdict`` tool name, its
 field names, the ``reviewer_{name}`` identity literal, and the
-``verdict``/``severity`` enums. Everything else (the blocking-vs-suggestion
+``verdict``/``severity``/``kind`` and ruling-subject enums. Everything else (the blocking-vs-suggestion
 judgment rules and the specialization footer) is editable HEURISTICS.
 """
 
