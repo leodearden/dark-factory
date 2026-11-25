@@ -69,3 +69,17 @@ async def test_resolve_waits_again_while_the_ticket_is_still_pending(
     assert (expired['status'], expired['reason']) == ('pending', 'wait_timeout')
     assert answer['status'] == 'created'
     assert 'task_id' in answer
+
+
+@pytest.mark.asyncio
+async def test_resolve_returns_an_open_answer_after_shutdown_without_asking_again(stack: Stack) -> None:
+    release = hold_first_prepare(stack.curator)
+    try:
+        submitted = await stack.call('submit_task', **_followup('Tidy the a module'))
+        assert 'ticket' in submitted, submitted
+        await stack.interceptor.close()
+        answer = await stack.resolve(submitted['ticket'])
+    finally:
+        release.set()
+
+    assert (answer['status'], answer['reason']) == ('pending', 'store_unavailable')
