@@ -227,7 +227,7 @@ class TestVerdictMapping:
     ) -> None:
         red = dataclasses.replace(
             real_verify_result(False),
-            failing_test_ids_by_module={'alpha': ['tests.test_a::test_x']},
+            failing_test_ids_by_module={'alpha': ['tests.test_a::test_x'], 'beta': []},
             failing_test_ids=['tests.test_a::test_x'],
         )
 
@@ -240,6 +240,24 @@ class TestVerdictMapping:
         }
         assert record['modules']['beta'] == {'failing_test_ids': [], 'failing_count': 0}
         assert outcome.ok is False
+
+    async def test_a_module_absent_from_the_attribution_map_is_recorded_unattributed(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        red = dataclasses.replace(
+            real_verify_result(False),
+            failing_test_ids_by_module={'alpha': ['tests.test_a::test_x']},
+            failing_test_ids=['tests.test_a::test_x'],
+        )
+
+        outcome = await run_box(preflight_config(repo), timed_double(clock, result=red), clock)
+
+        record = record_of(repo, outcome)
+        assert record['modules']['alpha'] == {
+            'failing_test_ids': ['tests.test_a::test_x'], 'failing_count': 1,
+        }
+        assert record['modules']['beta'] == {'failing_test_ids': None, 'failing_count': None}
+        assert outcome.primary.modules['beta'].failing_count is None
 
     async def test_a_trivial_pass_is_not_recorded_as_passed(
         self, repo: Path, clock: FakeClock,
