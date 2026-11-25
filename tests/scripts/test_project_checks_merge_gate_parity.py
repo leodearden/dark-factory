@@ -36,7 +36,7 @@ from hook_checks_fixture import (
     ModuleSpec,
     make_hook_repo,
 )
-from shared.proc_group import read_stat_fields, unsafe_pgid_reason
+from shared.proc_group import pid_running, read_stat_fields, unsafe_pgid_reason
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -272,14 +272,6 @@ def test_at_most_gate_slots_units_run_at_once(tmp_path: Path) -> None:
     assert 1 < max(seen) <= GATE_SLOTS, seen
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        stat = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8')
-    except FileNotFoundError:
-        return False
-    return stat.rpartition(')')[2].split()[0] != 'Z'
-
-
 def _eventually(condition: Callable[[], bool], timeout_secs: float) -> bool:
     deadline = time.monotonic() + timeout_secs
     while not condition():
@@ -336,7 +328,7 @@ def _kill_leftovers(commit: subprocess.Popen[bytes], units: list[_Unit]) -> None
         os.killpg(commit.pid, signal.SIGKILL)
         commit.wait()
     for unit in units:
-        if _pid_alive(unit.pid) and unsafe_pgid_reason(unit.pgid) is None:
+        if pid_running(unit.pid) and unsafe_pgid_reason(unit.pgid) is None:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(unit.pgid, signal.SIGKILL)
 
@@ -422,7 +414,7 @@ def test_an_interrupted_commit_stops_its_units_and_removes_their_logs(
         pid = units[-1].pid
         interrupt(commit.pid)
         commit.wait(timeout=60)
-        stopped = _eventually(lambda: not _pid_alive(pid), 30)
+        stopped = _eventually(lambda: not pid_running(pid), 30)
         logs_removed = _eventually(lambda: not any(hook_tmp.iterdir()), 30)
     finally:
         _kill_leftovers(commit, units)
@@ -461,7 +453,7 @@ def test_an_interrupted_commit_stops_what_an_uncollected_unit_left_when_its_shel
         _await_written(last_unit_file, out_path)
         _ctrl_c(commit.pid)
         commit.wait(timeout=60)
-        stopped = _eventually(lambda: not _pid_alive(pid), 30)
+        stopped = _eventually(lambda: not pid_running(pid), 30)
     finally:
         _kill_leftovers(commit, units)
 
@@ -513,7 +505,7 @@ def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_
         _ctrl_c(commit.pid)
         release.touch()
         commit.wait(timeout=60)
-        stopped = _eventually(lambda: not _pid_alive(units[0].pid), 30)
+        stopped = _eventually(lambda: not pid_running(units[0].pid), 30)
         logs_removed = _eventually(lambda: not any(hook_tmp.iterdir()), 30)
     finally:
         release.touch()
