@@ -3,7 +3,9 @@
 Every fixture is a small REAL single-package git repository measured by the
 real instrument in a subprocess; a mid-run event is simulated by a ``--python``
 shim that acts and then execs the real interpreter, or by a ``git`` shim on
-PATH that runs the real git and then acts, so no module is patched.
+PATH that runs the real git and then acts, so no module is patched. The Cargo
+fixtures, and the tokei and cargo shims the Rust instrument runs, are in
+rust_snapshot_fixtures.py.
 """
 from __future__ import annotations
 
@@ -18,8 +20,10 @@ from pathlib import Path
 import pytest
 import quality_metrics_snapshot as snapshot
 import quality_snapshot_cadence as cadence
+import rust_metrics_snapshot
 from git_listing import git
 from quality_snapshot_identity import below_run_id_and_cost
+from rust_snapshot_fixtures import rust_workspace_repo, tool_shims, write_fixture_rules
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -182,6 +186,87 @@ class TestTheIdentitySkip:
         assert _cadence(root, data) == 0
         assert 'already measured' not in capfd.readouterr().out
         assert snapshot.load_snapshot(out)['schema_version'] == snapshot.SCHEMA_VERSION
+
+
+class TestTheInstrumentChoice:
+    @pytest.fixture
+    def rules_dir(self, tmp_path: Path) -> Path:
+        directory = tmp_path / 'rules'
+        write_fixture_rules(directory / 'fixture.toml')
+        return directory
+
+    @pytest.fixture
+    def cargo_repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        bin_dir = tool_shims(tmp_path / 'tool-bin')
+        monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+        return rust_workspace_repo(tmp_path)
+
+    def test_a_cargo_workspace_is_measured_by_the_rust_instrument(
+        self,
+        tmp_path: Path,
+        capfd: pytest.CaptureFixture[str],
+        state_home: Path,
+        cargo_repo: Path,
+        rules_dir: Path,
+    ) -> None:
+        data = tmp_path / 'data'
+        sha = _main_sha(cargo_repo)
+        assert _cadence(cargo_repo, data, '--rust-rules-dir', str(rules_dir)) == 0
+        out = data / 'fixture' / f'{sha}.json'
+        assert rust_metrics_snapshot.load_snapshot(out)['as_of_sha'] == sha
+        assert f'measured: {sha} -> {out}' in capfd.readouterr().out.splitlines()
+        assert _worktrees(cargo_repo) == [cargo_repo.resolve()]
+        assert list(_pinned_trees_home(state_home).iterdir()) == []
+
+    def test_a_second_rust_run_at_one_identity_is_already_measured(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str], cargo_repo: Path, rules_dir: Path
+    ) -> None:
+        data = tmp_path / 'data'
+        sha = _main_sha(cargo_repo)
+        assert _cadence(cargo_repo, data, '--rust-rules-dir', str(rules_dir)) == 0
+        out = data / 'fixture' / f'{sha}.json'
+        written, written_at = out.read_bytes(), out.stat().st_mtime_ns
+        capfd.readouterr()
+        assert _cadence(cargo_repo, data, '--rust-rules-dir', str(rules_dir)) == 0
+        params = rust_metrics_snapshot.load_snapshot(out)['params']
+        assert capfd.readouterr().out.splitlines() == [
+            f'already measured: {sha} {json.dumps(params, sort_keys=True)}'
+        ]
+        assert (out.read_bytes(), out.stat().st_mtime_ns) == (written, written_at)
+
+    def test_a_cargo_workspace_without_a_rules_file_is_refused_naming_it(
+        self,
+        tmp_path: Path,
+        capfd: pytest.CaptureFixture[str],
+        state_home: Path,
+        cargo_repo: Path,
+    ) -> None:
+        data = tmp_path / 'data'
+        empty_rules_dir = tmp_path / 'no-rules'
+        empty_rules_dir.mkdir()
+        err = _refused(cargo_repo, data, capfd, '--rust-rules-dir', str(empty_rules_dir))
+        assert str(empty_rules_dir / 'fixture.toml') in err
+        assert not data.exists() or list(data.rglob('*')) == []
+        pinned = _pinned_trees_home(state_home)
+        assert not pinned.exists() or list(pinned.iterdir()) == []
+
+    def test_a_tree_with_neither_manifest_is_refused_naming_both_and_the_sha(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path, {path: text for path, text in _FILES.items() if path != 'pyproject.toml'})
+        data = tmp_path / 'data'
+        err = _refused(root, data, capfd)
+        assert 'pyproject.toml' in err
+        assert 'Cargo.toml' in err
+        assert _main_sha(root) in err
+        assert not data.exists()
+
+    def test_a_tree_with_both_manifests_is_measured_by_the_python_instrument(self, tmp_path: Path) -> None:
+        root = _repo(tmp_path, {**_FILES, 'Cargo.toml': '[workspace]\nmembers = []\n'})
+        data = tmp_path / 'data'
+        assert _cadence(root, data) == 0
+        out = data / 'fixture' / f'{_main_sha(root)}.json'
+        assert snapshot.load_snapshot(out)['as_of_sha'] == _main_sha(root)
 
 
 class TestAnExplicitShaList:
