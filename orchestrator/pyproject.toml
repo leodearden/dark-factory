@@ -308,6 +308,10 @@ dev = [
     # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
     # Do not relax to >=6 or drop the <7 ceiling without re-measuring.
     "complexipy>=6.2,<7",
+    # lizard — per-function cyclomatic complexity for Cargo projects, read by
+    # its one consumer scripts/rust_metrics_snapshot.py (run as
+    # `python -m lizard`, its version recorded in the snapshot's params).
+    "lizard>=1.26,<1.27",
     # mutmut — the mutation-score baseline of task 5035 ([tool.mutmut] below).
     # <3.8 because 3.8.0 requires click>=8.4.2 and uv.lock pins click 8.3.2.
     "mutmut>=3.7,<3.8",
