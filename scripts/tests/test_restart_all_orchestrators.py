@@ -2497,7 +2497,10 @@ def test_the_awaited_verify_sweep_completes_when_every_interpreter_start_is_star
     )
 
 
-def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_path):
+_STALL_PIN_TIMEOUT_SECS = 3
+
+
+def _assert_a_repolling_sweep_is_reported_as_stalled(tmp_path, *, spawn_latency_secs=None):
     bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
         tmp_path,
         {
@@ -2507,23 +2510,36 @@ def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_p
         },
     )
     env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "20"
+    if spawn_latency_secs is not None:
+        _install_spawn_latency(bin_dir, spawn_latency_secs)
 
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_sweep_while_progressing(
-            bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env, stall_timeout=3,
+            bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env,
+            stall_timeout=_STALL_PIN_TIMEOUT_SECS,
         )
 
     polls = read_drain_poll_trace(trace_path)
     calls = [
         [arg for arg in call if arg != "--user"] for call in _load_state(state_path)["calls"]
     ]
-    assert exc_info.value.timeout == 3
+    assert exc_info.value.timeout == _STALL_PIN_TIMEOUT_SECS
     assert polls, (
         "the stall fired before the gate's first poll, so this run never reached the "
         "repolling it pins: the stretch before that poll outlasted stall_timeout"
     )
     assert all(p == ("verifying", UNIT_R) for p in polls), polls
     assert not [call for call in calls if call[:1] == ["restart"]], calls
+
+
+def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_path):
+    _assert_a_repolling_sweep_is_reported_as_stalled(tmp_path)
+
+
+def test_a_repolling_sweep_is_reported_as_stalled_however_long_its_first_poll_takes(tmp_path):
+    _assert_a_repolling_sweep_is_reported_as_stalled(
+        tmp_path, spawn_latency_secs=_STALL_PIN_TIMEOUT_SECS + 1,
+    )
 
 
 def test_each_units_verify_wait_cap_counts_from_its_own_request(tmp_path):
