@@ -66,9 +66,9 @@ class AllowanceReading:
     """Every placed cycle resetting in the window, in reset order."""
     estimate_usd: float | None
     unplaced_accounts: tuple[str, ...]
-    """Accounts with spend but no reset ever recorded."""
+    """Accounts with spend but no weekly reset ever recorded."""
     dormant_accounts: tuple[str, ...]
-    """Accounts with a recorded reset but no spend or cap within one cycle of the window."""
+    """Accounts with a recorded weekly reset but no spend or cap within one cycle of the window."""
     unplaceable_cap_hits: int
     """Weekly cap hits within one cycle of the window recorded without a reset."""
     other_caps: Mapping[CapKind, int]

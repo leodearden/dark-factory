@@ -328,7 +328,7 @@ def _allowance_lines(reading: allowance.AllowanceReading) -> list[str]:
         )
         lines.append(f'  cycle {cycle.account} resetting {cycle.reset.isoformat()}: {state}, spend {_usd(cycle.spend_usd)}')
     if reading.unplaced_accounts:
-        lines.append(f'  accounts with spend and no reset ever recorded: {", ".join(reading.unplaced_accounts)}')
+        lines.append(f'  accounts with spend and no weekly reset ever recorded: {", ".join(reading.unplaced_accounts)}')
     if reading.dormant_accounts:
         lines.append(f'  dormant accounts (no spend or cap near the window): {", ".join(reading.dormant_accounts)}')
     if reading.unplaceable_cap_hits:

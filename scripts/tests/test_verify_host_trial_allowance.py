@@ -126,6 +126,16 @@ class TestUnplaced:
 
         assert reading.unplaced_accounts == ('max-z',)
 
+    def test_an_account_with_spend_and_only_a_session_cap_reset_is_listed(self):
+        session_only = CapHit('max-s', at(13), at(13, 5), CapKind.SESSION)
+
+        reading = account_cycles(
+            (*TWO_ACCOUNTS_CAPS, session_only), (*TWO_ACCOUNTS_SPEND, spend('max-s', at(12), 50.0)), SINCE, UNTIL
+        )
+
+        assert reading.unplaced_accounts == ('max-s',)
+        assert 'max-s' not in {cycle.account for cycle in reading.cycles}
+
     def test_a_cap_hit_without_a_reset_is_counted_as_unplaceable(self):
         caps = (*TWO_ACCOUNTS_CAPS, weekly('max-a', at(13), None))
 
