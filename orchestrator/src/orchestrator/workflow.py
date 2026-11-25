@@ -14990,11 +14990,8 @@ class TaskWorkflow:
             )
 
     def _backend_for(self, role: AgentRole) -> str:
-        """The configured agent backend that runs *role*; every reviewer* role shares one."""
-        backends_cfg = self.config.backends
-        if role.name.startswith('reviewer'):
-            return backends_cfg.reviewer
-        return getattr(backends_cfg, role.name, 'claude')
+        """The configured agent backend that runs *role*."""
+        return getattr(self.config.backends, _config_key(role.name), 'claude')
 
     def _resumes_killed_sessions(self, role: AgentRole) -> bool:
         """Whether _invoke can continue *role*'s killed session: its resume lifecycle corroborates against a claude transcript."""
@@ -15032,7 +15029,9 @@ class TaskWorkflow:
         # already resolved config by full role name: module_tagger
         # (harness.py's self.config.models.module_tagger) and deep_reviewer
         # (review_checkpoint.py's getattr(self.config.models, 'deep_reviewer', ...)).
-        role_key = role.name
+        # _config_key only collapses every reviewer* role to the shared
+        # 'reviewer' slot.
+        role_key = _config_key(role.name)
 
         # Route resolution (PRD adaptive-model-routing, task ε): the single
         # layered authority for (model, effort, budget_usd, max_turns),
@@ -15073,15 +15072,11 @@ class TaskWorkflow:
         source_layer = decision.source_layer
         rule_id = decision.rule_id
 
-        timeout_val = getattr(timeouts_cfg, role_key, self.config.invocation_timeout)
-        backend_val = self._backend_for(role)
-
         # timeout_val/backend_val are resolver-external (route resolution
         # owns model/effort/budget_usd/max_turns only — see this task's plan
-        # design_decisions). _backend_for owns the backend's reviewer*
-        # collapse; the timeout's stays local to _invoke.
-        if role.name.startswith('reviewer'):
-            timeout_val = timeouts_cfg.reviewer
+        # design_decisions).
+        timeout_val = getattr(timeouts_cfg, role_key, self.config.invocation_timeout)
+        backend_val = self._backend_for(role)
 
         scope = invocation_scope(self.config, role)
 
