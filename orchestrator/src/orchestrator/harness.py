@@ -1976,7 +1976,8 @@ class Harness:
             ReviewCheckpoint(config, self.mcp, self.usage_gate)
             if config.review.enabled else None
         )
-        # The running focused review checkpoint, if any; dispatch pauses while set.
+        # The running focused review checkpoint, if any: while set, a merge
+        # cannot start a second one.
         self._review_task: asyncio.Task | None = None
         # Slot and review-checkpoint tasks still running.  Each task removes
         # itself from its done-callback, so the set is never rebound.
@@ -3046,14 +3047,6 @@ class Harness:
             )
 
             while True:
-                # If a review checkpoint is running, don't acquire new tasks —
-                # wait for in-flight tasks (and the review, itself live) to end.
-                if self._review_task is not None:
-                    await asyncio.wait(
-                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    continue
-
                 # A slot is taken before a task is picked, so no picked task
                 # holds its module locks while waiting for one (task 8480).
                 scope = slots.free_scope()
@@ -12198,10 +12191,12 @@ class Harness:
             logger.error(f'Full review failed: {e}')
 
     def _trigger_review_checkpoint(self) -> None:
-        """Spawn a review checkpoint as a concurrent task.
+        """Spawn a review checkpoint as a concurrent task that runs beside dispatch.
 
-        The main loop will pause task acquisition while ``_review_task`` is
-        set, but in-flight tasks continue in their worktrees.
+        Pausing dispatch would protect nothing: in-flight slots and the merge
+        lane land on main during a checkpoint either way (Phase 1's tree
+        stability is task 11085).  The review's merge scope is fixed when it
+        starts (review_checkpoint.py::ReviewCheckpoint.run_focused).
         """
         task = asyncio.create_task(
             self._run_review_checkpoint(), name='review-checkpoint',
@@ -12211,7 +12206,7 @@ class Harness:
         task.add_done_callback(self._finish_review_checkpoint)
 
     def _finish_review_checkpoint(self, t: asyncio.Task) -> None:
-        """Done-callback of the review task: let the loop dispatch again."""
+        """Done-callback of the review task: clear the running-checkpoint mark so a later merge can trigger the next one."""
         self._live_tasks.discard(t)
         self._review_task = None
         error = None if t.cancelled() else t.exception()

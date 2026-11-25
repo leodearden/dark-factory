@@ -114,6 +114,9 @@ async def test_the_scheduler_snapshot_advances_while_a_checkpoint_runs(
 ) -> None:
     scene = _held_checkpoint_scene(tmp_path, monkeypatch)
     board = scene.board
+    # A tick with nothing ready writes no snapshot, so task 2's dispatch is the
+    # one write that can show it: the write throttle must not swallow it.
+    monkeypatch.setattr(board.scheduler.config, 'snapshot_min_write_interval_secs', 0.0)
     snapshot_path = scheduler_state_json(tmp_path)
 
     def snapshot_shows_task_2_holding_since(checkpoint_started: datetime) -> bool:
