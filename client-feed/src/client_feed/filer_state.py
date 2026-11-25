@@ -103,9 +103,7 @@ def _require_apart(policy: Policy, state_dir: Path) -> None:
 @contextlib.contextmanager
 def held_state_dir(policy: Policy) -> Iterator[StateDir]:
     """S checked apart before it is made and again after, then locked for this filer alone until the block exits."""
-    if policy.filer is None:
-        raise ValueError(f'the policy of {policy.project_id} has no filer block')
-    state_dir = policy.filer.state_dir
+    state_dir = policy.require_filer().state_dir
     _require_apart(policy, state_dir)
     state_dir.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
     _require_apart(policy, state_dir)

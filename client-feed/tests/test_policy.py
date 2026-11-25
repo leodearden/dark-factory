@@ -13,6 +13,7 @@ from pydantic import HttpUrl, ValidationError
 from client_feed.contract import FileKind
 from client_feed.policy import (
     FilerPolicy,
+    NoFilerBlock,
     Policy,
     PolicyError,
     PolicyProblem,
@@ -492,6 +493,18 @@ def test_a_policy_without_a_filer_block_has_no_state_dir_to_refuse(minimal: dict
     _policy(minimal).require_filer_state_dir_apart(resolved=True)
 
 
+def test_require_filer_is_the_filer_block_or_the_one_refusal_naming_the_project(
+    tmp_path: Path, minimal: dict[str, Any]
+) -> None:
+    filer = FilerPolicy(state_dir=tmp_path / 'state')
+
+    assert _policy(minimal, filer=filer).require_filer() == filer
+    with pytest.raises(NoFilerBlock) as caught:
+        _policy(minimal).require_filer()
+    assert caught.value.project_id == 'acme'
+    assert str(caught.value) == 'the policy of acme has no filer block'
+
+
 def test_the_lexical_rule_keeps_its_refusal(minimal: dict[str, Any]) -> None:
     state_dir = Path(minimal['out_dir']) / 'filer'
     unchecked = Policy.model_construct(
@@ -528,7 +541,7 @@ def test_the_filer_refuses_a_policy_without_a_filer_block(
     refusal = _filer_refusal(config)
 
     assert refusal.problem is PolicyProblem.NO_FILER_BLOCK
-    assert 'filer' in refusal.detail
+    assert refusal.detail == str(NoFilerBlock('acme'))
 
 
 def test_the_filer_refuses_an_unreadable_policy_as_the_publisher_does(tmp_path: Path) -> None:

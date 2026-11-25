@@ -270,7 +270,7 @@ def converge_filing(
     tools: ClosedTools, report: DefectReported, ref: str, policy: Policy, record: RefRecord | None
 ) -> _Outcome:
     """File `ref` as a fix and, unless auto-dispatched clean, its gate; every step re-derived from the store."""
-    filer = _filer(policy)
+    filer = policy.require_filer()
     try:
         filed = _filed_fix(tools, report, ref, filer, record)
         if filed is not None:
@@ -345,12 +345,6 @@ def converge_ruling(tools: ClosedTools, ref: str, record: RefRecord | None) -> _
     except ToolRefused as refused:
         return _Outcome(refused=_unconverged(ref, refused, record), record=record)
     return _Outcome()
-
-
-def _filer(policy: Policy) -> FilerPolicy:
-    if policy.filer is None:
-        raise ValueError(f'the policy of {policy.project_id} has no filer block')
-    return policy.filer
 
 
 def _read(policy: Policy, offset: int) -> tuple[InboxRead, int]:
@@ -456,7 +450,7 @@ def run_until_stopped(
 ) -> None:
     """Pass after pass under the state dir held for the whole run, backing off while passes are transient, until `stop` is set."""
     pause = stop.wait if wait is None else wait
-    interval = _filer(policy).interval_seconds
+    interval = policy.require_filer().interval_seconds
     streak = 0
     with held_state_dir(policy) as state:
         cursor = state.read_cursor()

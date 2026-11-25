@@ -377,12 +377,9 @@ def closed_tools(policy: Policy, open_tools: OpenTools) -> Iterator[ClosedTools]
 @contextmanager
 def open_session(policy: Policy) -> Iterator[SyncMcpSession]:
     """A session to the policy's fused-memory over a client that reads no proxy variable and no .netrc (trust_env=False)."""
-    if policy.filer is None:
-        raise ValueError(f'the policy of {policy.project_id} has no filer block')
+    url = str(policy.require_filer().fused_memory_url)
     with (
         httpx.Client(trust_env=False, follow_redirects=True, timeout=_SESSION_TIMEOUT_SECONDS) as client,
-        SyncMcpSession(
-            str(policy.filer.fused_memory_url), client_name=FILER_IDENTITY, http_client=client
-        ) as session,
+        SyncMcpSession(url, client_name=FILER_IDENTITY, http_client=client) as session,
     ):
         yield session
