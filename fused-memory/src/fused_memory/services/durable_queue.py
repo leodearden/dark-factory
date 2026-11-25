@@ -279,7 +279,15 @@ POST_EXECUTE_DEAD_PREFIX = (
 CLAIMABLE_STATUSES: tuple[str, ...] = ('pending', 'retry', 'parked')
 _CLAIMABLE_SQL = 'status IN ({})'.format(', '.join(f"'{s}'" for s in CLAIMABLE_STATUSES))
 
-_ATTEMPT_BUDGET: contextvars.ContextVar[asyncio.Timeout | None] = contextvars.ContextVar(
+@dataclass(frozen=True)
+class _AttemptBudget:
+    """One queue attempt's write budget, and the task running that attempt."""
+
+    owner: asyncio.Task[Any] | None
+    timeout: asyncio.Timeout
+
+
+_ATTEMPT_BUDGET: contextvars.ContextVar[_AttemptBudget | None] = contextvars.ContextVar(
     'durable_queue_attempt_budget', default=None,
 )
 
@@ -290,13 +298,22 @@ def release_attempt_budget() -> None:
     An executor calls this the instant its backend write lands. Cancelling the
     attempt after that cannot un-land the write; it only sends the item down
     the retry path, which re-executes it: the duplicate ``executed`` exists to
-    prevent. Outside a queue attempt, or once the budget has expired, it is a
-    no-op.
+    prevent.
+
+    Only the attempt's own task can disarm it. asyncio copies the attempt's
+    context into every task the attempt creates, and such a task can neither
+    vouch that the attempt's write landed nor act on a budget whose attempt
+    may already have ended. The owner sees its budget only inside the budget's
+    scope, where it is armed or expiring. So outside a queue attempt, in any
+    other task, or once the budget has expired, this is a no-op: it never
+    raises.
     """
-    budget = _ATTEMPT_BUDGET.get()
-    if budget is None or budget.expired():
+    attempt = _ATTEMPT_BUDGET.get()
+    if attempt is None or attempt.owner is not asyncio.current_task():
         return
-    budget.reschedule(None)
+    if attempt.timeout.expired():
+        return
+    attempt.timeout.reschedule(None)
 
 
 class DurableWriteQueue:
@@ -583,7 +600,9 @@ class DurableWriteQueue:
                 )
                 with self._executing(item):
                     async with asyncio.timeout(self._write_timeout_seconds) as budget:
-                        token = _ATTEMPT_BUDGET.set(budget)
+                        token = _ATTEMPT_BUDGET.set(
+                            _AttemptBudget(owner=asyncio.current_task(), timeout=budget)
+                        )
                         try:
                             result = await self._execute_write(value)
                         finally:

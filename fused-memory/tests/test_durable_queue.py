@@ -257,6 +257,106 @@ class TestTimeout:
     async def test_release_attempt_budget_outside_an_attempt_is_a_no_op(self):
         assert release_attempt_budget() is None
 
+    @pytest.mark.timing(
+        reason='the attempt budget is the behaviour under test: releasing it once it '
+        'expired must leave the timeout to surface',
+    )
+    @pytest.mark.asyncio
+    async def test_release_after_the_budget_expired_is_a_no_op(self, tmp_path):
+        budget = 0.1
+
+        async def releases_once_cancelled_by_the_budget(value):
+            try:
+                await asyncio.sleep(3 * budget)
+            except asyncio.CancelledError:
+                release_attempt_budget()
+                raise
+            return {'ok': True}
+
+        outcomes = await _sole_terminal_outcome(
+            tmp_path, releases_once_cancelled_by_the_budget, write_timeout_seconds=budget,
+        )
+
+        assert outcomes == [('W1', 'dead', 'TimeoutError: ')]
+
+    @pytest.mark.timing(
+        reason='the attempt budget is the behaviour under test: a task the attempt '
+        'spawned must not disarm it',
+    )
+    @pytest.mark.asyncio
+    async def test_a_task_the_attempt_spawned_cannot_disarm_its_budget(self, tmp_path):
+        budget = 0.1
+
+        async def release_from_this_task():
+            release_attempt_budget()
+
+        async def spawned_task_releases_then_write_never_lands(value):
+            await asyncio.create_task(release_from_this_task())
+            await asyncio.sleep(3 * budget)
+            return {'ok': True}
+
+        outcomes = await _sole_terminal_outcome(
+            tmp_path, spawned_task_releases_then_write_never_lands, write_timeout_seconds=budget,
+        )
+
+        assert outcomes == [('W1', 'dead', 'TimeoutError: ')]
+
+    @pytest.mark.asyncio
+    async def test_a_task_outliving_its_attempt_cannot_touch_the_ended_budget(
+        self, tmp_path
+    ):
+        attempt_ended = asyncio.Event()
+        spawned: list[asyncio.Task] = []
+
+        async def release_once_the_attempt_ended():
+            await attempt_ended.wait()
+            release_attempt_budget()
+
+        async def landing_leaves_a_task_behind(value):
+            spawned.append(asyncio.create_task(release_once_the_attempt_ended()))
+            release_attempt_budget()
+            return {'ok': True}
+
+        outcomes = await _sole_terminal_outcome(
+            tmp_path, landing_leaves_a_task_behind, write_timeout_seconds=120.0,
+        )
+        attempt_ended.set()
+
+        assert await spawned[0] is None
+        assert outcomes == [('W1', 'completed', None)]
+
+
+async def _sole_terminal_outcome(
+    tmp_path: Path, execute_write, write_timeout_seconds: float,
+) -> list[tuple[str, str, str | None]]:
+    """Run one item through a single-attempt queue; its terminal outcomes."""
+    outcomes: list[tuple[str, str, str | None]] = []
+
+    async def on_terminal(write_op_id, status, error):
+        outcomes.append((write_op_id, status, error))
+
+    q = DurableWriteQueue(
+        data_dir=tmp_path / 'queue',
+        execute_write=execute_write,
+        workers_per_group=1,
+        semaphore_limit=5,
+        max_attempts=1,
+        transient_max_attempts=1,
+        write_timeout_seconds=write_timeout_seconds,
+        on_terminal=on_terminal,
+    )
+    await q.initialize()
+    try:
+        await q.enqueue(queued(
+            'add_episode',
+            {'content': 'test', 'group_id': 'proj1', 'name': 'ep', '_write_op_id': 'W1'},
+            group_id='proj1',
+        ))
+        await poll_until(lambda: outcomes)
+    finally:
+        await q.close()
+    return outcomes
+
 
 class TestDeadLetter:
     @pytest.mark.asyncio
