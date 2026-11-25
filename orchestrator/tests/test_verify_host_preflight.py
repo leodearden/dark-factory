@@ -403,3 +403,147 @@ class TestSkipParityExceptions:
 
     def test_an_absent_file_means_no_exceptions(self, tmp_path: Path) -> None:
         assert preflight.load_skip_parity_exceptions(tmp_path / 'absent.yaml') == ()
+
+
+OWNED_A_AND_C = (
+    'exceptions:\n'
+    '  - test_id: "t::a"\n'
+    '    owner: {type: task, id: 7030}\n'
+    '    reason: needs reify\n'
+    '  - test_id: "t::c"\n'
+    '    owner: {type: ticket, id: tkt_01ABC}\n'
+    '    reason: needs a gpu\n'
+)
+
+
+@pytest.mark.asyncio
+class TestSkipParity:
+    @staticmethod
+    def pair_config(repo: Path, exceptions: str | None = None) -> OrchestratorConfig:
+        if exceptions is not None:
+            path = repo / preflight.SKIP_PARITY_EXCEPTIONS_RELPATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(exceptions)
+        return preflight_config(repo, runners=[declared_runner('box'), declared_runner('ref')])
+
+    @staticmethod
+    async def run_pair(
+        config: OrchestratorConfig, box: MagicMock, ref: MagicMock, clock: FakeClock,
+    ) -> preflight.PreflightOutcome:
+        doubles = {'box': box, 'ref': ref}
+        return await preflight.run_preflight(
+            config, runner='box', sha=None, reference='ref', deployed_sha=TEST_DEPLOYED_SHA,
+            build_runner=lambda rc: doubles[rc.name], clock=clock,
+        )
+
+    @staticmethod
+    def skipping(clock: FakeClock, name: str, skipped: list[str] | None, **fields: Any) -> MagicMock:
+        return timed_double(clock, name, result=green_result(skipped_test_ids=skipped, **fields))
+
+    async def test_both_runners_verify_the_same_commit_and_both_records_are_written(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        box = self.skipping(clock, 'box', ['t::b'])
+        ref = self.skipping(clock, 'ref', ['t::b'])
+
+        outcome = await self.run_pair(self.pair_config(repo), box, ref, clock)
+
+        sha = rev_parse(repo, 'main')
+        (box_sha, box_spec), _ = box.run_merge_verify.await_args
+        (ref_sha, ref_spec), _ = ref.run_merge_verify.await_args
+        assert box_sha == ref_sha == sha
+        assert box_spec == ref_spec
+        assert set(outcome.record_paths) == {
+            record_path_for(repo, sha, 'box'), record_path_for(repo, sha, 'ref'),
+        }
+        assert all(path.is_file() for path in outcome.record_paths)
+        assert outcome.ok is True
+
+    async def test_a_test_skipped_on_one_runner_only_breaks_parity(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        box = self.skipping(clock, 'box', ['t::a', 't::b'])
+        ref = self.skipping(clock, 'ref', ['t::b', 't::c'])
+
+        outcome = await self.run_pair(self.pair_config(repo), box, ref, clock)
+
+        assert outcome.parity is not None
+        assert outcome.parity.holds is False
+        assert outcome.parity.skipped_only_on_runner == ('t::a',)
+        assert outcome.parity.skipped_only_on_reference == ('t::c',)
+        assert outcome.primary.passed is True
+        assert outcome.ok is False
+        block = record_of(repo, outcome)['skip_parity']
+        assert block['skipped_only_on_runner'] == ['t::a']
+        assert block['skipped_only_on_reference'] == ['t::c']
+        assert block['holds'] is False
+
+    async def test_owned_exceptions_explain_a_skip_difference(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        box = self.skipping(clock, 'box', ['t::a', 't::b'])
+        ref = self.skipping(clock, 'ref', ['t::b', 't::c'])
+
+        outcome = await self.run_pair(self.pair_config(repo, OWNED_A_AND_C), box, ref, clock)
+
+        assert outcome.parity is not None
+        assert outcome.parity.holds is True
+        assert {e.test_id for e in outcome.parity.excepted} == {'t::a', 't::c'}
+        assert outcome.ok is True
+        excepted = record_of(repo, outcome)['skip_parity']['excepted']
+        assert {e['test_id']: e['owner'] for e in excepted} == {
+            't::a': {'type': 'task', 'id': 7030},
+            't::c': {'type': 'ticket', 'id': 'tkt_01ABC'},
+        }
+
+    async def test_a_reference_with_no_skip_vector_leaves_parity_undetermined(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        box = self.skipping(clock, 'box', ['t::b'])
+        ref = self.skipping(clock, 'ref', None)
+
+        outcome = await self.run_pair(self.pair_config(repo), box, ref, clock)
+
+        assert outcome.parity is not None
+        assert outcome.parity.holds is False
+        assert outcome.parity.undetermined
+        assert outcome.ok is False
+
+    async def test_an_unavailable_reference_leaves_parity_undetermined(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        box = self.skipping(clock, 'box', ['t::b'])
+        ref = timed_double(clock, 'ref', error=RunnerUnavailable('down', kind='transport'))
+
+        outcome = await self.run_pair(self.pair_config(repo), box, ref, clock)
+
+        assert outcome.parity is not None
+        assert outcome.parity.holds is False
+        assert outcome.parity.undetermined
+        assert outcome.ok is False
+
+    async def test_a_red_runner_is_not_ok_even_when_parity_holds(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        box = self.skipping(clock, 'box', ['t::b'], passed=False, category='test_failure')
+        ref = self.skipping(clock, 'ref', ['t::b'])
+
+        outcome = await self.run_pair(self.pair_config(repo), box, ref, clock)
+
+        assert outcome.parity is not None
+        assert outcome.parity.holds is True
+        assert outcome.ok is False
+
+    async def test_a_malformed_exceptions_file_is_refused_before_any_dispatch(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        box = self.skipping(clock, 'box', ['t::b'])
+        ref = self.skipping(clock, 'ref', ['t::b'])
+        config = self.pair_config(repo, 'exceptions:\n  - test_id: "t::a"\n    reason: r\n')
+
+        with pytest.raises(preflight.SkipParityExceptionsError):
+            await self.run_pair(config, box, ref, clock)
+
+        for double in (box, ref):
+            double.ensure_gate.assert_not_awaited()
+            double.run_merge_verify.assert_not_awaited()
