@@ -14,7 +14,13 @@ from pathlib import Path
 import pytest
 from _mimo_fixture import measured_export
 from _plan_tools_mcp_fixture import plan_tools_mcp
-from shared.cli_invoke import SubprocessResult
+from shared.cli_invoke import (
+    AgentFailureKind,
+    SubprocessResult,
+    classify_agent_failure,
+    is_timed_out_with_progress,
+    is_zero_output_timeout,
+)
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import mimo_backend
@@ -310,6 +316,11 @@ class TestParseMimoSessions:
         assert result.output_tokens == 200
         assert result.cache_read_tokens == 1200
 
+    def test_the_transcript_turns_count_every_stored_session_s_steps(self):
+        child = _with_text(measured_export('ses_child', parent_id='ses_x'), 'child text')
+        result = _parse([child, measured_export()])
+        assert result.transcript_turns == 4 == result.turns
+
     def test_the_root_is_the_session_the_stdout_names(self):
         exports = [measured_export('ses_a'), _with_text(measured_export('ses_b'), 'b text')]
         result = _parse(exports, _subprocess_result(stdout='not json\n' + _jsonl('ses_b')))
@@ -391,6 +402,7 @@ class TestParseMimoSessions:
         assert result.output_tokens is None
         assert result.cache_read_tokens is None
         assert result.cache_create_tokens is None
+        assert result.transcript_turns is None
 
     def test_a_timed_out_run_still_reports_its_tokens(self):
         result = _parse([measured_export()], _subprocess_result(timed_out=True, returncode=-9))
@@ -398,6 +410,15 @@ class TestParseMimoSessions:
         assert result.timed_out is True
         assert result.input_tokens == 1400
         assert result.cost_usd == _cost_of(1400, 100, 600)
+
+    def test_a_timed_out_run_with_steps_is_a_productive_kill(self):
+        result = _parse([measured_export()], _subprocess_result(timed_out=True, returncode=-9))
+        assert result.transcript_turns == 2
+        assert is_timed_out_with_progress(result) is True
+        assert is_zero_output_timeout(result) is False
+        failure = classify_agent_failure(result)
+        assert failure.kind is AgentFailureKind.TIMED_OUT
+        assert 'productive' in failure.summary
 
     def test_a_nonzero_exit_is_a_failure(self):
         result = _parse([measured_export()], _subprocess_result(returncode=1, stderr='boom'))

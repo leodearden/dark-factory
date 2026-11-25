@@ -18,6 +18,7 @@ import pytest
 from _mimo_fixture import measured_export
 from _operator_home_fixture import OPERATOR_ENV_VARS, write_operator_home
 from _plan_tools_mcp_fixture import plan_tools_mcp
+from shared.cli_invoke import is_timed_out_with_progress
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import sandbox_dispatch
@@ -237,6 +238,14 @@ class TestInvokeMimo:
         assert result.success is False
         assert result.input_tokens == 1400
         assert not Path(fake_mimo.run_record()['mimocode_home']).exists()
+
+    async def test_the_wall_clock_kill_of_a_run_with_stored_steps_is_productive(
+        self, fake_mimo, worktree, monkeypatch,
+    ):
+        monkeypatch.setenv('MIMO_FAKE_SLEEP', '60')
+        result = await _invoke(worktree, timeout_seconds=3)
+        assert result.transcript_turns == 2
+        assert is_timed_out_with_progress(result) is True
 
     async def test_a_run_that_reached_its_step_cap_is_error_max_turns(self, fake_mimo, worktree):
         result = await _invoke(worktree, max_turns=2)
