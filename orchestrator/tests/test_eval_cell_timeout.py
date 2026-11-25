@@ -5,35 +5,21 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 from _architect_eval_harness import run_architect_eval_hermetic
 from _campaign_gate_helpers import eval_base_config
+from _eval_workflow_cell import executor_task, stub_workflow_cell
 from shared.testing_virtual_clock import virtual_clock_test
 
 from orchestrator.evals import runner
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.metrics import EvalMetrics
 from orchestrator.evals.results import ResultStore
 from orchestrator.workflow import WorkflowOutcome
 
 _TASK_PATH = Path('/fake/task.json')
 _ARCHITECT = EvalConfig('architect-opus-high', 'claude', 'opus', 'high')
 _IMPLEMENTER = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
-
-
-def _task(tmp_path: Path, **extra) -> dict:
-    task = {
-        'id': 'df_task_t1',
-        'project_root': str(tmp_path),
-        'pre_task_commit': 'basecommit',
-        'task_definition': {'title': 'W', 'description': 'd'},
-        'modules': ['pkg/mod.py'],
-        'plan': {'steps': [{'id': 's1', 'status': 'pending'}]},
-    }
-    task.update(extra)
-    return task
 
 
 class _CutOffWorkflow:
@@ -58,23 +44,6 @@ class _CutOffWorkflow:
         return (self.cut_off_at - self.started_at) / 60
 
 
-async def _fake_create_wt(*_a, **_k) -> tuple[Path, str]:
-    return Path('/fake/wt'), 'run-t1'
-
-
-async def _fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None):
-    return EvalMetrics(
-        role_under_test=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend,
-    )
-
-
-def _stub_cell(monkeypatch: pytest.MonkeyPatch, task: dict, workflow) -> None:
-    monkeypatch.setattr(runner, 'create_eval_worktree', _fake_create_wt)
-    monkeypatch.setattr(runner, 'build_workflow', lambda **_kw: workflow)
-    monkeypatch.setattr(runner, 'collect_metrics', AsyncMock(side_effect=_fake_collect))
-    monkeypatch.setattr(runner, 'load_task', lambda _p: task)
-
-
 def _run_executor(executor: str, tmp_path: Path, store: ResultStore, **kwargs):
     if executor == 'run_end_to_end':
         return runner.run_end_to_end(
@@ -94,7 +63,7 @@ async def test_a_workflow_cell_without_a_fixture_ceiling_is_cut_off_at_three_hou
 ):
     workflow = _CutOffWorkflow()
     store = ResultStore(tmp_path / 'results')
-    _stub_cell(monkeypatch, _task(tmp_path), workflow)
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path), workflow)
 
     result = await _run_executor(executor, tmp_path, store)
 
@@ -109,7 +78,7 @@ async def test_a_fixture_ceiling_overrides_the_workflow_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     workflow = _CutOffWorkflow()
-    _stub_cell(monkeypatch, _task(tmp_path, timeout_minutes=45), workflow)
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path, timeout_minutes=45), workflow)
 
     result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
 
@@ -122,7 +91,7 @@ async def test_the_callers_override_beats_the_fixture_ceiling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     workflow = _CutOffWorkflow()
-    _stub_cell(monkeypatch, _task(tmp_path, timeout_minutes=45), workflow)
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path, timeout_minutes=45), workflow)
 
     result = await _run_executor(
         'run_eval', tmp_path, ResultStore(tmp_path / 'results'), timeout_override=90,
@@ -223,7 +192,7 @@ async def test_a_workflow_that_absorbs_the_deadline_reports_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     store = ResultStore(tmp_path / 'results')
-    _stub_cell(monkeypatch, _task(tmp_path), _CutOffWorkflow())
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path), _CutOffWorkflow())
 
     result = await _run_executor('run_eval', tmp_path, store)
 
@@ -236,7 +205,7 @@ async def test_a_workflow_that_absorbs_the_deadline_reports_timeout(
 async def test_a_workflow_that_propagates_the_deadline_reports_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    _stub_cell(monkeypatch, _task(tmp_path), _PropagatingWorkflow())
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path), _PropagatingWorkflow())
 
     result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
 
@@ -247,7 +216,7 @@ async def test_a_workflow_that_propagates_the_deadline_reports_timeout(
 async def test_a_workflow_that_ends_cancelled_before_its_ceiling_stays_cancelled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    _stub_cell(monkeypatch, _task(tmp_path), _EndsCancelledWorkflow())
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path), _EndsCancelledWorkflow())
 
     result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
 
@@ -258,7 +227,7 @@ async def test_a_workflow_that_ends_cancelled_before_its_ceiling_stays_cancelled
 async def test_a_workflow_that_fails_after_its_ceiling_fired_reports_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    _stub_cell(monkeypatch, _task(tmp_path), _FailsWhileCancelledWorkflow())
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path), _FailsWhileCancelledWorkflow())
 
     result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
 
@@ -269,7 +238,7 @@ async def test_a_workflow_that_fails_after_its_ceiling_fired_reports_timeout(
 async def test_a_bound_of_the_workflows_own_expiring_before_the_ceiling_reports_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    _stub_cell(monkeypatch, _task(tmp_path), _InnerBoundExpiresWorkflow())
+    stub_workflow_cell(monkeypatch, executor_task(tmp_path), _InnerBoundExpiresWorkflow())
 
     result = await _run_executor('run_eval', tmp_path, ResultStore(tmp_path / 'results'))
 
