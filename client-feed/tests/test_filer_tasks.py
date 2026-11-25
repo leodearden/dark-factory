@@ -4,18 +4,6 @@ from datetime import UTC, datetime
 
 import pytest
 from _defects import quarantined, reported, restated
-from client_feed.filer_tasks import (
-    ClientDefectFacts,
-    FilerFallback,
-    client_declaration,
-    facts_of,
-    fix_submission,
-    gate_submission,
-    is_filer_withdrawal,
-    operator_acceptance_event,
-    requires_gate,
-    withdrawal_event,
-)
 from shared.defects import (
     Declare,
     DefectDeclaration,
@@ -33,6 +21,18 @@ from shared.defects import (
 from shared.governed_exceptions import Debt, TaskRef
 
 from client_feed.contract import DefectReported, QuarantineReason
+from client_feed.filer_tasks import (
+    ClientDefectFacts,
+    FilerFallback,
+    client_declaration,
+    facts_of,
+    fix_submission,
+    gate_submission,
+    is_filer_withdrawal,
+    operator_acceptance_event,
+    requires_gate,
+    withdrawal_event,
+)
 from client_feed.filer_tools import FILER_IDENTITY, RefusalKind
 from client_feed.policy import TaskPriority
 
@@ -172,9 +172,8 @@ def test_the_facts_read_back_from_a_fix_are_the_facts_it_was_built_from(fallback
 
 
 def _declared() -> DefectDeclaration:
-    return Declare(
-        declaration=client_declaration(REF, summary='s', declared_at=AT, declared_by=FILER_IDENTITY)
-    ).declaration
+    declaration = client_declaration(REF, summary='s', declared_at=AT, declared_by=FILER_IDENTITY)
+    return Declare.model_validate({'declaration': declaration}).declaration
 
 
 def test_the_client_declaration_is_a_fresh_client_defect() -> None:
