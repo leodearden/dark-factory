@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
@@ -1004,23 +1005,52 @@ class _SuccessRowStallingJournal(WriteJournal):
         await super().log_backend_op(**kwargs)
 
 
+class _SuccessRowBlockingJournal(WriteJournal):
+    """A WriteJournal whose success rows block until their caller is cancelled."""
+
+    def __init__(self, data_dir: Path) -> None:
+        super().__init__(data_dir)
+        self.success_row_entered = asyncio.Event()
+        self._never_set = asyncio.Event()
+
+    async def log_backend_op(self, **kwargs: Any) -> None:
+        if kwargs['success']:
+            self.success_row_entered.set()
+            await self._never_set.wait()
+        await super().log_backend_op(**kwargs)
+
+
+@contextlib.asynccontextmanager
+async def _service_journaled_by(mock_config, journal: WriteJournal):
+    """journaled_service's build, in its production order, around *journal*."""
+    svc = mock_memory_backends(MemoryService(mock_config))
+    await svc.initialize()
+    await journal.initialize()
+    svc.set_write_journal(journal)
+    try:
+        yield svc
+    finally:
+        await svc.close()
+        await journal.close()
+
+
 @pytest_asyncio.fixture
 async def budget_stalled_service(mock_config, tmp_path):
     """journaled_service with a narrowed attempt budget and a stalling journal."""
     mock_config.queue.write_timeout_seconds = _ATTEMPT_BUDGET_SECONDS
-    svc = mock_memory_backends(MemoryService(mock_config))
-    await svc.initialize()
-
     journal = _SuccessRowStallingJournal(
         tmp_path / 'wj_e2e', stall_seconds=3 * _ATTEMPT_BUDGET_SECONDS,
     )
-    await journal.initialize()
-    svc.set_write_journal(journal)
+    async with _service_journaled_by(mock_config, journal) as svc:
+        yield svc, journal
 
-    yield svc, journal
 
-    await svc.close()
-    await journal.close()
+@pytest_asyncio.fixture
+async def success_row_blocked_service(mock_config, tmp_path):
+    """journaled_service whose journal blocks every success row."""
+    journal = _SuccessRowBlockingJournal(tmp_path / 'wj_e2e')
+    async with _service_journaled_by(mock_config, journal) as svc:
+        yield svc, journal
 
 
 @pytest.mark.timing(
@@ -1084,6 +1114,24 @@ class TestLandedWriteOutlivesAttemptBudget:
         assert journal.stall_backend is None, 'the mem0 success row never stalled'
         assert stats['counts'] == {'completed': 2}
         assert svc.mem0.add.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_success_row_write_records_no_backend_failure(
+        self, success_row_blocked_service
+    ):
+        svc, journal = success_row_blocked_service
+
+        await svc.add_episode(content='an episode that lands', project_id='test')
+        write_op_id = await _sole_queue_write_op_id(svc)
+        await poll_until(journal.success_row_entered.is_set, timeout=20.0)
+
+        await svc.durable_queue.close()
+
+        backend_ops = await journal.get_backend_ops_for_write_op(write_op_id)
+        assert [op for op in backend_ops if op['success'] == 0] == [], (
+            'the graphiti call returned, so no backend failure may be journaled'
+        )
+        assert svc.graphiti.add_episode.await_count == 1
 
 
 class TestAddMemoryReportsGraphitiQueued:
