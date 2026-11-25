@@ -257,6 +257,16 @@ class TestPrune:
         assert report["over_cap"] is True
         assert report["remaining_bytes"] == 1000
 
+    def test_min_age_secs_zero_makes_a_minute_old_file_eligible(
+        self, world: PrunerWorld
+    ) -> None:
+        path = put_object(world.store, "abc-fresh", 100, mtime_age=60)
+        code, report = world.prune("--min-age-secs", "0", cap=0)
+        assert code == 0
+        assert not path.exists()
+        assert report["removed"] == 1
+        assert report["skipped_young"] == 0
+
     def test_directories_are_never_removed(self, world: PrunerWorld) -> None:
         emptied = put_object(world.store, "abc-one", 100, mtime_age=DAY).parent
         precreated = world.store / "f" / "f" / "f"
