@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from git_listing import git, listed_files, run_git
+from git_listing import git, listed_files, run_git, tracked_files
 
 
 def _repo(path: Path) -> Path:
@@ -64,6 +64,25 @@ def test_listed_files_is_not_blinded_by_literal_pathspecs(
         'literal, so it saw nothing. That var redirects nothing, which is why '
         'df_pytest_isolation.py::git_redirect_env does not list it, and why the '
         'helper scrubs every GIT_* var rather than only that narrow list.'
+    )
+
+
+def test_tracked_files_lists_the_index_but_not_untracked_files(tmp_path: Path) -> None:
+    root = _repo(tmp_path / 'repo')
+    (root / 'committed.sh').write_text('true\n')
+    (root / 'staged.sh').write_text('true\n')
+    (root / 'scratch').mkdir()
+    (root / 'scratch' / 'untracked.sh').write_text('true\n')
+    (root / 'gone.sh').write_text('true\n')
+    git(root, 'add', 'committed.sh', 'staged.sh', 'gone.sh')
+    (root / 'gone.sh').unlink()
+
+    assert sorted(tracked_files(root, '*.sh')) == [root / 'committed.sh', root / 'staged.sh'], (
+        'tracked_files must list exactly git\'s index: an untracked file must '
+        'not be listed, because an untracked scratch script in the main '
+        'checkout is what refused that checkout\'s commits (task 10840); a '
+        'staged file must be listed, because it is what pre-commit is about to '
+        'land; and an index entry deleted from disk is dropped, as in listed_files.'
     )
 
 
