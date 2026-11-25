@@ -54,7 +54,8 @@ test("tab_overview.jsx::HostLoadCard renders a row for every key /api/load serve
     'fixture_unlabelled_metric',
     'precondition: the fixture exercises the fallback for an unlabelled key',
   );
-  assert.deepEqual(renderedRows(hostLoadPanel(container)), expected.map(row => [row.label, row.text]));
+  // Array.from builds the pairs in this realm; the window's arrays have its own Array.prototype.
+  assert.deepEqual(renderedRows(hostLoadPanel(container)), Array.from(expected, row => [row.label, row.text]));
 });
 
 test('tab_overview.jsx::HostLoadCard renders no metric row until /api/load answers, and says so', async t => {
