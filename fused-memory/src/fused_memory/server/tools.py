@@ -10020,6 +10020,7 @@ def create_mcp_server(
         offset: int = 0,
         tag: str | None = None,
         include_value: Any = False,
+        include_rows: Any = False,
     ) -> dict[str, Any]:
         """Exact lookup of the tasks whose top-level ``metadata[key]`` matches ``value``.
 
@@ -10056,7 +10057,8 @@ def create_mcp_server(
         page_size = min(limit, METADATA_LOOKUP_LIMIT_CAP)
         try:
             validate_metadata_query(
-                key=key, value=value, statuses=statuses, include_value=include_value,
+                key=key, value=value, statuses=statuses,
+                include_value=include_value, include_rows=include_rows,
             )
         except InvalidMetadataLookupError as e:
             return {'error': str(e), 'error_type': 'ValidationError'}
@@ -10066,7 +10068,7 @@ def create_mcp_server(
         found = await task_interceptor.find_tasks_by_metadata(
             normalized, key, value,
             statuses=statuses, limit=page_size, offset=offset, tag=tag,
-            include_value=include_value,
+            include_value=include_value, include_rows=include_rows,
         )
         results = _fit_rows_to_budget(found['results']) if include_value else found['results']
         pid = resolve_project_id(normalized)
@@ -10076,6 +10078,7 @@ def create_mcp_server(
             'key': key,
             'value': value,
             'statuses': statuses,
+            'include_rows': include_rows,
             'results': results,
             'tasks_with_key': found['tasks_with_key'],
             'pagination': _pagination_meta(

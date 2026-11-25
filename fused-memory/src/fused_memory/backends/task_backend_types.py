@@ -112,6 +112,8 @@ class MetadataLookupRow(TypedDict):
     priority: str
     updated_at: str
     matched_value: NotRequired[Any]
+    metadata: NotRequired[dict[str, Any]]
+    dependencies: NotRequired[list[int]]
 
 
 class MetadataLookupResult(TypedDict):
