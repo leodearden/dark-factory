@@ -580,6 +580,7 @@ def test_apply_preserved_refuses_a_value_it_cannot_write_faithfully():
 _FUSED_MEMORY = "fused-memory"
 _DASHBOARD = "dashboard"
 _CLIENT_FEED = "client-feed"
+_CLIENT_FEED_FILER = "client-feed-filer"
 
 
 def _units():
@@ -603,7 +604,7 @@ def test_units_registry_holds_exactly_the_installed_units():
     POLICY section) iterates this mapping, so a key added without its template
     and preserve set would silently widen what those guards claim to cover.
     """
-    expected = {_DASHBOARD, _FUSED_MEMORY, _CLIENT_FEED}
+    expected = {_DASHBOARD, _FUSED_MEMORY, _CLIENT_FEED, _CLIENT_FEED_FILER}
     assert set(_units()) == expected, (
         f"UNITS registers {sorted(_units())}; expected exactly {sorted(expected)}."
     )
@@ -672,6 +673,7 @@ def test_unit_log_tags_are_distinct_and_non_empty():
     assert tags[_DASHBOARD] == "dashboard_unit_render", tags
     assert tags[_FUSED_MEMORY] == "fused_memory_unit_render", tags
     assert tags[_CLIENT_FEED] == "client_feed_unit_render", tags
+    assert tags[_CLIENT_FEED_FILER] == "client_feed_filer_unit_render", tags
     assert all(tag.strip() for tag in tags.values()), (
         f"an empty log tag makes the report unroutable: {tags}"
     )
@@ -696,13 +698,20 @@ def test_dashboard_spec_is_the_modules_existing_public_surface():
     )
 
 
-def test_client_feed_spec_has_no_policy_family_and_preserves_nothing():
-    """The publisher unit declares no Environment= policy, so nothing is host-local."""
-    spec = _units()[_CLIENT_FEED]
+@pytest.mark.parametrize(
+    ("key", "template"),
+    [
+        (_CLIENT_FEED, "scripts/client-feed.service.template"),
+        (_CLIENT_FEED_FILER, "scripts/client-feed-filer.service.template"),
+    ],
+)
+def test_client_feed_specs_have_no_policy_family_and_preserve_nothing(key, template):
+    """The publisher and defect-filer units declare no Environment= policy, so nothing is host-local."""
+    spec = _units()[key]
 
     assert spec.family is None
     assert spec.host_local_environment == ()
-    assert spec.template == "scripts/client-feed.service.template"
+    assert spec.template == template
 
 
 def test_fused_memory_spec_preserves_the_known_project_roots():

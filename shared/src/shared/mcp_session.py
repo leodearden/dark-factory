@@ -391,6 +391,21 @@ def _tool_reply(name: str, body: Any) -> dict:
     return reply
 
 
+def _listed_names(result: Any) -> list[str]:
+    tools = result.get('tools') if isinstance(result, dict) else None
+    if not isinstance(tools, list):
+        raise McpCallError(
+            McpFailureKind.REPLY_SHAPE, f'MCP tools/list result carries no tools list: {result!r:.200}',
+        )
+    names = [tool.get('name') for tool in tools if isinstance(tool, dict)]
+    named = [name for name in names if isinstance(name, str)]
+    if len(named) != len(tools):
+        raise McpCallError(
+            McpFailureKind.REPLY_SHAPE, f'MCP tools/list names a tool without a str name: {tools!r:.200}',
+        )
+    return named
+
+
 class SyncMcpSession:
     """An MCP session for a script: entering handshakes, exiting releases.
 
@@ -402,6 +417,9 @@ class SyncMcpSession:
     :class:`McpCallError` for every failure, ``result.isError`` included.
     Caller *headers* ride every request (the escalation server reads
     ``X-Escalation-Identity`` from them) and may not name a protocol header.
+    An injected *http_client* carries every request and stays the caller's to
+    close; without one, the session builds its own and closes it on exit.
+    ``list_tools`` names the tools the server lists, every page followed.
     """
 
     def __init__(
@@ -411,17 +429,21 @@ class SyncMcpSession:
         client_name: str,
         timeout: float = 30.0,
         headers: Mapping[str, str] | None = None,
+        http_client: httpx.Client | None = None,
     ) -> None:
         self._endpoint = mcp_endpoint_url(base_url)
         self._client_name = client_name
         self._timeout = timeout
         self._caller_headers = _caller_headers(headers or {})
+        self._injected_client = http_client
         self._client: httpx.Client | None = None
         self._session_id: str | None = None
         self._request_id = 0
 
     def __enter__(self) -> SyncMcpSession:
-        self._client = httpx.Client(follow_redirects=True, timeout=self._timeout)
+        self._client = self._injected_client or httpx.Client(
+            follow_redirects=True, timeout=self._timeout
+        )
         try:
             self._handshake()
         except BaseException:
@@ -441,6 +463,20 @@ class SyncMcpSession:
         """Call the MCP tool *name* and return its reply dict."""
         payload = self._request('tools/call', {'name': name, 'arguments': dict(arguments)})
         return _tool_reply(name, _decoded('tools/call', self._post('tools/call', payload)))
+
+    def list_tools(self) -> tuple[str, ...]:
+        """The name of every tool the server lists, in its order, following ``nextCursor`` to the last page."""
+        names: list[str] = []
+        cursor: object = None
+        while True:
+            params = {} if cursor is None else {'cursor': cursor}
+            resp = self._post('tools/list', self._request('tools/list', params))
+            body = _rpc_result('tools/list', resp)
+            result = body.get('result') if isinstance(body, dict) else None
+            names.extend(_listed_names(result))
+            cursor = result.get('nextCursor') if isinstance(result, dict) else None
+            if cursor is None:
+                return tuple(names)
 
     def _handshake(self) -> None:
         payload = self._request('initialize', _initialize_params(self._client_name))
@@ -486,4 +522,5 @@ class SyncMcpSession:
         except Exception as exc:  # a release must never mask the call's outcome
             logger.debug('MCP session %s release to %s failed: %s', session_id, self._endpoint, exc)
         finally:
-            client.close()
+            if client is not self._injected_client:
+                client.close()

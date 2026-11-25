@@ -3,8 +3,8 @@
 
 ONE RENDERER FOR EVERY UNIT IN THE ``UNITS`` REGISTRY below, selected by
 ``--unit``: dark-factory-dashboard.service (task 4793), fused-memory.service
-(task 4796), and client-feed@.service (task 6974), which declares no
-Environment= policy and so preserves nothing. The preservation core here was
+(task 4796), client-feed@.service (task 6974) and client-feed-filer@.service
+(task 7404), which declare no Environment= policy and so preserve nothing. The preservation core here was
 already unit-neutral — only the operator-facing log tag and the preserve set
 were dashboard-specific — so each further unit is a registry entry rather than
 a forked near-copy.
@@ -212,6 +212,11 @@ UNITS: "dict[str, UnitRenderSpec]" = {
         log_tag="client_feed_unit_render",
         family=None,
         template="scripts/client-feed.service.template",
+    ),
+    "client-feed-filer": UnitRenderSpec(
+        log_tag="client_feed_filer_unit_render",
+        family=None,
+        template="scripts/client-feed-filer.service.template",
     ),
 }
 
@@ -494,8 +499,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             "Render a dark-factory systemd unit from its template, preserving "
             "host-local Environment= values already present in --output. "
             "--unit selects WHICH unit (and therefore which values are "
-            "host-local): dark-factory-dashboard.service, fused-memory.service "
-            "or client-feed@.service."
+            "host-local): dark-factory-dashboard.service, fused-memory.service, "
+            "client-feed@.service or client-feed-filer@.service."
         )
     )
     parser.add_argument(

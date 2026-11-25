@@ -3,7 +3,13 @@
 import pytest
 from shared.defects import DefectOrigin, MalformedDefectRef, parse_ref
 
-from client_feed.defect_ref import PortalReport, parse_portal_ref, portal_ref, portal_ref_prefix
+from client_feed.defect_ref import (
+    PortalReport,
+    check_ref,
+    parse_portal_ref,
+    portal_ref,
+    portal_ref_prefix,
+)
 
 
 def test_a_client_report_mints_its_portal_ref() -> None:
@@ -86,3 +92,19 @@ def test_the_prefix_is_the_text_every_ref_of_the_project_begins_with() -> None:
 def test_the_prefix_of_one_project_never_selects_a_prefix_sharing_project() -> None:
     assert not portal_ref('acme-widgets', 2, 3).startswith(portal_ref_prefix('acme'))
     assert not portal_ref('acme', 2, 3).startswith(portal_ref_prefix('acme-widgets'))
+
+
+def test_the_check_ref_is_the_projects_block_token_ref() -> None:
+    assert check_ref('acme-widgets') == 'portal:acme-widgets:check:1'
+
+
+def test_the_check_ref_is_a_client_ref_of_the_shared_grammar() -> None:
+    assert parse_ref(check_ref('acme-widgets')).origin is DefectOrigin.CLIENT
+
+
+def test_the_check_ref_names_no_portal_report() -> None:
+    assert parse_portal_ref(check_ref('acme-widgets'), project_id='acme-widgets') is None
+
+
+def test_the_check_ref_begins_with_the_projects_prefix() -> None:
+    assert check_ref('acme-widgets').startswith(portal_ref_prefix('acme-widgets'))
