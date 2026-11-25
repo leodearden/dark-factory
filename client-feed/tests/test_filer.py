@@ -1,6 +1,7 @@
 """The defect filer's pass (plans/client-feed-prd.md §14.4, §14.5): B25-B29 filing each portal report once as a fix and its gate, B35 its failures and the loop, B38-B40 rulings."""
 
 import contextlib
+import logging
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -13,6 +14,7 @@ from _defects import carrier_for, declared, quarantined, reported, restated, rul
 from _fake_fused_memory import FakeFusedMemory, SimulatedCrash
 from _in_dir import append_inbox, request_reveals
 from _stores import TasksDb
+from shared.defects import DefectProof, NodeId, Proof, ProofOutcome, SideOutcome, SideResult
 from shared.mcp_session import McpCallError, McpFailureKind
 
 from client_feed.contract import INBOX_FILENAME, QuarantineReason
@@ -565,6 +567,72 @@ def test_b39_a_started_fix_is_withdrawn_but_not_cancelled_while_its_gate_is(gate
     fix, gate = gated.fix_and_gate()
     assert fix['metadata']['defects'][0]['status'] == 'withdrawn'
     assert (fix['status'], gate['status']) == ('in-progress', 'cancelled')
+
+
+def _proven(ref: str) -> Proof:
+    node = NodeId(module_root='client-feed', path='tests/test_x.py', name='test_reproduces')
+    return Proof(
+        proof=DefectProof(
+            ref=ref,
+            outcome=ProofOutcome.PROVEN,
+            base_sha='a' * 40,
+            tip_sha='b' * 40,
+            measured_at=AT,
+            node_ids=(node,),
+            base=(SideResult(node_id=node, outcome=SideOutcome.FAILED),),
+            tip=(SideResult(node_id=node, outcome=SideOutcome.PASSED),),
+            duration_s=1.0,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ('started', 'after'),
+    [('in-progress', 'in-progress'), ('pending', 'cancelled')],
+    ids=['started', 'released'],
+)
+def test_b39_a_ruling_on_a_proven_defect_writes_no_defect_event_and_still_converges(
+    gated: World, caplog: pytest.LogCaptureFixture, started: str, after: str
+) -> None:
+    cursor = _file_then_rule(gated)
+    fix, gate = gated.fix_and_gate()
+    fix_id, gate_id = str(fix['id']), str(gate['id'])
+    gated.fake.call_tool(
+        'record_defect_outcome',
+        {
+            'task_id': fix_id,
+            'ref': REF,
+            'event': _proven(REF).model_dump(mode='json'),
+            'project_root': gated.fake.project_root,
+        },
+    )
+    [entry] = gated.fake.task(fix['id'])['metadata']['defects']
+    assert entry['status'] == 'proven'
+    if started == 'in-progress':
+        gated.fake.set_status(fix['id'], 'in-progress')
+    sent_before = len(gated.fake.calls)
+
+    with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
+        report, next_cursor = gated.run(cursor)
+
+    assert [name for name, _ in gated.fake.calls[sent_before:] if name in DEFECT_WRITES] == []
+    cancels = [('set_task_status', gate_id, 'cancelled')]
+    if after == 'cancelled':
+        cancels.insert(0, ('set_task_status', fix_id, 'cancelled'))
+    assert _writes_since(gated, sent_before) == cancels
+    fix, gate = gated.fix_and_gate()
+    assert fix['metadata']['defects'][0]['status'] == 'proven'
+    assert (fix['status'], gate['status']) == (after, 'cancelled')
+    assert (report.converged, report.unconverged) == ((REF,), ())
+    assert next_cursor == FilerCursor(inbox_offset=gated.inbox_size())
+    assert any(
+        record.levelno == logging.WARNING and REF in record.getMessage() and 'proven' in record.getMessage()
+        for record in caplog.records
+        if record.name == 'client_feed.filer'
+    )
+    writes_after_ruling = len(gated.writes())
+    gated.run(FilerCursor())
+    assert len(gated.writes()) == writes_after_ruling
 
 
 def test_b39_a_ruling_calls_only_closed_tools_and_sets_no_status_but_cancelled(gated: World) -> None:
