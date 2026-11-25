@@ -12,6 +12,10 @@ Import the fixtures in the explicit re-export form so pytest registers them in t
 ``curator_creates`` creates every curated candidate as filed; ``curator_script`` answers each one
 with the next scripted ``CuratorDecision`` (create when the script is empty) and never re-embeds.
 A test uses one of the two, never both.
+
+The stack's curator reads the store and an in-memory Qdrant corpus embedded to one constant vector,
+never reaches a network service or the LLM, and takes its decisions from ``curator_creates`` /
+``curator_script``.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from _curator_helpers import ExhaustibleEmbedder, in_memory_corpus_curator
 from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -50,6 +55,7 @@ class Stack:
     root: str
     backend: SqliteTaskBackend
     interceptor: TaskInterceptor
+    curator: TaskCurator
     server: Any
     ticket_store: TicketStore
     event_buffer: EventBuffer
@@ -135,12 +141,17 @@ async def stack(tmp_path: Path) -> AsyncIterator[Stack]:
     config = FusedMemoryConfig()
     config.taskmaster = None
     config.curator = CuratorConfig()
-    interceptor = TaskInterceptor(backend, None, event_buffer, config, ticket_store=ticket_store)
+    curator = in_memory_corpus_curator(
+        ExhaustibleEmbedder(config.embedder.dimensions), config, taskmaster=backend,
+    )
+    interceptor = TaskInterceptor(
+        backend, None, event_buffer, config, ticket_store=ticket_store, curator=curator,
+    )
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
     try:
         yield Stack(
-            root=str(tmp_path / 'proj'), backend=backend, interceptor=interceptor, server=server,
-            ticket_store=ticket_store, event_buffer=event_buffer,
+            root=str(tmp_path / 'proj'), backend=backend, interceptor=interceptor, curator=curator,
+            server=server, ticket_store=ticket_store, event_buffer=event_buffer,
         )
     finally:
         await interceptor.close()
