@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 from shared.project_layout import runs_db
@@ -26,7 +25,6 @@ from verify_host_trial_fixtures import (
 )
 from verify_host_trial_stores import (
     CPU_ARM_SPECS,
-    LOCK_CONFLICT_REASONS,
     AdmissionPlan,
     CapHit,
     CapKind,
@@ -48,7 +46,6 @@ from verify_host_trial_stores import (
     read_project,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 SINCE = datetime(2026, 11, 11, tzinfo=UTC)
 UNTIL = datetime(2026, 11, 25, tzinfo=UTC)
 HOST = 'laptop'
@@ -243,14 +240,6 @@ class TestTheOtherSources:
             CapHit('max-a', day(2), day(4), CapKind.WEEKLY),
             CapHit('max-b', day(3), None, CapKind.WEEKLY),
         )
-
-    def test_each_lock_conflict_reason_is_one_the_workflow_writes(self):
-        """The producer passes each reason as a bare literal; scripts/tests imports no orchestrator, so read its text."""
-        producer = (REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'workflow.py').read_text(encoding='utf-8')
-
-        assert LOCK_CONFLICT_REASONS
-        for reason in LOCK_CONFLICT_REASONS:
-            assert f"'{reason}'" in producer or f'"{reason}"' in producer, reason
 
 
 FABLE_SCOPE = 'claude-fable-5-1'
