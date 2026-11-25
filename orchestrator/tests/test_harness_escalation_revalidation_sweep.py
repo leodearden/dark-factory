@@ -701,21 +701,36 @@ class TestCloseSupersededMainSweepEscalations:
 # ---------------------------------------------------------------------------
 
 
-def _make_main_tip_harness(*, main_sha: str) -> Harness:
-    """Build a minimal bare Harness for main-tip-sweep self-heal wiring tests."""
+def _make_main_tip_harness(
+    *,
+    main_sha: str,
+    config: OrchestratorConfig | None = None,
+    git_ops: MagicMock | None = None,
+    queue: MagicMock | None = None,
+    cold_control: MainSweepColdControl | None = None,
+) -> Harness:
+    """Build a minimal bare Harness for main-tip-sweep self-heal wiring tests.
+
+    A *git_ops* or *queue* passed in replaces the default mock whole, so it
+    must answer every call the exercised path makes (``get_main_sha`` included).
+    """
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
-    h.config = OrchestratorConfig()
-    h.git_ops = MagicMock()
-    h.git_ops.get_main_sha = AsyncMock(return_value=main_sha)
-    h._escalation_queue = MagicMock()
-    h._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
-    h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h.config = config if config is not None else OrchestratorConfig()
+    if git_ops is None:
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    h.git_ops = git_ops
+    if queue is None:
+        queue = MagicMock()
+        queue.make_id = MagicMock(return_value='esc-sweep-1')
+        queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue = queue
     # Distinct from main_sha so the SHA-dedup gate does not short-circuit
     # before verify.run_main_tip_sweep is even called.
     h._last_swept_main_sha = 'stale-' + main_sha[:6]
     h._run_store = None
-    h._main_sweep_cold_control = None
+    h._main_sweep_cold_control = cold_control
     h.event_store = None
     return h
 
@@ -748,25 +763,29 @@ class TestMainTipSweepSelfHealWiring:
         from orchestrator import verify as verify_module
 
         clean_sha = 'c' * 40
-        h = _make_main_tip_harness(main_sha=clean_sha)
-        # kwargs pin (task 4481): both fields decide whether the close runs
-        # and which seed mode the control picks
-        h.config = OrchestratorConfig(
-            escalation_revalidation_enabled=True,
-            main_tip_sweep_cold_interval_secs=86400.0,
-        )
-        h._main_sweep_cold_control = _cold_control_choosing(mode)
+        # The PASS path reads only get_main_sha and is_ancestor from git_ops,
+        # and only get_pending and resolve from the queue.
         git_ops = MagicMock()
         git_ops.get_main_sha = AsyncMock(return_value=clean_sha)
         git_ops.is_ancestor = AsyncMock(return_value=True)
-        h.git_ops = git_ops
         esc = _make_esc(
             level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
             task_id='main-sweep-deadbeef1234', esc_id='esc-main-sweep-superseded',
         )
         queue = MagicMock()
         queue.get_pending.return_value = [esc]
-        h._escalation_queue = queue
+        h = _make_main_tip_harness(
+            main_sha=clean_sha,
+            # kwargs pin (task 4481): both fields decide whether the close
+            # runs and which seed mode the control picks
+            config=OrchestratorConfig(
+                escalation_revalidation_enabled=True,
+                main_tip_sweep_cold_interval_secs=86400.0,
+            ),
+            git_ops=git_ops,
+            queue=queue,
+            cold_control=_cold_control_choosing(mode),
+        )
         passing = VerifyResult(
             passed=True, test_output='', lint_output='', type_output='',
             summary='all checks passed',
