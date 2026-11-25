@@ -60,11 +60,11 @@ they are short and they are the law:
 
 - `fused-memory/src/fused_memory/config/schema.py`, `Mem0UpdateConfig` — since
   2026-08-12 the `curator-` grant is the **schema default**: both arms'
-  `default_factory` lists are `['recon-stage-', 'curator-']`. In
-  `config.yaml`'s `mem0_update:` block only the metadata-patch list is active
-  (it adds `link-heal-` for the link-heal executor, task 6181); the
-  content-amend list stays at the schema default (an active override of it
-  trips a deliberate tripwire test).
+  `default_factory` lists carry `recon-stage-` and `curator-`, and the
+  metadata arm's also carries `link-heal-` (the link-heal executor, tasks
+  6181 and 6431). `config.yaml`'s `mem0_update:` block is fully commented
+  out, so both lists are the schema default (an active override of the
+  content-amend list trips a deliberate tripwire test).
   The field descriptions record Leo's ruling (b) on esc-3524-1 and why **both**
   arms must carry `curator-`: retain-and-tag needs the preserving half, not
   just the destructive half.

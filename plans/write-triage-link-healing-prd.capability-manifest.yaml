@@ -58,15 +58,17 @@ tasks:
       - fused-memory/src/fused_memory/maintenance/link_heal.py
       - fused-memory/scripts/link_heal.py
   - name: link-heal-prefix-admitted
-    binding: built by this leaf — an uncommented config.yaml line admits 'link-heal-'
-      beside recon-stage-/curator-
+    binding: "built by this leaf — 'link-heal-' admitted on the metadata arm beside
+      recon-stage-/curator- (an active config.yaml list until task 6431 moved it into
+      Mem0UpdateConfig's schema default)"
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: ^[^#]*link-heal-
+      pattern: "^[^#]*'curator-', 'link-heal-'"
       expect: present
       paths:
       - fused-memory/config/config.yaml
+      - fused-memory/src/fused_memory/config/schema.py
   - name: link-heal-knobs-reloadable
     binding: built by this leaf — link_heal.* leaves registered in RELOADABLE_FIELDS
     verdict: PASS
