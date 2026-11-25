@@ -2026,8 +2026,9 @@ async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
             ),
         }
 
-    # runner.py reads both straight off the task record (task.get with 50 / 60
-    # defaults), so a fixture missing them silently runs at the wrong ceiling.
+    # runner.py reads both straight off the task record (task.get with the evals
+    # package's defaults), so a fixture missing them silently runs at the wrong
+    # ceiling.
     record['max_architect_turns'] = ceilings['max_architect_turns']
     record['timeout_minutes'] = ceilings['timeout_minutes']
     return record

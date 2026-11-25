@@ -366,8 +366,9 @@ class TestMintedPool:
         self, pool: list[dict], manifest: dict,
     ) -> None:
         # runner.py reads both straight off the task record (task.get with
-        # 50 / 60 defaults), so pinning them is pure data — but EVERY fixture
-        # must carry them or that fixture silently runs at the wrong ceiling.
+        # the evals package's defaults), so pinning them is pure data — but
+        # EVERY fixture must carry them or that fixture silently runs at the
+        # wrong ceiling.
         for f in pool:
             assert f['max_architect_turns'] == 120, f['id']
             assert f['timeout_minutes'] == manifest['ceilings']['timeout_minutes'], \
