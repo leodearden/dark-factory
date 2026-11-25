@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -353,6 +354,22 @@ def tree_snapshot(root: Path) -> dict[str, Any]:
     }
 
 
+def newer_occt_header(world: ProbeWorld) -> None:
+    (world.occt_include / "Standard.hxx").write_text("// occt 7.9\n")
+
+
+def rebuilt_static_archive(world: ProbeWorld) -> None:
+    (world.deps_root / "manifold" / "lib" / "libmanifold.a").write_bytes(b"manifold v2")
+
+
+def added_conda_package(world: ProbeWorld) -> None:
+    (world.deps_root / "conda-meta" / "zstd-1.5.json").write_text("{}")
+
+
+def slvs_header_appears(world: ProbeWorld) -> None:
+    world.slvs_header.write_text("/* slvs */\n")
+
+
 @pytest.fixture
 def world(tmp_path: Path) -> ProbeWorld:
     return ProbeWorld(tmp_path)
@@ -426,26 +443,19 @@ class TestDriftProbe:
         assert changed_lines(before, world.probe()) == set()
 
     @pytest.mark.parametrize(
-        ("change", "line"),
+        ("mutate", "line"),
         [
-            ("occt-header", "occt.include.tree"),
-            ("static-archive", "reify-deps.static-archives"),
-            ("conda-package", "reify-deps.conda-meta"),
-            ("slvs-header", "pkg-config.slvs"),
+            pytest.param(newer_occt_header, "occt.include.tree", id="occt-header"),
+            pytest.param(rebuilt_static_archive, "reify-deps.static-archives", id="static-archive"),
+            pytest.param(added_conda_package, "reify-deps.conda-meta", id="conda-package"),
+            pytest.param(slvs_header_appears, "pkg-config.slvs", id="slvs-header"),
         ],
     )
     def test_a_host_tree_change_changes_only_its_line(
-        self, world: ProbeWorld, change: str, line: str
+        self, world: ProbeWorld, mutate: Callable[[ProbeWorld], None], line: str
     ) -> None:
         before = world.probe()
-        if change == "occt-header":
-            (world.occt_include / "Standard.hxx").write_text("// occt 7.9\n")
-        elif change == "static-archive":
-            (world.deps_root / "manifold" / "lib" / "libmanifold.a").write_bytes(b"manifold v2")
-        elif change == "conda-package":
-            (world.deps_root / "conda-meta" / "zstd-1.5.json").write_text("{}")
-        else:
-            world.slvs_header.write_text("/* slvs */\n")
+        mutate(world)
         assert changed_lines(before, world.probe()) == {line}
 
     def test_writes_nothing(self, world: ProbeWorld) -> None:
