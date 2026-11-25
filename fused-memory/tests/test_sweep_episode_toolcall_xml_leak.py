@@ -371,16 +371,41 @@ class TestApplyRecordsPerEpisodeFailures:
         assert _mod.resolve_exit_code(report) == 1
 
     @pytest.mark.asyncio
-    async def test_content_that_changed_since_the_scan_is_flagged(self) -> None:
+    async def test_content_that_changed_since_the_scan_is_flagged(self, caplog) -> None:
         scan = _scan(_leak('tail', TAIL_CONTENT))
 
         def _redact(episode_uuid: str, **kwargs: Any) -> dict[str, Any]:
             return {'old_content': 'someone rewrote it', 'new_content': kwargs['new_content']}
 
-        report = await _mod.run(_args('--apply'), StubService(scan, redact=_redact))
+        with caplog.at_level(logging.WARNING, logger='sweep_episode_toolcall_xml_leak'):
+            report = await _mod.run(_args('--apply'), StubService(scan, redact=_redact))
 
-        assert _record(report, 'tail')[_mod.CONTENT_CHANGED_SINCE_SCAN] is True
+        record = _record(report, 'tail')
+        assert record[_mod.CONTENT_CHANGED_SINCE_SCAN] is True
         assert _mod.resolve_exit_code(report) == 1
+        assert _mod.REPLACED_CONTENT == 'replaced_content'
+        assert record[_mod.REPLACED_CONTENT] == 'someone rewrote it'
+        assert record['content'] == TAIL_CONTENT
+        printed = _record(json.loads(json.dumps(report, default=str)), 'tail')
+        assert printed[_mod.REPLACED_CONTENT] == 'someone rewrote it'
+        naming_the_field = [
+            entry for entry in caplog.records
+            if entry.name == 'sweep_episode_toolcall_xml_leak'
+            and entry.levelno == logging.WARNING
+            and 'tail' in entry.getMessage()
+            and _mod.REPLACED_CONTENT in entry.getMessage()
+        ]
+        assert len(naming_the_field) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_redaction_carries_no_replaced_content(self) -> None:
+        report = await _mod.run(_args('--apply'), StubService(_scan(_leak('tail', TAIL_CONTENT))))
+
+        record = _record(report, 'tail')
+        assert record['redacted'] is True
+        assert _mod.REPLACED_CONTENT not in record
+        assert _mod.CONTENT_CHANGED_SINCE_SCAN not in record
+        assert _mod.resolve_exit_code(report) == 0
 
 
 class TestApplyStoreMutationPreflight:
