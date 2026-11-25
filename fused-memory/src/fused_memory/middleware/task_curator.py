@@ -52,8 +52,9 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, Required, TypeAlias, TypedDict, TypeVar
 
+import openai
 from shared.account_reserve import WorkClass, WorkKind
 from shared.cancel_dispositions import sibling_lookup_values
 from shared.cli_invoke import (
@@ -111,6 +112,7 @@ from fused_memory.middleware.curator_types import (
     PoolWithheld,
     PreparedCandidate,
     RewrittenTask,
+    clip_for_embedding,
     clip_for_prompt,
     declared_scope_of,
     embedding_text,
@@ -147,6 +149,7 @@ from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 
 if TYPE_CHECKING:
+    from qdrant_client import AsyncQdrantClient
     from qdrant_client.models import ExtendedPointId
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
@@ -789,6 +792,22 @@ def _render_batch_prompt(
 CuratorInvoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
 
 
+EmbedderRefusal = openai.BadRequestError
+
+
+class CorpusEmbedder(Protocol):
+    """What the corpus needs of an embedder; graphiti_core's OpenAIEmbedder satisfies it."""
+
+    async def create(self, input_data: str) -> list[float]:
+        """Embed *input_data*.
+
+        Raise :data:`EmbedderRefusal` for an input that will never embed: the
+        candidate is then curated over its other streams. Any other exception
+        is an outage, and a candidate with no stream left defers CORPUS_FAILED.
+        """
+        ...
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -803,6 +822,8 @@ class TaskCurator:
         config_dir_base: Path | None = None,
         cost_store: CostStore | None = None,
         invoke: CuratorInvoke = invoke_with_cap_retry,
+        embedder: CorpusEmbedder | None = None,
+        qdrant_client: AsyncQdrantClient | None = None,
     ) -> None:
         self._config = config
         self._invoke = invoke
@@ -815,8 +836,9 @@ class TaskCurator:
         # Parent of the per-process config dir; None means the system tempdir.
         self._config_dir_base = config_dir_base
         self._config_dir: TaskConfigDir | None = None  # lazy, gated only
-        self._qdrant_client = None  # AsyncQdrantClient, lazy
-        self._embedder = None  # OpenAIEmbedder, lazy
+        # Owned and closed by the curator whether injected or built lazily.
+        self._qdrant_client: AsyncQdrantClient | None = qdrant_client
+        self._embedder: CorpusEmbedder | None = embedder
         self._initialized_collections: set[str] = set()
         # Idempotency cache: payload_hash -> (decision, monotonic_time)
         self._decision_cache: dict[str, tuple[CuratorDecision, float]] = {}
@@ -853,7 +875,7 @@ class TaskCurator:
     # Lazy init (mirrors task_dedup.py pattern)
     # ------------------------------------------------------------------
 
-    async def _get_qdrant(self):
+    async def _get_qdrant(self) -> AsyncQdrantClient:
         if self._qdrant_client is None:
             from qdrant_client import AsyncQdrantClient
 
@@ -863,7 +885,7 @@ class TaskCurator:
             )
         return self._qdrant_client
 
-    async def _get_embedder(self):
+    async def _get_embedder(self) -> CorpusEmbedder:
         if self._embedder is None:
             cfg = self._config.embedder
             if cfg.provider == 'openai' and cfg.providers.openai:
@@ -1987,14 +2009,16 @@ class TaskCurator:
     ) -> list[dict[str, Any]]:
         """Semantic nearest-neighbour search over the curator corpus.
 
-        Read-only: embeds the raw ``query`` string and returns the most
+        Read-only: embeds the ``query`` string and returns the most
         similar filed tasks for ``project_id`` ranked by cosine similarity
         (higher score = more similar). Never creates the collection — a
         missing collection (no tasks ever filed) yields ``[]``.
 
         Args:
-            query: Free-text query, embedded as-is (NOT passed through
-                ``embedding_text``, which composes stored-task fields).
+            query: Free-text query, embedded as-is apart from the
+                ``clip_for_embedding`` bound every corpus vector shares (NOT
+                passed through ``embedding_text``, which composes stored-task
+                fields).
             project_id: Project identifier selecting the collection.
             limit: Max number of hits to return.
             score_threshold: Drop hits below this cosine score server-side.
@@ -2010,7 +2034,7 @@ class TaskCurator:
             name = self._collection_name(project_id)
             if not await client.collection_exists(name):
                 return []
-            embedding = await (await self._get_embedder()).create(query)
+            embedding = await (await self._get_embedder()).create(clip_for_embedding(query))
             results = await client.query_points(
                 collection_name=name,
                 query=embedding,
@@ -2272,8 +2296,10 @@ class TaskCurator:
         where much of what the pool loses is lost (see the pool-cap block in
         ``config/schema.py::CuratorConfig``). A stream whose read fails is
         logged at WARNING and named in ``withheld.unavailable_streams``; when
-        every stream it attempted failed, it raises ``_CorpusUnavailableError``
-        instead, since an empty pool would then only look like no overlap.
+        every stream it attempted failed and some failure was not a refusal of
+        this candidate's input, it raises ``_CorpusUnavailableError`` instead,
+        since an empty pool would then only look like no overlap, and a retry
+        could change it.
         """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
@@ -2369,7 +2395,7 @@ class TaskCurator:
             )
             admit(dep_entries)
 
-        if reads.every_attempt_failed():
+        if reads.is_outage():
             raise _CorpusUnavailableError(tuple(reads.unavailable))
 
         # Every stream has run, so seen_ids is now the complete admitted set
@@ -3191,16 +3217,28 @@ _T = TypeVar('_T')
 
 @dataclass
 class _StreamReads:
-    """The corpus streams one ``_build_corpus`` call attempted, and those whose read failed."""
+    """The corpus streams one ``_build_corpus`` call attempted, those whose read failed, and which of those refused."""
 
     attempted: list[str] = field(default_factory=list)
     unavailable: list[str] = field(default_factory=list)
+    # The subset of ``unavailable`` whose read raised EmbedderRefusal: a
+    # refusal of this candidate's input, which a retry will not change.
+    refused: list[str] = field(default_factory=list)
 
     async def read(self, stream: str, read: Awaitable[_T], fallback: _T) -> _T:
         """Await *stream*'s *read*; a failure is logged, recorded, and answered with *fallback*."""
         self.attempted.append(stream)
         try:
             return await read
+        except EmbedderRefusal as exc:
+            logger.warning(
+                "task_curator: corpus stream %s refused this candidate's input, "
+                'which a retry will not change: %s',
+                stream, exception_summary(exc),
+            )
+            self.unavailable.append(stream)
+            self.refused.append(stream)
+            return fallback
         except Exception as exc:
             logger.warning(
                 'task_curator: corpus stream %s unavailable: %s', stream, exception_summary(exc),
@@ -3208,13 +3246,20 @@ class _StreamReads:
             self.unavailable.append(stream)
             return fallback
 
-    def every_attempt_failed(self) -> bool:
-        """Whether some stream was attempted and every attempted stream failed."""
-        return bool(self.attempted) and len(self.unavailable) == len(self.attempted)
+    def is_outage(self) -> bool:
+        """Whether some stream was attempted, every attempted stream failed, and a retry could change that.
+
+        A retry could change it when at least one failure was not a refusal.
+        """
+        return (
+            bool(self.attempted)
+            and len(self.unavailable) == len(self.attempted)
+            and len(self.refused) < len(self.unavailable)
+        )
 
 
 class _CorpusUnavailableError(RuntimeError):
-    """Every corpus stream ``_build_corpus`` attempted failed, so no pool can be trusted."""
+    """No attempted corpus stream answered and at least one failed in a way a retry could clear."""
 
     def __init__(self, streams: tuple[str, ...]) -> None:
         super().__init__(f'every corpus stream failed: {", ".join(streams)}')
