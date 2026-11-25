@@ -26,6 +26,7 @@ from shared.governed_exceptions import (
     owner_from_record,
     owner_record,
 )
+from shared.project_layout import verify_logs_dir
 from shared.safe_io import atomic_write_text
 
 from orchestrator.verify_hosts import remote_runner_for
@@ -39,7 +40,8 @@ from orchestrator.verify_runner import (
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
     from orchestrator.deployed_sha import DeployedSha
-    from orchestrator.remote_gate import EnsureReport
+    from orchestrator.flake_ledger import FlakeSuppression
+    from orchestrator.remote_gate import EnsureReport, RunnerUnavailableKind
     from orchestrator.verify import VerifyResult
 
 #: The archive key a preflight verifies under: remote archives and records share data/verify-logs/preflight/.
@@ -55,8 +57,6 @@ class PreflightRefused(Exception):
 
 class PreflightRunner(Protocol):
     """What a preflight calls on a verify host: RemoteRunner's own dispatch surface."""
-
-    name: str
 
     async def ensure_gate(self) -> EnsureReport: ...
 
@@ -208,7 +208,7 @@ class ModuleOutcome:
 class NoVerdict:
     """Why a runner produced no verdict: its RunnerUnavailable kind and message."""
 
-    kind: str
+    kind: RunnerUnavailableKind
     message: str
 
     def to_dict(self) -> dict[str, object]:
@@ -233,6 +233,7 @@ class RunnerVerdict:
     modules: Mapping[str, ModuleOutcome]
     failing_test_ids: tuple[str, ...] | None
     skipped_test_ids: tuple[str, ...] | None
+    flake_suppression: FlakeSuppression | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -250,6 +251,7 @@ class RunnerVerdict:
             'modules': {prefix: outcome.to_dict() for prefix, outcome in self.modules.items()},
             'failing_test_ids': _listed(self.failing_test_ids),
             'skipped_test_ids': _listed(self.skipped_test_ids),
+            'flake_suppression': _suppression_dict(self.flake_suppression),
         }
 
     @property
@@ -352,6 +354,16 @@ def _tupled(ids: list[str] | None) -> tuple[str, ...] | None:
     return None if ids is None else tuple(ids)
 
 
+def _suppression_dict(suppression: FlakeSuppression | None) -> dict[str, object] | None:
+    if suppression is None:
+        return None
+    return {
+        'verdict': str(suppression.verdict),
+        'test_ids': list(suppression.test_ids),
+        'psi_cpu_some10': suppression.psi_cpu_some10,
+    }
+
+
 @dataclass(frozen=True)
 class _Ensured:
     secs: float
@@ -397,6 +409,7 @@ class _Dispatch:
             modules=self._modules(result.failing_test_ids_by_module),
             failing_test_ids=_tupled(result.failing_test_ids),
             skipped_test_ids=_tupled(result.skipped_test_ids),
+            flake_suppression=result.flake_suppression,
         )
 
     def _unavailable(
@@ -413,6 +426,7 @@ class _Dispatch:
             modules=self._modules(None),
             failing_test_ids=None,
             skipped_test_ids=None,
+            flake_suppression=None,
         )
 
     def _modules(self, by_module: dict[str, list[str]] | None) -> dict[str, ModuleOutcome]:
@@ -518,7 +532,7 @@ def _parity_line(parity: SkipParity) -> str:
 
 
 def _archive_root(config: OrchestratorConfig) -> Path:
-    return config.project_root / 'data' / 'verify-logs'
+    return verify_logs_dir(config.project_root)
 
 
 def record_path(config: OrchestratorConfig, runner: str, sha: str) -> Path:
@@ -526,12 +540,13 @@ def record_path(config: OrchestratorConfig, runner: str, sha: str) -> Path:
     return _archive_root(config) / PREFLIGHT_ARCHIVE_KEY / f'{runner}-{sha}.json'
 
 
-def record_dict(verdict: RunnerVerdict, parity: SkipParity | None) -> dict[str, object]:
-    """The JSON record of *verdict*, carrying the preflight's skip parity (None without a reference)."""
-    return {**verdict.to_dict(), 'skip_parity': None if parity is None else parity.to_dict()}
+def record_json(verdict: RunnerVerdict, parity: SkipParity | None) -> str:
+    """The JSON record of *verdict*, carrying the preflight's skip parity (null without a reference)."""
+    record = {**verdict.to_dict(), 'skip_parity': None if parity is None else parity.to_dict()}
+    return json.dumps(record, indent=2, sort_keys=True)
 
 
 def _write_record(config: OrchestratorConfig, verdict: RunnerVerdict, parity: SkipParity | None) -> Path:
     path = record_path(config, verdict.runner, verdict.sha)
-    atomic_write_text(path, json.dumps(record_dict(verdict, parity), indent=2, sort_keys=True) + '\n', mkdir=True)
+    atomic_write_text(path, record_json(verdict, parity) + '\n', mkdir=True)
     return path

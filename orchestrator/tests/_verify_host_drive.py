@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import TEST_DEPLOYED_SHA
 from _merge_lane_fakes import FakeVerifier
 from _merge_worker_drive import make_merge_request
 from _verify_result_doubles import real_verify_result
@@ -92,7 +93,7 @@ def runner_double(
     sweep reaps its idle gates, and a preflight ensures its gate first — so a
     host is an injectable collaborator and no module attribute has to be
     substituted to decide what a verify on it does.  ``ensure_gate()``
-    reports a gate of the test deployed sha, *gate_built* when it had to
+    reports a gate of ``TEST_DEPLOYED_SHA``, *gate_built* when it had to
     build one, or raises *ensure_error*.
     """
     runner = MagicMock()
@@ -104,7 +105,7 @@ def runner_double(
         runner.ensure_gate = AsyncMock(side_effect=ensure_error)
     else:
         runner.ensure_gate = AsyncMock(return_value=EnsureReport(
-            built=gate_built, identity=local_gate_identity('d' * 40),
+            built=gate_built, identity=local_gate_identity(TEST_DEPLOYED_SHA.sha),
         ))
     if error is not None:
         runner.run_merge_verify = AsyncMock(side_effect=error)

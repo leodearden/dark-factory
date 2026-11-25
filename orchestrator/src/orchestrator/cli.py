@@ -1287,7 +1287,7 @@ def verify_host_preflight(
         click.echo(f'Error: {exc}', err=True)
         sys.exit(2)
     if as_json:
-        click.echo(json.dumps(preflight.record_dict(outcome.primary, outcome.parity), indent=2, sort_keys=True))
+        click.echo(preflight.record_json(outcome.primary, outcome.parity))
     else:
         click.echo(preflight.render_summary(outcome))
     sys.exit(0 if outcome.ok else 1)

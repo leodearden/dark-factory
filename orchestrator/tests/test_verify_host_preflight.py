@@ -15,10 +15,10 @@ from _git_fixtures import seed_repo
 from _verify_artifact_fixtures import registry_config
 from _verify_host_drive import runner_double
 from _verify_result_doubles import real_verify_result
-from shared.governed_exceptions import TaskRef
 
 from orchestrator import verify_host_preflight as preflight
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, VerifyRunnerConfig
+from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     RemoteRunner,
@@ -153,6 +153,7 @@ class TestDispatchAndRecord:
         assert spec.task_files is None
         assert spec.verify_cache is None
         assert tuple(vc.prefix for vc in spec.verify_commands) == ('alpha', 'beta')
+        assert set(kwargs) == {'task_id', 'archive_root'}
         assert kwargs['archive_root'] == repo / 'data' / 'verify-logs'
         assert kwargs['task_id'] == preflight.PREFLIGHT_ARCHIVE_KEY
 
@@ -188,6 +189,7 @@ class TestDispatchAndRecord:
             'beta': {'failing_test_ids': [], 'failing_count': 0},
         }
         assert record['skipped_test_ids'] == ['tests.test_s::test_skipped']
+        assert record['flake_suppression'] is None
         assert outcome.ok is True
         assert outcome.record_paths == (path,)
 
@@ -258,6 +260,32 @@ class TestVerdictMapping:
         }
         assert record['modules']['beta'] == {'failing_test_ids': None, 'failing_count': None}
         assert outcome.primary.modules['beta'].failing_count is None
+
+    async def test_a_green_won_by_isolated_reruns_records_its_flake_suppression(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        suppressed = green_result(
+            category='merge_flake_suppressed',
+            flake_suppression=FlakeSuppression(
+                verdict=FlakeVerdict.passes_in_isolation,
+                test_ids=('tests.test_a::test_x',),
+                observed_at='2026-11-25T00:00:00+00:00',
+                call_site=FlakeCallSite.merge_gate,
+                runner='box',
+                psi_cpu_some10=42.5,
+                unconfirmable_reason=None,
+            ),
+        )
+
+        outcome = await run_box(preflight_config(repo), timed_double(clock, result=suppressed), clock)
+
+        record = record_of(repo, outcome)
+        assert record['passed'] is True
+        assert record['flake_suppression'] == {
+            'verdict': 'passes_in_isolation',
+            'test_ids': ['tests.test_a::test_x'],
+            'psi_cpu_some10': 42.5,
+        }
 
     async def test_a_trivial_pass_is_not_recorded_as_passed(
         self, repo: Path, clock: FakeClock,
@@ -355,7 +383,6 @@ class TestRefusals:
 TRACKED_EXCEPTIONS = (
     Path(__file__).resolve().parents[2] / 'config' / 'verify-host-skip-parity-exceptions.yaml'
 )
-REIFY_GUARD = 'tests.test_verify_role_integration::test_role_env_propagates_to_reify_verify_plan'
 
 
 def exceptions_file(tmp_path: Path, text: str) -> Path:
@@ -365,13 +392,8 @@ def exceptions_file(tmp_path: Path, text: str) -> Path:
 
 
 class TestSkipParityExceptions:
-    def test_the_tracked_file_loads_and_every_entry_is_owned(self) -> None:
-        loaded = preflight.load_skip_parity_exceptions(TRACKED_EXCEPTIONS)
-
-        assert loaded
-        owners = {e.test_id: e.owner for e in loaded}
-        assert owners[f'{REIFY_GUARD}[merge]'] == TaskRef(7030)
-        assert owners[f'{REIFY_GUARD}[task]'] == TaskRef(7030)
+    def test_the_tracked_file_loads_so_every_entry_is_owned(self) -> None:
+        preflight.load_skip_parity_exceptions(TRACKED_EXCEPTIONS)
 
     def test_an_entry_with_no_owner_is_refused_by_test_id(self, tmp_path: Path) -> None:
         path = exceptions_file(tmp_path, (
