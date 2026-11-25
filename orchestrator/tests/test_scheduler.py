@@ -2828,7 +2828,7 @@ class TestDispatchCooldownGate:
         )
 
     @pytest.mark.asyncio
-    async def test_signal_evaluated_once_per_dispatch_with_primed_cooldown(
+    async def test_cooldown_signal_is_not_re_evaluated_at_the_arm_site(
         self, monkeypatch
     ):
         """_dispatch_cooldown_signal is evaluated once per gate pass and never again at the arm site.
