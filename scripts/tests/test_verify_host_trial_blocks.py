@@ -13,6 +13,7 @@ from verify_host_trial_blocks import (
     Transition,
     derive_blocks,
 )
+from verify_host_trial_stores import EventType
 
 SINCE = datetime(2026, 11, 11, tzinfo=UTC)
 UNTIL = datetime(2026, 11, 25, tzinfo=UTC)
@@ -169,6 +170,6 @@ class TestBlock:
         assert not block.contains(day(1) - timedelta(microseconds=1))
 
 
-def test_the_block_rule_names_its_three_producers():
-    for event_type in ('verify_host_admitted', 'verify_host_retired', 'merge_verify'):
-        assert event_type in BLOCK_RULE
+def test_the_block_rule_names_the_event_types_the_blocks_are_read_from():
+    for event_type in (EventType.VERIFY_HOST_ADMITTED, EventType.VERIFY_HOST_RETIRED, EventType.MERGE_VERIFY):
+        assert event_type.value in BLOCK_RULE, event_type
