@@ -473,8 +473,9 @@ Dark-factory `scripts/deploy/`:
   from reify's `Cargo.lock` each run: every registry crate's `[package.metadata.system-deps]` entries
   and `x11-dl`'s probe list (30 modules at reify `27c69f616f`). A target-scoped `cfg(...)` table of
   system-deps entries is descended one level, and every target's modules are listed without evaluating
-  the cfg: a module of a non-Linux target prints `ABSENT` on both Linux hosts, so it never makes a
-  difference. A build script that bakes a pkg-config answer into generated source makes its crate and
+  the cfg. A module listed only for a non-Linux target is usually `ABSENT` on both Linux hosts; when it
+  is not, its line can differ without being a key input, which errs toward a false difference, never a
+  missed one. A build script that bakes a pkg-config answer into generated source makes its crate and
   every dependent miss on a host that answers differently; gate α's 18 cross-host misses were
   `libxss-dev` present on one host only (`xscrnsaver`), which the fixed package list did not see.
   `#info.cargo.registry-sources-missing` names the locked registry crates whose source is not on the
