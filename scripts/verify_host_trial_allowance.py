@@ -65,7 +65,7 @@ class AllowanceReading:
     dormant_accounts: tuple[str, ...]
     """Accounts with a recorded reset but no spend or cap within one cycle of the window."""
     unplaceable_cap_hits: int
-    """Cap hits recorded without a reset."""
+    """Cap hits within one cycle of the window recorded without a reset."""
 
 
 def _first_caps(cap_hits: Iterable[CapHit]) -> dict[tuple[str, datetime], datetime]:
@@ -142,7 +142,7 @@ def account_cycles(
         estimate_usd=estimate,
         unplaced_accounts=tuple(sorted(by_account.keys() - latest.keys())),
         dormant_accounts=tuple(sorted(latest.keys() - active)),
-        unplaceable_cap_hits=sum(1 for hit in cap_hits if hit.resets_at is None),
+        unplaceable_cap_hits=sum(1 for hit in cap_hits if hit.resets_at is None and since - CYCLE <= hit.at < until),
     )
 
 
