@@ -33,6 +33,7 @@ This file covers:
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -719,10 +720,14 @@ def _make_main_tip_harness(*, main_sha: str) -> Harness:
     return h
 
 
+_FROZEN_NOW = datetime(2026, 10, 9, tzinfo=UTC)
+
+
 def _cold_control_choosing(mode: SweepSeedMode) -> MainSweepColdControl:
-    """A ledger-less cold control whose next ``seed_mode()`` is *mode*:
-    a cold verdict just recorded keeps it WARM, no history makes it COLD."""
-    control = MainSweepColdControl(None, 'dark_factory')
+    """A ledger-less cold control, its clock frozen at ``_FROZEN_NOW``, whose
+    next ``seed_mode()`` is *mode*: a cold verdict recorded at that instant
+    keeps it WARM, no history makes it COLD."""
+    control = MainSweepColdControl(None, 'dark_factory', clock=lambda: _FROZEN_NOW)
     if mode is SweepSeedMode.WARM:
         control.record_verdict(SweepSeedMode.COLD, 'a' * 40)
     return control
