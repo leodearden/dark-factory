@@ -361,6 +361,7 @@ class TestPolicySelectionPrepPhases:
             status_map={'A': 'pending'},
             tasks_by_id={'A': task},
             candidates=[task],
+            tasks_read_at=datetime(2026, 11, 25, tzinfo=UTC),
         )
 
         result = await scheduler._phase_starvation(ctx)

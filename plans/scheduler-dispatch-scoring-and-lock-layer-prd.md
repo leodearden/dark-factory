@@ -392,12 +392,12 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
   before holders re-dispatch. Resolving there would close a standing wedge at every restart,
   and since a resolve keeps the baseline, the same wedge would never be re-filed.
 - *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`; AMENDED 2026-11-24, task
-  10700). A HELD module's owner must be a slot this scheduler process has dispatched and not
-  released (`Scheduler._dispatched`); otherwise the reason is `lock_without_slot`, a lock no
-  running slot will release. A dispatched owner is live when terminal, `pending` with no claimant
-  (dispatched, not yet claimed), or gone from the active read: its slot awaits its claim or is
-  unwinding to its release. The slot's own exit path bounds that unwinding, and the
-  terminal-status watcher force-releases a slot that never unwinds
+  10700; AMENDED 2026-11-25, task 11627). A HELD module's owner must be a slot this scheduler
+  process has dispatched and not released (`Scheduler._dispatched`); otherwise the reason is
+  `lock_without_slot`, a lock no running slot will release. A dispatched owner is live when
+  terminal, `pending` with no claimant (dispatched, not yet claimed), or gone from the active
+  read: its slot awaits its claim or is unwinding to its release. The slot's own exit path
+  bounds that unwinding, and the terminal-status watcher force-releases a slot that never unwinds
   (`orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot`). Any other
   dispatched owner is live while someone alive holds it:
   `shared.task_claimant.is_stranded_any_status` at `claimant_liveness_ttl_secs`, the dispatch
@@ -408,7 +408,12 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
   status. A `pending` owner still carrying a claimant whose heartbeat went stale is a slot whose
   requeue exit hung past the TTL. Nothing else watches a non-terminal hung slot, so it reads
   `no_live_claimant`, non-live as a stranded `blocked` owner is. The cap L1 reads the lock view
-  and the in-flight set together, after the tick's awaits. A PARKED blocker's owner is followed
+  and the in-flight set together, after the tick's awaits. It judges claimant heartbeats as of
+  the tick's task read (`TickContext.tasks_read_at`), not the phase's wall clock, because the
+  phases between the two can outlast `claimant_liveness_ttl_secs`: judged at the phase's clock,
+  heartbeating holders filed the false `no_live_claimant` cap L1s
+  `esc-__starvation_auto_pin_cap__-160` and `-162` (task 11627). A heartbeat that goes stale
+  during a long tick is named on the next tick. A PARKED blocker's owner is followed
   to its own blockers, at most `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A
   cycle, a deeper chain, or an owner absent from the read or terminal is non-live. A park owner
   whose modules are all free waits only for a run slot, which is live.
