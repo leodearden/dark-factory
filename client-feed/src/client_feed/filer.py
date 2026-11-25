@@ -517,9 +517,12 @@ def _check_report(
 def _checked(policy: Policy, session: ListingCaller, cursor: FilerCursor, ref: str) -> CheckReport:
     try:
         missing = missing_tools(session)
-        live = bool(ClosedTools(session, policy.project_root).lookup_defect_ref(ref))
     except ToolRefused as refused:
         return _check_report(ref, (), None, None, str(refused))
+    try:
+        live = bool(ClosedTools(session, policy.project_root).lookup_defect_ref(ref))
+    except ToolRefused as refused:
+        return _check_report(ref, missing, None, None, str(refused))
     withheld = WithheldWrites(session)
     report, _ = run_pass(policy, ClosedTools(withheld, policy.project_root), cursor)
     return _check_report(ref, missing, live, withheld, _pass_problem(report))

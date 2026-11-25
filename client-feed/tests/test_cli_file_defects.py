@@ -1,7 +1,7 @@
 """`client-feed file-defects`: the defect filer run from its command line, --once and --check (plans/client-feed-prd.md §14.4)."""
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +12,8 @@ import yaml
 from _defects import reported
 from _fake_fused_memory import FakeFusedMemory
 from _in_dir import append_inbox
-from shared.testing_mcp_stub import StubMcpServer
+from shared.mcp_session import McpCallError, McpFailureKind
+from shared.testing_mcp_stub import StubMcpServer, ToolHandler
 
 from client_feed.cli import EXIT_LOCK_HELD, main
 from client_feed.contract import INBOX_FILENAME
@@ -107,15 +108,15 @@ def test_once_files_a_restated_report_prints_its_pass_and_stores_the_cursor(
     assert cursor.inbox_offset == (client.in_dir / INBOX_FILENAME).stat().st_size == printed['offset_to']
 
 
-@pytest.mark.parametrize('mode', ['--once', '--check'])
+@pytest.mark.parametrize('mode', [('--once',), ('--check',), ()], ids=['once', 'check', 'loop'])
 def test_a_held_lock_exits_lock_held_naming_it_before_any_request(
-    client: Client, server: StubMcpServer, capsys: pytest.CaptureFixture[str], mode: str
+    client: Client, server: StubMcpServer, capsys: pytest.CaptureFixture[str], mode: tuple[str, ...]
 ) -> None:
     append_inbox(client.in_dir, reported(2, 3, at=AT))
     config = client.config(server.url)
 
     with held_state_dir(load_filer_policy(config)):
-        code = main(['file-defects', '--config', str(config), mode])
+        code = main(['file-defects', '--config', str(config), *mode])
 
     assert code == EXIT_LOCK_HELD == 3
     assert capsys.readouterr().err.strip() == str(FilerLockHeld(client.state_dir / LOCK_NAME))
@@ -213,6 +214,33 @@ def test_check_names_a_closed_tool_the_server_does_not_list(
     assert printed['ok'] is False
     assert printed['missing_tools'] == ['set_task_status']
     assert not set(client.tool_names()) & WRITE_TOOLS
+
+
+def _serving_only(listed: list[str], fake: FakeFusedMemory) -> ToolHandler:
+    """A server that answers only the tools it lists, as fused-memory refuses a tool it does not have."""
+
+    def handle(name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        if name not in listed:
+            raise McpCallError(McpFailureKind.TOOL_ERROR, f'Unknown tool: {name}')
+        return fake.handle(name, arguments)
+
+    return handle
+
+
+def test_check_names_a_missing_lookup_tool_beside_the_refused_lookup(
+    client: Client, capsys: pytest.CaptureFixture[str]
+) -> None:
+    listed = sorted(CLOSED_TOOLS - {'lookup_defect_ref'})
+    with StubMcpServer(stateful=False, tools=_serving_only(listed, client.fake), listed_tools=listed) as stub:
+        code = main(['file-defects', '--config', str(client.config(stub.url)), '--check'])
+
+    assert code == 1
+    printed = json.loads(capsys.readouterr().out)
+    assert printed['ok'] is False
+    assert printed['missing_tools'] == ['lookup_defect_ref']
+    assert 'lookup_defect_ref refused' in printed['problem']
+    assert printed['check_ref_live'] is None
+    assert client.tool_names() == []
 
 
 def test_check_against_a_closed_port_names_the_transport_failure(
