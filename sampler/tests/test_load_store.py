@@ -787,6 +787,14 @@ def _count_at(db_path: Path, ts: int) -> int:
         conn.close()
 
 
+def _count_all(db_path: Path) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0]
+    finally:
+        conn.close()
+
+
 class TestThirtyDayRetention:
     """Asserted by BEHAVIOUR, not by signature introspection.
 
@@ -1099,6 +1107,73 @@ class TestCleanupIsIntervalGated:
             'cleanup must not stamp the vacuum clock — the two gates are separate'
         )
         assert store.should_vacuum(now) is True
+
+
+class TestRetentionIsBoundedPerTick:
+    """No tick deletes more than ``max_rows``; a backlog drains over the ticks after."""
+
+    def test_a_backlog_over_budget_drains_over_several_ticks_never_more_than_the_budget(
+        self, tmp_path: Path
+    ):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 25, step=1)
+        _bulk_insert(db_path, RUNQ.metric, now + THIRTY_DAYS + DAY, 7, step=1)
+        kept = (now - 60, now, now + 60)
+        for ts in kept:
+            store.insert_sample(ts, RUNQ, 1.0)
+
+        returns: list[int] = []
+        last_tick = now
+        for k in range(10):
+            last_tick = now + 5 * k
+            before = _count_all(db_path)
+            deleted = store.cleanup_old(last_tick, max_rows=10)
+            assert deleted <= 10, returns
+            assert before - _count_all(db_path) == deleted, returns
+            returns.append(deleted)
+            if deleted < 10:
+                break
+
+        assert returns == [10, 10, 10, 2]
+        assert _count_all(db_path) == 3
+        assert [_count_at(db_path, ts) for ts in kept] == [1, 1, 1]
+        assert store.should_cleanup(last_tick) is False
+        assert store.cleanup_old(last_tick + 5, max_rows=10) == 0
+
+    def test_a_full_chunk_leaves_the_sweep_due_and_its_clock_unstamped(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 15, step=1)
+
+        assert store.cleanup_old(now, max_rows=10) == 10
+        assert _meta(db_path, 'last_cleanup_ts') is None
+        assert store.should_cleanup(now) is True
+
+        assert store.cleanup_old(now + 5, max_rows=10) == 5
+        assert _meta(db_path, 'last_cleanup_ts') == str(now + 5)
+
+    def test_a_backlog_exactly_one_budget_deep_finishes_on_a_zero_row_call(
+        self, tmp_path: Path
+    ):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 10, step=1)
+
+        assert store.cleanup_old(now, max_rows=10) == 10
+        assert _meta(db_path, 'last_cleanup_ts') is None
+
+        assert store.cleanup_old(now + 5, max_rows=10) == 0
+        assert _meta(db_path, 'last_cleanup_ts') == str(now + 5)
 
 
 # ---------------------------------------------------------------------------
