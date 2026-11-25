@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from shared.testing_own_time import OwnTimeClock
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The repo-wide deploy-clock guard's OWN snapshot/compare (task 3797), reused
@@ -433,7 +434,8 @@ def _run_sweep_while_progressing(
     stall_timeout=_SWEEP_STALL_TIMEOUT_SECS,
 ):
     """`_run_script`, stopped as stalled once `_sweep_progress` has not
-    changed for *stall_timeout* seconds, however long the whole sweep takes.
+    changed for *stall_timeout* seconds of the script's own time, however long
+    the whole sweep takes.
 
     On a stall the TimeoutExpired carries the last progress, the ledger and
     the partial output as notes.
@@ -445,7 +447,7 @@ def _run_sweep_while_progressing(
     try:
         return run_in_new_session_while_progressing(
             cmd, progress=lambda: _sweep_progress(state_path, trace_path),
-            stall_timeout=stall_timeout, env=full_env,
+            stall_timeout=stall_timeout, stall_clock=OwnTimeClock, env=full_env,
         )
     except subprocess.TimeoutExpired as exc:
         exc.add_note(f"last progress={_sweep_progress(state_path, trace_path)!r}")
