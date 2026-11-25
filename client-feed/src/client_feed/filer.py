@@ -293,7 +293,7 @@ def _unconverged(ref: str, refused: ToolRefused, record: RefRecord | None) -> Un
 
 
 def _pending_on_filer_withdrawal(fix: TaskView, ref: str) -> bool:
-    return any(entry.get('ref') == ref and is_filer_withdrawal(entry) for entry in fix.defects)
+    return any(declaration.ref == ref and is_filer_withdrawal(declaration) for declaration in fix.defects)
 
 
 def _warn_out_of_reach(ref: str, fix: TaskView, defect_status: DefectStatus) -> None:

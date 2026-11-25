@@ -191,7 +191,7 @@ def test_the_filers_withdrawal_and_acceptance_close_the_defect_as_withdrawn() ->
     assert withdrawn.status is DefectStatus.WITHDRAWN
     assert withdrawn.ruling is not None
     assert (withdrawn.ruling.accepted, withdrawn.ruling.ruled_by) == (True, RuledBy.OPERATOR)
-    assert is_filer_withdrawal(pending.model_dump(mode='json')) is True
+    assert is_filer_withdrawal(pending) is True
 
 
 def test_another_pending_closure_is_not_the_filers_withdrawal() -> None:
@@ -210,5 +210,5 @@ def test_another_pending_closure_is_not_the_filers_withdrawal() -> None:
         }
     )
 
-    assert is_filer_withdrawal(exempted.model_dump(mode='json')) is False
-    assert is_filer_withdrawal(duplicate.model_dump(mode='json')) is False
+    assert is_filer_withdrawal(exempted) is False
+    assert is_filer_withdrawal(duplicate) is False

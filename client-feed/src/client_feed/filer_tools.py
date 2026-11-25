@@ -12,7 +12,7 @@ from typing import Any, Final, Protocol, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
-from shared.defects import DefectStatus
+from shared.defects import DefectDeclaration, DefectStatus
 from shared.mcp_session import McpCallError, SyncMcpSession
 
 from client_feed.contract import TaskStatus, Token
@@ -174,7 +174,7 @@ class TaskView(_View):
     dependencies: frozenset[str]
     source: str | None
     x_client_defect: dict[str, Any] | None
-    defects: tuple[dict[str, Any], ...]
+    defects: tuple[DefectDeclaration, ...]
 
 
 def _task_id(value: object) -> str:
@@ -191,20 +191,33 @@ def _carrier(entry: Mapping[str, Any]) -> Carrier:
     )
 
 
+def _declaration(entry: object) -> DefectDeclaration | None:
+    try:
+        return DefectDeclaration.model_validate(entry)
+    except ValidationError:
+        return None
+
+
+def _declarations(entries: object) -> tuple[DefectDeclaration, ...]:
+    """The metadata.defects entries that read as declarations; one another writer shaped differently reads as absent."""
+    if not isinstance(entries, list):
+        return ()
+    return tuple(declaration for declaration in map(_declaration, entries) if declaration is not None)
+
+
 def _task_view(reply: Mapping[str, Any]) -> TaskView:
     metadata = reply.get('metadata') or {}
     if not isinstance(metadata, dict):
         metadata = {}
     source = metadata.get(SOURCE_KEY)
     facts = metadata.get(CLIENT_DEFECT_KEY)
-    defects = metadata.get(DEFECTS_KEY)
     return TaskView(
         task_id=_task_id(reply['id']),
         status=reply['status'],
         dependencies=frozenset(_task_id(task_id) for task_id in reply.get('dependencies') or ()),
         source=source if isinstance(source, str) else None,
         x_client_defect=facts if isinstance(facts, dict) else None,
-        defects=tuple(entry for entry in defects if isinstance(entry, dict)) if isinstance(defects, list) else (),
+        defects=_declarations(metadata.get(DEFECTS_KEY)),
     )
 
 

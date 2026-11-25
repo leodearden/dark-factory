@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict
 from shared.defects import (
     DeclareClosure,
     DefectDeclaration,
@@ -113,12 +112,8 @@ def operator_acceptance_event(ref: str) -> dict[str, Any]:
     return Rule(ref=ref, ruling=ruling).model_dump(mode='json')
 
 
-def is_filer_withdrawal(entry: Mapping[str, Any]) -> bool:
-    """Whether a defects entry is pending on exactly the filer's withdrawal."""
-    try:
-        declaration = DefectDeclaration.model_validate(entry)
-    except ValidationError:
-        return False
+def is_filer_withdrawal(declaration: DefectDeclaration) -> bool:
+    """Whether a declared defect is pending on exactly the filer's withdrawal."""
     return declaration.status is DefectStatus.PENDING and declaration.closure == _FILER_WITHDRAWAL
 
 

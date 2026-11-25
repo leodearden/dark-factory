@@ -5,9 +5,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _defects import declared
 from _fake_fused_memory import FakeFusedMemory
 from pydantic import HttpUrl
-from shared.defects import DefectStatus
+from shared.defects import DefectDeclaration, DefectStatus
 from shared.mcp_session import McpCallError, McpFailureKind
 from shared.testing_mcp_stub import StubMcpServer
 
@@ -227,7 +228,7 @@ def test_lookup_is_a_tuple_of_typed_carriers(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize('ids', [(4, 5), ('4', '5')], ids=['int', 'str'])
 def test_get_task_is_a_typed_view_with_normalised_ids(tmp_path: Path, ids: tuple[object, object]) -> None:
-    entry = {'ref': REF, 'status': 'open'}
+    entry = declared(REF)
     caller = Scripted(
         get_task=[
             {
@@ -246,7 +247,17 @@ def test_get_task_is_a_typed_view_with_normalised_ids(tmp_path: Path, ids: tuple
     assert view.dependencies == frozenset({'5'})
     assert view.source == FILER_IDENTITY
     assert view.x_client_defect == {'block': 2}
-    assert view.defects == (entry,)
+    assert view.defects == (DefectDeclaration.model_validate(entry),)
+
+
+def test_a_defects_entry_that_is_no_declaration_reads_as_absent(tmp_path: Path) -> None:
+    fake = FakeFusedMemory(tmp_path)
+    malformed = {'ref': REF, 'status': 'open'}
+    task_id = str(fake.seed_task(metadata={'defects': [malformed, declared(REF), 'not-a-mapping']}))
+
+    view = ClosedTools(fake, tmp_path).get_task(task_id)
+
+    assert view.defects == (DefectDeclaration.model_validate(declared(REF)),)
 
 
 def test_a_task_without_filer_metadata_has_no_source_or_facts(tmp_path: Path) -> None:
