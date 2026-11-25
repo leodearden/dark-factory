@@ -10,14 +10,15 @@ import json
 from pathlib import Path
 
 import pytest
-from escalation.disposition import ReviewerDisposition
-from shared.defects import (
-    MalformedDefectRef,
-    RulingSubject,
-    mint_redmain_ref,
-    mint_review_ref,
-    parse_ref,
+from _defect_ruling_fixtures import (
+    RULED_REF,
+    SECOND_RULED_REF,
+    contract_ruling,
+    contract_ruling_without,
+    parse_ref_message,
 )
+from escalation.disposition import ReviewerDisposition
+from shared.defects import RulingSubject
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals import compare
@@ -313,22 +314,16 @@ class TestNoteDispositions:
         )
 
 
-_REVIEW_REF = mint_review_ref(7048, 'a.py:1', 'x is wrong')
-_REDMAIN_REF = mint_redmain_ref('0123456789abcdef')
-_CLOSURE_RAW = {'ref': _REVIEW_REF, 'subject': 'closure', 'accepted': True}
-_RETIREMENT_RAW = {'ref': _REDMAIN_REF, 'subject': 'retirement', 'accepted': False}
-_CLOSURE = DefectRuling(_REVIEW_REF, RulingSubject.CLOSURE, True)
-_RETIREMENT = DefectRuling(_REDMAIN_REF, RulingSubject.RETIREMENT, False)
+_CLOSURE_RAW = contract_ruling()
+_RETIREMENT_RAW = contract_ruling(
+    ref=SECOND_RULED_REF, subject=RulingSubject.RETIREMENT.value, accepted=False,
+)
+_CLOSURE = DefectRuling(RULED_REF, RulingSubject.CLOSURE, True)
+_RETIREMENT = DefectRuling(SECOND_RULED_REF, RulingSubject.RETIREMENT, False)
 
 
 def _with_rulings(raw: object, verdict: str = 'PASS') -> dict:
     return {**_payload(verdict, issues=[]), 'defect_rulings': raw}
-
-
-def _parse_ref_message(value: object) -> str:
-    with pytest.raises(MalformedDefectRef) as raised:
-        parse_ref(value)
-    return str(raised.value)
 
 
 class TestDefectRulings:
@@ -368,17 +363,17 @@ class TestDefectRulings:
     @pytest.mark.parametrize(
         ('entry', 'named'),
         [
-            pytest.param(_REVIEW_REF, 'str', id='entry-not-a-mapping'),
-            pytest.param({'subject': 'closure', 'accepted': True}, 'None', id='missing-ref'),
+            pytest.param(RULED_REF, 'str', id='entry-not-a-mapping'),
+            pytest.param(contract_ruling_without('ref'), 'None', id='missing-ref'),
             pytest.param(
-                {**_CLOSURE_RAW, 'ref': 'not-a-ref'}, 'not-a-ref', id='malformed-ref',
+                contract_ruling(ref='not-a-ref'), 'not-a-ref', id='malformed-ref',
             ),
-            pytest.param({**_CLOSURE_RAW, 'subject': 'closed'}, 'closed', id='unknown-subject'),
+            pytest.param(contract_ruling(subject='closed'), 'closed', id='unknown-subject'),
             pytest.param(
-                {'ref': _REVIEW_REF, 'subject': 'closure'}, 'accepted', id='missing-accepted',
+                contract_ruling_without('accepted'), 'accepted', id='missing-accepted',
             ),
-            pytest.param({**_CLOSURE_RAW, 'accepted': 1}, '1', id='int-accepted'),
-            pytest.param({**_CLOSURE_RAW, 'accepted': 'true'}, "'true'", id='str-accepted'),
+            pytest.param(contract_ruling(accepted=1), '1', id='int-accepted'),
+            pytest.param(contract_ruling(accepted='true'), "'true'", id='str-accepted'),
         ],
     )
     def test_malformed_entry_raises_naming_its_index_and_value(self, entry: object, named: str):
@@ -391,21 +386,21 @@ class TestDefectRulings:
     @pytest.mark.parametrize('ref', [None, 'not-a-ref', 'review:7048'])
     def test_a_bad_ref_is_refused_in_parse_refs_own_words(self, ref: object):
         with pytest.raises(ReviewPayloadError) as raised:
-            parse_defect_rulings([{**_CLOSURE_RAW, 'ref': ref}], reviewer=_REVIEWER)
+            parse_defect_rulings([contract_ruling(ref=ref)], reviewer=_REVIEWER)
 
-        assert _parse_ref_message(ref) in str(raised.value)
+        assert parse_ref_message(ref) in str(raised.value)
 
     def test_unknown_subject_lists_the_valid_values(self):
         with pytest.raises(ReviewPayloadError) as raised:
-            parse_defect_rulings([{**_CLOSURE_RAW, 'subject': 'closed'}], reviewer=_REVIEWER)
+            parse_defect_rulings([contract_ruling(subject='closed')], reviewer=_REVIEWER)
 
         for subject in RulingSubject:
             assert repr(subject.value) in str(raised.value)
 
     def test_a_duplicated_ref_and_subject_names_both_indices(self):
-        duplicate = {**_CLOSURE_RAW, 'accepted': False}
+        duplicate = contract_ruling(accepted=False)
 
-        with pytest.raises(ReviewPayloadError, match=_REVIEW_REF) as raised:
+        with pytest.raises(ReviewPayloadError, match=RULED_REF) as raised:
             parse_defect_rulings(
                 [dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW), duplicate], reviewer=_REVIEWER,
             )
@@ -413,10 +408,10 @@ class TestDefectRulings:
         assert 'entries 0 and 2' in str(raised.value)
 
     def test_one_ref_may_be_ruled_under_each_subject(self):
-        retirement = {**_CLOSURE_RAW, 'subject': 'retirement'}
+        retirement = contract_ruling(subject=RulingSubject.RETIREMENT.value)
 
         assert parse_defect_rulings([dict(_CLOSURE_RAW), retirement]) == (
-            _CLOSURE, DefectRuling(_REVIEW_REF, RulingSubject.RETIREMENT, True),
+            _CLOSURE, DefectRuling(RULED_REF, RulingSubject.RETIREMENT, True),
         )
 
     def test_to_record_carries_rulings_and_round_trips(self):

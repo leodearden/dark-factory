@@ -16,12 +16,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _defect_ruling_fixtures import RULED_REF, SECOND_RULED_REF, contract_ruling
 from _plan_model_helpers import read_model
 from _review_fixtures import review_aggregation, review_issue
 from _review_payloads import blocking_review, pass_review
 from escalation.disposition import ReviewerDisposition
 from shared import safe_io
-from shared.defects import IssueKind, IssueKindFlag, RulingSubject, mint_review_ref
+from shared.defects import IssueKind, IssueKindFlag, RulingSubject
 
 from orchestrator.artifacts import (
     LANE_SYMLINKED_ARTIFACTS,
@@ -1630,13 +1631,12 @@ class TestReviewNoteDispositions:
         assert aggregation.note_dispositions == ()
 
 
-_CLOSURE_REF = mint_review_ref(7048, 'a.py:1', 'x is wrong')
-_RETIREMENT_REF = mint_review_ref(7048, 'b.py:2', 'y is gone')
-_CLOSURE_RULING = {'ref': _CLOSURE_REF, 'subject': 'closure', 'accepted': True}
-_RETIREMENT_RULING = {'ref': _RETIREMENT_REF, 'subject': 'retirement', 'accepted': False}
+_RETIREMENT_RULING = contract_ruling(
+    ref=SECOND_RULED_REF, subject=RulingSubject.RETIREMENT.value, accepted=False,
+)
 _TYPED_RULINGS = (
-    DefectRuling(_CLOSURE_REF, RulingSubject.CLOSURE, True),
-    DefectRuling(_RETIREMENT_REF, RulingSubject.RETIREMENT, False),
+    DefectRuling(RULED_REF, RulingSubject.CLOSURE, True),
+    DefectRuling(SECOND_RULED_REF, RulingSubject.RETIREMENT, False),
 )
 
 
@@ -1649,7 +1649,7 @@ class TestReviewDefectRulings:
             'verdict': 'PASS',
             'issues': [],
             'summary': 'OK',
-            'defect_rulings': [dict(_CLOSURE_RULING), dict(_RETIREMENT_RULING)],
+            'defect_rulings': [contract_ruling(), dict(_RETIREMENT_RULING)],
         })
 
         assert artifacts.aggregate_reviews().defect_rulings == _TYPED_RULINGS
@@ -1660,7 +1660,7 @@ class TestReviewDefectRulings:
             'verdict': 'ERROR',
             'issues': [],
             'summary': 'Reviewer error',
-            'defect_rulings': [dict(_CLOSURE_RULING)],
+            'defect_rulings': [contract_ruling()],
         })
 
         assert artifacts.aggregate_reviews().defect_rulings == ()
@@ -1681,7 +1681,7 @@ class TestReviewDefectRulings:
         role = 'reviewer_comprehensive'
         result = _submit_review_verdict(
             artifacts, role, 'sid', role, 'PASS', [], 'OK',
-            defect_rulings=[dict(_CLOSURE_RULING), dict(_RETIREMENT_RULING)],
+            defect_rulings=[contract_ruling(), dict(_RETIREMENT_RULING)],
         )
         assert result['status'] == 'ok'
         envelope = artifacts.read_verdict(role)

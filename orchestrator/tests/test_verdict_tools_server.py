@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _defect_ruling_fixtures import contract_ruling, parse_ref_message
 from _review_issue_fixtures import contract_issue, contract_issue_without
 from fastmcp import Client, FastMCP
-from shared.defects import IssueKind, MalformedDefectRef, RulingSubject, mint_review_ref, parse_ref
+from shared.defects import IssueKind, RulingSubject
 from shared.mcp_markup_middleware import OUTCOMES as MARKUP_OUTCOMES
 
 from orchestrator.agents.roles import ALL_REVIEWERS
@@ -40,18 +41,6 @@ def artifacts(tmp_path):
 _NO_ACTION_NOTE = {
     'escalation_id': 'esc-42-1', 'disposition': 'no_action', 'rationale': 'pure observation',
 }
-
-_RULED_REF = mint_review_ref(7048, 'a.py:1', 'x is wrong')
-_CLOSURE_RULING = {'ref': _RULED_REF, 'subject': 'closure', 'accepted': True}
-
-
-def _parse_ref_message(value: object) -> str:
-    try:
-        parse_ref(value)
-    except MalformedDefectRef as exc:
-        return str(exc)
-    raise AssertionError(f'{value!r} parsed as a defect ref')
-
 
 # ---------------------------------------------------------------------------
 # Standalone _impl tests (independent of the MCP tool/pydantic boundary)
@@ -206,13 +195,13 @@ class TestSubmitReviewVerdict:
             verdict='PASS',
             issues=[],
             summary='ok',
-            defect_rulings=[dict(_CLOSURE_RULING)],
+            defect_rulings=[contract_ruling()],
         )
         assert result == {'status': 'ok', 'role': 'test_analyst'}
 
         envelope = artifacts.read_verdict('test_analyst')
         assert envelope is not None
-        assert envelope['verdict']['defect_rulings'] == [_CLOSURE_RULING]
+        assert envelope['verdict']['defect_rulings'] == [contract_ruling()]
 
     def test_omitted_defect_rulings_leave_no_key_in_the_payload(self, artifacts):
         _submit_review_verdict(
@@ -228,21 +217,21 @@ class TestSubmitReviewVerdict:
         ('defect_rulings', 'named'),
         [
             pytest.param(
-                [{**_CLOSURE_RULING, 'subject': 'closed'}],
+                [contract_ruling(subject='closed')],
                 [repr(subject.value) for subject in RulingSubject],
                 id='unknown-subject',
             ),
             pytest.param(
-                [{**_CLOSURE_RULING, 'ref': 'not-a-ref'}],
-                [_parse_ref_message('not-a-ref')],
+                [contract_ruling(ref='not-a-ref')],
+                [parse_ref_message('not-a-ref')],
                 id='malformed-ref',
             ),
             pytest.param(
-                [{**_CLOSURE_RULING, 'accepted': 'yes'}],
+                [contract_ruling(accepted='yes')],
                 ["'yes'", 'true or false'],
                 id='non-bool-accepted',
             ),
-            pytest.param(dict(_CLOSURE_RULING), ['expected a list'], id='not-a-list'),
+            pytest.param(contract_ruling(), ['expected a list'], id='not-a-list'),
         ],
     )
     def test_malformed_defect_rulings_return_error_and_write_nothing(
@@ -433,12 +422,12 @@ class TestCreateServer:
             'verdict': 'PASS',
             'issues': [],
             'summary': 's',
-            'defect_rulings': [dict(_CLOSURE_RULING)],
+            'defect_rulings': [contract_ruling()],
         })
 
         envelope = artifacts.read_verdict('test_analyst')
         assert envelope is not None
-        assert envelope['verdict']['defect_rulings'] == [_CLOSURE_RULING]
+        assert envelope['verdict']['defect_rulings'] == [contract_ruling()]
 
     async def test_reviewer_tool_defect_rulings_is_optional(self, artifacts):
         server = create_server(artifacts, 'test_analyst')
@@ -624,7 +613,7 @@ class TestSubmitReviewVerdictIssueIntake:
     async def test_a_malformed_ruling_with_on_contract_issues_is_refused(self, artifacts):
         result = await _call_review_tool(
             artifacts, [contract_issue()],
-            defect_rulings=[{**_CLOSURE_RULING, 'subject': 'closed'}],
+            defect_rulings=[contract_ruling(subject='closed')],
         )
 
         assert result['status'] == 'error'
