@@ -147,6 +147,7 @@ from fused_memory.middleware.recon_code_fix_premise_guard import (
 from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
 from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 from fused_memory.reconciliation.context_assembler import estimate_tokens
+from fused_memory.services.provider_billing import billing_source_of
 
 if TYPE_CHECKING:
     from qdrant_client import AsyncQdrantClient
@@ -806,6 +807,22 @@ class CorpusEmbedder(Protocol):
         is an outage, and a candidate with no stream left defers CORPUS_FAILED.
         """
         ...
+
+
+class CorpusSearchError(RuntimeError):
+    """The corpus could not be searched, so its answer is unknown, not empty.
+
+    ``error_type`` is the cause's class name and ``billing_exhausted`` the
+    billing source the cause reports exhausted, or None.
+    """
+
+    def __init__(self, project_id: str, cause: Exception) -> None:
+        self.error_type = type(cause).__name__
+        self.billing_exhausted = billing_source_of(cause)
+        message = f'curator corpus search failed for project {project_id}: {exception_summary(cause)}'
+        if self.billing_exhausted is not None:
+            message += f' (billing exhausted: {self.billing_exhausted})'
+        super().__init__(message)
 
 
 class TaskCurator:
@@ -2025,9 +2042,13 @@ class TaskCurator:
 
         Returns:
             List of dicts ``{task_id, title, description, files_to_modify,
-            priority, updated_at, score}``. Returns ``[]`` on any error
-            (Qdrant/embedder unavailable), mirroring corpus_count's
-            best-effort degradation.
+            priority, updated_at, score}``. ``[]`` means the corpus was
+            searched with no hit, or its collection does not exist (nothing
+            was ever filed).
+
+        Raises:
+            CorpusSearchError: Qdrant or the embedder failed, so the answer
+                is unknown.
         """
         try:
             client = await self._get_qdrant()
@@ -2057,11 +2078,8 @@ class TaskCurator:
                     },
                 )
             return hits
-        except Exception:
-            logger.warning(
-                'task_curator: search_corpus failed for project %s', project_id, exc_info=True,
-            )
-            return []
+        except Exception as exc:
+            raise CorpusSearchError(project_id, exc) from exc
 
     async def backfill_corpus(
         self,
