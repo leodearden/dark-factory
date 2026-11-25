@@ -191,7 +191,7 @@ from fused_memory.middleware.task_creation_journal import (
     CreationAttribution,
     creation_operation_for,
 )
-from fused_memory.middleware.task_curator import TaskCurator, flatten_task_tree
+from fused_memory.middleware.task_curator import CorpusSearchError, TaskCurator, flatten_task_tree
 from fused_memory.middleware.ticket_store import OPEN_TICKET_STATUSES, ResolveReason, TicketStatus
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -6662,7 +6662,11 @@ class TaskInterceptor:
         Returns:
             ``{'results': [...]}`` on success, where each hit carries a
             ``status`` key (``None`` if the task no longer exists). Returns a
-            ``ConfigurationError`` shape when the curator is disabled.
+            ``ConfigurationError`` shape when the curator is disabled. When
+            the corpus cannot be searched it returns ``{'results': [],
+            'degraded': True, 'error', 'error_type', 'billing_exhausted'}``:
+            the answer is unknown, not "nothing similar", and the ``error``
+            key makes callers that treat any error as a failure fail closed.
         """
         curator = await self._get_curator()
         if curator is None:
@@ -6672,9 +6676,18 @@ class TaskInterceptor:
                 'results': [],
             }
         project_id = resolve_project_id(project_root)
-        hits = await curator.search_corpus(
-            query, project_id, limit=limit, score_threshold=score_threshold,
-        )
+        try:
+            hits = await curator.search_corpus(
+                query, project_id, limit=limit, score_threshold=score_threshold,
+            )
+        except CorpusSearchError as exc:
+            return {
+                'results': [],
+                'degraded': True,
+                'error': str(exc),
+                'error_type': exc.error_type,
+                'billing_exhausted': exc.billing_exhausted,
+            }
         # Enrich with live status via a single status read for the whole set.
         statuses = await self.get_statuses(project_root)
         for hit in hits:
