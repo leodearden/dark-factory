@@ -874,7 +874,27 @@ def test_discover_uv_run_scripts_reads_every_shell_script_outside_test_trees(
             "scripts/notes.txt": "uv run --frozen --project shared python x.py\n",
         },
     )
+    git(tmp_path, "add", "-A")
     assert discover_uv_run_scripts(tmp_path) == ["scripts/a.sh", "scripts/odd.sh", "top.sh"]
+
+
+def test_discover_uv_run_scripts_ignores_an_untracked_script(tmp_path: pathlib.Path) -> None:
+    """An untracked script is not swept; a staged one is, because it is what the commit lands."""
+    git(tmp_path, "init", "-q")
+    _plant(tmp_path, {"scripts/a.sh": "uv run --no-sync --project shared python x.py\n"})
+    _plant(tmp_path, {"scripts/new.sh": "uv run --no-sync --project shared python y.py\n"})
+    git(tmp_path, "add", "scripts/a.sh", "scripts/new.sh")
+    _plant(
+        tmp_path,
+        {"plans/study/repro/trial.sh": "nice uv run --project shared pytest tests/scripts/ -q\n"},
+    )
+    assert discover_uv_run_scripts(tmp_path) == ["scripts/a.sh", "scripts/new.sh"], (
+        "task 10840: an untracked plans/.../repro/trial.sh in the main checkout "
+        "refused every commit there that selected screen:uv_run_venv_isolation, "
+        "the nightly legibility trickle's codebook commit included. The sweep's "
+        "population is checked-in scripts, i.e. git's index: a staged script is "
+        "swept, an untracked one is not."
+    )
 
 
 def test_script_uv_run_sites_names_the_script_it_read(tmp_path: pathlib.Path) -> None:
