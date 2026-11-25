@@ -23,6 +23,7 @@ from types import MappingProxyType
 from typing import Any
 
 from shared import safe_io
+from shared.defects import issue_kind_of
 from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
@@ -802,7 +803,7 @@ def _warn_off_contract_issues(reviewer_name: str, issues: tuple[dict, ...]) -> N
 
 
 def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, issue_level: int = 2) -> str:
-    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, location, issue and suggested fix."""
+    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, kind, location, issue and suggested fix."""
     issue_heading = '#' * issue_level
     lines = [heading]
     for issue in issues:
@@ -811,7 +812,12 @@ def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, i
         category = issue.get('category', '')
         description = issue.get('description', '')
         fix = issue.get('suggested_fix', '')
+        reading = issue_kind_of(issue)
         lines.append(f'{issue_heading} [{reviewer}] {category}')
+        lines.append(
+            f'**Kind:** {reading.kind}'
+            + (f' (read fail-closed: kind {reading.flag})' if reading.flagged else '')
+        )
         if location:
             lines.append(f'**Location:** {location}')
         lines.append(f'**Issue:** {description}')
