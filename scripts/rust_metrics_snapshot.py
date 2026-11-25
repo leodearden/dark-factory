@@ -27,117 +27,171 @@ graph) with Rust-aware instruments:
     (Python) patch targets
   - impl-block spread: per type, the src files holding an `impl Type` block -- Rust
     couples files through impl blocks, which the use-graph cannot see
-  - fix density: fix-grep'd non-merge commits touching the file since SINCE_DATE
+  - fix density: fix-grep'd non-merge commits touching the file since the rules' date
 
 Needs tokei, lizard, cargo and git on PATH. There is no --diff yet: the summary says
 there was no previous snapshot.
 
-PROJECT RULES (the block between the PROJECT RULES markers below): EXCLUDE_RE,
-AREA_RULES, INFERRED, TEST_RE, LIZARD_EXCLUDES and the --since-date default are
-supplied by the project overlay (references/project-overlay.md, Path -> area map and
-Metrics instruments) -- reify's are the shipped example. Replace them from the
-overlay before running on another project; the snapshot records AREA_RULES and
-INFERRED in its params so the report can cite them.
+The project's rules (domain excludes, area rules, inferred mappings, test-file pattern,
+lizard excludes, fix-density start date) are a TOML file given by --rules, from the
+project overlay (references/project-overlay.md, Path -> area map and Metrics
+instruments); reify's is scripts/rust_metrics_rules/reify.toml. The snapshot records
+them in params.rules so the report can cite them.
 
-Usage: rust_metrics_snapshot.py --root WORKTREE --run-id ID --out DIR [--since-date YYYY-MM-DD]
+Usage: rust_metrics_snapshot.py --rules RULES.toml --root WORKTREE --run-id ID --out DIR
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
+import datetime
 import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
+
+import source_measures
 
 H14_SOFT = 1500
 H14_ALARM = 2000
 
 SRC_EXT = {'.rs', '.ts', '.tsx', '.py', '.sh', '.mjs'}
 
-# ==== PROJECT RULES: supplied by the overlay -- reify's are the shipped example ====
-# Paths outside the measured domain (generated, vendored, docs, fixtures).
-EXCLUDE_RE = re.compile(
-    r'^(tree-sitter-reify/src/|docs/|prj/|examples/|data/|gui/src/editor/reifyParser(\.terms)?\.js$|'
-    r'gui/src-tauri/sandbox/|.*node_modules/|.*\.d\.ts$|gui/src/__tests__/fixtures/)'
-)
 
-# One ordered rule list maps a path to a briefing area (contract §3); first match wins, with a
-# catch-all per area. The overlay carries it; the snapshot records it in params.area_rules.
-AREA_RULES = [
-    (r'^crates/reify-eval/src/compute_targets/', 'analysis'),
-    (
-        r'^crates/reify-eval/src/(compute_persist|shell_extract_compute|morph_stage_\w*|engine_compute|modal_ops|dynamics_ops)\.rs$',
-        'analysis',
-    ),
-    (r'^crates/reify-eval/src/(trajectory_ops)\.rs$', 'kinematics-and-motion'),
-    (
-        r'^crates/reify-eval/src/(geometry_ops|topology_\w+|primitive_attribute_seed|selector_vocabulary_v2|sweep_classifier|structural_classifier|appearance|kernel_registry|dispatcher|warm_pool|realization_\w+|engine_constraints|relate_solve|tolerance_combine)(\.rs|/)',
-        'constraints-and-geometry',
-    ),
-    (r'^crates/reify-eval/', 'language-pipeline'),
-    (
-        r'^crates/reify-stdlib/src/(trajectory/|joints\.rs|mechanism\.rs|loop_closure\w*\.rs|orientation\.rs|snapshot\.rs|flexures/)',
-        'kinematics-and-motion',
-    ),
-    (
-        r'^crates/reify-stdlib/src/(dynamics/|modal/|fea\.rs|analysis\.rs|loads\.rs|supports\.rs|tensegrity\.rs)',
-        'analysis',
-    ),
-    (r'^crates/reify-stdlib/', 'constraints-and-geometry'),
-    (r'^crates/reify-compiler/src/connect\.rs$', 'assemblies'),
-    (
-        r'^crates/(reify-core|reify-ast|reify-syntax|reify-compiler|reify-ir|reify-expr|reify-builtins|reify-compute-contract|reify-spec-conformance|reify-runtime|reify-test-support)/',
-        'language-pipeline',
-    ),
-    (r'^tree-sitter-reify/', 'language-pipeline'),
-    (r'^crates/(reify-constraints|reify-kernel-\w+|reify-geometry)/', 'constraints-and-geometry'),
-    (
-        r'^crates/(reify-solver-elastic|reify-mesh-morph|reify-shell-extract|reify-fdm|reify-eval-fea-tests)/',
-        'analysis',
-    ),
-    (r'^crates/reify-gcode/', 'kinematics-and-motion'),
-    (r'^crates/(reify-cli|reify-lsp|reify-mcp|reify-config|reify-doc|reify-doc-build)/', 'tooling'),
-    (r'^crates/reify-audit/', 'reify-audit'),
-    (r'^crates/reify-build-utils/', 'factory-infra'),
-    (r'^gui/', 'gui'),
-    (r'^(scripts/|tests/|hooks/|\.cargo/|dark-factory-orchestrator\.yaml)', 'factory-infra'),
-]
-# Paths mapped by inference rather than by a briefing statement: briefing defects for /review-briefing.
-INFERRED = {
-    'crates/reify-test-support/': 'language-pipeline (inferred: compiler/eval test harness; briefing silent)',
-    'crates/reify-build-utils/': 'factory-infra (inferred: native-dep link resolution; briefing silent)',
-    'crates/reify-geometry/': 'constraints-and-geometry (inferred: kernel holder trait; briefing silent)',
-    'crates/reify-eval/src/*': 'sub-crate rules split reify-eval across analysis / kinematics / constraints-and-geometry / language-pipeline by file name',
-    'crates/reify-stdlib/src/*': 'sub-crate rules split reify-stdlib across kinematics / analysis / constraints-and-geometry by file name',
-    'crates/reify-compiler/src/connect.rs': 'assemblies (inferred: connection graph compile; the assemblies area names no crate)',
-}
+@dataclasses.dataclass(frozen=True)
+class AreaRule:
+    pattern: re.Pattern[str]
+    area: str
 
-# Which files are tests (kind 'tests'); everything else in the domain is src.
-TEST_RE = re.compile(
-    r'(^|/)(tests?|__tests__|benches|examples)/|(_tests?|\.test|\.spec)\.(rs|ts|tsx)$|(^|/)tests\.rs$|(^|/)test_[^/]*\.(py|sh)$|(^|/)test_support\.rs$|(^|/)mocks\.rs$'
-)
-# Paths lizard must not descend into (it walks directories, not the git domain).
-LIZARD_EXCLUDES = ['*/node_modules/*', './target/*', './tree-sitter-reify/src/*', './docs/*', './prj/*', '*/.claude/*']
-FIX_DENSITY_SINCE = '2026-07-06'
-# ==== end PROJECT RULES ====
+
+@dataclasses.dataclass(frozen=True)
+class RustRules:
+    """One project's measurement rules, as its --rules TOML file states them."""
+
+    exclude: re.Pattern[str]
+    test: re.Pattern[str]
+    areas: tuple[AreaRule, ...]
+    inferred: Mapping[str, str]
+    lizard_excludes: tuple[str, ...]
+    fix_density_since: datetime.date
+
+    def area_of(self, path: str) -> str | None:
+        """The briefing area of the first area rule matching *path* from its start."""
+        return next((rule.area for rule in self.areas if rule.pattern.match(path)), None)
+
+    def excluded(self, path: str) -> bool:
+        return self.exclude.match(path) is not None
+
+    def is_test(self, path: str) -> bool:
+        return self.test.search(path) is not None
+
+    def to_json(self) -> dict[str, Any]:
+        """The rules in the TOML file's own keys, each pattern as its source."""
+        return {
+            'exclude': self.exclude.pattern,
+            'test': self.test.pattern,
+            'area': [{'pattern': rule.pattern.pattern, 'area': rule.area} for rule in self.areas],
+            'inferred': dict(self.inferred),
+            'lizard_excludes': list(self.lizard_excludes),
+            'fix_density_since': self.fix_density_since.isoformat(),
+        }
+
+
+_RULE_KEYS = ('exclude', 'test', 'area', 'inferred', 'lizard_excludes', 'fix_density_since')
+_AREA_KEYS = ('pattern', 'area')
+
+
+def _refused(path: Path, key: str, problem: str) -> source_measures.MetricsError:
+    return source_measures.MetricsError(f'{path}: rules key {key} {problem}')
+
+
+def _string(path: Path, key: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise _refused(path, key, f'must be a string, not {type(value).__name__}')
+    return value
+
+
+def _regex(path: Path, key: str, value: object) -> re.Pattern[str]:
+    try:
+        return re.compile(_string(path, key, value))
+    except re.error as exc:
+        raise _refused(path, key, f'is not a regex that compiles: {exc}') from exc
+
+
+def _table(path: Path, key: str, value: object, keys: tuple[str, ...]) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise _refused(path, key, f'must be a table, not {type(value).__name__}')
+    missing = [name for name in keys if name not in value]
+    if missing:
+        raise _refused(path, f'{key}.{missing[0]}' if key else missing[0], 'is missing')
+    unknown = sorted(set(value) - set(keys))
+    if unknown:
+        raise _refused(path, f'{key}.{unknown[0]}' if key else unknown[0], f'is not one of {", ".join(keys)}')
+    return value
+
+
+def _area_rules(path: Path, value: object) -> tuple[AreaRule, ...]:
+    if not isinstance(value, list):
+        raise _refused(path, 'area', f'must be an array of tables, not {type(value).__name__}')
+    rules = []
+    for index, entry in enumerate(value):
+        key = f'area[{index}]'
+        fields = _table(path, key, entry, _AREA_KEYS)
+        rules.append(
+            AreaRule(_regex(path, f'{key}.pattern', fields['pattern']), _string(path, f'{key}.area', fields['area']))
+        )
+    return tuple(rules)
+
+
+def _inferred(path: Path, value: object) -> Mapping[str, str]:
+    if not isinstance(value, dict):
+        raise _refused(path, 'inferred', f'must be a table, not {type(value).__name__}')
+    return MappingProxyType({name: _string(path, f'inferred.{name}', note) for name, note in value.items()})
+
+
+def _strings(path: Path, key: str, value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise _refused(path, key, f'must be an array of strings, not {type(value).__name__}')
+    return tuple(_string(path, f'{key}[{index}]', item) for index, item in enumerate(value))
+
+
+def _date(path: Path, key: str, value: object) -> datetime.date:
+    if not isinstance(value, datetime.date) or isinstance(value, datetime.datetime):
+        raise _refused(path, key, f'must be a TOML local date (YYYY-MM-DD), not {value!r}')
+    return value
+
+
+def load_rules(path: Path) -> RustRules:
+    """The rules file at *path*, every key checked; else a MetricsError naming the file and the key."""
+    try:
+        parsed = tomllib.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise source_measures.MetricsError(f'{path}: could not be read -- {exc.__class__.__name__}: {exc}') from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise source_measures.MetricsError(f'{path}: is not valid TOML -- {exc}') from exc
+    table = _table(path, '', parsed, _RULE_KEYS)
+    return RustRules(
+        exclude=_regex(path, 'exclude', table['exclude']),
+        test=_regex(path, 'test', table['test']),
+        areas=_area_rules(path, table['area']),
+        inferred=_inferred(path, table['inferred']),
+        lizard_excludes=_strings(path, 'lizard_excludes', table['lizard_excludes']),
+        fix_density_since=_date(path, 'fix_density_since', table['fix_density_since']),
+    )
 
 
 def sh(cmd, cwd=None, check=True):
     return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=check).stdout
-
-
-def area_of(path):
-    for pat, area in AREA_RULES:
-        if re.match(pat, path):
-            return area
-    return None
 
 
 def strip_rust_noise(text):
@@ -339,12 +393,13 @@ class RustModules:
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument('--rules', required=True)
     ap.add_argument('--root', required=True)
     ap.add_argument('--run-id', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--since-date', default=FIX_DENSITY_SINCE)
     ap.add_argument('--lizard', default='lizard')
     a = ap.parse_args()
+    rules = load_rules(Path(a.rules))
     root = Path(a.root).resolve()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -356,15 +411,15 @@ def main():
     tracked = sh(['git', 'ls-files'], cwd=root).split('\n')
     domain = []
     for p in tracked:
-        if not p or EXCLUDE_RE.match(p):
+        if not p or rules.excluded(p):
             continue
         ext = os.path.splitext(p)[1]
         if ext in SRC_EXT or p.startswith('hooks/'):
             if p.startswith('hooks/') and p.endswith('.sample'):
                 continue
             domain.append(p)
-    unmapped = sorted(p for p in domain if area_of(p) is None)
-    domain = [p for p in domain if area_of(p) is not None]
+    unmapped = sorted(p for p in domain if rules.area_of(p) is None)
+    domain = [p for p in domain if rules.area_of(p) is not None]
 
     # ---- cargo members
     meta = json.loads(sh(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=root))
@@ -398,7 +453,7 @@ def main():
     # ---- lizard
     lz_dirs = sorted({p.split('/')[0] if '/' not in p else p.split('/')[0] for p in domain})
     lz_cmd = [a.lizard, '--csv', '-t', '8']
-    for pattern in LIZARD_EXCLUDES:
+    for pattern in rules.lizard_excludes:
         lz_cmd += ['-x', pattern]
     lz_cmd += ['./' + d for d in lz_dirs]
     lz = subprocess.run(lz_cmd, cwd=root, text=True, capture_output=True)
@@ -419,7 +474,7 @@ def main():
         [
             'git',
             'log',
-            f'--since={a.since_date}',
+            f'--since={rules.fix_density_since.isoformat()}',
             '--no-merges',
             '-i',
             '--grep=fix\\|bug\\|regress\\|repair\\|hotfix',
@@ -449,8 +504,8 @@ def main():
         ccn_max, ccn_fn = max(((c, f) for c, f, _ in rows), default=(0, None))
         rec: dict[str, Any] = dict(
             path=p,
-            area=area_of(p),
-            kind='tests' if TEST_RE.search(p) else 'src',
+            area=rules.area_of(p),
+            kind='tests' if rules.is_test(p) else 'src',
             lang=lang or os.path.splitext(p)[1].lstrip('.'),
             lines=lines,
             code=code,
@@ -686,10 +741,8 @@ def main():
             h14_alarm_lines=H14_ALARM,
             complexity_instrument='lizard 1.24.1 cyclomatic complexity (CCN) per function',
             prose_instrument='tokei 15.0.0 comments/(code+comments)',
-            fix_density_since=a.since_date,
             fix_density_rule='non-merge commits whose message matches fix|bug|regress|repair|hotfix (case-insensitive) touching the file, since the date, at HEAD',
-            area_rules=AREA_RULES,
-            inferred_area_mappings=INFERRED,
+            rules=rules.to_json(),
         ),
         evidence=dict(
             complete=True,
