@@ -151,6 +151,14 @@ RUST_CYCLE_FILES: dict[str, str] = {
     'crates/core/src/d.rs': 'use crate::c::C;\n\npub struct D;\n',
 }
 
+#: In core: a reaches back to its parent lib; b's fn body defers a `use` of a, which closes
+#: the cycle lib -> b -> a -> lib that only the top-level edges lib -> a -> lib show part of.
+RUST_LAYERING_FILES: dict[str, str] = {
+    'crates/core/src/lib.rs': 'mod a;\nmod b;\n\npub struct Root;\n\nuse crate::a::A;\nuse crate::b::B;\n',
+    'crates/core/src/a.rs': 'use crate::Root;\n\npub struct A;\n',
+    'crates/core/src/b.rs': 'pub struct B;\n\npub fn f() {\n    use crate::a::A;\n    let _ = A;\n}\n',
+}
+
 _COMMITTER = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
 
 

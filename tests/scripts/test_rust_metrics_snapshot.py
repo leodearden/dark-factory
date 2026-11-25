@@ -26,6 +26,7 @@ from rust_snapshot_fixtures import (
     FIXTURE_RULES_TOML,
     MOVES_HEAD_ENV,
     RUST_CYCLE_FILES,
+    RUST_LAYERING_FILES,
     RUST_WORKSPACE_FILES,
     rust_workspace_repo,
     tool_shims,
@@ -206,6 +207,43 @@ class TestTheMeasurement:
             'crates/core/tests/t.rs': ('core', 'tests'),
         }
         assert 'metrics snapshot r1 @ ' in capsys.readouterr().out
+
+    def test_it_measures_complexity_internal_items_imports_and_area_lines(
+        self, tmp_path: Path, fixture_rules: Path
+    ) -> None:
+        out = tmp_path / 'out' / 'snapshot.json'
+        assert _measure(fixture_rules, rust_workspace_repo(tmp_path), out) == 0
+        taken = rust_metrics_snapshot.load_snapshot(out)
+        files = {record['path']: record for record in taken['files']}
+        lib, main = files['crates/core/src/lib.rs'], files['crates/app/src/main.rs']
+        assert (lib['ccn_max'], lib['ccn_max_fn'], lib['internal_pub_items']) == (3, 'classify', 1)
+        assert (lib['fan_in_src'], main['fan_out']) == (1, 1)
+        assert taken['import_graph']['edges'] == [['app', 'core']]
+        tests_lines = RUST_WORKSPACE_FILES['crates/core/tests/t.rs'].count('\n')
+        assert taken['per_area']['core']['tests_lines'] == tests_lines
+
+    def test_it_counts_reach_back_deferred_and_cycle_closing_imports(
+        self, tmp_path: Path, fixture_rules: Path
+    ) -> None:
+        out = tmp_path / 'out' / 'snapshot.json'
+        repo = rust_workspace_repo(tmp_path, {**RUST_WORKSPACE_FILES, **RUST_LAYERING_FILES})
+        assert _measure(fixture_rules, repo, out) == 0
+        taken = rust_metrics_snapshot.load_snapshot(out)
+        counted = ('reach_back_imports', 'deferred_imports', 'cycle_closing_imports')
+        files = {record['path']: record for record in taken['files']}
+        assert {path: tuple(files[path][key] for key in counted) for path in RUST_LAYERING_FILES} == {
+            'crates/core/src/lib.rs': (0, 0, 0),
+            'crates/core/src/a.rs': (1, 0, 0),
+            'crates/core/src/b.rs': (0, 1, 1),
+        }
+        assert tuple(taken['per_area']['core'][key] for key in counted) == (1, 1, 1)
+        graph = taken['import_graph']
+        assert [(entry['from'], entry['to']) for entry in graph['reach_back']] == [('core::a', 'core')]
+        assert [(entry['from'], entry['to'], entry['closes_cycle']) for entry in graph['deferred']] == [
+            ('core::b', 'core::a', True)
+        ]
+        assert graph['cycles'] == [['core', 'core::a']]
+        assert graph['hidden_cycles'] == [['core', 'core::a', 'core::b']]
 
     def test_two_trees_of_one_commit_measure_identically_below_run_id_and_cost(
         self, tmp_path: Path, fixture_rules: Path
