@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Measure a project's main, or given shas, from a pinned tree into ``<data-dir>/<project_id>/<sha>.json``.
 
+The instrument follows each sha's structure: a root pyproject.toml means
+scripts/quality_metrics_snapshot.py; otherwise a root Cargo.toml means
+scripts/rust_metrics_snapshot.py under the rules file
+``<rust-rules-dir>/<project_id>.toml``; a tree with neither is refused.
+
 A sha whose file already records the same measurement identity is skipped; nothing
 is ever committed. Exit 0 when done; exit 2 on any failure, its cause named on
 stderr. Rationale: plans/quality-dashboard-prd.md decisions 18-19.
@@ -19,15 +24,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 import quality_metrics_snapshot as snapshot
+import rust_metrics_snapshot
 import source_measures
 
 FACTORY_ROOT = Path(__file__).resolve().parents[1]
-INSTRUMENT_SCRIPT = FACTORY_ROOT / 'scripts' / 'quality_metrics_snapshot.py'
+PYTHON_INSTRUMENT_SCRIPT = FACTORY_ROOT / 'scripts' / 'quality_metrics_snapshot.py'
+RUST_INSTRUMENT_SCRIPT = FACTORY_ROOT / 'scripts' / 'rust_metrics_snapshot.py'
+DEFAULT_RUST_RULES_DIR = FACTORY_ROOT / 'scripts' / 'rust_metrics_rules'
 DEFAULT_PYTHON = FACTORY_ROOT / '.venv' / 'bin' / 'python'
 DEFAULT_DATA_DIR = FACTORY_ROOT / 'data' / 'quality-metrics'
 
@@ -85,9 +93,37 @@ def _state_home(project_id: str) -> Path:
     return Path(base) / 'dark-factory' / 'quality-snapshot' / project_id
 
 
-def _predicted_params(python: Path) -> dict[str, Any]:
+@dataclasses.dataclass(frozen=True)
+class _Instrument:
+    """A snapshot instrument: its script, the arguments every call of it carries, and the identity a file it wrote records."""
+
+    script: Path
+    args: tuple[str, ...]
+    recorded: Callable[[Path], snapshot.MeasurementIdentity | None]
+
+
+def _python_identity(path: Path) -> snapshot.MeasurementIdentity | None:
+    """The Python snapshot's identity; None for one whose schema predates the identity."""
+    existing = snapshot.load_snapshot(path)
+    return snapshot.measurement_identity(existing) if snapshot.identity_known(existing) else None
+
+
+def _rust_identity(path: Path) -> snapshot.MeasurementIdentity:
+    existing = rust_metrics_snapshot.load_snapshot(path)
+    return snapshot.MeasurementIdentity.of(existing['as_of_sha'], existing['params'])
+
+
+def _python_instrument() -> _Instrument:
+    return _Instrument(PYTHON_INSTRUMENT_SCRIPT, (), _python_identity)
+
+
+def _rust_instrument(rules: Path) -> _Instrument:
+    return _Instrument(RUST_INSTRUMENT_SCRIPT, ('--rules', str(rules)), _rust_identity)
+
+
+def _predicted_params(python: Path, instrument: _Instrument) -> dict[str, Any]:
     """The params a measurement by *python* would record, asked of the instrument itself."""
-    command = [str(python), str(INSTRUMENT_SCRIPT), '--params']
+    command = [str(python), str(instrument.script), '--params', *instrument.args]
     printed = _stdout(command)
     try:
         params = json.loads(printed)
@@ -156,9 +192,12 @@ def _pinned(root: Path, sha: str, home: Path) -> Iterator[Path]:
     _remove_worktree(root, tree, after=None)
 
 
-def _measure(python: Path, sha: str, tree: Path, out: Path, run_id: str) -> None:
-    """Run the instrument on *tree*, its stdout and stderr this process's own."""
-    command = [str(python), str(INSTRUMENT_SCRIPT), '--run-id', run_id, '--out', str(out), '--root', str(tree)]
+def _measure(python: Path, instrument: _Instrument, sha: str, tree: Path, out: Path, run_id: str) -> None:
+    """Run *instrument* on *tree*, its stdout and stderr this process's own."""
+    command = [
+        str(python), str(instrument.script), *instrument.args,
+        '--run-id', run_id, '--out', str(out), '--root', str(tree),
+    ]
     returncode = _run(command, capture=False).returncode
     if returncode != 0:
         raise source_measures.MetricsError(
@@ -176,6 +215,7 @@ class _Settings:
     python: Path
     data_dir: Path
     force: bool
+    rust_rules_dir: Path
 
 
 def _utc_stamp() -> str:
@@ -183,27 +223,45 @@ def _utc_stamp() -> str:
     return datetime.datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%S.%fZ')
 
 
-def _already_measured(out: Path, wanted: snapshot.MeasurementIdentity) -> bool:
+def _instrument_for(settings: _Settings, sha: str) -> _Instrument:
+    """The instrument *sha*'s root manifests select: pyproject.toml first, else Cargo.toml with its rules file."""
+    manifests = ('pyproject.toml', 'Cargo.toml')
+    present = set(_git(settings.root, 'ls-tree', '--name-only', sha, '--', *manifests).splitlines())
+    if 'pyproject.toml' in present:
+        return _python_instrument()
+    if 'Cargo.toml' in present:
+        rules = settings.rust_rules_dir / f'{settings.project_id}.toml'
+        if not rules.is_file():
+            raise source_measures.MetricsError(
+                f'{sha} is a Cargo project, and the Rust instrument measures it under the rules file '
+                f"{rules}, which does not exist; write it from the project's /review-all overlay "
+                '(scripts/rust_metrics_rules/reify.toml is an example)'
+            )
+        return _rust_instrument(rules)
+    raise source_measures.MetricsError(
+        f'{sha} has neither {" nor ".join(manifests)} at its root, so no snapshot instrument measures it'
+    )
+
+
+def _already_measured(out: Path, wanted: snapshot.MeasurementIdentity, instrument: _Instrument) -> bool:
     """Whether *out* holds a measurement at *wanted*; one whose schema predates the identity holds none."""
-    if not out.exists():
-        return False
-    existing = snapshot.load_snapshot(out)
-    return snapshot.identity_known(existing) and snapshot.measurement_identity(existing) == wanted
+    return out.exists() and instrument.recorded(out) == wanted
 
 
-def _cadence_one(settings: _Settings, sha: str, params: Mapping[str, Any]) -> str:
+def _cadence_one(settings: _Settings, sha: str) -> str:
     """Measure *sha* unless its file already records this identity; the line to print."""
     out = settings.data_dir / settings.project_id / f'{sha}.json'
-    wanted = snapshot.MeasurementIdentity.of(sha, params)
-    if not settings.force and _already_measured(out, wanted):
+    instrument = _instrument_for(settings, sha)
+    wanted = snapshot.MeasurementIdentity.of(sha, _predicted_params(settings.python, instrument))
+    if not settings.force and _already_measured(out, wanted, instrument):
         return f'already measured: {wanted}'
     run_id = f'quality-snapshot-{settings.project_id}-{sha[:12]}-{_utc_stamp()}'
     with _pinned(settings.root, sha, _state_home(settings.project_id)) as tree:
-        _measure(settings.python, sha, tree, out, run_id)
-    recorded = snapshot.measurement_identity(snapshot.load_snapshot(out))
+        _measure(settings.python, instrument, sha, tree, out, run_id)
+    recorded = instrument.recorded(out)
     if recorded != wanted:
         raise source_measures.MetricsError(
-            f'{out}: the measurement recorded the identity {recorded}, not the '
+            f'{out}: the measurement recorded the identity {recorded or "unknown"}, not the '
             f'predicted {wanted}; the instrument or its interpreter changed mid-run'
         )
     return f'measured: {sha} -> {out}'
@@ -221,8 +279,9 @@ def _project_id(value: str) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Measure a project's main, or the given shas, with the factory's snapshot "
-            'instrument in a pinned worktree, skipping a sha already measured at the same '
+            "Measure a project's main, or the given shas, in a pinned worktree with the "
+            "factory's snapshot instrument its structure selects (pyproject.toml: Python; "
+            'else Cargo.toml: Rust), skipping a sha already measured at the same '
             'identity (as_of_sha, params). Never commits.'
         ),
         epilog='Exit codes: 0 done; 2 any failure, its cause named on stderr.',
@@ -243,6 +302,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_PYTHON,
         help=f'The interpreter that measures (default: {DEFAULT_PYTHON}).',
+    )
+    parser.add_argument(
+        '--rust-rules-dir',
+        type=Path,
+        default=DEFAULT_RUST_RULES_DIR,
+        help=f'Where a Cargo project\'s <project-id>.toml rules file is (default: {DEFAULT_RUST_RULES_DIR}).',
     )
     return parser
 
@@ -268,13 +333,13 @@ def _failure_lines(failure: source_measures.MetricsError) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point; see the module docstring for the exit codes."""
     args = _build_parser().parse_args(argv)
-    settings = _Settings(args.root, args.project_id, args.python, args.data_dir, args.force)
+    settings = _Settings(
+        args.root, args.project_id, args.python, args.data_dir, args.force, args.rust_rules_dir
+    )
     try:
         _require_executable(settings.python)
-        shas = _shas(settings.root, args.sha)
-        params = _predicted_params(settings.python)
-        for sha in shas:
-            print(_cadence_one(settings, sha, params), flush=True)
+        for sha in _shas(settings.root, args.sha):
+            print(_cadence_one(settings, sha), flush=True)
     except source_measures.MetricsError as exc:
         print(*_failure_lines(exc), sep='\n', file=sys.stderr)
         return 2
