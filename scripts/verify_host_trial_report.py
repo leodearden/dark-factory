@@ -67,13 +67,24 @@ class ProjectFigures:
 
 
 @dataclass(frozen=True)
+class PartialInput:
+    """A project left out of a fleet count feeding the decision, because its figure was not measured."""
+
+    project: str
+    figure: FigureId
+    state: NeverWritten | Unavailable
+
+
+@dataclass(frozen=True)
 class BlockReport:
     number: int
     block: blocks.Block
     landings: int
-    """Fleet tasks whose first landing falls in the block."""
+    """Tasks whose first landing falls in the block, over the projects whose landings were measured."""
     host_verifies: int
-    """Fleet host merge_verify starts in the block."""
+    """Host merge_verify starts in the block, over the projects whose host verifies were measured."""
+    partial: tuple[PartialInput, ...]
+    """The projects left out of those two counts."""
     cpu: measures.Figure[Any]
     expired_usd: float | None
     projects: tuple[ProjectFigures, ...]
@@ -92,6 +103,8 @@ class TrialReport:
     allowance: allowance.AllowanceReading
     cpu: stores.CpuRead
     decision: decision.Decision
+    partial: tuple[PartialInput, ...]
+    """The projects left out of a fleet count in any block, each once."""
 
 
 _TRANSITIONS: Mapping[stores.EventType, tuple[blocks.HostState, blocks.LifecycleOrigin]] = {
@@ -108,8 +121,21 @@ def _project_name(project: stores.ProjectRead) -> str:
     return project.root.name or str(project.root)
 
 
-def _count(figure: measures.Figure[Any]) -> int:
-    return figure.value if isinstance(figure, Measured) else 0
+def _fleet_count(
+    figure_id: FigureId, figures: Iterable[tuple[str, measures.Figure[int]]]
+) -> tuple[int, tuple[PartialInput, ...]]:
+    """The sum of each project's measured count (no host verify adds 0), and the projects whose count was not measured."""
+    total = 0
+    partial: list[PartialInput] = []
+    for project, figure in figures:
+        match figure:
+            case Measured(value=value):
+                total += value
+            case NoHostVerify():
+                pass
+            case NeverWritten() | Unavailable():
+                partial.append(PartialInput(project, figure_id, figure))
+    return total, tuple(partial)
 
 
 def _block_report(
@@ -121,11 +147,18 @@ def _block_report(
     reading: allowance.AllowanceReading,
 ) -> BlockReport:
     projects = tuple(ProjectFigures(_project_name(p), measures.project_figures(p, host, block)) for p in read)
+    landings, unlanded = _fleet_count(
+        FigureId.LANDINGS_PER_DAY, ((_project_name(p), measures.landings(p, block)) for p in read)
+    )
+    verifies, unverified = _fleet_count(
+        FigureId.HOST_VERIFIES, ((p.project, p.figures[FigureId.HOST_VERIFIES]) for p in projects)
+    )
     return BlockReport(
         number=number,
         block=block,
-        landings=sum(measures.landing_count(project, block) for project in read),
-        host_verifies=sum(_count(project.figures[FigureId.HOST_VERIFIES]) for project in projects),
+        landings=landings,
+        host_verifies=verifies,
+        partial=unlanded + unverified,
         cpu=measures.cpu_pressure(cpu, block),
         expired_usd=allowance.expired_in_block(reading, block),
         projects=projects,
@@ -158,9 +191,10 @@ def build_report(request: TrialRequest) -> TrialReport:
         resamples=request.resamples,
         seed=request.seed,
     )
+    partial = tuple(dict.fromkeys(gap for block in block_reports for gap in block.partial))
     return TrialReport(
         request, projects, first_verify, lifecycle, any(p.lifecycle_ever_written for p in read),
-        block_reports, reading, cpu, verdict,
+        block_reports, reading, cpu, verdict, partial,
     )
 
 
@@ -253,7 +287,13 @@ def lifecycle_words(report: TrialReport) -> str:
     return f'host lifecycle: {_plural(len(report.lifecycle), f"{producer} row")} for {report.request.host}, {inside} inside the window'
 
 
-def decision_words(verdict: decision.Decision) -> str:
+def _partial_words(partial: Sequence[PartialInput]) -> str:
+    named = ', '.join(f'{p.project} {_LABELS[p.figure]} ({figure_words(p.figure, p.state)})' for p in partial)
+    return f'; partial, left out of the fleet counts: {named}' if named else ''
+
+
+def decision_words(report: TrialReport) -> str:
+    verdict = report.decision
     on = 'n/a' if verdict.on_rate is None else f'{verdict.on_rate:.2f} landings/day ({_plural(verdict.on_blocks, "block")})'
     off = 'n/a' if verdict.off_rate is None else f'{verdict.off_rate:.2f} landings/day ({_plural(verdict.off_blocks, "block")})'
     if verdict.effect is None:
@@ -267,7 +307,7 @@ def decision_words(verdict: decision.Decision) -> str:
     excluded = ', '.join(str(position + 1) for position in verdict.excluded_on_blocks)
     excluded = f'; on-blocks where no verify ran on this host, excluded: {excluded}' if excluded else ''
     return (
-        f'decision: on {on} against off {off}: {outcome}{excluded}; '
+        f'decision: on {on} against off {off}: {outcome}{excluded}{_partial_words(report.partial)}; '
         f'host cost {verdict.host_cost_share:.1%} of the seat bill'
     )
 
@@ -350,7 +390,7 @@ def render_text(report: TrialReport) -> str:
         *(line for block in report.blocks for line in _block_lines(block)),
         *_allowance_lines(report.allowance),
         f'rule: {decision.DECISION_RULE}',
-        decision_words(report.decision),
+        decision_words(report),
     ])
 
 
@@ -432,7 +472,13 @@ def report_json(report: TrialReport) -> dict[str, Any]:
         'samples_db': {'path': str(report.cpu.samples_db), 'reason': report.cpu.reason, 'unreadable_dropped': report.cpu.unreadable_dropped},
         'blocks': [_block_json(block) for block in report.blocks],
         'allowance': _jsonable(report.allowance),
-        'decision': {**_jsonable(report.decision), 'text': decision_words(report.decision)},
+        'decision': {
+            **_jsonable(report.decision),
+            'partial': [
+                {'project': p.project, 'figure': p.figure, **figure_json(p.figure, p.state)} for p in report.partial
+            ],
+            'text': decision_words(report),
+        },
     }
 
 

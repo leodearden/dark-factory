@@ -52,7 +52,7 @@ __all__ = [
     'cpu_pressure',
     'deferral_hours_by_metric',
     'host_verifies',
-    'landing_count',
+    'landings',
     'landings_per_day',
     'lock_conflict_requeues',
     'merge_verify_median_by_runner',
@@ -171,16 +171,17 @@ def _gate(project: ProjectRead, sources: Sequence[Source], *, needs_all: bool = 
 # ---------------------------------------------------------------------------
 
 
-def landing_count(project: ProjectRead, block: Block) -> int:
+def landings(project: ProjectRead, block: Block) -> Figure[int]:
     """The tasks whose first landing falls in *block*."""
-    return sum(1 for landing in project.landings if block.contains(landing.at))
-
-
-def landings_per_day(project: ProjectRead, block: Block) -> Figure[float]:
     blocked = _gate(project, (Source.MERGE_FINALIZED, Source.TASK_RESULTS), needs_all=False)
     if blocked is not None:
         return blocked
-    return Measured(landing_count(project, block) / block.days)
+    return Measured(sum(1 for landing in project.landings if block.contains(landing.at)))
+
+
+def landings_per_day(project: ProjectRead, block: Block) -> Figure[float]:
+    count = landings(project, block)
+    return Measured(count.value / block.days) if isinstance(count, Measured) else count
 
 
 @dataclass(frozen=True)

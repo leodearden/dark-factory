@@ -20,6 +20,7 @@ from verify_host_trial_measures import (
     cpu_pressure,
     deferral_hours_by_metric,
     host_verifies,
+    landings,
     landings_per_day,
     lock_conflict_requeues,
     merge_verify_median_by_runner,
@@ -93,10 +94,17 @@ class TestLandingsPerDay:
         assert landings_per_day(read, A) == Measured(1.0)
         assert landings_per_day(read, B) == Measured(0.5)
 
+    def test_the_count_behind_the_rate_is_a_figure_too(self):
+        read = project(landings=(Landing('1', day(1)), Landing('2', day(1.5)), Landing('3', day(3))))
+
+        assert landings(read, A) == Measured(2)
+        assert landings(read, B) == Measured(1)
+
     def test_a_store_where_neither_producer_wrote(self):
         read = project(never=(Source.MERGE_FINALIZED, Source.TASK_RESULTS))
 
         assert landings_per_day(read, A) == NeverWritten('merge_finalized or task_results done')
+        assert landings(read, A) == NeverWritten('merge_finalized or task_results done')
 
     def test_an_unavailable_landing_source_makes_the_figure_unavailable(self):
         figure = landings_per_day(project(unavailable=(Source.TASK_RESULTS,)), A)

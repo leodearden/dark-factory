@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -210,6 +211,50 @@ def test_a_root_without_a_runs_db_is_named_and_the_others_still_report(capsys, t
     assert f'project pump-web-ui: missing ({runs_db(absent)})' in lines(text)
     assert 'project reify' in text
     assert '+100.0%' in decision_line(text)
+
+
+class TestPartialFleetInput:
+    """A project whose landings or host-verify figure is not measured is left out of the fleet counts, by name."""
+
+    @pytest.fixture
+    def reify_without_completed_at(self, toggled):
+        conn = sqlite3.connect(runs_db(toggled[1]))
+        try:
+            conn.executescript(
+                'DROP TABLE task_results;'
+                'CREATE TABLE task_results (run_id TEXT, task_id TEXT, outcome TEXT);'
+                "INSERT INTO task_results VALUES ('run-1', 'on2-0', 'done');"
+            )
+        finally:
+            conn.close()
+        return toggled
+
+    def test_the_decision_line_names_the_project_left_out(self, capsys, reify_without_completed_at, samples):
+        line = decision_line(run(capsys, reify_without_completed_at, samples))
+
+        assert (
+            'partial, left out of the fleet counts: '
+            'reify landings per day (unavailable: task_results lacks column completed_at)'
+        ) in line
+
+    def test_its_landings_do_not_enter_the_fleet_counts(self, capsys, reify_without_completed_at, samples):
+        report = json.loads(run(capsys, reify_without_completed_at, samples, '--json'))
+
+        assert [block['landings'] for block in report['blocks']] == [4, 2, 4, 3]
+        assert [block['host_verifies'] for block in report['blocks']] == [2, 0, 1, 0]
+        assert report['decision']['partial'] == [{
+            'project': 'reify',
+            'figure': 'landings_per_day',
+            'state': 'unavailable',
+            'text': 'unavailable: task_results lacks column completed_at',
+        }]
+
+    def test_a_fully_measured_fleet_has_no_partial_input(self, capsys, toggled, samples):
+        text = run(capsys, toggled, samples)
+        report = json.loads(run(capsys, toggled, samples, '--json'))
+
+        assert 'partial' not in decision_line(text)
+        assert report['decision']['partial'] == []
 
 
 def test_unparseable_rows_of_a_whole_store_source_are_labelled_whole_store(capsys, store, samples):

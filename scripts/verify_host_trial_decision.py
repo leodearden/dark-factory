@@ -17,7 +17,9 @@ _PERCENTILES = (2.5, 97.5)
 
 DECISION_RULE = (
     'decision: fleet landings per day (sum of landings / sum of days) over the on-blocks where a '
-    'host verify ran, against every off-block; effect = on rate / off rate - 1; interval = '
+    "host verify ran, against every off-block; a block's fleet landings and host verifies sum each "
+    "read store's measured figure, and a store whose figure is unavailable or never written is left "
+    'out and named as partial; effect = on rate / off rate - 1; interval = '
     'nearest-rank 2.5th and 97.5th percentiles of a block bootstrap that resamples whole blocks '
     'with replacement within each condition (--resamples draws, fixed --seed), needing at least '
     f'{MIN_BLOCKS_FOR_INTERVAL} blocks per condition; host cost share = --host-cost-usd / '
