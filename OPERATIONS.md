@@ -2343,24 +2343,13 @@ diff /tmp/drift-<workstation>.tsv /tmp/drift-leo-laptop.tsv
 ```
 
 Zero differences outside `#info` lines are required before gates ι and κ.
-Each pkg-config module that reify's dependencies probe has its own
-`pkg-config.<module>` line, carrying its version and `libdir`, or `ABSENT`, so
-the diff names the module. α's cross-host misses were `xscrnsaver` present on
-the laptop only (libxss-dev, esc-10782-1). The module list is derived from the
-checkout's `Cargo.lock` on every run: each locked registry crate's
-`[package.metadata.system-deps]` entries, read from its source under
-`$CARGO_HOME/registry/src`, plus the pkg-config names in x11-dl's `build.rs`.
-`#info.cargo.registry-sources-missing` names locked registry crates whose
-source is not on that host. It is informational and never compared: it lists
-what the host has not fetched, mostly target-specific crates a Linux build
-never downloads. If a missing crate declares system-deps, its
-`pkg-config.<module>` lines are absent on that host only, so the diff shows
-it. Run `cargo fetch` in the reify checkout on that host and probe again. Whole-system
-package and module lists are not compared, because the hosts legitimately
-differ in hundreds of unrelated packages. A probe of a checkout with no
-`Cargo.lock` exits 2.
+When `#info.cargo.registry-sources-missing` names a crate on one host only, run
+`cargo fetch` in that host's reify checkout and probe again.
 
-`REIFY_PROBE_DEEP=1` adds the digests of the C++ wrappers' header closures.
+It exits 0 when it printed every line, 1 when deriving the pkg-config module
+lines from `Cargo.lock` failed, and 2 when the checkout is not a directory or
+has no `Cargo.lock`. `REIFY_PROBE_DEEP=1` adds the digests of the C++
+wrappers' header closures. PRD C13 says what each line covers and why.
 
 ### Shrinking the old host sccache cache
 

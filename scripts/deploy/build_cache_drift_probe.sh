@@ -1,43 +1,20 @@
 #!/usr/bin/env bash
 # build_cache_drift_probe.sh [<reify checkout>]
 #
-# Prints one "name<TAB>digest-or-value" line per input that reaches an sccache
-# key for reify's cached compiles (PRD C13,
-# plans/canonical-build-path-shared-cache-prd.md). Run it on both hosts
-# against their reify checkouts and diff the two outputs: zero differences
-# outside the #info lines are required before gates iota and kappa share one
-# store between the hosts. It is read-only and builds nothing.
+# Prints one "name<TAB>value" line per input that reaches an sccache key for
+# reify's cached compiles. Run it on both hosts and diff the two outputs.
+# Why each line exists: PRD C13, plans/canonical-build-path-shared-cache-prd.md.
 #
-# cc1, cc1plus and as are printed although sccache hashes only the compiler
-# driver (PRD decision 20): a host whose driver matches but whose cc1 differs
-# would serve the other host's objects.
+# The checkout defaults to $REIFY_ROOT, else $HOME/src/reify.
+# REIFY_PROBE_DEEP=1 adds the header-closure digest of the two hand-written
+# C++ wrappers. The host trees digested are $REIFY_PROBE_OCCT_INCLUDE (default
+# /usr/include/opencascade), $REIFY_PROBE_DEPS_ROOT (default /opt/reify-deps)
+# and $REIFY_PROBE_SLVS_HEADER (default /usr/include/slvs.h).
 #
-# One pkg-config.<module> line per module that reify's dependencies probe
-# carries its --modversion and libdir, or ABSENT. A build script that bakes a
-# pkg-config answer into generated source (x11-dl's libdir table) makes its
-# crate and every dependent miss on a host that answers differently: gate
-# alpha's cross-host misses were xscrnsaver present on one host only
-# (esc-10782-1). The module list is derived from <checkout>/Cargo.lock each
-# run: every registry crate's [package.metadata.system-deps] entries, read
-# from its source under $CARGO_HOME/registry/src, plus the pkg-config names in
-# x11-dl's build.rs. #info.cargo.registry-sources-missing names any locked
-# registry crate whose source is not on this host. It is informational: which
-# sources a host holds depends on what it last fetched (a Linux build never
-# downloads windows-* or objc2-* crates), not on a cache-key input. A missing
-# crate that declares system-deps still shows in the comparison, because its
-# pkg-config.<module> lines are absent on that host only.
-# Whole-system package or module lists are not compared: hosts legitimately
-# differ in hundreds of unrelated ones.
+# Exit 2: the checkout is not a directory or has no Cargo.lock. Exit 1:
+# deriving the pkg-config module lines from Cargo.lock failed.
 #
-# The checkout defaults to $REIFY_ROOT, else $HOME/src/reify; exit 2 if it is
-# not a directory or has no Cargo.lock. REIFY_PROBE_DEEP=1 adds the
-# header-closure digest of the two hand-written C++ wrappers (cc -M,
-# preprocess only).
-#
-# The host trees digested are
-# $REIFY_PROBE_OCCT_INCLUDE (default /usr/include/opencascade),
-# $REIFY_PROBE_DEPS_ROOT (default /opt/reify-deps) and
-# $REIFY_PROBE_SLVS_HEADER (default /usr/include/slvs.h).
+# Read-only: it builds and writes nothing.
 set -u
 export LC_ALL=C
 OCCT_INCLUDE="${REIFY_PROBE_OCCT_INCLUDE:-/usr/include/opencascade}"
