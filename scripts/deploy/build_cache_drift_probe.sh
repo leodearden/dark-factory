@@ -116,15 +116,23 @@ def crate_source(name, version):
     return next(iter(sorted(registry.glob(f'*/{name}-{version}'))), None)
 
 
-def system_deps(source):
-    manifest = tomllib.loads((source / 'Cargo.toml').read_text())
-    entries = manifest.get('package', {}).get('metadata', {}).get('system-deps', {})
+def declared_modules(entries):
     for key, spec in entries.items():
         if isinstance(spec, dict):
             yield spec.get('name', key)
             yield from spec.get('fallback-names', [])
         else:
             yield key
+
+
+def system_deps(source):
+    manifest = tomllib.loads((source / 'Cargo.toml').read_text())
+    entries = manifest.get('package', {}).get('metadata', {}).get('system-deps', {})
+    for key, spec in entries.items():
+        if key.startswith('cfg(') and isinstance(spec, dict):
+            yield from declared_modules(spec)
+        else:
+            yield from declared_modules({key: spec})
 
 
 def probed_modules(source, name):
