@@ -7,11 +7,13 @@ not close as 'pure gate resolved'. Every row drives ``DeterministicRunner.run``
 only, against an in-memory scheduler double whose ``update_task`` merges into
 the task's metadata as the real merge write does, and a real
 ``EscalationQueue``, so the record written by one dispatch is the one read by
-the next.
+the next. The stale-dispatch rows hand the runner an older copy of the row
+than the store holds, and the runner must act on the store's (task 11430).
 """
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,9 +88,13 @@ def queue(tmp_path: Path) -> EscalationQueue:
     return EscalationQueue(tmp_path / 'escalations')
 
 
-async def _dispatch(scheduler: _SchedulerDouble, queue: EscalationQueue) -> WorkflowOutcome:
+async def _dispatch(
+    scheduler: _SchedulerDouble, queue: EscalationQueue, row: dict | None = None,
+) -> WorkflowOutcome:
+    """Run one dispatch handing the runner *row*, the store's own row when None."""
     runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
-    return await runner.run(TaskAssignment(task_id=TASK_ID, task=scheduler.task, modules=[]))
+    dispatched = scheduler.task if row is None else row
+    return await runner.run(TaskAssignment(task_id=TASK_ID, task=dispatched, modules=[]))
 
 
 def _pending(queue: EscalationQueue) -> list[Escalation]:
@@ -282,3 +288,38 @@ async def test_preconditions_stamp_is_a_recognised_metadata_key(queue):
 
     unknown = [w.field for w in warnings if w.code == 'unknown_key']
     assert unknown == [], f'runner-written metadata keys not blessed: {unknown}'
+
+
+@pytest.mark.asyncio
+async def test_a_stale_dispatch_of_a_gate_awaiting_its_human_files_nothing(queue):
+    scheduler = _SchedulerDouble(_gate_task(deps=[10]))
+    stale = copy.deepcopy(scheduler.task)
+    assert await _dispatch(scheduler, queue) == WorkflowOutcome.BLOCKED
+    fired = [e.id for e in _pending(queue)]
+    writes_before = len(scheduler.writes)
+
+    outcome = await _dispatch(scheduler, queue, stale)
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    assert [e.id for e in _pending(queue)] == fired
+    assert scheduler.writes[writes_before:] == []
+
+
+@pytest.mark.asyncio
+async def test_a_stale_dispatch_of_a_held_gate_stamps_the_store_s_preconditions(queue):
+    scheduler = _SchedulerDouble(_gate_task(deps=[]))
+    stale = copy.deepcopy(scheduler.task)
+    first = await _fire_and_resolve(scheduler, queue)
+    scheduler.task['dependencies'] = ['8263']
+
+    assert await _dispatch(scheduler, queue, stale) == WorkflowOutcome.BLOCKED
+    pending = _pending(queue)
+    assert len(pending) == 1 and pending[0].id != first.id, pending
+    refiled = pending[0]
+    assert scheduler.task['metadata'][GATE_ESCALATED_PRECONDITIONS_KEY]['dependencies'] == ['8263']
+    _resolve_pending(queue)
+
+    outcome = await _dispatch(scheduler, queue)
+
+    _assert_closed_citing(scheduler, outcome, refiled.id)
+    assert sorted(e.id for e in queue.get_by_task(TASK_ID)) == sorted([first.id, refiled.id])

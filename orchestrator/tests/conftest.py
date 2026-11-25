@@ -91,6 +91,7 @@ from _orch_helpers import (  # noqa: E402
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
+    unchanged_dispatch_row,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
@@ -616,10 +617,23 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         'markers',
+        'real_dispatch_row_refresh: opt a test OUT of the autouse '
+        '`_hermetic_dispatch_row` patch so the Scheduler re-reads its dispatch '
+        'winner through its own read_task/get_statuses (task 11430).',
+    )
+    config.addinivalue_line(
+        'markers',
         f'{REAL_MCP_SESSION_MARKER}: opt a test OUT of the autouse forbid_live_mcp '
         'guard so shared.mcp_session.McpSession runs for real (stub server / '
         'mocked transport only) — task 7802',
     )
+
+
+def _patch_unless_marked(monkeypatch, request, marker: str, target: str, hermetic: object) -> None:
+    """Install the *hermetic* default at *target* unless the test carries the opt-out *marker*."""
+    if request.node.get_closest_marker(marker):
+        return
+    monkeypatch.setattr(target, hermetic)
 
 
 @pytest.fixture(autouse=True)
@@ -679,9 +693,26 @@ def _hermetic_psi_reader(monkeypatch, request):
     A test may instead reassign ``scheduler._read_psi_sample``
     post-construction, as the saturation tests do.
     """
-    if request.node.get_closest_marker('real_psi_reader'):
-        return
-    monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
+    _patch_unless_marked(
+        monkeypatch, request, 'real_psi_reader',
+        'orchestrator.scheduler.read_psi_sample', idle_psi_sample,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_dispatch_row(monkeypatch, request):
+    """Default every Scheduler's re-read of its dispatch winner to an echo of the snapshot row (task 11430).
+
+    Patches the module-level ``orchestrator.scheduler.refresh_dispatch_row``,
+    bound at ``Scheduler.__init__``, with ``_orch_helpers.py::unchanged_dispatch_row``:
+    a per-dispatch fused-memory read in every bare-Scheduler test would trip
+    ``forbid_live_mcp``.  Same seam pattern as ``_hermetic_psi_reader`` above.
+    A test marked ``real_dispatch_row_refresh`` keeps the real re-read.
+    """
+    _patch_unless_marked(
+        monkeypatch, request, 'real_dispatch_row_refresh',
+        'orchestrator.scheduler.refresh_dispatch_row', unchanged_dispatch_row,
+    )
 
 
 @pytest.fixture(autouse=True)

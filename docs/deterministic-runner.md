@@ -9,6 +9,16 @@ name is a member of `deterministic_runner.py`, except `ScriptTimeout`
 (`orchestrator/src/orchestrator/before_done_script.py`) and
 `summarize_predicate_output` (`orchestrator/src/orchestrator/predicate_output.py`).
 
+`run()` acts on the task row as the store holds it at entry, not the row the
+dispatch handed over (task 11430). `_store_row` re-reads it through the
+scheduler's `get_task`; when that read fails, `run()` falls back to the
+dispatched row. A row the store already holds done or cancelled returns DONE
+with no write and no escalation. The scheduler likewise re-reads and re-checks
+its dispatch winner after claiming it
+(`orchestrator/src/orchestrator/scheduler.py::Scheduler._confirm_claim`). So a
+write that lands mid-tick, such as a new dependency or a gate stamp, is seen
+before a gate is re-filed or its preconditions stamped.
+
 Phase β delivers the **pure-gate** pattern
 (`before_done=None`, `always_escalates=True`).
 
