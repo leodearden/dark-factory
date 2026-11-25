@@ -4,13 +4,16 @@ about who still holds the payload."""
 from __future__ import annotations
 
 import enum
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    residue_payload_length,
 )
 
 #: All a ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE`` residue record can say about
@@ -114,5 +117,35 @@ def residue_prose(record: Mapping[str, Any]) -> ResidueProse:
     middleware's own ``summary`` and ``suggested_action``, so a sink files it
     visibly instead of dropping it.
     """
-    known = _KNOWN_KIND_PROSE.get(record.get('error_type'))
+    error_type = record.get('error_type')
+    known = _KNOWN_KIND_PROSE.get(error_type) if isinstance(error_type, str) else None
     return known if known is not None else _unrecognised_prose(record)
+
+
+#: The greppable first token of :func:`log_unpreserved_residue`'s line.
+RESIDUE_UNPRESERVED_LOG_EVENT = 'markup_residue_unpreserved'
+
+
+def log_unpreserved_residue(
+    log: logging.Logger,
+    record: Mapping[str, Any],
+    *,
+    why: str,
+    exc_info: bool = False,
+    extra: Mapping[str, object] | None = None,
+) -> None:
+    """The last floor under a residue sink, for a host whose log is durable.
+
+    Meant for a long-lived service under journald. The whole record rides as
+    data in ``residue_record`` and as text in the message, which journald keeps.
+    """
+    whole = dict(record)
+    log.error(
+        '%s: the %r residue of %s.%s (%d chars) was preserved nowhere durable '
+        'because %s, so this line is its copy. record=%r; %s',
+        RESIDUE_UNPRESERVED_LOG_EVENT, record.get('error_type'),
+        record.get('tool'), record.get('field'), residue_payload_length(record),
+        why, whole, MARKUP_RECURRENCE_ROUTING,
+        exc_info=exc_info,
+        extra={'residue_record': whole, **(extra or {})},
+    )
