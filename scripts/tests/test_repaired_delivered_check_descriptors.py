@@ -128,7 +128,8 @@ _REPOINTED_AFTER_RENAME = [
     ),
 ]
 
-# Each site task 6764 must clear, mapped to the suffix restatement as spelled there.
+# Each site task 6764 must clear, mapped to the suffix restatement as spelled there
+# (the stamper's is already gone and kept as a regression guard).
 _SUFFIX_RESTATEMENT_SITES = {
     "fused-memory/src/fused_memory/server/manifest_stamping.py":
         "_SIDECAR_SUFFIX = '.capability-manifest.yaml'",
@@ -143,7 +144,7 @@ _SUFFIX_RESTATEMENT_SITES = {
 }
 
 # Task 10341: widened to every restatement 6764 removes; the task-record half is
-# task 10341's operational follow-up, ticket tkt_0RXD2YBTT281JRW4KY7F3BF79D.
+# the operational task 11697.
 _SUFFIX_GATE = (
     "plans/review-all-s25-scripts-instruments-prd.capability-manifest.yaml",
     6764, "ι", "suffix-spellings-gone",
@@ -232,6 +233,11 @@ def _the_one_row(rows, relpath: str, label: str, capability: str):
         f"in {relpath}, found {len(matches)}"
     )
     return matches[0]
+
+
+def _sidecar_row(rows, descriptor):
+    relpath, _task_id, label, capability, _expected = descriptor
+    return _the_one_row(rows, relpath, label, capability)
 
 
 def _reify_tree_holding(tmp_path: Path, scripts) -> str:
@@ -349,32 +355,27 @@ _SUFFIX_FREE_SITE = "from shared.capability_manifest import SIDECAR_SUFFIX\n"
 
 
 @pytest.mark.parametrize(
-    "survivor", list(_SUFFIX_RESTATEMENT_SITES), ids=lambda path: Path(path).stem,
+    "survivor,expected",
+    [
+        *(pytest.param(site, CheckOutcome.FAIL, id=Path(site).stem)
+          for site in _SUFFIX_RESTATEMENT_SITES),
+        pytest.param(None, CheckOutcome.PASS, id="no-survivor"),
+    ],
 )
-def test_suffix_gate_holds_while_any_restatement_survives(tmp_path, sidecar_rows, survivor):
-    """Every restatement 6764 removes is gated, so the gate cannot pass early."""
-    relpath, _task_id, label, capability, _expected = _SUFFIX_GATE
-    row = _the_one_row(sidecar_rows, relpath, label, capability)
+def test_suffix_gate_holds_until_no_restatement_survives(
+        tmp_path, sidecar_rows, survivor, expected):
+    """Every restatement 6764 removes is gated, so the gate cannot pass early, and a
+    tree free of all of them delivers, so 6764 can actually finish."""
+    row = _sidecar_row(sidecar_rows, _SUFFIX_GATE)
     files = dict.fromkeys(_SUFFIX_RESTATEMENT_SITES, _SUFFIX_FREE_SITE)
-    files[survivor] = f"{_SUFFIX_RESTATEMENT_SITES[survivor]}\n"
+    if survivor is not None:
+        files[survivor] = f"{_SUFFIX_RESTATEMENT_SITES[survivor]}\n"
 
     outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "sites", files), ref="HEAD")
-    assert outcome is CheckOutcome.FAIL, (
+    assert outcome is expected, (
         f"task 6764's delivered_check evaluates {outcome.value} on a tree where "
-        f"{survivor} still restates the sidecar suffix; it must gate every restatement."
-    )
-
-
-def test_suffix_gate_opens_once_no_site_restates_the_suffix(tmp_path, sidecar_rows):
-    """A tree free of every restatement delivers, so 6764 can actually finish."""
-    relpath, _task_id, label, capability, _expected = _SUFFIX_GATE
-    row = _the_one_row(sidecar_rows, relpath, label, capability)
-    files = dict.fromkeys(_SUFFIX_RESTATEMENT_SITES, _SUFFIX_FREE_SITE)
-
-    outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "sites", files), ref="HEAD")
-    assert outcome is CheckOutcome.PASS, (
-        f"task 6764's delivered_check evaluates {outcome.value} on a tree where no "
-        f"site restates the sidecar suffix."
+        f"{survivor or 'no site'} restates the sidecar suffix; it must hold while any "
+        f"restatement survives and open once none does."
     )
 
 
@@ -397,8 +398,7 @@ def test_quality_boundary_gate_follows_the_test_file_not_the_prose(
         tmp_path, sidecar_rows, files, expected):
     """esc-8461-1's two failure modes, inverted: prose naming the file must not
     deliver, and the file must deliver whatever it says."""
-    relpath, _task_id, label, capability, _expected = _QUALITY_BOUNDARY
-    row = _the_one_row(sidecar_rows, relpath, label, capability)
+    row = _sidecar_row(sidecar_rows, _QUALITY_BOUNDARY)
     repo = committed_repo(tmp_path / "dashboard", files)
 
     outcome = evaluate_row(row, repo_root=repo, ref="HEAD")
