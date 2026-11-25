@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from _architect_eval_harness import run_architect_eval_hermetic
 from _campaign_gate_helpers import eval_base_config
 from shared.testing_virtual_clock import virtual_clock_test
 
@@ -129,3 +130,54 @@ async def test_the_callers_override_beats_the_fixture_ceiling(
 
     assert workflow.minutes_run == pytest.approx(90)
     assert result.timeout_minutes == 90
+
+
+class _HangingInvoke:
+    """An architect invoke that never answers; records when it started and when it was cut off."""
+
+    def __init__(self) -> None:
+        self.started_at: float | None = None
+        self.cut_off_at: float | None = None
+
+    async def invoke(self, **_kw) -> None:
+        loop = asyncio.get_running_loop()
+        self.started_at = loop.time()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cut_off_at = loop.time()
+
+    @property
+    def minutes_run(self) -> float:
+        assert self.started_at is not None and self.cut_off_at is not None
+        return (self.cut_off_at - self.started_at) / 60
+
+
+@virtual_clock_test
+async def test_an_architect_cell_without_a_fixture_ceiling_keeps_its_one_hour_default(
+    tmp_path: Path,
+):
+    hang = _HangingInvoke()
+    store = ResultStore(tmp_path / 'results')
+
+    result, _ = await run_architect_eval_hermetic(
+        _ARCHITECT, produced_plan={'steps': []}, invoke_side_effect=hang.invoke, store=store,
+    )
+
+    assert hang.minutes_run == pytest.approx(60)
+    assert result.timeout_minutes == 60
+    [persisted] = store.load_all()
+    assert persisted.timeout_minutes == 60
+
+
+@virtual_clock_test
+async def test_a_fixture_ceiling_overrides_the_architect_default(tmp_path: Path):
+    hang = _HangingInvoke()
+
+    result, _ = await run_architect_eval_hermetic(
+        _ARCHITECT, produced_plan={'steps': []}, invoke_side_effect=hang.invoke,
+        task_timeout_minutes=45, store=ResultStore(tmp_path / 'results'),
+    )
+
+    assert hang.minutes_run == pytest.approx(45)
+    assert result.timeout_minutes == 45
