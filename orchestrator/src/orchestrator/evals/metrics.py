@@ -71,6 +71,20 @@ class RoleUnderTest(StrEnum):
     END_TO_END = 'end_to_end'
 
 
+class EndpointKind(StrEnum):
+    """Who serves the candidate's model, as its config builder declares it.
+
+    Orthogonal to the harness, which ``EvalConfig.backend`` records.
+    """
+
+    NATIVE_ANTHROPIC = 'native_anthropic'
+    """Anthropic's own API serves the model."""
+    SELF_HOSTED_VLLM = 'self_hosted_vllm'
+    """A vLLM server we run, whether a workstation or a RunPod pod."""
+    VENDOR_CLOUD = 'vendor_cloud'
+    """A third-party model vendor's hosted API, metered or subscription, whichever harness drives it."""
+
+
 # The roles an OFAT candidate can vary; END_TO_END is a methodology stage.
 CANDIDATE_ROLES: frozenset[RoleUnderTest] = frozenset({
     RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT, RoleUnderTest.JUDGE,

@@ -21,7 +21,7 @@ from orchestrator.config import default_price_table
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.shadow_types import CostBasis
 
-from .metrics import CANDIDATE_ROLES, RoleUnderTest
+from .metrics import CANDIDATE_ROLES, EndpointKind, RoleUnderTest
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ class EvalConfig:
     role: RoleUnderTest = RoleUnderTest.IMPLEMENTER
     max_budget_usd: float = 20.0
     env_overrides: dict[str, str] = field(default_factory=dict)
+    endpoint_kind: EndpointKind = EndpointKind.NATIVE_ANTHROPIC
     # The implementer brief variant this candidate runs under; becomes the
     # cell's OrchestratorConfig.implementer_brief_variant (task 5385).
     harness_variant: ImplementerBriefVariant = ImplementerBriefVariant.WHOLE_PLAN
@@ -113,7 +114,7 @@ def _vllm_config(
         env.update(extra_env)
     return EvalConfig(
         name=name, backend='claude', model='sonnet', effort=effort,
-        env_overrides=env,
+        env_overrides=env, endpoint_kind=EndpointKind.SELF_HOSTED_VLLM,
         image=image, gpu_type=gpu_type, gpu_count=gpu_count,
         container_disk_gb=container_disk_gb,
     )
@@ -756,6 +757,7 @@ def _claude_endpoint_config(
             'ANTHROPIC_BASE_URL': base_url,
             'ANTHROPIC_AUTH_TOKEN': auth_token,
         },
+        endpoint_kind=EndpointKind.VENDOR_CLOUD,
     )
 
 
@@ -933,12 +935,15 @@ def codex_pi_candidates() -> list[EvalConfig]:
     return [
         EvalConfig(
             'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         EvalConfig(
             'codex-gpt6.1-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         EvalConfig(
             'codex-gpt6.1-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend
