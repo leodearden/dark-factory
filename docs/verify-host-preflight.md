@@ -12,13 +12,13 @@ It verifies one commit. The default is the tip of `git.main_branch`, and
 `--sha` takes any revision that names a commit in the project checkout.
 
 - **The gate.** It builds the merge-verify spec with the lane's own builder,
-  `verify_runner.py::build_merge_verify_spec`, over every registered module.
+  `orchestrator/src/orchestrator/verify_runner.py::build_merge_verify_spec`, over every registered module.
   It then sets the breadth to `full`, so no module is scoped out. `task_files`
   is unset and no verify cache is shipped, so every unit runs on the host and
   no replayed green stands in for the host's own run. Every other field of the
   merge-gate profile (workspace, env, cold timeouts, pre-provision) is exactly
   what the lane ships.
-- **The path.** The runner is built by `verify_hosts.py::remote_runner_for`,
+- **The path.** The runner is built by `orchestrator/src/orchestrator/verify_hosts.py::remote_runner_for`,
   the same builder the harness uses. The preflight first calls
   `RemoteRunner.ensure_gate`, timed on its own: this publishes the CLI
   checkout's own sha as the gate and checks the gate's handshake. It then calls
