@@ -4,7 +4,7 @@ schema_version: 1
 signal_leaves: ["λ"]
 tasks:
   - label: "α1"
-    task_id: null
+    task_id: 11733
     title: "Verify-host roster file parser, provisioning script, contract checker and the known host-tied tests"
     capabilities:
       - name: "gate-wrapper-contract-exists"
@@ -35,7 +35,7 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: path
-          paths: ["scripts/deploy/verify-host-wrapper.sh.in", "config/verify-hosts.example.yaml"]
+          paths: ["scripts/deploy/verify-host-wrapper.template.sh", "config/verify-hosts.example.yaml"]
           expect: present
       - name: "script-and-checker-share-one-requirement-table"
         binding: "built here"
@@ -44,7 +44,7 @@ tasks:
           kind: manual
           reason: "agreement of the two lists is asserted by the task's own test, not by a pattern"
   - label: "α2"
-    task_id: null
+    task_id: 11734
     title: "The orchestrator reads its verify hosts from the private roster file"
     capabilities:
       - name: "environment-ranks-above-the-yaml"
@@ -71,7 +71,7 @@ tasks:
           kind: manual
           reason: "the rejection is proven by a load that fails, not by a pattern"
   - label: "β"
-    task_id: null
+    task_id: 11731
     title: "orchestrator verify-host-preflight: the real gate on a named runner through the production path"
     capabilities:
       - name: "merge-verify-spec-builder-wired"
@@ -101,7 +101,7 @@ tasks:
           kind: manual
           reason: "ownership of each exception entry is checked by the task's own test"
   - label: "γ"
-    task_id: null
+    task_id: 11735
     title: "Live verify-host roster: a reload admits, drains and retires hosts without a restart"
     capabilities:
       - name: "reload-entry-point"
@@ -149,7 +149,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/event_store.py"]
           expect: present
   - label: "δ"
-    task_id: null
+    task_id: 11736
     title: "Per-host trust: probation, local confirmation of every verdict, automatic graduation"
     capabilities:
       - name: "local-re-run-of-a-remote-green-wired"
@@ -183,7 +183,7 @@ tasks:
           kind: manual
           reason: "the red path is proven by boundary rows 18 and 19, not by a pattern"
   - label: "ε"
-    task_id: null
+    task_id: 11732
     title: "verify_host_trial_report.py: on-block against off-block landings and mechanism measures"
     capabilities:
       - name: "event-vocabulary"
@@ -206,7 +206,7 @@ tasks:
           kind: manual
           reason: "the distinct rendering is asserted by the task's own test over a store with no host rows"
   - label: "ζ"
-    task_id: null
+    task_id: 11738
     title: "Operator sitting: move the laptop's entries into the roster file"
     capabilities:
       - name: "orchestrators-read-the-roster-file"
@@ -216,7 +216,7 @@ tasks:
           kind: manual
           reason: "deployment of α2 to each running orchestrator is checked by the operator at the sitting"
   - label: "η"
-    task_id: null
+    task_id: 11737
     title: "Operator gate: rent the trial server and join it to the tailnet"
     capabilities:
       - name: "tools-exist-before-rent-starts"
@@ -226,7 +226,7 @@ tasks:
           kind: manual
           reason: "a human action; the producers' own checks gate it through the dependency"
   - label: "θ"
-    task_id: null
+    task_id: 11739
     title: "Bring-up sitting, Python step: dark-factory and the two solar projects on the rented host"
     capabilities:
       - name: "host-rented-and-reachable"
@@ -236,7 +236,7 @@ tasks:
           kind: manual
           reason: "resolved by citing the three preflight records"
   - label: "ι"
-    task_id: null
+    task_id: 11740
     title: "Bring-up sitting, reify step: reify on the rented host"
     capabilities:
       - name: "host-serving-the-python-projects"
@@ -246,7 +246,7 @@ tasks:
           kind: manual
           reason: "resolved by citing reify's preflight record"
   - label: "κ1"
-    task_id: null
+    task_id: 11741
     title: "Trial toggle 1: host OFF"
     capabilities:
       - name: "live-disable-and-trusted-host"
@@ -256,7 +256,7 @@ tasks:
           kind: manual
           reason: "resolved by citing the verify_host_retired row in every project that uses the host"
   - label: "κ2"
-    task_id: null
+    task_id: 11742
     title: "Trial toggle 2: host ON"
     capabilities:
       - name: "previous-block-closed"
@@ -266,7 +266,7 @@ tasks:
           kind: manual
           reason: "resolved by citing the verify_host_admitted rows"
   - label: "κ3"
-    task_id: null
+    task_id: 11743
     title: "Trial toggle 3: host OFF"
     capabilities:
       - name: "previous-block-closed"
@@ -276,7 +276,7 @@ tasks:
           kind: manual
           reason: "resolved by citing the verify_host_retired rows"
   - label: "κ4"
-    task_id: null
+    task_id: 11744
     title: "Trial toggle 4: host ON"
     capabilities:
       - name: "previous-block-closed"
@@ -286,7 +286,7 @@ tasks:
           kind: manual
           reason: "resolved by citing the verify_host_admitted rows"
   - label: "λ"
-    task_id: null
+    task_id: 11745
     title: "Reading gate: keep, buy or stop"
     capabilities:
       - name: "two-on-and-two-off-blocks"

@@ -7,7 +7,7 @@
 
 ## Decompose-time contracts (not in the PRD's words; the checks depend on them)
 
-1. **File names are fixed.** The checks name `orchestrator/src/orchestrator/verify_host_roster_file.py`, `scripts/deploy/provision_verify_host.sh`, `scripts/deploy/check_verify_host.py`, `scripts/deploy/verify-host-wrapper.sh.in`, `config/verify-hosts.example.yaml`, `orchestrator/src/orchestrator/verify_host_roster.py`, `orchestrator/src/orchestrator/merge_lane/host_trust.py` and `scripts/verify_host_trial_report.py`. Each producing task's text states its paths.
+1. **File names are fixed.** The checks name `orchestrator/src/orchestrator/verify_host_roster_file.py`, `scripts/deploy/provision_verify_host.sh`, `scripts/deploy/check_verify_host.py`, `scripts/deploy/verify-host-wrapper.template.sh`, `config/verify-hosts.example.yaml`, `orchestrator/src/orchestrator/verify_host_roster.py`, `orchestrator/src/orchestrator/merge_lane/host_trust.py` and `scripts/verify_host_trial_report.py`. Each producing task's text states its paths.
 2. **α2's hook is in `config.py`.** The check looks for the string `verify_host_roster_file` there, so the call into the parser sits in or beside `config.py::load_config`, not in a caller.
 3. **γ names the planner function `plan_host_changes`** and calls it from `harness.py`.
 4. **The gates (ζ to λ) carry no mechanical check.** Each is resolved by a human or the standing watcher citing the evidence its row names.

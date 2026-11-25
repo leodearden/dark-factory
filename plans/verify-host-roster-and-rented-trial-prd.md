@@ -103,7 +103,7 @@ Three parts, each usable without the next.
 | systemd | `systemd-run --user --scope true` succeeds over a non-interactive ssh session (linger on) |
 | Kernel | Landlock ABI 2 or higher; `/var/tmp` writable |
 | Memory | swap present; `MemAvailable` at least the sum of the per-project scope `max_gib` values in the roster's `host_config` maps |
-| Wrapper | `/usr/local/bin/orchestrator` equals the tracked template `scripts/deploy/verify-host-wrapper.sh.in` rendered with this host's paths, and honours `ORCH_GATE_BIN` |
+| Wrapper | `/usr/local/bin/orchestrator` equals the tracked template `scripts/deploy/verify-host-wrapper.template.sh` rendered with this host's paths, and honours `ORCH_GATE_BIN` |
 | Checkouts | the Dark Factory checkout and each project checkout exist at the roster's paths with `receive.denyCurrentBranch=updateInstead` |
 | Per-host YAML | for each project using the host, the file at its `config_path` exists and equals a fresh render of the roster's `host_config` |
 | Disk | free space at least the project's stated footprint; a synchronous-write probe reported in ms (`warn` above 20 ms: one rented host measured 126 ms and more than doubled the dark-factory gate) |
