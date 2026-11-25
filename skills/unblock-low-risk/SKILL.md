@@ -659,9 +659,9 @@ stamp is an available option on every failing arm.
 
 Some proposals originate from a **post-merge-verify block**, not an ordinary
 agent-block: the task's solution already passed its own verify **and**
-review, but landing on `main` jammed (e.g. a rebase conflict, or an
-import/type/lint break introduced by whatever landed on `main` after this
-branch was verified). Recognize this mode from
+review, but landing on `main` jammed (the only kind this mode completes is
+an import/type/lint break introduced by whatever landed on `main` after this
+branch was verified; a rebase conflict is never completed here). Recognize this mode from
 `latest['block_class'] == 'merge_verify_red'` (present on the same
 `dry_run_proposals[-1]` entry precondition 1 already reads).
 
@@ -677,9 +677,10 @@ unchanged — there is nothing extra for you to check.
 
 Two refinements to the Procedure for this mode specifically:
 
-- **Step 3 (apply the fix — scoped)** is, in practice, either a **rebase/
-  conflict resolution** confined to files already in the task's own diff,
-  or an **import/type/lint repair** against the new `main` tip. If the fix
+- **Step 3 (apply the fix — scoped)** is, in this mode, an
+  **import/type/lint repair** against the new `main` tip only. A conflict
+  at step 4 aborts in this mode exactly as in every other: this mode never
+  resolves conflicts. If the fix
   demands anything beyond that (a logic change, a genuinely new and
   unrelated test failure, a cross-module edit), the investigator's
   labelling guidance (`skills/unblock-auto/SKILL.md`) says that should
