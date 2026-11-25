@@ -108,8 +108,12 @@ def _python_identity(path: Path) -> snapshot.MeasurementIdentity | None:
     return snapshot.measurement_identity(existing) if snapshot.identity_known(existing) else None
 
 
-def _rust_identity(path: Path) -> snapshot.MeasurementIdentity:
-    existing = rust_metrics_snapshot.load_snapshot(path)
+def _rust_identity(path: Path) -> snapshot.MeasurementIdentity | None:
+    """The Rust snapshot's identity; None for one written under another schema."""
+    try:
+        existing = rust_metrics_snapshot.load_snapshot(path)
+    except rust_metrics_snapshot.OtherSchemaError:
+        return None
     return snapshot.MeasurementIdentity.of(existing['as_of_sha'], existing['params'])
 
 

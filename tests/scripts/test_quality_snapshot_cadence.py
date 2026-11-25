@@ -234,6 +234,36 @@ class TestTheInstrumentChoice:
         ]
         assert (out.read_bytes(), out.stat().st_mtime_ns) == (written, written_at)
 
+    def test_a_rust_snapshot_of_another_schema_has_no_identity_and_is_re_measured(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str], cargo_repo: Path, rules_dir: Path
+    ) -> None:
+        data = tmp_path / 'data'
+        assert _cadence(cargo_repo, data, '--rust-rules-dir', str(rules_dir)) == 0
+        out = data / 'fixture' / f'{_main_sha(cargo_repo)}.json'
+        older = json.loads(out.read_text(encoding='utf-8'))
+        older['schema_version'] = rust_metrics_snapshot.SCHEMA_VERSION - 1
+        out.write_text(json.dumps(older, indent=2) + '\n', encoding='utf-8')
+        capfd.readouterr()
+        assert _cadence(cargo_repo, data, '--rust-rules-dir', str(rules_dir)) == 0
+        assert 'already measured' not in capfd.readouterr().out
+        assert rust_metrics_snapshot.load_snapshot(out)['schema_version'] == rust_metrics_snapshot.SCHEMA_VERSION
+
+    def test_an_edited_rules_file_re_measures_under_the_edited_rules(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str], cargo_repo: Path, rules_dir: Path
+    ) -> None:
+        data = tmp_path / 'data'
+        assert _cadence(cargo_repo, data, '--rust-rules-dir', str(rules_dir)) == 0
+        rules = rules_dir / 'fixture.toml'
+        text = rules.read_text(encoding='utf-8')
+        assert text.count("area = 'core'") == 1
+        rules.write_text(text.replace("area = 'core'", "area = 'kernel'"), encoding='utf-8')
+        capfd.readouterr()
+        assert _cadence(cargo_repo, data, '--rust-rules-dir', str(rules_dir)) == 0
+        assert 'already measured' not in capfd.readouterr().out
+        remeasured = rust_metrics_snapshot.load_snapshot(data / 'fixture' / f'{_main_sha(cargo_repo)}.json')
+        assert remeasured['params']['rules'] == rust_metrics_snapshot.load_rules(rules).to_json()
+        assert {'pattern': '^crates/core/', 'area': 'kernel'} in remeasured['params']['rules']['area']
+
     def test_a_cargo_workspace_without_a_rules_file_is_refused_naming_it(
         self,
         tmp_path: Path,

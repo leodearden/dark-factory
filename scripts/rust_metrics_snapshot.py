@@ -1014,12 +1014,19 @@ _PARAMS_KEYS = (
 )
 
 
+class OtherSchemaError(source_measures.MetricsError):
+    """A snapshot this instrument wrote under another SCHEMA_VERSION: it records no identity comparable to this one's."""
+
+
 def _invalid(path: Path, field: str, found: object, expected: str) -> source_measures.MetricsError:
     return source_measures.MetricsError(f'{path}: {field} is {found!r}, not {expected}')
 
 
 def load_snapshot(path: Path) -> dict[str, Any]:
-    """The snapshot file at *path*, its identity fields checked; else a MetricsError naming the path and the field."""
+    """The snapshot file at *path*, its identity fields checked; else a MetricsError naming the path and the field.
+
+    A file of this instrument's under another schema is refused as an OtherSchemaError.
+    """
     try:
         snapshot = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeDecodeError) as exc:
@@ -1031,7 +1038,8 @@ def load_snapshot(path: Path) -> dict[str, Any]:
     if snapshot.get('instrument') != INSTRUMENT:
         raise _invalid(path, 'instrument', snapshot.get('instrument'), repr(INSTRUMENT))
     if snapshot.get('schema_version') != SCHEMA_VERSION:
-        raise _invalid(path, 'schema_version', snapshot.get('schema_version'), str(SCHEMA_VERSION))
+        found = snapshot.get('schema_version')
+        raise OtherSchemaError(f'{path}: schema_version is {found!r}, not {SCHEMA_VERSION}')
     if not isinstance(snapshot.get('as_of_sha'), str):
         raise _invalid(path, 'as_of_sha', snapshot.get('as_of_sha'), 'a string')
     params = snapshot.get('params')

@@ -293,6 +293,17 @@ class TestLoadSnapshot:
         assert run_snapshot(committed_repo(tmp_path / 'python', BASE_FILES), python_snapshot) == 0
         assert 'instrument' in self._refusal(python_snapshot)
 
+    def test_another_schema_version_is_refused_as_another_schema(
+        self, tmp_path: Path, taken: dict[str, Any]
+    ) -> None:
+        taken['schema_version'] = rust_metrics_snapshot.SCHEMA_VERSION + 1
+        edited = tmp_path / 'edited.json'
+        edited.write_text(json.dumps(taken), encoding='utf-8')
+        with pytest.raises(rust_metrics_snapshot.OtherSchemaError) as refused:
+            rust_metrics_snapshot.load_snapshot(edited)
+        assert str(edited) in str(refused.value)
+        assert 'schema_version' in str(refused.value)
+
     def test_params_missing_a_recorded_key_is_refused_naming_the_key(
         self, tmp_path: Path, taken: dict[str, Any]
     ) -> None:
