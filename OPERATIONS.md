@@ -2582,7 +2582,14 @@ a bind change is restart-only in both processes (the orchestrator's
   stamps retained peers via metadata-only patches). `link-heal-` admits the
   link-heal executor's metadata-only heals
   (`plans/write-triage-link-healing-prd.md` H1) and never content amends.
-  The lists are separate
+  Task 6431 (2026-11-25) moved `link-heal-` out of `config.yaml` into this
+  schema default, so that change takes effect on a fused-memory restart
+  (`scripts/restart-fused-memory.sh`); do not run
+  `mcp__fused-memory__reload_config` between its merge and that restart. A
+  reload in that window rebuilds the old in-memory two-item default, applies
+  it green-tier, and drops `link-heal-` from the live metadata arm until the
+  next restart (fail-closed: link-heal writes are refused with
+  `Mem0UpdateNotAuthorized`). The lists are separate
   because the arms carry different risk: widening
   **`metadata_patch_allowed_agent_prefixes` alone** remains the supported
   way to admit a new interactive tagging flow without granting anyone
