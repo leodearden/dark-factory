@@ -4,7 +4,8 @@ Merges that land while a review runs belong to the next review.  Drives a real
 ``ReviewCheckpoint`` only through its public seams (``record_merge``,
 ``should_trigger``, ``should_run_full``, ``run_focused``, ``run_full``) with a
 real config, and Phase 1 and the deep reviewer replaced by fakes.  The reviewer
-fake records the merges a test queued as landing mid-review before it answers.
+fake records the merges a test queued as landing mid-review, or tries a second
+review, before it answers.
 """
 
 from __future__ import annotations
@@ -26,15 +27,19 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures('code_default_config'
 
 
 class _Reviewer:
-    """The deep reviewer: lands the merges queued for this review, then answers or caps."""
+    """The deep reviewer: lands the merges queued for this review, tries any second review queued, then answers or caps."""
 
     def __init__(self, checkpoint: ReviewCheckpoint) -> None:
         self._checkpoint = checkpoint
         self._landing: list[list[str]] = []
         self._caps_next = False
+        self._overlaps_next = False
 
     def lands_during_next_review(self, *merges: list[str]) -> None:
         self._landing.extend(merges)
+
+    def tries_a_full_review_during_next_review(self) -> None:
+        self._overlaps_next = True
 
     def caps_next_review(self) -> None:
         self._caps_next = True
@@ -43,6 +48,10 @@ class _Reviewer:
         landing, self._landing = self._landing, []
         for modules in landing:
             self._checkpoint.record_merge(modules)
+        if self._overlaps_next:
+            self._overlaps_next = False
+            with pytest.raises(RuntimeError, match='already running'):
+                await self._checkpoint.run_full()
         if self._caps_next:
             self._caps_next = False
             raise AllAccountsCappedException(
@@ -161,3 +170,18 @@ async def test_a_capped_review_leaves_every_merge_unreviewed(
     report = await checkpoint.run_focused()
     assert report.ran
     assert report.changed_modules == ['pkg/a', 'pkg/late']
+
+
+async def test_a_review_cannot_start_while_another_runs(
+    checkpoint: ReviewCheckpoint, reviewer: _Reviewer,
+) -> None:
+    checkpoint.record_merge(['pkg/a'])
+    checkpoint.record_merge(['pkg/a'])
+    reviewer.tries_a_full_review_during_next_review()
+
+    report = await checkpoint.run_focused()
+
+    assert report.ran
+    checkpoint.record_merge(['pkg/b'])
+    checkpoint.record_merge(['pkg/b'])
+    assert (await checkpoint.run_focused()).changed_modules == ['pkg/b']
