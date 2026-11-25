@@ -31,7 +31,9 @@ from fused_memory.backends.episode_toolcall_leak_scan import (
     read_episode_toolcall_leaks,
 )
 from fused_memory.backends.graph_access import BudgetedGraph
-from fused_memory.backends.paged_read import INCOMPLETE_SHORT_READ
+from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+from fused_memory.backends.paged_read import INCOMPLETE_SHORT_READ, RESULTSET_SIZE
+from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.toolcall_xml_leak import PREFILTER_NEEDLES, find_toolcall_xml_leak
 
 GROUP = 'dark_factory'
@@ -229,6 +231,78 @@ class TestImmutability:
             scan.episodes_in_group = 0  # type: ignore[misc]
         with pytest.raises(dataclasses.FrozenInstanceError):
             scan.leaks[0].content = 'repaired'  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# The backend and service layers over the module read.
+# ---------------------------------------------------------------------------
+
+
+def _leak_rows() -> list[list[Any]]:
+    return [
+        _row('a-leak', _tail_leak('A decision body.')),
+        _row('b-near', _near_miss('Prose body.')),
+        _row('c-leak', _tail_leak('Another body.')),
+    ]
+
+
+class TestGraphitiBackendScan:
+    @pytest.mark.asyncio
+    async def test_reads_the_groups_graph_and_returns_the_module_reads_leaks(
+        self, mock_config, make_backend,
+    ) -> None:
+        double = EpisodeGraphDouble(rows=_leak_rows(), population=30)
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({GROUP: double}))
+
+        scan = await backend.scan_episode_toolcall_leaks(group_id=GROUP)
+
+        expected = await _scan(EpisodeGraphDouble(rows=_leak_rows(), population=30))
+        assert scan == expected
+        assert [leak.uuid for leak in scan.leaks] == ['a-leak', 'c-leak']
+        assert double.calls, 'the scan must read the graph wired for its group'
+
+    @pytest.mark.asyncio
+    async def test_a_structural_refusal_raises_rather_than_reading_clean(
+        self, mock_config, make_backend,
+    ) -> None:
+        double = EpisodeGraphDouble(rows=_leak_rows(), population=30)
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({GROUP: double}))
+
+        with pytest.raises(IncompleteEnumerationError):
+            await backend.scan_episode_toolcall_leaks(group_id=GROUP, page_size=RESULTSET_SIZE)
+
+        assert double.candidate_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_an_empirical_shortfall_is_returned_not_raised(
+        self, mock_config, make_backend,
+    ) -> None:
+        double = EpisodeGraphDouble(rows=_leak_rows(), population=30, candidate_census=9)
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({GROUP: double}))
+
+        scan = await backend.scan_episode_toolcall_leaks(group_id=GROUP)
+
+        assert scan.candidates.complete is False
+        assert scan.candidates.incomplete_kind == INCOMPLETE_SHORT_READ
+        assert [leak.uuid for leak in scan.leaks] == ['a-leak', 'c-leak']
+
+
+class TestMemoryServiceScan:
+    @pytest.mark.asyncio
+    async def test_delegates_to_the_graphiti_backend_for_the_project(
+        self, mock_config, make_backend,
+    ) -> None:
+        double = EpisodeGraphDouble(rows=_leak_rows(), population=30)
+        service = MemoryService(mock_config)
+        service.graphiti = make_backend(
+            mock_config, graph_access=FakeGraphAccess({GROUP: double}),
+        )
+
+        scan = await service.scan_episode_toolcall_leaks(project_id=GROUP)
+
+        assert isinstance(scan, EpisodeToolcallLeakScan)
+        assert scan.group_id == GROUP
+        assert [leak.uuid for leak in scan.leaks] == ['a-leak', 'c-leak']
 
 
 # ---------------------------------------------------------------------------
