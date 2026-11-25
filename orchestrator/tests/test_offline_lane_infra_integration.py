@@ -716,9 +716,10 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     rationale. Every function classified in `worst_case_secs` must also
     appear here (enforced by a key-set equality assertion below).
 
-    `single_pass_exempt` holds the remaining composing test, ib1 — it drives
-    exactly one `_run_one_lane_pass` call, so its worst case is a single
-    `_LANE_PASS_BOUND_SECS`, the marker-less budget
+    `single_pass_exempt` holds the remaining composing tests, ib1 and
+    ``test_an_infra_pass_that_raises_fails_its_drive_with_its_own_exception`` —
+    each drives exactly one `_run_one_lane_pass` call, so its worst case is a
+    single `_LANE_PASS_BOUND_SECS`, the marker-less budget
     `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` pins.
     """
     worst_case_secs = {
@@ -790,6 +791,7 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         f'test.'
     )
     single_pass_exempt = {
+        test_an_infra_pass_that_raises_fails_its_drive_with_its_own_exception,
         test_ib1_advance_triggers_from_head_infra_sub_run,
     }
 
@@ -1163,6 +1165,27 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
         f'test_ib2_infra_run_in_flight_never_gates_merge needs beyond its '
         f'own _drive_advance call.'
     )
+
+
+# ---------------------------------------------------------------------------
+# Lane drive harness — an infra pass that raises fails its drive with its own exception
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_infra_pass_that_raises_fails_its_drive_with_its_own_exception(harness, git_ops, repo, tmp_path):
+    """A raising infra pass surfaces at once with its own exception, never as a
+    drive timeout nor as a retry after ``run()``'s fail-open backoff."""
+
+    async def _raising_infra_runner(wt, head, threads):
+        raise RuntimeError('infra seam raised')
+
+    worker = _build_infra_worker(git_ops, tmp_path, infra_runner=_raising_infra_runner)
+    _wire_lane(harness, worker)
+    await _drive_advance(harness, repo)
+
+    with pytest.raises(RuntimeError, match='infra seam raised'):
+        await _run_one_lane_pass(worker)
 
 
 # ---------------------------------------------------------------------------
