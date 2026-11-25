@@ -283,7 +283,9 @@ def tagged_pids(tag: str) -> set[int]:
     """Pids whose environment holds exactly ``HOLDER_TAG_ENV=<tag>``, never this process.
 
     An unreadable entry (vanished, or another user's) is skipped, and a
-    zombie reads an empty environ, so only live processes match.
+    zombie reads an empty environ, so only live processes match.  A live
+    process mid-exec reads empty too, so one snapshot can miss it; see
+    :func:`wait_pid_tagged`.
     """
     wanted = f'{HOLDER_TAG_ENV}={tag}'.encode()
     pids: set[int] = set()
@@ -305,6 +307,34 @@ def sweep_tagged(tag: str, *, kill: Callable[[int, int], None] = os.kill) -> Non
     for pid in tagged_pids(tag):
         with contextlib.suppress(ProcessLookupError, PermissionError):
             kill(pid, signal.SIGKILL)
+
+
+def wait_pid_tagged(
+    pid: int,
+    tag: str,
+    *,
+    timeout: float | None = None,
+    interval: float = 0.05,
+    _tagged_pids: Callable[[str], AbstractSet[int]] = tagged_pids,
+) -> bool:
+    """Poll until *pid* carries ``HOLDER_TAG_ENV=<tag>``; return whether the last probe saw it.
+
+    One :func:`tagged_pids` snapshot is not a verdict on a process that may
+    still be exec'ing: its environ reads 0 bytes across the exec (measured,
+    esc-6179-4), so a :func:`sleeper_spec` build, which publishes its pid
+    before ``exec sleep``, can be missed.  ``timeout=0`` is exactly one probe.
+
+    *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
+    the wait starts, as in :func:`wait_for_pgid_file`.  *_tagged_pids* is a
+    private seam for the self-tests.
+    """
+    timeout = row_discovery_ceiling_secs() if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    while True:
+        found = pid in _tagged_pids(tag)
+        if found or time.monotonic() >= deadline:
+            return found
+        time.sleep(interval)
 
 
 def spawn_verify_merge(
