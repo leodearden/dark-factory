@@ -4786,6 +4786,23 @@ async def test_make_stages_hands_the_cost_store_to_every_stage(
     ]
 
 
+def test_harness_builds_its_judge_with_the_cost_store(journal, event_buffer, mock_memory_service):
+    """The judge writes its LLM call to the harness's invocations ledger (task 10414)."""
+    store = MagicMock(name='cost_store')
+
+    with patch('fused_memory.reconciliation.harness.Judge') as judge_cls:
+        make_harness(
+            journal=journal,
+            event_buffer=event_buffer,
+            memory_service=mock_memory_service,
+            taskmaster=AsyncMock(),
+            config=make_harness_config(judge_enabled=True),
+            cost_store=store,
+        )
+
+    assert judge_cls.call_args.kwargs['cost_store'] is store
+
+
 @pytest.mark.asyncio
 async def test_cancellation_cleanup_failure_preserves_cancelled_error(
     journal,

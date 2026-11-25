@@ -6,7 +6,10 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _invocation_ledger import invocation_rows
 from _sdk_client_stubs import sdk_client_double
+from shared.cli_invoke import AgentResult
+from shared.cost_store import CostStore
 from shared.phantom_verdict import (
     UNPARSEABLE_ISSUE_PREFIX,
     UNPARSEABLE_VERDICT_CODE,
@@ -17,6 +20,9 @@ from shared.testing import make_gate_mock
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     JudgeVerdict,
+    ReconciliationRun,
+    RunStatus,
+    RunType,
     VerdictAction,
     VerdictSeverity,
 )
@@ -3842,3 +3848,90 @@ class TestJudgeCapRetryResumeKeepsVerdictContract:
         assert all(
             f.get('code') != 'unparseable_judge_response' for f in stamped.findings
         )
+
+
+class TestJudgeInvocationLedger:
+    """The judge's CLI call lands one invocations row under its run's keys (task 10414)."""
+
+    _TOKENS = {
+        'input_tokens': 900,
+        'output_tokens': 120,
+        'cache_read_tokens': 30000,
+        'cache_create_tokens': 2500,
+    }
+
+    @staticmethod
+    def _config(tmp_path) -> ReconciliationConfig:
+        return _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+            explore_codebase_root=str(tmp_path),
+        )
+
+    @staticmethod
+    def _seed_run(mock_journal) -> None:
+        mock_journal.get_run = AsyncMock(return_value=ReconciliationRun(
+            id='run-j',
+            project_id='proj-j',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+            stage_reports={},
+        ))
+        mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    async def _review_with_store(self, tmp_path, mock_journal, served: AgentResult):
+        self._seed_run(mock_journal)
+        db_path = tmp_path / 'curator_events.db'
+        async with CostStore(db_path) as store:
+            judge = Judge(config=self._config(tmp_path), journal=mock_journal, cost_store=store)
+            with patch('shared.cli_invoke.invoke_claude_agent', new=AsyncMock(return_value=served)):
+                outcome = await judge.review_run('run-j')
+        return outcome, await invocation_rows(db_path)
+
+    @pytest.mark.asyncio
+    async def test_review_lands_one_row_under_the_run_keys(self, tmp_path, mock_journal):
+        served = AgentResult(
+            success=True,
+            output='',
+            structured_output={'severity': 'ok', 'findings': []},
+            cost_usd=0.07,
+            **self._TOKENS,
+        )
+
+        outcome, rows = await self._review_with_store(tmp_path, mock_journal, served)
+
+        assert isinstance(outcome, JudgeVerdict)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['role'] == 'recon_judge'
+        assert row['run_id'] == 'run-j'
+        assert row['project_id'] == 'proj-j'
+        assert row['model'] == self._config(tmp_path).judge_llm_model
+        assert {key: row[key] for key in self._TOKENS} == self._TOKENS
+
+    @pytest.mark.asyncio
+    async def test_returned_failure_still_lands_a_row(self, tmp_path, mock_journal):
+        hung = AgentResult(success=False, output='', timed_out=True, **self._TOKENS)
+
+        outcome, rows = await self._review_with_store(tmp_path, mock_journal, hung)
+
+        assert len(rows) == 1
+        assert isinstance(outcome, NoVerdict)
+        assert outcome.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_judge_without_store_passes_none(self, tmp_path, mock_journal):
+        self._seed_run(mock_journal)
+        judge = Judge(config=self._config(tmp_path), journal=mock_journal)
+        invoke = AsyncMock(return_value=AgentResult(
+            success=True, output='', structured_output={'severity': 'ok', 'findings': []},
+        ))
+
+        with patch('fused_memory.reconciliation.judge.invoke_with_cap_retry', new=invoke):
+            await judge.review_run('run-j')
+
+        assert invoke.call_args.kwargs['cost_store'] is None
+        assert invoke.call_args.kwargs['role'] == 'recon_judge'
