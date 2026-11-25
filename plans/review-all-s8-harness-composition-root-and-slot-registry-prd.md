@@ -469,8 +469,12 @@ backend and a `SandboxRefusalDedup` object that the composition root owns and `b
 `TaskWorkflow`; `invoke_agent` gains `sandbox_backend` beside `sandbox_modules`. The two readers that
 appeared after `d40ba048e9` take the backend the same way: `dry_run_unblock.py::_investigation_sandbox_modules`
 reads `config.sandbox.backend` and the injected dedup, and `evals/shadow_isolation.py`'s
-`resolve_backend` default binds the configured backend at its composition site. Both autouse
-`_restore_sandbox_backend` fixtures are deleted. κ1 edits `_invoke`'s region after S9 ζ1.
+`resolve_backend` default binds the configured backend at its composition site. The out-of-harness
+callers found since (κ1 leaf) take it the same way: `scripts/sitting/nightly_prepare.py::run` hands
+`settings.sandbox_backend` to the resolver and the wrapper instead of binding it, and the eval workflow
+cell (`evals/cell_sandbox.py`, S1 μ) stops binding while `EvalMetrics.sandbox_backend` still records
+what its agents ran under. All three autouse `_restore_sandbox_backend` fixtures are deleted. κ1 edits
+`_invoke`'s region after S9 ζ1.
 
 **κ2 — non-claude backends write under `.task/`; one claude spawn recipe.** `_invoke_claude_with_sandbox`
 collapses onto `invoke_claude_agent(..., sandbox_wrap=…, env_overrides=…)`, deleting the duplicated
@@ -631,7 +635,8 @@ degrade); `harness.py`'s heuristic-14 measurement is re-taken and recorded in th
   escalation dedup moves to a `SandboxRefusalDedup` the composition root owns, because that dedup is
   per orchestrator process, not per module. `fused-memory`'s `reconciliation/sandbox_guard.py` mirrors
   the resolution order by comment today; S19's shared sandbox module adopts the parameterised API when
-  it moves.
+  it moves. Every out-of-harness caller (dry-run, the shadow-isolation probe, the eval workflow cell,
+  the sitting nightly) takes the backend the same way; the κ1 leaf lists their files.
 - **D13 — session, not url (μ1, μ2).** Consumers receive an `McpSession`; a url appears only where a
   session is built (`McpLifecycle.__init__`, `fm_session`, and the out-of-harness entry points' own
   `async with`). Rejected: a session provider callable (temporal coupling on `start()` survives in a new
@@ -1427,12 +1432,19 @@ on S3 ζ, so on S6 μ (behind S6's chain and task 5040), S7 δ, task 5409 and S3
   `orchestrator/tests/test_workflow_sandbox_refusal.py`, `orchestrator/tests/test_workflow_sandbox_events.py`,
   `orchestrator/tests/test_dry_run_unblock.py`, `orchestrator/tests/test_sandbox_git_config.py`,
   `orchestrator/tests/test_shadow_invocation_sandbox.py`, `orchestrator/tests/test_workflow_task_root.py`,
-  `orchestrator/tests/test_landlock.py`, `orchestrator/tests/test_sandbox.py`. 17 files, above the
-  15-file review trigger: one process global becomes a parameter, and every test site that set or reset
-  it changes mechanically.
+  `orchestrator/tests/test_landlock.py`, `orchestrator/tests/test_sandbox.py`. Re-measured over the
+  whole tree at `defc45bfa7` (2026-11-25; the `e634cfe658` measurement covered only `orchestrator/`),
+  the callers it missed or that landed since: `orchestrator/src/orchestrator/evals/cell_sandbox.py`
+  (S1 μ, task 9849) and its composition site `orchestrator/src/orchestrator/evals/runner.py`,
+  `scripts/sitting/nightly_prepare.py` (task 6203), and the tests
+  `orchestrator/tests/test_eval_corpus_sandbox.py`, `orchestrator/tests/test_zcode_dotenv_live.py`
+  (task 9541) and `scripts/tests/test_sitting_nightly_prepare.py`. 23 files, above the 15-file review
+  trigger: one process global becomes a parameter, and every site that set, read or reset it changes
+  mechanically.
 - Keys: `fk-a97501641592`. Deps: ι2 (same file `harness.py`); S9 ζ1 (`_invoke`) if filed.
 - Deletes: `set_backend`, `get_backend`, `_preferred`, `_escalated_backend_state`, `reset_escalation_dedupe`,
-  both `_restore_sandbox_backend` fixtures.
+  all three `_restore_sandbox_backend` fixtures (`conftest.py`, `orchestrator/tests/conftest.py`,
+  `scripts/tests/test_sitting_nightly_prepare.py`).
 - Signal: boundary row 19; `dry_run_unblock` and the shadow-isolation probe resolve the configured
   backend with no `Harness` in the process.
 - G7: INV-9 — the backend has one home per process, the composition root.
