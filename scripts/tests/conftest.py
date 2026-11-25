@@ -365,10 +365,13 @@ def install_fake_httpx(monkeypatch):
 # `make_runs_db` (task 5989) is the event-dict factory that replaced the private
 # copies in the wiped-metadata, merge-lane-throughput and speculation-depth suites.
 #
-# RUNS_DB_SCHEMA is a VERBATIM copy of the four tables those scripts read,
+# RUNS_DB_SCHEMA is a VERBATIM copy of the five tables those scripts read,
 # captured with
 #
-#     sqlite3 data/orchestrator/runs.db ".schema events invocations account_events runs"
+#     for t in events invocations account_events runs task_results; do
+#         sqlite3 -readonly data/orchestrator/runs.db ".schema $t"; done
+#
+# (`.schema` takes one LIKE-pattern, so the tables are captured one at a time).
 #
 # Copied rather than imported because this directory is collected by
 # `uv run --project shared pytest` and imports NO first-party package (the
@@ -431,6 +434,25 @@ CREATE TABLE runs (
     paused_for_cap INTEGER DEFAULT 0,
     cap_pause_secs REAL DEFAULT 0.0
 );
+CREATE TABLE task_results (
+    run_id              TEXT NOT NULL REFERENCES runs(run_id),
+    task_id             TEXT NOT NULL,
+    project_id          TEXT NOT NULL,
+    title               TEXT,
+    outcome             TEXT NOT NULL,
+    cost_usd            REAL DEFAULT 0.0,
+    duration_ms         INTEGER DEFAULT 0,
+    agent_invocations   INTEGER DEFAULT 0,
+    execute_iterations  INTEGER DEFAULT 0,
+    verify_attempts     INTEGER DEFAULT 0,
+    review_cycles       INTEGER DEFAULT 0,
+    steward_cost_usd    REAL DEFAULT 0.0,
+    steward_invocations INTEGER DEFAULT 0,
+    completed_at        TEXT, block_reason TEXT, block_phase TEXT,
+    PRIMARY KEY (run_id, task_id)
+);
+CREATE INDEX idx_task_results_project
+    ON task_results(project_id, completed_at);
 """
 
 _INSERT_EVENT = (
