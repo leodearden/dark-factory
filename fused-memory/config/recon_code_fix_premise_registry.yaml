@@ -188,19 +188,23 @@
     improve this area still reaches the architect — pinned by
     tests/test_recon_code_fix_premise_guard.py::TestSeedRegistryRealSource::
     test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped, whose
-    candidate title carries BOTH anchor tokens by construction so the
+    candidate title carries every title anchor by construction so the
     description anchor is genuinely exercised (match_candidate requires ALL
     title_substrings). Two executable guards back that test: a
     dataclasses.replace mutation control asserting the candidate DOES match
     once description_substrings is widened to a bare "gate_escalated_at"
     token, and the inverse control
     test_absence_phrasing_with_same_title_does_match (same title, absence
-    phrasing, matches).
+    phrasing, matches). Why the bare "no escalation record exists" anchor
+    was dropped: tests/test_recon_code_fix_premise_guard.py::
+    TestSeedRegistryRealSource::
+    test_task_8211_followup_is_not_refuted_as_a_gate_absence_claim.
   title_substrings:
     - "deterministic"
     - "escalation"
+    - "gate"
   description_substrings:
-    - "no escalation record exists"
+    - "that no escalation record exists"
     - "gate_escalated_at but no escalation record"
     - "escalation record was never written"
     - "never wrote an escalation record"

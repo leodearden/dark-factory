@@ -792,10 +792,10 @@ class TestSeedRegistryRealSource:
         assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is not None
 
     # Candidate shared by the over-broad-anchoring guard and its inverse control.
-    # The title carries BOTH anchor tokens ("deterministic", "escalation") BY
-    # CONSTRUCTION — match_candidate requires ALL title_substrings, so without
-    # both tokens the candidate would die at the TITLE gate and the description
-    # anchor these tests exist to pin would never be exercised.
+    # The title carries EVERY title anchor ("deterministic", "escalation",
+    # "gate") BY CONSTRUCTION — match_candidate requires ALL title_substrings,
+    # so without them the candidate would die at the TITLE gate and the
+    # description anchor these tests exist to pin would never be exercised.
     _LEGITIMATE_PROPOSAL_TITLE = (
         "Expose an archive-inclusive escalation lookup for deterministic gate tasks"
     )
@@ -804,7 +804,7 @@ class TestSeedRegistryRealSource:
         """Over-broad-anchoring guard: task 3023's OWN framing must still reach
         the architect.
 
-        The title carries both anchor tokens by construction (see
+        The title carries every title anchor by construction (see
         _LEGITIMATE_PROPOSAL_TITLE) — that is precisely what makes the
         DESCRIPTION anchor reachable, so this test rejects on the anchor it
         claims to pin rather than on the title gate. The description mentions
