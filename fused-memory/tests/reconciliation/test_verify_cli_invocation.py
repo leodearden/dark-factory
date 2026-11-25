@@ -15,6 +15,7 @@ from _invocation_ledger import invocation_rows
 from _invocation_tokens import LEDGER_TOKENS, agent_result_with_tokens
 from shared.cli_invoke import AgentResult
 from shared.cost_store import CostStore
+from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
@@ -172,3 +173,26 @@ async def test_an_audited_max_turns_failure_still_lands_a_row(tmp_path, git_root
 
     assert len(rows) == 1
     assert result.agent_failed is True
+
+
+@pytest.mark.asyncio
+async def test_a_verifier_given_a_usage_gate_dispatches_on_the_pooled_account_token(git_root):
+    """Only invoke_claude_agent is patched, so invoke_with_cap_retry's real
+    gated branch runs: the CLI must authenticate on the gate's pooled account,
+    never on the ambient ~/.claude login (task 11783)."""
+    gate = make_gate_mock(before_invoke=AsyncMock(return_value='pooled-token'))
+    served = AgentResult(
+        success=True,
+        output='',
+        structured_output={'verdict': 'confirmed', 'confidence': 1.0, 'evidence': [], 'summary': 's'},
+    )
+    with patch('shared.cli_invoke.invoke_claude_agent', autospec=True, return_value=served) as mock_agent:
+        result = await CodebaseVerifier(ReconciliationConfig(), usage_gate=gate).verify(
+            claim='x.py defines x', codebase_root=git_root,
+        )
+
+    mock_agent.assert_called_once()
+    assert mock_agent.call_args.kwargs['oauth_token'] == 'pooled-token'
+    gate.confirm_account_ok.assert_called_once_with('pooled-token')
+    assert result.verdict == 'confirmed'
+    assert result.agent_failed is False
