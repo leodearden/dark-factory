@@ -6,10 +6,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _curator_helpers import exhaustible_embedder, in_memory_corpus_curator
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
-from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.middleware.curator_types import CandidateTask
+from fused_memory.middleware.task_curator import CorpusSearchError, TaskCurator
 from fused_memory.server.tools import create_mcp_server
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -108,22 +110,54 @@ class TestSearchCorpus:
         mock_client.query_points.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_search_corpus_swallows_errors(self):
-        """A raising query_points degrades to [] rather than propagating."""
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
+    async def test_an_exhausted_embedder_raises_corpus_search_error(self):
+        """A dead embedder makes the corpus unsearchable, which is not "no similar task"."""
+        embedder = exhaustible_embedder()
+        curator = in_memory_corpus_curator(embedder)
+        try:
+            await curator.record_task('42', CandidateTask(title='Fix the parser'), 'p')
+            hits = await curator.search_corpus('Fix the parser', 'p')
+            assert [h['task_id'] for h in hits] == ['42']
 
-        mock_client = AsyncMock()
-        mock_client.collection_exists = AsyncMock(return_value=True)
-        mock_client.query_points = AsyncMock(side_effect=RuntimeError('qdrant down'))
+            embedder.exhaust()
+            with pytest.raises(CorpusSearchError) as raised:
+                await curator.search_corpus('Fix the parser', 'p')
+        finally:
+            await curator.close()
 
-        mock_embedder = AsyncMock()
-        mock_embedder.create = AsyncMock(return_value=[0.1] * 1536)
+        err = raised.value
+        assert err.error_type == 'RateLimitError'
+        assert err.billing_exhausted == 'api_key_credits'
+        assert 'api_key_credits' in str(err)
 
-        with patch.object(curator, '_get_qdrant', return_value=mock_client), \
-             patch.object(curator, '_get_embedder', return_value=mock_embedder):
-            hits = await curator.search_corpus('boom', 'someproject')
+    @pytest.mark.asyncio
+    async def test_an_unreachable_qdrant_raises_corpus_search_error(self):
+        config = _make_config()
+        config.mem0.qdrant_url = 'http://127.0.0.1:9'
+        curator = TaskCurator(
+            config=config, taskmaster=None,
+            embedder=exhaustible_embedder(), qdrant_client=None,
+        )
+        try:
+            with pytest.raises(CorpusSearchError) as raised:
+                await curator.search_corpus('anything', 'p')
+        finally:
+            await curator.close()
 
-        assert hits == []
+        err = raised.value
+        assert err.billing_exhausted is None
+        assert isinstance(err.error_type, str)
+        assert err.error_type not in ('', 'CorpusSearchError')
+
+    @pytest.mark.asyncio
+    async def test_nothing_filed_is_a_genuine_empty_result_even_with_a_dead_embedder(self):
+        embedder = exhaustible_embedder()
+        embedder.exhaust()
+        curator = in_memory_corpus_curator(embedder)
+        try:
+            assert await curator.search_corpus('anything', 'p') == []
+        finally:
+            await curator.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
