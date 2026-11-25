@@ -51,17 +51,18 @@ wording is what distinguishes them, not the severity.
 
 Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalator`:
 
-* Defensive import of the optional ``escalation`` workspace package.  When
-  the package is missing (minimal envs, tests without escalation infra),
-  ``report_rejection`` becomes a logged no-op — the guard's own outcome is
-  unaffected (on the FILES-certain path the error dict is still returned;
-  on the advisory path the submission still proceeds and still carries the
-  stamp), so escalation is purely additive.
 * Per-project ``EscalationQueue`` cache keyed by ``project_root``.
 * Escalations land in ``{project_root}/data/escalations`` — the *filing*
   project's queue (the place the agent was operating against), regardless
   of outcome.  This matches the existing esc-2240-series scope_violation
   pattern referenced in task 1088.
+
+Unlike that class, it imports the ``escalation`` workspace package
+defensively.  When the package is missing (minimal envs, tests without
+escalation infra), ``report_rejection`` becomes a logged no-op — the guard's
+own outcome is unaffected (on the FILES-certain path the error dict is still
+returned; on the advisory path the submission still proceeds and still
+carries the stamp), so escalation is purely additive.
 
 Burst control: :meth:`report_budget_misconfig` applies a per-project dedup
 window (``_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS``) so a sustained per-call
@@ -89,9 +90,9 @@ from shared.project_layout import escalation_queue_dir
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-# Mirror the defensive-import pattern from curator_escalator.py:50-55 so
-# the escalator silently no-ops when the escalation package is unavailable
-# (minimal CI / unit-test envs, deployments that haven't installed it yet).
+# Defensive import so the escalator silently no-ops when the escalation
+# package is unavailable (minimal CI / unit-test envs, deployments that
+# haven't installed it yet).
 try:
     from escalation.dedupe import (  # type: ignore[import-untyped]
         DedupeConfig,

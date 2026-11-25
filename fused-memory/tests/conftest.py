@@ -70,10 +70,10 @@ _shared_src = os.path.join(
 if _shared_src not in sys.path:
     sys.path.insert(0, _shared_src)
 
-# Make the sibling 'escalation' workspace package importable without installing it.
-# curator_escalator.py uses a try/except guard (HAS_ESCALATION) — adding the src
-# path here (before test files are collected) ensures the guard resolves to True so
-# tests that exercise the escalation-routing branch can actually run.
+# Likewise insert this worktree's escalation/src at the front of sys.path so
+# that `import escalation` loads the local code rather than whatever editable
+# install the uv workspace has pinned to another tree (mirrors the shared/src
+# insertion above).
 _escalation_src = os.path.join(
     os.path.dirname(os.path.dirname(_tests_dir)),  # workspace root
     'escalation', 'src',

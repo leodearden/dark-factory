@@ -728,15 +728,8 @@ class TestRaisedFailureKeepsZotMarker:
     """Task 5491: the interactive-path raise still says whether it was a ZOT."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('gate', ['no-orchestrator', 'no-escalation-package'])
     @pytest.mark.parametrize('zero_output_timeout', [True, False])
-    async def test_raise_carries_zero_output_timeout(
-        self, tmp_path, monkeypatch, gate, zero_output_timeout,
-    ):
-        if gate == 'no-escalation-package':
-            monkeypatch.setattr(
-                'fused_memory.middleware.curator_escalator.HAS_ESCALATION', False,
-            )
+    async def test_raise_carries_zero_output_timeout(self, tmp_path, zero_output_timeout):
         with pytest.raises(CuratorFailureError) as exc_info:
             await CuratorEscalator().report_failure(
                 project_root=str(tmp_path), project_id='proj-x',
