@@ -2,7 +2,8 @@
 
 The verify-host trial report's store boundary. The event types, the cap_hit
 account event and the lock-conflict requeue reasons are spelled once here; no
-enum elsewhere holds them. Each source declares its table and the columns it
+enum elsewhere holds them. A cap_hit row records any kind of cap, so each is
+classified here into a CapKind: weekly, session, per-model or unrecognised. Each source declares its table and the columns it
 needs in SOURCES. Those columns are asked of the store, never assumed: a
 missing table or column makes that one source unavailable. A source whose
 producer never wrote a row is never_written, which is distinct from a source
@@ -12,6 +13,7 @@ table sampler.metrics.ARM_METRICS, so no metric name is spelled here.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -32,6 +34,7 @@ __all__ = [
     'SOURCES',
     'AdmissionPlan',
     'CapHit',
+    'CapKind',
     'CpuRead',
     'CpuSample',
     'Deferral',
@@ -70,7 +73,7 @@ class EventType(StrEnum):
 
 
 CAP_HIT = 'cap_hit'
-"""The account_events event_type of an account reaching its weekly cap."""
+"""The account_events event_type of an account reaching a cap of any kind (CapKind)."""
 
 REQUEUED = 'requeued'
 """The task_completed outcome of a task put back in the queue."""
@@ -243,11 +246,20 @@ class Invocation:
     cost_usd: float
 
 
+class CapKind(StrEnum):
+    WEEKLY = 'weekly'
+    SESSION = 'session'
+    """A session or N-hour short-window cap."""
+    PER_MODEL = 'per_model'
+    UNRECOGNISED = 'unrecognised'
+
+
 @dataclass(frozen=True)
 class CapHit:
     account: str
     at: datetime
     resets_at: datetime | None
+    kind: CapKind
 
 
 class SourceState(StrEnum):
@@ -507,9 +519,41 @@ def _invocation(record: Mapping[str, Any], at: datetime, _window: _Window) -> In
     return Invocation(at, _text(record['account_name']), _number(record['cost_usd']))
 
 
+_CAP_BANNER = re.compile(r"You've hit your (\S+) limit\b")
+"""The CLI's cap banner; its one word names the limit reached."""
+
+_LIMIT_WORD_KINDS: tuple[tuple[re.Pattern[str], CapKind], ...] = (
+    (re.compile('weekly'), CapKind.WEEKLY),
+    (re.compile(r'session|\d+-hour'), CapKind.SESSION),
+    (re.compile('[A-Z][a-z]+'), CapKind.PER_MODEL),
+)
+"""Each banner limit word, matched whole, to its cap kind; a model family name (Sonnet, Fable) is per-model."""
+
+
+def _cap_kind(details: Mapping[str, Any]) -> CapKind:
+    """The cap kind of one cap_hit's details; a reason that is present but not text is malformed.
+
+    A scope key wins over the reason: it is the writer's per-model attribution by invoked model,
+    shared/src/shared/usage_gate.py::UsageGate._handle_cap_detected.
+    """
+    scope = details.get('scope')
+    if isinstance(scope, str) and scope:
+        return CapKind.PER_MODEL
+    if 'reason' not in details:
+        return CapKind.UNRECOGNISED
+    banner = _CAP_BANNER.match(_text(details['reason']))
+    if banner is None:
+        return CapKind.UNRECOGNISED
+    word = banner.group(1)
+    return next((kind for pattern, kind in _LIMIT_WORD_KINDS if pattern.fullmatch(word)), CapKind.UNRECOGNISED)
+
+
 def _cap_hit(record: Mapping[str, Any], at: datetime, _window: _Window) -> CapHit:
-    resets_at = _object(record['details']).get('resets_at')
-    return CapHit(_text(record['account_name']), at, None if resets_at is None else _at(resets_at))
+    details = _object(record['details'])
+    resets_at = details.get('resets_at')
+    return CapHit(
+        _text(record['account_name']), at, None if resets_at is None else _at(resets_at), _cap_kind(details)
+    )
 
 
 # ---------------------------------------------------------------------------
