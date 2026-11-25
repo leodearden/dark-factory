@@ -1560,10 +1560,9 @@ def create_server(
         unknown = sorted(granted_tools - registered)
         if unknown:
             logger.warning(
-                'plan-tools grant names tool(s) %s that this server does not '
-                'register: dropping them, because the launcher predates their '
-                'rename or removal.',
-                unknown,
+                'plan-tools grant names tool(s) %s this server does not '
+                'register (registered: %s); dropping them',
+                unknown, sorted(registered),
             )
         for name in registered - granted_tools:
             mcp.local_provider.remove_tool(name)

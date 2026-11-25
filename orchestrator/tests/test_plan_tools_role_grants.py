@@ -74,7 +74,9 @@ async def test_an_unknown_grant_is_dropped_with_a_warning(artifacts, caplog):
 
     assert await _listed(server) == ['mark_step_done']
     assert any(
-        record.levelno == logging.WARNING and 'no_such_tool' in record.getMessage()
+        record.levelno == logging.WARNING
+        and 'no_such_tool' in record.getMessage()
+        and 'record_step_deviation' in record.getMessage()
         for record in caplog.records
     )
 
@@ -122,10 +124,17 @@ async def test_an_unmarked_cli_launch_exposes_nothing_and_warns(tmp_path, caplog
 
 
 @pytest.mark.asyncio
-async def test_a_marked_cli_launch_with_no_grant_exposes_nothing(tmp_path):
+async def test_a_marked_cli_launch_with_no_grant_exposes_nothing_silently(tmp_path, caplog):
     argv = [*_lane_argv(tmp_path), '--grants-enforced']
 
-    assert await _listed(plan_tools.server_from_argv(argv)) == []
+    with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+        server = plan_tools.server_from_argv(argv)
+
+    assert await _listed(server) == []
+    assert not [
+        record for record in caplog.records
+        if record.levelno >= logging.WARNING and '--grants-enforced' in record.getMessage()
+    ]
 
 
 @pytest.mark.asyncio
