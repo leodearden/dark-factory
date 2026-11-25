@@ -1541,11 +1541,14 @@ def create_server(
     artifacts: TaskArtifacts, granted_tools: frozenset[str] | None = None,
     caller_role: str | None = None,
 ) -> FastMCP:
-    """Create the plan-tools MCP server.
+    """Create the plan-tools MCP server; the one home of its grant policy.
 
-    *granted_tools* ``None`` registers every tool. Otherwise only the granted
-    names stay registered, so an ungranted tool neither lists nor dispatches;
-    a granted name this server does not register raises ``ValueError``.
+    *granted_tools* ``None`` registers every tool, for in-process callers.
+    Otherwise only the granted names stay registered, so an ungranted tool
+    neither lists nor dispatches. A granted name this server does not
+    register is dropped with a WARNING rather than refused, because a
+    running launcher can name a tool this on-disk server has since renamed
+    or removed: plans/plan-deviation-recording-prd.md D14.
 
     *caller_role* names the role this server serves on its markup records;
     ``None`` leaves them attributed from each call's arguments alone.
@@ -1554,11 +1557,14 @@ def create_server(
     if granted_tools is not None:
         unknown = sorted(granted_tools - registered)
         if unknown:
-            raise ValueError(
-                f'plan-tools grant names unregistered tool(s) {unknown}; '
-                f'registered: {sorted(registered)}'
+            logger.warning(
+                'plan-tools grant names tool(s) %s that this server does not '
+                'register: dropping them, because the launcher predates their '
+                'rename or removal.',
+                unknown,
             )
-        _restrict_to_grant(mcp, registered, granted_tools)
+        for name in registered - granted_tools:
+            mcp.local_provider.remove_tool(name)
     return mcp
 
 
@@ -2161,13 +2167,6 @@ def _server_with_every_tool(
     return mcp, frozenset(registered)
 
 
-def _restrict_to_grant(
-    mcp: FastMCP, registered: frozenset[str], granted: frozenset[str],
-) -> None:
-    for name in registered - granted:
-        mcp.local_provider.remove_tool(name)
-
-
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -2190,32 +2189,19 @@ def server_from_argv(argv: list[str] | None = None) -> FastMCP:
 
     A launch carrying ``--grants-enforced`` or any ``--grant`` exposes only
     the granted tools, so a marked launch with no grant exposes none. A
-    granted name this server does not register is dropped with a WARNING,
-    where ``create_server`` raises. A launch carrying neither keeps every
-    tool and logs a WARNING. Why both cases exist:
-    plans/plan-deviation-recording-prd.md D14.
+    launch carrying neither keeps every tool and logs a WARNING. Why both
+    cases exist: plans/plan-deviation-recording-prd.md D14.
     """
     args = _cli_parser().parse_args(argv)
-    mcp, registered = _server_with_every_tool(
-        _artifacts_from_namespace(args), args.caller_role,
-    )
-    granted: frozenset[str] = frozenset(args.grant or ())
+    granted: frozenset[str] | None = frozenset(args.grant or ())
     if not (args.grants_enforced or granted):
         logger.warning(
             'plan-tools launched without --grants-enforced or any --grant: exposing '
             'every plan-tools tool, because the launcher predates task 7717. '
             'Task 10803 removes this path.'
         )
-        return mcp
-    unknown = sorted(granted - registered)
-    if unknown:
-        logger.warning(
-            'plan-tools launch grants tool(s) %s that this server does not register: '
-            'dropping them, because the launcher predates their rename or removal.',
-            unknown,
-        )
-    _restrict_to_grant(mcp, registered, granted)
-    return mcp
+        granted = None
+    return create_server(_artifacts_from_namespace(args), granted, args.caller_role)
 
 
 def _cli_parser() -> argparse.ArgumentParser:
