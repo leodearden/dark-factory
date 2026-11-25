@@ -616,6 +616,32 @@ class TestStoreInstall:
         rerun_calls = installed.systemctl_calls()[calls_before:]
         assert not [call for call in rerun_calls if "restart" in call]
 
+    @pytest.mark.parametrize(
+        ("drifted", "restarted"),
+        [
+            pytest.param(STORE_UNIT, {STORE_UNIT}, id="store-unit"),
+            pytest.param(PRUNE_SERVICE, set(), id="prune-service"),
+            pytest.param(PRUNE_TIMER, {PRUNE_TIMER}, id="prune-timer"),
+        ],
+    )
+    def test_a_drifted_unit_is_rewritten_and_restarts_only_what_it_runs(
+        self, installed: StoreWorld, drifted: str, restarted: set[str]
+    ) -> None:
+        rendered = installed.unit_text(drifted)
+        with (installed.unit_dir / drifted).open("a") as unit:
+            unit.write("# hand edit\n")
+        calls_before = len(installed.systemctl_calls())
+        pid = installed.store_pid()
+
+        proc = installed.install()
+
+        assert proc.returncode == 0, installed.install_report(proc)
+        assert installed.unit_text(drifted) == rendered
+        rerun_calls = installed.systemctl_calls()[calls_before:]
+        assert {call[2] for call in rerun_calls if call[1:2] == ["restart"]} == restarted
+        if STORE_UNIT not in restarted:
+            assert installed.store_pid() == pid
+
     @pytest.mark.parametrize("change", ["rotate", "recreate"])
     def test_changed_credentials_restart_the_store(
         self, installed: StoreWorld, change: str
