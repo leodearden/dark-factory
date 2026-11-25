@@ -101,7 +101,7 @@ under the project root. The fields are:
 | `gate_built` | Whether that ensure had to build the gate; null when it raised. |
 | `summary`, `category` | The verdict's own summary and failure category. |
 | `no_verdict` | `{kind, message}` when the host produced no usable verdict; `kind` is a `RunnerUnavailable` kind (`transport`, `gate`, `unparseable`, `no_verdict`, `wire_shape`). |
-| `modules.<prefix>.failing_test_ids` | That module's failing junit ids; null when the verdict carries no per-module attribution. |
+| `modules.<prefix>.failing_test_ids` | That module's failing junit ids; null when they are not attributed, either because the verdict carries no per-module attribution or because the module collected no junit (for example, its test leg never produced a report). null is not zero. |
 | `modules.<prefix>.failing_count` | Their count, or null. |
 | `failing_test_ids` | The run-wide failing ids. |
 | `skipped_test_ids` | The run-wide skipped junit ids, or null when no junit was collected. |

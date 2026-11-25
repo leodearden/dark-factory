@@ -189,7 +189,7 @@ def _skip_parity_exception(path: Path, index: int, entry: object) -> SkipParityE
 
 @dataclass(frozen=True)
 class ModuleOutcome:
-    """One dispatched module's failing junit ids; None when the verdict carries no attribution."""
+    """One dispatched module's failing junit ids; None when unattributed: the verdict has no map, or this module collected no junit."""
 
     failing_test_ids: tuple[str, ...] | None
 
@@ -414,7 +414,7 @@ class _Dispatch:
     def _modules(self, by_module: dict[str, list[str]] | None) -> dict[str, ModuleOutcome]:
         return {
             vc.prefix: ModuleOutcome(
-                None if by_module is None else tuple(by_module.get(vc.prefix, ())),
+                None if by_module is None or vc.prefix not in by_module else tuple(by_module[vc.prefix]),
             )
             for vc in self.spec.verify_commands
         }
