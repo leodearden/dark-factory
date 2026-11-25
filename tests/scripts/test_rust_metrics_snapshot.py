@@ -24,6 +24,7 @@ from quality_snapshot_fixtures import BASE_FILES, committed_repo, run_snapshot
 from quality_snapshot_identity import below_run_id_and_cost
 from rust_snapshot_fixtures import (
     FIXTURE_RULES_TOML,
+    MOVES_HEAD_ENV,
     RUST_CYCLE_FILES,
     RUST_WORKSPACE_FILES,
     rust_workspace_repo,
@@ -236,6 +237,38 @@ class TestTheMeasurement:
             outs.append(out)
         assert len(json.loads(outs[0].read_text(encoding='utf-8'))['import_graph']['cycles']) == 2
         assert [below_run_id_and_cost(out) for out in outs[1:]] == [below_run_id_and_cost(outs[0])] * 3
+
+
+@pytest.mark.usefixtures('shims')
+class TestTheRefusals:
+    def test_a_head_moved_during_the_measurement_is_refused_and_nothing_is_written(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        fixture_rules: Path,
+    ) -> None:
+        repo = rust_workspace_repo(tmp_path)
+        started_at = git(repo, 'rev-parse', 'HEAD').strip()
+        monkeypatch.setenv(MOVES_HEAD_ENV, '1')
+        out = tmp_path / 'out' / 'snapshot.json'
+        assert _measure(fixture_rules, repo, out) == 2
+        found_at = git(repo, 'rev-parse', 'HEAD').strip()
+        assert found_at != started_at
+        refusal = capsys.readouterr().err
+        assert started_at in refusal
+        assert found_at in refusal
+        assert not out.exists()
+
+    def test_a_dirty_tracked_file_is_refused_by_name_and_nothing_is_written(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], fixture_rules: Path
+    ) -> None:
+        repo = rust_workspace_repo(tmp_path)
+        (repo / 'crates/core/src/lib.rs').write_text('pub fn changed() {}\n', encoding='utf-8')
+        out = tmp_path / 'out' / 'snapshot.json'
+        assert _measure(fixture_rules, repo, out) == 2
+        assert 'crates/core/src/lib.rs' in capsys.readouterr().err
+        assert not out.exists()
 
 
 class TestLoadSnapshot:

@@ -38,8 +38,13 @@ def write_fixture_rules(path: Path) -> Path:
     return path
 
 
+#: Set to '1' in the environment, the tokei shim commits in its cwd before counting: a merge landing mid-measurement.
+MOVES_HEAD_ENV = 'FAKE_TOKEI_MOVES_HEAD'
+
 _TOKEI_SHIM = '''
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -64,6 +69,12 @@ args = sys.argv[1:]
 if args == ['--version']:
     print(f'tokei {VERSION} compiled with serialization support: json')
 elif args == ['-f', '-o', 'json', '.']:
+    if os.environ.get(MOVES_HEAD_ENV) == '1':
+        subprocess.run(
+            ['git', '-c', 'user.name=f', '-c', 'user.email=f@e.invalid',
+             'commit', '--allow-empty', '--no-verify', '-q', '-m', 'moved'],
+            check=True,
+        )
     print(json.dumps(_report()))
 else:
     sys.exit(f'tokei shim: unexpected argv {args}')
@@ -94,11 +105,12 @@ def _write_shim(path: Path, body: str) -> None:
 def tool_shims(bin_dir: Path, *, tokei_version: str = '15.0.0') -> Path:
     """Executable ``tokei`` and ``cargo`` stand-ins in *bin_dir*, answering only the instrument's argv.
 
-    tokei counts every ``.rs`` file under its cwd (``//`` lines as comments);
-    cargo lists one package per ``crates/<name>/Cargo.toml`` under its cwd.
+    tokei counts every ``.rs`` file under its cwd (``//`` lines as comments), first
+    committing there when ``MOVES_HEAD_ENV`` is '1'; cargo lists one package per
+    ``crates/<name>/Cargo.toml`` under its cwd.
     """
     bin_dir.mkdir(parents=True, exist_ok=True)
-    _write_shim(bin_dir / 'tokei', f'VERSION = {tokei_version!r}\n{_TOKEI_SHIM}')
+    _write_shim(bin_dir / 'tokei', f'VERSION = {tokei_version!r}\nMOVES_HEAD_ENV = {MOVES_HEAD_ENV!r}\n{_TOKEI_SHIM}')
     _write_shim(bin_dir / 'cargo', _CARGO_SHIM)
     return bin_dir
 
