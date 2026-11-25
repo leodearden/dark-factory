@@ -103,6 +103,45 @@ def test_an_error_payload_from_any_tool_raises_store_unreachable_naming_tool_and
 
     assert tool in str(raised.value)
     assert "store is down" in str(raised.value)
+    assert not isinstance(raised.value, task_store.StoreDegraded)
+
+
+def test_an_error_reply_not_flagged_degraded_is_unreachable_not_an_outage() -> None:
+    post = _RecordingPost({"search_tasks": [{**_error_reply(), "degraded": False}]})
+
+    with pytest.raises(task_store.StoreUnreachable) as raised:
+        _store(post).search_tasks(_ROOT, query="q", score_threshold=0.6)
+
+    assert not isinstance(raised.value, task_store.StoreDegraded)
+
+
+_DEGRADED_SEARCH_REPLY = {
+    "results": [],
+    "degraded": True,
+    "error": "curator corpus search failed for project p: RateLimitError: insufficient_quota",
+    "error_type": "RateLimitError",
+    "billing_exhausted": "api_key_credits",
+}
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _DEGRADED_SEARCH_REPLY,
+        {key: value for key, value in _DEGRADED_SEARCH_REPLY.items() if key not in ("error", "error_type")},
+    ],
+    ids=["documented-shape", "flag-without-error"],
+)
+def test_a_degraded_search_reply_raises_store_degraded_never_no_match(reply) -> None:
+    post = _RecordingPost({"search_tasks": [reply]})
+
+    with pytest.raises(task_store.StoreDegraded) as raised:
+        _store(post).search_tasks(_ROOT, query="q", score_threshold=0.6)
+
+    assert isinstance(raised.value, task_store.StoreUnreachable)
+    assert "search_tasks" in str(raised.value)
+    if "error" in reply:
+        assert "insufficient_quota" in str(raised.value)
 
 
 def test_a_raising_post_becomes_store_unreachable_chaining_the_original() -> None:
