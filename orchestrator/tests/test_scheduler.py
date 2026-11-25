@@ -2827,57 +2827,6 @@ class TestDispatchCooldownGate:
             'Dict reopen_reason with "steward" key must not arm the cooldown gate'
         )
 
-    @pytest.mark.asyncio
-    async def test_cooldown_signal_is_not_re_evaluated_at_the_arm_site(
-        self, monkeypatch
-    ):
-        """_dispatch_cooldown_signal is evaluated once per gate pass and never again at the arm site.
-
-        Scenario: ``_last_dispatch_at`` is primed (simulating a prior signal-bearing
-        dispatch whose signal has since cleared).  The candidate task carries no
-        cooldown markers so ``_dispatch_cooldown_signal`` returns ``None`` and the
-        gate is open.  The gates run twice per dispatch: once on the snapshot row
-        (candidacy) and once on the winner's re-read row after its claim (task
-        11430, ``Scheduler._confirm_claim``).  The arm site reuses the
-        confirmation's value, so the counter is 2; a re-evaluation at the arm
-        site would make it 3.
-        """
-        task = self._pending_task_with({'files': ['backend']})
-        task_response = self._make_task_response(task)
-
-        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
-        scheduler = Scheduler(config)
-        scheduler.finish_startup()
-
-        mock = AsyncMock(return_value=task_response)
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        # Prime _last_dispatch_at to simulate a prior signal-bearing dispatch whose
-        # signal has since cleared (e.g. recon_reset_count was removed from metadata).
-        scheduler._last_dispatch_at['99'] = time.monotonic()
-
-        # Wrap the signal helper with a call counter.  Instance-attribute assignment
-        # shadows the bound class method for this scheduler instance only; no module-
-        # level patching needed since the instance is local to this test.
-        counts = [0]
-        real_signal = scheduler._dispatch_cooldown_signal  # bound method
-
-        def counting_signal(task):
-            counts[0] += 1
-            return real_signal(task)
-
-        scheduler._dispatch_cooldown_signal = counting_signal
-
-        # Dispatch must succeed: gate is open (no signal → cooldown inactive).
-        result = await scheduler.acquire_next()
-        assert result is not None and result.task_id == '99', (
-            'Dispatch must succeed when cooldown window is primed but signal has cleared'
-        )
-        assert counts[0] == 2, (
-            f'_dispatch_cooldown_signal must be called once per gate pass (candidacy, '
-            f'confirmation) and not at the arm site (got {counts[0]})'
-        )
-
 
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.

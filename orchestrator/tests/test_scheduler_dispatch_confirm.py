@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,9 +22,11 @@ from _park_test_helpers import make_task
 from shared.task_read import TaskAbsent, TaskFound, TaskRead, TaskReadFailed
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.overrides import OverrideStore
 from orchestrator.scheduler import Scheduler
+from orchestrator.starvation_state import StarvationStateStore
 
 pytestmark = [
     pytest.mark.real_dispatch_row_refresh,
@@ -83,6 +85,8 @@ class _Board:
 class _Rig:
     scheduler: Scheduler
     store: EventStore
+    watchdog_db: Path
+    project_root: str
 
 
 def _rig(tmp_path: Path, *, pinned: tuple[str, ...] = ()) -> _Rig:
@@ -91,15 +95,26 @@ def _rig(tmp_path: Path, *, pinned: tuple[str, ...] = ()) -> _Rig:
     for task_id in pinned:
         overrides.set_override(str(config.project_root), task_id, pinned=True)
     store = EventStore(tmp_path / 'runs.db', 'run-1')
+    watchdog_db = tmp_path / 'scheduler_eligibility.db'
     scheduler = Scheduler(
         config,
         store,
         override_store=overrides,
         state_snapshot_path=tmp_path / 'scheduler_state.json',
         branch_work_reader=dict,
+        eligibility_clock_store=EligibilityClockStore(watchdog_db),
     )
     scheduler.finish_startup()
-    return _Rig(scheduler, store)
+    return _Rig(scheduler, store, watchdog_db, str(config.project_root))
+
+
+def _lock_refusals(rig: _Rig) -> Mapping[str, int]:
+    """The starvation watchdog's durable lock_refused counts."""
+    return StarvationStateStore(rig.watchdog_db).load(rig.project_root).refusals
+
+
+def _reads(board: _Board, task_id: str) -> int:
+    return sum(1 for call in board.read_task.await_args_list if call.args[0] == task_id)
 
 
 def _with(task: dict, **fields: object) -> dict:
@@ -227,13 +242,14 @@ async def test_an_unreadable_store_stops_dispatch_for_the_tick(tmp_path):
 
 async def test_a_pin_the_store_has_blocked_yields_to_an_unpinned_candidate(tmp_path):
     rig = _rig(tmp_path, pinned=('P',))
-    _Board(rig.scheduler, snapshot=[P, C], rows=[_with(P, status='blocked'), C])
+    board = _Board(rig.scheduler, snapshot=[P, C], rows=[_with(P, status='blocked'), C])
 
     result = await rig.scheduler.acquire_next()
 
     assert result is not None and result.task_id == 'C'
     assert _unclaimed(rig, 'P')
     assert not _skipped(rig, 'P')
+    assert _reads(board, 'P') == 1, 'a pin dropped at confirmation is not re-read by the scored phase'
 
 
 async def test_a_pin_on_an_unreadable_store_stops_dispatch_for_the_tick(tmp_path):
@@ -349,10 +365,74 @@ async def test_a_pin_started_while_an_earlier_pin_was_confirming_is_not_lock_blo
 
     a, b = await _race(rig, board)
 
-    assert b == 'P2'
-    assert a != 'P2'
+    assert (b, a) == ('P2', None)
+    assert (_reads(board, 'P1'), _reads(board, 'P2')) == (1, 1)
     assert _acquired(rig, 'P2') == 1
     snapshot = rig.scheduler.get_state_snapshot()
     assert 'P2' not in snapshot.parks
     assert 'P2' not in snapshot.pin_reservations
     assert all(event['task_id'] != 'P2' for event in rig.store.fetch_events_by_type(EventType.pin_blocked))
+
+
+async def test_a_candidate_started_below_the_confirming_winner_is_neither_claimed_nor_counted_refused(tmp_path):
+    rig = _rig(tmp_path)
+    confirming, below, last = (
+        make_task('T', 'high', ['m1.py']),
+        make_task('Y', 'medium', ['m2.py']),
+        make_task('Z', 'low', ['m3.py']),
+    )
+    board = _Board(rig.scheduler, snapshot=[confirming, below, last], rows=[_with(confirming, status='blocked'), below, last])
+
+    a, b = await _race(rig, board)
+
+    assert (b, a) == ('Y', 'Z')
+    assert _acquired(rig, 'Y') == 1
+    assert 'Y' not in _lock_refusals(rig)
+    _assert_not_passed_over(rig, 'Y')
+
+
+async def test_a_confirmation_cancelled_mid_read_leaves_no_claim(tmp_path):
+    rig = _rig(tmp_path)
+    board = _Board(rig.scheduler, snapshot=[A], rows=[A])
+    entered, _release = board.hold_next_read()
+    pass_a = asyncio.create_task(rig.scheduler.acquire_next())
+    await wait_responsive(entered.wait(), label="pass A reaches its winner's confirmation read")
+
+    pass_a.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pass_a
+
+    assert _unclaimed(rig, 'A')
+    result = await rig.scheduler.acquire_next()
+    assert result is not None and result.task_id == 'A'
+
+
+def _cooldown_signalled(task: dict) -> dict:
+    return _with(task, metadata={**task['metadata'], 'recon_reset_count': 2})
+
+
+async def _redispatched_after_release(rig: _Rig, board: _Board, task_id: str) -> bool:
+    rig.scheduler.release(task_id)
+    board.snapshot = [copy.deepcopy(board.rows[task_id])]
+    again = await rig.scheduler.acquire_next()
+    return again is not None and again.task_id == task_id
+
+
+async def test_a_cooldown_signal_the_store_s_row_gained_arms_the_cooldown(tmp_path):
+    rig = _rig(tmp_path)
+    board = _Board(rig.scheduler, snapshot=[A], rows=[_cooldown_signalled(A)])
+
+    result = await rig.scheduler.acquire_next()
+
+    assert result is not None and result.task_id == 'A'
+    assert not await _redispatched_after_release(rig, board, 'A')
+
+
+async def test_a_cooldown_signal_the_store_s_row_dropped_does_not_arm_the_cooldown(tmp_path):
+    rig = _rig(tmp_path)
+    board = _Board(rig.scheduler, snapshot=[_cooldown_signalled(A)], rows=[A])
+
+    result = await rig.scheduler.acquire_next()
+
+    assert result is not None and result.task_id == 'A'
+    assert await _redispatched_after_release(rig, board, 'A')
