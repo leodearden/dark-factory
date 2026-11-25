@@ -48,9 +48,11 @@ Detection: the exit code is insufficient. The arm reads
 `mimo session list --format json` (cwd = the worktree) and then
 `mimo export <id>` under the same `MIMOCODE_HOME`. That recovered the lost
 run's usage, the 401 as `info.error`, and 33 completed steps after a
-wall-clock kill. The steps the store holds after a kill are the run's
-`AgentResult.transcript_turns`, so a productive wall-clock kill classifies as
-timed-out-with-progress.
+wall-clock kill. The run's `AgentResult.transcript_turns` counts the stored
+assistant steps that recorded token usage, so a productive wall-clock kill
+classifies as timed-out-with-progress. A stored step without usage is a
+request the endpoint never answered and counts no turn, so a run killed
+holding only such steps stays a no-progress timeout.
 
 Usage is summed over every exported session. The run's outcome and output
 come from its root session's last assistant step. The root is the session
