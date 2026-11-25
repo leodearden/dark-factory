@@ -23,11 +23,13 @@ from git_listing import git
 from quality_snapshot_fixtures import BASE_FILES, committed_repo, run_snapshot
 from quality_snapshot_identity import below_run_id_and_cost
 from rust_snapshot_fixtures import (
+    CARGO_PRINTS_ENV,
     FIXTURE_RULES_TOML,
     MOVES_HEAD_ENV,
     RUST_CYCLE_FILES,
     RUST_LAYERING_FILES,
     RUST_WORKSPACE_FILES,
+    TOKEI_PRINTS_ENV,
     rust_workspace_repo,
     tool_shims,
     write_fixture_rules,
@@ -317,6 +319,42 @@ class TestTheRefusals:
         refusal = capsys.readouterr().err
         assert started_at in refusal
         assert found_at in refusal
+        assert not out.exists()
+
+    @pytest.mark.parametrize(
+        ('env', 'printed', 'named'),
+        [
+            pytest.param(TOKEI_PRINTS_ENV, 'not json', ('`tokei -f -o json .`', 'no JSON'), id='tokei-not-json'),
+            pytest.param(
+                TOKEI_PRINTS_ENV,
+                '{"Rust": {"reports": [{"name": "./x.rs"}]}}',
+                ('`tokei -f -o json .`', "'stats'"),
+                id='tokei-report-without-stats',
+            ),
+            pytest.param(
+                CARGO_PRINTS_ENV,
+                '{"crates": []}',
+                ('`cargo metadata --no-deps --format-version 1`', "'packages'"),
+                id='cargo-without-packages',
+            ),
+        ],
+    )
+    def test_tool_output_of_another_shape_is_refused_naming_the_command_and_what_it_lacked(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        fixture_rules: Path,
+        env: str,
+        printed: str,
+        named: tuple[str, str],
+    ) -> None:
+        repo = rust_workspace_repo(tmp_path)
+        monkeypatch.setenv(env, printed)
+        out = tmp_path / 'out' / 'snapshot.json'
+        assert _measure(fixture_rules, repo, out) == 2
+        refusal = capsys.readouterr().err
+        assert [fragment for fragment in named if fragment not in refusal] == []
         assert not out.exists()
 
     def test_a_dirty_tracked_file_is_refused_by_name_and_nothing_is_written(

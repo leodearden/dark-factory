@@ -41,6 +41,12 @@ def write_fixture_rules(path: Path) -> Path:
 #: Set to '1' in the environment, the tokei shim commits in its cwd before counting: a merge landing mid-measurement.
 MOVES_HEAD_ENV = 'FAKE_TOKEI_MOVES_HEAD'
 
+#: Set in the environment, tokei prints its value verbatim in place of its JSON report.
+TOKEI_PRINTS_ENV = 'FAKE_TOKEI_PRINTS'
+
+#: Set in the environment, cargo prints its value verbatim in place of its JSON metadata.
+CARGO_PRINTS_ENV = 'FAKE_CARGO_PRINTS'
+
 _TOKEI_SHIM = '''
 import json
 import os
@@ -75,13 +81,14 @@ elif args == ['-f', '-o', 'json', '.']:
              'commit', '--allow-empty', '--no-verify', '-q', '-m', 'moved'],
             check=True,
         )
-    print(json.dumps(_report()))
+    print(os.environ.get(PRINTS_ENV, json.dumps(_report())))
 else:
     sys.exit(f'tokei shim: unexpected argv {args}')
 '''
 
 _CARGO_SHIM = '''
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -91,7 +98,7 @@ if args == ['metadata', '--no-deps', '--format-version', '1']:
         {'name': manifest.parent.name, 'manifest_path': str(manifest.resolve())}
         for manifest in sorted(Path('.').glob('crates/*/Cargo.toml'))
     ]
-    print(json.dumps({'packages': packages}))
+    print(os.environ.get(PRINTS_ENV, json.dumps({'packages': packages})))
 else:
     sys.exit(f'cargo shim: unexpected argv {args}')
 '''
@@ -107,11 +114,16 @@ def tool_shims(bin_dir: Path, *, tokei_version: str = '15.0.0') -> Path:
 
     tokei counts every ``.rs`` file under its cwd (``//`` lines as comments), first
     committing there when ``MOVES_HEAD_ENV`` is '1'; cargo lists one package per
-    ``crates/<name>/Cargo.toml`` under its cwd.
+    ``crates/<name>/Cargo.toml`` under its cwd. Each prints ``TOKEI_PRINTS_ENV`` or
+    ``CARGO_PRINTS_ENV`` instead, when that is set.
     """
     bin_dir.mkdir(parents=True, exist_ok=True)
-    _write_shim(bin_dir / 'tokei', f'VERSION = {tokei_version!r}\nMOVES_HEAD_ENV = {MOVES_HEAD_ENV!r}\n{_TOKEI_SHIM}')
-    _write_shim(bin_dir / 'cargo', _CARGO_SHIM)
+    _write_shim(
+        bin_dir / 'tokei',
+        f'VERSION = {tokei_version!r}\nMOVES_HEAD_ENV = {MOVES_HEAD_ENV!r}\n'
+        f'PRINTS_ENV = {TOKEI_PRINTS_ENV!r}\n{_TOKEI_SHIM}',
+    )
+    _write_shim(bin_dir / 'cargo', f'PRINTS_ENV = {CARGO_PRINTS_ENV!r}\n{_CARGO_SHIM}')
     return bin_dir
 
 

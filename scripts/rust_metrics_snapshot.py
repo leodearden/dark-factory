@@ -65,10 +65,10 @@ import sys
 import time
 import tomllib
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeVar
 
 import _checkout as _checkout
 import source_measures
@@ -500,12 +500,31 @@ def _domain(root: Path, rules: RustRules) -> _Domain:
     )
 
 
+_Shape = TypeVar('_Shape')
+
+
+def _tool_json(command: Sequence[str], root: Path, read: Callable[[Any], _Shape]) -> _Shape:
+    """*command*'s stdout in *root* as JSON, taken apart by *read*; else a MetricsError naming the command and what it lacked."""
+    printed = _run(command, root).stdout
+    try:
+        return read(json.loads(printed))
+    except json.JSONDecodeError as exc:
+        raise source_measures.MetricsError(f'`{shlex.join(command)}` in {root} printed no JSON: {exc}') from exc
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise source_measures.MetricsError(
+            f'`{shlex.join(command)}` in {root} printed JSON of another shape: {exc.__class__.__name__}: {exc}'
+        ) from exc
+
+
 def _cargo_modules(root: Path, domain: Sequence[str]) -> RustModules:
-    meta = json.loads(_run(['cargo', 'metadata', '--no-deps', '--format-version', '1'], root).stdout)
-    members = {}
-    for pkg in meta['packages']:
-        d = os.path.relpath(os.path.dirname(pkg['manifest_path']), root)
-        members[pkg['name'].replace('-', '_')] = d
+    members = _tool_json(
+        ['cargo', 'metadata', '--no-deps', '--format-version', '1'],
+        root,
+        lambda meta: {
+            pkg['name'].replace('-', '_'): os.path.relpath(os.path.dirname(pkg['manifest_path']), root)
+            for pkg in meta['packages']
+        },
+    )
     rm = RustModules(members)
     # Register every module before resolving any `use`: resolution matches the longest registered
     # prefix, so a single pass would drop every import of a file that sorts later.
@@ -520,7 +539,10 @@ _TokeiStats = tuple[int, int, int, str]
 
 def _tokei_stats(root: Path) -> dict[str, _TokeiStats]:
     """Per file: (code, comments, blanks, language), embedded blobs folded in."""
-    tok = json.loads(_run(['tokei', '-f', '-o', 'json', '.'], root).stdout)
+    return _tool_json(['tokei', '-f', '-o', 'json', '.'], root, _tokei_report)
+
+
+def _tokei_report(tok: Any) -> dict[str, _TokeiStats]:
     tstats = {}
     for lang, blob in tok.items():
         if lang == 'Total':
