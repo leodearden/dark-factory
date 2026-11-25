@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -432,10 +434,11 @@ _SWEEP_STALL_TIMEOUT_SECS = 15
 def _run_sweep_while_progressing(
     bin_dir, state_path, fleet_dir, trace_path, *extra_args, env,
     stall_timeout=_SWEEP_STALL_TIMEOUT_SECS,
+    stall_clock: Callable[[int], Callable[[], float]] = OwnTimeClock,
 ):
     """`_run_script`, stopped as stalled once `_sweep_progress` has not
-    changed for *stall_timeout* seconds of the script's own time, however long
-    the whole sweep takes.
+    changed for *stall_timeout* seconds counted on *stall_clock*, by default
+    the script's own time, however long the whole sweep takes.
 
     On a stall the TimeoutExpired carries the last progress, the ledger and
     the partial output as notes.
@@ -447,7 +450,7 @@ def _run_sweep_while_progressing(
     try:
         return run_in_new_session_while_progressing(
             cmd, progress=lambda: _sweep_progress(state_path, trace_path),
-            stall_timeout=stall_timeout, stall_clock=OwnTimeClock, env=full_env,
+            stall_timeout=stall_timeout, stall_clock=stall_clock, env=full_env,
         )
     except subprocess.TimeoutExpired as exc:
         exc.add_note(f"last progress={_sweep_progress(state_path, trace_path)!r}")
@@ -455,6 +458,25 @@ def _run_sweep_while_progressing(
         exc.add_note(f"stdout={_decode(exc.stdout)!r}")
         exc.add_note(f"stderr={_decode(exc.stderr)!r}")
         raise
+
+
+class _OwnTimeSinceFirstPoll:
+    """The sweep's own time since its gate's first complete poll, 0 until then,
+    so a stall pin measures only the re-polling it pins, never the interpreter
+    starts before that poll."""
+
+    def __init__(self, pid: int, *, trace_path: Path) -> None:
+        self._own_time = OwnTimeClock(pid)
+        self._trace_path = trace_path
+        self._armed_at: float | None = None
+
+    def __call__(self) -> float:
+        now = self._own_time()
+        if self._armed_at is None:
+            if not read_drain_poll_trace(self._trace_path, complete_only=True):
+                return 0.0
+            self._armed_at = now
+        return now - self._armed_at
 
 
 def _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env):
@@ -2509,7 +2531,7 @@ def _assert_a_repolling_sweep_is_reported_as_stalled(tmp_path, *, spawn_latency_
             UNIT_SELF: _hb_drain([]),
         },
     )
-    env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "20"
+    env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "60"
     if spawn_latency_secs is not None:
         _install_spawn_latency(bin_dir, spawn_latency_secs)
 
@@ -2517,6 +2539,7 @@ def _assert_a_repolling_sweep_is_reported_as_stalled(tmp_path, *, spawn_latency_
         _run_sweep_while_progressing(
             bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env,
             stall_timeout=_STALL_PIN_TIMEOUT_SECS,
+            stall_clock=functools.partial(_OwnTimeSinceFirstPoll, trace_path=trace_path),
         )
 
     polls = read_drain_poll_trace(trace_path)
@@ -2525,8 +2548,8 @@ def _assert_a_repolling_sweep_is_reported_as_stalled(tmp_path, *, spawn_latency_
     ]
     assert exc_info.value.timeout == _STALL_PIN_TIMEOUT_SECS
     assert polls, (
-        "the stall fired before the gate's first poll, so this run never reached the "
-        "repolling it pins: the stretch before that poll outlasted stall_timeout"
+        "an empty ledger means the stall fired before the gate's first poll, so this run "
+        "never reached the repolling it pins; _OwnTimeSinceFirstPoll exists to rule that out"
     )
     assert all(p == ("verifying", UNIT_R) for p in polls), polls
     assert not [call for call in calls if call[:1] == ["restart"]], calls
