@@ -497,9 +497,31 @@ class TestSkipParity:
         assert outcome.primary.passed is True
         assert outcome.ok is False
         block = record_of(repo, outcome)['skip_parity']
+        assert block['runner'] == 'box'
         assert block['skipped_only_on_runner'] == ['t::a']
         assert block['skipped_only_on_reference'] == ['t::c']
         assert block['holds'] is False
+
+    async def test_the_reference_record_names_both_runners_in_its_parity_block(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        box = self.skipping(clock, 'box', ['t::a', 't::b'])
+        ref = self.skipping(clock, 'ref', ['t::b', 't::c'])
+
+        outcome = await self.run_pair(self.pair_config(repo), box, ref, clock)
+
+        sha = rev_parse(repo, 'main')
+        box_record = json.loads(record_path_for(repo, sha, 'box').read_text())
+        ref_record = json.loads(record_path_for(repo, sha, 'ref').read_text())
+        assert box_record['runner'] == 'box'
+        assert box_record['skip_parity']['runner'] == 'box'
+        assert box_record['skip_parity']['reference'] == 'ref'
+        assert box_record['skip_parity']['skipped_only_on_runner'] == ['t::a']
+        assert box_record['skip_parity']['skipped_only_on_reference'] == ['t::c']
+        assert ref_record['runner'] == 'ref'
+        assert ref_record['skip_parity'] == box_record['skip_parity']
+        assert outcome.parity is not None
+        assert outcome.parity.runner == 'box'
 
     async def test_owned_exceptions_explain_a_skip_difference(
         self, repo: Path, clock: FakeClock,
