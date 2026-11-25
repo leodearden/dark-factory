@@ -62,7 +62,6 @@ import asyncio
 import inspect
 import logging
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,6 +74,7 @@ from _offline_lane_drive import await_lane_passes
 from _orch_helpers import (
     MEASURED_SPAWN_LATENCY_SECS,
     VERIFY_CLI_PER_TEST_TIMEOUT,
+    env_resolving_running_interpreter,
     required_timeout_secs,
 )
 from escalation.models import Escalation
@@ -615,7 +615,7 @@ exit 1
 @pytest.fixture
 def pytest_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """The fixture command runs ``pytest`` by name, as a lane command does."""
-    monkeypatch.setenv('PATH', f'{Path(sys.executable).parent}{os.pathsep}{os.environ["PATH"]}')
+    monkeypatch.setenv('PATH', env_resolving_running_interpreter(os.environ)['PATH'])
 
 
 async def _commit_files(repo: Path, files: dict[str, str]) -> None:
