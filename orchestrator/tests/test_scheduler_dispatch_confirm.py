@@ -89,7 +89,12 @@ class _Rig:
     project_root: str
 
 
-def _rig(tmp_path: Path, *, pinned: tuple[str, ...] = ()) -> _Rig:
+def _rig(
+    tmp_path: Path,
+    *,
+    pinned: tuple[str, ...] = (),
+    time_source: Callable[[], float] | None = None,
+) -> _Rig:
     config = OrchestratorConfig(max_per_module=1)
     overrides = OverrideStore(tmp_path / 'scheduler_overrides.db')
     for task_id in pinned:
@@ -103,6 +108,7 @@ def _rig(tmp_path: Path, *, pinned: tuple[str, ...] = ()) -> _Rig:
         state_snapshot_path=tmp_path / 'scheduler_state.json',
         branch_work_reader=dict,
         eligibility_clock_store=EligibilityClockStore(watchdog_db),
+        time_source=time_source,
     )
     scheduler.finish_startup()
     return _Rig(scheduler, store, watchdog_db, str(config.project_root))
@@ -418,8 +424,12 @@ async def _redispatched_after_release(rig: _Rig, board: _Board, task_id: str) ->
     return again is not None and again.task_id == task_id
 
 
+def _frozen_clock() -> float:
+    return 1000.0
+
+
 async def test_a_cooldown_signal_the_store_s_row_gained_arms_the_cooldown(tmp_path):
-    rig = _rig(tmp_path)
+    rig = _rig(tmp_path, time_source=_frozen_clock)
     board = _Board(rig.scheduler, snapshot=[A], rows=[_cooldown_signalled(A)])
 
     result = await rig.scheduler.acquire_next()
@@ -429,10 +439,11 @@ async def test_a_cooldown_signal_the_store_s_row_gained_arms_the_cooldown(tmp_pa
 
 
 async def test_a_cooldown_signal_the_store_s_row_dropped_does_not_arm_the_cooldown(tmp_path):
-    rig = _rig(tmp_path)
+    rig = _rig(tmp_path, time_source=_frozen_clock)
     board = _Board(rig.scheduler, snapshot=[_cooldown_signalled(A)], rows=[A])
 
     result = await rig.scheduler.acquire_next()
 
     assert result is not None and result.task_id == 'A'
+    board.rows['A'] = _cooldown_signalled(A)
     assert await _redispatched_after_release(rig, board, 'A')
