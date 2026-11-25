@@ -361,6 +361,11 @@ def modules(markers: Path) -> list[ModuleConfig]:
 
 
 @pytest.fixture
+def never_modules(markers: Path) -> list[ModuleConfig]:
+    return [cache_module('alpha', markers, verify_cache='never'), cache_module('beta', markers)]
+
+
+@pytest.fixture
 def registry(tmp_path: Path) -> Registry:
     return Registry(tmp_path / 'verify_cache.db')
 
@@ -741,6 +746,10 @@ def _dispatcher_spec(repo: Path, modules: list[ModuleConfig]) -> MergeVerifySpec
     return build_merge_verify_spec(cache_config(repo, _BOTH_ON), modules, None)
 
 
+#: Every unit a never-cache alpha keeps out of the registry: its own legs, and the tree it was part of.
+_NEVER_CACHED = [*sorted(module_units('alpha')), keys.TREE_UNIT_ID]
+
+
 @pytest.mark.usefixtures('seam')
 class TestARemoteMergeGateThroughTheRealRemoteRunner:
     @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
@@ -859,6 +868,28 @@ class TestARemoteMergeGateThroughTheRealRemoteRunner:
         assert reshipped is not None
         assert evicted.key not in {candidate.key for candidate in reshipped.candidates}
         assert units_by_id(result)[_ALPHA].outcome is UnitOutcome.RAN_GREEN
+
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    @pytest.mark.asyncio
+    async def test_a_never_cache_module_is_neither_recorded_nor_replayed_remotely(
+        self, repo, never_modules, registry, store, laptop_checkout, markers,
+    ):
+        pool = _remote_pool(_Laptop(laptop_checkout, VerifyCacheConfig()), repo, registry, store, _BOTH_ON)
+        first = await pool.dispatch(head_of(repo), _dispatcher_spec(repo, never_modules))
+        assert first.passed, first.summary
+        assert await registry.candidates(_NEVER_CACHED, per_unit=16) == ()
+        assert await registry.candidates(sorted(module_units('beta')), per_unit=16)
+        commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        merge_sha = head_of(repo)
+        clear_markers(markers)
+
+        result = await pool.dispatch(merge_sha, _dispatcher_spec(repo, never_modules))
+
+        assert result.passed, result.summary
+        assert outcomes_of(result, module_units('alpha')) == {UnitOutcome.RAN_GREEN}
+        assert module_legs('alpha') <= ran_legs(markers)
+        assert await registry.consumed_for(merge_sha) == ()
+        assert await registry.candidates(_NEVER_CACHED, per_unit=16) == ()
 
 
 class _HeldGreens(Registry):
@@ -1029,3 +1060,40 @@ class TestARemoteTaskVerifyThroughTheRealRemoteRunner:
         assert _ALPHA in str(raised.value) and evicted.key in str(raised.value)
         shipped = _shipped_view(laptop.commands[0])
         assert shipped is not None and evicted.candidate in shipped.candidates
+
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    @pytest.mark.asyncio
+    async def test_a_never_cache_module_is_neither_recorded_nor_replayed_remotely(
+        self, repo, never_modules, registry, store, laptop_checkout, markers,
+    ):
+        runner = _Laptop(laptop_checkout, VerifyCacheConfig()).runner(repo)
+
+        async def verified_at_head() -> tuple[TaskVerifySpec, VerifyResult]:
+            spec = build_task_verify_spec(
+                cache_config(repo, _BOTH_ON), never_modules, _TASK_FILES,
+                force_workspace=False, attempt_id=1, task_id='9123', tip_sha=head_of(repo),
+            )
+            result = await runner.run_task_verify(
+                spec, task_id='9123', archive_root=None, verify_cache=RemoteCache(registry, _BOTH_ON),
+            )
+            assert result.passed, result.summary
+            return spec, result
+
+        spec, first = await verified_at_head()
+        row_id = store.emit(EventType.workflow_verify, task_id='9123', data={'runner': _LAPTOP, **verify_event_fields(first)})
+        assert isinstance(row_id, int)
+        assert first.cache_record is not None
+        outcome = await record_greens(
+            registry, first.cache_record, flake_suppressed=first.flake_suppression is not None,
+            evidence=VerifyEvidenceRef(row_id, store.run_id, spec.tip_sha, first.passed),
+        )
+        recorded = {entry.unit_id for entry in outcome.recorded}
+        assert {'module:beta:lint', 'module:beta:type'} <= recorded
+        assert not recorded & {*_NEVER_CACHED}
+        commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        clear_markers(markers)
+
+        _, second = await verified_at_head()
+
+        assert outcomes_of(second, module_units('alpha')) == {UnitOutcome.RAN_GREEN}
+        assert module_legs('alpha') <= ran_legs(markers)
