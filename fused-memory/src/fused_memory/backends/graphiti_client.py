@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict, TypeVar
 from urllib.parse import urlparse
 
+import httpx
 from falkordb.asyncio import FalkorDB
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
@@ -33,6 +34,7 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
+from openai import AsyncOpenAI
 
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
@@ -202,7 +204,9 @@ def check_openai_responses_api() -> None:
     )
 
 
-def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
+def build_llm_client(
+    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None = None,
+) -> LLMClient | None:
     """Construct the graphiti LLM client from unified config, or None.
 
     Returns None when the configured provider block is absent or carries no
@@ -225,8 +229,11 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
     Every returned client carries an ``AttributingTokenUsageTracker``, installed
     here once rather than per arm, so ``measure_llm_tokens`` can attribute its
     spend on whichever arm is configured.
+
+    ``http_client``, when given, carries every request of an OpenAI-shaped arm
+    (the plan route's gated client, task 9944); the anthropic arm ignores it.
     """
-    llm_client = _construct_llm_client(cfg)
+    llm_client = _construct_llm_client(cfg, http_client=http_client)
     if llm_client is not None:
         llm_client.token_tracker = AttributingTokenUsageTracker()
     return llm_client
@@ -254,7 +261,9 @@ def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
     return embedder
 
 
-def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
+def _construct_llm_client(
+    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None,
+) -> LLMClient | None:
     # LLMConfig rejects this at load; a config mutated afterwards is not re-validated.
     if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
         logger.warning(
@@ -278,6 +287,10 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 max_tokens=cfg.llm.max_tokens,
                 base_url=cfg.llm.providers.openai.api_url,
             )
+            sdk_client = (
+                AsyncOpenAI(api_key=api_key, base_url=llm_config.base_url, http_client=http_client)
+                if http_client is not None else None
+            )
             llm_client: LLMClient
             # max_tokens= below is load-bearing on both arms, not redundant with llm_config: see
             # fused-memory/tests/test_local_endpoint_base_url_integration.py::TestGraphitiLLMPathReachesConfiguredEndpoint::test_configured_max_tokens_reaches_the_wire
@@ -287,12 +300,17 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                     if cfg.llm.structured_output_mode == 'json_object'
                     else TokenRecordingOpenAIGenericClient
                 )
-                llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
+                llm_client = generic_cls(
+                    config=llm_config, client=sdk_client, max_tokens=cfg.llm.max_tokens,
+                )
             else:
                 check_openai_responses_api()
-                llm_client = OpenAIClient(config=llm_config, max_tokens=cfg.llm.max_tokens)
+                llm_client = OpenAIClient(
+                    config=llm_config, client=sdk_client, max_tokens=cfg.llm.max_tokens,
+                )
+            route = ' via the plan route' if http_client is not None else ''
             logger.info(
-                f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}{route} '
                 f'({type(llm_client).__name__}, max_tokens={cfg.llm.max_tokens})'
             )
             return llm_client

@@ -75,6 +75,7 @@ class EscalationCategory(StrEnum):
     OUT_OF_SCOPE = 'out_of_scope'
     PLANNING_STALLED = 'planning_stalled'
     PLAN_DELIVERY_UNMEASURED = 'plan_delivery_unmeasured'
+    PLAN_ROUTE_CAPPED = 'plan_route_capped'
     POST_MERGE_VERIFY = 'post_merge_verify'
     PREEXISTING_MAIN_BREAK = 'preexisting_main_break'
     PROVENANCE_CONFLICT = 'provenance_conflict'

@@ -536,6 +536,27 @@ class RoutingConfig(BaseModel):
         return self
 
 
+# --- Plan route ---
+
+class PlanRouteConfig(BaseModel):
+    """The ChatGPT-plan proxy that every plan-routed call goes through (task 9944)."""
+
+    proxy_url: str | None = Field(
+        default=None,
+        description='Base URL of the plan proxy; a call whose base_url equals it is gated on the cap.',
+    )
+    probe_interval_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        description='Longest wait between probes of a capped plan, however far off its reset is.',
+    )
+
+    @field_validator('proxy_url')
+    @classmethod
+    def _blank_proxy_url_is_unset(cls, value: str | None) -> str | None:
+        return blank_means_inherit(value)
+
+
 # --- Queue ---
 
 class QueueConfig(BaseModel):
@@ -4026,6 +4047,7 @@ class FusedMemoryConfig(BaseSettings):
     graphiti: GraphitiBackendConfig = Field(default_factory=GraphitiBackendConfig)
     mem0: Mem0BackendConfig = Field(default_factory=Mem0BackendConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    plan_route: PlanRouteConfig = Field(default_factory=PlanRouteConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
     # Bare submodel for the same per-leaf-reload reason as write_triage below —
     # here it buys the INVERSE disposition: reload.py descends into it and
