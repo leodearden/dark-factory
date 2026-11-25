@@ -3227,6 +3227,33 @@ class TestWatcherAllowedTools:
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
         )
 
+    def test_git_cat_file_in_allowed_tools(self) -> None:
+        """'Bash(git cat-file:*)' must be in _WATCHER_ALLOWED_TOOLS, and not disallowed.
+
+        skills/escalation-watcher-auto/SKILL.md prescribes git cat-file on the
+        orphan-reaper-amend-folded-step-recurring-df auto-close path three
+        times: `git cat-file -t <stale_commit>` in the investigation step,
+        `git cat-file -e main:<path>` for close condition 2, and
+        `git cat-file -t main:<path>` for the condition-3 blob path-shape
+        precondition (task 4081), which runs once per declared path on every
+        candidate close. The rotation runs under bypassPermissions, so this
+        entry is not what makes the call work today — but a future tightening
+        of the tool policy to an exhaustive allowlist could silently strand
+        the condition-2/condition-3 reads with no test failing. This
+        assertion makes the dependency explicit and enforced.
+        """
+        tool = 'Bash(git cat-file:*)'
+        assert tool in _WATCHER_ALLOWED_TOOLS, (
+            f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the watcher can run '
+            'the condition-2 existence probe and the condition-3 blob '
+            f'path-shape probe (task 4081); current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        assert tool not in _WATCHER_DISALLOWED_TOOLS, (
+            f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
+            'silently strand the condition-2/condition-3 reads (task 4081); '
+            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
     def test_archive_inclusive_read_tool_is_granted(self) -> None:
         """get_task_escalations must be allowed, and not disallowed.
 
