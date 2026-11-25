@@ -90,7 +90,9 @@ def _records(root: Path) -> list[dict]:
 def _resolve(root: Path, escalation_id: str) -> None:
     from escalation.queue import EscalationQueue
 
-    EscalationQueue(escalation_queue_dir(root)).resolve(escalation_id, 'Leo upgraded the plan')
+    EscalationQueue(escalation_queue_dir(root)).resolve(
+        escalation_id, 'Leo upgraded the plan', resolution_class='actionable',
+    )
 
 
 class TestTheFirstCap:
