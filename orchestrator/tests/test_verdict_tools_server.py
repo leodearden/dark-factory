@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from _review_issue_fixtures import contract_issue, contract_issue_without
 from fastmcp import Client, FastMCP
-from shared.defects import IssueKind
+from shared.defects import IssueKind, MalformedDefectRef, RulingSubject, mint_review_ref, parse_ref
 from shared.mcp_markup_middleware import OUTCOMES as MARKUP_OUTCOMES
 
 from orchestrator.agents.roles import ALL_REVIEWERS
@@ -40,6 +40,17 @@ def artifacts(tmp_path):
 _NO_ACTION_NOTE = {
     'escalation_id': 'esc-42-1', 'disposition': 'no_action', 'rationale': 'pure observation',
 }
+
+_RULED_REF = mint_review_ref(7048, 'a.py:1', 'x is wrong')
+_CLOSURE_RULING = {'ref': _RULED_REF, 'subject': 'closure', 'accepted': True}
+
+
+def _parse_ref_message(value: object) -> str:
+    try:
+        parse_ref(value)
+    except MalformedDefectRef as exc:
+        return str(exc)
+    raise AssertionError(f'{value!r} parsed as a defect ref')
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +193,74 @@ class TestSubmitReviewVerdict:
         assert result['status'] == 'error'
         assert named in result['message']
         assert located in result['message']
+
+        assert artifacts.read_verdict('test_analyst') is None
+
+
+    def test_defect_rulings_are_written_into_the_payload(self, artifacts):
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='PASS',
+            issues=[],
+            summary='ok',
+            defect_rulings=[dict(_CLOSURE_RULING)],
+        )
+        assert result == {'status': 'ok', 'role': 'test_analyst'}
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['defect_rulings'] == [_CLOSURE_RULING]
+
+    def test_omitted_defect_rulings_leave_no_key_in_the_payload(self, artifacts):
+        _submit_review_verdict(
+            artifacts, role='test_analyst', session_id='s', reviewer='test_analyst',
+            verdict='PASS', issues=[], summary='ok',
+        )
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert 'defect_rulings' not in envelope['verdict']
+
+    @pytest.mark.parametrize(
+        ('defect_rulings', 'named'),
+        [
+            pytest.param(
+                [{**_CLOSURE_RULING, 'subject': 'closed'}],
+                [repr(subject.value) for subject in RulingSubject],
+                id='unknown-subject',
+            ),
+            pytest.param(
+                [{**_CLOSURE_RULING, 'ref': 'not-a-ref'}],
+                [_parse_ref_message('not-a-ref')],
+                id='malformed-ref',
+            ),
+            pytest.param(
+                [{**_CLOSURE_RULING, 'accepted': 'yes'}],
+                ["'yes'", 'true or false'],
+                id='non-bool-accepted',
+            ),
+            pytest.param(dict(_CLOSURE_RULING), ['expected a list'], id='not-a-list'),
+        ],
+    )
+    def test_malformed_defect_rulings_return_error_and_write_nothing(
+        self, artifacts, defect_rulings, named,
+    ):
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='PASS',
+            issues=[],
+            summary='x',
+            defect_rulings=defect_rulings,
+        )
+        assert result['status'] == 'error'
+        for name in named:
+            assert name in result['message']
 
         assert artifacts.read_verdict('test_analyst') is None
 
@@ -342,6 +421,32 @@ class TestCreateServer:
 
         assert 'note_dispositions' in tool.parameters['properties']
         assert 'note_dispositions' not in tool.parameters['required']
+
+
+    async def test_reviewer_tool_run_writes_defect_rulings(self, artifacts):
+        server = create_server(artifacts, 'test_analyst')
+        tool = await server.get_tool('submit_review_verdict')
+        assert tool is not None
+
+        await tool.run({
+            'reviewer': 'test_analyst',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 's',
+            'defect_rulings': [dict(_CLOSURE_RULING)],
+        })
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['defect_rulings'] == [_CLOSURE_RULING]
+
+    async def test_reviewer_tool_defect_rulings_is_optional(self, artifacts):
+        server = create_server(artifacts, 'test_analyst')
+        tool = await server.get_tool('submit_review_verdict')
+        assert tool is not None
+
+        assert 'defect_rulings' in tool.parameters['properties']
+        assert 'defect_rulings' not in tool.parameters['required']
 
 
 def _journal_lines(root: Path) -> list[dict[str, Any]]:
@@ -515,6 +620,16 @@ class TestSubmitReviewVerdictIssueIntake:
         envelope = artifacts.read_verdict('test_analyst')
         assert envelope is not None
         assert envelope['verdict']['issues'] == issues
+
+    async def test_a_malformed_ruling_with_on_contract_issues_is_refused(self, artifacts):
+        result = await _call_review_tool(
+            artifacts, [contract_issue()],
+            defect_rulings=[{**_CLOSURE_RULING, 'subject': 'closed'}],
+        )
+
+        assert result['status'] == 'error'
+        assert "'closed'" in result['message']
+        assert artifacts.read_verdict('test_analyst') is None
 
     @pytest.mark.parametrize(
         ('overrides', 'named'),

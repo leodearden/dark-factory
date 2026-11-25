@@ -21,6 +21,7 @@ from _review_fixtures import review_aggregation, review_issue
 from _review_payloads import blocking_review, pass_review
 from escalation.disposition import ReviewerDisposition
 from shared import safe_io
+from shared.defects import RulingSubject, mint_review_ref
 
 from orchestrator.artifacts import (
     LANE_SYMLINKED_ARTIFACTS,
@@ -42,7 +43,7 @@ from orchestrator.artifacts import (
     plan_task_text_fp,
 )
 from orchestrator.mcp.verdict_tools import _submit_review_verdict
-from orchestrator.review_payload import NoteDisposition, ReviewPayloadError
+from orchestrator.review_payload import DefectRuling, NoteDisposition, ReviewPayloadError
 
 
 @pytest.fixture
@@ -1597,6 +1598,75 @@ class TestReviewNoteDispositions:
         )
 
         assert aggregation.note_dispositions == ()
+
+
+_CLOSURE_REF = mint_review_ref(7048, 'a.py:1', 'x is wrong')
+_RETIREMENT_REF = mint_review_ref(7048, 'b.py:2', 'y is gone')
+_CLOSURE_RULING = {'ref': _CLOSURE_REF, 'subject': 'closure', 'accepted': True}
+_RETIREMENT_RULING = {'ref': _RETIREMENT_REF, 'subject': 'retirement', 'accepted': False}
+_TYPED_RULINGS = (
+    DefectRuling(_CLOSURE_REF, RulingSubject.CLOSURE, True),
+    DefectRuling(_RETIREMENT_REF, RulingSubject.RETIREMENT, False),
+)
+
+
+class TestReviewDefectRulings:
+    def test_mirrored_review_rulings_reach_the_aggregation_in_order(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+            'defect_rulings': [dict(_CLOSURE_RULING), dict(_RETIREMENT_RULING)],
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == _TYPED_RULINGS
+
+    def test_an_error_review_contributes_no_rulings(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error',
+            'defect_rulings': [dict(_CLOSURE_RULING)],
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == ()
+
+    def test_a_review_without_the_key_gives_none(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == ()
+
+    def test_rulings_survive_the_verdict_tool_to_mirror_round_trip(
+        self, artifacts: TaskArtifacts,
+    ):
+        role = 'reviewer_comprehensive'
+        result = _submit_review_verdict(
+            artifacts, role, 'sid', role, 'PASS', [], 'OK',
+            defect_rulings=[dict(_CLOSURE_RULING), dict(_RETIREMENT_RULING)],
+        )
+        assert result['status'] == 'ok'
+        envelope = artifacts.read_verdict(role)
+        assert envelope is not None
+
+        artifacts.write_review(role, envelope['verdict'])
+
+        assert artifacts.aggregate_reviews().defect_rulings == _TYPED_RULINGS
+
+    def test_a_directly_built_aggregation_carries_no_rulings(self):
+        aggregation = ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={},
+        )
+
+        assert aggregation.defect_rulings == ()
 
 
 class TestBlockingDependency:
