@@ -1027,11 +1027,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7a. Client-feed publisher unit template (rendered, never enabled)
+# 7a. Client-feed publisher and defect-filer unit templates (rendered, never enabled)
 # ---------------------------------------------------------------------------
-info "Installing the client-feed publisher unit template"
+info "Installing the client-feed publisher and defect-filer unit templates"
 
-# One instance per client project is enabled by hand: OPERATIONS.md §"Client feed".
+# One instance of each per client project is enabled by hand: OPERATIONS.md §"Client feed".
 _cf_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
 if python3 "$_cf_render_script" \
      --unit      client-feed \
@@ -1044,6 +1044,18 @@ if python3 "$_cf_render_script" \
 else
   fail "client-feed@.service render FAILED — see the [client_feed_unit_render] report above."
   fail "  Any installed $UNIT_DIR/client-feed@.service was left untouched."
+fi
+if python3 "$_cf_render_script" \
+     --unit      client-feed-filer \
+     --template  "$REPO_ROOT/scripts/client-feed-filer.service.template" \
+     --repo-root "$REPO_ROOT" \
+     --uv-path   "$UV_PATH" \
+     --output    "$UNIT_DIR/client-feed-filer@.service"; then
+  systemctl --user daemon-reload
+  ok "client-feed-filer@.service installed; no instance enabled (one per client project, by hand: OPERATIONS.md §\"Client feed\")"
+else
+  fail "client-feed-filer@.service render FAILED — see the [client_feed_filer_unit_render] report above."
+  fail "  Any installed $UNIT_DIR/client-feed-filer@.service was left untouched."
 fi
 
 # ---------------------------------------------------------------------------
