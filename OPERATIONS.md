@@ -2572,13 +2572,24 @@ a bind change is restart-only in both processes (the orchestrator's
   the next call, allowlisted or not.
 - `mem0_update.content_amend_allowed_agent_prefixes` and
   `mem0_update.metadata_patch_allowed_agent_prefixes` — two independently
-  configurable `agent_id`-prefix allowlists, both shipping as
-  `['recon-stage-', 'curator-']`: `recon-stage-` admits every
+  configurable `agent_id`-prefix allowlists. The content-amend list ships
+  as `['recon-stage-', 'curator-']` and the metadata-patch list as
+  `['recon-stage-', 'curator-', 'link-heal-']`: `recon-stage-` admits every
   reconciliation stage agent, and `curator-` admits the interactive
   memory-consolidation sitting defined by `skills/curate-fused-memories`
   (esc-3524-1 ruling (b), promoted to an all-deployments schema default on
   2026-08-12; it deliberately holds both arms because retain-and-tag
-  stamps retained peers via metadata-only patches). The lists are separate
+  stamps retained peers via metadata-only patches). `link-heal-` admits the
+  link-heal executor's metadata-only heals
+  (`plans/write-triage-link-healing-prd.md` H1) and never content amends.
+  Task 6431 (2026-11-25) moved `link-heal-` out of `config.yaml` into this
+  schema default, so that change takes effect on a fused-memory restart
+  (`scripts/restart-fused-memory.sh`); do not run
+  `mcp__fused-memory__reload_config` between its merge and that restart. A
+  reload in that window rebuilds the old in-memory two-item default, applies
+  it green-tier, and drops `link-heal-` from the live metadata arm until the
+  next restart (fail-closed: link-heal writes are refused with
+  `Mem0UpdateNotAuthorized`). The lists are separate
   because the arms carry different risk: widening
   **`metadata_patch_allowed_agent_prefixes` alone** remains the supported
   way to admit a new interactive tagging flow without granting anyone

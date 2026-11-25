@@ -48,7 +48,7 @@
 | `reloadable-config-registry` | capability→substrate (wired) — fused-memory/src/fused_memory/config/reload.py::RELOADABLE_FIELDS; verified on main 0a9870b604 (2026-10-02) | PASS | — |
 | `hand-link-verdict-corpus` | capability→producer (upstream) — fused-memory/calibration/hand_link_verdicts.jsonl + .summary.json, committed with the PRD (8faca80c27, merge carrier 6180); commit_planning waits for it on main | PASS | — |
 | `link-heal-executor-and-cli` | built by this leaf — maintenance/link_heal.py + scripts/link_heal.py (plan/apply/undo/status) | PASS | path present: `fused-memory/src/fused_memory/maintenance/link_heal.py`, `fused-memory/scripts/link_heal.py` |
-| `link-heal-prefix-admitted` | built by this leaf — an uncommented config.yaml line admits 'link-heal-' beside recon-stage-/curator- | PASS | grep present `^[^#]*link-heal-` in `fused-memory/config/config.yaml` |
+| `link-heal-prefix-admitted` | built by this leaf — 'link-heal-' admitted on the metadata arm beside recon-stage-/curator- (an active config.yaml list until task 6431 moved it into Mem0UpdateConfig's schema default) | PASS | grep present `^[^#]*'curator-', 'link-heal-'` in `fused-memory/config/config.yaml`, `fused-memory/src/fused_memory/config/schema.py` |
 | `link-heal-knobs-reloadable` | built by this leaf — link_heal.* leaves registered in RELOADABLE_FIELDS | PASS | grep present `link_heal\.` in `fused-memory/src/fused_memory/config/reload.py` |
 | `status-names-the-no-producer-state` | built by this leaf — `status` on an empty ledger prints "no link-heal run has written here" | PASS | manual — behavioural; asserted by α's own boundary test and observed live by β |
 
