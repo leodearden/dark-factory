@@ -3448,6 +3448,11 @@ _OVERRIDABLE_FIELDS = frozenset({
 
 ModuleVerifyCache = Literal['default', 'never']
 
+
+def check_module_verify_cache(owner: str, value: object) -> None:
+    if value not in get_args(ModuleVerifyCache):
+        raise ValueError(f'{owner}: verify_cache is {value!r}, expected one of {get_args(ModuleVerifyCache)}')
+
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
     'node_modules', '__pycache__', 'build', 'target', '.gradle',
@@ -3486,11 +3491,7 @@ class ModuleConfig:
     verify_cache: ModuleVerifyCache = 'default'
 
     def __post_init__(self) -> None:
-        if self.verify_cache not in get_args(ModuleVerifyCache):
-            raise ValueError(
-                f'module {self.prefix!r}: verify_cache is {self.verify_cache!r}, '
-                f'expected one of {get_args(ModuleVerifyCache)}',
-            )
+        check_module_verify_cache(f'module {self.prefix!r}', self.verify_cache)
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:

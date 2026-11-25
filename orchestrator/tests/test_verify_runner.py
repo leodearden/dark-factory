@@ -2229,6 +2229,8 @@ class TestBuildMergeVerifySpec:
         # attr is non-None and truthy, so it would flag every mock module.
         mc.scope_cargo = scope_cargo
         mc.verify_env = None
+        # Task 9123: VerifyCommand carries (and checks) the module's verify_cache.
+        mc.verify_cache = 'default'
         return mc
 
     def _make_config(

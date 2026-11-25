@@ -618,7 +618,8 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     """Reconstruct a ModuleConfig from a VerifyCommand + shared MergeVerifySpec fields.
 
     This is the exact inverse of build_merge_verify_spec's projection:
-    - prefix + three command fields come from the VerifyCommand
+    - prefix + three command fields come from the VerifyCommand, and so does the
+      module's verify_cache, so a never-cache module stays never-cache here
     - verify_env and cold_timeout_secs are shared spec-level fields threaded into
       each ModuleConfig's verify_env and verify_cold_command_timeout_secs
 

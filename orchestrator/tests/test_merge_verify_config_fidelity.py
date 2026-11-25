@@ -171,7 +171,9 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
         "Tasks 5653 and 9123: the host's verify-result cache mode never decides the verdict. A "
         "shipped view's mode replaces the host's for the merge role (_spec_field_overrides), and "
         'without a view CacheAccess.on_runner() holds no registry, so every unit is UNAVAILABLE '
-        'and every leg runs. The dispatcher backs every replay the runner reports before it counts.',
+        'and every leg runs. The dispatcher backs every replay the runner reports before it counts. '
+        "A module's verify_cache rides VerifyCommand (task 9123), so a runner never replays or admits "
+        'a never-cache module, and RemoteCache.settle refuses its replays and greens again on the dispatcher.',
     ),
     'defect_tests': Classified(
         Fidelity.MERGE_NEUTRAL,
