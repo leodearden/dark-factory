@@ -34,8 +34,9 @@ from _orch_helpers import pydantic_spec
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import fixed_prompt
 
+import orchestrator.routing
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.agents.roles import IMPLEMENTER
+from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, AgentRole
 from orchestrator.config import OrchestratorConfig, PriceEntry, RoutingRule, RuleMatch, RuleSet
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.routing import PlanShape, RoutingDecision
@@ -116,6 +117,13 @@ def _make_workflow(
     cfg.timeouts.implementer = 1200.0
     cfg.backends.implementer = 'claude'
 
+    cfg.models.architect = 'opus'
+    cfg.budgets.architect = _BUDGET_USD
+    cfg.max_turns.architect = _MAX_TURNS
+    cfg.effort.architect = 'high'
+    cfg.timeouts.architect = 1200.0
+    cfg.backends.architect = 'claude'
+
     cfg.routing.allowed_models = ['haiku', 'sonnet', 'opus']
     cfg.routing.ladder = ['haiku', 'sonnet', 'opus']
     cfg.routing.per_model_daily_ceiling_usd = {}
@@ -155,7 +163,9 @@ def _routing_decision_entries(rec: _RecordingEventStore) -> list[dict]:
     return [entry for (etype, entry) in rec.events if etype == EventType.routing_decision]
 
 
-async def _invoke_implementer(wf: TaskWorkflow, cwd: Path, *, prompt: str = 'x') -> None:
+async def _invoke_role(
+    wf: TaskWorkflow, role: AgentRole, cwd: Path, *, prompt: str = 'x',
+) -> None:
     with (
         patch(
             'orchestrator.workflow.invoke_with_cap_retry',
@@ -163,7 +173,11 @@ async def _invoke_implementer(wf: TaskWorkflow, cwd: Path, *, prompt: str = 'x')
         ),
         patch.object(wf, '_build_agent_env', return_value=None),
     ):
-        await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt(prompt), cwd=cwd)
+        await wf._invoke(role, build_prompt=fixed_prompt(prompt), cwd=cwd)
+
+
+async def _invoke_implementer(wf: TaskWorkflow, cwd: Path, *, prompt: str = 'x') -> None:
+    await _invoke_role(wf, IMPLEMENTER, cwd, prompt=prompt)
 
 
 @pytest.mark.asyncio
@@ -567,6 +581,63 @@ class TestRoutingDecisionCarriesWorkflowPhase:
         assert len(ends) == 1, ends
         assert decisions[0]['phase'] == state.value
         assert decisions[0]['phase'] == ends[0]['phase']
+
+
+@pytest.mark.asyncio
+class TestInvokeRecordsPlanShape:
+    """The routing_decision event and the metadata.routing mirror carry the
+    plan shape the resolver saw: step and module counts, null before a plan
+    exists."""
+
+    async def test_implementer_with_a_plan_records_its_shape(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        wf.plan = {'steps': [{}] * 5}
+        wf.modules = ['a', 'b', 'c']
+
+        await _invoke_implementer(wf, tmp_path)
+
+        (entry,) = _routing_decision_entries(rec)
+        assert (entry['data']['plan_steps'], entry['data']['plan_modules']) == (5, 3)
+        payload = cast(AsyncMock, wf.scheduler.update_task).call_args.args[1]
+        latest = payload['routing']['latest']
+        assert (latest['plan_steps'], latest['plan_modules']) == (5, 3)
+        in_memory = wf.task['metadata']['routing']['latest']
+        assert (in_memory['plan_steps'], in_memory['plan_modules']) == (5, 3)
+
+    async def test_architect_before_a_plan_records_nulls(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+
+        await _invoke_role(wf, ARCHITECT, tmp_path)
+
+        (entry,) = _routing_decision_entries(rec)
+        data = entry['data']
+        assert 'plan_steps' in data and 'plan_modules' in data
+        assert data['plan_steps'] is None
+        assert data['plan_modules'] is None
+
+    async def test_recorded_shape_is_the_one_the_resolver_saw(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        wf.plan = {'steps': [{}] * 7}
+        wf.modules = ['a', 'b']
+        real_resolve_route = orchestrator.routing.resolve_route
+        seen_shapes: list[PlanShape | None] = []
+
+        def _spy(route_inputs, config):
+            seen_shapes.append(route_inputs.plan_shape)
+            return real_resolve_route(route_inputs, config)
+
+        with patch('orchestrator.workflow.resolve_route', side_effect=_spy):
+            await _invoke_implementer(wf, tmp_path)
+
+        (shape,) = seen_shapes
+        assert shape is not None
+        (entry,) = _routing_decision_entries(rec)
+        assert (entry['data']['plan_steps'], entry['data']['plan_modules']) == (
+            shape.step_count, len(shape.module_paths),
+        )
 
 
 class TestSelectModelForRoleRetired:
