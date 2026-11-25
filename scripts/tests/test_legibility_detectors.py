@@ -1173,4 +1173,4 @@ def test_an_interactive_digest_has_user_turns_and_an_unattended_one_none(
 ):
     front = coder.parse_frontmatter(digest.build_digest(_write_session(tmp_path, encoded, records).path))
 
-    _assert_the_class_and_the_user_turns_agree(expected, front['n_user_turns'])
+    _assert_the_class_and_the_user_turns_agree(front['agent_class'], front['n_user_turns'])
