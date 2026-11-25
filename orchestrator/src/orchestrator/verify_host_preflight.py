@@ -8,11 +8,12 @@ its record file is its only output.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import subprocess
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -23,6 +24,7 @@ from shared.governed_exceptions import (
     TaskRef,
     TicketRef,
     owner_from_record,
+    owner_record,
 )
 from shared.safe_io import atomic_write_text
 
@@ -250,17 +252,92 @@ class RunnerVerdict:
             'skipped_test_ids': _listed(self.skipped_test_ids),
         }
 
+    @property
+    def comparable_skips(self) -> frozenset[str] | None:
+        """The skipped ids a parity check may compare; None when a no-verdict or no junit licenses no comparison."""
+        if self.no_verdict is not None or self.skipped_test_ids is None:
+            return None
+        return frozenset(self.skipped_test_ids)
+
+
+@dataclass(frozen=True)
+class SkipParity:
+    """How a runner's skipped junit ids differ from its reference's on the same commit."""
+
+    reference: str
+    skipped_only_on_runner: tuple[str, ...]
+    skipped_only_on_reference: tuple[str, ...]
+    excepted: tuple[SkipParityException, ...]
+    undetermined: str | None
+
+    @property
+    def unexplained(self) -> tuple[str, ...]:
+        """The differing ids no owned exception covers."""
+        covered = {exception.test_id for exception in self.excepted}
+        differing = {*self.skipped_only_on_runner, *self.skipped_only_on_reference}
+        return tuple(sorted(differing - covered))
+
+    @property
+    def holds(self) -> bool:
+        return self.undetermined is None and not self.unexplained
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            'reference': self.reference,
+            'skipped_only_on_runner': list(self.skipped_only_on_runner),
+            'skipped_only_on_reference': list(self.skipped_only_on_reference),
+            'excepted': [
+                {'test_id': e.test_id, 'owner': owner_record(e.owner), 'reason': e.reason}
+                for e in self.excepted
+            ],
+            'unexplained': list(self.unexplained),
+            'undetermined': self.undetermined,
+            'holds': self.holds,
+        }
+
+
+def compare_skips(
+    runner: RunnerVerdict, reference: RunnerVerdict, exceptions: Sequence[SkipParityException],
+) -> SkipParity:
+    """The skip parity of *runner* against *reference*, failing closed when either vector is missing."""
+    ours, theirs = runner.comparable_skips, reference.comparable_skips
+    if ours is None or theirs is None:
+        return SkipParity(
+            reference=reference.runner, skipped_only_on_runner=(), skipped_only_on_reference=(),
+            excepted=(), undetermined=_incomparable(runner, reference),
+        )
+    differing = ours ^ theirs
+    return SkipParity(
+        reference=reference.runner,
+        skipped_only_on_runner=tuple(sorted(ours - theirs)),
+        skipped_only_on_reference=tuple(sorted(theirs - ours)),
+        excepted=tuple(e for e in exceptions if e.test_id in differing),
+        undetermined=None,
+    )
+
+
+def _incomparable(*verdicts: RunnerVerdict) -> str:
+    return '; '.join(
+        f'{v.runner} produced no verdict ({v.no_verdict.kind})' if v.no_verdict is not None
+        else f'{v.runner} collected no junit skip vector'
+        for v in verdicts
+        if v.comparable_skips is None
+    )
+
 
 @dataclass(frozen=True)
 class PreflightOutcome:
-    """Every verdict one preflight produced, and the record files it wrote."""
+    """Every verdict one preflight produced, its skip parity, and the record files it wrote."""
 
     primary: RunnerVerdict
+    reference: RunnerVerdict | None
+    parity: SkipParity | None
     record_paths: tuple[Path, ...]
 
     @property
     def ok(self) -> bool:
-        return self.primary.passed
+        """The runner passed and, against a reference, skip parity holds."""
+        return self.primary.passed and (self.parity is None or self.parity.holds)
 
 
 def _listed(ids: tuple[str, ...] | None) -> list[str] | None:
@@ -355,19 +432,39 @@ async def run_preflight(
 ) -> PreflightOutcome:
     """Verify one commit (default: the main tip) at full breadth on *runner*, and record the verdict.
 
-    Every PreflightRefused is raised before any runner is built or awaited.
+    With *reference*, the same commit is verified on that runner concurrently
+    and the two skip vectors are compared under the project's owned
+    exceptions.  Every PreflightRefused, and a malformed exceptions file's
+    SkipParityExceptionsError, is raised before any runner is built or awaited.
     """
     refuse_persistent_merge_worktree(config)
-    primary_config, _reference_config = preflight_targets(config, runner, reference)
-    dispatch = _Dispatch(
-        sha=resolve_commit(config.project_root, sha or config.git.main_branch),
-        spec=full_gate_spec(config),
-        archive_root=_archive_root(config),
-        gate=deployed_sha,
-        clock=clock,
+    primary_config, reference_config = preflight_targets(config, runner, reference)
+    commit = resolve_commit(config.project_root, sha or config.git.main_branch)
+    exceptions = (
+        () if reference_config is None
+        else load_skip_parity_exceptions(config.project_root / SKIP_PARITY_EXCEPTIONS_RELPATH)
     )
-    primary = await dispatch.on(primary_config.name, build_runner(primary_config))
-    return PreflightOutcome(primary=primary, record_paths=(_write_record(config, primary),))
+    dispatch = _Dispatch(
+        sha=commit, spec=full_gate_spec(config), archive_root=_archive_root(config),
+        gate=deployed_sha, clock=clock,
+    )
+    targets = [t for t in (primary_config, reference_config) if t is not None]
+    primary, *others = await _verify_all(dispatch, targets, build_runner)
+    reference_verdict = others[0] if others else None
+    parity = None if reference_verdict is None else compare_skips(primary, reference_verdict, exceptions)
+    return PreflightOutcome(
+        primary=primary, reference=reference_verdict, parity=parity,
+        record_paths=tuple(_write_record(config, v, parity) for v in (primary, *others)),
+    )
+
+
+async def _verify_all(
+    dispatch: _Dispatch, targets: Sequence[VerifyRunnerConfig], build_runner: BuildRunner,
+) -> list[RunnerVerdict]:
+    runners = [(target.name, build_runner(target)) for target in targets]
+    async with asyncio.TaskGroup() as group:
+        tasks = [group.create_task(dispatch.on(name, runner)) for name, runner in runners]
+    return [task.result() for task in tasks]
 
 
 def production_runner_builder(config: OrchestratorConfig, deployed_sha: DeployedSha) -> BuildRunner:
@@ -386,7 +483,12 @@ def record_path(config: OrchestratorConfig, runner: str, sha: str) -> Path:
     return _archive_root(config) / PREFLIGHT_ARCHIVE_KEY / f'{runner}-{sha}.json'
 
 
-def _write_record(config: OrchestratorConfig, verdict: RunnerVerdict) -> Path:
+def record_dict(verdict: RunnerVerdict, parity: SkipParity | None) -> dict[str, object]:
+    """The JSON record of *verdict*, carrying the preflight's skip parity (None without a reference)."""
+    return {**verdict.to_dict(), 'skip_parity': None if parity is None else parity.to_dict()}
+
+
+def _write_record(config: OrchestratorConfig, verdict: RunnerVerdict, parity: SkipParity | None) -> Path:
     path = record_path(config, verdict.runner, verdict.sha)
-    atomic_write_text(path, json.dumps(verdict.to_dict(), indent=2, sort_keys=True) + '\n', mkdir=True)
+    atomic_write_text(path, json.dumps(record_dict(verdict, parity), indent=2, sort_keys=True) + '\n', mkdir=True)
     return path
