@@ -158,13 +158,13 @@ def test_a_state_dir_reaching_out_dir_through_a_symlink_exits_1_untouched(
     assert server.requests == ()
 
 
-def test_once_and_check_are_mutually_exclusive_and_one_is_required(client: Client) -> None:
+def test_once_and_check_are_mutually_exclusive(client: Client) -> None:
     config = str(client.config(_closed_url()))
 
-    for argv in (['file-defects', '--config', config], ['file-defects', '--config', config, '--once', '--check']):
-        with pytest.raises(SystemExit) as caught:
-            main(argv)
-        assert caught.value.code == 2
+    with pytest.raises(SystemExit) as caught:
+        main(['file-defects', '--config', config, '--once', '--check'])
+
+    assert caught.value.code == 2
 
 
 def test_check_prints_the_reads_performed_and_the_writes_withheld_and_stores_nothing(

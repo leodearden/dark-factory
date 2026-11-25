@@ -7,13 +7,13 @@ import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from shared.defects import DefectStatus
 
 from client_feed.contract import DefectReported, DefectRuled, TaskStatus
-from client_feed.defect_ref import portal_ref
+from client_feed.defect_ref import check_ref, portal_ref
 from client_feed.filer_state import FilerCursor, RefRecord, StateDir, held_state_dir
 from client_feed.filer_tasks import (
     ClientDefectFacts,
@@ -30,12 +30,17 @@ from client_feed.filer_tools import (
     FILER_IDENTITY,
     ClosedTools,
     Disposition,
+    ListingCaller,
+    OpenSession,
     OpenTools,
     RefusalKind,
     SessionUnavailable,
     TaskView,
     ToolRefused,
+    WithheldWrites,
     closed_tools,
+    missing_tools,
+    opened,
 )
 from client_feed.inbox import FeedIoProblem, InboxRead, InboxUnusable, read_inbox
 from client_feed.policy import FilerPolicy, Policy
@@ -438,3 +443,74 @@ def run_until_stopped(
             transient, cursor = _stored_pass(policy, state, cursor, open_tools)
             streak = streak + 1 if transient else 0
             pause(next_delay(interval, streak))
+
+
+class CheckedCall(BaseModel):
+    """A call one pass would make: a read it performed, or a write it withheld."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    tool: str
+    arguments: dict[str, Any]
+    withheld: bool
+
+
+class CheckReport(BaseModel):
+    """σ4's install check: the closed tools the server lacks, the check ref's standing, and the calls one pass would make."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    ok: bool
+    missing_tools: tuple[str, ...]
+    check_ref: str
+    check_ref_live: bool | None
+    calls: tuple[CheckedCall, ...]
+    problem: str | None
+
+
+def _pass_problem(report: PassReport) -> str | None:
+    if report.inbox_problem is not None:
+        return f'the inbox is unusable ({report.inbox_problem})'
+    refusals = [f'{item.ref}: {item.tool} refused ({item.kind}, {item.code})' for item in report.unconverged]
+    return '; '.join(refusals) or None
+
+
+def _check_report(
+    ref: str,
+    missing: tuple[str, ...],
+    live: bool | None,
+    withheld: WithheldWrites | None,
+    problem: str | None,
+) -> CheckReport:
+    calls = () if withheld is None else withheld.calls
+    return CheckReport(
+        ok=not missing and problem is None,
+        missing_tools=missing,
+        check_ref=ref,
+        check_ref_live=live,
+        calls=tuple(CheckedCall(tool=call.tool, arguments=dict(call.arguments), withheld=call.withheld) for call in calls),
+        problem=problem,
+    )
+
+
+def _checked(policy: Policy, session: ListingCaller, cursor: FilerCursor, ref: str) -> CheckReport:
+    try:
+        missing = missing_tools(session)
+        live = bool(ClosedTools(session, policy.project_root).lookup_defect_ref(ref))
+    except ToolRefused as refused:
+        return _check_report(ref, (), None, None, str(refused))
+    withheld = WithheldWrites(session)
+    report, _ = run_pass(policy, ClosedTools(withheld, policy.project_root), cursor)
+    return _check_report(ref, missing, live, withheld, _pass_problem(report))
+
+
+def check(policy: Policy, *, open_session: OpenSession) -> CheckReport:
+    """One pass's plan under the held state dir, its writes withheld and its cursor discarded: nothing is written but the lock file."""
+    ref = check_ref(policy.project_id)
+    with held_state_dir(policy) as state:
+        cursor = state.read_cursor()
+        try:
+            with opened(policy, open_session) as session:
+                return _checked(policy, session, cursor, ref)
+        except SessionUnavailable as exc:
+            return _check_report(ref, (), None, None, str(exc))

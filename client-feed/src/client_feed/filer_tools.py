@@ -35,6 +35,7 @@ WRITE_TOOLS: Final = frozenset({
 })
 CLOSED_TOOLS: Final = READ_TOOLS | WRITE_TOOLS
 
+LIST_TOOLS: Final = 'tools/list'
 IS_ERROR_CODE: Final = 'is_error'
 UNRECOGNISED_CODE: Final = 'unrecognised'
 _PAGE_SIZE: Final = 100
@@ -45,6 +46,15 @@ _T = TypeVar('_T')
 
 class ToolCaller(Protocol):
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
+
+
+class ListingCaller(ToolCaller, Protocol):
+    """A session that also names the tools its server lists."""
+
+    def list_tools(self) -> tuple[str, ...]: ...
+
+
+_Caller = TypeVar('_Caller', bound=ToolCaller)
 
 
 class RefusalKind(StrEnum):
@@ -115,6 +125,11 @@ def _refusal_code(reply: Mapping[str, Any]) -> str | None:
     if reply.get('error') is None and reply.get('success') is not False:
         return None
     return _token(reply.get('error_type') or reply.get('error'))
+
+
+def _session_refusal(tool: str, exc: McpCallError) -> ToolRefused:
+    kind = RefusalKind(exc.kind.value)
+    return ToolRefused(tool, kind, IS_ERROR_CODE if kind is RefusalKind.TOOL_ERROR else kind.lower())
 
 
 def _reply_shape(tool: str) -> ToolRefused:
@@ -224,9 +239,7 @@ class ClosedTools:
         try:
             return self._caller.call_tool(tool, {**arguments, 'project_root': self._project_root})
         except McpCallError as exc:
-            kind = RefusalKind(exc.kind.value)
-            code = IS_ERROR_CODE if kind is RefusalKind.TOOL_ERROR else kind.lower()
-            raise ToolRefused(tool, kind, code) from None
+            raise _session_refusal(tool, exc) from None
 
     @staticmethod
     def _reply(
@@ -322,7 +335,17 @@ class WithheldWrites:
         return {'success': True}
 
 
+def missing_tools(session: ListingCaller) -> tuple[str, ...]:
+    """The closed tools the session's server does not list, sorted."""
+    try:
+        listed = frozenset(session.list_tools())
+    except McpCallError as exc:
+        raise _session_refusal(LIST_TOOLS, exc) from None
+    return tuple(sorted(CLOSED_TOOLS - listed))
+
+
 OpenTools = Callable[[Policy], AbstractContextManager[ToolCaller]]
+OpenSession = Callable[[Policy], AbstractContextManager[ListingCaller]]
 
 
 class SessionUnavailable(Exception):
@@ -334,13 +357,20 @@ class SessionUnavailable(Exception):
 
 
 @contextmanager
-def closed_tools(policy: Policy, open_tools: OpenTools) -> Iterator[ClosedTools]:
-    """The policy's closed tools over one session from `open_tools`; a failed handshake is SessionUnavailable."""
+def opened(policy: Policy, open_caller: Callable[[Policy], AbstractContextManager[_Caller]]) -> Iterator[_Caller]:
+    """One session from `open_caller`; a failed handshake is SessionUnavailable."""
     with ExitStack() as stack:
         try:
-            caller = stack.enter_context(open_tools(policy))
+            caller = stack.enter_context(open_caller(policy))
         except McpCallError as exc:
             raise SessionUnavailable(RefusalKind(exc.kind.value)) from None
+        yield caller
+
+
+@contextmanager
+def closed_tools(policy: Policy, open_tools: OpenTools) -> Iterator[ClosedTools]:
+    """The policy's closed tools over one session from `open_tools`."""
+    with opened(policy, open_tools) as caller:
         yield ClosedTools(caller, policy.project_root)
 
 

@@ -18,11 +18,14 @@ from client_feed.contract import FEED_FILENAME, CommitSha, FeedError, RunKind
 from client_feed.criteria import CriteriaError, staging_run, write_staging
 from client_feed.dump_sources import dump_sources, render_dump
 from client_feed.feed_io import FeedIoError, read_feed_lines
+from client_feed.filer import check, file_once, run_until_stopped
+from client_feed.filer_state import FilerLockHeld, StateDirRefused
+from client_feed.filer_tools import SessionUnavailable, open_session
 from client_feed.fold import fold
 from client_feed.policy import (
     OutDirRefused,
-    Policy,
     PolicyError,
+    load_filer_policy,
     load_policy,
     require_usable_out_dir,
 )
@@ -34,6 +37,8 @@ from client_feed.validate import validate_out_dir
 
 _REFUSALS: Final = (PolicyError, OutDirRefused, FeedIoError, FeedError)
 _STAGING_REFUSALS: Final = (CriteriaError, ArchiveReadError, OutDirRefused, FeedIoError)
+_FILER_REFUSALS: Final = (PolicyError, StateDirRefused, SessionUnavailable)
+EXIT_LOCK_HELD: Final = 3
 _COMMIT_SHA: Final = TypeAdapter(CommitSha)
 _STOP_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 _JOIN_POLL_SECS: Final = 1.0
@@ -97,26 +102,26 @@ def _utc_now() -> datetime:
 
 
 def _configure_logging() -> None:
-    """The publisher's progress, logged to stderr."""
+    """The publisher's and the filer's progress, logged to stderr."""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 
 
-def _publish_until_signalled(policy: Policy, clock: Callable[[], datetime]) -> None:
-    """Publish on a worker thread until SIGTERM or SIGINT; the worker's own failure is raised here.
+def _until_signalled(work: Callable[[threading.Event], None], *, name: str) -> None:
+    """Run `work` on a worker thread until SIGTERM or SIGINT sets its event; the worker's own failure is raised here.
 
-    The handlers run on this thread, which never waits on `stop` itself, so setting it cannot deadlock.
+    The handlers run on this thread, which never waits on the event itself, so setting it cannot deadlock.
     """
     stop = threading.Event()
     failures: list[BaseException] = []
 
-    def work() -> None:
+    def run() -> None:
         try:
-            publish(policy, stop=stop, clock=clock)
+            work(stop)
         except BaseException as exc:
             failures.append(exc)
 
     previous = {number: signal.signal(number, lambda *_: stop.set()) for number in _STOP_SIGNALS}
-    worker = threading.Thread(target=work, name='client-feed-publish')
+    worker = threading.Thread(target=run, name=name)
     try:
         worker.start()
         while worker.is_alive():
@@ -131,7 +136,10 @@ def _publish_until_signalled(policy: Policy, clock: Callable[[], datetime]) -> N
 def _run_publish(args: argparse.Namespace) -> int:
     _configure_logging()
     try:
-        _publish_until_signalled(load_policy(args.config), _utc_now)
+        policy = load_policy(args.config)
+        _until_signalled(
+            lambda stop: publish(policy, stop=stop, clock=_utc_now), name='client-feed-publish'
+        )
     except _REFUSALS as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -190,6 +198,53 @@ def _add_dump_state(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
         '--out-dir', type=Path, required=True, help='the directory holding feed.jsonl'
     )
     parser.set_defaults(run=_run_dump_state)
+
+
+def _file_defects(args: argparse.Namespace) -> int:
+    policy = load_filer_policy(args.config)
+    if args.once:
+        print(file_once(policy, open_tools=open_session).model_dump_json(indent=2))
+        return 0
+    if args.check:
+        report = check(policy, open_session=open_session)
+        print(report.model_dump_json(indent=2))
+        return 0 if report.ok else 1
+    _until_signalled(
+        lambda stop: run_until_stopped(policy, open_tools=open_session, stop=stop),
+        name='client-feed-file-defects',
+    )
+    return 0
+
+
+def _run_file_defects(args: argparse.Namespace) -> int:
+    _configure_logging()
+    try:
+        return _file_defects(args)
+    except FilerLockHeld as exc:
+        print(exc, file=sys.stderr)
+        return EXIT_LOCK_HELD
+    except _FILER_REFUSALS as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+
+def _add_file_defects(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        'file-defects',
+        help=(
+            "file each portal defect report in the policy's project as a fix and its human gate,"
+            ' every filer.interval_seconds until SIGTERM or SIGINT'
+        ),
+    )
+    parser.add_argument('--config', type=Path, required=True, help='the policy YAML, with its filer: block')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--once', action='store_true', help='file one pass and print its report as JSON')
+    mode.add_argument(
+        '--check',
+        action='store_true',
+        help='print the calls one pass would make, its writes withheld; writes nothing but the lock file',
+    )
+    parser.set_defaults(run=_run_file_defects)
 
 
 def _commit_sha(text: str) -> str:
@@ -252,6 +307,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_snapshot(subparsers)
     _add_dump_state(subparsers)
     _add_criteria_results(subparsers)
+    _add_file_defects(subparsers)
     return parser
 
 
