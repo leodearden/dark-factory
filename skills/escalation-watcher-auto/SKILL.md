@@ -94,6 +94,7 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `Bash(git log ...)` | Inspect recent commits on a module or branch |
 | `Bash(git diff ...)` | Diff between commits or branches to identify breaking changes |
 | `Bash(git show ...)` | Read a specific commit's diff |
+| `Bash(git cat-file ...)` | Probe existence and object TYPE of a path on a ref (`-e` / `-t`) — condition 2, and the condition-3 blob precondition |
 | `Bash(git status ...)` | Working-tree state at the project root |
 | `python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py` | List and count one task's `runs.db` events before a `root_cause`/`evidence` narrative joins them (read-only). Advisory entry: not in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`; it runs because the rotation's `bypassPermissions` mode admits Bash, as `scripts/watcher-rearm.sh` does |
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |

@@ -671,6 +671,10 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'Bash(git diff:*)',
     'Bash(git status:*)',
     'Bash(git show:*)',
+    # Path existence/type probes backing SKILL.md's orphan-reaper close
+    # condition 2 (`-e`) and condition-3 blob path-shape check (`-t`).
+    # Covered by TestWatcherAllowedTools.test_git_cat_file_in_allowed_tools.
+    'Bash(git cat-file:*)',
     'Bash(git rev-parse:*)',
     'Bash(git branch:*)',
     'Bash(git ls-files:*)',
