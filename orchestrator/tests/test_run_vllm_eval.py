@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from orchestrator.evals.results import CellName, ResultStore
+from orchestrator.evals.runner import WORKFLOW_CELL_TIMEOUT_MINUTES
 
 # Stub out runpod_toolkit BEFORE importing the launcher. The real package has
 # a transitive paramiko dependency that's not installed in the orchestrator
@@ -76,7 +77,6 @@ from run_vllm_eval import (  # type: ignore[import-not-found]  # noqa: E402
     wait_for_vllm,
 )
 
-from orchestrator.evals.runner import WORKFLOW_CELL_TIMEOUT_MINUTES  # noqa: E402
 from orchestrator.evals.snapshots import eval_worktree_root  # noqa: E402
 
 # ---------------------------------------------------------------------------
