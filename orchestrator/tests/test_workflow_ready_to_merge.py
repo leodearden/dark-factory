@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,14 +28,16 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _git_fixtures import seed_repo
+from _orch_helpers import git_env_with_ceiling, pydantic_spec
 from shared.task_transitions import outcome_allows_status
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 _TASK_ID = '50'
@@ -144,11 +147,17 @@ def _make(
             return tip_is_ancestor_of_main
         return False
 
+    known_shas = {sha for sha in (_TIP, main_sha, tip) if sha is not None}
+
+    async def _commits_named(tokens: list[str]) -> dict[str, str]:
+        return {token: token for token in tokens if token in known_shas}
+
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value=main_sha)
     git_ops.resolve_branch_sha = AsyncMock(return_value=tip)
     git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     git_ops.get_head_tree_hash = AsyncMock(return_value=tree_hash)
+    git_ops.commits_named = AsyncMock(side_effect=_commits_named)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -536,6 +545,118 @@ class TestReadyToMergeMalformedArtifact:
         assert outcome == WorkflowOutcome.BLOCKED
         f.mark_blocked.assert_awaited_once()
         assert f.mark_blocked.await_args.kwargs.get('escalate_to_human') is not True
+
+
+# ---------------------------------------------------------------------------
+# Cited-commit resolution against real git: an abbreviated hex SHA names the
+# tip; a ref name, an unknown prefix or an unanswerable git does not
+# ---------------------------------------------------------------------------
+
+
+def _git_out(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', *args], cwd=repo, env=git_env_with_ceiling(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@dataclass(frozen=True)
+class _TwoCommitRepo:
+    path: Path
+    tip: str
+    other: str
+
+
+@pytest.fixture
+def two_commit_repo(tmp_path: Path) -> _TwoCommitRepo:
+    repo = seed_repo(tmp_path / 'repo')
+    _git_out(repo, 'commit', '--allow-empty', '-m', 'tip')
+    return _TwoCommitRepo(
+        path=repo,
+        tip=_git_out(repo, 'rev-parse', 'HEAD'),
+        other=_git_out(repo, 'rev-parse', 'HEAD~1'),
+    )
+
+
+@pytest.mark.asyncio
+class TestReadyToMergeAbbreviatedCitation:
+    """The cited commit is resolved by git before it is compared to the tip.
+
+    Only the resolution step runs against real git; every other predicate keeps
+    the file's mocked GitOps, wired so the branch tip is the repo's HEAD.
+    """
+
+    async def _run(
+        self, tmp_path: Path, repo: _TwoCommitRepo, citation: str,
+        *, git_root: Path | None = None,
+    ) -> _Fixture:
+        f = _make(tmp_path=tmp_path, tip=repo.tip, verified_tip=repo.tip)
+        f.git_ops.commits_named = GitOps(
+            GitConfig(), git_root or repo.path,
+        ).commits_named
+        f.artifacts.write_ready_to_merge(commit=citation, evidence='ev')
+        f.outcome = await f.wf._handle_ready_to_merge_report()
+        return f
+
+    def _cited_commit_reject(self, f: _Fixture) -> dict:
+        """The ``measured`` facts of the one ``cited_commit`` reject event."""
+        assert f.outcome == WorkflowOutcome.BLOCKED
+        assert f.merge_queue.qsize() == 0
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        assert len(rows) == 1
+        data = rows[0].get('data') or {}
+        assert data['decision'] == 'rejected'
+        assert data['predicate'] == 'cited_commit'
+        return data['measured']
+
+    async def test_abbreviated_tip_sha_is_accepted(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        repo = two_commit_repo
+        f = await self._run(tmp_path, repo, repo.tip[:10])
+
+        assert f.merge_queue.qsize() == 1
+        assert f.merge_queue.get_nowait().snapshot_tip == repo.tip
+        f.mark_blocked.assert_not_awaited()
+
+    async def test_abbreviation_of_another_commit_is_rejected(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        repo = two_commit_repo
+        f = await self._run(tmp_path, repo, repo.other[:10])
+
+        assert self._cited_commit_reject(f)['resolved'] == repo.other
+
+    async def test_ref_name_is_rejected_although_it_names_the_tip(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        """A ref always equals the current tip, so it corroborates nothing."""
+        assert _git_out(two_commit_repo.path, 'rev-parse', 'HEAD') == two_commit_repo.tip
+        f = await self._run(tmp_path, two_commit_repo, 'HEAD')
+
+        self._cited_commit_reject(f)
+
+    async def test_unresolvable_hex_prefix_is_rejected(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        f = await self._run(tmp_path, two_commit_repo, 'deadbeef0')
+
+        measured = self._cited_commit_reject(f)
+        assert 'resolved' in measured
+        assert measured['resolved'] is None
+
+    async def test_git_failure_is_a_reject_carrying_the_error(
+        self, tmp_path: Path, two_commit_repo: _TwoCommitRepo,
+    ):
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+        f = await self._run(
+            tmp_path, two_commit_repo, two_commit_repo.tip[:10], git_root=plain,
+        )
+
+        assert self._cited_commit_reject(f)['git_error']
 
 
 # ---------------------------------------------------------------------------
