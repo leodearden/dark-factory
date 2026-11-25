@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from shared.cli_invoke import AgentResult
@@ -45,8 +46,8 @@ class TestLedgerRole:
 
 class TestLedgerInvokeKwargs:
     def test_spreads_every_key(self):
-        store = object()
-        ledger = InvocationLedger(store, LedgerRole.RECON_JUDGE, run_id='r1', project_id='p1')  # type: ignore[arg-type]
+        store = MagicMock(name='cost_store')
+        ledger = InvocationLedger(store, LedgerRole.RECON_JUDGE, run_id='r1', project_id='p1')
 
         assert ledger_invoke_kwargs(ledger) == {
             'cost_store': store,
