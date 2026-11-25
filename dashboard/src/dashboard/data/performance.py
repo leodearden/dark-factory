@@ -980,23 +980,46 @@ def _merge_history(per_db: list[dict]) -> dict:
     return out
 
 
+@dataclass(frozen=True, slots=True)
+class PerformanceHistory:
+    """One project's hour-bucketed series, every one aligned to the ``labels`` axis."""
+
+    labels: tuple[str, ...]
+    p50: tuple[float, ...]
+    p95: tuple[float, ...]
+    one_pass: tuple[float, ...]
+    escalation: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        series = {'p50': self.p50, 'p95': self.p95, 'one_pass': self.one_pass, 'escalation': self.escalation}
+        for name, values in series.items():
+            if len(values) != len(self.labels):
+                raise ValueError(
+                    f'history series {name} has {len(values)} values for {len(self.labels)} labels',
+                )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'history_labels': list(self.labels),
+            'time_centiles_history': {'p50': list(self.p50), 'p95': list(self.p95)},
+            'one_pass_history': {'values': list(self.one_pass)},
+            'escalation_history': {'values': list(self.escalation)},
+        }
+
+
+EMPTY_HISTORY = PerformanceHistory(labels=(), p50=(), p95=(), one_pass=(), escalation=())
+
+
 async def aggregate_performance_history(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
     now: datetime | None = None,
-) -> dict[str, dict]:
+) -> dict[str, PerformanceHistory]:
     """Return per-project bucketed history for ttc, one-pass, escalation.
 
-    Result shape::
-
-        {
-          project_id: {
-            time_centiles_history: {labels, p50, p95},
-            one_pass_history:      {labels, values},
-            escalation_history:    {labels, values},
-          }
-        }
+    Result shape: each project_id maps to its :class:`PerformanceHistory`,
+    whose :meth:`PerformanceHistory.to_wire` is the served form.
 
     Args:
         now: Reference timestamp forwarded to :func:`_cutoff`. Resolved
@@ -1031,27 +1054,19 @@ async def aggregate_performance_history(
     if not pids:
         return {}
 
-    out: dict[str, dict] = {}
+    out: dict[str, PerformanceHistory] = {}
     for pid in pids:
         per_db = [
             await _per_db_history(db, pid, days=days, now=effective_now) for db in dbs
         ]
         merged = _merge_history(per_db)
-        out[pid] = {
-            'time_centiles_history': {
-                'labels': merged['labels'],
-                'p50': merged['p50'],
-                'p95': merged['p95'],
-            },
-            'one_pass_history': {
-                'labels': merged['labels'],
-                'values': merged['one_pass'],
-            },
-            'escalation_history': {
-                'labels': merged['labels'],
-                'values': merged['escalation'],
-            },
-        }
+        out[pid] = PerformanceHistory(
+            labels=tuple(merged['labels']),
+            p50=tuple(merged['p50']),
+            p95=tuple(merged['p95']),
+            one_pass=tuple(merged['one_pass']),
+            escalation=tuple(merged['escalation']),
+        )
     return out
 
 
