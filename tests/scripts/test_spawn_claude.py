@@ -20,7 +20,7 @@ import textwrap
 import threading
 import time
 import urllib.parse
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -1993,14 +1993,13 @@ def test_spawn_run_cap_leaves_headroom_inside_governing_timeout() -> None:
     assert _SPAWN_RUN_CAP_SECS + _READINESS_WAIT_CAP_SECS < 300
 
 
-def _capture_spawn_timeout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, **kwargs
+def _capture_run_timeout(
+    monkeypatch: pytest.MonkeyPatch, invoke: Callable[[], object]
 ) -> float:
-    """Invoke _run_spawn with subprocess.run monkeypatched to a no-op stub
-    that records the `timeout` kwarg it was handed, so the load-scaling
-    policy is pinned as runtime behaviour (the actual argument
-    subprocess.run receives) without ever launching a real subprocess or
-    sleeping.
+    """Call *invoke* with subprocess.run monkeypatched to a no-op stub that
+    records the `timeout` kwarg it was handed, so the load-scaling policy
+    is pinned as runtime behaviour (the actual argument subprocess.run
+    receives) without ever launching a real subprocess or sleeping.
     """
     captured: dict[str, float] = {}
 
@@ -2009,8 +2008,15 @@ def _capture_spawn_timeout(
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    _run_spawn({}, tmp_path, **kwargs)
+    invoke()
     return captured["timeout"]
+
+
+def _capture_spawn_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, **kwargs
+) -> float:
+    """The `timeout` a bare _run_spawn call with *kwargs* hands subprocess.run."""
+    return _capture_run_timeout(monkeypatch, lambda: _run_spawn({}, tmp_path, **kwargs))
 
 
 def test_run_spawn_scales_its_timeout_under_load(
@@ -2078,6 +2084,23 @@ def test_run_spawn_scale_timeout_false_forwards_base_unchanged(
         monkeypatch, tmp_path, scale_timeout=False, timeout=10
     )
     assert timeout == 10
+
+
+def test_no_emulator_spawn_bound_is_load_scaled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """rc==126 is load-insensitive, but reaching it under contention is not:
+    esc-7143-3 saw this 0.05s-idle path cross a fixed 10s bound at 10.6s
+    and 10.7s. So the 126 sites take the same load-scaled must-not-hang
+    bound as every other _run_spawn site.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    bound = _capture_run_timeout(
+        monkeypatch, lambda: _run_spawn_without_emulator(tmp_path)
+    )
+    assert bound == _capture_spawn_timeout(monkeypatch, tmp_path)
 
 
 # ===========================================================================
