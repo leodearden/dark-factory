@@ -93,13 +93,12 @@ def crate_source(name, version):
     return next(iter(sorted(registry.glob(f'*/{name}-{version}'))), None)
 
 
-def declared_modules(entries):
-    for key, spec in entries.items():
-        if isinstance(spec, dict):
-            yield spec.get('name', key)
-            yield from spec.get('fallback-names', [])
-        else:
-            yield key
+def entry_modules(key, spec):
+    if isinstance(spec, dict):
+        yield spec.get('name', key)
+        yield from spec.get('fallback-names', [])
+    else:
+        yield key
 
 
 def system_deps(source):
@@ -107,9 +106,10 @@ def system_deps(source):
     entries = manifest.get('package', {}).get('metadata', {}).get('system-deps', {})
     for key, spec in entries.items():
         if key.startswith('cfg(') and isinstance(spec, dict):
-            yield from declared_modules(spec)
+            for target_key, target_spec in spec.items():
+                yield from entry_modules(target_key, target_spec)
         else:
-            yield from declared_modules({key: spec})
+            yield from entry_modules(key, spec)
 
 
 def probed_modules(source, name):
