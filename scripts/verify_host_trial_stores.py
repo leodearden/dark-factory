@@ -28,6 +28,7 @@ from shared.project_layout import runs_db
 __all__ = [
     'CPU_ARM_SPECS',
     'LOCK_CONFLICT_REASONS',
+    'REQUEUED',
     'SOURCES',
     'AdmissionPlan',
     'CapHit',
@@ -70,6 +71,9 @@ class EventType(StrEnum):
 
 CAP_HIT = 'cap_hit'
 """The account_events event_type of an account reaching its weekly cap."""
+
+REQUEUED = 'requeued'
+"""The task_completed outcome of a task put back in the queue."""
 
 LOCK_CONFLICT_REASONS = frozenset({'plan_blast_radius_lock_conflict', 'scope_grant_lock_conflict'})
 """task_completed reasons of a requeue on a lock conflict (workflow.py::TaskWorkflow._requeue_on_lock_conflict)."""
