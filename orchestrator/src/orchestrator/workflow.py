@@ -235,6 +235,7 @@ from orchestrator.routing import (
     _config_key,
     resolve_route,
 )
+from orchestrator.routing_dispatch import plan_shape_fields
 from orchestrator.scheduler import (
     BlastRadiusResult,
     SetTaskStatusRejected,
@@ -15724,6 +15725,7 @@ class TaskWorkflow:
             source_layer=source_layer,
             rule_id=rule_id,
             rejected=list(decision.rejected),
+            plan_shape=plan_shape,
         )
 
         if self.cost_store:
@@ -15763,8 +15765,12 @@ class TaskWorkflow:
         source_layer: str,
         rule_id: str | None,
         rejected: list[str] | None = None,
+        plan_shape: PlanShape | None,
     ) -> None:
         """Persist the resolved routing decision for this invocation (PRD γ).
+
+        The record carries ``plan_steps``/``plan_modules`` derived from
+        *plan_shape*, the shape the resolver saw.
 
         Best-effort (never raises) but awaited synchronously inside
         ``_invoke``'s critical path — it is not fire-and-forget in the
@@ -15801,6 +15807,7 @@ class TaskWorkflow:
                 rejected=rejected or [],
                 routing_tier=state.routing_tier,
                 decided_at=datetime.now(UTC).isoformat(),
+                **plan_shape_fields(plan_shape),
             )
         except Exception:
             logger.warning(

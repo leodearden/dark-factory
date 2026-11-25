@@ -870,7 +870,8 @@ class RoutingDecisionMirror(BaseModel):
     so that dataclass can be swapped in as this model's source with no
     schema change (PRD invariant 7). ``extra='allow'`` so any of ε's
     additional fields survive round-trip before this model is updated to
-    know about them by name.
+    know about them by name. ``plan_steps``/``plan_modules`` are the plan
+    shape the resolver saw, null before a plan exists.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -885,6 +886,8 @@ class RoutingDecisionMirror(BaseModel):
     rejected: list[str] = Field(default_factory=list)
     routing_tier: int = 0
     decided_at: str | None = None
+    plan_steps: int | None = None
+    plan_modules: int | None = None
 
 
 # Bounded history length for RoutingState.with_decision (PRD Open-Q 3).

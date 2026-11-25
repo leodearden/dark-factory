@@ -42,7 +42,7 @@ import hashlib
 import json
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from shared.task_metadata import RoutingDecisionMirror, RoutingState
 
@@ -101,6 +101,27 @@ async def _ceiling_spend_by_model(
                 model_name, exc_info=True,
             )
     return spend
+
+
+class PlanShapeFields(TypedDict):
+    """The plan shape a routing decision records: what the resolver saw."""
+
+    plan_steps: int | None
+    plan_modules: int | None
+
+
+def plan_shape_fields(plan_shape: PlanShape | None) -> PlanShapeFields:
+    """Derive the recorded plan-shape fields from the resolver's ``PlanShape``.
+
+    The one home of this derivation for both recorders: this module's
+    ``resolve_and_record_route`` and ``workflow.py::TaskWorkflow._record_routing_decision``.
+    """
+    if plan_shape is None:
+        return {'plan_steps': None, 'plan_modules': None}
+    return {
+        'plan_steps': plan_shape.step_count,
+        'plan_modules': len(plan_shape.module_paths),
+    }
 
 
 def _out_of_band_inputs_digest(
@@ -240,6 +261,7 @@ async def resolve_and_record_route(
             rejected=list(decision.rejected),
             routing_tier=routing_state.routing_tier,
             decided_at=datetime.now(UTC).isoformat(),
+            **plan_shape_fields(plan_shape),
         )
     except Exception:
         logger.warning(
