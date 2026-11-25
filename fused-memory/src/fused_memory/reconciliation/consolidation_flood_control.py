@@ -1,11 +1,10 @@
 """The per-cycle flood-control policy for consolidation candidates.
 
 This module is the single home of that policy (``plans/memory-auto-consolidation-prd.md``
-D6). Two callers share it: the auto-consolidation executor
+D6). Its caller is the auto-consolidation executor
 (``reconciliation/consolidation_auto_executor.py``), which passes
-``cap = max_auto_per_cycle + max_gate_filings_per_cycle``, and task 4916's
-detector-report submitter, which passes its own cap. Both read their numbers
-from the one ``consolidation_auto`` config block. Like
+``cap = max_auto_per_cycle + max_gate_filings_per_cycle``, read from the
+``consolidation_auto`` config block. Like
 ``reconciliation/consolidation_auto.py`` it imports only the standard library;
 the config type is referenced under ``TYPE_CHECKING`` only.
 """
