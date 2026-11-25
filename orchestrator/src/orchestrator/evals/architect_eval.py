@@ -172,7 +172,7 @@ class ArchitectAttempt:
     usage: ArchitectUsage = dataclasses.field(default_factory=ArchitectUsage)
     cost_usd: float = 0.0
     cost_source: str = 'cli'
-    is_local_model: bool = False
+    cli_cost_untrusted: bool = False
     unmeasured: Unmeasured | None = None
 
 
@@ -222,10 +222,10 @@ async def invoke_architect(
         declines = _read_declines(ended.artifacts, call.label)
     finally:
         await deps.cleanup_worktree(project_root, worktree)
-    is_local_model = is_proxied_endpoint(config.env_overrides)
+    cli_cost_untrusted = is_proxied_endpoint(config.env_overrides)
     cost_usd, cost_source = _architect_cost(
         ended.usage, model=config.model, prices=ended.prices,
-        spent_usd=ended.spent_usd, is_local_model=is_local_model,
+        spent_usd=ended.spent_usd, cli_cost_untrusted=cli_cost_untrusted,
     )
     return ArchitectAttempt(
         address=address,
@@ -236,7 +236,7 @@ async def invoke_architect(
         usage=ended.usage,
         cost_usd=cost_usd,
         cost_source=cost_source,
-        is_local_model=is_local_model,
+        cli_cost_untrusted=cli_cost_untrusted,
         unmeasured=ended.unmeasured,
     )
 
@@ -437,7 +437,7 @@ def _architect_cost(
     model: str,
     prices: dict[str, Any] | None,
     spent_usd: float,
-    is_local_model: bool,
+    cli_cost_untrusted: bool,
 ) -> tuple[float, str]:
     """The architect component's ``(cost_usd, cost_source)`` per Invariant P5."""
     tokens = usage.tokens
@@ -445,7 +445,7 @@ def _architect_cost(
         return 0.0, 'cli'
     return resolve_cost_usd(
         tokens, model=model, prices=prices,
-        cli_cost_usd=spent_usd, is_local_model=is_local_model,
+        cli_cost_usd=spent_usd, cli_cost_untrusted=cli_cost_untrusted,
     )
 
 
@@ -588,7 +588,7 @@ def assemble_metrics(
         ),
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
-        is_local_model=attempt.is_local_model,
+        cli_cost_untrusted=attempt.cli_cost_untrusted,
         cache_read_tokens=usage.cache_read_tokens,
         cache_create_tokens=usage.cache_create_tokens,
         turns_used=usage.turns,

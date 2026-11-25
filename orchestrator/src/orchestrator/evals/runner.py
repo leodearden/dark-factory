@@ -350,7 +350,7 @@ def build_eval_orch_config(
     # claude_endpoint_price_table() into config.prices whenever THIS
     # candidate runs against a PROXIED endpoint — the SAME predicate
     # collect_metrics and run_architect_eval read before calling
-    # resolve_cost_usd(..., is_local_model=...), which is why it has one home
+    # resolve_cost_usd(..., cli_cost_untrusted=...), which is why it has one home
     # (metrics.is_proxied_endpoint) instead of three inline env reads: the
     # table that gets seeded and the flag that decides whether to trust the CLI
     # figure must never disagree. Without this, an operator who forgets to seed
@@ -799,7 +799,7 @@ async def collect_metrics(
     # Via the shared predicate, NOT an inline env read: the same signal decides
     # whether build_eval_orch_config seeds the proxied price table, so the two
     # must not be able to drift apart (see is_proxied_endpoint).
-    is_local = is_proxied_endpoint(workflow.config.env_overrides)
+    cli_cost_untrusted = is_proxied_endpoint(workflow.config.env_overrides)
 
     # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
     # proxied endpoint, so resolve cost from the config price table by the run's
@@ -824,7 +824,7 @@ async def collect_metrics(
         model=run_model,
         prices=workflow.config.prices,
         cli_cost_usd=wf_metrics.total_cost_usd,
-        is_local_model=is_local,
+        cli_cost_untrusted=cli_cost_untrusted,
     )
 
     m = EvalMetrics(
@@ -851,7 +851,7 @@ async def collect_metrics(
         lines_changed=lines_changed,
         files_changed=files_changed,
         tokens_per_second=round(tps, 2),
-        is_local_model=is_local,
+        cli_cost_untrusted=cli_cost_untrusted,
         role_under_test=role,
         replay_frame=replay_frame,
         sandbox_backend=sandbox_backend,

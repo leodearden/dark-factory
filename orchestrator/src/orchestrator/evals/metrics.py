@@ -120,6 +120,13 @@ class EvalMetrics:
     # trustworthy native-cloud source) so a result JSON persisted before this
     # field existed reads back sanely.
     cost_source: str = 'cli'
+    # True when the role's env routed the Claude CLI to a non-Anthropic base URL
+    # (is_proxied_endpoint), so resolve_cost_usd never takes the CLI's own cost
+    # figure. Legacy cells stored this as 'is_local_model' (results.py legacy rule).
+    cli_cost_untrusted: bool = False
+    # The endpoint the candidate config declared (EvalConfig.endpoint_kind);
+    # None for a cell recorded before task 9970.
+    endpoint_kind: EndpointKind | None = None
     workflow_duration_ms: int = 0
     turns_used: int = 0
     iterations: int = 0          # implementer re-invocations
@@ -156,11 +163,6 @@ class EvalMetrics:
 
     # Inference speed
     tokens_per_second: float = 0.0       # output_tokens / generation_seconds
-    # True when env_overrides has ANTHROPIC_BASE_URL — i.e. a PROXIED endpoint.
-    # Repurposed by Invariant P5 as the cost-source signal: a proxied endpoint's
-    # CLI cost is untrustworthy, so an unlisted model there resolves to
-    # 'unpriced_proxy' (see resolve_cost_usd) rather than the raw CLI number.
-    is_local_model: bool = False
 
     # Derived
     composite_score: float = 0.0
@@ -320,6 +322,8 @@ class EvalMetrics:
     def __post_init__(self) -> None:
         if self.reference_kind is not None:
             self.reference_kind = ReferenceKind(self.reference_kind)
+        if self.endpoint_kind is not None:
+            self.endpoint_kind = EndpointKind(self.endpoint_kind)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -694,7 +698,7 @@ def resolve_cost_usd(
     model: str,
     prices: dict[str, Any] | None,
     cli_cost_usd: float,
-    is_local_model: bool,
+    cli_cost_untrusted: bool,
 ) -> tuple[float, str]:
     """Resolve ``(cost_usd, cost_source)`` for one invocation's *usage*, per Invariant P5.
 
@@ -710,10 +714,10 @@ def resolve_cost_usd(
       that nonzero cache tokens needed. Those tokens are priced at
       input_per_1m in place of the missing rate, and a WARNING names the
       missing keys.
-    - **cli** — a NATIVE cloud endpoint (``is_local_model=False``) whose model
+    - **cli** — a NATIVE cloud endpoint (``cli_cost_untrusted=False``) whose model
       is unlisted: the CLI's own ``cli_cost_usd`` is trustworthy for the real
       Anthropic API, so it is used verbatim.
-    - **unpriced_proxy** — a PROXIED endpoint (``is_local_model=True`` —
+    - **unpriced_proxy** — a PROXIED endpoint (``cli_cost_untrusted=True`` —
       ``ANTHROPIC_BASE_URL`` set) whose model is unlisted: the CLI cost is
       WRONG for a proxied endpoint, so emit a loud WARNING (mirroring task
       2459) and price the usage at the DEFINED ``FALLBACK_PRICE`` — never a
@@ -736,7 +740,7 @@ def resolve_cost_usd(
         )
         return priced.cost_usd, 'price_table_no_cache_rate'
 
-    if not is_local_model:
+    if not cli_cost_untrusted:
         # Native cloud endpoint — the CLI's own cost figure is trustworthy.
         return cli_cost_usd, 'cli'
 
