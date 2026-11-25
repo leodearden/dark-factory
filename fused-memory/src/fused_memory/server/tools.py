@@ -9978,7 +9978,8 @@ def create_mcp_server(
 
         When the task corpus cannot be searched (an embedder or Qdrant
         outage), the reply is ``{'results': [], 'degraded': true, 'error':
-        ..., 'error_type': ..., 'billing_exhausted': <'api_key_credits' or
+        ..., 'error_type': ..., 'billing_exhausted': <a
+        provider_billing.BillingSource value, e.g. 'api_key_credits', or
         null>}``. That reply means the lookup FAILED, not "nothing similar
         filed": your duplicate check did not run. What a findings
         instrument does next is in docs/quality-findings-contract.md §8.

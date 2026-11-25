@@ -21,7 +21,6 @@ from _curator_helpers import (
 from mcp.server.fastmcp import FastMCP
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.task_curator import CorpusSearchError, TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -30,12 +29,6 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-
-def _make_config() -> FusedMemoryConfig:
-    cfg = FusedMemoryConfig()
-    cfg.curator = CuratorConfig()
-    return cfg
 
 
 def _mock_point(payload: dict, score: float) -> MagicMock:
@@ -55,7 +48,7 @@ class TestSearchCorpus:
     async def test_search_corpus_returns_ranked_hits(self):
         """search_corpus embeds the query, calls query_points with limit +
         score_threshold, and maps payload + score into hit dicts."""
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        curator = TaskCurator(config=make_config(), taskmaster=None)
         project_id = 'myproject'
 
         results = MagicMock()
@@ -108,7 +101,7 @@ class TestSearchCorpus:
     async def test_search_corpus_missing_collection_returns_empty(self):
         """No collection (no tasks ever filed) → [], and query_points is never
         called (reads must not create the collection)."""
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        curator = TaskCurator(config=make_config(), taskmaster=None)
 
         mock_client = AsyncMock()
         mock_client.collection_exists = AsyncMock(return_value=False)
@@ -147,7 +140,7 @@ class TestSearchCorpus:
 
     @pytest.mark.asyncio
     async def test_an_unreachable_qdrant_raises_corpus_search_error(self):
-        config = _make_config()
+        config = make_config()
         config.mem0.qdrant_url = 'http://127.0.0.1:9'
         curator = TaskCurator(
             config=config, taskmaster=None,
@@ -335,6 +328,25 @@ async def test_an_exhausted_embedder_answers_degraded_not_empty(tmp_path):
     assert degraded['billing_exhausted'] == 'api_key_credits'
     assert isinstance(degraded['error'], str)
     assert degraded['error']
+
+
+@pytest.mark.asyncio
+async def test_a_degraded_answer_leaves_a_server_side_warning(tmp_path, caplog):
+    embedder = exhaustible_embedder()
+    async with _search_stack(tmp_path, embedder) as stack:
+        await stack.file('1', _FILED_TITLE)
+        embedder.exhaust()
+        with caplog.at_level('WARNING', logger='fused_memory.middleware.task_interceptor'):
+            await stack.search(_FILED_TITLE)
+
+    warnings = [
+        record for record in caplog.records
+        if record.name == 'fused_memory.middleware.task_interceptor'
+        and 'answering degraded' in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is not None
+    assert isinstance(warnings[0].exc_info[1], CorpusSearchError)
 
 
 @pytest.mark.asyncio

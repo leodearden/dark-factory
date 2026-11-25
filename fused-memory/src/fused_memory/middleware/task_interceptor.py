@@ -6693,6 +6693,10 @@ class TaskInterceptor:
                 query, project_id, limit=limit, score_threshold=score_threshold,
             )
         except CorpusSearchError as exc:
+            logger.warning(
+                'search_tasks: corpus search failed for %s; answering degraded',
+                project_id, exc_info=True,
+            )
             return {
                 'results': [],
                 'degraded': True,
