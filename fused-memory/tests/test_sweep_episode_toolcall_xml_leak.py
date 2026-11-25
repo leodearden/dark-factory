@@ -265,7 +265,7 @@ class TestMainReportsAnAbort:
         @contextlib.asynccontextmanager
         async def _failing_service(*_args: Any, **_kwargs: Any):
             raise RuntimeError('FalkorDB unreachable')
-            yield  # pragma: no cover - makes this an async generator
+            yield
 
         monkeypatch.setattr(maintenance_utils, 'maintenance_service', _failing_service)
 

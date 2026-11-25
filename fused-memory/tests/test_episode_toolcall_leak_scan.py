@@ -227,10 +227,10 @@ class TestImmutability:
 
         scan = await _scan(double)
 
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            scan.episodes_in_group = 0  # type: ignore[misc]
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            scan.leaks[0].content = 'repaired'  # type: ignore[misc]
+        for record in (scan, scan.leaks[0]):
+            for field in dataclasses.fields(record):
+                with pytest.raises(dataclasses.FrozenInstanceError):
+                    setattr(record, field.name, None)
 
 
 # ---------------------------------------------------------------------------
