@@ -74,9 +74,10 @@ def _make_workflow(
     Mirrors ``test_workflow_invocation_end_truthful.py``'s ``_make_workflow``
     (pydantic_spec spec_set MagicMock cfg, patched ``invoke_with_cap_retry`` +
     ``_build_agent_env``), plus concrete cfg.models/budgets/max_turns/effort/
-    timeouts/backends.implementer values — needed here because the
-    routing_decision payload asserts on the actual resolved model/effort/
-    budget_usd/max_turns (a bare MagicMock attribute would satisfy the
+    timeouts/backends values for the implementer, and the same values for the
+    architect (``TestInvokeRecordsPlanShape``'s no-plan case) — needed here
+    because the routing_decision payload asserts on the actual resolved
+    model/effort/budget_usd/max_turns (a bare MagicMock attribute would satisfy the
     precedent test's assertions but not these, and a MagicMock timeout_val
     would blow up the ``'timeout=%.0fs'`` log-format call in ``_invoke``).
     ``scheduler.update_task`` is replaced with an ``AsyncMock`` so the
@@ -629,15 +630,26 @@ class TestInvokeRecordsPlanShape:
             seen_shapes.append(route_inputs.plan_shape)
             return real_resolve_route(route_inputs, config)
 
-        with patch('orchestrator.workflow.resolve_route', side_effect=_spy):
-            await _invoke_implementer(wf, tmp_path)
+        def _replan_mid_invocation(*_args, **_kwargs) -> AgentResult:
+            wf.plan = {'steps': [{}] * 3}
+            wf.modules = ['c']
+            return _stub_agent_result()
 
-        (shape,) = seen_shapes
-        assert shape is not None
+        with (
+            patch('orchestrator.workflow.resolve_route', side_effect=_spy),
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(side_effect=_replan_mid_invocation),
+            ),
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
+
+        assert seen_shapes == [PlanShape(7, ('a', 'b'))]
         (entry,) = _routing_decision_entries(rec)
-        assert (entry['data']['plan_steps'], entry['data']['plan_modules']) == (
-            shape.step_count, len(shape.module_paths),
-        )
+        assert (entry['data']['plan_steps'], entry['data']['plan_modules']) == (7, 2)
+        latest = wf.task['metadata']['routing']['latest']
+        assert (latest['plan_steps'], latest['plan_modules']) == (7, 2)
 
 
 class TestSelectModelForRoleRetired:
