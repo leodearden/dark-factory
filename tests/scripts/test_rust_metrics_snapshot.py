@@ -10,6 +10,8 @@ import importlib.metadata
 import json
 import os
 import platform
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,8 @@ from quality_snapshot_fixtures import BASE_FILES, committed_repo, run_snapshot
 from quality_snapshot_identity import below_run_id_and_cost
 from rust_snapshot_fixtures import (
     FIXTURE_RULES_TOML,
+    RUST_CYCLE_FILES,
+    RUST_WORKSPACE_FILES,
     rust_workspace_repo,
     tool_shims,
     write_fixture_rules,
@@ -29,6 +33,7 @@ from rust_snapshot_fixtures import (
 
 REPO_ROOT = Path(__file__).parents[2]
 REIFY_RULES = REPO_ROOT / 'scripts' / 'rust_metrics_rules' / 'reify.toml'
+INSTRUMENT_SCRIPT = REPO_ROOT / 'scripts' / 'rust_metrics_snapshot.py'
 
 
 class TestReifyRules:
@@ -211,6 +216,26 @@ class TestTheMeasurement:
         for out in outs:
             text = out.read_text(encoding='utf-8')
             assert not [tree for tree in trees if str(tree) in text]
+
+    def test_processes_with_different_hash_seeds_measure_identically(
+        self, tmp_path: Path, fixture_rules: Path
+    ) -> None:
+        repo = rust_workspace_repo(tmp_path, {**RUST_WORKSPACE_FILES, **RUST_CYCLE_FILES})
+        outs = []
+        for seed in range(4):
+            out = tmp_path / 'out' / f'{seed}.json'
+            argv = ['--rules', str(fixture_rules), '--run-id', f'r{seed}', '--out', str(out), '--root', str(repo)]
+            completed = subprocess.run(
+                [sys.executable, str(INSTRUMENT_SCRIPT), *argv],
+                env={**os.environ, 'PYTHONHASHSEED': str(seed)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert completed.returncode == 0, completed.stderr
+            outs.append(out)
+        assert len(json.loads(outs[0].read_text(encoding='utf-8'))['import_graph']['cycles']) == 2
+        assert [below_run_id_and_cost(out) for out in outs[1:]] == [below_run_id_and_cost(outs[0])] * 3
 
 
 class TestLoadSnapshot:

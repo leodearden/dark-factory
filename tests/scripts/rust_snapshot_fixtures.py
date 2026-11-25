@@ -129,13 +129,23 @@ RUST_WORKSPACE_FILES: dict[str, str] = {
     'crates/app/src/main.rs': 'use core::classify;\n\nfn main() {\n    let _ = classify(true, false);\n}\n',
 }
 
+#: Two module cycles in core, a <-> b and c <-> d, both entered from lib.rs, so the order
+#: Tarjan's walk finds them in follows the iteration order of lib.rs's successor set.
+RUST_CYCLE_FILES: dict[str, str] = {
+    'crates/core/src/lib.rs': 'mod a;\nmod b;\nmod c;\nmod d;\n\nuse crate::a::A;\nuse crate::c::C;\n',
+    'crates/core/src/a.rs': 'use crate::b::B;\n\npub struct A;\n',
+    'crates/core/src/b.rs': 'use crate::a::A;\n\npub struct B;\n',
+    'crates/core/src/c.rs': 'use crate::d::D;\n\npub struct C;\n',
+    'crates/core/src/d.rs': 'use crate::c::C;\n\npub struct D;\n',
+}
+
 _COMMITTER = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
 
 
-def rust_workspace_repo(tmp_path: Path) -> Path:
-    """A committed Cargo workspace under *tmp_path* (no pyproject.toml) whose one branch is main."""
+def rust_workspace_repo(tmp_path: Path, files: dict[str, str] = RUST_WORKSPACE_FILES) -> Path:
+    """A committed Cargo workspace of *files* under *tmp_path* (no pyproject.toml) whose one branch is main."""
     root = tmp_path / 'repo'
-    for relpath, text in RUST_WORKSPACE_FILES.items():
+    for relpath, text in files.items():
         target = root / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding='utf-8')

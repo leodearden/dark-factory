@@ -5,8 +5,8 @@ The Rust shape of /review-all's Phase 1 instrument (SKILL.md Phase 1), for a pro
 that is not a Python uv-workspace and so cannot run scripts/quality_metrics_snapshot.py.
 First written for reify's first run (review-all-reify-20261010); measured there:
 2,901 files / 1.99M lines in 5m25s, 195 files at or over 2,000 lines. That run's
-import-graph figures predate the module pre-registration in main() and under-read
-every `use` of a file that sorts after its importer.
+import-graph figures predate the module pre-registration in _cargo_modules() and
+under-read every `use` of a file that sorts after its importer.
 
 A report, never a gate: measures and the two heuristic-14 marks only. Mirrors the
 shape of dark-factory's scripts/quality_metrics_snapshot.py (file records + import
@@ -40,7 +40,8 @@ them in params.rules so the report can cite them.
 Needs tokei, cargo and git on PATH; lizard runs as `python -m lizard` under the measuring
 interpreter, which records its version.
 
-    --rules RULES.toml --run-id ID --out DIR --root WORKTREE   measure HEAD
+    --rules RULES.toml --run-id ID --out FILE --root WORKTREE  measure HEAD into one JSON
+                                                               file, the summary on stdout
     --rules RULES.toml --params                                the params a measurement here records
 
 Exit 0 when done; exit 2 on an instrument failure, with the cause named on stderr.
@@ -61,6 +62,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import tomllib
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
@@ -68,7 +70,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import _checkout as _checkout
 import source_measures
+
+from shared import safe_io
+
+SCHEMA_VERSION = 2
+INSTRUMENT = 'rust-metrics-snapshot'
 
 H14_SOFT = 1500
 H14_ALARM = 2000
@@ -451,30 +459,30 @@ class RustModules:
         return None
 
 
-def _measure(args: argparse.Namespace, rules: RustRules) -> int:
-    params = measurement_params(rules)
-    root = Path(args.root).resolve()
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    head = source_measures.head_commit(root)
-    if _run(['git', 'status', '--porcelain', '--untracked-files=no'], root).stdout.strip():
-        print('dirty domain: tracked changes in the pinned worktree', file=sys.stderr)
-        sys.exit(2)
+@dataclasses.dataclass(frozen=True)
+class _Domain:
+    paths: tuple[str, ...]
+    unmapped: tuple[str, ...]
 
-    tracked = _run(['git', 'ls-files'], root).stdout.split('\n')
-    domain = []
-    for p in tracked:
+
+def _domain(root: Path, rules: RustRules) -> _Domain:
+    """The tracked source files the rules keep and map to an area, in git's order; and those left unmapped."""
+    kept = []
+    for p in _run(['git', 'ls-files'], root).stdout.split('\n'):
         if not p or rules.excluded(p):
             continue
         ext = os.path.splitext(p)[1]
         if ext in SRC_EXT or p.startswith('hooks/'):
             if p.startswith('hooks/') and p.endswith('.sample'):
                 continue
-            domain.append(p)
-    unmapped = sorted(p for p in domain if rules.area_of(p) is None)
-    domain = [p for p in domain if rules.area_of(p) is not None]
+            kept.append(p)
+    return _Domain(
+        paths=tuple(p for p in kept if rules.area_of(p) is not None),
+        unmapped=tuple(sorted(p for p in kept if rules.area_of(p) is None)),
+    )
 
-    # ---- cargo members
+
+def _cargo_modules(root: Path, domain: Sequence[str]) -> RustModules:
     meta = json.loads(_run(['cargo', 'metadata', '--no-deps', '--format-version', '1'], root).stdout)
     members = {}
     for pkg in meta['packages']:
@@ -486,8 +494,14 @@ def _measure(args: argparse.Namespace, rules: RustRules) -> int:
     for p in domain:
         if p.endswith('.rs'):
             rm.register(p)
+    return rm
 
-    # ---- tokei
+
+_TokeiStats = tuple[int, int, int, str]
+
+
+def _tokei_stats(root: Path) -> dict[str, _TokeiStats]:
+    """Per file: (code, comments, blanks, language), embedded blobs folded in."""
     tok = json.loads(_run(['tokei', '-f', '-o', 'json', '.'], root).stdout)
     tstats = {}
     for lang, blob in tok.items():
@@ -502,9 +516,21 @@ def _measure(args: argparse.Namespace, rules: RustRules) -> int:
                 com += sub['comments']
                 bl += sub['blanks']
             tstats[name] = (code, com, bl, lang)
+    return tstats
 
-    # ---- lizard
-    lz_dirs = sorted({p.split('/')[0] if '/' not in p else p.split('/')[0] for p in domain})
+
+_FunctionRow = tuple[int, str, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _LizardRun:
+    rows: Mapping[str, list[_FunctionRow]]
+    stderr: str
+
+
+def _lizard_rows(root: Path, domain: Sequence[str], rules: RustRules) -> _LizardRun:
+    """Per file, each function's (CCN, name, NLOC) in lizard's order; its stderr lines sorted, as -t 8 interleaves them."""
+    lz_dirs = sorted({p.split('/')[0] for p in domain})
     lz_cmd = [sys.executable, '-m', 'lizard', '--csv', '-t', '8']
     for pattern in rules.lizard_excludes:
         lz_cmd += ['-x', pattern]
@@ -521,8 +547,10 @@ def _measure(args: argparse.Namespace, rules: RustRules) -> int:
         f = row[6]
         f = f[2:] if f.startswith('./') else f
         fn_rows[f].append((ccn, row[7], nloc))
+    return _LizardRun(rows=fn_rows, stderr='\n'.join(sorted(lz.stderr.splitlines())))
 
-    # ---- fix density
+
+def _fix_density(root: Path, head: str, rules: RustRules) -> Counter[str]:
     fixlog = _run(
         [
             'git',
@@ -537,133 +565,215 @@ def _measure(args: argparse.Namespace, rules: RustRules) -> int:
         ],
         root,
     ).stdout
-    fix_density = Counter(name for name in fixlog.split('\n') if name)
+    return Counter(name for name in fixlog.split('\n') if name)
 
-    # ---- per-file records + Rust imports
+
+_Edge = tuple[str, str, list[str], int, bool, bool]  # (from_mod, to_mod, names, line, deferred, is_pub)
+
+
+@dataclasses.dataclass
+class _Gathered:
+    """What the per-file pass collects across files: import edges, and the inputs of Rust test reach."""
+
+    edges: list[_Edge] = dataclasses.field(default_factory=list)
+    test_tokens_by_crate: defaultdict[str, set[str]] = dataclasses.field(default_factory=lambda: defaultdict(set))
+    internal_pubs: dict[str, set[str]] = dataclasses.field(default_factory=dict)  # path -> names
+
+
+@dataclasses.dataclass(frozen=True)
+class _FileInputs:
+    """The per-file measures taken over the whole tree before any file is read."""
+
+    rules: RustRules
+    modules: RustModules
+    tstats: Mapping[str, _TokeiStats]
+    fn_rows: Mapping[str, list[_FunctionRow]]
+    fix_density: Counter[str]
+    domain: frozenset[str]
+
+
+def _new_record(p: str, raw: str, inputs: _FileInputs) -> dict[str, Any]:
+    lines = raw.count('\n') + (0 if raw.endswith('\n') or not raw else 1)
+    code, com, bl, lang = inputs.tstats.get(p, (None, None, None, None))
+    prose = (com / (code + com)) if code is not None and com is not None and (code + com) else None
+    rows = inputs.fn_rows.get(p, [])
+    ccn_max, ccn_fn = max(((c, f) for c, f, _ in rows), default=(0, None))
+    return dict(
+        path=p,
+        area=inputs.rules.area_of(p),
+        kind='tests' if inputs.rules.is_test(p) else 'src',
+        lang=lang or os.path.splitext(p)[1].lstrip('.'),
+        lines=lines,
+        code=code,
+        comments=com,
+        blanks=bl,
+        prose_ratio=prose,
+        functions=len(rows),
+        ccn_max=ccn_max,
+        ccn_max_fn=ccn_fn,
+        ccn_total=sum(c for c, _, _ in rows),
+        fix_density=inputs.fix_density.get(p, 0),
+        embedded_test_lines=0,
+        module=None,
+        fan_in_src=0,
+        fan_out=0,
+        reach_back_imports=0,
+        deferred_imports=0,
+        cycle_closing_imports=0,
+        reexport_names=[],
+        private_patch_targets=[],
+        internal_pub_items=0,
+    )
+
+
+_INTERNAL_PUB_RE = re.compile(
+    r'pub\((?:crate|super)\)\s+(?:unsafe\s+)?(?:fn|struct|enum|type|const|static|trait|mod)\s+(\w+)'
+)
+_HIDDEN_PUB_RE = re.compile(
+    r'#\[doc\(hidden\)\]\s*pub\s+(?:unsafe\s+)?(?:fn|struct|enum|type|const|static|trait|mod)\s+(\w+)'
+)
+_TOKEN_RE = re.compile(r'\b[a-z_][a-z0-9_]{3,}\b')
+
+
+def _rust_fields(rec: dict[str, Any], raw: str, modules: RustModules, gathered: _Gathered) -> None:
+    p = rec['path']
+    mod = modules.register(p)
+    rec['module'] = mod
+    clean = strip_rust_noise(raw)
+    body, tl, test_raw = split_test_mod(clean, raw)
+    rec['embedded_test_lines'] = tl
+    # impl-block spread: Rust couples files through `impl Type` blocks, not `use`, so the
+    # use-graph under-reads it; count impl targets per file and later how many files share one
+    rec['impl_types'] = dict(
+        Counter(
+            m.group(1)
+            for m in re.finditer(r'^\s*impl(?:<[^>]*>)?\s+(?:[\w:<>, ]+\s+for\s+)?([A-Z]\w*)', body, re.M)
+        )
+    )
+    if rec['kind'] == 'src':
+        names = set(_INTERNAL_PUB_RE.findall(body)) | set(_HIDDEN_PUB_RE.findall(body))
+        gathered.internal_pubs[p] = names
+        rec['internal_pub_items'] = len(names)
+    crate = mod.split('::')[0] if mod else None
+    if crate:
+        toks = set(_TOKEN_RE.findall(test_raw)) if test_raw else set()
+        if rec['kind'] == 'tests':
+            toks |= set(_TOKEN_RE.findall(raw))
+        gathered.test_tokens_by_crate[crate] |= toks
+    if mod:
+        for _stmt, is_pub, deferred, line, tree in scan_uses(body):
+            leaves = expand_use(tree)
+            if is_pub:
+                rec['reexport_names'].extend(leaf.split('::')[-1] for leaf in leaves)
+            targets = defaultdict(list)
+            for leaf in leaves:
+                t = modules.resolve(mod, leaf)
+                if t and t != mod:
+                    targets[t].append(leaf.split('::')[-1])
+            for t, names_ in targets.items():
+                gathered.edges.append((mod, t, names_, line, deferred, is_pub))
+
+
+def _ts_fields(rec: dict[str, Any], raw: str, domain: frozenset[str], gathered: _Gathered) -> None:
+    p = rec['path']
+    rec['module'] = p
+    for m in re.finditer(
+        r'''(?:import|export)\s[^;]*?from\s+['"](\.{1,2}/[^'"]+)['"]|import\(\s*['"](\.{1,2}/[^'"]+)['"]''', raw
+    ):
+        spec = m.group(1) or m.group(2)
+        target = os.path.normpath(os.path.join(os.path.dirname(p), spec))
+        cands = [target + e for e in ('', '.ts', '.tsx', '/index.ts', '/index.tsx')]
+        t = next((c for c in cands if c in domain), None)
+        line = raw.count('\n', 0, m.start()) + 1
+        deferred = m.group(2) is not None
+        if t and t != p:
+            gathered.edges.append((p, t, [], line, deferred, m.group(0).startswith('export')))
+    if rec['kind'] == 'tests':
+        rec['private_patch_targets'] = sorted(set(re.findall(r'''vi\.(?:mock|spyOn|doMock)\(\s*['"]?([\w./@-]+)''', raw)))
+
+
+def _py_fields(rec: dict[str, Any], raw: str) -> None:
+    rec['module'] = rec['path']
+    if rec['kind'] == 'tests':
+        rec['private_patch_targets'] = sorted(set(re.findall(r'''patch(?:\.object)?\(\s*['"]([\w.]+)['"]''', raw)))
+
+
+def _file_records(root: Path, paths: Sequence[str], inputs: _FileInputs) -> tuple[dict[str, dict[str, Any]], list[_Edge]]:
+    """Per readable domain file, its record; and every import edge between the files."""
     records = {}
-    edges = []  # (from_mod, to_mod, names, line, deferred, is_pub)
-    test_tokens_by_crate = defaultdict(set)
-    internal_pubs = {}  # path -> set(names)
-    for p in domain:
-        full = root / p
+    gathered = _Gathered()
+    for p in paths:
         try:
-            raw = full.read_text(encoding='utf-8', errors='replace')
+            raw = (root / p).read_text(encoding='utf-8', errors='replace')
         except OSError:
             continue
-        lines = raw.count('\n') + (0 if raw.endswith('\n') or not raw else 1)
-        code, com, bl, lang = tstats.get(p, (None, None, None, None))
-        prose = (com / (code + com)) if code is not None and (code + com) else None
-        rows = fn_rows.get(p, [])
-        ccn_max, ccn_fn = max(((c, f) for c, f, _ in rows), default=(0, None))
-        rec: dict[str, Any] = dict(
-            path=p,
-            area=rules.area_of(p),
-            kind='tests' if rules.is_test(p) else 'src',
-            lang=lang or os.path.splitext(p)[1].lstrip('.'),
-            lines=lines,
-            code=code,
-            comments=com,
-            blanks=bl,
-            prose_ratio=prose,
-            functions=len(rows),
-            ccn_max=ccn_max,
-            ccn_max_fn=ccn_fn,
-            ccn_total=sum(c for c, _, _ in rows),
-            fix_density=fix_density.get(p, 0),
-            embedded_test_lines=0,
-            module=None,
-            fan_in_src=0,
-            fan_out=0,
-            reach_back_imports=0,
-            deferred_imports=0,
-            cycle_closing_imports=0,
-            reexport_names=[],
-            private_patch_targets=[],
-            internal_pub_items=0,
-        )
+        rec = _new_record(p, raw, inputs)
         if p.endswith('.rs'):
-            mod = rm.register(p)
-            rec['module'] = mod
-            clean = strip_rust_noise(raw)
-            body, tl, test_raw = split_test_mod(clean, raw)
-            rec['embedded_test_lines'] = tl
-            # impl-block spread: Rust couples files through `impl Type` blocks, not `use`, so the
-            # use-graph under-reads it; count impl targets per file and later how many files share one
-            rec['impl_types'] = dict(
-                Counter(
-                    m.group(1)
-                    for m in re.finditer(r'^\s*impl(?:<[^>]*>)?\s+(?:[\w:<>, ]+\s+for\s+)?([A-Z]\w*)', body, re.M)
-                )
-            )
-            if rec['kind'] == 'src':
-                names = set(
-                    re.findall(
-                        r'pub\((?:crate|super)\)\s+(?:unsafe\s+)?(?:fn|struct|enum|type|const|static|trait|mod)\s+(\w+)',
-                        body,
-                    )
-                )
-                names |= set(
-                    re.findall(
-                        r'#\[doc\(hidden\)\]\s*pub\s+(?:unsafe\s+)?(?:fn|struct|enum|type|const|static|trait|mod)\s+(\w+)',
-                        body,
-                    )
-                )
-                internal_pubs[p] = names
-                rec['internal_pub_items'] = len(names)
-            crate = mod.split('::')[0] if mod else None
-            if crate:
-                toks = set(re.findall(r'\b[a-z_][a-z0-9_]{3,}\b', test_raw)) if test_raw else set()
-                if rec['kind'] == 'tests':
-                    toks |= set(re.findall(r'\b[a-z_][a-z0-9_]{3,}\b', raw))
-                test_tokens_by_crate[crate] |= toks
-            if mod:
-                for _stmt, is_pub, deferred, line, tree in scan_uses(body):
-                    leaves = expand_use(tree)
-                    if is_pub:
-                        rec['reexport_names'].extend(leaf.split('::')[-1] for leaf in leaves)
-                    targets = defaultdict(list)
-                    for leaf in leaves:
-                        t = rm.resolve(mod, leaf)
-                        if t and t != mod:
-                            targets[t].append(leaf.split('::')[-1])
-                    for t, names_ in targets.items():
-                        edges.append((mod, t, names_, line, deferred, is_pub))
+            _rust_fields(rec, raw, inputs.modules, gathered)
         elif p.endswith(('.ts', '.tsx', '.mjs')):
-            rec['module'] = p
-            for m in re.finditer(
-                r'''(?:import|export)\s[^;]*?from\s+['"](\.{1,2}/[^'"]+)['"]|import\(\s*['"](\.{1,2}/[^'"]+)['"]''', raw
-            ):
-                spec = m.group(1) or m.group(2)
-                target = os.path.normpath(os.path.join(os.path.dirname(p), spec))
-                cands = [target + e for e in ('', '.ts', '.tsx', '/index.ts', '/index.tsx')]
-                t = next((c for c in cands if c in set(domain)), None)
-                line = raw.count('\n', 0, m.start()) + 1
-                deferred = m.group(2) is not None
-                if t and t != p:
-                    edges.append((p, t, [], line, deferred, m.group(0).startswith('export')))
-            if rec['kind'] == 'tests':
-                rec['private_patch_targets'] = sorted(
-                    set(re.findall(r'''vi\.(?:mock|spyOn|doMock)\(\s*['"]?([\w./@-]+)''', raw))
-                )
+            _ts_fields(rec, raw, inputs.domain, gathered)
         elif p.endswith('.py'):
-            rec['module'] = p
-            if rec['kind'] == 'tests':
-                rec['private_patch_targets'] = sorted(
-                    set(re.findall(r'''patch(?:\.object)?\(\s*['"]([\w.]+)['"]''', raw))
-                )
+            _py_fields(rec, raw)
         records[p] = rec
-
     # Rust tests-reaching-internals: internal pub names referenced from tests of the same crate
-    for p, names in internal_pubs.items():
+    for p, names in gathered.internal_pubs.items():
         crate = records[p]['module'].split('::')[0]
-        reached = sorted(n for n in names if n in test_tokens_by_crate.get(crate, set()))
+        reached = sorted(n for n in names if n in gathered.test_tokens_by_crate.get(crate, set()))
         records[p]['private_patch_targets'] = reached
+    return records, gathered.edges
 
-    # ---- graph measures
-    mod_of = {}
-    for r in records.values():
-        if r['module']:
-            mod_of[r['module']] = r
+
+def _sccs(graph: Mapping[str, set[str]]) -> list[list[str]]:
+    """The strongly connected components of more than one node (Tarjan), each sorted and in sorted order.
+
+    Sorting the list matters: the walk's discovery order follows set iteration, which
+    hash randomisation varies per process, and a snapshot must not.
+    """
+    index, low, on, stack, result, idx = {}, {}, set(), [], [], [0]
+    sys.setrecursionlimit(100000)
+
+    def strong(v):
+        index[v] = low[v] = idx[0]
+        idx[0] += 1
+        stack.append(v)
+        on.add(v)
+        for w in graph.get(v, ()):
+            if w not in index:
+                strong(w)
+                low[v] = min(low[v], low[w])
+            elif w in on:
+                low[v] = min(low[v], index[w])
+        if low[v] == index[v]:
+            comp = []
+            while True:
+                w = stack.pop()
+                on.discard(w)
+                comp.append(w)
+                if w == v:
+                    break
+            if len(comp) > 1:
+                result.append(sorted(comp))
+
+    nodes = set(graph) | {w for ws in graph.values() for w in ws}
+    for v in sorted(nodes):
+        if v not in index:
+            strong(v)
+    return sorted(result)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Graph:
+    cycles: list[list[str]]
+    hidden: list[list[str]]
+    reach_back: list[dict[str, Any]]
+    deferred: list[dict[str, Any]]
+    impl_spread: list[tuple[int, str, str]]  # (files, crate, type), widest first
+
+
+def _edge_pass(
+    edges: Sequence[_Edge], mod_of: Mapping[str, dict[str, Any]]
+) -> tuple[defaultdict[str, set[str]], defaultdict[str, set[str]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Top-level and all edges; reach-back and deferred entries; each record's fan-in, fan-out and counts."""
     top_edges = defaultdict(set)
     all_edges = defaultdict(set)
     reach_back = []
@@ -687,56 +797,14 @@ def _measure(args: argparse.Namespace, rules: RustRules) -> int:
             deferred.append(dict(**{'from': frm, 'to': to, 'line': line, 'imports': names[:8], 'closes_cycle': False}))
             if frm in mod_of:
                 mod_of[frm]['deferred_imports'] += 1
-
-    def sccs(graph):
-        index, low, on, stack, result, idx = {}, {}, set(), [], [], [0]
-        sys.setrecursionlimit(100000)
-
-        def strong(v):
-            index[v] = low[v] = idx[0]
-            idx[0] += 1
-            stack.append(v)
-            on.add(v)
-            for w in graph.get(v, ()):
-                if w not in index:
-                    strong(w)
-                    low[v] = min(low[v], low[w])
-                elif w in on:
-                    low[v] = min(low[v], index[w])
-            if low[v] == index[v]:
-                comp = []
-                while True:
-                    w = stack.pop()
-                    on.discard(w)
-                    comp.append(w)
-                    if w == v:
-                        break
-                if len(comp) > 1:
-                    result.append(sorted(comp))
-
-        nodes = set(graph) | {w for ws in graph.values() for w in ws}
-        for v in sorted(nodes):
-            if v not in index:
-                strong(v)
-        return result
-
-    cycles = sccs(top_edges)
-    full_cycles = sccs(all_edges)
-    top_sets = [set(c) for c in cycles]
-    hidden = [c for c in full_cycles if not any(set(c) <= s for s in top_sets)]
-    comp_of = {}
-    for c in full_cycles:
-        for m in c:
-            comp_of[m] = id(c)
-    for d in deferred:
-        if comp_of.get(d['from']) is not None and comp_of.get(d['from']) == comp_of.get(d['to']):
-            d['closes_cycle'] = True
-            if d['from'] in mod_of:
-                mod_of[d['from']]['cycle_closing_imports'] += 1
     for m, r in mod_of.items():
         r['fan_in_src'] = len(fan_in.get(m, ()))
         r['fan_out'] = len(fan_out.get(m, ()))
-    # impl spread: for each (crate, Type) the set of src files holding an impl block for it
+    return top_edges, all_edges, reach_back, deferred
+
+
+def _impl_spread(records: Mapping[str, dict[str, Any]]) -> list[tuple[int, str, str]]:
+    """Per record, its widest-spread impl type; overall, each (crate, Type) whose impl blocks span 4+ src files."""
     impl_files = defaultdict(set)
     for r in records.values():
         if r.get('impl_types') and r['kind'] == 'src' and r['module']:
@@ -749,10 +817,34 @@ def _measure(args: argparse.Namespace, rules: RustRules) -> int:
         spread = {t: len(impl_files[(crate, t)]) for t in r['impl_types']} if crate else {}
         r['impl_spread'] = max(spread.values(), default=0)
         r['impl_spread_type'] = max(spread, key=lambda t: spread[t]) if spread else None
-    snapshot_impl_spread = sorted(((len(v), k[0], k[1]) for k, v in impl_files.items() if len(v) >= 4), reverse=True)
+    return sorted(((len(v), k[0], k[1]) for k, v in impl_files.items() if len(v) >= 4), reverse=True)
 
-    # ---- aggregates
-    per_area: defaultdict[str | None, Counter[str]] = defaultdict(Counter)
+
+def _graph_measures(records: Mapping[str, dict[str, Any]], edges: Sequence[_Edge]) -> _Graph:
+    mod_of = {}
+    for r in records.values():
+        if r['module']:
+            mod_of[r['module']] = r
+    top_edges, all_edges, reach_back, deferred = _edge_pass(edges, mod_of)
+    cycles = _sccs(top_edges)
+    full_cycles = _sccs(all_edges)
+    top_sets = [set(c) for c in cycles]
+    hidden = [c for c in full_cycles if not any(set(c) <= s for s in top_sets)]
+    comp_of = {m: number for number, c in enumerate(full_cycles) for m in c}
+    for d in deferred:
+        if comp_of.get(d['from']) is not None and comp_of.get(d['from']) == comp_of.get(d['to']):
+            d['closes_cycle'] = True
+            if d['from'] in mod_of:
+                mod_of[d['from']]['cycle_closing_imports'] += 1
+    return _Graph(cycles=cycles, hidden=hidden, reach_back=reach_back, deferred=deferred, impl_spread=_impl_spread(records))
+
+
+def _prose_ratio(counts: Mapping[str, int]) -> float | None:
+    return round(counts['comments'] / (counts['code'] + counts['comments']), 3) if (counts['code'] + counts['comments']) else None
+
+
+def _per_area(records: Mapping[str, dict[str, Any]], fn_rows: Mapping[str, list[_FunctionRow]]) -> dict[str, Counter[str]]:
+    per_area: defaultdict[str, Counter[str]] = defaultdict(Counter)
     for r in records.values():
         c = per_area[r['area']]
         c['files'] += 1
@@ -773,73 +865,157 @@ def _measure(args: argparse.Namespace, rules: RustRules) -> int:
         c['ccn_total'] += r['ccn_total']
         c['fns_ccn_over_15'] += sum(1 for ccn, _, _ in fn_rows.get(r['path'], []) if ccn > 15)
         c['functions'] += r['functions']
+    return per_area
+
+
+def _cycles_by_area(cycles: Sequence[list[str]], modules: RustModules, records: Mapping[str, dict[str, Any]]) -> Counter[str]:
+    return Counter(records[modules.module_file[c[0]]]['area'] for c in cycles if c[0] in modules.module_file)
+
+
+_IMPORT_GRAPH_NOTE = (
+    'nodes are Rust module paths (crate::a::b) or TS/py file paths; Rust intra-crate module cycles '
+    'are legal and common, so cycles measure layering not compile errors'
+)
+
+
+def take_snapshot(root: Path, *, run_id: str, rules: RustRules) -> dict[str, Any]:
+    """Measure *root*'s HEAD under *rules* as a SCHEMA_VERSION snapshot."""
+    started = time.monotonic()
+    params = measurement_params(rules)
+    head = source_measures.head_commit(root)
+    if _run(['git', 'status', '--porcelain', '--untracked-files=no'], root).stdout.strip():
+        print('dirty domain: tracked changes in the pinned worktree', file=sys.stderr)
+        sys.exit(2)
+    domain = _domain(root, rules)
+    modules = _cargo_modules(root, domain.paths)
+    lizard = _lizard_rows(root, domain.paths, rules)
+    inputs = _FileInputs(
+        rules=rules,
+        modules=modules,
+        tstats=_tokei_stats(root),
+        fn_rows=lizard.rows,
+        fix_density=_fix_density(root, head, rules),
+        domain=frozenset(domain.paths),
+    )
+    records, edges = _file_records(root, domain.paths, inputs)
+    graph = _graph_measures(records, edges)
+    per_area = _per_area(records, lizard.rows)
     totals: Counter[str] = Counter()
     for c in per_area.values():
         totals.update(c)
-    prose_by_area = {
-        area: round(c['comments'] / (c['code'] + c['comments']), 3) if (c['code'] + c['comments']) else None
-        for area, c in per_area.items()
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'instrument': INSTRUMENT,
+        'run_id': run_id,
+        'as_of_sha': head,
+        'evidence': {
+            'complete': True,
+            'unreadable': [],
+            'domain_files': len(records),
+            'unmapped_paths': list(domain.unmapped),
+            'lizard_stderr': lizard.stderr[-2000:],
+        },
+        'cost': {'wall_clock_s': round(time.monotonic() - started, 1)},
+        'params': params,
+        'files': sorted(records.values(), key=lambda r: r['path']),
+        'import_graph': {
+            'edges': sorted({(f, t) for f, t, *_ in edges}),
+            'reach_back': graph.reach_back,
+            'deferred': graph.deferred,
+            'cycles': graph.cycles,
+            'hidden_cycles': graph.hidden,
+            'typing_cycles': [],
+            'note': _IMPORT_GRAPH_NOTE,
+        },
+        'per_area': {area: dict(c, prose_ratio=_prose_ratio(c)) for area, c in per_area.items()},
+        'cycles_by_area': dict(_cycles_by_area(graph.cycles, modules, records)),
+        'totals': dict(totals, prose_ratio=_prose_ratio(totals)),
+        'impl_spread': [{'files': n, 'crate': c, 'type': t} for n, c, t in graph.impl_spread],
     }
-    total_prose = round(totals['comments'] / (totals['code'] + totals['comments']), 3)
-    cyc_by_area = Counter(records[rm.module_file[c[0]]]['area'] for c in cycles if c[0] in rm.module_file)
 
-    snapshot = dict(
-        schema='review-all-reify-rust-1',
-        instrument='rust_metrics_snapshot.py (lead-authored, Phase 1)',
-        run_id=args.run_id,
-        as_of_sha=head,
-        root=str(root),
-        params=params,
-        evidence=dict(
-            complete=True,
-            unreadable=[],
-            domain_files=len(records),
-            unmapped_paths=unmapped,
-            lizard_stderr=lz.stderr[-2000:],
-        ),
-        files=sorted(records.values(), key=lambda r: r['path']),
-        import_graph=dict(
-            edges=sorted({(f, t) for f, t, *_ in edges}),
-            reach_back=reach_back,
-            deferred=deferred,
-            cycles=cycles,
-            hidden_cycles=hidden,
-            typing_cycles=[],
-            note='nodes are Rust module paths (crate::a::b) or TS/py file paths; Rust intra-crate module cycles are legal and common, so cycles measure layering not compile errors',
-        ),
-        per_area={k: dict(v, prose_ratio=prose_by_area[k]) for k, v in per_area.items()},
-        cycles_by_area=dict(cyc_by_area),
-        totals=dict(totals, prose_ratio=total_prose),
-        impl_spread=[dict(files=n, crate=c, type=t) for n, c, t in snapshot_impl_spread],
-    )
-    (out / 'snapshot.json').write_text(json.dumps(snapshot, indent=1))
-    (out / 'import_graph.json').write_text(json.dumps(snapshot['import_graph']))
 
-    # ---- summary (<=4k chars)
+def summary_text(snapshot: Mapping[str, Any]) -> str:
+    """The snapshot's headline, per-area table, top CCN files and widest impl spreads."""
+    totals = Counter(snapshot['totals'])
+    graph = snapshot['import_graph']
+    cyc_by_area = snapshot['cycles_by_area']
     s = []
     s.append(
-        f"metrics snapshot {args.run_id} @ {head[:10]} — {len(records)} files, {totals['lines']} lines (prose share {total_prose}), "
+        f"metrics snapshot {snapshot['run_id']} @ {snapshot['as_of_sha'][:10]} — {len(snapshot['files'])} files, {totals['lines']} lines (prose share {totals['prose_ratio']}), "
         f"{totals['functions']} functions, {totals['fns_ccn_over_15']} with CCN>15; files >= {H14_ALARM} lines: {totals['alarm_files']}, {H14_SOFT}-{H14_ALARM}: {totals['soft_files']}; "
-        f"module cycles (SCCs>1): {len(cycles)}, hidden: {len(hidden)}; reach-back imports: {totals['reach_back_imports']}; deferred: {totals['deferred_imports']} ({totals['cycle_closing_imports']} close a cycle); re-exports: {totals['reexports']}; test->internal reaches: {totals['patch_targets']}. No previous snapshot; since = none. Instruments: lizard CCN (not cognitive), tokei prose. Line counts set read budgets only (quality doc: Do not steer by)."
+        f"module cycles (SCCs>1): {len(graph['cycles'])}, hidden: {len(graph['hidden_cycles'])}; reach-back imports: {totals['reach_back_imports']}; deferred: {totals['deferred_imports']} ({totals['cycle_closing_imports']} close a cycle); re-exports: {totals['reexports']}; test->internal reaches: {totals['patch_targets']}. No previous snapshot; since = none. Instruments: lizard CCN (not cognitive), tokei prose. Line counts set read budgets only (quality doc: Do not steer by)."
     )
     s.append(
         'area | files | lines | src/tests/embedded-test lines | prose | fns CCN>15 | alarm/soft files | cycles | reach-back | cycle-closing deferred | re-exports | test reaches'
     )
-    for area, c in sorted(per_area.items(), key=lambda kv: -kv[1]['lines']):
+    for area, row in sorted(snapshot['per_area'].items(), key=lambda kv: -kv[1]['lines']):
+        c = Counter(row)
         s.append(
-            f"{area} | {c['files']} | {c['lines']} | {c['src_lines']}/{c['tests_lines']}/{c['embedded_test_lines']} | {prose_by_area[area]} | {c['fns_ccn_over_15']} | {c['alarm_files']}/{c['soft_files']} | {cyc_by_area.get(area, 0)} | {c['reach_back_imports']} | {c['cycle_closing_imports']} | {c['reexports']} | {c['patch_targets']}"
+            f"{area} | {c['files']} | {c['lines']} | {c['src_lines']}/{c['tests_lines']}/{c['embedded_test_lines']} | {c['prose_ratio']} | {c['fns_ccn_over_15']} | {c['alarm_files']}/{c['soft_files']} | {cyc_by_area.get(area, 0)} | {c['reach_back_imports']} | {c['cycle_closing_imports']} | {c['reexports']} | {c['patch_targets']}"
         )
     s.append('top files by per-function CCN max (max / file total / fn):')
-    for r in sorted(records.values(), key=lambda r: -r['ccn_max'])[:12]:
+    for r in sorted(snapshot['files'], key=lambda r: -r['ccn_max'])[:12]:
         s.append(f"  {r['path']} {r['ccn_max']}/{r['ccn_total']} {r['ccn_max_fn']}")
     s.append(
         'types whose impl blocks are spread over the most src files (crate Type files) — Rust couples files through impl blocks, invisible to the use-graph:'
     )
-    s.append('  ' + '; '.join(f"{c} {t} {n}" for n, c, t in snapshot_impl_spread[:12]))
-    summary = '\n'.join(s)
-    (out / 'metrics_summary.txt').write_text(summary)
-    print(summary[:4000])
-    print(f"\nunmapped paths: {len(unmapped)}", file=sys.stderr)
+    s.append('  ' + '; '.join(f"{e['crate']} {e['type']} {e['files']}" for e in snapshot['impl_spread'][:12]))
+    return '\n'.join(s)
+
+
+_PARAMS_KEYS = (
+    'tokei_version',
+    'lizard_version',
+    'python_version',
+    'instrument',
+    'h14_soft_ceiling_lines',
+    'h14_alarm_lines',
+    'rules',
+)
+
+
+def _invalid(path: Path, field: str, found: object, expected: str) -> source_measures.MetricsError:
+    return source_measures.MetricsError(f'{path}: {field} is {found!r}, not {expected}')
+
+
+def load_snapshot(path: Path) -> dict[str, Any]:
+    """The snapshot file at *path*, its identity fields checked; else a MetricsError naming the path and the field."""
+    try:
+        snapshot = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise source_measures.MetricsError(f'{path}: could not be read -- {exc.__class__.__name__}: {exc}') from exc
+    except json.JSONDecodeError as exc:
+        raise source_measures.MetricsError(f'{path}: is not JSON -- {exc}') from exc
+    if not isinstance(snapshot, dict):
+        raise _invalid(path, 'the top level', type(snapshot).__name__, 'an object')
+    if snapshot.get('instrument') != INSTRUMENT:
+        raise _invalid(path, 'instrument', snapshot.get('instrument'), repr(INSTRUMENT))
+    if snapshot.get('schema_version') != SCHEMA_VERSION:
+        raise _invalid(path, 'schema_version', snapshot.get('schema_version'), str(SCHEMA_VERSION))
+    if not isinstance(snapshot.get('as_of_sha'), str):
+        raise _invalid(path, 'as_of_sha', snapshot.get('as_of_sha'), 'a string')
+    params = snapshot.get('params')
+    if not isinstance(params, dict):
+        raise _invalid(path, 'params', type(params).__name__, 'an object')
+    missing = [key for key in _PARAMS_KEYS if key not in params]
+    if missing:
+        raise source_measures.MetricsError(f'{path}: params records no {", ".join(missing)}')
+    return snapshot
+
+
+def _write(out: Path, text: str) -> None:
+    try:
+        safe_io.atomic_write_text(out, text, mkdir=True)
+    except OSError as exc:
+        raise source_measures.MetricsError(f'{out}: could not be written -- {exc.__class__.__name__}: {exc}') from exc
+
+
+def _measure(args: argparse.Namespace, rules: RustRules) -> int:
+    snapshot = take_snapshot(Path(args.root).resolve(), run_id=args.run_id, rules=rules)
+    _write(Path(args.out), json.dumps(snapshot, indent=2) + '\n')
+    print(summary_text(snapshot)[:4000])
+    unmapped = snapshot['evidence']['unmapped_paths']
+    print(f'\nunmapped paths: {len(unmapped)}', file=sys.stderr)
     for u in unmapped[:40]:
         print('  ', u, file=sys.stderr)
     return 0
@@ -860,7 +1036,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--rules', required=True, help="The project's rules TOML file.")
     parser.add_argument('--run-id', help="The measuring run's id, recorded as run_id.")
-    parser.add_argument('--out', help='Where to write the snapshot.')
+    parser.add_argument('--out', help='Where to write the snapshot JSON file.')
     parser.add_argument('--root', help='The checkout to measure.')
     parser.add_argument(
         '--params',
