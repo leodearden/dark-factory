@@ -4,8 +4,8 @@ SCOPE, stated precisely because the honest boundary is narrower than the
 invariant one would want.  This module sweeps every committed unit whose start
 runs ``uv run``: in its ExecStart, or one level down, in the checkout's shell
 wrapper its ExecStart executes (read as text by shell_uv_run_sites, never run).
-A second arm sweeps every non-test ``*.sh`` the checkout lists, by content,
-whether or not a unit runs it.
+A second arm sweeps every non-test ``*.sh`` in git's index (a staged script
+counts, an untracked one does not), by content, whether or not a unit runs it.
 It does NOT follow a wrapper's own callees, a wrapper not named ``*.sh``, a uv
 the wrapper reaches through a variable whose name never mentions uv, or a
 ``*_CMD`` seam a unit overrides through ``Environment=`` (no committed unit
@@ -48,7 +48,7 @@ import subprocess
 from collections.abc import Callable
 
 import pytest
-from git_listing import git, listed_files
+from git_listing import git, tracked_files
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_logical_lines import logical_lines
 from systemd_unit_invariants import (
@@ -452,14 +452,14 @@ def discover_uv_run_units() -> list[str]:
 
 
 def discover_uv_run_scripts(root: pathlib.Path = REPO_ROOT) -> list[str]:
-    """*root*-relative paths of every non-test shell script git lists that runs `uv run`.
+    """*root*-relative paths of every non-test shell script git's index holds that runs `uv run`.
 
     An UnreadableShellUvRun INCLUDES the path rather than skipping it, for the
-    reasons discover_uv_run_units gives.  listed_files raises on a git failure,
+    reasons discover_uv_run_units gives.  tracked_files raises on a git failure,
     so discovery never silently answers [].
     """
     scripts = []
-    for path in listed_files(root, *_NON_TEST_SHELL_SCRIPTS):
+    for path in tracked_files(root, *_NON_TEST_SHELL_SCRIPTS):
         rel_path = path.relative_to(root).as_posix()
         try:
             if not script_uv_run_sites(rel_path, root):
@@ -590,7 +590,7 @@ def test_script_discovery_covers_every_known_uv_run_script() -> None:
     assert discovered, (
         "discovery found no shell script running `uv run` at all, so the "
         "parametrized sweeps below would check no script and report green. "
-        f"Check that git lists the checkout's *.sh files (REPO_ROOT={REPO_ROOT})."
+        f"Check that git's index holds the checkout's *.sh files (REPO_ROOT={REPO_ROOT})."
     )
     missing = _EXPECTED_UV_RUN_SCRIPTS - discovered
     extra = discovered - _EXPECTED_UV_RUN_SCRIPTS
@@ -607,7 +607,8 @@ def test_script_discovery_covers_every_known_uv_run_script() -> None:
         "carries the same obligation, so add it to the constant. A script whose "
         "`uv run` this scan cannot read also lands here, deliberately (see "
         "discover_uv_run_scripts); its own case below names the defect. A test "
-        "fixture belongs under a tests/ directory, which discovery excludes."
+        "fixture belongs under a tests/ directory, which discovery excludes. "
+        "Discovery reads git's index, so an untracked script never lands here."
     )
 
 
