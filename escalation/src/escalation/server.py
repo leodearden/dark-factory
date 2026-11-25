@@ -22,18 +22,12 @@ from shared.eval_lane import eval_lane_provenance
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
 # not pull fastmcp into every consumer of the base layer.
-from shared.markup_residue_custody import (
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
-    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
-    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
-)
+from shared.markup_residue_custody import ResidueCall, residue_prose
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
     MARKUP_RECURRENCE_ROUTING,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
-    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -1073,62 +1067,21 @@ def _emit_uuid_prefix_fact(fact: dict[str, Any]) -> None:
 
 
 def _markup_residue_prose(record: dict[str, Any]) -> str:
-    """What actually happened to the call, in the reader's own terms.
+    """What happened to the call and to its payload, as one paragraph.
 
-    DISPATCHED ON ``error_type``, never assumed, because this sink receives two
-    residue kinds whose triage is OPPOSITE and this server is the only site that
-    produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
-    REFUSED — nothing was written, and the caller was told, so a human may
-    reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
-    means the call was FORWARDED without the parameter, and nobody was bounced:
-    no retry is coming (``MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT``), and
-    whether the call then succeeded is unknown here
-    (``MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT`` says why).  One
-    hardcoded "the call was refused" sentence renders the second kind a record
-    that contradicts its own summary three lines above, and the false half is
-    the half that changes what an operator does.
-
-    ``shared.mcp_markup_middleware`` names the kinds precisely so a sink written
-    when only the refusal existed cannot silently mis-file the newer one; this
-    is that sink, matching the set rather than a single name.
-
-    An UNRECOGNISED kind is filed anyway, with a visibly-hedged body that
-    renders the middleware's own ``summary`` and ``suggested_action`` — the same
-    posture ``orchestrator.mcp.markup_sink`` takes.  Dropping a record kind is
-    the silent fail-soft this PRD exists to end, and an unfamiliar record in the
-    queue is a question an operator can answer.
+    The words are ``shared/src/shared/markup_residue_custody.py::residue_prose``'s.
+    A kind it has no text for is still filed, hedged, and also logged here, so
+    an unfamiliar record is visible in the log as well as in the queue.
     """
-    error_type = record.get('error_type')
-    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
-        return (
-            'THE CALL WAS REFUSED. The leaked fragment\'s own boundary could '
-            'not be determined, so no repair was attempted and nothing was '
-            'guessed. ' + MARKUP_REFUSAL_CUSTODY_CAVEAT
+    prose = residue_prose(record)
+    if prose.call is ResidueCall.UNRECOGNISED:
+        logger.warning(
+            'markup guard: filing an unrecognised residue kind %r — the '
+            'middleware emits something this sink does not know about '
+            '(known: %s)',
+            record.get('error_type'), sorted(MARKUP_RESIDUE_ERROR_TYPES),
         )
-    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
-        return (
-            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER. The value below '
-            'was recovered from the leak but could not be typed against the '
-            'parameter\'s declared schema, so it was dropped from the call '
-            'rather than passed through untyped. '
-            f'{MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT} '
-            f'{MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT}'
-        )
-    logger.warning(
-        'markup guard: filing an unrecognised residue kind %r — the middleware '
-        'emits something this sink does not know about (known: %s)',
-        error_type, sorted(MARKUP_RESIDUE_ERROR_TYPES),
-    )
-    return '\n'.join([
-        f'UNRECOGNISED RESIDUE KIND {error_type!r}. This sink does not know '
-        'what this call\'s outcome was, so it states neither — the middleware '
-        'grew a record kind that escalation/src/escalation/server.py has not '
-        'been taught. Its own words for what happened follow; treat them, not '
-        'this paragraph, as the account of the call.',
-        '',
-        f'summary: {record.get("summary")!r}',
-        f'suggested_action: {record.get("suggested_action")!r}',
-    ])
+    return f'{prose.outcome} {prose.custody}'
 
 
 # INV-4 storm escape for root-cause OVER-FOLDING (task 3998).  Canonicalising
