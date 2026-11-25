@@ -2994,6 +2994,7 @@ time, rather than silently matching nothing (or everything).
 | `min_routing_tier` | The task's persisted routing-tier counter is at least this value |
 | `min_dispatch_count` | The task's dispatch count is at least this value |
 | `simple_saturated` | The task's routing metadata's `simple_saturated` flag equals this bool |
+| `split` | `{salt, buckets, bucket}`: the task is in arm `bucket` of a `buckets`-way split keyed on a salted sha256 of its task id (`shared/src/shared/routing_split.py::split_bucket`); an invocation with no task id is in no arm. `buckets >= 2` and `0 <= bucket < buckets` are checked at load and reload. The arm is not recorded on the event: it is recomputed from (salt, task id) |
 
 `set` (all optional — a rule may set any subset; unset fields fall through
 to the next-lower layer):
