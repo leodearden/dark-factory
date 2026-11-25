@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from typing import Final
 
 from orchestrator.config import VerifyCacheConfig
 from orchestrator.verify_cache.keys import UnitKey
@@ -15,6 +16,8 @@ from orchestrator.verify_cache.registry import Candidate, Entry, Registry, Regis
 from orchestrator.verify_evidence import Leg
 
 logger = logging.getLogger(__name__)
+
+NEVER_CACHE_REFUSAL: Final = 'the module is never-cache'
 
 
 class Decision(StrEnum):
@@ -146,7 +149,7 @@ def _refusal(mode: CacheMode, role: VerifyRole, leg: LegResult) -> str | None:
     if mode is CacheMode.OFF:
         return f'verify cache is off for the {role} role'
     if leg.never_cache:
-        return 'the module is never-cache'
+        return NEVER_CACHE_REFUSAL
     if leg.trivial:
         return 'a trivial verify ran nothing'
     if leg.rc != 0:

@@ -23,7 +23,13 @@ from orchestrator.verify_cache.recorder import (
 )
 from orchestrator.verify_cache.registry import Candidate, KillSwitch, Registry, RegistryView
 from orchestrator.verify_cache.wire import optional_field, typed_field, wire_fields
-from orchestrator.verify_evidence import UnitOutcome, VerifyUnit, module_unit_ids
+from orchestrator.verify_evidence import (
+    Leg,
+    UnitOutcome,
+    VerifyUnit,
+    module_leg_name,
+    module_unit_ids,
+)
 from orchestrator.verify_spec_shared import VerifyCommand
 
 logger = logging.getLogger(__name__)
@@ -82,6 +88,13 @@ class ShippedView:
 def planned_unit_ids(commands: Iterable[VerifyCommand]) -> tuple[str, ...]:
     """The units a remote verify of *commands* can key: every set leg of every command, and the tree."""
     return (*(unit_id for command in commands for unit_id in module_unit_ids(command.prefix, command)), TREE_UNIT_ID)
+
+
+def never_cache_unit_ids(commands: Iterable[VerifyCommand]) -> frozenset[str]:
+    """Every leg's unit id, set or not, of each never-cache command among *commands*."""
+    return frozenset(
+        module_leg_name(command.prefix, leg) for command in commands if command.verify_cache == 'never' for leg in Leg
+    )
 
 
 async def ship_view(
@@ -148,14 +161,20 @@ class RemoteCache:
         units: Sequence[VerifyUnit] | None,
         report: CacheReport | None,
         *,
+        never_cache: frozenset[str],
         landing_sha: str | None,
     ) -> RemoteSettlement:
         """Back every replay among *units* against the live registry, consuming the backing
         entries for *landing_sha* when there is one (I6), and rebuild the record of *report*
-        under the mode *view* shipped. Never raises; the caller maps the outcome to a verdict."""
-        record = None if view is None or report is None else report.record(role, self.modes.with_mode(role, view.mode))
+        under the mode *view* shipped. This is also the dispatcher's own check of the
+        never-cache rule: a unit of *never_cache*, and the tree beside any, neither replays
+        nor records, whatever the runner reports. Never raises; the caller maps the outcome
+        to a verdict."""
+        record = None if view is None or report is None else report.record(
+            role, self.modes.with_mode(role, view.mode), never_cache=never_cache,
+        )
         claimed = _claimed_replays(units, report)
-        refused = _refused(view, role, claimed)
+        refused = _refused(view, role, claimed, never_cache)
         if refused is not None:
             return RemoteSettlement(record, refused)
         if record is None:
@@ -180,10 +199,18 @@ def _claimed_replays(units: Sequence[VerifyUnit] | None, report: CacheReport | N
     )
 
 
-def _refused(view: ShippedView | None, role: VerifyRole, claimed: Sequence[UnbackedReplay]) -> ConsumeOutcome | None:
+def _refused(
+    view: ShippedView | None, role: VerifyRole, claimed: Sequence[UnbackedReplay], never_cache: frozenset[str],
+) -> ConsumeOutcome | None:
     """Why no replay among *claimed* can be backed, whatever the registry holds; None when each may be."""
     if not claimed:
         return None
+    never = [
+        replay for replay in claimed
+        if replay.unit_id in never_cache or (never_cache and replay.unit_id == TREE_UNIT_ID)
+    ]
+    if never:
+        return ConsumeOutcome.refused(never, 'a never-cache module cannot replay')
     if view is None:
         return ConsumeOutcome.refused(claimed, f'no view was shipped to the {role} verify, so it could replay nothing')
     if view.mode is not CacheMode.ON:

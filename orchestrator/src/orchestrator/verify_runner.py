@@ -103,7 +103,12 @@ from orchestrator.verify_cache.recorder import (
     report_of,
 )
 from orchestrator.verify_cache.registry import Registry
-from orchestrator.verify_cache.remote_view import RemoteCache, ShippedView, planned_unit_ids
+from orchestrator.verify_cache.remote_view import (
+    RemoteCache,
+    ShippedView,
+    never_cache_unit_ids,
+    planned_unit_ids,
+)
 from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
@@ -1840,16 +1845,22 @@ class RemoteRunner:
         cache: RemoteCache | None,
         view: ShippedView | None,
         role: VerifyRole,
+        commands: Sequence[VerifyCommand | None],
         result: VerifyResult,
         *,
         landing_sha: str | None,
     ) -> VerifyResult:
         """*result* once *cache* has backed each replay it claims against the live registry,
         consuming them for *landing_sha* before the verdict returns (I6), carrying the record
-        the dispatcher records its greens from (I8). Unchanged outside the cache."""
+        the dispatcher records its greens from (I8), with the never-cache modules of the
+        dispatcher's own *commands* refused again. Unchanged outside the cache."""
         if cache is None:
             return result
-        settlement = await cache.settle(view, role, result.units, result.cache_report, landing_sha=landing_sha)
+        settlement = await cache.settle(
+            view, role, result.units, result.cache_report,
+            never_cache=never_cache_unit_ids(command for command in commands if command is not None),
+            landing_sha=landing_sha,
+        )
         if not settlement.outcome.backs_every_hit:
             result = self._unbacked(result, role, settlement.outcome)
         return dataclasses.replace(result, cache_record=settlement.record)
@@ -1914,8 +1925,9 @@ class RemoteRunner:
             _RemoteArchiveTarget(archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID, 'merge')
             if archive_root is not None and task_id is not None else None
         )
+        commands = (*spec.verify_commands, spec.global_verify_command)
         view = await self._shipped_view(
-            verify_cache, 'merge', (*spec.verify_commands, spec.global_verify_command),
+            verify_cache, 'merge', commands,
             lambda shipped: self._verify_command(
                 'verify-merge', merge_sha, request_id, spec_to_json(dataclasses.replace(spec, verify_cache=shipped)),
             ),
@@ -1938,7 +1950,7 @@ class RemoteRunner:
                         self.name, spec, result, merge_sha, outcome.duration_ms,
                     ),
                 )
-        return await self._settled(verify_cache, view, 'merge', result, landing_sha=merge_sha)
+        return await self._settled(verify_cache, view, 'merge', commands, result, landing_sha=merge_sha)
 
     async def run_task_verify(
         self,
@@ -1975,8 +1987,9 @@ class RemoteRunner:
             if archive_root is not None else None
         )
         request_id = self._id_factory()
+        commands = (*spec.verify_commands, spec.global_verify_command)
         view = await self._shipped_view(
-            verify_cache, 'task', (*spec.verify_commands, spec.global_verify_command),
+            verify_cache, 'task', commands,
             lambda shipped: self._verify_command(
                 'verify-task', spec.tip_sha, request_id,
                 task_spec_to_json(dataclasses.replace(spec, verify_cache=shipped)),
@@ -2005,7 +2018,7 @@ class RemoteRunner:
             worktree_log_paths=[],
             archive_log_paths=[str(path) for path in archived],
         )
-        return await self._settled(verify_cache, view, 'task', result, landing_sha=None)
+        return await self._settled(verify_cache, view, 'task', commands, result, landing_sha=None)
 
     async def _push_main_mirror(self, *, task_id: str | None, event_store: Any) -> None:
         """Step 0 (best-effort): push main FIRST so the remote has a fresh view of it.

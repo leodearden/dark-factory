@@ -31,7 +31,8 @@ class LegRun:
 @dataclass(frozen=True)
 class RecordedUnit:
     """A settled unit, its key, the leg that ran it, and the entry it replayed or would have.
-    *admission* is a verdict on recording it reached where its leg ran (A5), when it was."""
+    *admission* is a verdict reached before the recorder runs, either where the leg ran (A5)
+    or the dispatcher's never-cache refusal."""
 
     unit: VerifyUnit
     key: UnitKey | None
@@ -49,8 +50,8 @@ class ReportedUnit:
     admission: Admission | None
     entry: Candidate | None
 
-    def recorded(self) -> RecordedUnit:
-        return RecordedUnit(self.unit, self.key, None, self.entry, self.admission)
+    def recorded(self, admission: Admission | None) -> RecordedUnit:
+        return RecordedUnit(self.unit, self.key, None, self.entry, admission)
 
 
 @dataclass(frozen=True)
@@ -60,12 +61,16 @@ class CacheReport:
     units: tuple[ReportedUnit, ...]
     tree: ReportedUnit | None
 
-    def record(self, role: VerifyRole, modes: VerifyCacheConfig) -> CacheRecord:
-        """This report as a settled record of *role* under *modes*; no leg ran on this host."""
+    def record(self, role: VerifyRole, modes: VerifyCacheConfig, *, never_cache: frozenset[str]) -> CacheRecord:
+        """This report as a settled record of *role* under *modes*; no leg ran on this host.
+        Each unit of *never_cache* is refused whatever the runner admitted, and any of them
+        in the verify refuses the tree."""
+        never = Admission(False, policy.NEVER_CACHE_REFUSAL)
+        tree_refusal = Admission(False, 'a never-cache module was in the verify') if never_cache else None
         return CacheRecord(
             role=role, modes=modes, legs=(),
-            units=tuple(unit.recorded() for unit in self.units),
-            tree=None if self.tree is None else self.tree.recorded(),
+            units=tuple(unit.recorded(never if unit.unit.unit in never_cache else unit.admission) for unit in self.units),
+            tree=None if self.tree is None else self.tree.recorded(tree_refusal),
         )
 
 
@@ -242,6 +247,8 @@ def _tree_admission(
     ]
     if record.modes.mode_for(record.role) is CacheMode.OFF:
         return Admission(False, f'verify cache is off for the {record.role} role')
+    if record.tree is not None and record.tree.admission is not None and not record.tree.admission.admitted:
+        return record.tree.admission
     if record.tree is None or record.tree.key is None:
         return Admission(False, 'the tree unit has no key')
     if record.tree.unit.outcome is UnitOutcome.CACHE_HIT:
