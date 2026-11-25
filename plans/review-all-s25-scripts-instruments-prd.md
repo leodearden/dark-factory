@@ -571,8 +571,9 @@ Same-file leaves are chained by real edges.
   - Files: `fused-memory/src/fused_memory/server/manifest_stamping.py`,
     `scripts/audit_manifest_descriptor_drift.py`, `scripts/audit_delivered_checks.py`,
     `scripts/audit_combine_gate_marker_loss.py`, `shared/src/shared/delivered_check_polarity.py`,
-    `shared/tests/capability_manifest_corpus.py`, `fused-memory/tests/test_manifest_stamping.py`,
-    `scripts/tests/test_audit_delivered_checks.py`, `scripts/tests/test_audit_manifest_descriptor_drift.py`,
+    `shared/tests/cross_suite_helpers/capability_manifest_corpus.py`,
+    `fused-memory/tests/test_manifest_stamping.py`, `scripts/tests/test_audit_delivered_checks.py`,
+    `scripts/tests/test_audit_manifest_descriptor_drift.py`,
     `scripts/tests/test_audit_combine_gate_marker_loss.py`.
   - Work:
     - C3 consumers.
@@ -581,6 +582,8 @@ Same-file leaves are chained by real edges.
     - Both audits discover through `tracked_sidecar_paths`. `audit_delivered_checks.AuditCoverage`
       gains a discovery-failed field and a non-clean exit.
     - `audit_combine_gate_marker_loss`'s glob table uses `SIDECAR_SUFFIX`.
+    - `delivered_check_polarity._MANIFEST_SUFFIX` and the corpus helper's `MANIFEST_SUFFIX` use
+      `SIDECAR_SUFFIX`.
     - The stamper calls `sidecar_for`.
   - Signal: B6 and B7. Also, `python3 scripts/audit_delivered_checks.py --project-root <non-git dir>`
     prints a discovery-failed coverage row and exits non-zero instead of reporting a clean sweep.
