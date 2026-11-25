@@ -576,6 +576,9 @@ const MINUTE_MS = 60_000;
 
 // A Datum whose displayed age is 90 minutes, far from any boundary of
 // formatAge's minute granularity, as a poll that received it now would stamp it.
+// Each arm builds its Datum inside its own test: stamped at module load, the
+// receipt ages by however long the file's earlier tests ran, and a minute
+// boundary can then fall between StatTile's render and the expected view.
 function agedDatum(value, overrides) {
   const asOf = Date.parse(wireDatum(value).as_of);
   return wireDatum(value, {
@@ -586,17 +589,18 @@ function agedDatum(value, overrides) {
 }
 
 const DRAWN_DATUMS = [
-  { arm: 'a fresh Datum', datum: agedDatum(5) },
-  { arm: 'a fresh measured zero', datum: agedDatum(0) },
-  { arm: 'a stale Datum', datum: agedDatum(5, { state: 'stale', reason: 'the scheduler stopped answering' }) },
-  { arm: 'a lower_bound Datum', datum: agedDatum(5, { state: 'lower_bound', reason: 'the runs ledger starts later' }) },
-  { arm: 'an unknown Datum', datum: wireDatum(null, { state: 'unknown', reason: 'the map could not be read' }) },
+  { arm: 'a fresh Datum', makeDatum: () => agedDatum(5) },
+  { arm: 'a fresh measured zero', makeDatum: () => agedDatum(0) },
+  { arm: 'a stale Datum', makeDatum: () => agedDatum(5, { state: 'stale', reason: 'the scheduler stopped answering' }) },
+  { arm: 'a lower_bound Datum', makeDatum: () => agedDatum(5, { state: 'lower_bound', reason: 'the runs ledger starts later' }) },
+  { arm: 'an unknown Datum', makeDatum: () => wireDatum(null, { state: 'unknown', reason: 'the map could not be read' }) },
 ];
 
 const callerFormat = value => `${value} widgets`;
 
-for (const { arm, datum } of DRAWN_DATUMS) {
+for (const { arm, makeDatum } of DRAWN_DATUMS) {
   test(`charts.jsx::StatTile draws datumView's text, title and age over ${arm}`, t => {
+    const datum = makeDatum();
     const harness = openWindow(t);
     const { DF_CHARTS, DF_DATUM } = harness.window;
     const { container } = harness.mount(DF_CHARTS.StatTile, { label: 'L', datum, format: callerFormat });
