@@ -10,7 +10,8 @@ in each way a client must not mistake for success (:class:`StubAnswer`), and
 its first *unavailable_tool_calls* requests can be answered 503, as a gateway
 answers while the server behind it restarts. A *tools* handler can answer each
 OK ``tools/call`` by tool name and arguments, so a fake backend is served over
-the socket. :func:`tool_reply_body` is that OK answer's JSON-RPC body, for a
+the socket, and ``tools/list`` names the *listed_tools*, none by default.
+:func:`tool_reply_body` is that OK answer's JSON-RPC body, for a
 client-side fault injector whose one good reply cannot come from a socket.
 
 Real sockets rather than patching a client's modules: the session header, path
@@ -28,7 +29,7 @@ import functools
 import json
 import threading
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import MappingProxyType, TracebackType
@@ -122,8 +123,10 @@ class StubMcpServer:
         payload: Mapping[str, Any] = _DEFAULT_PAYLOAD,
         unavailable_tool_calls: int = 0,
         tools: ToolHandler | None = None,
+        listed_tools: Sequence[str] = (),
     ) -> None:
         self._stateful = stateful
+        self._listed_tools = tuple(listed_tools)
         self._answer = answer
         self._unavailable_left = unavailable_tool_calls
         self._payload_text = json.dumps(dict(payload))
@@ -287,7 +290,8 @@ class StubMcpServer:
         if method == 'initialize':
             return self._frame(message, self._initialize_result(message), session_id)
         if method == 'tools/list':
-            return self._frame(message, {'tools': []}, session_id)
+            listed = [{'name': name, 'inputSchema': {'type': 'object'}} for name in self._listed_tools]
+            return self._frame(message, {'tools': listed}, session_id)
         error = {'code': _METHOD_NOT_FOUND, 'message': 'Method not found'}
         return self._frame(message, None, session_id, error=error)
 
