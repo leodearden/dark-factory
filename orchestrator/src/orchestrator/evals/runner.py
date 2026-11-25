@@ -395,6 +395,18 @@ def _corpus_profile() -> CellProfile:
     return CellProfile(build_eval_orch_config, fixture_task_gate)
 
 
+WORKFLOW_CELL_TIMEOUT_MINUTES = 180
+"""A workflow cell verifies cold, and on a loaded host completed cells took 74 to 106 min."""
+
+ARCHITECT_CELL_TIMEOUT_MINUTES = 60
+"""A plan-only architect cell runs no verify."""
+
+
+def _cell_timeout_minutes(task: dict, timeout_override: float | None, default: float) -> float:
+    """The cell's wall-clock ceiling: the caller's override, else the fixture's timeout_minutes, else *default*."""
+    return timeout_override or task.get('timeout_minutes', default)
+
+
 async def run_eval(
     task_path: Path,
     config: EvalConfig,
@@ -588,6 +600,7 @@ async def _run_workflow_cell(
     (docs/eval-replay-frame.md). The wall clock includes worktree setup.
     """
     cell = f'{task["id"]} × {label}'
+    timeout_minutes = _cell_timeout_minutes(task, timeout_override, WORKFLOW_CELL_TIMEOUT_MINUTES)
     logger.info(f'Starting eval: {cell} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
     worktree, run_id = await _open_cell_worktree(task, worktree)
@@ -600,9 +613,7 @@ async def _run_workflow_cell(
             task, orch_config, worktree, initial_plan,
             replay_framed=replay_framed, usage_gate=gate, task_gate=task_gate,
         )
-        outcome = await _await_outcome(
-            workflow, timeout_override or task.get('timeout_minutes', 60), cell,
-        )
+        outcome = await _await_outcome(workflow, timeout_minutes, cell)
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
@@ -617,6 +628,7 @@ async def _run_workflow_cell(
             wall_clock_ms=wall_clock_ms,
             run_id=address.run_id,
             trial=trial,
+            timeout_minutes=timeout_minutes,
         )
         store.save(result)
     logger.info(
@@ -694,7 +706,7 @@ def _cell_workflow(
     return workflow
 
 
-async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: int, cell: str) -> str:
+async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: float, cell: str) -> str:
     """The workflow's terminal outcome; a timeout or a raise becomes the cell's outcome."""
     try:
         report = await asyncio.wait_for(workflow.run(), timeout=timeout_minutes * 60)
