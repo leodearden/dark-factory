@@ -1433,15 +1433,24 @@ def test_kill_holder_tree_sweeps_the_session_escaped_orphan_of_an_already_reaped
 
 
 def test_tagged_pids_finds_a_session_escaped_grandchild_and_nothing_else():
-    """tagged_pids(tag) names exactly one holder's tree, session escapes included."""
+    """tagged_pids(tag) names exactly one holder's tree, session escapes included.
+
+    The grandchild prints its own pid, so it is past its exec when probed: a
+    process mid-exec reads an empty environ (esc-6179-4), and one snapshot of
+    it would be no verdict.
+    """
     sleep_secs = f'273.{os.getpid() % 1000:03d}'
+    grandchild_source = (
+        'import os, time\n'
+        'print(os.getpid(), flush=True)\n'
+        f'time.sleep({sleep_secs})\n'
+    )
     leader = TaggedPopen(
         [
             sys.executable, '-c',
-            'import subprocess, time\n'
-            f'child = subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True, '
-            'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
-            'print(child.pid, flush=True)\n'
+            'import subprocess, sys, time\n'
+            f'subprocess.Popen([sys.executable, "-c", {grandchild_source!r}], '
+            'start_new_session=True, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
             'time.sleep(300)\n',
         ],
         stdout=subprocess.PIPE,
