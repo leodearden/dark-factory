@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
-from shared.defects import DefectStatus
+from shared.defects import DEFECT_TRANSITIONS, DefectStatus, DefectTrigger
 
 from client_feed.contract import DefectReported, DefectRuled, TaskStatus
 from client_feed.defect_ref import check_ref, portal_ref
@@ -53,7 +53,9 @@ MAX_BACKOFF_SECONDS: Final = 300
 _DEFERRED: Final = TaskStatus.DEFERRED
 _TERMINAL: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED})
 _CANCELLABLE_FIX: Final = frozenset({TaskStatus.PENDING, TaskStatus.DEFERRED})
-_UNWITHDRAWN: Final = frozenset({DefectStatus.OPEN, DefectStatus.PROVEN})
+_WITHDRAWABLE: Final = frozenset(
+    status for (status, trigger) in DEFECT_TRANSITIONS if trigger is DefectTrigger.DECLARE_CLOSURE and status is not None
+)
 
 
 class Unconverged(BaseModel):
@@ -288,10 +290,23 @@ def _pending_on_filer_withdrawal(fix: TaskView, ref: str) -> bool:
     return any(entry.get('ref') == ref and is_filer_withdrawal(entry) for entry in fix.defects)
 
 
+def _warn_out_of_reach(ref: str, fix: TaskView, defect_status: DefectStatus) -> None:
+    """A defect no closure may leave (proven, exempted, pending on another closure) takes no write; a withdrawn one is converged."""
+    if defect_status is not DefectStatus.WITHDRAWN:
+        logger.warning(
+            "%s: the defect on fix %s is %s; the ruling withdraws nothing and cancels the filer's tasks",
+            ref,
+            fix.task_id,
+            defect_status,
+        )
+
+
 def _withdraw(tools: ClosedTools, ref: str, fix: TaskView, defect_status: DefectStatus) -> bool:
     """Withdraw the fix's defect as not a defect and record Leo's acceptance; False once the store says the fix went terminal."""
-    withdraws = defect_status in _UNWITHDRAWN
+    withdraws = defect_status in _WITHDRAWABLE
     accepts = withdraws or (defect_status is DefectStatus.PENDING and _pending_on_filer_withdrawal(fix, ref))
+    if not accepts:
+        _warn_out_of_reach(ref, fix, defect_status)
     try:
         if withdraws:
             tools.declare_withdrawal(fix.task_id, withdrawal_event(ref))
