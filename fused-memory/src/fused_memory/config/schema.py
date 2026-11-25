@@ -3334,10 +3334,10 @@ class Mem0UpdateConfig(BaseModel):
         ),
     )
     metadata_patch_allowed_agent_prefixes: list[str] = Field(
-        default_factory=lambda: ['recon-stage-', 'curator-'],
+        default_factory=lambda: ['recon-stage-', 'curator-', 'link-heal-'],
         description=(
-            'agent_id prefixes authorized to PATCH METADATA in place. Ships '
-            'identical to the content-amend list but is independently '
+            'agent_id prefixes authorized to PATCH METADATA in place. Ships as '
+            'the content-amend list plus link-heal-, and is independently '
             'configurable, and that is the point: widening THIS list alone '
             'remains the supported way to admit a new interactive tagging flow '
             'without granting content-amend authority. A mistagged patch is '
@@ -3346,7 +3346,13 @@ class Mem0UpdateConfig(BaseModel):
             'this one: gate 3200 ratified retain-and-tag, whose folded entries '
             'are retained as topic-stamped peers via a metadata-only patch — '
             'content_amend alone would be the destructive half without the '
-            'preserving half. Green-tier hot-reloadable via reload_config.'
+            'preserving half. link-heal- admits the link-heal executor\'s '
+            'metadata-only heals (fused-memory/scripts/link_heal.py, agent_id '
+            'link-heal-<run8>; plans/write-triage-link-healing-prd.md H1, task '
+            '6181); task 6431 made it a schema default on this arm only, '
+            'mirroring curator-\'s 2026-08-12 ruling, so no config.yaml '
+            'override is needed on any deployment. Green-tier hot-reloadable '
+            'via reload_config.'
         ),
     )
     agent_prefix_sanctioned_use: dict[str, str] = Field(
