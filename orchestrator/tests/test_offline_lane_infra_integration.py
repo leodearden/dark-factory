@@ -69,7 +69,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import contextlib
 import inspect
 import logging
 from dataclasses import dataclass
@@ -80,6 +79,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _git_fixtures import SEED_REPO_MAX_GIT_SPAWNS, seed_repo
 from _lane_episode_fakes import Clock, FakeLedgerClient
+from _offline_lane_drive import await_lane_passes
 from _orch_helpers import (
     MEASURED_SPAWN_LATENCY_SECS,
     VERIFY_CLI_PER_TEST_TIMEOUT,
@@ -357,24 +357,16 @@ async def _run_lane(
     full passes (``_run_once`` calls) have COMPLETED, then cancel the loop
     task.
 
-    Wraps ``worker._run_once`` itself — NOT ``suite_runner``/``infra_runner``
-    alone — with a call counter, so ``done`` is only set once a pass,
-    INCLUDING its confirm, the engine's observe and any filing or
-    escalation it makes (numeric OR infra), has fully returned. Counting at
-    either detect seam instead would race the red path, which awaits real
-    I/O after detection returns. Restores the original ``_run_once`` in the
-    ``finally`` block so repeated calls (:func:`_drive_infra_pass` is called
-    up to six times per scenario) never nest counting wrappers.
+    The counting is ``_offline_lane_drive.py::await_lane_passes``, shared
+    with ``test_offline_lane_integration.py``: a pass counts only once it has
+    fully returned, INCLUDING its confirm, the engine's observe and any
+    filing or escalation it makes (numeric OR infra), and a pass that raises
+    fails the drive at once with its own exception. IB1 drives a single pass
+    via :func:`_run_one_lane_pass`; IB3-IB6 one per :func:`_drive_infra_pass`
+    call.
 
-    Adapted verbatim from ``test_offline_lane_integration.py``'s
-    ``_run_lane``, generalized from a fixed N=1 to an arbitrary pass count
-    (IB1's single pass via :func:`_run_one_lane_pass`; IB3-IB6 one per
-    :func:`_drive_infra_pass` call). Requires ``worker._dirty`` (or
-    the wake event) to already be set by a prior trigger, exactly as
-    production wiring would leave it.
-
-    ``timeout`` defaults to 30.0, not a tight bound: the clock starts at
-    ``asyncio.create_task`` above, so it also covers the real-git test-body
+    ``timeout`` defaults to 30.0, not a tight bound: the clock starts with
+    the drive, so it also covers the real-git test-body
     work the caller does between entering the held pass and releasing it
     (each :func:`_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` subprocess
     spawns — MEASURED, not hand-counted, by
@@ -420,26 +412,7 @@ async def _run_lane(
     was composition coverage (the override rule the preceding paragraph
     describes), not the bound value itself.
     """
-    inner_run_once = worker._run_once
-    done = asyncio.Event()
-    count = {'n': 0}
-
-    async def _counting_run_once():
-        result = await inner_run_once()
-        count['n'] += 1
-        if count['n'] >= expected_passes:
-            done.set()
-        return result
-
-    worker._run_once = _counting_run_once
-    task = asyncio.create_task(worker.run())
-    try:
-        await asyncio.wait_for(done.wait(), timeout=timeout)
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        worker._run_once = inner_run_once
+    await asyncio.wait_for(await_lane_passes(worker, expected_passes), timeout=timeout)
 
 
 async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = _LANE_PASS_BOUND_SECS) -> None:
@@ -644,6 +617,7 @@ _LANE_PASS_COMPOSING_HELPER_NAMES = frozenset(
         '_run_one_lane_pass',
         '_drive_infra_pass',
         '_assert_infra_never_a_gate',
+        'await_lane_passes',
     },
 )
 

@@ -59,7 +59,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import contextlib
 import inspect
 import logging
 import os
@@ -72,6 +71,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _git_fixtures import SEED_REPO_MAX_GIT_SPAWNS, seed_repo
 from _lane_episode_fakes import Clock, FakeLedgerClient
+from _offline_lane_drive import await_lane_passes
 from _orch_helpers import (
     MEASURED_SPAWN_LATENCY_SECS,
     VERIFY_CLI_PER_TEST_TIMEOUT,
@@ -136,7 +136,7 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 # `test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task`: 3 git
 # spawns from `_run_once` plus 2 real infra `run_all.sh` spawns. In THIS
 # module only B1-B3's injected-seam passes sit inside a `_run_lane` window;
-# red-path passes are awaited unbounded through `_await_lane_passes`. See
+# red-path passes are awaited unbounded through `await_lane_passes`. See
 # `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` for the
 # full derivation.
 _SPAWNS_PER_LANE_PASS_WORST_CASE = 5
@@ -331,46 +331,9 @@ async def _drive_advance(
     return base_sha, head_sha
 
 
-async def _await_lane_passes(worker: OfflineLaneWorker, expected_passes: int) -> None:
-    """Drive worker.run() as a real background task until *expected_passes*
-    full passes (``_run_once`` calls, so INCLUDING each pass's confirm, engine
-    observe and filing) have completed, then cancel the loop task.
-
-    A pass that raises fails here at once with its own exception, rather than
-    being swallowed into ``run()``'s fail-open backoff and retried. Requires
-    ``worker._dirty`` (or the wake event) to already be set by a prior trigger,
-    exactly as production wiring would leave it.
-    """
-    inner_run_once = worker._run_once
-    completed = asyncio.get_running_loop().create_future()
-    count = {'n': 0}
-
-    async def _counting_run_once():
-        try:
-            result = await inner_run_once()
-        except Exception as exc:
-            if not completed.done():
-                completed.set_exception(exc)
-            raise
-        count['n'] += 1
-        if count['n'] >= expected_passes and not completed.done():
-            completed.set_result(None)
-        return result
-
-    worker._run_once = _counting_run_once
-    task = asyncio.create_task(worker.run())
-    try:
-        await completed
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        worker._run_once = inner_run_once
-
-
 async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
-    """:func:`_await_lane_passes`, bounded at ``_LANE_PASS_BOUND_SECS`` (read at
-    call time).
+    """``_offline_lane_drive.py::await_lane_passes``, bounded at
+    ``_LANE_PASS_BOUND_SECS`` (read at call time).
 
     Modeled on ``test_offline_lane.py``'s
     ``test_loop_coalesces_to_exactly_one_rerun`` cancel-after-N pattern,
@@ -414,7 +377,7 @@ async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
     override, a rule ``test_every_composing_caller_carries_a_timeout_override``
     enforces rather than merely describes. This bound covers only B1-B3's
     injected-seam passes; a red-path pass runs real sub-runs and is awaited
-    unbounded through :func:`_await_lane_passes`.
+    unbounded through :func:`await_lane_passes`.
 
     The 30.0 value rests on task 3451's measurement above, not on the
     retracted task 3491 claim — narrowing it would re-introduce the flake
@@ -422,7 +385,7 @@ async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
     was composition coverage (the override rule the preceding paragraph
     describes), not the bound value itself.
     """
-    await asyncio.wait_for(_await_lane_passes(worker, expected_passes), timeout=_LANE_PASS_BOUND_SECS)
+    await asyncio.wait_for(await_lane_passes(worker, expected_passes), timeout=_LANE_PASS_BOUND_SECS)
 
 
 async def _run_one_lane_pass(worker: OfflineLaneWorker) -> None:
@@ -723,7 +686,7 @@ async def _drive_lane_pass(lane: _RedLane, target: str | None = None, *, minutes
 
     The pass is a real advance and the real on_merge_landed fan-out
     (:func:`_drive_advance`) followed by one full ``run()`` pass awaited to
-    completion with no wall-clock deadline (:func:`_await_lane_passes`), so a
+    completion with no wall-clock deadline (:func:`await_lane_passes`), so a
     caller carries its own ``@pytest.mark.timeout`` sized for its passes
     (enforced by ``test_every_composing_caller_carries_a_timeout_override``).
     """
@@ -731,7 +694,7 @@ async def _drive_lane_pass(lane: _RedLane, target: str | None = None, *, minutes
         (lane.control / 'test_target').write_text(target)
     lane.clock.advance(minutes=minutes)
     await _drive_advance(lane.harness, lane.project_root)
-    await _await_lane_passes(lane.worker, 1)
+    await await_lane_passes(lane.worker, 1)
     pass_id = lane.record().last_pass_id
     assert pass_id is not None, 'the engine records every pass it observes'
     record = lane.worker.records.load_pass(lane.command, pass_id)
@@ -772,7 +735,7 @@ def _materialized_worktree_names(worktree_base: Path) -> set[str]:
 # review remediation from "drives at least one `_run_lane`-bounded pass" to
 # that broader membership rule: `_run_lane` / `_run_one_lane_pass` each
 # compose `_LANE_PASS_BOUND_SECS`-bounded passes, `_drive_lane_pass` /
-# `_await_lane_passes` drive passes with no deadline of their own whose real
+# `await_lane_passes` drive passes with no deadline of their own whose real
 # work a marker must still cover, and `_assert_never_a_gate` composes its own `_NOTE_OFFLINE_LANE_BOUND_SECS` +
 # `_NOTE_MERGE_ALL_BOUND_SECS` pair (0.5 + 15.0 = 15.5s) without any lane
 # pass at all. Used by `_lane_pass_composing_callers` below to DISCOVER the
@@ -788,7 +751,7 @@ def _materialized_worktree_names(worktree_base: Path) -> set[str]:
 # default while requiring more than twice that.
 _LANE_PASS_COMPOSING_HELPER_NAMES = frozenset(
     {
-        '_run_lane', '_run_one_lane_pass', '_drive_lane_pass', '_await_lane_passes',
+        '_run_lane', '_run_one_lane_pass', '_drive_lane_pass', 'await_lane_passes',
         '_assert_never_a_gate',
     },
 )
@@ -1054,7 +1017,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     sit well under that shared worst case (the numeric `suite_runner` seam
     there is a bare injected callable, never a real subprocess); its
     red-path passes run real sub-runs and are awaited unbounded through
-    `_await_lane_passes`. The floor is still asserted here, AND additionally
+    `await_lane_passes`. The floor is still asserted here, AND additionally
     checked for equality against the infra module's own copy immediately
     below — the floor/ceiling relation alone permits any value in
     [5x measured spawn latency, 0.6x effective timeout] for EACH module
@@ -1446,7 +1409,7 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     calls.clear()
     with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
          patch(f'{__name__}._run', side_effect=_counting_run):
-        await _await_lane_passes(lane.worker, 1)
+        await await_lane_passes(lane.worker, 1)
 
     pass_id = lane.record().last_pass_id
     assert pass_id is not None, 'the engine records every pass it observes'
