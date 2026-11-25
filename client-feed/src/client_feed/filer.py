@@ -100,7 +100,7 @@ class _Outcome:
     record: RefRecord | None = None
 
 
-class _Held(Exception):
+class _RefusedWithRecord(Exception):
     """A refusal that leaves a ref unconverged, with the record the cursor keeps for the ref after it."""
 
     def __init__(self, refused: ToolRefused, record: RefRecord | None) -> None:
@@ -110,11 +110,11 @@ class _Held(Exception):
 
 
 @contextmanager
-def _holding(record: RefRecord | None) -> Iterator[None]:
+def _keeping_record(record: RefRecord | None) -> Iterator[None]:
     try:
         yield
     except ToolRefused as refused:
-        raise _Held(refused, record) from None
+        raise _RefusedWithRecord(refused, record) from None
 
 
 @dataclass(frozen=True)
@@ -132,11 +132,11 @@ def _ref_states(read: InboxRead, project_id: str) -> dict[str, _RefState]:
         if not isinstance(line, DefectReported | DefectRuled):
             continue
         ref = portal_ref(project_id, line.block, line.report)
-        held = states.get(ref, _RefState(report=None, ruled=False))
+        so_far = states.get(ref, _RefState(report=None, ruled=False))
         if isinstance(line, DefectRuled):
-            states[ref] = _RefState(report=held.report, ruled=True)
+            states[ref] = _RefState(report=so_far.report, ruled=True)
         else:
-            states[ref] = _RefState(report=held.report or line, ruled=held.ruled)
+            states[ref] = _RefState(report=so_far.report or line, ruled=so_far.ruled)
     return states
 
 
@@ -189,7 +189,7 @@ def _gate_and_commit(
     fix: TaskView,
     facts: ClientDefectFacts,
 ) -> None:
-    """Gate a fix still held deferred, then release it; a released fix is never gated after the fact.
+    """Gate a fix still deferred, then release it; a released fix is never gated after the fact.
 
     A fix released ahead of its gate (a per-id commit refusal, a crash mid-batch, a hand release)
     still has that gate released, so nothing the filer planned is left deferred.
@@ -212,8 +212,8 @@ def _gate_and_commit(
         gate_id, gate_status = tools.submit_planned(submission), _DEFERRED
     if gate_id is not None and gate_id not in fix.dependencies:
         tools.add_dependency(fix.task_id, gate_id)
-    held = [fix.task_id] + ([gate_id] if gate_id is not None and gate_status is _DEFERRED else [])
-    tools.commit_planning(held)
+    still_deferred = [fix.task_id] + ([gate_id] if gate_id is not None and gate_status is _DEFERRED else [])
+    tools.commit_planning(still_deferred)
 
 
 def _after_refusal(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
@@ -230,7 +230,7 @@ def _submitted(
     tools: ClosedTools, report: DefectReported, ref: str, filer: FilerPolicy, record: RefRecord | None
 ) -> _Filed:
     fallback = None if record is None else record.fallback
-    with _holding(record):
+    with _keeping_record(record):
         submission = fix_submission(report, ref=ref, priority=filer.fix_priority, fallback=fallback)
         task_id = tools.submit_planned(submission)
     return _Filed(_just_submitted(task_id), facts_of(report, fallback), record)
@@ -244,10 +244,10 @@ def _submit_fix(
         return _submitted(tools, report, ref, filer, record)
     try:
         return _submitted(tools, report, ref, filer, record)
-    except _Held as held:
-        record = _after_refusal(record, held.refused)
+    except _RefusedWithRecord as refusal:
+        record = _after_refusal(record, refusal.refused)
         if record is None or record.fallback is None:
-            raise _Held(held.refused, record) from None
+            raise _RefusedWithRecord(refusal.refused, record) from None
     return _submitted(tools, report, ref, filer, record)
 
 
@@ -255,7 +255,7 @@ def _filed_fix(
     tools: ClosedTools, report: DefectReported, ref: str, filer: FilerPolicy, record: RefRecord | None
 ) -> _Filed | None:
     """The ref's filer fix, submitted if the store holds none; None when the ref was filed by hand."""
-    with _holding(record):
+    with _keeping_record(record):
         carriers = [tools.get_task(carrier.task_id) for carrier in tools.lookup_defect_ref(ref)]
     mine = [view for view in carriers if view.source == FILER_IDENTITY]
     if carriers and not mine:
@@ -274,10 +274,10 @@ def converge_filing(
     try:
         filed = _filed_fix(tools, report, ref, filer, record)
         if filed is not None:
-            with _holding(filed.record):
+            with _keeping_record(filed.record):
                 _gate_and_commit(tools, report, ref, policy, filer, filed.fix, filed.facts)
-    except _Held as held:
-        return _Outcome(refused=_unconverged(ref, held.refused, held.record), record=held.record)
+    except _RefusedWithRecord as refusal:
+        return _Outcome(refused=_unconverged(ref, refusal.refused, refusal.record), record=refusal.record)
     return _Outcome()
 
 
