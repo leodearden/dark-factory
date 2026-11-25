@@ -365,8 +365,8 @@ class TestMintedPool:
     def test_ceilings_are_pinned_fixture_side(
         self, pool: list[dict], manifest: dict,
     ) -> None:
-        # runner.py reads both straight off the task record (task.get with
-        # the evals package's defaults), so pinning them is pure data — but
+        # The evals package reads both straight off the task record (task.get
+        # with its own defaults), so pinning them is pure data — but
         # EVERY fixture must carry them or that fixture silently runs at the
         # wrong ceiling.
         for f in pool:
