@@ -866,8 +866,9 @@ class TestSeedRegistryRealSource:
 
         Pins the description anchor from the other side: with an identical
         title to the legitimate-proposal case above, adding
-        "no escalation record exists" is sufficient to match the entry. The
-        pair together CHARACTERISES the anchor instead of sampling one side.
+        "gate_escalated_at but no escalation record" is sufficient to match the
+        entry. The pair together CHARACTERISES the anchor instead of sampling
+        one side.
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
 
@@ -884,6 +885,113 @@ class TestSeedRegistryRealSource:
             "them."
         )
         assert entry.name == "deterministic_gate_escalation_record_archived_not_missing"
+
+    _GATE_ESCALATION_ENTRY = "deterministic_gate_escalation_record_archived_not_missing"
+    _TASK_8211_TITLE = (
+        "Put the AgentFailureKind name into orchestrator agent-failure escalation "
+        "reasons so the steward can match its failure-kind guide deterministically"
+    )
+    _FOLLOWUP_BOILERPLATE = (
+        "Follow-up filed by task 6468's implementer during its review-amendment pass "
+        "(reviewer_comprehensive suggestion 6, design-coherence). No escalation record "
+        "exists for it."
+    )
+
+    def _gate_escalation_entry(self, entries):
+        return next(e for e in entries if e.name == self._GATE_ESCALATION_ENTRY)
+
+    def test_task_8211_followup_is_not_refuted_as_a_gate_absence_claim(self):
+        """Task 8211 was a code task the live guard would have refused (task 10112,
+        esc-task-curator-37's go-live watch list).
+
+        "No escalation record exists for it." is agent-followup boilerplate meaning
+        the follow-up carries no escalation id, not a claim that a gate's record is
+        missing. "deterministic" matched the adverb "deterministically" in its title.
+        So the bare "no escalation record exists" anchor became "that no escalation
+        record exists", and the title must also name the entry's subject, "gate".
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._TASK_8211_TITLE,
+            description=(
+                self._FOLLOWUP_BOILERPLATE
+                + " Agent-failure escalations from the orchestrator carry "
+                "AgentFailureClass.summary prose; kind.name never reaches the steward."
+            ),
+        )
+
+        matched = match_candidate(candidate, entries)
+        assert matched is None, f"8211 matched {matched.name if matched else None}"
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None
+
+    def test_followup_boilerplate_does_not_satisfy_the_description_anchor(self):
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._LEGITIMATE_PROPOSAL_TITLE,
+            description=self._FOLLOWUP_BOILERPLATE,
+        )
+
+        matched = match_candidate(candidate, entries)
+        assert matched is None, f"boilerplate matched {matched.name if matched else None}"
+
+        widened = dataclasses.replace(
+            self._gate_escalation_entry(entries),
+            description_substrings=["no escalation record exists"],
+        )
+        assert match_candidate(candidate, [widened]) is not None, (
+            "the candidate must pass the title gate, so the description anchor "
+            "alone is what protects it"
+        )
+
+    def test_gate_absence_phrasing_under_a_non_gate_title_does_not_match(self):
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._TASK_8211_TITLE,
+            description="task stamped gate_escalated_at but no escalation record exists",
+        )
+
+        matched = match_candidate(candidate, entries)
+        assert matched is None, f"non-gate title matched {matched.name if matched else None}"
+
+        widened = dataclasses.replace(
+            self._gate_escalation_entry(entries),
+            title_substrings=["deterministic", "escalation"],
+        )
+        assert match_candidate(candidate, [widened]) is not None, (
+            "the description must satisfy an anchor, so the title gate alone is "
+            "what protects the candidate"
+        )
+
+    def test_task_2807_absence_claim_still_matches(self):
+        """Recall control: the real recurrence the old bare anchor covered."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=(
+                "Investigate DeterministicRunner pure-gate escalation-filing silent "
+                "failure — task 2799 stamped gate_escalated_at with no matching "
+                "escalation record"
+            ),
+            description=(
+                "get_pending_escalations(level=2) also returned empty. This is a live, "
+                "authoritative confirmation (not a memory-search miss) that no "
+                "escalation record exists anywhere in the queue for this task."
+            ),
+        )
+
+        matched = match_candidate(candidate, entries)
+        assert matched is not None
+        assert matched.name == self._GATE_ESCALATION_ENTRY
 
     #: The name of the entry the four tests below are about, spelled once.
     _EXPIRED_AT_ENTRY = "valid_edge_query_expired_at_filter_refuted"
