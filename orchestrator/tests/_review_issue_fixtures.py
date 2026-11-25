@@ -6,10 +6,13 @@ ON_CONTRACT_VALUES here once, and every test fixture built below follows.
 
 from __future__ import annotations
 
+from shared.defects import IssueKind
+
 from orchestrator.review_issue_contract import IssueField, IssueSeverity
 
 ON_CONTRACT_VALUES: dict[IssueField, str] = {
     IssueField.SEVERITY: IssueSeverity.BLOCKING.value,
+    IssueField.KIND: IssueKind.DEFECT.value,
     IssueField.LOCATION: 'pkg/mod.py:3',
     IssueField.CATEGORY: 'correctness',
     IssueField.DESCRIPTION: 'the thing is broken',

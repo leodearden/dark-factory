@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from _review_issue_fixtures import contract_issue, contract_issue_without
 from fastmcp import Client, FastMCP
+from shared.defects import IssueKind
 from shared.mcp_markup_middleware import OUTCOMES as MARKUP_OUTCOMES
 
 from orchestrator.agents.roles import ALL_REVIEWERS
@@ -25,7 +26,7 @@ from orchestrator.mcp.verdict_tools import (
     _submit_triage,
     create_server,
 )
-from orchestrator.review_issue_contract import IssueField
+from orchestrator.review_issue_contract import REQUIRED_ISSUE_FIELDS, IssueField
 
 
 @pytest.fixture()
@@ -351,6 +352,26 @@ def _journal_lines(root: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
 
 
+def _review_server(artifacts: TaskArtifacts, journal_root: Path | None = None) -> FastMCP:
+    artifacts.write_plan({
+        'task_id': 'test-1', 'title': 'T', 'analysis': 'A',
+        'prerequisites': [], 'steps': [],
+    })
+    return create_server(
+        artifacts, 'test_analyst', resolve_project_root=lambda _wt: journal_root,
+    )
+
+
+def _review_arguments(issues: list[Any], **overrides: Any) -> dict[str, Any]:
+    return {
+        'reviewer': 'test_analyst',
+        'verdict': 'ISSUES_FOUND',
+        'issues': issues,
+        'summary': 'x',
+        **overrides,
+    }
+
+
 async def _call_review_tool(
     artifacts: TaskArtifacts,
     issues: list[Any],
@@ -359,22 +380,11 @@ async def _call_review_tool(
     **overrides: Any,
 ) -> dict[str, Any]:
     """Call the registered reviewer tool through an MCP client, as an agent does."""
-    artifacts.write_plan({
-        'task_id': 'test-1', 'title': 'T', 'analysis': 'A',
-        'prerequisites': [], 'steps': [],
-    })
-    server = create_server(
-        artifacts, 'test_analyst', resolve_project_root=lambda _wt: journal_root,
-    )
-    arguments = {
-        'reviewer': 'test_analyst',
-        'verdict': 'ISSUES_FOUND',
-        'issues': issues,
-        'summary': 'x',
-        **overrides,
-    }
+    server = _review_server(artifacts, journal_root)
     async with Client(server) as client:
-        result = await client.call_tool('submit_review_verdict', arguments)
+        result = await client.call_tool(
+            'submit_review_verdict', _review_arguments(issues, **overrides),
+        )
     return result.data
 
 
@@ -442,6 +452,52 @@ class TestSubmitReviewVerdictIssueIntake:
         assert 'issues[0].severity' in result['message']
         assert result['issue_contract']['outcome'] == IssueIntakeOutcome.REFUSED
         assert artifacts.read_verdict('test_analyst') is None
+
+    @pytest.mark.parametrize(
+        'issue',
+        [contract_issue_without(IssueField.KIND), contract_issue(kind='bug')],
+        ids=['missing', 'unknown'],
+    )
+    async def test_issue_with_a_missing_or_unknown_kind_is_refused_naming_every_kind(
+        self, artifacts, issue,
+    ):
+        result = await _call_review_tool(artifacts, [issue])
+
+        assert result['status'] == 'error'
+        assert 'issues[0].kind' in result['message']
+        for kind in IssueKind:
+            assert repr(kind.value) in result['message']
+        assert result['issue_contract']['outcome'] == IssueIntakeOutcome.REFUSED
+        assert artifacts.read_verdict('test_analyst') is None
+
+    async def test_a_refusal_states_every_required_field(self, artifacts):
+        result = await _call_review_tool(
+            artifacts, [contract_issue_without(IssueField.DESCRIPTION)],
+        )
+
+        assert result['status'] == 'error'
+        assert IssueField.KIND in REQUIRED_ISSUE_FIELDS
+        for field in REQUIRED_ISSUE_FIELDS:
+            assert str(field) in result['message']
+
+    async def test_a_kind_refusal_is_retryable_in_the_same_session(self, artifacts):
+        corrected = contract_issue(kind=IssueKind.TEST_QUALITY.value)
+        server = _review_server(artifacts)
+
+        async with Client(server) as client:
+            refused = await client.call_tool(
+                'submit_review_verdict',
+                _review_arguments([contract_issue_without(IssueField.KIND)]),
+            )
+            landed = await client.call_tool(
+                'submit_review_verdict', _review_arguments([corrected]),
+            )
+
+        assert refused.data['status'] == 'error'
+        assert landed.data == {'status': 'ok', 'role': 'test_analyst'}
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == [corrected]
 
     async def test_off_vocabulary_severity_alone_still_lands_the_verdict(self, artifacts):
         """INV-6: a repairable issue must not strand the review gate."""
@@ -512,6 +568,16 @@ class TestIssueContractJournal:
         [line] = _journal_lines(tmp_path)
         assert line['outcome'] == IssueIntakeOutcome.REFUSED
         assert any(d.startswith('issues[0].description') for d in line['deviations'])
+
+    async def test_a_kind_refusal_is_journalled_once(self, artifacts, tmp_path):
+        result = await _call_review_tool(
+            artifacts, [contract_issue_without(IssueField.KIND)], journal_root=tmp_path,
+        )
+
+        assert result['status'] == 'error'
+        [line] = _journal_lines(tmp_path)
+        assert line['outcome'] == IssueIntakeOutcome.REFUSED
+        assert any(d.startswith('issues[0].kind') for d in line['deviations'])
 
     async def test_a_clean_intake_writes_no_journal_line(self, artifacts, tmp_path):
         result = await _call_review_tool(artifacts, [contract_issue()], journal_root=tmp_path)
