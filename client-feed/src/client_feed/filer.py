@@ -1,0 +1,281 @@
+"""The client defect filer's pass (plans/client-feed-prd.md §14.4, §14.5): each portal defect report filed once in its project as a fix and the human gate it waits on, re-derived from the store every pass."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from typing import Final
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from client_feed.contract import DefectReported, DefectRuled, TaskStatus
+from client_feed.defect_ref import portal_ref
+from client_feed.filer_state import FilerCursor, RefRecord, held_state_dir
+from client_feed.filer_tasks import (
+    ClientDefectFacts,
+    FilerFallback,
+    facts_of,
+    fix_submission,
+    gate_submission,
+    requires_gate,
+)
+from client_feed.filer_tools import (
+    FILER_IDENTITY,
+    ClosedTools,
+    Disposition,
+    RefusalKind,
+    TaskView,
+    ToolCaller,
+    ToolRefused,
+)
+from client_feed.inbox import FeedIoProblem, InboxRead, InboxUnusable, read_inbox
+from client_feed.policy import FilerPolicy, Policy
+
+logger = logging.getLogger(__name__)
+
+OpenTools = Callable[[Policy], AbstractContextManager[ToolCaller]]
+
+_DEFERRED: Final = TaskStatus.DEFERRED
+
+
+class Unconverged(BaseModel):
+    """A ref the pass could not bring to its final state, and the refusal that stopped it."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    ref: str
+    tool: str
+    kind: RefusalKind
+    code: str
+    disposition: Disposition
+    attempts: int
+
+
+class PassReport(BaseModel):
+    """What one pass read and did; it names refusals by kind and code only."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    offset_from: int
+    offset_to: int
+    converged: tuple[str, ...]
+    unconverged: tuple[Unconverged, ...]
+    rejected_lines: int
+    inbox_problem: str | None = None
+
+
+@dataclass(frozen=True)
+class _RefState:
+    """A ref's final state over the lines read: its report, if read, and whether any ruling names it."""
+
+    report: DefectReported | None
+    ruled: bool
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """A ref's result: converged, or the refusal that stopped it and the record the cursor keeps for it."""
+
+    refused: Unconverged | None = None
+    record: RefRecord | None = None
+
+
+def _ref_states(read: InboxRead, project_id: str) -> dict[str, _RefState]:
+    states: dict[str, _RefState] = {}
+    for line in read.lines:
+        if not isinstance(line, DefectReported | DefectRuled):
+            continue
+        ref = portal_ref(project_id, line.block, line.report)
+        held = states.get(ref, _RefState(report=None, ruled=False))
+        if isinstance(line, DefectRuled):
+            states[ref] = _RefState(report=held.report, ruled=True)
+        else:
+            states[ref] = _RefState(report=held.report or line, ruled=held.ruled)
+    return states
+
+
+def _id_order(task_id: str) -> tuple[int, str]:
+    return (int(task_id), '') if task_id.isdecimal() else (-1, task_id)
+
+
+def _lowest(views: Sequence[TaskView], what: str, ref: str) -> TaskView | None:
+    if len(views) > 1:
+        logger.warning(
+            '%s has %d filer %ss (%s); using the lowest id',
+            ref,
+            len(views),
+            what,
+            ', '.join(view.task_id for view in views),
+        )
+    return min(views, key=lambda view: _id_order(view.task_id), default=None)
+
+
+def _filer_tasks(tools: ClosedTools, task_ids: Sequence[str]) -> list[TaskView]:
+    return [view for view in map(tools.get_task, task_ids) if view.source == FILER_IDENTITY]
+
+
+def _just_submitted(task_id: str) -> TaskView:
+    """A fix this pass submitted, as the store now holds it, without reading it back (a --check plan's id names no task)."""
+    return TaskView(
+        task_id=task_id,
+        status=_DEFERRED,
+        dependencies=frozenset(),
+        source=FILER_IDENTITY,
+        x_client_defect=None,
+        defects=(),
+    )
+
+
+def _facts(fix: TaskView, report: DefectReported, fallback: FilerFallback | None) -> ClientDefectFacts:
+    try:
+        return ClientDefectFacts.model_validate(fix.x_client_defect)
+    except ValidationError:
+        logger.warning('fix %s carries no readable x_client_defect; using its report line', fix.task_id)
+        return facts_of(report, fallback)
+
+
+def _gate_and_commit(
+    tools: ClosedTools,
+    report: DefectReported,
+    ref: str,
+    policy: Policy,
+    filer: FilerPolicy,
+    fix: TaskView,
+    facts: ClientDefectFacts,
+) -> None:
+    """Gate a fix still held deferred, then release it; a released fix is never gated after the fact."""
+    if fix.status is not _DEFERRED:
+        return
+    gate = _lowest(_filer_tasks(tools, tools.find_gates(ref)), 'gate', ref)
+    gate_id, gate_status = (None, None) if gate is None else (gate.task_id, gate.status)
+    if gate_id is None and requires_gate(facts, auto_dispatch=filer.auto_dispatch):
+        submission = gate_submission(
+            report,
+            ref=ref,
+            fix_task_id=fix.task_id,
+            facts=facts,
+            priority=filer.fix_priority,
+            project_id=policy.project_id,
+        )
+        gate_id, gate_status = tools.submit_planned(submission), _DEFERRED
+    if gate_id is not None and gate_id not in fix.dependencies:
+        tools.add_dependency(fix.task_id, gate_id)
+    held = [fix.task_id] + ([gate_id] if gate_id is not None and gate_status is _DEFERRED else [])
+    tools.commit_planning(held)
+
+
+def _file(
+    tools: ClosedTools, report: DefectReported, ref: str, policy: Policy, filer: FilerPolicy, record: RefRecord | None
+) -> None:
+    carriers = [tools.get_task(carrier.task_id) for carrier in tools.lookup_defect_ref(ref)]
+    mine = [view for view in carriers if view.source == FILER_IDENTITY]
+    if carriers and not mine:
+        return
+    fallback = None if record is None else record.fallback
+    fix = _lowest(mine, 'fix', ref)
+    if fix is None:
+        submission = fix_submission(report, ref=ref, priority=filer.fix_priority, fallback=fallback)
+        fix, facts = _just_submitted(tools.submit_planned(submission)), facts_of(report, fallback)
+    else:
+        facts = _facts(fix, report, fallback)
+    _gate_and_commit(tools, report, ref, policy, filer, fix, facts)
+
+
+def converge_filing(
+    tools: ClosedTools, report: DefectReported, ref: str, policy: Policy, record: RefRecord | None
+) -> _Outcome:
+    """File `ref` as a fix and, unless auto-dispatched clean, its gate; every step re-derived from the store."""
+    filer = _filer(policy)
+    try:
+        _file(tools, report, ref, policy, filer, record)
+    except ToolRefused as refused:
+        attempts = 0 if record is None else record.attempts
+        return _Outcome(refused=_unconverged(ref, refused, attempts), record=record)
+    return _Outcome()
+
+
+def _unconverged(ref: str, refused: ToolRefused, attempts: int) -> Unconverged:
+    return Unconverged(
+        ref=ref,
+        tool=refused.tool,
+        kind=refused.kind,
+        code=refused.code,
+        disposition=refused.disposition,
+        attempts=attempts,
+    )
+
+
+def _filer(policy: Policy) -> FilerPolicy:
+    if policy.filer is None:
+        raise ValueError(f'the policy of {policy.project_id} has no filer block')
+    return policy.filer
+
+
+def _read(policy: Policy, offset: int) -> tuple[InboxRead, int]:
+    """The inbox past `offset`, and where the read began: a rewound inbox is read again from its start."""
+    try:
+        return read_inbox(policy.in_dir, offset=offset), offset
+    except InboxUnusable as exc:
+        if exc.problem is not FeedIoProblem.INBOX_REWOUND:
+            raise
+        logger.warning('inbox of %s was replaced (%s); reading it from its start', policy.project_id, exc.detail)
+        return read_inbox(policy.in_dir, offset=0), 0
+
+
+def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[PassReport, FilerCursor]:
+    """One pass over the inbox from the cursor; stateless, so the caller stores the cursor it returns."""
+    try:
+        read, offset_from = _read(policy, cursor.inbox_offset)
+    except InboxUnusable as exc:
+        unusable = PassReport(
+            offset_from=cursor.inbox_offset,
+            offset_to=cursor.inbox_offset,
+            converged=(),
+            unconverged=(),
+            rejected_lines=0,
+            inbox_problem=str(exc.problem),
+        )
+        return unusable, cursor
+    outcomes: dict[str, _Outcome] = {}
+    for ref, state in _ref_states(read, policy.project_id).items():
+        if state.ruled or state.report is None:
+            outcomes[ref] = _Outcome()
+            continue
+        outcomes[ref] = converge_filing(tools, state.report, ref, policy, cursor.refs.get(ref))
+    unconverged = tuple(outcome.refused for outcome in outcomes.values() if outcome.refused is not None)
+    offset_to = offset_from if unconverged else read.offset
+    report = PassReport(
+        offset_from=offset_from,
+        offset_to=offset_to,
+        converged=tuple(ref for ref, outcome in outcomes.items() if outcome.refused is None),
+        unconverged=unconverged,
+        rejected_lines=len(read.rejected),
+    )
+    kept = {ref: outcome.record for ref, outcome in outcomes.items() if outcome.refused and outcome.record}
+    return report, FilerCursor(inbox_offset=offset_to, refs=kept)
+
+
+def _log_unconverged(report: PassReport) -> None:
+    for item in report.unconverged:
+        logger.warning(
+            '%s not filed: %s refused (%s, %s), %s after %d attempts',
+            item.ref,
+            item.tool,
+            item.kind,
+            item.code,
+            item.disposition,
+            item.attempts,
+        )
+
+
+def file_once(policy: Policy, *, open_tools: OpenTools) -> PassReport:
+    """One pass under the held state dir, from the stored cursor, storing the cursor it leaves."""
+    with held_state_dir(policy) as state:
+        cursor = state.read_cursor()
+        with open_tools(policy) as caller:
+            report, next_cursor = run_pass(policy, ClosedTools(caller, policy.project_root), cursor)
+        state.write_cursor(next_cursor)
+    _log_unconverged(report)
+    return report
