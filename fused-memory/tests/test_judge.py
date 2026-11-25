@@ -3,6 +3,7 @@
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -3861,6 +3862,18 @@ class TestJudgeInvocationLedger:
     }
 
     @staticmethod
+    def _with_tokens(*, success: bool, **fields: Any) -> AgentResult:
+        return AgentResult(
+            success=success,
+            output='',
+            input_tokens=900,
+            output_tokens=120,
+            cache_read_tokens=30000,
+            cache_create_tokens=2500,
+            **fields,
+        )
+
+    @staticmethod
     def _config(tmp_path) -> ReconciliationConfig:
         return _make_judge_config(
             judge_llm_provider='claude_cli',
@@ -3893,12 +3906,8 @@ class TestJudgeInvocationLedger:
 
     @pytest.mark.asyncio
     async def test_review_lands_one_row_under_the_run_keys(self, tmp_path, mock_journal):
-        served = AgentResult(
-            success=True,
-            output='',
-            structured_output={'severity': 'ok', 'findings': []},
-            cost_usd=0.07,
-            **self._TOKENS,
+        served = self._with_tokens(
+            success=True, structured_output={'severity': 'ok', 'findings': []}, cost_usd=0.07,
         )
 
         outcome, rows = await self._review_with_store(tmp_path, mock_journal, served)
@@ -3914,7 +3923,7 @@ class TestJudgeInvocationLedger:
 
     @pytest.mark.asyncio
     async def test_returned_failure_still_lands_a_row(self, tmp_path, mock_journal):
-        hung = AgentResult(success=False, output='', timed_out=True, **self._TOKENS)
+        hung = self._with_tokens(success=False, timed_out=True)
 
         outcome, rows = await self._review_with_store(tmp_path, mock_journal, hung)
 

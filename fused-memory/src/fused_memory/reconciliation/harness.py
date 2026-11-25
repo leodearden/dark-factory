@@ -953,6 +953,7 @@ class ReconciliationHarness:
                 self.config, journal,
                 usage_gate=self.usage_gate,
                 on_unhalt_cb=self._on_judge_unhalt,
+                cost_store=self._cost_store,
             )
             if self.config.judge_enabled else None
         )
