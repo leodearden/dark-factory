@@ -15797,10 +15797,12 @@ class Harness:
         see ``Harness._build_lifecycle_registry`` for the periodic invocation
         context.
 
-        On a PASS (task 2114), also self-heals: calls
-        ``_close_superseded_main_sweep_escalations`` with the just-verified
-        clean SHA to auto-close any prior main-sweep escalation whose swept
-        SHA this clean tip has superseded.  Never called on the failure path.
+        On a PASS (task 2114) of EITHER seed mode, warm passes included, also
+        self-heals: calls ``_close_superseded_main_sweep_escalations`` with
+        the just-verified clean SHA to auto-close any prior main-sweep
+        escalation whose swept SHA this clean tip has superseded.  Never
+        called on the failure path.  The accepted risk of closing on a warm
+        pass is stated on ``_close_superseded_main_sweep_escalations``.
 
         Before filing, a drifting result is passed through
         ``verify.confirm_main_tip_failure_is_real`` (task 2370): a fresh
@@ -15960,15 +15962,24 @@ class Harness:
 
         ``_run_main_tip_sweep`` never closed its own stale failing escalation
         once a LATER pass verified main clean — this is the pile-up gap.  The
-        only fail-safe positive evidence that the cited defect is actually
-        fixed is a FRESH full-verify PASS at a SHA that is a STRICT
-        descendant of the failed swept SHA (main advanced and now verifies
-        clean).  A bare ``is_ancestor(cited_sha, main)`` is unsafe: the
+        accepted positive evidence that the cited defect is actually fixed is
+        a full-verify PASS, from a warm (CoW-seeded) or a cold build, at a SHA
+        that is a STRICT descendant of the failed swept SHA (main advanced and
+        now verifies clean).  A bare ``is_ancestor(cited_sha, main)`` is unsafe: the
         failing SHA is itself an ancestor of an un-advanced (still-broken)
         main, and ``git merge-base --is-ancestor`` is reflexive (a commit is
         trivially an ancestor of itself) — so an escalation whose swept SHA
         equals *clean_sha* at 12-hex precision is explicitly guarded rather
         than auto-closed, even though ``is_ancestor`` would return True.
+
+        Accepting a warm pass is a ruling (Leo 2026-10-09, esc-5812-4 option
+        C) with a known residual risk.  SHA dedup (``_last_swept_main_sha``)
+        stops the cold control (``main_tip_sweep_cold_interval_secs``, daily
+        by default) from re-checking a SHA a warm pass already cleared, so a
+        wrong warm pass, e.g. from a poisoned warm base, can close a real
+        red-main escalation and mask a red main for up to about 24 h, until a
+        cold sweep of a later tip.  Pinned by
+        ``orchestrator/tests/test_harness_escalation_revalidation_sweep.py::TestMainTipSweepSelfHealWiring``.
 
         Enumerates every pending escalation and closes (``close_only``, via
         ``resolve(dismiss=True)`` — never resumed/re-pended) each
