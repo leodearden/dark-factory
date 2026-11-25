@@ -46,6 +46,7 @@ import {
   mergeRecentRow,
   openEscalationItem,
   orchestratorRow,
+  performanceEntry,
   projectRow,
   receiptsFor,
   schedulerLockRow,
@@ -704,20 +705,46 @@ const PERF_CARDS = {
   ttc: { p50: 1000, p75: 1000, p90: 1000, p95: 1000, count: 2 },
 };
 
+const OTHER_PERF_PROJECT = 'q';
+
+// Two projects whose hour axes partly overlap: four distinct hours in all.
+const PERF_HISTORY = {
+  [PROJECT]: {
+    labels: ['2026-10-14T07:00', '2026-10-14T08:00', '2026-10-14T09:00'],
+    p50: [60_000, 120_000, 90_000], p95: [180_000, 240_000, 300_000],
+    onePass: [50, 100, 75], escalation: [5, 25, 10],
+  },
+  [OTHER_PERF_PROJECT]: {
+    labels: ['2026-10-14T08:00', '2026-10-14T09:00', '2026-10-14T10:00'],
+    p50: [30_000, 45_000, 150_000], p95: [600_000, 360_000, 420_000],
+    onePass: [40, 60, 20], escalation: [15, 30, 2],
+  },
+};
+const PERF_HISTORY_HOURS = new Set(Object.values(PERF_HISTORY).flatMap(history => history.labels));
+
 function seedPerformance(window) {
   seedDashboardData(window, {
-    PROJECTS: [projectRow(PROJECT)],
+    PROJECTS: [projectRow(PROJECT), projectRow(OTHER_PERF_PROJECT)],
     PERFORMANCE: {
-      [PROJECT]: {
-        cards: wireDatum(PERF_CARDS),
-        time_centiles_history: { labels: [], p50: [], p95: [] },
-        one_pass_history: { labels: [], values: [] },
-        escalation_history: { labels: [], values: [] },
-      },
+      [PROJECT]: performanceEntry({ cards: wireDatum(PERF_CARDS), ...PERF_HISTORY[PROJECT] }),
+      [OTHER_PERF_PROJECT]: performanceEntry({
+        cards: wireDatum({ ...PERF_CARDS, ttc: { p50: 2000, p75: 2000, p90: 2000, p95: 2000, count: 1 } }),
+        ...PERF_HISTORY[OTHER_PERF_PROJECT],
+      }),
     },
-    PERFORMANCE_LISTING: wireDatum(1),
+    PERFORMANCE_LISTING: wireDatum(2),
     __receipt: receiptsFor(window.DF_DATA_LOADER, ['PERFORMANCE', 'PERFORMANCE_LISTING', 'PROJECTS']),
   });
+}
+
+function projectHead(container, label) {
+  const heads = [...container.querySelectorAll('.proj-head')].filter(head => head.querySelector('.name')?.textContent === label);
+  assert.equal(heads.length, 1, `expected one header for project ${label}`);
+  return heads[0];
+}
+
+function projectGroup(container, label) {
+  return projectHead(container, label).closest('.panel');
 }
 
 // The 8px swatch beside the legend label that reads *path*.
@@ -733,7 +760,7 @@ test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths
   const harness = openWindow(t);
   seedPerformance(harness.window);
   const { container } = harness.mount(harness.window.DF_TABS.PerfTab, { projectFilter: [] });
-  const panel = panelTitled(container, 'Completion paths');
+  const panel = panelTitled(projectGroup(container, PROJECT), 'Completion paths');
 
   const swatches = COMPLETION_PATHS.map(path => {
     const swatch = legendSwatch(panel, path).style.background;
@@ -742,6 +769,37 @@ test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths
     return swatch;
   });
   assert.equal(new Set(swatches).size, COMPLETION_PATHS.length, `two slices share a colour: ${JSON.stringify(swatches)}`);
+});
+
+test("tabs.jsx::PerfTab draws a project's ttc trend over its history_labels axis", t => {
+  const harness = openWindow(t);
+  seedPerformance(harness.window);
+  const { container } = harness.mount(harness.window.DF_TABS.PerfTab, { projectFilter: [] });
+  const panel = panelTitled(projectGroup(container, PROJECT), 'Time to completion · centiles');
+
+  assert.ok(!panel.textContent.includes('not enough history yet'), 'the ttc trend was not drawn');
+  const xLabels = [...panel.querySelectorAll('svg text[text-anchor="middle"]')].map(text => text.textContent);
+  assert.deepEqual(xLabels, PERF_HISTORY[PROJECT].labels.map(harness.window.DF_SHELL.fmtDateTime));
+});
+
+test('tabs.jsx::PerfTab header tiles spark DF_PERFORMANCE_HISTORY.meanHistorySpark over the in-scope projects', t => {
+  const harness = openWindow(t);
+  seedPerformance(harness.window);
+  const { container } = harness.mount(harness.window.DF_TABS.PerfTab, { projectFilter: [] });
+  const { DF_DATA, DF_PERFORMANCE_HISTORY, DF_SPARK_PATH } = harness.window;
+
+  for (const [label, series] of [
+    ['p50 time-to-completion', 'p50'],
+    ['p95 time-to-completion', 'p95'],
+    ['One-pass success', 'one_pass'],
+    ['Human escalation rate', 'escalation'],
+  ]) {
+    const spark = DF_PERFORMANCE_HISTORY.meanHistorySpark(DF_DATA.PERFORMANCE, series);
+    assert.equal(spark.length, PERF_HISTORY_HOURS.size, `the ${series} spark should hold one point per seeded hour`);
+    const paths = statTile(container, label).querySelectorAll('path');
+    assert.ok(paths.length > 0, `the "${label}" tile draws no spark`);
+    assert.equal(paths[paths.length - 1].getAttribute('d'), DF_SPARK_PATH.sparkPaths(spark, 100, 28).line, label);
+  }
 });
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
@@ -1215,12 +1273,6 @@ function mountTasks(harness) {
   return handle;
 }
 
-function projectHead(container) {
-  const heads = [...container.querySelectorAll('.proj-head')].filter(head => head.querySelector('.name')?.textContent === PROJECT);
-  assert.equal(heads.length, 1, `expected one header for project ${PROJECT}`);
-  return heads[0];
-}
-
 // Fills storage until jsdom's own quota refuses a single character more, and
 // returns the error that refusal threw.
 function fillStorageToQuota(storage) {
@@ -1287,22 +1339,22 @@ test('tab_tasks.jsx::TasksTab folds a project on its first header click, and the
   const harness = openWindow(t);
   const { window } = harness;
   const first = mountTasks(harness);
-  assert.equal(projectHead(first.container).dataset.open, 'true', 'a project with no stored flag did not start open');
-  click(window, projectHead(first.container));
-  assert.equal(projectHead(first.container).dataset.open, 'false', 'one header click did not fold the project');
+  assert.equal(projectHead(first.container, PROJECT).dataset.open, 'true', 'a project with no stored flag did not start open');
+  click(window, projectHead(first.container, PROJECT));
+  assert.equal(projectHead(first.container, PROJECT).dataset.open, 'false', 'one header click did not fold the project');
   assert.ok(storedKeys(window).includes('df.tasksOpen'), 'the fold was not stored');
   first.unmount();
 
   // A folded project renders no graph, so this mount cannot go through mountTasks.
   const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
-  assert.equal(projectHead(container).dataset.open, 'false', 'the stored fold did not seed the next mount');
-  click(window, projectHead(container));
-  assert.equal(projectHead(container).dataset.open, 'true', 'one header click did not unfold the project');
+  assert.equal(projectHead(container, PROJECT).dataset.open, 'false', 'the stored fold did not seed the next mount');
+  click(window, projectHead(container, PROJECT));
+  assert.equal(projectHead(container, PROJECT).dataset.open, 'true', 'one header click did not unfold the project');
   assert.ok(!storedKeys(window).includes('df.tasksOpen'), 'the project is back at its default-open, yet its key is still stored');
 });
 
 function groupingButton(container, label) {
-  const buttons = [...projectHead(container).querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  const buttons = [...projectHead(container, PROJECT).querySelectorAll('.seg button')].filter(button => button.textContent === label);
   assert.equal(buttons.length, 1, `expected one '${label}' grouping button`);
   return buttons[0];
 }

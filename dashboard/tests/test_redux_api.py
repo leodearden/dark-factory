@@ -23,7 +23,7 @@ from dashboard.data.memory import (
     write_queue_datum,
 )
 from dashboard.data.merge_queue import MergeAttempts, TrainThroughput, trailing_landing_rates
-from dashboard.data.performance import PerformanceCards, PerformanceListing
+from dashboard.data.performance import PerformanceCards, PerformanceHistory, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.project_labels import ProjectLabels
 
@@ -1111,11 +1111,9 @@ def _perf_listing(cards: dict[str, Datum[PerformanceCards]]) -> PerformanceListi
     return PerformanceListing(cards=cards, listed=listed)
 
 
-_PERF_HISTORY = {
-    'time_centiles_history': {'labels': ['2026-09-30T11:00'], 'p50': [60_000], 'p95': [90_000]},
-    'one_pass_history': {'labels': ['2026-09-30T11:00'], 'values': [100.0]},
-    'escalation_history': {'labels': ['2026-09-30T11:00'], 'values': [0.0]},
-}
+_PERF_HISTORY = PerformanceHistory(
+    labels=('2026-09-30T11:00',), p50=(60_000,), p95=(90_000,), one_pass=(100.0,), escalation=(0.0,),
+)
 
 
 def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
@@ -1127,10 +1125,15 @@ def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
         served_at=_PERF_SERVED_AT,
     )
     entry = body['PERFORMANCE']['p1']
-    assert set(entry) == {'cards', 'time_centiles_history', 'one_pass_history', 'escalation_history'}
+    assert set(entry) == {
+        'cards', 'history_labels', 'time_centiles_history', 'one_pass_history', 'escalation_history',
+    }
     assert entry['cards'] == cards.to_wire()
     assert entry['cards']['as_of'] == '2026-09-30T11:00:00+00:00'
-    assert entry['time_centiles_history'] == _PERF_HISTORY['time_centiles_history']
+    assert entry['history_labels'] == ['2026-09-30T11:00']
+    assert entry['time_centiles_history'] == {'p50': [60_000], 'p95': [90_000]}
+    assert entry['one_pass_history'] == {'values': [100.0]}
+    assert entry['escalation_history'] == {'values': [0.0]}
 
 
 def test_shape_performance_project_without_history_gets_empty_blocks():
@@ -1139,9 +1142,10 @@ def test_shape_performance_project_without_history_gets_empty_blocks():
         served_at=_PERF_SERVED_AT,
     )
     entry = body['PERFORMANCE']['p1']
-    assert entry['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
-    assert entry['one_pass_history'] == {'labels': [], 'values': []}
-    assert entry['escalation_history'] == {'labels': [], 'values': []}
+    assert entry['history_labels'] == []
+    assert entry['time_centiles_history'] == {'p50': [], 'p95': []}
+    assert entry['one_pass_history'] == {'values': []}
+    assert entry['escalation_history'] == {'values': []}
 
 
 def test_shape_performance_lists_exactly_the_projects_with_cards():

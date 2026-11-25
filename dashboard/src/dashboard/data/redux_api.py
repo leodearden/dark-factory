@@ -40,7 +40,7 @@ from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.label_spans import label_spans
 from dashboard.data.merge_queue import LandingRateSeries, MergeAttempts
 from dashboard.data.outcome_colors import assign_outcome_colors
-from dashboard.data.performance import PerformanceListing
+from dashboard.data.performance import EMPTY_HISTORY, PerformanceHistory, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
@@ -960,14 +960,17 @@ def shape_escalation_analytics(
 def shape_performance(
     *,
     listing: PerformanceListing,
-    history: Mapping[str, Mapping[str, Any]] | None = None,
+    history: Mapping[str, PerformanceHistory] | None = None,
     served_at: datetime,
 ) -> dict[str, Any]:
     """Each project's cards Datum beside its hour-bucketed histories, as served at *served_at*.
 
-    Output: ``{PERFORMANCE: {project_basename: {cards, time_centiles_history,
-    one_pass_history, escalation_history}}, PERFORMANCE_LISTING, served_at}``,
-    where ``cards`` is the project's wire Datum from
+    Output: ``{PERFORMANCE: {project_basename: {cards, history_labels,
+    time_centiles_history: {p50, p95}, one_pass_history: {values},
+    escalation_history: {values}}}, PERFORMANCE_LISTING, served_at}``, where
+    every history series aligns to the one ``history_labels`` axis
+    (:meth:`dashboard.data.performance.PerformanceHistory.to_wire`) and
+    ``cards`` is the project's wire Datum from
     :func:`dashboard.data.performance.aggregate_performance_cards` and
     ``served_at`` is the instant every Datum was validated against — the one
     the client ages each ``as_of`` from.
@@ -983,17 +986,12 @@ def shape_performance(
     :class:`~dashboard.data.datum.DatumContractError` propagates.
     """
     history = history or {}
-    empty_pair = {'labels': [], 'values': []}
-    empty_centiles = {'labels': [], 'p50': [], 'p95': []}
     out: dict[str, dict] = {}
     for pid, datum in listing.cards.items():
         validate_datum(datum, served_at)
-        h = history.get(pid) or {}
         out[basename_label(pid)] = {
             'cards': datum.to_wire(),
-            'time_centiles_history': dict(h.get('time_centiles_history') or empty_centiles),
-            'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
-            'escalation_history': dict(h.get('escalation_history') or empty_pair),
+            **history.get(pid, EMPTY_HISTORY).to_wire(),
         }
     return {
         'PERFORMANCE': out,

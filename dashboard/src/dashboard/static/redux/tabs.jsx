@@ -40,6 +40,8 @@ const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalTex
 const { healthTone } = window.DF_SYSTEM_HEALTH;
 // PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
 const { projectCards, cardsAbsentReason, cardsShortfall } = window.DF_PERFORMANCE_CARDS;
+// PerfTab reads each project's hourly series, and their mean sparks — performance_history.js.
+const { projectHistory, meanHistorySpark } = window.DF_PERFORMANCE_HISTORY;
 const { useState: uS } = React;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
@@ -97,7 +99,8 @@ const fmtAgeSecs = secs => {
 
 // ── Cross-project aggregation helpers (no synthetic fallbacks) ──
 // PERFORMANCE is keyed by project: a served `cards` Datum (paths/escalation/hist/ttc)
-// plus three *_history series. These return null when there's no data (UI renders '—').
+// beside one history_labels axis its series align to, read through performance_history.js.
+// These return null when there's no data (UI renders '—').
 // A project whose cards Datum is a hole has no block, so it carries no weight.
 const cardBlocks = perf => Object.values(perf || {}).map(p => p.cards?.value).filter(Boolean);
 function _weightedMean(samples) {
@@ -447,65 +450,10 @@ function PerfTab({ projectFilter }) {
             : <span title={shortfall}>{hint} · partial fleet</span>);
           const countHint = value => (value == null ? null : `${totalTasks} tasks (window)`);
           const fmtPct = v => `${v.toFixed(1)}`;
-          // Aggregate historical sparks across the in-scope projects.
-          // Per-project hour buckets must be aligned by label before summing.
-          const histKeys = Object.keys(subset);
-          const buildAggSpark = field => {
-            const bucketMap = {};
-            histKeys.forEach(pid => {
-              const h = subset[pid][field] || { labels: [], values: [], p50: [], p95: [] };
-              const labels = h.labels || [];
-              const values = field === 'time_centiles_history' ? (h.p95 || []) : (h.values || []);
-              labels.forEach((lbl, i) => {
-                bucketMap[lbl] = (bucketMap[lbl] || 0) + (values[i] || 0);
-              });
-            });
-            return Object.keys(bucketMap).sort().map(k => bucketMap[k]);
-          };
-          const buildP50Spark = () => {
-            const bucketMap = {};
-            histKeys.forEach(pid => {
-              const h = subset[pid].time_centiles_history || { labels: [], p50: [] };
-              (h.labels || []).forEach((lbl, i) => {
-                // For ttc: average across projects per bucket (medians don't sum).
-                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
-                bucketMap[lbl].sum += (h.p50 || [])[i] || 0;
-                bucketMap[lbl].n += 1;
-              });
-            });
-            return Object.keys(bucketMap).sort()
-              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n)));
-          };
-          const buildP95Spark = () => {
-            const bucketMap = {};
-            histKeys.forEach(pid => {
-              const h = subset[pid].time_centiles_history || { labels: [], p95: [] };
-              (h.labels || []).forEach((lbl, i) => {
-                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
-                bucketMap[lbl].sum += (h.p95 || [])[i] || 0;
-                bucketMap[lbl].n += 1;
-              });
-            });
-            return Object.keys(bucketMap).sort()
-              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n)));
-          };
-          const buildPctSpark = field => {
-            const bucketMap = {};
-            histKeys.forEach(pid => {
-              const h = subset[pid][field] || { labels: [], values: [] };
-              (h.labels || []).forEach((lbl, i) => {
-                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
-                bucketMap[lbl].sum += (h.values || [])[i] || 0;
-                bucketMap[lbl].n += 1;
-              });
-            });
-            return Object.keys(bucketMap).sort()
-              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n) * 10) / 10);
-          };
-          const p50Spark = buildP50Spark();
-          const p95Spark = buildP95Spark();
-          const onePassSpark = buildPctSpark('one_pass_history');
-          const escalationSpark = buildPctSpark('escalation_history');
+          const p50Spark = meanHistorySpark(subset, 'p50');
+          const p95Spark = meanHistorySpark(subset, 'p95');
+          const onePassSpark = meanHistorySpark(subset, 'one_pass');
+          const escalationSpark = meanHistorySpark(subset, 'escalation');
           return (
             <>
               <ST label="p50 time-to-completion"
@@ -526,7 +474,6 @@ function PerfTab({ projectFilter }) {
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
 
       {projects.map(pid => {
-        const p = DF.PERFORMANCE[pid];
         const cards = projectCards(DF, pid);
         const block = cards.value;
         const summary = (
@@ -589,8 +536,8 @@ function PerfTab({ projectFilter }) {
                       ))}
                     </div>
                     {(() => {
-                      const h = p.time_centiles_history || { labels: [], p50: [], p95: [] };
-                      if (!h.labels || h.labels.length < 2) {
+                      const h = projectHistory(DF.PERFORMANCE, pid);
+                      if (h.labels.length < 2) {
                         return (
                           <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>
                             ttc trend — not enough history yet

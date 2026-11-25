@@ -83,6 +83,7 @@ T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 TASKS = '/api/v2/dashboard/tasks'
 BURNDOWN = '/api/v2/dashboard/burndown'
 COSTS = '/api/v2/dashboard/costs'
+PERFORMANCE = '/api/v2/dashboard/performance'
 MERGE_QUEUE = '/api/v2/dashboard/merge-queue'
 ESCALATIONS = '/api/v2/dashboard/escalations'
 ESCALATION_ANALYTICS = '/api/v2/dashboard/escalation-analytics'
@@ -482,6 +483,28 @@ def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
                 bodies[f'merge_{window}'] = _get(client, MERGE_QUEUE, window=window)
 
     return bodies
+
+
+def _write_completions(root: Path) -> None:
+    """*root*'s runs.db holding done completions in two hours before :data:`T0`, beside an empty queue."""
+    write_runs_db(root, task_results=[
+        ('1', 'done', T0 - timedelta(hours=2)),
+        ('2', 'done', T0 - timedelta(hours=1, minutes=30)),
+        ('3', 'done', T0 - timedelta(minutes=30)),
+    ])
+    (root / 'data' / 'escalations').mkdir(parents=True, exist_ok=True)
+
+
+def _performance_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """/performance over every hour a project completed in, its history included."""
+    with (
+        _canned_roots(
+            client, workdir / 'performance', {'dark-factory': _substrate(REIFY_COUNTS)},
+            furnish={'dark-factory': _write_completions},
+        ),
+        installed_clock(app, fixed_clock(T0)),
+    ):
+        return {'performance_all': _get(client, PERFORMANCE, window='all')}
 
 
 def _file_escalations(config: DashboardConfig) -> None:
@@ -1235,6 +1258,7 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_census_family(client, workdir),
             **_burndown_family(client, workdir),
             **_window_family(client, workdir),
+            **_performance_family(client, workdir),
             **_corpus_family(client, workdir),
             **_check_owner_family(client, workdir),
             **prd_view_family(client, workdir),

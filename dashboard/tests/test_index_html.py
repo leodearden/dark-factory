@@ -1971,6 +1971,7 @@ _MODULE_EDGES = {
         'tab_tasks.jsx',
     )),
     'render_failure.js': _ModuleEdges(consumers=('app.jsx',)),
+    'performance_history.js': _ModuleEdges(consumers=('tabs.jsx',)),
     'poll_scope.js': _ModuleEdges(consumers=('data.js', 'app.jsx')),
     'chart_marks.js': _ModuleEdges(consumers=('charts.jsx', 'tab_escalation_analytics.jsx')),
     'quality_view.js': _ModuleEdges(reads=('chart_marks.js',)),
