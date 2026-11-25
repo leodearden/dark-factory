@@ -86,6 +86,28 @@ def test_mutations_of_the_runtime_are_left_out(tmp_path: Path) -> None:
     assert rec.mutations_outside_runtime() == (Mutated('os.mkdir', (tmp_path / 'd',)),)
 
 
+def test_a_mutation_of_the_runtime_outside_a_bytecode_cache_is_kept() -> None:
+    runtime_data = Path(json.__file__).with_name('no-such-package') / 'data'
+
+    with recording() as rec, pytest.raises(FileNotFoundError):
+        os.mkdir(runtime_data)
+
+    assert rec.mutations_outside_runtime() == (Mutated('os.mkdir', (runtime_data,)),)
+
+
+def test_only_a_write_into_a_runtime_bytecode_cache_is_left_out_of_the_opens() -> None:
+    absent = Path(json.__file__).with_name('no-such-package')
+    cached, data = absent / '__pycache__' / 'a.cpython.pyc', absent / 'data.txt'
+
+    with recording() as rec:
+        for target in (cached, data):
+            with pytest.raises(FileNotFoundError):
+                target.write_bytes(b'x')
+
+    assert rec.opens == (Opened(cached, writes=True), Opened(data, writes=True))
+    assert rec.opens_outside_runtime() == (Opened(data, writes=True),)
+
+
 def test_only_events_inside_the_block_are_recorded(tmp_path: Path) -> None:
     (tmp_path / 'before').write_text('x')
 

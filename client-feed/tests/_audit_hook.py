@@ -41,6 +41,7 @@ _SPAWNS: Final = frozenset({
     'os.forkpty',
 })
 _RECORDED: Final = frozenset({_OPEN, _CONNECT, *_MUTATIONS, *_SPAWNS})
+_BYTECODE_CACHE: Final = '__pycache__'
 _WRITE_FLAGS: Final = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
 
 _lock = threading.RLock()
@@ -141,6 +142,11 @@ def _under(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(candidate.is_relative_to(root) for candidate in {path, path.resolve()} for root in roots)
 
 
+def _in_runtime_cache(path: Path, roots: tuple[Path, ...]) -> bool:
+    """Whether `path` lies in a bytecode cache of the runtime, the one place the importer writes there."""
+    return _BYTECODE_CACHE in path.parts and _under(path, roots)
+
+
 class AuditRecord:
     """The events raised while its recording() block was open, normalised on read."""
 
@@ -169,13 +175,22 @@ class AuditRecord:
         return tuple(_spawned(event, args) for event, args in self._raw() if event in _SPAWNS)
 
     def opens_outside_runtime(self) -> tuple[Opened, ...]:
+        """Leaves out reads of the runtime and the CA bundle, and the importer's bytecode-cache writes; any other write is kept."""
         roots = _resolved_runtime_roots()
-        return tuple(opened for opened in self.opens if not _under(opened.path, roots))
+        return tuple(opened for opened in self.opens if not _runtime_open(opened, roots))
 
     def mutations_outside_runtime(self) -> tuple[Mutated, ...]:
-        """Leaves out the importer's bytecode-cache writes, made on a module's first import from an uncompiled venv."""
+        """Leaves out the importer's bytecode-cache writes, made on a module's first import from an uncompiled venv; any other mutation of the runtime is kept."""
         roots = _resolved_runtime_roots()
-        return tuple(mutated for mutated in self.mutations if not all(_under(path, roots) for path in mutated.paths))
+        return tuple(mutated for mutated in self.mutations if not _runtime_cache_write(mutated, roots))
+
+
+def _runtime_open(opened: Opened, roots: tuple[Path, ...]) -> bool:
+    return _in_runtime_cache(opened.path, roots) if opened.writes else _under(opened.path, roots)
+
+
+def _runtime_cache_write(mutated: Mutated, roots: tuple[Path, ...]) -> bool:
+    return bool(mutated.paths) and all(_in_runtime_cache(path, roots) for path in mutated.paths)
 
 
 def _resolved_runtime_roots() -> tuple[Path, ...]:
