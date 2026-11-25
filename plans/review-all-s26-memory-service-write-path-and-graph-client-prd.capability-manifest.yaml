@@ -645,20 +645,20 @@ tasks:
           paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
           expect: absent
       - name: "store-records-module"
-        binding: "producer (ρ) — fm/services/store_records.py::MEM0_CONTENT_KEYS, mem0_content, metadata_row_text and the codec/error helpers"
+        binding: "producer (ρ) — fm/services/store_records.py::metadata_row_text with the record decoders and store-error helpers; it imports mem0_payload_text from fm/utils/mem0_content_keys.py, the content keys' one home since task 4857, and restates no content-key tuple"
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "^MEM0_CONTENT_KEYS = "
+          pattern: "^def metadata_row_text\\("
           paths: ["fused-memory/src/fused_memory/services/store_records.py"]
           expect: present
-      - name: "no-private-codec-import"
-        binding: "anti-inversion — server/grouped_read.py imports the public name, not memory_service's private"
+      - name: "codec-readers-left-the-service"
+        binding: "anti-inversion — server/tools.py and reconciliation/preservation_specimen_guard.py import metadata_row_text from store_records, not memory_service (grouped_read.py has read fm/utils/mem0_content_keys.py since task 4857)"
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "memory_service import _MEM0_CONTENT_KEYS"
-          paths: ["fused-memory/src/fused_memory/server/grouped_read.py"]
+          pattern: "memory_service import .*\\bmetadata_row_text\\b"
+          paths: ["fused-memory/src/fused_memory/server/tools.py", "fused-memory/src/fused_memory/reconciliation/preservation_specimen_guard.py"]
           expect: absent
   - label: "τ"
     task_id: 9245
