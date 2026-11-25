@@ -170,16 +170,20 @@ from fused_memory.memory_metadata import validate_memory_metadata
 from fused_memory.models import MEM0_PRIMARY, MemoryCategory
 from fused_memory.utils.mem0_content_keys import MEM0_CONTENT_KEYS, mem0_payload_text
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
-from fused_memory.utils.toolcall_xml_leak import LEAK_TAIL
+from fused_memory.utils.toolcall_xml_leak import (
+    LeakShape,
+    classify_leak_shape,
+    repair_leaked_text,
+)
 
 logger = logging.getLogger('sweep_toolcall_xml_leak')
 
-CLEAN = 'clean'
-REPAIRABLE_TAIL = 'repairable_tail'
-REPAIRABLE_DUPLICATE = 'repairable_duplicate'
-MANUAL_REVIEW = 'manual_review'
+CLEAN = LeakShape.CLEAN
+REPAIRABLE_TAIL = LeakShape.REPAIRABLE_TAIL
+REPAIRABLE_DUPLICATE = LeakShape.REPAIRABLE_DUPLICATE
+MANUAL_REVIEW = LeakShape.MANUAL_REVIEW
 
-CLASSIFICATIONS = (CLEAN, REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE, MANUAL_REVIEW)
+CLASSIFICATIONS = tuple(LeakShape)
 
 # The four per-record outcomes that leave a record needing HUMAN adjudication
 # -- see resolve_exit_code()'s docstring for what each one means and why. This
@@ -295,85 +299,24 @@ def carried_metadata(payload: dict, memory_id: Any) -> tuple[dict, list[str]]:
     return metadata, dropped
 
 
-def _split_at_leak(text: str) -> tuple[str, str] | None:
-    """Split *text* into (before, remainder) around the leak marker.
-
-    ``before`` is everything preceding the stray closing tag -- the text the
-    caller actually meant to write. ``remainder`` is everything AFTER the
-    continuation tag that follows it, which is what a repair would discard.
-
-    Returns None when *text* carries no leak.
-
-    The leak pattern itself is never re-spelled here: ``LEAK_TAIL`` from the
-    shared module is the sole oracle, and this function only skips past the
-    continuation tag's own closing ``>`` to find where the discarded remainder
-    begins. That skip assumes a continuation tag contains no ``>`` inside its
-    quoted attribute value -- true of every recorded specimen. A mis-split
-    could only ever make ``remainder`` fail to match ``before``, which
-    downgrades the record to ``manual_review``; it can never manufacture a
-    false repair. Fail-safe in the only direction that matters.
-    """
-    stripped = text.rstrip()
-    match = LEAK_TAIL.search(stripped)
-    if match is None:
-        return None
-    before = stripped[: match.start()]
-    continuation = match.group(1)
-    tag_end = continuation.find('>')
-    remainder = continuation[tag_end + 1 :] if tag_end != -1 else ''
-    return before, remainder
-
-
 def classify_record(payload: dict) -> str:
     """Classify a raw Qdrant payload into one of :data:`CLASSIFICATIONS`.
 
-    Returns:
-        'clean' when the extracted content carries no leak (including a
-        payload with no extractable content at all -- nothing to repair);
-        'repairable_tail' when the fragment carries nothing after its marker
-        and dropping it leaves non-empty text;
-        'repairable_duplicate' when the text after the marker is a VERBATIM
-        duplicate of the text before it;
-        'manual_review' for every other leak -- including a leak at offset 0,
-        where no repair could preserve content because there is none to keep.
+    The shape rule is the shared one,
+    ``fused_memory.utils.toolcall_xml_leak.classify_leak_shape``; a payload with
+    no extractable content is 'clean' (nothing to repair).
     """
-    content = mem0_payload_text(payload)
-    split = _split_at_leak(content)
-    if split is None:
-        return CLEAN
-
-    before, remainder = split
-    if not before:
-        # Dropping the fragment would leave an empty memory: refuse.
-        return MANUAL_REVIEW
-    if not remainder.strip():
-        return REPAIRABLE_TAIL
-    if remainder == before:
-        return REPAIRABLE_DUPLICATE
-    return MANUAL_REVIEW
+    return classify_leak_shape(mem0_payload_text(payload))
 
 
 def repair_content(text: str | None) -> str | None:
     """Return the content-preserving repair of *text*, or None to REFUSE.
 
-    None means exactly one thing: "do not mutate this record". It is returned
-    for a leak this function cannot vouch for, and for a None input, so a
-    refusal can never be mistaken for a repair.
-
-    Clean text is returned UNCHANGED rather than as None. That is what makes
-    the repair idempotent -- ``repair_content(repair_content(x)) ==
-    repair_content(x)`` -- since a repaired string is itself clean.
+    Delegates to the shared
+    ``fused_memory.utils.toolcall_xml_leak.repair_leaked_text``, the one repair
+    definition both leak sweeps use.
     """
-    if text is None:
-        return None
-    classification = classify_record({'data': text})
-    if classification == CLEAN:
-        return text
-    if classification in (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE):
-        split = _split_at_leak(text)
-        assert split is not None  # guaranteed by the classification
-        return split[0]
-    return None
+    return repair_leaked_text(text)
 
 
 def readd_persisted(response: Any) -> tuple[bool, str]:

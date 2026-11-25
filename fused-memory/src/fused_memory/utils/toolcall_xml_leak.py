@@ -128,6 +128,7 @@ when that lands, revisit this section rather than trusting it.
 from __future__ import annotations
 
 import re
+from enum import StrEnum
 from typing import NamedTuple
 
 from shared.toolcall_markup import PARAMETER_CLOSER_NAMES, PREFILTER_NEEDLES
@@ -137,9 +138,12 @@ __all__ = [
     'PREFILTER_NEEDLES',
     'SCANNED_COLUMNS',
     'LeakHit',
+    'LeakShape',
+    'classify_leak_shape',
     'detect_leak',
     'find_toolcall_xml_leak',
     'has_toolcall_xml_leak',
+    'repair_leaked_text',
 ]
 
 # The task-text columns a leak counts in. `metadata` is deliberately excluded:
@@ -231,3 +235,83 @@ def detect_leak(text: object) -> str | None:
     """
     hits = find_toolcall_xml_leak(text)
     return hits[0].fragment if hits else None
+
+
+class LeakShape(StrEnum):
+    """Which leak shapes can be repaired without losing content.
+
+    The values are the vocabulary the committed Mem0 sweep artifacts carry, so
+    they are a persisted contract, not just labels.
+    """
+
+    CLEAN = 'clean'
+    REPAIRABLE_TAIL = 'repairable_tail'
+    REPAIRABLE_DUPLICATE = 'repairable_duplicate'
+    MANUAL_REVIEW = 'manual_review'
+
+
+def _split_at_leak(text: str) -> tuple[str, str] | None:
+    """Split *text* into (before, remainder) around the leak marker.
+
+    ``before`` is everything preceding the stray closing tag -- the text the
+    caller meant to write. ``remainder`` is everything AFTER the continuation
+    tag that follows it, which is what a repair would discard. Returns None
+    when *text* carries no leak.
+
+    The skip past the continuation tag's own ``>`` assumes no ``>`` inside its
+    quoted attribute value. A mis-split can only make ``remainder`` differ from
+    ``before``, which downgrades the text to manual review; it can never
+    manufacture a false repair.
+    """
+    stripped = text.rstrip()
+    match = LEAK_TAIL.search(stripped)
+    if match is None:
+        return None
+    before = stripped[: match.start()]
+    continuation = match.group(1)
+    tag_end = continuation.find('>')
+    remainder = continuation[tag_end + 1 :] if tag_end != -1 else ''
+    return before, remainder
+
+
+def classify_leak_shape(text: object) -> LeakShape:
+    """Classify *text* into a :class:`LeakShape`.
+
+    A non-str or empty value is CLEAN (nothing to repair). A leak at offset 0
+    is MANUAL_REVIEW, because dropping it would leave no content to keep. A
+    fragment with nothing after its marker is REPAIRABLE_TAIL; one whose
+    remainder is a verbatim copy of the body is REPAIRABLE_DUPLICATE; every
+    other leak is MANUAL_REVIEW.
+    """
+    if not text or not isinstance(text, str):
+        return LeakShape.CLEAN
+    split = _split_at_leak(text)
+    if split is None:
+        return LeakShape.CLEAN
+    before, remainder = split
+    if not before:
+        return LeakShape.MANUAL_REVIEW
+    if not remainder.strip():
+        return LeakShape.REPAIRABLE_TAIL
+    if remainder == before:
+        return LeakShape.REPAIRABLE_DUPLICATE
+    return LeakShape.MANUAL_REVIEW
+
+
+def repair_leaked_text(text: str | None) -> str | None:
+    """Return the content-preserving repair of *text*, or None to REFUSE.
+
+    None means exactly "do not mutate this record": it is returned for a leak
+    no repair can vouch for and for a None input. Clean text comes back
+    unchanged, which makes the repair idempotent.
+    """
+    if text is None:
+        return None
+    shape = classify_leak_shape(text)
+    if shape is LeakShape.CLEAN:
+        return text
+    if shape is LeakShape.MANUAL_REVIEW:
+        return None
+    split = _split_at_leak(text)
+    assert split is not None  # guaranteed by the repairable classification
+    return split[0]
