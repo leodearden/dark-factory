@@ -1,18 +1,23 @@
 """Tests of ``scripts/rust_metrics_snapshot.py``, the Cargo-workspace metrics report.
 
-Per-project rules are a TOML file loaded at the boundary into a typed value;
-the fixture rules are in rust_snapshot_fixtures.py.
+Per-project rules are a TOML file loaded at the boundary into a typed value.
+tokei and cargo are shims first on PATH; lizard is the real, uv-locked one.
+The fixture rules and the shims are in rust_snapshot_fixtures.py.
 """
 from __future__ import annotations
 
+import importlib.metadata
 import json
+import os
+import platform
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import rust_metrics_snapshot
 import source_measures
-from rust_snapshot_fixtures import FIXTURE_RULES_TOML, write_fixture_rules
+from git_listing import git
+from rust_snapshot_fixtures import FIXTURE_RULES_TOML, tool_shims, write_fixture_rules
 
 REPO_ROOT = Path(__file__).parents[2]
 REIFY_RULES = REPO_ROOT / 'scripts' / 'rust_metrics_rules' / 'reify.toml'
@@ -93,3 +98,56 @@ def test_a_malformed_rules_file_is_refused_naming_the_file_and_the_key(
         rust_metrics_snapshot.load_rules(path)
     assert str(path) in str(refused.value)
     assert key in str(refused.value)
+
+
+@pytest.fixture
+def fixture_rules(tmp_path: Path) -> Path:
+    return write_fixture_rules(tmp_path / 'rules' / 'fixture.toml')
+
+
+def _put_first_on_path(monkeypatch: pytest.MonkeyPatch, bin_dir: Path) -> None:
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+
+
+class TestParams:
+    @pytest.mark.parametrize('tokei_version', ['15.0.0', '99.1.2'])
+    def test_params_records_the_versions_of_the_tools_that_measure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        fixture_rules: Path,
+        tokei_version: str,
+    ) -> None:
+        _put_first_on_path(monkeypatch, tool_shims(tmp_path / 'bin', tokei_version=tokei_version))
+        assert rust_metrics_snapshot.main(['--params', '--rules', str(fixture_rules)]) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert len(printed) == 1
+        rules = rust_metrics_snapshot.load_rules(fixture_rules)
+        assert json.loads(printed[0]) == rust_metrics_snapshot.measurement_params(rules)
+        assert json.loads(printed[0]) == {
+            'tokei_version': tokei_version,
+            'lizard_version': importlib.metadata.version('lizard'),
+            'python_version': platform.python_version(),
+            'instrument': {
+                'rust_metrics_snapshot': git(REPO_ROOT, 'hash-object', 'scripts/rust_metrics_snapshot.py').strip(),
+            },
+            'h14_soft_ceiling_lines': 1500,
+            'h14_alarm_lines': 2000,
+            'rules': rules.to_json(),
+        }
+
+    def test_a_missing_tokei_is_refused_naming_its_install_command(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        fixture_rules: Path,
+    ) -> None:
+        bin_dir = tool_shims(tmp_path / 'bin')
+        (bin_dir / 'tokei').unlink()
+        monkeypatch.setenv('PATH', os.pathsep.join([str(bin_dir), '/usr/bin', '/bin']))
+        assert rust_metrics_snapshot.main(['--params', '--rules', str(fixture_rules)]) == 2
+        refusal = capsys.readouterr().err
+        assert 'tokei' in refusal
+        assert 'cargo install --locked tokei' in refusal
