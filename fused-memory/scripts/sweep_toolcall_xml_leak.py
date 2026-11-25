@@ -551,7 +551,7 @@ def build_report(
     its own incompleteness rather than presenting a partial count as the
     incidence rate.
     """
-    counts = {name: 0 for name in CLASSIFICATIONS}
+    counts: dict[str, int] = {name: 0 for name in CLASSIFICATIONS}
     for record in records:
         classification = record.get('classification')
         if classification in counts:
