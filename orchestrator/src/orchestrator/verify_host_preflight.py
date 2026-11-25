@@ -17,6 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+import yaml
+from shared.governed_exceptions import (
+    MalformedDisposition,
+    TaskRef,
+    TicketRef,
+    owner_from_record,
+)
 from shared.safe_io import atomic_write_text
 
 from orchestrator.verify_hosts import remote_runner_for
@@ -35,6 +42,9 @@ if TYPE_CHECKING:
 
 #: The archive key a preflight verifies under: remote archives and records share data/verify-logs/preflight/.
 PREFLIGHT_ARCHIVE_KEY = 'preflight'
+
+#: A project's owned skip-parity exceptions, relative to its project_root; absent means none.
+SKIP_PARITY_EXCEPTIONS_RELPATH = Path('config/verify-host-skip-parity-exceptions.yaml')
 
 
 class PreflightRefused(Exception):
@@ -117,6 +127,62 @@ def _require_usable(target: VerifyRunnerConfig) -> None:
         raise PreflightRefused(
             f'verify runner name {target.name!r} is not one path segment, so it cannot name a record file'
         )
+
+
+@dataclass(frozen=True)
+class SkipParityException:
+    """A junit test id that may be skipped on one runner and run on the other, and who removes it."""
+
+    test_id: str
+    owner: TaskRef | TicketRef
+    reason: str
+
+
+class SkipParityExceptionsError(ValueError):
+    """The skip-parity exceptions file is malformed; the message names the file and the entry."""
+
+
+def load_skip_parity_exceptions(path: Path) -> tuple[SkipParityException, ...]:
+    """Every exception in *path*, each owned and explained; an absent file holds none."""
+    try:
+        text = path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return ()
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise SkipParityExceptionsError(f'{path}: not YAML: {exc}') from exc
+    entries = document.get('exceptions') if isinstance(document, dict) else None
+    if not isinstance(entries, list):
+        raise SkipParityExceptionsError(f'{path}: the top level must be a mapping holding an `exceptions` list')
+    loaded = tuple(_skip_parity_exception(path, index, entry) for index, entry in enumerate(entries))
+    seen: set[str] = set()
+    for exception in loaded:
+        if exception.test_id in seen:
+            raise SkipParityExceptionsError(f'{path}: test_id {exception.test_id!r} is listed twice')
+        seen.add(exception.test_id)
+    return loaded
+
+
+def _skip_parity_exception(path: Path, index: int, entry: object) -> SkipParityException:
+    if not isinstance(entry, dict):
+        raise SkipParityExceptionsError(f'{path}: entry {index} is not a mapping')
+    test_id = entry.get('test_id')
+    if not isinstance(test_id, str) or not test_id.strip():
+        raise SkipParityExceptionsError(f'{path}: entry {index} has no test_id')
+    if 'owner' not in entry:
+        raise SkipParityExceptionsError(
+            f'{path}: entry {test_id!r} has no owner; every exception names the task or ticket '
+            'that will remove it (INV-12)'
+        )
+    try:
+        owner = owner_from_record(entry['owner'])
+    except MalformedDisposition as exc:
+        raise SkipParityExceptionsError(f'{path}: entry {test_id!r} has a malformed owner: {exc}') from exc
+    reason = entry.get('reason')
+    if not isinstance(reason, str) or not reason.strip():
+        raise SkipParityExceptionsError(f'{path}: entry {test_id!r} has no reason')
+    return SkipParityException(test_id=test_id, owner=owner, reason=reason.strip())
 
 
 @dataclass(frozen=True)
