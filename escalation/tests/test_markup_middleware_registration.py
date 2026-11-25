@@ -45,6 +45,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,8 @@ from shared.markup_residue_custody import (
 )
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     MarkupGuardMiddleware,
     RepairPolicy,
     residue_header_lines,
@@ -1465,6 +1469,61 @@ class _ResidueRefusingQueue(EscalationQueue):
         return super().submit(escalation)
 
 
+class _ResidueIdlessQueue(EscalationQueue):
+    """A queue that cannot mint an id under the residue anchor."""
+
+    def make_id(self, key: str) -> str:
+        if key == 'mcp-markup-residue':
+            raise OSError(28, 'No space left on device')
+        return super().make_id(key)
+
+
+@dataclass(frozen=True)
+class _LeakingCall:
+    """One leaked ``escalate_info`` call, and what its caller is told and gets."""
+
+    error_type: str
+    arguments: dict[str, Any]
+    raw: str
+    reported_residue_id: Callable[[Client, dict[str, Any]], Awaitable[str | None]]
+    caller_records_filed: int
+
+
+async def _refusal_residue_id(client: Client, arguments: dict[str, Any]) -> str | None:
+    """A refused call names its residue's home on the ToolError."""
+    with pytest.raises(ToolError) as excinfo:
+        await client.call_tool('escalate_info', arguments)
+    return error_payload(excinfo)['escalation_id']
+
+
+async def _forwarded_residue_id(client: Client, arguments: dict[str, Any]) -> str | None:
+    """A forwarded call names its dropped slice's home on the result meta."""
+    result = await client.call_tool('escalate_info', arguments)
+    assert result.meta is not None
+    return result.meta['markup_repair']['unrecovered_residue_id']
+
+
+def _refused_call() -> _LeakingCall:
+    record = specimen(UNREPAIRABLE)
+    return _LeakingCall(
+        error_type=MARKUP_UNREPAIRABLE_ERROR_TYPE,
+        arguments={**REQUIRED, record['param']: record['value']},
+        raw=record['value'],
+        reported_residue_id=_refusal_residue_id,
+        caller_records_filed=0,
+    )
+
+
+def _dropped_slice_call() -> _LeakingCall:
+    return _LeakingCall(
+        error_type=MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+        arguments={**REQUIRED, 'detail': _leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE)},
+        raw=UNTYPABLE_EVIDENCE,
+        reported_residue_id=_forwarded_residue_id,
+        caller_records_filed=1,
+    )
+
+
 class TestAResidueTheQueueCannotTakeSurvivesInTheLog:
     """The queue is the residue's first home, never its only chance.
 
@@ -1472,53 +1531,42 @@ class TestAResidueTheQueueCannotTakeSurvivesInTheLog:
     and as data, so the payload is recoverable from the service's journal.
     """
 
-    @staticmethod
-    def _refused() -> tuple[dict[str, Any], str]:
-        record = specimen(UNREPAIRABLE)
-        return {**REQUIRED, record['param']: record['value']}, record['value']
-
-    @staticmethod
-    def _dropped_slice() -> tuple[dict[str, Any], str]:
-        leaked = _leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE)
-        return {**REQUIRED, 'detail': leaked}, UNTYPABLE_EVIDENCE
-
-    async def _call(
-        self, client: Client, error_type: str, arguments: dict[str, Any]
-    ) -> str | None:
-        """The call's own report of where its residue went."""
-        if error_type == 'mcp_markup_unrepairable':
-            with pytest.raises(ToolError) as excinfo:
-                await client.call_tool('escalate_info', arguments)
-            return error_payload(excinfo)['escalation_id']
-        result = await client.call_tool('escalate_info', arguments)
-        assert result.meta is not None
-        return result.meta['markup_repair']['unrecovered_residue_id']
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('error_type', 'call'),
+        'failing_queue',
         [
-            pytest.param('mcp_markup_unrepairable', _refused, id='refused'),
-            pytest.param('mcp_markup_unrecovered_param', _dropped_slice, id='dropped-slice'),
+            pytest.param(_ResidueRefusingQueue, id='submit-raises'),
+            pytest.param(_ResidueIdlessQueue, id='make-id-raises'),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'leaking_call',
+        [
+            pytest.param(_refused_call, id='refused'),
+            pytest.param(_dropped_slice_call, id='dropped-slice'),
         ],
     )
     async def test_the_whole_record_is_logged(
-        self, tmp_path: Path, caplog, error_type, call
+        self,
+        tmp_path: Path,
+        caplog,
+        failing_queue: type[EscalationQueue],
+        leaking_call: Callable[[], _LeakingCall],
     ):
-        arguments, raw = call()
-        queue = _ResidueRefusingQueue(tmp_path / 'esc')
+        call = leaking_call()
+        queue = failing_queue(tmp_path / 'esc')
         server = create_server(queue, startup_sweep=False)
 
         with caplog.at_level('ERROR', logger='escalation.server'):
             async with Client(server) as client:
-                preserved_in = await self._call(client, error_type, arguments)
+                preserved_in = await call.reported_residue_id(client, call.arguments)
 
         assert preserved_in is None
         [line] = [r for r in caplog.records if 'residue_record' in r.__dict__]
         residue_record = line.__dict__['residue_record']
-        assert residue_record['raw_value'] == raw
-        assert residue_record['error_type'] == error_type
-        assert repr(raw) in line.getMessage()
+        assert residue_record['raw_value'] == call.raw
+        assert residue_record['error_type'] == call.error_type
+        assert repr(call.raw) in line.getMessage()
         assert line.exc_info is not None
         assert line.exc_info[0] is OSError
-        assert [e for e in queue.get_pending() if e.category == RESIDUE_CATEGORY] == []
+        assert len(queue.get_by_task(REQUIRED['task_id'])) == call.caller_records_filed
