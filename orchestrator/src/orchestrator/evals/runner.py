@@ -73,6 +73,7 @@ from .hermeticity import (
     writers_held_by,
 )
 from .metrics import (
+    EndpointKind,
     EvalMetrics,
     RoleUnderTest,
     compute_composite,
@@ -455,6 +456,7 @@ async def run_eval(
         ),
         label=judge_config.name if judge_config is not None else config.name,
         role=RoleUnderTest.JUDGE if judge_config is not None else RoleUnderTest.IMPLEMENTER,
+        endpoint_kind=config.endpoint_kind,
         initial_plan=initial_plan,
         replay_framed=False,
         worktree=worktree_path,
@@ -567,6 +569,7 @@ async def run_end_to_end(
         ),
         label=f'{arch_config.name}+{impl_config.name}',
         role=RoleUnderTest.END_TO_END,
+        endpoint_kind=impl_config.endpoint_kind,
         initial_plan=None,
         replay_framed=True,
         worktree=None,
@@ -584,6 +587,7 @@ async def _run_workflow_cell(
     *,
     label: str,
     role: RoleUnderTest,
+    endpoint_kind: EndpointKind,
     initial_plan: dict | None,
     replay_framed: bool,
     worktree: Path | None,
@@ -619,7 +623,7 @@ async def _run_workflow_cell(
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
-            sandbox_backend=sandbox_backend,
+            sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
         )
         result = EvalResult(
             task_id=address.task_id,
@@ -745,18 +749,19 @@ async def _cell_metrics(
     role: RoleUnderTest,
     replay_frame: str | None,
     sandbox_backend: CellSandbox,
+    endpoint_kind: EndpointKind,
 ) -> dict[str, Any]:
     """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
     try:
         metrics = await collect_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
-            sandbox_backend=sandbox_backend,
+            sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
         )
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
         return {
             'role_under_test': role, 'replay_frame': replay_frame,
-            'sandbox_backend': sandbox_backend,
+            'sandbox_backend': sandbox_backend, 'endpoint_kind': endpoint_kind,
         }
     return metrics.to_dict()
 
@@ -769,8 +774,9 @@ async def collect_metrics(
     role: RoleUnderTest,
     replay_frame: str | None = None,
     sandbox_backend: CellSandbox,
+    endpoint_kind: EndpointKind,
 ) -> EvalMetrics:
-    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame* and *sandbox_backend*."""
+    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame*, *sandbox_backend* and *endpoint_kind*."""
     wf_metrics = workflow.metrics
 
     # Plan completion
@@ -855,6 +861,7 @@ async def collect_metrics(
         role_under_test=role,
         replay_frame=replay_frame,
         sandbox_backend=sandbox_backend,
+        endpoint_kind=endpoint_kind,
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.

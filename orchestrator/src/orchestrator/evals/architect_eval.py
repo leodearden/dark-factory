@@ -44,6 +44,7 @@ from .measurement import (
     exception_reason,
 )
 from .metrics import (
+    EndpointKind,
     EvalMetrics,
     RoleUnderTest,
     compose_cost_source,
@@ -173,6 +174,8 @@ class ArchitectAttempt:
     cost_usd: float = 0.0
     cost_source: str = 'cli'
     cli_cost_untrusted: bool = False
+    # None means not stamped, never a guessed native endpoint.
+    endpoint_kind: EndpointKind | None = None
     unmeasured: Unmeasured | None = None
 
 
@@ -237,6 +240,7 @@ async def invoke_architect(
         cost_usd=cost_usd,
         cost_source=cost_source,
         cli_cost_untrusted=cli_cost_untrusted,
+        endpoint_kind=config.endpoint_kind,
         unmeasured=ended.unmeasured,
     )
 
@@ -589,6 +593,7 @@ def assemble_metrics(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         cli_cost_untrusted=attempt.cli_cost_untrusted,
+        endpoint_kind=attempt.endpoint_kind,
         cache_read_tokens=usage.cache_read_tokens,
         cache_create_tokens=usage.cache_create_tokens,
         turns_used=usage.turns,
