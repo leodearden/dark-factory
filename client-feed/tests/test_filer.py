@@ -1,4 +1,4 @@
-"""The defect filer's pass (plans/client-feed-prd.md §14.4, §14.5): B25-B29 filing each portal report once as a fix and its gate, B35 its failures and the loop."""
+"""The defect filer's pass (plans/client-feed-prd.md §14.4, §14.5): B25-B29 filing each portal report once as a fix and its gate, B35 its failures and the loop, B38-B40 rulings."""
 
 import contextlib
 import tempfile
@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _defects import carrier_for, declared, quarantined, reported, restated
+from _defects import carrier_for, declared, quarantined, reported, restated, ruled
 from _fake_fused_memory import FakeFusedMemory, SimulatedCrash
 from _in_dir import append_inbox, request_reveals
 from _stores import TasksDb
@@ -17,6 +17,7 @@ from shared.mcp_session import McpCallError, McpFailureKind
 
 from client_feed.contract import INBOX_FILENAME, QuarantineReason
 from client_feed.defect_ref import portal_ref
+from client_feed.envelope import Stamp
 from client_feed.filer import (
     FALLBACK_AFTER_ATTEMPTS,
     MAX_BACKOFF_SECONDS,
@@ -26,16 +27,25 @@ from client_feed.filer import (
     run_until_stopped,
 )
 from client_feed.filer_state import CURSOR_NAME, FilerCursor, FilerLockHeld, held_state_dir
-from client_feed.filer_tasks import FIX_TITLE, GATE_TITLE, RESTATED_HEADING
+from client_feed.filer_tasks import (
+    FIX_TITLE,
+    GATE_TITLE,
+    RESTATED_HEADING,
+    operator_acceptance_event,
+    withdrawal_event,
+)
 from client_feed.filer_tools import (
+    CLOSED_TOOLS,
     FILER_IDENTITY,
     WRITE_TOOLS,
     ClosedTools,
     Disposition,
     ToolCaller,
 )
+from client_feed.fold import fold
 from client_feed.policy import Policy
 from client_feed.sources.tasks import DefectCarrier, read_defect_carriers
+from client_feed.value_events import defect_filed_events
 
 PROJECT = 'acme-widgets'
 REF = portal_ref(PROJECT, 2, 3)
@@ -421,3 +431,216 @@ def test_the_loop_stores_the_cursor_after_each_pass_and_backs_off_while_transien
     assert delays == [next_delay(interval, 1), next_delay(interval, 2), next_delay(interval, 0)]
     assert stored_offsets == [0, 0, gated.inbox_size()]
     _assert_filed_and_gated(gated)
+
+
+DEFECT_WRITES = ('declare_defect', 'record_defect_outcome')
+
+
+def _file_then_rule(world: World) -> FilerCursor:
+    """A report filed by one pass, then ruled on the portal: the cursor the filing pass left."""
+    append_inbox(world.in_dir, reported(2, 3, at=AT))
+    _, cursor = world.run()
+    append_inbox(world.in_dir, ruled(2, 3, at=AT))
+    return cursor
+
+
+def _writes_since(world: World, sent_before: int) -> list[tuple[str, str, str | None]]:
+    """Each write after the first `sent_before` calls: its tool, the task it names, and the status it sets."""
+    return [
+        (name, arguments.get('task_id', arguments.get('id')), arguments.get('status'))
+        for name, arguments in world.fake.calls[sent_before:]
+        if name in WRITE_TOOLS
+    ]
+
+
+def _assert_withdrawn_and_cancelled(world: World) -> None:
+    fix, gate = world.fix_and_gate()
+    [entry] = fix['metadata']['defects']
+    assert entry['status'] == 'withdrawn'
+    assert (fix['status'], gate['status']) == ('cancelled', 'cancelled')
+
+
+def test_b38_a_report_ruled_before_it_was_filed_is_never_filed(gated: World) -> None:
+    append_inbox(gated.in_dir, reported(2, 3, at=AT), ruled(2, 3, at=AT))
+
+    report, cursor = gated.run()
+
+    assert gated.writes() == []
+    assert gated.fake.tasks() == ()
+    assert report.converged == (REF,)
+    assert cursor.inbox_offset == gated.inbox_size()
+
+
+def test_b38_a_report_ruled_after_filing_is_withdrawn_and_its_fix_then_gate_cancelled(gated: World) -> None:
+    cursor = _file_then_rule(gated)
+    fix, gate = gated.fix_and_gate()
+    filed_carriers = gated.carriers()
+    acknowledged = defect_filed_events(
+        filed_carriers, state=fold((), project_id=PROJECT), stamp=Stamp(project_id=PROJECT, first_seq=1), now=AT
+    )
+    sent_before = len(gated.fake.calls)
+
+    report, _ = gated.run(cursor)
+
+    fix_id, gate_id = str(fix['id']), str(gate['id'])
+    assert _writes_since(gated, sent_before) == [
+        ('declare_defect', fix_id, None),
+        ('record_defect_outcome', fix_id, None),
+        ('set_task_status', fix_id, 'cancelled'),
+        ('set_task_status', gate_id, 'cancelled'),
+    ]
+    sent = {name: arguments for name, arguments in gated.fake.calls[sent_before:] if name in DEFECT_WRITES}
+    assert sent['declare_defect']['event'] == withdrawal_event(REF)
+    assert (sent['record_defect_outcome']['ref'], sent['record_defect_outcome']['event']) == (
+        REF,
+        operator_acceptance_event(REF),
+    )
+    _assert_withdrawn_and_cancelled(gated)
+    assert report.converged == (REF,)
+    carrier = carrier_for(REF, project_id=PROJECT, task_id=fix['id'], gated=True)
+    assert filed_carriers == gated.carriers() == (carrier,)
+    assert len(acknowledged) == 1
+    later = defect_filed_events(
+        gated.carriers(),
+        state=fold(acknowledged, project_id=PROJECT),
+        stamp=Stamp(project_id=PROJECT, first_seq=2),
+        now=AT,
+    )
+    assert later == ()
+
+
+@pytest.mark.parametrize(
+    'crash',
+    [
+        lambda fake: fake.crash_after('declare_defect', 1),
+        lambda fake: fake.crash_after('record_defect_outcome', 1),
+        lambda fake: fake.crash_after('set_task_status', 1),
+        lambda fake: fake.crash_before('set_task_status', 2),
+    ],
+    ids=['after-withdrawal', 'after-acceptance', 'after-fix-cancel', 'before-gate-cancel'],
+)
+def test_b39_every_crash_point_of_a_ruling_converges_without_a_repeated_defect_write(
+    gated: World, crash: Callable[[FakeFusedMemory], None]
+) -> None:
+    cursor = _file_then_rule(gated)
+    crash(gated.fake)
+
+    with pytest.raises(SimulatedCrash):
+        gated.run(cursor)
+    gated.run(cursor)
+    writes_after_recovery = len(gated.writes())
+    gated.run(FilerCursor())
+
+    _assert_withdrawn_and_cancelled(gated)
+    assert [name for name in gated.writes() if name in DEFECT_WRITES] == list(DEFECT_WRITES)
+    assert len(gated.writes()) == writes_after_recovery
+
+
+def test_b39_a_ruling_writes_only_the_filers_own_fix_and_gate(gated: World) -> None:
+    cursor = _file_then_rule(gated)
+    fix, gate = gated.fix_and_gate()
+    decoys = (
+        gated.fake.seed_task(metadata={'source': FILER_IDENTITY, 'defects': [declared(portal_ref(PROJECT, 2, 4))]}),
+        gated.fake.seed_task(metadata={'defects': [declared(REF)]}),
+        gated.fake.seed_task(metadata={'x_client_defect_gate_for': REF}),
+    )
+    seeded = [gated.fake.task(decoy) for decoy in decoys]
+    sent_before = len(gated.fake.calls)
+
+    report, _ = gated.run(cursor)
+
+    assert {task_id for _, task_id, _ in _writes_since(gated, sent_before)} == {str(fix['id']), str(gate['id'])}
+    assert [gated.fake.task(decoy) for decoy in decoys] == seeded
+    assert (gated.fake.task(fix['id'])['status'], gated.fake.task(gate['id'])['status']) == ('cancelled', 'cancelled')
+    assert report.converged == (REF,)
+
+
+def test_b39_a_started_fix_is_withdrawn_but_not_cancelled_while_its_gate_is(gated: World) -> None:
+    cursor = _file_then_rule(gated)
+    fix, _ = gated.fix_and_gate()
+    gated.fake.set_status(fix['id'], 'in-progress')
+
+    gated.run(cursor)
+
+    fix, gate = gated.fix_and_gate()
+    assert fix['metadata']['defects'][0]['status'] == 'withdrawn'
+    assert (fix['status'], gate['status']) == ('in-progress', 'cancelled')
+
+
+def test_b39_a_ruling_calls_only_closed_tools_and_sets_no_status_but_cancelled(gated: World) -> None:
+    cursor = _file_then_rule(gated)
+
+    gated.run(cursor)
+
+    statuses = [arguments['status'] for name, arguments in gated.fake.calls if name == 'set_task_status']
+    assert {name for name, _ in gated.fake.calls} <= CLOSED_TOOLS
+    assert statuses and set(statuses) == {'cancelled'}
+
+
+def test_b40_a_done_fix_gets_no_defect_write_and_stays_done(gated: World) -> None:
+    cursor = _file_then_rule(gated)
+    fix, _ = gated.fix_and_gate()
+    gated.fake.set_status(fix['id'], 'done')
+
+    report, _ = gated.run(cursor)
+    writes_after_ruling = len(gated.writes())
+    gated.run(FilerCursor())
+
+    fix, gate = gated.fix_and_gate()
+    assert [name for name in gated.writes() if name in DEFECT_WRITES] == []
+    assert (fix['status'], fix['metadata']['defects'][0]['status'], gate['status']) == ('done', 'open', 'cancelled')
+    assert report.converged == (REF,)
+    assert len(gated.writes()) == writes_after_ruling
+
+
+def test_b40_a_defect_write_refused_as_terminal_counts_as_done_and_is_not_retried(gated: World) -> None:
+    cursor = _file_then_rule(gated)
+    fix, gate = gated.fix_and_gate()
+    gated.fake.refuse_next('declare_defect', {'success': False, 'error': 'defect_write_to_terminal_task'})
+    sent_before = len(gated.fake.calls)
+
+    report, next_cursor = gated.run(cursor)
+
+    assert _writes_since(gated, sent_before) == [
+        ('declare_defect', str(fix['id']), None),
+        ('set_task_status', str(gate['id']), 'cancelled'),
+    ]
+    assert (report.converged, report.unconverged) == ((REF,), ())
+    assert next_cursor == FilerCursor(inbox_offset=gated.inbox_size())
+
+
+def test_a_ruled_ref_whose_filing_crashed_cancels_its_deferred_fix_and_gate(gated: World) -> None:
+    append_inbox(gated.in_dir, reported(2, 3, at=AT))
+    gated.fake.crash_before('commit_planning', 1)
+    with pytest.raises(SimulatedCrash):
+        gated.run()
+    append_inbox(gated.in_dir, ruled(2, 3, at=AT))
+
+    report, _ = gated.run()
+
+    _assert_withdrawn_and_cancelled(gated)
+    assert [task for task in gated.fake.tasks() if task['status'] == 'deferred'] == []
+    assert report.converged == (REF,)
+
+
+@pytest.mark.parametrize(
+    ('refusal', 'disposition'),
+    [(BACKLOG, Disposition.RETRY), (VALIDATION, Disposition.FALLBACK)],
+    ids=['backlog', 'validation-error'],
+)
+def test_a_refused_fix_step_leaves_the_gate_uncancelled_until_it_converges(
+    gated: World, refusal: dict[str, Any], disposition: Disposition
+) -> None:
+    cursor = _file_then_rule(gated)
+    gated.fake.refuse_next('declare_defect', refusal)
+
+    stuck, stuck_cursor = gated.run(cursor)
+
+    fix, gate = gated.fix_and_gate()
+    assert (fix['status'], gate['status']) == ('pending', 'pending')
+    assert 'set_task_status' not in gated.writes()
+    [named] = stuck.unconverged
+    assert (named.ref, named.tool, named.disposition) == (REF, 'declare_defect', disposition)
+    assert stuck_cursor.inbox_offset == cursor.inbox_offset
+    gated.run(stuck_cursor)
+    _assert_withdrawn_and_cancelled(gated)

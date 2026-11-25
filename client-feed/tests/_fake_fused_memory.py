@@ -133,6 +133,11 @@ class FakeFusedMemory:
                 priority=priority,
             )
 
+    def set_status(self, task_id: int | str, status: str) -> None:
+        """A status another actor gave a task (a worker started it, a merge landed it); no call is recorded."""
+        with self._lock:
+            self._tasks[int(task_id)]['status'] = status
+
     def write_tasks_db(self, tasks: TasksDb, *, updated_at: str) -> None:
         """Every task held, written into a real tasks.db in the project's tag, so the publisher's readers see them."""
         for task in self.tasks():
