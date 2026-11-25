@@ -21,6 +21,7 @@ from orchestrator.config import (
     RoutingRule,
     RuleMatch,
     RuleSet,
+    SplitMatch,
 )
 from orchestrator.routing import DEFAULT_LADDER
 
@@ -64,6 +65,44 @@ class TestClosedVocabularyForbidsUnknownKeys:
         with pytest.raises(ValidationError) as exc_info:
             RuleSet(vibe='good')  # type: ignore[call-arg]
         assert 'vibe' in str(exc_info.value)
+
+
+class TestSplitMatchValidation:
+    """A split condition is validated at construction: a malformed split
+    raises a ValidationError whose loc names the offending field."""
+
+    def test_valid_split_parses_and_rides_on_rule_match(self):
+        split = SplitMatch(salt='routing-exp-1', buckets=2, bucket=1)
+        assert RuleMatch(split=split).split == split
+        assert RuleMatch().split is None
+
+    def test_fewer_than_two_buckets_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='x', buckets=1, bucket=0)
+        assert exc_info.value.errors()[0]['loc'][-1] == 'buckets'
+
+    def test_bucket_equal_to_buckets_rejected_naming_both_values(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='x', buckets=2, bucket=2)
+        error = exc_info.value.errors()[0]
+        assert error['loc'][-1] == 'bucket'
+        assert 'bucket 2' in error['msg']
+        assert 'buckets=2' in error['msg']
+
+    def test_negative_bucket_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='x', buckets=2, bucket=-1)
+        assert exc_info.value.errors()[0]['loc'][-1] == 'bucket'
+
+    def test_empty_salt_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='', buckets=2, bucket=0)
+        assert exc_info.value.errors()[0]['loc'][-1] == 'salt'
+
+    def test_unknown_key_rejected_naming_the_key(self):
+        with pytest.raises(ValidationError) as exc_info:
+            SplitMatch(salt='x', buckets=2, bucket=0, arm=1)  # type: ignore[call-arg]
+        assert 'arm' in str(exc_info.value)
 
 
 class TestRoutingConfigDefaults:
