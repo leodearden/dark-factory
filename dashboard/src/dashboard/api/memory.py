@@ -41,7 +41,7 @@ _MEMORY_ENDPOINT_TIMEOUT_SECONDS = 5.0
 
 @router.get('/api/v2/dashboard/memory')
 async def api_memory(request: Request) -> JSONResponse:
-    """MEMORY_STATUS, including the write-queue Datum and per-project totals."""
+    """MEMORY_STATUS, including the write-queue and plan-route Datums and per-project totals."""
     http_client = request.app.state.http_client
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
@@ -69,6 +69,7 @@ async def api_memory(request: Request) -> JSONResponse:
         redux_api.shape_memory(
             status,
             memory_data.write_queue_datum(raw_queue, measured_at=render_at),
+            plan_route=memory_data.plan_route_datum(status, measured_at=render_at),
             served_at=served_at,
             sparks=sparks,
             queue_spark=queue_spark,

@@ -35,7 +35,9 @@ const {
   attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, totalHint,
   projectLandingRate, landingRateCaption, landingRateReading,
 } = window.DF_MERGE_QUEUE;
-const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
+const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText, planRoute, planRouteText, planRouteHealth } = window.DF_MEMORY_READINGS;
+// The one health -> tone mapping the Overview's rows read too — system_health.js.
+const { healthTone } = window.DF_SYSTEM_HEALTH;
 // PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
 const { projectCards, cardsAbsentReason, cardsShortfall } = window.DF_PERFORMANCE_CARDS;
 const { useState: uS } = React;
@@ -636,6 +638,7 @@ function PerfTab({ projectFilter }) {
 // ── Memory ──
 function MemoryTab({ projectFilter, onNavigate }) {
   const queue = writeQueue(DF);
+  const route = planRoute(DF);
   const projects = Object.entries(DF.MEMORY_STATUS.projects).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid));
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
@@ -654,6 +657,10 @@ function MemoryTab({ projectFilter, onNavigate }) {
         <ST label="fused-memory"
             datum={plainDatum(DF.MEMORY_STATUS.uptime_seconds, EP.memory)} format={secs => `up ${window.DF_SHELL.fmtUptime(secs)}`}
             hint={DF.MEMORY_STATUS.started_at || '—'} />
+      </div>
+
+      <div className="col-span-12 mono" data-testid="memory-plan-route" style={{ fontSize: 12, color: CP[healthTone(planRouteHealth(route))] }}>
+        <DatumReading datum={route} format={planRouteText} />
       </div>
 
       <div className="col-span-8 panel">

@@ -476,6 +476,62 @@ def write_queue_datum(
     )
 
 
+PLAN_ROUTE_FRESHNESS_BOUND_SECONDS = WRITE_QUEUE_FRESHNESS_BOUND_SECONDS
+"""How long a plan-route reading stays fresh: it rides the same /memory fan-out."""
+
+_PLAN_ROUTE_FIELDS = (
+    'state',
+    'proxy_host',
+    'capped_since',
+    'resets_at',
+    'next_probe_at',
+    'parked_items',
+    'judge_fail_opens_since_latch',
+    'escalation_id',
+)
+
+
+def plan_route_datum(
+    status: Mapping[str, Any], *, measured_at: datetime,
+) -> Datum[dict[str, Any]]:
+    """The plan route's cap latch as one Datum: the one normaliser of get_status's plan_route.
+
+    A reachable answer is a fresh value of exactly the server's plan_route
+    fields (``fused_memory.services.plan_route::PlanRouteSnapshot.to_status``).
+    An offline status, an older server with no plan_route, the server's own
+    ``{'error': ...}`` arm or anything but an object with a ``state`` is
+    ``unknown``: an unread latch is a hole, never "ok".
+    """
+    if status.get('offline'):
+        return unknown_datum(
+            status.get('error') or 'get_status reported offline without an error',
+            PLAN_ROUTE_FRESHNESS_BOUND_SECONDS,
+        )
+    if 'plan_route' not in status:
+        return unknown_datum(
+            'get_status reports no plan_route: fused-memory predates task 9944',
+            PLAN_ROUTE_FRESHNESS_BOUND_SECONDS,
+        )
+    plan_route = status['plan_route']
+    if not isinstance(plan_route, Mapping):
+        return unknown_datum(
+            f'get_status plan_route is not an object: {plan_route!r}',
+            PLAN_ROUTE_FRESHNESS_BOUND_SECONDS,
+        )
+    if not isinstance(plan_route.get('state'), str):
+        return unknown_datum(
+            plan_route.get('error') or f'get_status plan_route carries no state: {plan_route!r}',
+            PLAN_ROUTE_FRESHNESS_BOUND_SECONDS,
+        )
+    return Datum(
+        {key: plan_route.get(key) for key in _PLAN_ROUTE_FIELDS},
+        measured_at,
+        DatumState.FRESH,
+        None,
+        PLAN_ROUTE_FRESHNESS_BOUND_SECONDS,
+    )
+
+
 # Intentionally NOT converted to first_success: collects a per-URL entry from
 # ALL configured URLs rather than short-circuiting on the first success.
 async def get_wal_status(

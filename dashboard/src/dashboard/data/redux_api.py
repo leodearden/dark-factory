@@ -174,6 +174,7 @@ def shape_memory(
     status: Mapping[str, Any],
     queue: Datum[dict[str, Any]],
     *,
+    plan_route: Datum[dict[str, Any]],
     served_at: datetime,
     sparks: Mapping[str, Mapping[str, list]] | None = None,
     queue_spark: Mapping[str, list] | None = None,
@@ -185,7 +186,9 @@ def shape_memory(
     ``queue`` is the write queue as one Datum (``memory.py::write_queue_datum``)
     served under ``queue.stats``, aged to *served_at*; the queue block is the
     same whether ``get_status`` answered or not, because the two probes are
-    independent. ``sparks`` (optional) carries ``{graphiti_nodes,
+    independent. ``plan_route`` is the plan route's cap latch as one Datum
+    (``memory.py::plan_route_datum``), served under ``plan_route`` on both
+    branches the same way. ``sparks`` (optional) carries ``{graphiti_nodes,
     mem0_memories}`` time series; ``queue_spark`` carries the pending-queue
     series; ``delta_24h`` carries per-project ``{graphiti_nodes,
     mem0_memories}`` snapshots from ~24h ago for delta rendering.  All three
@@ -198,6 +201,7 @@ def shape_memory(
     spark_m = (sparks or {}).get('mem0_memories') or _EMPTY_SERIES
     delta_map = delta_24h or {}
     queue_block = _queue_block(queue, queue_spark, served_at)
+    plan_route_block = _wire_served(plan_route, 'MEMORY_STATUS plan_route', served_at)
 
     def _project_block(pid: str, payload: Mapping[str, Any]) -> dict:
         before = delta_map.get(pid) or {}
@@ -213,6 +217,7 @@ def shape_memory(
                          'spark': _empty_series_dict()},
             'mem0': {'connected': None, 'memory_count': 0, 'spark': _empty_series_dict()},
             'queue': queue_block,
+            'plan_route': plan_route_block,
             'projects': {},
             'wal': _shape_wal_status(wal),
             'offline': True,
@@ -245,6 +250,7 @@ def shape_memory(
         'graphiti': graphiti,
         'mem0': mem0,
         'queue': queue_block,
+        'plan_route': plan_route_block,
         'projects': enriched_projects,
         'wal': wal_block,
         'uptime_seconds': status.get('uptime_seconds'),

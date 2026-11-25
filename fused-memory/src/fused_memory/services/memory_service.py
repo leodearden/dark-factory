@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
+import httpx
 from graphiti_core.nodes import EpisodeType
 from shared.streak import KeyedStreaks
 
@@ -24,6 +25,7 @@ from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     GraphitiBackend,
     ReadCompleteness,
+    build_llm_client,
     read_all_valid_edges_checked,
     read_entity_nodes_checked,
 )
@@ -119,9 +121,10 @@ from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
 from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
 from fused_memory.services.billing_exhaustion_alarm import (
+    ApiKeyCreditsParkGuard,
     BillingExhaustionAlarm,
-    BillingParkPolicy,
 )
+from fused_memory.services.billing_park_policy import BillingParkPolicy
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -154,7 +157,10 @@ from fused_memory.services.overreach_shadow import (
     open_overreach_shadow,
     shadow_job_from_write,
 )
+from fused_memory.services.plan_cap_alarm import PlanCapAlarm
+from fused_memory.services.plan_route import PlanRoute, PlanRouteParkGuard, PlanRouteSite
 from fused_memory.services.provider_billing import (
+    BillingSource,
     billing_source_of,
     classify_billing_exhaustion,
 )
@@ -2140,9 +2146,12 @@ class MemoryService:
         config: FusedMemoryConfig,
         *,
         mem0_retry_policy: Mem0RetryPolicy = DEFAULT_MEM0_RETRY_POLICY,
+        queue_clock: Callable[[], float] = time.time,
     ):
+        """*queue_clock* schedules the durable queue, and the plan route, whose probe times become parked rows' horizons."""
         self.config = config
         self._mem0_retry_policy = mem0_retry_policy
+        self._queue_clock = queue_clock
         self.graphiti = GraphitiBackend(config)
         self.mem0 = Mem0Backend(config)
         self.classifier = WriteClassifier(config)
@@ -2150,6 +2159,17 @@ class MemoryService:
         self.durable_queue: DurableWriteQueue | None = None
         self._billing_alarm = BillingExhaustionAlarm(
             resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
+        )
+        def queue_moment() -> datetime:
+            return datetime.fromtimestamp(queue_clock(), UTC)
+
+        self._plan_cap_alarm = PlanCapAlarm(
+            resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
+            count_parked_or_in_flight=self._count_parked_or_in_flight_writes,
+            clock=queue_moment,
+        )
+        self.plan_route = PlanRoute(
+            config.plan_route, listener=self._plan_cap_alarm, clock=queue_moment,
         )
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
@@ -2406,9 +2426,55 @@ class MemoryService:
         if self._event_buffer:
             await self._event_buffer.push(event)
 
+    async def _count_parked_writes(self) -> int:
+        if self.durable_queue is None:
+            return 0
+        return (await self.durable_queue.get_stats())['counts'].get('parked', 0)
+
+    async def _count_parked_or_in_flight_writes(self) -> int:
+        if self.durable_queue is None:
+            return 0
+        counts = (await self.durable_queue.get_stats())['counts']
+        return counts.get('parked', 0) + counts.get('in_flight', 0)
+
+    async def _global_parked_count(self, queue_stats: object, project_id: str | None) -> int:
+        """The global parked count, read from *queue_stats* when they are unscoped."""
+        if project_id is None and isinstance(queue_stats, dict) and 'counts' in queue_stats:
+            return queue_stats['counts'].get('parked', 0)
+        return await self._count_parked_writes()
+
+    async def _plan_route_status(
+        self, queue_stats: object, project_id: str | None,
+    ) -> dict[str, Any]:
+        """get_status's plan_route field. A queue that cannot be counted costs
+        only ``parked_items`` (None), never the latch."""
+        try:
+            parked_items: int | None = await self._global_parked_count(queue_stats, project_id)
+        except Exception:
+            logger.warning(
+                'get_status: could not count parked writes; plan_route reports parked_items=None',
+                exc_info=True,
+            )
+            parked_items = None
+        return self.plan_route.state().to_status(
+            parked_items=parked_items, escalation_id=self._plan_cap_alarm.escalation_id(),
+        )
+
+    def _graphiti_plan_route_client(self) -> httpx.AsyncClient | None:
+        provider = self.config.llm.providers.openai
+        if self.config.llm.provider != 'openai' or provider is None or not provider.api_url:
+            return None
+        return self.plan_route.http_client_for(provider.api_url, site=PlanRouteSite.GRAPHITI)
+
     async def initialize(self) -> None:
         """Initialize backends and the durable write queue."""
-        await self.graphiti.initialize()
+        plan_client = self._graphiti_plan_route_client()
+        if plan_client is None:
+            await self.graphiti.initialize()
+        else:
+            await self.graphiti.initialize(
+                llm_client=build_llm_client(self.config, http_client=plan_client),
+            )
 
         qcfg = self.config.queue
 
@@ -2441,7 +2507,11 @@ class MemoryService:
             transient_error_names=qcfg.transient_error_names,
             on_terminal=self._record_queue_terminal_outcome,
             on_dead_letter=self._report_queue_dead_letter,
-            park_policy=BillingParkPolicy(self._billing_alarm),
+            park_policy=BillingParkPolicy({
+                BillingSource.API_KEY_CREDITS: ApiKeyCreditsParkGuard(self._billing_alarm),
+                BillingSource.PLAN_CAP: PlanRouteParkGuard(self.plan_route),
+            }),
+            clock=self._queue_clock,
         )
         self.durable_queue.register_callback(
             QueueCallback.DUAL_WRITE_EPISODE, self._dual_write_callback
@@ -11469,6 +11539,8 @@ class MemoryService:
                 status['queue'] = await self.durable_queue.get_stats(group_id=project_id)
             except Exception as e:
                 status['queue'] = {'error': str(e)}
+
+        status['plan_route'] = await self._plan_route_status(status.get('queue'), project_id)
 
         # Server uptime fields (informational; dashboard reads uptime_seconds as primary)
         status['started_at'] = self._started_at.isoformat()

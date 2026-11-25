@@ -7859,6 +7859,16 @@ def create_mcp_server(
         ``embedder`` block reports the probed endpoint, and ``config_overlay``
         the active config overlay's provenance.
 
+        The top-level ``plan_route`` field is the ChatGPT-plan route's cap
+        latch (task 9944): ``state`` (``ok``, ``capped`` or ``unconfigured``),
+        ``proxy_host``, ``capped_since``, ``resets_at``, ``next_probe_at``,
+        ``parked_items`` (globally parked writes, null when the queue cannot
+        be counted),
+        ``judge_fail_opens_since_latch`` and ``escalation_id``. ``capped``
+        means plan-routed work is parked behind the ``plan_route_capped`` L2
+        that ``escalation_id`` names, re-probing at ``next_probe_at``. A capped
+        plan never falls back onto OPENAI_API_KEY.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """

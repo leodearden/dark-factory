@@ -20,8 +20,10 @@ runs dry again within ``REPAGE_COOLDOWN`` of a recovery is still settling, so
 its page waits out the rest of that window rather than pushing Leo a second
 time at once.
 
-:class:`BillingParkPolicy` is the durable queue's side of it: the queue parks
-what the policy names and reports parking and clearing back to the alarm.
+:class:`ApiKeyCreditsParkGuard` is this source's guard in the durable queue's
+``billing_park_policy.py::BillingParkPolicy``: the queue parks what the policy
+names and reports parking and clearing back to the alarm. A plan cap has its
+own page (``plan_cap_alarm.py``), so this alarm ignores every other source.
 """
 
 from __future__ import annotations
@@ -37,11 +39,11 @@ from fused_memory.middleware._folded_escalation import (
     pending_folded_escalations,
     resolve_folded_escalations,
 )
-from fused_memory.services.durable_queue import ParkedWriteEvent
 from fused_memory.services.provider_billing import (
     BillingExhaustion,
     BillingSource,
-    classify_billing_exhaustion,
+    alarm_category_of,
+    billing_evidence_lines,
     exhaustion_of,
 )
 
@@ -49,10 +51,10 @@ logger = logging.getLogger(__name__)
 
 ANCHOR_TASK_ID = 'provider-billing-exhausted'
 _AGENT_ROLE = 'harness-fused-memory-billing-guard'
-_CATEGORY = 'provider_billing_exhausted'
-_LOG_LABEL = 'provider_billing_exhausted'
 #: The anchor is per billing source, so a re-latched record names its source.
 _SOURCE = BillingSource.API_KEY_CREDITS
+_CATEGORY = alarm_category_of(_SOURCE)
+_LOG_LABEL = 'provider_billing_exhausted'
 _UNKNOWN = 'unknown'
 
 #: Sets two cadences. An exhaustion this soon after a recovery waits it out,
@@ -104,6 +106,12 @@ class BillingExhaustionAlarm:
         return self._state
 
     async def record_exhausted(self, exhaustion: BillingExhaustion, *, site: str) -> None:
+        if exhaustion.source is not _SOURCE:
+            logger.info(
+                '%s: %s exhaustion at %s is not this page\'s source; ignored',
+                _LOG_LABEL, exhaustion.source.value, site,
+            )
+            return
         now = self._clock()
         latched = self._state
         if latched is not None and (self._paging or self._page_is_current(latched, now)):
@@ -251,10 +259,6 @@ class BillingExhaustionAlarm:
             )
 
 
-def _one_line(text: str) -> str:
-    return ' '.join(text.split())
-
-
 def _summary(latched: BillingAlarmState) -> str:
     exhaustion = latched.exhaustion
     return (
@@ -276,14 +280,9 @@ def _suggested_action(exhaustion: BillingExhaustion) -> str:
 def _detail(latched: BillingAlarmState) -> str:
     exhaustion = latched.exhaustion
     return '\n'.join([
-        f'provider={exhaustion.provider}',
-        f'billing_source={exhaustion.source.value}',
-        f'key_scope={exhaustion.key_scope}',
-        f'code={exhaustion.code}',
+        *billing_evidence_lines(exhaustion),
         f'first_seen={latched.first_seen.isoformat()}',
         f'first_site={latched.first_site}',
-        f'error_type={exhaustion.error_type}',
-        f'provider_message={_one_line(exhaustion.provider_message)}',
         '',
         'Durable writes that hit this are parked, not dead-lettered: they drain '
         'by themselves, and this record resolves itself, on the first '
@@ -294,26 +293,20 @@ def _detail(latched: BillingAlarmState) -> str:
     ])
 
 
-class BillingParkPolicy:
-    """Parks the durable writes a provider refuses for exhausted billing.
+class ApiKeyCreditsParkGuard:
+    """The API-key credits source's guard in the durable queue's billing park policy.
 
-    Satisfies ``durable_queue.py::ParkPolicy``; a parked write that lands is
-    the recovery evidence.
+    Its parked rows keep the queue's own horizon.
     """
 
     def __init__(self, alarm: BillingExhaustionAlarm) -> None:
         self._alarm = alarm
 
-    def park_reason(self, exc: BaseException) -> str | None:
-        exhaustion = classify_billing_exhaustion(exc)
-        if exhaustion is None:
-            return None
-        return f'{exhaustion.provider} {exhaustion.source.value} exhausted ({exhaustion.code})'
+    def park_until(self) -> float | None:
+        return None
 
-    async def on_parked(self, event: ParkedWriteEvent) -> None:
-        exhaustion = classify_billing_exhaustion(event.exc)
-        if exhaustion is not None:
-            await self._alarm.record_exhausted(exhaustion, site=f'durable_queue:{event.operation}')
+    async def on_parked(self, exhaustion: BillingExhaustion, *, site: str) -> None:
+        await self._alarm.record_exhausted(exhaustion, site=site)
 
-    async def on_cleared(self) -> None:
-        await self._alarm.record_recovered(site='durable_queue')
+    async def on_cleared(self, *, site: str) -> None:
+        await self._alarm.record_recovered(site=site)

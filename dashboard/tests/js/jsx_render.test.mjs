@@ -5,8 +5,9 @@
 //
 // node --test runs each file in its own process, and each process pays the
 // Babel compile once, so render tests share as few files as possible: this
-// one, and jsx_render_quality.test.mjs for the quality dashboard's seams. The
-// window/act/fetch plumbing both use is _render_helpers.mjs.
+// one, jsx_render_quality.test.mjs for the quality dashboard's seams, and
+// jsx_render_memory.test.mjs for MemoryTab's. The window/act/fetch plumbing
+// they use is _render_helpers.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
