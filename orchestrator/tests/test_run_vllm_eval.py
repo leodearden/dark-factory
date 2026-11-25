@@ -474,8 +474,13 @@ def _patch_pod_infra(monkeypatch, *, vllm_healthy_first=True):
     return fake_client
 
 
-def _patch_subprocess_run_success(monkeypatch, results_dir: Path):
-    """Patch subprocess.run so 'orchestrator eval' calls write a fake result file."""
+def _patch_subprocess_run_success(monkeypatch, results_dir: Path) -> dict[str, Any]:
+    """Patch subprocess.run so 'orchestrator eval' calls write a fake result file.
+
+    Returns a dict holding the last eval command (``cmd``) and the subprocess
+    timeout it ran under (``timeout``).
+    """
+    recorded: dict[str, Any] = {}
     real_run = subprocess.run
 
     def fake_run(cmd, *args, **kwargs):
@@ -491,10 +496,12 @@ def _patch_subprocess_run_success(monkeypatch, results_dir: Path):
             results_dir.mkdir(parents=True, exist_ok=True)
             run_id = f"r{int(time.time() * 1000) % 100000000:08d}"
             _write_result(results_dir, task_id, config_name, run_id)
+            recorded.update(cmd=cmd, timeout=kwargs.get("timeout"))
             return SimpleNamespace(returncode=0)
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    return recorded
 
 
 class TestPodLifecycle:
@@ -745,42 +752,24 @@ class TestPodLifecycle:
         assert fake_client.terminate_calls == ["pod-fake-1"]
 
 
+def _flag_value(cmd: list[str], flag: str) -> str | None:
+    """The argument following ``flag`` in ``cmd``, or None when ``flag`` is absent."""
+    return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+
 class TestOuterTimeoutPairing:
     """The launcher's kill deadline outlasts the ceiling the cell runs under,
     so the orchestrator hits its own ceiling first and writes a result file.
     """
 
     def _run_launcher(
-        self, monkeypatch, tmp_path, *, extra_argv: list[str], fixture_extra: dict
+        self, monkeypatch, tmp_path, *, extra_argv: list[str], spec_extra: dict | None = None
     ) -> tuple[int, dict[str, Any]]:
-        results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
-        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
-
-        fake_tasks = tmp_path / "tasks"
-        fake_tasks.mkdir()
-        (fake_tasks / "df_task_12.json").write_text(
-            json.dumps({"id": "df_task_12", "pre_task_commit": "deadbeef", **fixture_extra})
+        results, _ = _setup_launcher_fixture(
+            monkeypatch, tmp_path, ["df_task_12"], spec_extra=spec_extra
         )
-        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
-
-        _patch_pod_infra(monkeypatch)
         monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
-
-        recorded: dict[str, Any] = {}
-        real_run = subprocess.run
-
-        def fake_run(cmd, *args, **kwargs):
-            if isinstance(cmd, list) and cmd[:4] == ["uv", "run", "orchestrator", "eval"]:
-                recorded["cmd"] = cmd
-                recorded["timeout"] = kwargs["timeout"]
-                results.mkdir(parents=True, exist_ok=True)
-                config_name = cmd[cmd.index("--config-name") + 1]
-                _write_result(results, "df_task_12", config_name, "r00000001")
-                return SimpleNamespace(returncode=0)
-            return real_run(cmd, *args, **kwargs)
-
-        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+        recorded = _patch_subprocess_run_success(monkeypatch, results)
 
         rc = launcher.main(
             [
@@ -798,32 +787,28 @@ class TestOuterTimeoutPairing:
         return rc, recorded
 
     @pytest.mark.parametrize(
-        ("extra_argv", "fixture_extra", "inner_minutes"),
+        ("extra_argv", "spec_extra", "inner_minutes", "forwarded_timeout"),
         [
-            ([], {}, WORKFLOW_CELL_TIMEOUT_MINUTES),
-            (["--orch-timeout-min", "360"], {}, 360),
-            ([], {"timeout_minutes": 240}, 240),
+            ([], None, WORKFLOW_CELL_TIMEOUT_MINUTES, None),
+            (["--orch-timeout-min", "360"], None, 360, "360"),
+            ([], {"timeout_minutes": 240}, 240, None),
         ],
         ids=["workflow-default", "orch-timeout-flag", "fixture-ceiling"],
     )
     def test_the_default_kill_deadline_outlasts_the_cells_own_ceiling(
-        self, monkeypatch, tmp_path, extra_argv, fixture_extra, inner_minutes
+        self, monkeypatch, tmp_path, extra_argv, spec_extra, inner_minutes, forwarded_timeout
     ):
         rc, recorded = self._run_launcher(
-            monkeypatch, tmp_path, extra_argv=extra_argv, fixture_extra=fixture_extra
+            monkeypatch, tmp_path, extra_argv=extra_argv, spec_extra=spec_extra
         )
 
         assert rc == 0
         assert recorded["timeout"] > inner_minutes * 60
-        if extra_argv:
-            timeout_at = recorded["cmd"].index("--timeout")
-            assert recorded["cmd"][timeout_at + 1] == "360"
-        else:
-            assert "--timeout" not in recorded["cmd"]
+        assert _flag_value(recorded["cmd"], "--timeout") == forwarded_timeout
 
     def test_an_explicit_kill_deadline_is_honoured(self, monkeypatch, tmp_path):
         rc, recorded = self._run_launcher(
-            monkeypatch, tmp_path, extra_argv=["--task-timeout-min", "90"], fixture_extra={}
+            monkeypatch, tmp_path, extra_argv=["--task-timeout-min", "90"]
         )
 
         assert rc == 0
@@ -1126,7 +1111,9 @@ def _release_on_summary(monkeypatch, task_id: str) -> threading.Event:
     return event
 
 
-def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
+def _write_n_task_specs(
+    fake_tasks: Path, task_ids: list[str], spec_extra: dict | None = None
+) -> None:
     fake_tasks.mkdir(parents=True, exist_ok=True)
     for tid in task_ids:
         (fake_tasks / f"{tid}.json").write_text(
@@ -1135,16 +1122,18 @@ def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
                     "id": tid,
                     "pre_task_commit": "deadbeef",
                     "verify_commands": {"lint": "true", "typecheck": "true"},
+                    **(spec_extra or {}),
                 }
             )
         )
 
 
-def _setup_concurrent_fixture(
-    monkeypatch, tmp_path: Path, task_ids: list[str]
+def _setup_launcher_fixture(
+    monkeypatch, tmp_path: Path, task_ids: list[str], *, spec_extra: dict | None = None
 ) -> tuple[Path, _FakeClient]:
     """Shared RESULT_STORE / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
-    the ordering-sensitive TestConcurrentLoop tests below.
+    tests that drive launcher.main() over fake task specs, each carrying
+    ``spec_extra`` on top of the minimal spec.
 
     Returns ``(results_dir, fake_client)``.
     """
@@ -1153,7 +1142,7 @@ def _setup_concurrent_fixture(
     monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
     fake_tasks = tmp_path / "tasks"
-    _write_n_task_specs(fake_tasks, task_ids)
+    _write_n_task_specs(fake_tasks, task_ids, spec_extra)
     monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
     fake_client = _patch_pod_infra(monkeypatch)
@@ -1410,7 +1399,7 @@ class TestConcurrentLoop:
         incidental effect of the ordering fixture itself.
         """
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        results, fake_client = _setup_launcher_fixture(monkeypatch, tmp_path, task_ids)
         captured = _capture_summaries(monkeypatch)
 
         # Force the adverse order: df_task_11 cannot even start its body
@@ -1472,7 +1461,7 @@ class TestConcurrentLoop:
         bug.
         """
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        results, fake_client = _setup_launcher_fixture(monkeypatch, tmp_path, task_ids)
         captured = _capture_summaries(monkeypatch)
 
         # Two chained gates, not one. df_task_11 waits for df_task_10's
@@ -1529,7 +1518,7 @@ class TestConcurrentLoop:
     def test_concurrent_stop_on_first_failure_drains(self, monkeypatch, tmp_path):
         """Failing task stops the queue but in-flight tasks finish."""
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        results, fake_client = _setup_launcher_fixture(monkeypatch, tmp_path, task_ids)
         captured = _capture_summaries(monkeypatch)
 
         # Load-bearing happens-before (task 3805): see _release_on_summary's
