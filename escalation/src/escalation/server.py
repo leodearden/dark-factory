@@ -1071,7 +1071,7 @@ def _emit_uuid_prefix_fact(fact: dict[str, Any]) -> None:
 
 
 def _markup_residue_prose(record: Mapping[str, Any]) -> str:
-    """What happened to the call and to its payload, as one paragraph.
+    """What happened to the call, then a paragraph on who holds its payload.
 
     The words are ``shared/src/shared/markup_residue_custody.py::residue_prose``'s.
     A kind it has no text for is still filed, hedged, and also logged here, so
@@ -1085,7 +1085,7 @@ def _markup_residue_prose(record: Mapping[str, Any]) -> str:
             '(known: %s)',
             record.get('error_type'), sorted(MARKUP_RESIDUE_ERROR_TYPES),
         )
-    return f'{prose.outcome} {prose.custody}'
+    return f'{prose.outcome}\n\n{prose.custody}'
 
 
 def _markup_residue_escalation(record: Mapping[str, Any], esc_id: str) -> Escalation:

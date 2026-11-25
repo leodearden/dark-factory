@@ -98,7 +98,9 @@ def _unrecognised_prose(record: Mapping[str, Any]) -> ResidueProse:
     outcome = '\n'.join([
         f'UNRECOGNISED RESIDUE KIND {record.get("error_type")!r}. This sink does '
         "not know what this call's outcome was, so it states neither — the "
-        'middleware grew a record kind this module has no text for. Its own '
+        'middleware grew a record kind that '
+        'shared/src/shared/markup_residue_custody.py::residue_prose has no '
+        'text for. Its own '
         'words for what happened follow; treat them, not this paragraph, as the '
         'account of the call.',
         '',

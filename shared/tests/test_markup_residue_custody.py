@@ -91,6 +91,12 @@ class TestAnUnrecognisedKind:
 
         assert "UNRECOGNISED RESIDUE KIND 'mcp_markup_something_new'" in prose.outcome
 
+    def test_it_names_where_the_missing_text_belongs(self) -> None:
+        prose = residue_prose({'error_type': _FUTURE_KIND})
+
+        assert 'shared/src/shared/markup_residue_custody.py::residue_prose' in prose.outcome
+        assert 'this module' not in prose.outcome
+
 
 _LOGGER_NAME = 'test.markup_residue_custody'
 _RAW = 'THE ONLY COPY\n"quoted" tail'

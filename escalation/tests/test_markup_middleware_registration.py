@@ -1213,6 +1213,9 @@ class TestAnUnknownResidueKindIsFiledVisibly:
         assert 'Recover it.' in residue.detail
         assert 'the payload' in residue.detail
         assert "UNRECOGNISED RESIDUE KIND 'mcp_markup_something_new'" in residue.detail
+        # The custody hedge is this sink's, so it must not read as a tail of
+        # the middleware's own suggested action.
+        assert "suggested_action: 'Recover it.'" in residue.detail.splitlines()
         assert any(
             'unrecognised residue kind' in r.getMessage() for r in caplog.records
         ), 'an unknown kind must be visible in the log, not merely in the queue'
