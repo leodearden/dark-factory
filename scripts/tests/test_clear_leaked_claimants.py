@@ -28,6 +28,7 @@ from clear_leaked_claimants import (
     Bucket,
     Census,
     ExitCode,
+    RefusalReason,
     Tier,
     apply_repairs,
     emit_report,
@@ -684,6 +685,8 @@ class TestHolderPreflight:
         report = _apply(census, server)
 
         assert report.refused is True
+        assert report.refusal is RefusalReason.HOLDERS_IN_SELECTION
+        assert report.holder_set_error is None
         assert report.holder_intersection == (4028,)
         assert server.calls == []
         assert _store_rows(root) == before
@@ -724,6 +727,8 @@ class TestHolderPreflight:
         report = _apply(take_census(root, NOW), server)
 
         assert report.refused is False
+        assert report.refusal is None
+        assert report.holder_set_error is None
         assert server.written_ids() == TERMINAL_IDS
 
     def test_holders_are_read_at_apply_time_not_census_time(self, seed_root):
@@ -738,16 +743,51 @@ class TestHolderPreflight:
         assert report.holder_intersection == (5225,)
         assert server.calls == []
 
-    @pytest.mark.parametrize('snapshot', ['[]', '{"current_holders": ["4028"]}'])
-    def test_a_malformed_snapshot_is_treated_as_no_holders(self, seed_root, snapshot):
+    @pytest.mark.parametrize(
+        'snapshot', ['', '{not json', '[]', '{"current_holders": ["4028"]}'],
+        ids=['torn', 'invalid-json', 'non-object', 'malformed-shape'],
+    )
+    def test_an_unreadable_snapshot_refuses_the_whole_project(self, seed_root, snapshot):
         root = seed_root(TIER_TABLE_ROWS)
         _write_scheduler_state(root, snapshot)
+        census = take_census(root, NOW)
+        before = _store_rows(root)
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert report.refused is True
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
+        assert report.holder_intersection == ()
+        assert report.holder_set_error is not None
+        assert 'scheduler_state.json' in report.holder_set_error
+        assert server.calls == []
+        assert _store_rows(root) == before
+        assert report.outcomes == ()
+        assert report.verification_census is None
+
+    def test_a_snapshot_path_that_cannot_be_read_refuses(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        (Path(root) / 'data' / 'orchestrator' / 'scheduler_state.json').mkdir(parents=True)
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server)
+
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
+        assert server.calls == []
+        assert report.holder_set_error is not None
+        assert 'IsADirectoryError' in report.holder_set_error
+
+    def test_an_unreadable_snapshot_with_nothing_selected_does_not_refuse(self, seed_root):
+        root = seed_root([STALE_PENDING])
+        _write_scheduler_state(root, '{not json')
         server = _FakeClaimantServer()
 
         report = _apply(take_census(root, NOW), server)
 
         assert report.refused is False
-        assert server.written_ids() == TERMINAL_IDS
+        assert report.refusal is None
+        assert server.calls == []
 
 
 def _sweep(roots, client, *, apply=True, tiers=TERMINAL_ONLY, clock=lambda: NOW):
