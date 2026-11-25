@@ -149,6 +149,48 @@ async def test_rows_omit_the_value_unless_asked(lookup_stack):
 
 
 @pytest.mark.asyncio
+async def test_include_rows_adds_the_whole_metadata_and_sorted_dependencies(lookup_stack):
+    p1, _p2, p3 = [await lookup_stack.seed() for _ in range(3)]
+    dependent = await lookup_stack.seed('pending', {'x_k': 'v', 'x_other': {'nested': [1, 2]}})
+    loner = await lookup_stack.seed('pending', {'x_k': 'v'})
+    for depends_on in (p3, p1):
+        await lookup_stack.backend.add_dependency(
+            str(dependent), str(depends_on), lookup_stack.root,
+        )
+
+    found = await lookup_stack.interceptor.find_tasks_by_metadata(
+        lookup_stack.root, 'x_k', 'v', include_rows=True,
+    )
+
+    assert [row['task_id'] for row in found['results']] == [dependent, loner]
+    rows = {row['task_id']: row for row in found['results']}
+    for task_id, row in rows.items():
+        assert set(row) == _SLIM_ROW_KEYS | {'metadata', 'dependencies'}
+        stored = await lookup_stack.backend.get_task(str(task_id), lookup_stack.root)
+        assert row['metadata'] == stored['metadata']
+    assert rows[dependent]['dependencies'] == [p1, p3]
+    assert rows[loner]['dependencies'] == []
+
+
+@pytest.mark.asyncio
+async def test_in_process_include_rows_applies_no_byte_budget(lookup_stack):
+    metadata = {'x_blob': 'a' * 60_000}
+    assert len(json.dumps(metadata).encode('utf-8')) > RESULT_BYTE_BUDGET
+    task_id = await lookup_stack.seed('pending', metadata)
+
+    found = await lookup_stack.interceptor.find_tasks_by_metadata(
+        lookup_stack.root, 'x_blob', include_rows=True,
+    )
+
+    stored = await lookup_stack.backend.get_task(str(task_id), lookup_stack.root)
+    assert [row['task_id'] for row in found['results']] == [task_id]
+    row = found['results'][0]
+    assert row['metadata'] == stored['metadata']
+    assert row['metadata']['x_blob'] == metadata['x_blob']
+    assert 'truncated_row' not in row
+
+
+@pytest.mark.asyncio
 async def test_in_process_paging_tiles_the_match_set(lookup_stack):
     ids = [await lookup_stack.seed('pending', {'x_k': 'v'}) for _ in range(5)]
     lookup = lookup_stack.interceptor.find_tasks_by_metadata
@@ -170,6 +212,8 @@ async def test_in_process_paging_tiles_the_match_set(lookup_stack):
         ('key', {'key': 'a"b'}),
         ('value', {'value': True}),
         ('include_value', {'include_value': 'yes'}),
+        ('include_rows', {'include_rows': 'yes'}),
+        ('include_rows', {'include_rows': 1}),
         ('limit', {'limit': 0}),
         ('offset', {'offset': -1}),
         ('value', {'value': 2**63}),
@@ -327,6 +371,37 @@ async def test_include_value_must_be_a_real_bool(lookup_stack, unbacked_call, in
     _assert_validation_error(response, 'include_value', include_value)
     response = await unbacked_call(key='x_k', include_value=include_value)
     _assert_validation_error(response, 'include_value', include_value)
+
+
+@pytest.mark.asyncio
+async def test_include_rows_is_echoed_and_the_default_omits_rows(lookup_stack):
+    prerequisite = await lookup_stack.seed()
+    task_id = await lookup_stack.seed('pending', {'x_k': 'v'})
+    await lookup_stack.backend.add_dependency(
+        str(task_id), str(prerequisite), lookup_stack.root,
+    )
+
+    omitted = await lookup_stack.call(key='x_k', value='v')
+    declined = await lookup_stack.call(key='x_k', value='v', include_rows=False)
+    opted_in = await lookup_stack.call(key='x_k', value='v', include_rows=True)
+
+    assert omitted['include_rows'] is False
+    assert set(omitted['results'][0]) == _SLIM_ROW_KEYS
+    assert declined['include_rows'] is False
+    assert opted_in['include_rows'] is True
+    row = opted_in['results'][0]
+    assert row['metadata']['x_k'] == 'v'
+    assert row['dependencies'] == [prerequisite]
+    assert 'description' not in row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('include_rows', ['yes', 1, None])
+async def test_include_rows_must_be_a_real_bool(lookup_stack, unbacked_call, include_rows):
+    response = await lookup_stack.call(key='x_k', include_rows=include_rows)
+    _assert_validation_error(response, 'include_rows', include_rows)
+    response = await unbacked_call(key='x_k', include_rows=include_rows)
+    _assert_validation_error(response, 'include_rows', include_rows)
 
 
 @pytest.mark.asyncio
