@@ -2616,7 +2616,14 @@ are paged: follow `pagination.has_more` with `offset += returned`.
 48,000 B page budget
 (`fused-memory/src/fused_memory/server/tools.py::RESULT_BYTE_BUDGET`);
 a single row over that budget comes back alone with `truncated_value: true`
-and its value elided, so read that task with `get_task`. `tasks_with_key`
+and its value elided, so read that task with `get_task`.
+`include_rows=True` adds each row's whole `metadata` object and its
+`dependencies` (integer ids, ascending, `[]` when none), under the same
+48,000 B page budget; a single row over that budget comes back alone with
+`truncated_row: true` and its `metadata` elided, so read that task with
+`get_task`. `description` is not returned. The response always echoes
+`include_rows`, so a stdlib client can tell a server that honoured the
+argument from one that dropped it. `tasks_with_key`
 counts the tasks in the searched statuses that carry the key, so without a
 `statuses` filter `tasks_with_key == 0` means no task carries it at all (a
 misspelt key, or no producer has written it yet). An unknown status is

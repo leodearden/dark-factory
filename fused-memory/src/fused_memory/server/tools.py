@@ -583,7 +583,7 @@ Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (keep page_size <= 2000 — larger pages can exceed the MCP tool-response transport limit and be rejected wholesale), with auto_paginate=True as an opt-in one-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
-- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value
+- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value; include_rows=True adds metadata and dependencies (echoed as include_rows)
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
@@ -10047,13 +10047,19 @@ def create_mcp_server(
             offset: Zero-based index into the matches, ordered by task id.
             tag: Tag context (optional).
             include_value: True adds ``matched_value``, the whole ``metadata[key]``.
+            include_rows: True adds ``metadata`` (the whole top-level object) and
+                ``dependencies`` (ids ascending, ``[]`` when none); ``description``
+                is never returned.
 
         Returns ``results`` (``task_id``, ``title``, ``status``, ``priority``,
         ``updated_at``), ``tasks_with_key`` (how many tasks in the searched
         statuses carry ``key``), ``pagination`` (page on ``has_more`` with
         ``offset += returned``), ``malformed_metadata_ids`` when some task's
-        metadata is not a JSON object, and the echoed arguments. An ``error``
-        payload means the lookup failed; it never means "no match".
+        metadata is not a JSON object, and the echoed arguments, ``include_rows``
+        among them. With either opt-in a page fits ``RESULT_BYTE_BUDGET``; a lone
+        over-budget row carries ``truncated_value`` / ``truncated_row`` with its
+        payload elided, so read it with ``get_task``. An ``error`` payload means
+        the lookup failed; it never means "no match".
         """
         paging_error = _validate_paging(limit, offset, size_arg='limit')
         if paging_error is not None:
