@@ -222,8 +222,17 @@ def test_step_two_reads_back_the_top_hit_and_files_when_it_is_done() -> None:
     assert decision.step is Step.CURATOR
 
 
-def test_an_unreachable_step_two_goes_to_the_curator_and_says_so() -> None:
-    store = FakeTaskStore(unreachable=["search_tasks"])
+@pytest.mark.parametrize(
+    "store",
+    [
+        FakeTaskStore(unreachable=["search_tasks"]),
+        FakeTaskStore(search_hits={_filing().title: task_store.StoreUnreachable(
+            "search_tasks: ValidationError: query carries MCP envelope markup",
+        )}),
+    ],
+    ids=["transport-failure", "refused-query"],
+)
+def test_an_unreachable_step_two_goes_to_the_curator_and_says_so(store) -> None:
     submit = _Submit()
 
     decision = _only(disposition.dispose([_filing()], store=store, submit=submit))
@@ -232,6 +241,31 @@ def test_an_unreachable_step_two_goes_to_the_curator_and_says_so() -> None:
     assert decision.step is Step.CURATOR
     assert decision.note is not None
     assert "search_tasks" in decision.note
+
+
+def _degraded() -> task_store.StoreDegraded:
+    return task_store.StoreDegraded("search_tasks: degraded: RateLimitError: insufficient_quota")
+
+
+@pytest.mark.parametrize("submit", [_Submit(), None], ids=["filing", "dry-run"])
+def test_a_degraded_step_two_holds_the_finding_unfiled_for_the_next_run(submit) -> None:
+    filing = _filing()
+    store = FakeTaskStore(search_hits={filing.title: _degraded()})
+
+    disposal = disposition.dispose([filing], store=store, submit=submit)
+
+    if submit is not None:
+        assert submit.calls == []
+    decision = _only(disposal)
+    assert decision.step is Step.SEMANTIC
+    assert decision.routed is False
+    assert decision.back_link(_RUN) is None
+    assert decision.disposition() == "open"
+    assert decision.note is not None
+    assert "insufficient_quota" in decision.note
+    assert "next run" in decision.note
+    assert disposal.unfiled == ()
+    assert disposal.unreachable is None
 
 
 def test_step_three_files_through_the_curator_and_holds_the_pending_ticket() -> None:
@@ -831,6 +865,20 @@ def test_a_refused_ticket_says_so_with_the_reason() -> None:
 
     assert row["resolution"] == "refused"
     assert "premise" in row["note"]
+
+
+def test_a_held_finding_renders_open_with_why_and_when_it_is_retried() -> None:
+    filing = _filing()
+    store = FakeTaskStore(search_hits={filing.title: _degraded()})
+
+    (row,) = _table(_filed(_record(*_disposed_and_resolved([filing], store))))
+
+    assert row["step"] == "semantic"
+    assert row["disposition"] == "open"
+    assert row["ticket"] == ""
+    assert row["task_id"] == ""
+    assert "next run" in row["note"]
+    assert "insufficient_quota" in row["note"]
 
 
 def test_a_finding_filed_into_another_project_names_that_project() -> None:
@@ -1620,6 +1668,21 @@ def test_a_present_finding_whose_done_task_is_found_by_meaning_after_step_1c_is_
 
     assert submit.calls == []
     assert (decision.step, decision.task_id) == (Step.SEMANTIC, 88)
+
+
+def test_a_present_finding_held_at_a_degraded_step_two_keeps_its_step_1c_note() -> None:
+    filing = _present(_filing())
+    store = FakeTaskStore(metadata_hits=_key_hits(_hit(40, "done")), search_hits={filing.title: _degraded()})
+    submit = _Submit()
+
+    decision = _only(disposition.dispose([filing], store=store, submit=submit))
+
+    assert submit.calls == []
+    assert decision.step is Step.SEMANTIC
+    assert decision.routed is False
+    assert decision.note is not None
+    assert "§8 step 1c" in decision.note
+    assert "next run" in decision.note
 
 
 def test_a_filing_that_already_supersedes_a_task_keeps_it_when_its_key_finds_another_done_task() -> None:
