@@ -43,7 +43,7 @@ from fused_memory.utils.toolcall_xml_leak import (
     repair_leaked_text,
 )
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'sweep_episode_toolcall_xml_leak.py'
+SCRIPT_PATH = Path(__file__).resolve().parent.parent / 'scripts' / 'sweep_episode_toolcall_xml_leak.py'
 _mod = load_script_module(SCRIPT_PATH, mod_name='sweep_episode_toolcall_xml_leak')
 
 _neutralise = neutralise_fixture(
