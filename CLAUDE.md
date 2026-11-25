@@ -259,6 +259,16 @@ measured 2026-09-27 (CLI 2.1.283), `Grep` answered "Path does not exist:
 orchestrator/src/orchestrator. Note: your current working directory is
 .../orchestrator/src".
 
+Leave a directory before you delete it. In an interactive session, a shell
+that `cd`'d into a scratch worktree or a `mktemp -d` dir and then removed it is
+stranded: the next call is refused unrun ("Working directory ... no longer
+exists, so this command was not run"), even one that opens with an absolute
+`cd`. Neither `cd ..` from a subdirectory of the removed tree nor the anchor
+above gets you out of a scratch worktree: both leave the shell inside it. Do the
+entered work in a subshell, `( cd "$D" && ... )`, or pass the directory
+instead (`git -C`, `uv run --project`). The full rule's single home is
+`orchestrator/src/orchestrator/agents/bash_cwd_guidance.py::DELETED_CWD_GUIDANCE`.
+
 ## Memory Usage
 
 ### When to read memory
