@@ -1,4 +1,4 @@
-"""The test harness of ``scripts/rust_metrics_snapshot.py``: fixture rules, and tokei and cargo shims.
+"""The test harness of ``scripts/rust_metrics_snapshot.py``: fixture rules, tokei and cargo shims, a Cargo repo.
 
 The shims go first on PATH, so a verify host needs neither binary.
 
@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+
+from git_listing import git
 
 #: Two areas, one per fixture crate; nothing excluded beyond docs/.
 FIXTURE_RULES_TOML = """\
@@ -99,3 +101,46 @@ def tool_shims(bin_dir: Path, *, tokei_version: str = '15.0.0') -> Path:
     _write_shim(bin_dir / 'tokei', f'VERSION = {tokei_version!r}\n{_TOKEI_SHIM}')
     _write_shim(bin_dir / 'cargo', _CARGO_SHIM)
     return bin_dir
+
+
+#: A two-crate Cargo workspace: core's lib holds two ifs and a pub(crate) fn, app uses core.
+RUST_WORKSPACE_FILES: dict[str, str] = {
+    'Cargo.toml': '[workspace]\nmembers = ["crates/core", "crates/app"]\n',
+    'crates/core/Cargo.toml': '[package]\nname = "core"\nversion = "0.1.0"\n',
+    'crates/core/src/lib.rs': (
+        '// The fixture library.\n'
+        'pub fn classify(a: bool, b: bool) -> u8 {\n'
+        '    let mut x = 0;\n'
+        '    if a {\n'
+        '        x = 1;\n'
+        '    }\n'
+        '    if b {\n'
+        '        x = 2;\n'
+        '    }\n'
+        '    x\n'
+        '}\n'
+        '\n'
+        'pub(crate) fn helper() -> u8 {\n'
+        '    1\n'
+        '}\n'
+    ),
+    'crates/core/tests/t.rs': '#[test]\nfn classifies() {\n    assert_eq!(core::classify(true, false), 1);\n}\n',
+    'crates/app/Cargo.toml': '[package]\nname = "app"\nversion = "0.1.0"\n',
+    'crates/app/src/main.rs': 'use core::classify;\n\nfn main() {\n    let _ = classify(true, false);\n}\n',
+}
+
+_COMMITTER = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
+
+
+def rust_workspace_repo(tmp_path: Path) -> Path:
+    """A committed Cargo workspace under *tmp_path* (no pyproject.toml) whose one branch is main."""
+    root = tmp_path / 'repo'
+    for relpath, text in RUST_WORKSPACE_FILES.items():
+        target = root / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+    git(root, 'init', '-q')
+    git(root, 'add', '-A')
+    git(root, *_COMMITTER, 'commit', '--no-verify', '-q', '-m', 'base')
+    git(root, 'branch', '-M', 'main')
+    return root

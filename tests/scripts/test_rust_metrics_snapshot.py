@@ -12,12 +12,20 @@ import os
 import platform
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 import rust_metrics_snapshot
 import source_measures
 from git_listing import git
-from rust_snapshot_fixtures import FIXTURE_RULES_TOML, tool_shims, write_fixture_rules
+from quality_snapshot_fixtures import BASE_FILES, committed_repo, run_snapshot
+from quality_snapshot_identity import below_run_id_and_cost
+from rust_snapshot_fixtures import (
+    FIXTURE_RULES_TOML,
+    rust_workspace_repo,
+    tool_shims,
+    write_fixture_rules,
+)
 
 REPO_ROOT = Path(__file__).parents[2]
 REIFY_RULES = REPO_ROOT / 'scripts' / 'rust_metrics_rules' / 'reify.toml'
@@ -151,3 +159,88 @@ class TestParams:
         refusal = capsys.readouterr().err
         assert 'tokei' in refusal
         assert 'cargo install --locked tokei' in refusal
+
+
+@pytest.fixture
+def shims(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    bin_dir = tool_shims(tmp_path / 'bin')
+    _put_first_on_path(monkeypatch, bin_dir)
+    return bin_dir
+
+
+def _measure(rules: Path, root: Path, out: Path, run_id: str = 'r1') -> int:
+    return rust_metrics_snapshot.main(
+        ['--rules', str(rules), '--run-id', run_id, '--out', str(out), '--root', str(root)]
+    )
+
+
+@pytest.mark.usefixtures('shims')
+class TestTheMeasurement:
+    def test_it_writes_one_snapshot_whose_params_are_the_predicted_ones(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], fixture_rules: Path
+    ) -> None:
+        repo = rust_workspace_repo(tmp_path)
+        out = tmp_path / 'out' / 'snapshot.json'
+        assert _measure(fixture_rules, repo, out) == 0
+        assert list(out.parent.iterdir()) == [out]
+        assert git(repo, 'status', '--porcelain') == ''
+        taken = rust_metrics_snapshot.load_snapshot(out)
+        assert taken['instrument'] == rust_metrics_snapshot.INSTRUMENT == 'rust-metrics-snapshot'
+        assert taken['schema_version'] == rust_metrics_snapshot.SCHEMA_VERSION
+        assert taken['as_of_sha'] == git(repo, 'rev-parse', 'HEAD').strip()
+        assert taken['params'] == rust_metrics_snapshot.measurement_params(
+            rust_metrics_snapshot.load_rules(fixture_rules)
+        )
+        assert {record['path']: (record['area'], record['kind']) for record in taken['files']} == {
+            'crates/app/src/main.rs': ('app', 'src'),
+            'crates/core/src/lib.rs': ('core', 'src'),
+            'crates/core/tests/t.rs': ('core', 'tests'),
+        }
+        assert 'metrics snapshot r1 @ ' in capsys.readouterr().out
+
+    def test_two_trees_of_one_commit_measure_identically_below_run_id_and_cost(
+        self, tmp_path: Path, fixture_rules: Path
+    ) -> None:
+        repo = rust_workspace_repo(tmp_path)
+        trees = [tmp_path / 'tree-a', tmp_path / 'tree-b']
+        outs = [tmp_path / 'out' / 'a.json', tmp_path / 'out' / 'b.json']
+        for number, (tree, out) in enumerate(zip(trees, outs, strict=True)):
+            git(repo, 'worktree', 'add', '--detach', '-q', str(tree), 'main')
+            assert _measure(fixture_rules, tree, out, run_id=f'r{number}') == 0
+        assert below_run_id_and_cost(outs[0]) == below_run_id_and_cost(outs[1])
+        for out in outs:
+            text = out.read_text(encoding='utf-8')
+            assert not [tree for tree in trees if str(tree) in text]
+
+
+class TestLoadSnapshot:
+    @pytest.fixture
+    def taken(self, tmp_path: Path, fixture_rules: Path, shims: Path) -> dict[str, Any]:
+        out = tmp_path / 'out' / 'snapshot.json'
+        assert _measure(fixture_rules, rust_workspace_repo(tmp_path), out) == 0
+        return json.loads(out.read_text(encoding='utf-8'))
+
+    def _refusal(self, path: Path) -> str:
+        with pytest.raises(source_measures.MetricsError) as refused:
+            rust_metrics_snapshot.load_snapshot(path)
+        assert str(path) in str(refused.value)
+        return str(refused.value)
+
+    def test_a_python_instrument_snapshot_is_refused_naming_the_instrument(self, tmp_path: Path) -> None:
+        python_snapshot = tmp_path / 'python.json'
+        (tmp_path / 'python').mkdir()
+        assert run_snapshot(committed_repo(tmp_path / 'python', BASE_FILES), python_snapshot) == 0
+        assert 'instrument' in self._refusal(python_snapshot)
+
+    def test_params_missing_a_recorded_key_is_refused_naming_the_key(
+        self, tmp_path: Path, taken: dict[str, Any]
+    ) -> None:
+        del taken['params']['tokei_version']
+        edited = tmp_path / 'edited.json'
+        edited.write_text(json.dumps(taken), encoding='utf-8')
+        assert 'tokei_version' in self._refusal(edited)
+
+    def test_a_file_that_is_not_json_is_refused(self, tmp_path: Path) -> None:
+        garbled = tmp_path / 'garbled.json'
+        garbled.write_text('{"instrument": ', encoding='utf-8')
+        assert 'JSON' in self._refusal(garbled)
