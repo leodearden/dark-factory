@@ -22,11 +22,13 @@ Heuristic 14's measurement of this file and its split: task 7082's commit.
 
 Usage (stdio transport, spawned by orchestrator):
     # Direct-interpreter no-uv hot path (production, task 1776):
-    <sys.executable> -m orchestrator.mcp.plan_tools --worktree /path/to/worktree
+    <sys.executable> -m orchestrator.mcp.plan_tools --worktree /path/to/worktree \
+        --grants-enforced [--grant NAME ...]
 
     # uv fallback with fast-start flags (task 1775, backward-compat):
     uv run --project <orchestrator-dir> --no-sync --frozen \
-        python -m orchestrator.mcp.plan_tools --worktree /path/to/worktree
+        python -m orchestrator.mcp.plan_tools --worktree /path/to/worktree \
+        --grants-enforced [--grant NAME ...]
 """
 
 from __future__ import annotations
@@ -2187,21 +2189,27 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
 def server_from_argv(argv: list[str] | None = None) -> FastMCP:
     """The server a stdio launch with *argv* serves, over its artifacts.
 
-    A launch carrying ``--grants-enforced`` or any ``--grant`` exposes only
-    the granted tools, so a marked launch with no grant exposes none. A
-    launch carrying neither keeps every tool and logs a WARNING. Why both
-    cases exist: plans/plan-deviation-recording-prd.md D14.
+    A launch declaring ``--grants-enforced`` exposes exactly its ``--grant``
+    tools; one without it exposes none and logs a WARNING. The grant policy
+    itself is :func:`create_server`'s.
     """
     args = _cli_parser().parse_args(argv)
-    granted: frozenset[str] | None = frozenset(args.grant or ())
-    if not (args.grants_enforced or granted):
-        logger.warning(
-            'plan-tools launched without --grants-enforced or any --grant: exposing '
-            'every plan-tools tool, because the launcher predates task 7717. '
-            'Task 10803 removes this path.'
-        )
-        granted = None
-    return create_server(_artifacts_from_namespace(args), granted, args.caller_role)
+    return create_server(
+        _artifacts_from_namespace(args), _launch_grant(args), args.caller_role,
+    )
+
+
+def _launch_grant(args: argparse.Namespace) -> frozenset[str]:
+    granted = frozenset(args.grant or ())
+    if args.grants_enforced:
+        return granted
+    logger.warning(
+        'plan-tools launched without --grants-enforced: exposing no tool and '
+        'ignoring grant(s) %s. orchestrator.mcp_lifecycle.plan_tools_mcp_server '
+        'always passes the marker.',
+        sorted(granted),
+    )
+    return frozenset()
 
 
 def _cli_parser() -> argparse.ArgumentParser:
@@ -2232,8 +2240,8 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--grants-enforced', action='store_true',
         help=(
-            'Expose only the --grant tools, so none when no grant is given. '
-            'Every launcher from task 7717 on passes it.'
+            'Required: without it the server exposes no tool, whatever --grant '
+            'names. With it the server exposes exactly the --grant tools.'
         ),
     )
     parser.add_argument(
