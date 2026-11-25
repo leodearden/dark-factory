@@ -49,7 +49,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'fused-memory' /
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared' / 'src'))
 
 # A stdlib-only module under empty package __init__s, so the scripts env can import it.
-from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from fused_memory.mcp_tools.scheduler_state import (
+    SchedulerStateUnreadable,
+    read_scheduler_state_strict,
+)
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     is_stale_hygiene_tier_claimant,
@@ -196,6 +199,11 @@ class Bucket(StrEnum):
     FAILED = 'failed'
 
 
+class RefusalReason(StrEnum):
+    HOLDERS_IN_SELECTION = 'holders_in_selection'
+    HOLDER_SET_UNREADABLE = 'holder_set_unreadable'
+
+
 Delta = Mapping[str, tuple[Any, Any]]
 
 
@@ -211,11 +219,23 @@ class RowOutcome:
 class ApplyReport:
     project_root: str
     tiers: tuple[Tier, ...]
-    refused: bool
     holder_intersection: tuple[int, ...]
+    holder_set_error: str | None
     outcomes: tuple[RowOutcome, ...]
     verification_census: Census | None
     verification_error: str | None
+
+    @property
+    def refusal(self) -> RefusalReason | None:
+        if self.holder_set_error is not None:
+            return RefusalReason.HOLDER_SET_UNREADABLE
+        if self.holder_intersection:
+            return RefusalReason.HOLDERS_IN_SELECTION
+        return None
+
+    @property
+    def refused(self) -> bool:
+        return self.refusal is not None
 
     def counts(self) -> dict[Bucket, int]:
         counts = {bucket: 0 for bucket in Bucket}
@@ -257,7 +277,19 @@ async def _clear_claimant(client: ToolClient, project_root: str, violation: Viol
 
 
 def holder_task_ids(project_root: str) -> frozenset[str]:
-    return read_scheduler_state(Path(project_root)).holder_task_ids()
+    snapshot = read_scheduler_state_strict(Path(project_root))
+    return frozenset() if snapshot is None else snapshot.holder_task_ids()
+
+
+def _holder_preflight(root: str, selected: Sequence[Violation]) -> tuple[tuple[int, ...], str | None]:
+    """The selected rows the scheduler holds, or why its holder set could not be read."""
+    if not selected:
+        return (), None
+    try:
+        holders = holder_task_ids(root)
+    except SchedulerStateUnreadable as exc:
+        return (), _describe(exc)
+    return tuple(sorted(v.task_id for v in selected if str(v.task_id) in holders)), None
 
 
 def observed_delta(
@@ -343,14 +375,13 @@ async def apply_repairs(
         raise ValueError('apply_repairs writes through an MCP client; none was given')
     root = census.project_root
     selected = tuple(v for v in census.violations if v.tier in tiers)
-    holders = holder_task_ids(root)
-    held = tuple(sorted(v.task_id for v in selected if str(v.task_id) in holders))
-    if held:
+    held, holder_set_error = _holder_preflight(root, selected)
+    if held or holder_set_error is not None:
         return ApplyReport(
             project_root=root,
             tiers=_ordered(tiers),
-            refused=True,
             holder_intersection=held,
+            holder_set_error=holder_set_error,
             outcomes=(),
             verification_census=None,
             verification_error=None,
@@ -366,8 +397,8 @@ async def apply_repairs(
     return ApplyReport(
         project_root=root,
         tiers=_ordered(tiers),
-        refused=False,
         holder_intersection=(),
+        holder_set_error=None,
         outcomes=bucket_outcomes(selected, attempts, verification, tiers),
         verification_census=verification,
         verification_error=verification_error,
