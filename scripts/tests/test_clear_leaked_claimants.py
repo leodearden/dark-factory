@@ -813,6 +813,8 @@ class TestApplyOutput:
         assert 4028 in {v['task_id'] for v in project['census']['violations']}
         applied = project['apply']
         assert applied['refused'] is False
+        assert applied['refusal_reason'] is None
+        assert applied['holder_set_error'] is None
         assert applied['holder_intersection'] == []
         assert applied['counts'] == {
             'repaired': 3, 'skipped_changed_under_us': 0, 'arrived_during_window': 0, 'failed': 0,
@@ -851,6 +853,40 @@ class TestApplyOutput:
         ]
         fields = {token.split('=', 1)[0] for token in skipped_line.split()}
         assert {'delta.status', 'delta.claimant_run_id'} <= fields
+
+    def test_json_names_an_unreadable_holder_set_as_the_refusal_reason(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        payload = json.loads(render_json(_sweep([root], _FakeClaimantServer())))
+
+        applied = payload['projects'][0]['apply']
+        assert applied['refused'] is True
+        assert applied['refusal_reason'] == 'holder_set_unreadable'
+        assert applied['holder_intersection'] == []
+        assert 'scheduler_state.json' in applied['holder_set_error']
+        assert applied['counts']['repaired'] == 0
+
+    def test_json_names_held_rows_as_the_refusal_reason(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, _holders(orchestrator_src='4028'))
+
+        payload = json.loads(render_json(_sweep([root], _FakeClaimantServer())))
+
+        applied = payload['projects'][0]['apply']
+        assert applied['refusal_reason'] == 'holders_in_selection'
+        assert applied['holder_set_error'] is None
+
+    def test_text_says_the_holder_set_could_not_be_read(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        text = render_text(_sweep([root], _FakeClaimantServer()))
+
+        (refused_line,) = [
+            line for line in text.splitlines() if 'refused' in line and 'could not be read' in line
+        ]
+        assert 'scheduler_state.json' in refused_line
 
 
 def _tiers_by_id(census: Census) -> dict[int, Tier]:
@@ -983,6 +1019,40 @@ class TestExitCode:
 
         assert exit_code(result) is ExitCode.REPAIR_FAILED
         assert exit_conditions(result) == (ExitCode.REPAIR_FAILED, ExitCode.HOLDER_REFUSED)
+
+    def test_an_unreadable_holder_set_is_its_own_exit_code(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        result = _sweep([root], _FakeClaimantServer())
+
+        assert exit_code(result) is ExitCode.HOLDER_SET_UNREADABLE
+        assert int(ExitCode.HOLDER_SET_UNREADABLE) == 6
+
+    def test_exit_precedence_is_failure_then_unreadable_then_held(self, seed_root):
+        unreadable = seed_root(TIER_TABLE_ROWS, name='unreadable')
+        refused = seed_root(TIER_TABLE_ROWS, name='refused')
+        failing = seed_root(TIER_TABLE_ROWS, name='failing')
+        _write_scheduler_state(unreadable, '{not json')
+        _write_scheduler_state(refused, _holders(orchestrator_src='4028'))
+
+        result = _sweep([unreadable, refused, failing], _mixed_traffic_server(failing))
+
+        assert exit_conditions(result) == (
+            ExitCode.REPAIR_FAILED, ExitCode.HOLDER_SET_UNREADABLE, ExitCode.HOLDER_REFUSED,
+        )
+
+    def test_stderr_names_an_unreadable_holder_set(self, seed_root, capsys):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+        result = _sweep([root], _FakeClaimantServer())
+        capsys.readouterr()
+
+        emit_report(result, as_json=False)
+
+        errors = [line for line in capsys.readouterr().err.splitlines() if line.startswith('error:')]
+        (error,) = errors
+        assert 'scheduler_state.json' in error
 
     def test_stderr_names_every_condition_not_only_the_winning_one(self, seed_root, capsys):
         refused = seed_root(TIER_TABLE_ROWS, name='refused')
