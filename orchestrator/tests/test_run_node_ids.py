@@ -15,7 +15,7 @@ from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from _poll_responsive import poll_responsive
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
-from orchestrator.verify import run_node_ids
+from orchestrator.verify import run_node_id_results, run_node_ids
 
 pytestmark = [
     pytest.mark.xdist_group('run_node_ids_real_pytest'),
@@ -472,3 +472,74 @@ def test_a_cancelled_concurrent_run_returns_only_after_a_group_only_sigkill_ends
         for pid in _spinning_pids(pids).values():
             if _alive(pid):
                 os.kill(pid, signal.SIGKILL)
+
+
+_DETAIL_PROBE = """\
+def test_defect():
+    assert False, 'DEFECT at pkg/x.py:7'
+"""
+
+DEFECT = 'pkg/tests/test_detail.py::test_defect'
+
+
+def _make_detail_tree(tmp_path: Path) -> Path:
+    tree = _make_tree(tmp_path)
+    (tree / 'pkg' / 'tests' / 'test_detail.py').write_text(_DETAIL_PROBE, encoding='utf-8')
+    return tree
+
+
+def _results(tree: Path, ids: list[str]):
+    return asyncio.run(run_node_id_results(tree, _make_config(tree), [_module_config('pkg')], ids))
+
+
+def test_a_failing_id_carries_its_junit_failure_text(tmp_path):
+    tree = _make_detail_tree(tmp_path)
+
+    results = _results(tree, [DEFECT, BAD, FAIL_THEN_TEARDOWN_ERROR])
+
+    assert {node_id: result.status for node_id, result in results.items()} == {
+        DEFECT: 'fail', BAD: 'fail', FAIL_THEN_TEARDOWN_ERROR: 'fail',
+    }
+    assert 'DEFECT at pkg/x.py:7' in results[DEFECT].detail
+    assert 'assert False' in results[BAD].detail
+    assert 'teardown fails' not in results[FAIL_THEN_TEARDOWN_ERROR].detail
+
+
+def test_a_setup_error_carries_its_junit_error_text(tmp_path):
+    tree = _make_tree(tmp_path)
+
+    results = _results(tree, [SETUP_ERROR])
+
+    assert results[SETUP_ERROR].status == 'error'
+    assert 'setup fails' in results[SETUP_ERROR].detail
+
+
+def test_a_passing_or_skipped_id_has_no_detail(tmp_path):
+    tree = _make_tree(tmp_path)
+
+    results = _results(tree, [OK, SKIP])
+
+    assert {node_id: (result.status, result.detail) for node_id, result in results.items()} == {
+        OK: ('pass', ''), SKIP: ('skipped', ''),
+    }
+
+
+def test_an_unmappable_or_uncollected_id_errors_with_no_detail(tmp_path):
+    tree = _make_tree(tmp_path)
+
+    results = _results(tree, [OK, ABSENT_FILE, MISSING])
+
+    assert {node_id: (result.status, result.detail) for node_id, result in results.items()} == {
+        OK: ('pass', ''), ABSENT_FILE: ('error', ''), MISSING: ('error', ''),
+    }
+
+
+def test_run_node_ids_is_the_status_projection_of_the_results(tmp_path):
+    tree = _make_detail_tree(tmp_path)
+    ids = [OK, BAD, SKIP, SETUP_ERROR, PARAMETRIZED_ONE_FAILS, DEFECT, ABSENT_FILE]
+    config, module_configs = _make_config(tree), [_module_config('pkg')]
+
+    results = asyncio.run(run_node_id_results(tree, config, module_configs, ids))
+    statuses = asyncio.run(run_node_ids(tree, config, module_configs, ids))
+
+    assert {node_id: result.status for node_id, result in results.items()} == dict(statuses)
