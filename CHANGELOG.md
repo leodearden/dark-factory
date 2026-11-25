@@ -174,8 +174,9 @@ per category, and the headline leaves out categories the previous report did not
 sweep. Each category's detector stderr is kept beside its plan as
 `plan-<STAMP>-<category>.stderr.log`. A previous report that cannot be read is
 refused before that project's sweep starts. The report is
-`authoritative: false` and files nothing. Gate filing stays blocked on the detector's
-recall and belongs to task 4916. `--plan` mode rebuilds a report from saved plans with
+`authoritative: false` and files nothing. Gate filing from the report is descoped by
+the 2026-11-17 ruling (esc-10244-1), recorded as `recall_caveat.gate_filing_ruling`.
+`--plan` mode rebuilds a report from saved plans with
 no store access, which seeds the 2026-08-11 T0 baseline. Settings live in
 `fused-memory/config/duplicate-audit.yaml`, including the recall caveat every report
 carries. See OPERATIONS.md §12, "Weekly duplicate-cluster report (Sun 06:30)".
