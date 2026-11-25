@@ -19,6 +19,7 @@ from _verify_result_doubles import real_verify_result
 from orchestrator import verify_host_preflight as preflight
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_runner import RunnerUnavailable
 
 ENSURE_SECS = 7.0
 VERIFY_SECS = 100.0
@@ -203,3 +204,125 @@ class TestDispatchAndRecord:
 
         assert [rc.name for rc in built] == ['box']
         assert outcome.primary.passed is True
+
+
+def record_of(repo: Path, outcome: preflight.PreflightOutcome) -> dict[str, Any]:
+    return json.loads(record_path_for(repo, outcome.primary.sha).read_text())
+
+
+def record_path_for(repo: Path, sha: str, runner: str = 'box') -> Path:
+    return preflight_dir(repo) / f'{runner}-{sha}.json'
+
+
+@pytest.mark.asyncio
+class TestVerdictMapping:
+    async def test_a_red_verdict_records_its_failing_ids_per_module(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        red = dataclasses.replace(
+            real_verify_result(False),
+            failing_test_ids_by_module={'alpha': ['tests.test_a::test_x']},
+            failing_test_ids=['tests.test_a::test_x'],
+        )
+
+        outcome = await run_box(preflight_config(repo), timed_double(clock, result=red), clock)
+
+        record = record_of(repo, outcome)
+        assert record['passed'] is False
+        assert record['modules']['alpha'] == {
+            'failing_test_ids': ['tests.test_a::test_x'], 'failing_count': 1,
+        }
+        assert record['modules']['beta'] == {'failing_test_ids': [], 'failing_count': 0}
+        assert outcome.ok is False
+
+    async def test_a_trivial_pass_is_not_recorded_as_passed(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        vacuous = green_result(trivial=True)
+
+        outcome = await run_box(preflight_config(repo), timed_double(clock, result=vacuous), clock)
+
+        record = record_of(repo, outcome)
+        assert record['passed'] is False
+        assert record['trivial'] is True
+        assert outcome.ok is False
+
+    async def test_an_unavailable_verify_still_writes_a_no_verdict_record(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        double = timed_double(clock, error=RunnerUnavailable('host down', kind='transport'))
+
+        outcome = await run_box(preflight_config(repo), double, clock)
+
+        record = record_of(repo, outcome)
+        assert record['passed'] is False
+        assert record['no_verdict'] == {'kind': 'transport', 'message': 'host down'}
+        assert outcome.ok is False
+
+    async def test_an_unavailable_gate_records_its_kind_and_never_dispatches_the_verify(
+        self, repo: Path, clock: FakeClock,
+    ) -> None:
+        double = timed_double(
+            clock, ensure_error=RunnerUnavailable('skewed', kind='wire_shape'),
+        )
+
+        outcome = await run_box(preflight_config(repo), double, clock)
+
+        record = record_of(repo, outcome)
+        assert record['no_verdict']['kind'] == 'wire_shape'
+        assert record['passed'] is False
+        double.run_merge_verify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestRefusals:
+    @staticmethod
+    async def assert_refused(
+        config: OrchestratorConfig,
+        *,
+        runner: str = 'box',
+        sha: str | None = None,
+        reference: str | None = None,
+    ) -> None:
+        double = runner_double('box', is_local=False)
+        built: list[VerifyRunnerConfig] = []
+
+        def build(rc: VerifyRunnerConfig) -> MagicMock:
+            built.append(rc)
+            return double
+
+        with pytest.raises(preflight.PreflightRefused):
+            await preflight.run_preflight(
+                config, runner=runner, sha=sha, reference=reference,
+                deployed_sha=TEST_DEPLOYED_SHA, build_runner=build,
+            )
+
+        assert built == []
+        double.ensure_gate.assert_not_awaited()
+        double.run_merge_verify.assert_not_awaited()
+        assert not preflight_dir(config.project_root).exists()
+
+    async def test_refuses_an_undeclared_runner(self, repo: Path) -> None:
+        await self.assert_refused(preflight_config(repo), runner='nope')
+
+    async def test_refuses_a_project_with_a_persistent_merge_worktree(self, repo: Path) -> None:
+        await self.assert_refused(preflight_config(repo, persistent_merge_worktree=True))
+
+    async def test_refuses_a_revision_that_names_no_commit(self, repo: Path) -> None:
+        await self.assert_refused(preflight_config(repo), sha='no-such-rev')
+
+    async def test_refuses_a_reference_equal_to_the_runner(self, repo: Path) -> None:
+        await self.assert_refused(preflight_config(repo), reference='box')
+
+    async def test_refuses_a_runner_without_gate_paths(self, repo: Path) -> None:
+        config = preflight_config(repo, runners=[declared_runner(df_checkout_path=None)])
+
+        await self.assert_refused(config)
+
+    @pytest.mark.parametrize('name', ['a/b', '..', '.'])
+    async def test_refuses_a_runner_name_that_is_not_one_path_segment(
+        self, repo: Path, name: str,
+    ) -> None:
+        config = preflight_config(repo, runners=[declared_runner(name)])
+
+        await self.assert_refused(config, runner=name)
