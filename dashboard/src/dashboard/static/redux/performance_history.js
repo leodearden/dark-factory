@@ -40,6 +40,9 @@ function projectHistory(perf, project) {
 }
 
 function meanHistorySpark(perf, series) {
+  if (!Object.hasOwn(PERF_HISTORY_SERIES, series)) {
+    throw new Error(`meanHistorySpark: unknown series ${series}; expected one of ${Object.keys(PERF_HISTORY_SERIES).join(', ')}`);
+  }
   const byHour = new Map();
   for (const project of Object.keys(perf)) {
     const history = projectHistory(perf, project);

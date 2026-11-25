@@ -108,3 +108,13 @@ for (const [series, expected] of [
 test('the spark over no projects is empty', () => {
   assert.deepEqual(meanHistorySpark({}, 'p50'), []);
 });
+
+for (const [name, perf] of [['some projects', OVERLAPPING], ['no projects', {}]]) {
+  test(`an unknown series is refused over ${name}, naming it and every valid series`, () => {
+    assert.throws(() => meanHistorySpark(perf, 'onePass'), error => (
+      error instanceof Error
+        && /\bonePass\b/.test(error.message)
+        && ['p50', 'p95', 'one_pass', 'escalation'].every(series => new RegExp(`\\b${series}\\b`).test(error.message))
+    ));
+  });
+}
