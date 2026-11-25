@@ -496,6 +496,7 @@ async def run_architect_eval(
             'where an injected deps persists the cell'
         )
     task = load_task(task_path)
+    timeout_minutes = _cell_timeout_minutes(task, timeout_override, ARCHITECT_CELL_TIMEOUT_MINUTES)
     deps = deps or ArchitectEvalDeps(store=store or ResultStore.packaged())
     label = cell_label(task, config)
     logger.info(f'Starting architect eval: {label} (trial {trial})')
@@ -506,7 +507,7 @@ async def run_architect_eval(
             config, task, base_config, memory_endpoint=memory_endpoint,
         ),
         usage_gate=usage_gate,
-        timeout_minutes=timeout_override or task.get('timeout_minutes', 60),
+        timeout_minutes=timeout_minutes,
     )
     reference_diff = await read_reference_diff(task, deps)
     scoring = classify_attempt(attempt)
@@ -525,6 +526,7 @@ async def run_architect_eval(
         wall_clock_ms=wall_clock_ms,
         run_id=attempt.address.run_id,
         trial=trial,
+        timeout_minutes=timeout_minutes,
     )
     deps.store.save(result)
     log_architect_cell(label, scoring, metrics, wall_clock_ms)
