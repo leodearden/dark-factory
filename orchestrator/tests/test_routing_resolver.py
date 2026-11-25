@@ -30,6 +30,7 @@ from orchestrator.config import (
     RoutingRule,
     RuleMatch,
     RuleSet,
+    SplitMatch,
     TurnsConfig,
 )
 from orchestrator.routing import (
@@ -40,6 +41,7 @@ from orchestrator.routing import (
     RoutingDecision,
     resolve_route,
 )
+from shared.routing_split import split_bucket
 
 pytestmark = pytest.mark.usefixtures("code_default_config")
 
@@ -58,6 +60,7 @@ def _cfg_with_rules(*rules: RoutingRule) -> OrchestratorConfig:
 def _inputs(
     *,
     role_name: str = 'implementer',
+    task_id: str = '1',
     task_metadata: dict | None = None,
     plan_shape: PlanShape | None = None,
     routing_tier: int = 0,
@@ -68,7 +71,7 @@ def _inputs(
     'sonnet' sentinel distinguishable from any rule's opus/haiku set.model."""
     return RouteInputs(
         role_name=role_name,
-        task_id='1',
+        task_id=task_id,
         task_metadata={} if task_metadata is None else task_metadata,
         plan_shape=plan_shape,
         routing_tier=routing_tier,
@@ -432,6 +435,119 @@ class TestConditionSimpleSaturated:
         rule = RoutingRule(id='r', match=RuleMatch(simple_saturated=True), set=RuleSet(model='opus'))
         decision = resolve_route(_inputs(task_metadata={}), _cfg_with_rules(rule))
         assert decision.rule_id is None
+
+
+class TestSplitCondition:
+    """split: the rule matches only task ids that ``split_bucket`` puts in
+    the rule's arm; an invocation with no task id is in no arm."""
+
+    _EXPERIMENT_ROLES = ['implementer', 'debugger']
+
+    @staticmethod
+    def _split_rule(*, salt='t', bucket=1, role=('implementer',)) -> RoutingRule:
+        return RoutingRule(
+            id=f'arm-{bucket}',
+            match=RuleMatch(role=list(role), split=SplitMatch(salt=salt, buckets=2, bucket=bucket)),
+            set=RuleSet(model='opus'),
+        )
+
+    @staticmethod
+    def _id_in_bucket(salt: str, bucket: int) -> str:
+        return next(
+            str(i) for i in range(1, 1001) if split_bucket(salt, str(i), 2) == bucket
+        )
+
+    def test_resolver_selects_exactly_the_split_bucket_ids(self):
+        cfg = _cfg_with_rules(self._split_rule())
+        ids = [str(i) for i in range(1, 1001)]
+
+        matched = {
+            task_id for task_id in ids
+            if resolve_route(_inputs(task_id=task_id), cfg).rule_id == 'arm-1'
+        }
+
+        assert matched == {task_id for task_id in ids if split_bucket('t', task_id, 2) == 1}
+        assert 0 < len(matched) < len(ids)
+
+    def test_split_ands_with_role(self):
+        cfg = _cfg_with_rules(self._split_rule(role=('architect',)))
+        in_arm = self._id_in_bucket('t', 1)
+
+        decision = resolve_route(_inputs(role_name='implementer', task_id=in_arm), cfg)
+
+        assert decision.rule_id is None
+
+    @pytest.mark.parametrize('bucket', [0, 1])
+    def test_empty_task_id_is_in_no_arm(self, bucket):
+        cfg = _cfg_with_rules(self._split_rule(bucket=bucket))
+
+        decision = resolve_route(_inputs(task_id=''), cfg)
+
+        assert decision.rule_id is None
+
+    def _experiment_one_cfg(self) -> OrchestratorConfig:
+        large = RuleSet(model='opus', max_turns=120)
+        return _cfg_with_rules(
+            RoutingRule(
+                id='large-plan-steps',
+                match=RuleMatch(role=self._EXPERIMENT_ROLES, plan_min_steps=12),
+                set=large,
+            ),
+            RoutingRule(
+                id='large-plan-modules-4',
+                match=RuleMatch(
+                    role=self._EXPERIMENT_ROLES,
+                    plan_min_modules=4,
+                    split=SplitMatch(salt='routing-exp-1', buckets=2, bucket=1),
+                ),
+                set=large,
+            ),
+            RoutingRule(
+                id='large-plan-modules',
+                match=RuleMatch(
+                    role=self._EXPERIMENT_ROLES,
+                    plan_min_modules=3,
+                    split=SplitMatch(salt='routing-exp-1', buckets=2, bucket=0),
+                ),
+                set=large,
+            ),
+            RoutingRule(
+                id='simple-saturated-full-path',
+                match=RuleMatch(role=['architect'], simple_saturated=True),
+                set=RuleSet(model='opus'),
+            ),
+            RoutingRule(
+                id='retry-tier-up',
+                match=RuleMatch(role=[*self._EXPERIMENT_ROLES, 'architect'], min_routing_tier=1),
+                set=RuleSet(model='+1'),
+            ),
+        )
+
+    def test_experiment_one_three_module_plan_splits_by_arm(self):
+        cfg = self._experiment_one_cfg()
+        plan = PlanShape(step_count=5, module_paths=('a', 'b', 'c'))
+
+        control = resolve_route(
+            _inputs(task_id=self._id_in_bucket('routing-exp-1', 0), plan_shape=plan), cfg,
+        )
+        treatment = resolve_route(
+            _inputs(task_id=self._id_in_bucket('routing-exp-1', 1), plan_shape=plan), cfg,
+        )
+
+        assert (control.rule_id, control.model) == ('large-plan-modules', 'opus')
+        assert treatment.rule_id is None
+        assert treatment.source_layer == 'config'
+        assert treatment.model == cfg.models.implementer
+
+    def test_experiment_one_four_module_plan_in_arm_one_takes_the_four_module_rule(self):
+        cfg = self._experiment_one_cfg()
+        plan = PlanShape(step_count=5, module_paths=('a', 'b', 'c', 'd'))
+
+        decision = resolve_route(
+            _inputs(task_id=self._id_in_bucket('routing-exp-1', 1), plan_shape=plan), cfg,
+        )
+
+        assert decision.rule_id == 'large-plan-modules-4'
 
 
 class TestConditionsAreAnded:
