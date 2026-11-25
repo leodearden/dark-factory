@@ -776,7 +776,8 @@ the Mem0 sweep uses.
   beside the scanned `content`. The write journal does not hold that text: it
   stores only a truncated `new_content`. The printed `--apply` report is the
   only full copy, so redirect it to a file before adjudicating.
-- Exit 2 means the run aborted. The partial report is printed first.
+- Exit 2 means the run aborted. The partial report is printed first. An
+  interrupt (Ctrl-C) prints the partial report too, then propagates.
 
 **Measured 2026-11-25** with read-only queries against production graph
 `dark_factory`:

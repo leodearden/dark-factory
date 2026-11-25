@@ -263,7 +263,12 @@ def _build_parser() -> LoudArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse *argv*, open the service, run the sweep and print its report."""
+    """Parse *argv*, open the service, run the sweep and print its report.
+
+    The report is printed however the run ends, because it is the only full
+    copy of any text a redaction overwrote. An abort exits 2; an interrupt is
+    re-raised once its partial report is out.
+    """
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s',
     )
@@ -279,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         report = asyncio.run(_run_live())
-    except Exception:
+    except BaseException as exc:
         report = report_from_progress(args, progress)
         report['aborted'] = True
         logger.exception(
@@ -288,6 +293,8 @@ def main(argv: list[str] | None = None) -> int:
             SCRIPT_ID, len(report['records']),
         )
         print(json.dumps(report, indent=2, default=str))
+        if not isinstance(exc, Exception):
+            raise
         return EXIT_ABORTED
 
     print(json.dumps(report, indent=2, default=str))

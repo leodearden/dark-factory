@@ -140,6 +140,51 @@ class StubService:
         }
 
 
+class OpenedStubService(StubService):
+    """A StubService as ``maintenance_service`` constructs it, recording each lifecycle await."""
+
+    __slots__ = ('lifecycle',)
+
+    def __init__(
+        self,
+        scan: EpisodeToolcallLeakScan | BaseException,
+        *,
+        redact: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(scan, redact=redact)
+        self.lifecycle: list[str] = []
+
+    async def initialize(self) -> None:
+        self.lifecycle.append('initialize')
+
+    async def initialize_for_reads(self) -> None:
+        self.lifecycle.append('initialize_for_reads')
+
+    async def close(self) -> None:
+        self.lifecycle.append('close')
+
+
+_SERVICE_CLASS = 'fused_memory.services.memory_service.MemoryService'
+
+
+def _install_service(
+    monkeypatch: pytest.MonkeyPatch,
+    scan: EpisodeToolcallLeakScan,
+    *,
+    redact: Callable[..., dict[str, Any]] | None = None,
+) -> list[OpenedStubService]:
+    """Replace the class at the seam ``maintenance_service`` looks it up on; return what it builds."""
+    built: list[OpenedStubService] = []
+
+    def _construct(_config: Any) -> OpenedStubService:
+        service = OpenedStubService(scan, redact=redact)
+        built.append(service)
+        return service
+
+    monkeypatch.setattr(_SERVICE_CLASS, _construct)
+    return built
+
+
 def _args(*argv: str) -> Any:
     return _mod._build_parser().parse_args(list(argv))
 
@@ -275,6 +320,58 @@ class TestMainReportsAnAbort:
         report = json.loads(capsys.readouterr().out)
         assert report['aborted'] is True
         assert report['records'] == []
+
+    def test_an_interrupted_apply_prints_its_partial_report_then_reraises(
+        self, monkeypatch, capsys,
+    ) -> None:
+        scan = _scan(_leak('first', TAIL_CONTENT), _leak('second', DUPLICATE_CONTENT))
+
+        def _redact(episode_uuid: str, **kwargs: Any) -> dict[str, Any]:
+            if episode_uuid == 'second':
+                raise KeyboardInterrupt
+            return {'old_content': 'someone rewrote it', 'new_content': kwargs['new_content']}
+
+        built = _install_service(monkeypatch, scan, redact=_redact)
+
+        with pytest.raises(KeyboardInterrupt):
+            _mod.main(['--apply'])
+
+        report = json.loads(capsys.readouterr().out)
+        assert report['aborted'] is True
+        assert _record(report, 'first')[_mod.REPLACED_CONTENT] == 'someone rewrote it'
+        (service,) = built
+        assert service.lifecycle == ['initialize', 'close']
+
+
+class TestMainOpensTheServiceForItsMode:
+    def test_a_dry_run_opens_for_reads_only_prints_its_report_and_exits_zero(
+        self, monkeypatch, capsys,
+    ) -> None:
+        built = _install_service(monkeypatch, _three_shapes())
+
+        code = _mod.main([])
+
+        assert code == 0
+        (service,) = built
+        assert service.lifecycle == ['initialize_for_reads', 'close']
+        service.redact_episode_content.assert_not_awaited()
+        report = json.loads(capsys.readouterr().out)
+        assert report['dry_run'] is True
+        assert [record['uuid'] for record in report['records']] == ['tail', 'dup', 'manual']
+
+    def test_an_apply_opens_the_full_service_and_exits_on_its_report(
+        self, monkeypatch, capsys,
+    ) -> None:
+        built = _install_service(monkeypatch, _three_shapes())
+
+        code = _mod.main(['--apply'])
+
+        (service,) = built
+        assert service.lifecycle == ['initialize', 'close']
+        report = json.loads(capsys.readouterr().out)
+        assert report['dry_run'] is False
+        assert report['redacted'] == 2
+        assert code == _mod.resolve_exit_code(report) == 1
 
 
 # ---------------------------------------------------------------------------
