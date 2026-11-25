@@ -151,3 +151,85 @@ class TestExpiredInBlock:
         reading = account_cycles(TWO_ACCOUNTS_CAPS, TWO_ACCOUNTS_SPEND, SINCE, UNTIL)
 
         assert expired_in_block(reading, self.block(SINCE, at(12))) == 0.0
+
+
+class TestOnlyWeeklyCapsPlaceCycles:
+    WINDOW = Block(HostState.ON, SINCE, UNTIL, BlockOrigin.ADMITTED, SINCE)
+
+    def reading(self, *extra: CapHit):
+        return account_cycles((*TWO_ACCOUNTS_CAPS, *extra), TWO_ACCOUNTS_SPEND, SINCE, UNTIL)
+
+    def test_a_session_cap_creates_no_cycle(self):
+        weekly_only = self.reading()
+        with_sessions = self.reading(
+            CapHit('max-a', at(18, 13), at(18, 18), CapKind.SESSION),
+            CapHit('max-b', at(21, 17), at(21, 19), CapKind.SESSION),
+        )
+
+        assert with_sessions.cycles == weekly_only.cycles
+        assert with_sessions.estimate_usd == weekly_only.estimate_usd
+        assert expired_in_block(with_sessions, self.WINDOW) == expired_in_block(weekly_only, self.WINDOW)
+
+    def test_a_session_cap_does_not_move_the_lattice(self):
+        reading = self.reading(CapHit('max-a', at(24, 13), at(24, 18), CapKind.SESSION))
+
+        cycles = cycles_by_reset(reading)
+        assert sorted(reset for account, reset in cycles if account == 'max-a') == [R_A, R_A + CYCLE]
+        assert not cycles['max-a', R_A + CYCLE].capped
+        assert ('max-a', at(24, 18)) not in cycles
+
+    def test_a_per_model_cap_does_not_retime_a_weekly_cap(self):
+        reading = self.reading(CapHit('max-b', at(17, 3), R_B, CapKind.PER_MODEL))
+
+        assert cycles_by_reset(reading)['max-b', R_B].capped_at == at(19, 4)
+        assert reading.estimate_usd == 2200.0
+
+    def test_a_per_model_cap_does_not_cap_an_uncapped_cycle(self):
+        reading = self.reading(CapHit('max-a', at(22, 2), R_A + CYCLE, CapKind.PER_MODEL))
+
+        cycle = cycles_by_reset(reading)['max-a', R_A + CYCLE]
+        assert not cycle.capped
+        assert cycle.expired_usd == 1700.0
+        assert reading.estimate_usd == 2200.0
+
+    def test_one_other_cap_recorded_by_two_stores_counts_once(self):
+        reading = self.reading(
+            CapHit('max-a', at(18, 13), at(18, 18), CapKind.SESSION),
+            CapHit('max-a', at(18, 14), at(18, 18), CapKind.SESSION),
+        )
+
+        assert reading.other_caps == {CapKind.SESSION: 1}
+
+    def test_hits_without_a_reset_each_count_alone(self):
+        reading = self.reading(
+            CapHit('max-b', at(21, 17), None, CapKind.SESSION),
+            CapHit('max-b', at(21, 23), None, CapKind.SESSION),
+        )
+
+        assert reading.other_caps == {CapKind.SESSION: 2}
+
+    def test_a_hit_more_than_a_cycle_before_since_is_not_counted(self):
+        reading = self.reading(CapHit('max-a', at(3, 23), at(4, 4), CapKind.SESSION))
+
+        assert reading.other_caps == {}
+
+    def test_the_count_is_by_kind(self):
+        reading = self.reading(
+            CapHit('max-a', at(18, 13), at(18, 18), CapKind.SESSION),
+            CapHit('max-a', at(18, 14), at(18, 18), CapKind.SESSION),
+            CapHit('max-b', at(21, 17), None, CapKind.SESSION),
+            CapHit('max-b', at(17, 3), R_B, CapKind.PER_MODEL),
+            CapHit('max-a', at(13), None, CapKind.UNRECOGNISED),
+            CapHit('max-a', at(3, 23), at(4, 4), CapKind.SESSION),
+        )
+
+        assert reading.other_caps == {CapKind.SESSION: 2, CapKind.PER_MODEL: 1, CapKind.UNRECOGNISED: 1}
+
+    def test_weekly_caps_alone_count_no_other_cap(self):
+        assert self.reading().other_caps == {}
+
+    def test_only_a_weekly_cap_without_a_reset_is_unplaceable(self):
+        reading = self.reading(weekly('max-a', at(13), None), CapHit('max-b', at(14), None, CapKind.SESSION))
+
+        assert reading.unplaceable_cap_hits == 1
+        assert reading.other_caps == {CapKind.SESSION: 1}

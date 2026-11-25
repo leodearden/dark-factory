@@ -10,6 +10,7 @@ from verify_host_trial_allowance import ALLOWANCE_RULE
 from verify_host_trial_blocks import BLOCK_RULE
 from verify_host_trial_decision import DECISION_RULE
 from verify_host_trial_fixtures import (
+    cap_hit,
     insert_rows,
     invocation,
     lifecycle,
@@ -213,6 +214,27 @@ def test_a_root_without_a_runs_db_is_named_and_the_others_still_report(capsys, t
     assert f'project pump-web-ui: missing ({runs_db(absent)})' in lines(text)
     assert 'project reify' in text
     assert '+100.0%' in decision_line(text)
+
+
+def test_json_allowance_places_cycles_at_weekly_caps_only_and_counts_the_others(capsys, store, samples):
+    weekly_reset = day(4)
+    five_hour_reset = day(6) + timedelta(hours=5)
+    five_hour = "You've hit your 5-hour limit · resets 7pm (Europe/London)"
+    root = store(
+        'dark-factory',
+        account_events=[
+            cap_hit(day(2), 'max-a', weekly_reset),
+            cap_hit(day(6), 'max-a', five_hour_reset, reason=five_hour),
+        ],
+        invocations=[invocation(day(1), 'max-a', 30.0)],
+    )
+
+    allowance = json.loads(run(capsys, [root], samples, '--json'))['allowance']
+
+    cycles = [cycle for cycle in allowance['cycles'] if cycle['account'] == 'max-a']
+    assert [cycle['reset'] for cycle in cycles if cycle['capped']] == [weekly_reset.isoformat()]
+    assert five_hour_reset.isoformat() not in {cycle['reset'] for cycle in cycles}
+    assert allowance['other_caps'] == {'session': 1}
 
 
 @pytest.mark.parametrize(
