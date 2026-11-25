@@ -511,6 +511,21 @@ def test_timeout_mark_budget_names_the_offence_of_each_banned_mark():
     assert 'LITERAL' in offence
 
 
+def test_scaled_discovery_call_count_bills_a_tag_wait():
+    """wait_pid_tagged is a load-scaled discovery wait, so the sweep bills it."""
+    (func,) = ast.parse(textwrap.dedent('''
+        def test_waits(pid, tag):
+            wait_pid_tagged(pid, tag)
+            wait_pid_tagged(pid, tag, timeout=row_discovery_ceiling_secs())
+            wait_pid_tagged(pid, tag, timeout=5.0)
+    ''')).body
+
+    assert _scaled_discovery_call_count(func) == 2, (
+        'a load-scaled tag wait the discovery-budget sweep does not bill can be '
+        'truncated by pytest-timeout instead of failing with its own assertion'
+    )
+
+
 #: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
 #: matching is a guard reporting PASS while guarding nothing.  "At minimum"
 #: -- the sweep may match more holder teardowns than this names; the
