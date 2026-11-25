@@ -402,7 +402,7 @@ ARCHITECT_CELL_TIMEOUT_MINUTES = 60
 """A plan-only architect cell runs no verify."""
 
 
-def _cell_timeout_minutes(task: dict, timeout_override: float | None, default: float) -> float:
+def cell_timeout_minutes(task: dict, timeout_override: float | None, default: float) -> float:
     """The cell's wall-clock ceiling: the caller's override, else the fixture's timeout_minutes, else *default*."""
     return timeout_override or task.get('timeout_minutes', default)
 
@@ -496,7 +496,7 @@ async def run_architect_eval(
             'where an injected deps persists the cell'
         )
     task = load_task(task_path)
-    timeout_minutes = _cell_timeout_minutes(task, timeout_override, ARCHITECT_CELL_TIMEOUT_MINUTES)
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, ARCHITECT_CELL_TIMEOUT_MINUTES)
     deps = deps or ArchitectEvalDeps(store=store or ResultStore.packaged())
     label = cell_label(task, config)
     logger.info(f'Starting architect eval: {label} (trial {trial})')
@@ -602,7 +602,7 @@ async def _run_workflow_cell(
     (docs/eval-replay-frame.md). The wall clock includes worktree setup.
     """
     cell = f'{task["id"]} × {label}'
-    timeout_minutes = _cell_timeout_minutes(task, timeout_override, WORKFLOW_CELL_TIMEOUT_MINUTES)
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, WORKFLOW_CELL_TIMEOUT_MINUTES)
     logger.info(f'Starting eval: {cell} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
     worktree, run_id = await _open_cell_worktree(task, worktree)
