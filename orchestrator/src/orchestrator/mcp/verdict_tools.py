@@ -46,6 +46,7 @@ from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 from orchestrator.mcp import markup_journal, markup_sink
 from orchestrator.review_issue_contract import (
+    REQUIRED_ISSUE_FIELDS,
     REVIEW_ISSUE_OFF_CONTRACT_FACT,
     IssueIntake,
     check_issues,
@@ -82,10 +83,10 @@ def _envelope(role: str, session_id: str, payload: dict) -> dict:
 #
 # Only _submit_review_verdict has constrained/validated fields (the
 # reviewer==role identity check, the verdict enum, the note_dispositions
-# shape below, and each issue checked against the contract in
-# orchestrator/review_issue_contract.py) — the other three payloads
-# (completion/triage/merge) have no enum-like fields today,
-# so they write whatever they receive. Booleans and lists are still
+# shape below, and each issue's severity, kind and other fields checked
+# against the contract in orchestrator/review_issue_contract.py) — the
+# other three payloads (completion/triage/merge) have no enum-like fields
+# today, so they write whatever they receive. Booleans and lists are still
 # type-checked at the pydantic MCP tool boundary in create_server(). Add
 # parallel validation here if any of those payloads gain a constrained
 # field in the future.
@@ -158,16 +159,19 @@ class IssueIntakeOutcome(StrEnum):
     REFUSED = 'refused'
 
 
+_REQUIRED_FIELDS_TEXT = ', '.join(str(field) for field in REQUIRED_ISSUE_FIELDS)
+
+
 def _issue_contract_refusal(intake: IssueIntake) -> dict[str, Any]:
     deviations = [d.describe() for d in intake.unusable]
     return {
         'status': 'error',
         'message': (
             'nothing was written: every issue must be an object carrying a '
-            'severity and a description, and these are not: '
+            f'valid {_REQUIRED_FIELDS_TEXT}, and these are not: '
             + '; '.join(deviations) + '. Call submit_review_verdict again with '
-            'severity and description on every issue (or drop the issue) and '
-            'the verdict will land.'
+            f'a valid {_REQUIRED_FIELDS_TEXT} on every issue (or drop the '
+            'issue) and the verdict will land.'
         ),
         'issue_contract': {'outcome': IssueIntakeOutcome.REFUSED, 'deviations': deviations},
     }
@@ -572,10 +576,10 @@ def create_server(
                 verdict: One of "PASS" or "ISSUES_FOUND".
                 issues: Structured list of issues found (empty if PASS),
                     each shaped as the reviewer contract in your
-                    instructions states. An issue lacking severity or
-                    description is refused (status: error); other
-                    off-contract fields are normalised and reported back
-                    under issue_contract.
+                    instructions states. An issue lacking severity, kind
+                    or description, or with an unknown kind, is refused
+                    (status: error); other off-contract fields are
+                    normalised and reported back under issue_contract.
                 summary: One-paragraph summary of the review.
                 note_dispositions: One entry per info note your briefing lists, each
                     {escalation_id, disposition: "addressed" | "no_action" |

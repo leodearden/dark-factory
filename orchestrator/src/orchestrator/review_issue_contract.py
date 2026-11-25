@@ -2,8 +2,10 @@
 
 An issue is one object in a reviewer verdict's ``issues`` list. The prompt that
 states the contract, the verdict-tools intake that normalises against it and
-the review gate that reads it all take the vocabulary from here. Stdlib only:
-the per-invocation verdict-tools stdio server imports it on its startup path.
+the review gate that reads it all take the vocabulary from here. The
+per-invocation verdict-tools stdio server imports it on its startup path, so
+its one dependency beyond the stdlib is the shared defect vocabulary, about
+0.1 s on top of the fastmcp/pydantic imports that server already pays.
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar
+
+from shared.defects import IssueKind
 
 
 class IssueSeverity(StrEnum):
@@ -41,6 +45,7 @@ def parse_severity(value: object) -> IssueSeverity | None:
 
 class IssueField(StrEnum):
     SEVERITY = 'severity'
+    KIND = 'kind'
     LOCATION = 'location'
     CATEGORY = 'category'
     DESCRIPTION = 'description'
@@ -76,9 +81,15 @@ def _vocabulary_text(vocabulary: type[StrEnum]) -> str:
 
 @dataclass(frozen=True)
 class _FieldRule:
+    """How one contract field is checked.
+
+    An off-vocabulary value is recorded as ``off_vocabulary_as``; when that is
+    None the value is refused and the issue is unusable.
+    """
+
     required: bool = False
     vocabulary: type[StrEnum] | None = None
-    off_vocabulary_as: str = ''
+    off_vocabulary_as: str | None = None
     when_missing: Callable[[Mapping[str, Any]], str] = lambda _issue: ''
 
 
@@ -115,6 +126,7 @@ _RULES: dict[IssueField, _FieldRule] = {
         vocabulary=IssueSeverity,
         off_vocabulary_as=IssueSeverity.SUGGESTION.value,
     ),
+    IssueField.KIND: _FieldRule(required=True, vocabulary=IssueKind),
     IssueField.LOCATION: _FieldRule(when_missing=_location_from_file_and_line),
     IssueField.CATEGORY: _FieldRule(),
     IssueField.DESCRIPTION: _FieldRule(
@@ -122,6 +134,11 @@ _RULES: dict[IssueField, _FieldRule] = {
     ),
     IssueField.SUGGESTED_FIX: _FieldRule(),
 }
+
+#: The fields every issue must carry, in contract order.
+REQUIRED_ISSUE_FIELDS: tuple[IssueField, ...] = tuple(
+    field for field, rule in _RULES.items() if rule.required
+)
 
 
 @dataclass(frozen=True)
@@ -152,7 +169,7 @@ class IssueDeviation:
         vocabulary = None if self.field is None else _RULES[self.field].vocabulary
         contract = (
             f' (contract: {_vocabulary_text(vocabulary)})'
-            if self.deviation is Deviation.OFF_VOCABULARY and vocabulary else ''
+            if vocabulary else ''
         )
         outcome = (
             'the issue is unusable' if self.recorded_as is None
