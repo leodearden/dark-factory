@@ -266,7 +266,7 @@ exists, so this command was not run"), even one that opens with an absolute
 `cd`. Neither `cd ..` from a subdirectory of the removed tree nor the anchor
 above gets you out of a scratch worktree: both leave the shell inside it. Do the
 entered work in a subshell, `( cd "$D" && ... )`, or pass the directory
-instead (`git -C`, `uv run --project`). The full rule's single home is
+instead (`git -C`, `uv run --directory`). The full rule's single home is
 `orchestrator/src/orchestrator/agents/bash_cwd_guidance.py::DELETED_CWD_GUIDANCE`.
 
 ## Memory Usage

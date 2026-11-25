@@ -25,7 +25,7 @@ its composition and its splice, never its wording.
 """
 
 LINGERING_CD_GUIDANCE = """
-## An earlier `cd` can move every later relative path
+## Where your shell stands: a lingering `cd`, or a deleted directory
 
 You are dispatched with your working directory at the ROOT of your checkout.
 Whether a `cd` outlives the `Bash` call that ran it depends on the session: in
@@ -72,7 +72,8 @@ put back at its launch directory (observed 2026-11-18, CLI 2.1.325).
 
 - Run the entered part in a subshell, `( cd "$D" && <command> )`, so the `cd`
   ends with it. Or pass the directory instead of entering it: `git -C "$D"`,
-  `uv run --project "$D"`, absolute paths.
+  `uv run --directory "$D"`, absolute paths. Not `uv run --project "$D"`: the
+  child it starts still runs in your shell's directory.
 - Before removing a directory you may be inside, `cd` to an absolute path
   outside it. `cd ..` from a subdirectory of it does not get you out. Nor does
   `cd "$(git rev-parse --show-toplevel)"` from inside a scratch worktree: that
