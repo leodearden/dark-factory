@@ -736,10 +736,14 @@ function seedPerformance(window) {
   });
 }
 
+function projectHead(container, label) {
+  const heads = [...container.querySelectorAll('.proj-head')].filter(head => head.querySelector('.name')?.textContent === label);
+  assert.equal(heads.length, 1, `expected one header for project ${label}`);
+  return heads[0];
+}
+
 function projectGroup(container, label) {
-  const names = [...container.querySelectorAll('.proj-head > .name')].filter(name => name.textContent === label);
-  assert.equal(names.length, 1, `expected exactly one project group named "${label}"`);
-  return names[0].closest('.panel');
+  return projectHead(container, label).closest('.panel');
 }
 
 // The 8px swatch beside the legend label that reads *path*.
@@ -1268,12 +1272,6 @@ function mountTasks(harness) {
   return handle;
 }
 
-function projectHead(container) {
-  const heads = [...container.querySelectorAll('.proj-head')].filter(head => head.querySelector('.name')?.textContent === PROJECT);
-  assert.equal(heads.length, 1, `expected one header for project ${PROJECT}`);
-  return heads[0];
-}
-
 // Fills storage until jsdom's own quota refuses a single character more, and
 // returns the error that refusal threw.
 function fillStorageToQuota(storage) {
@@ -1340,22 +1338,22 @@ test('tab_tasks.jsx::TasksTab folds a project on its first header click, and the
   const harness = openWindow(t);
   const { window } = harness;
   const first = mountTasks(harness);
-  assert.equal(projectHead(first.container).dataset.open, 'true', 'a project with no stored flag did not start open');
-  click(window, projectHead(first.container));
-  assert.equal(projectHead(first.container).dataset.open, 'false', 'one header click did not fold the project');
+  assert.equal(projectHead(first.container, PROJECT).dataset.open, 'true', 'a project with no stored flag did not start open');
+  click(window, projectHead(first.container, PROJECT));
+  assert.equal(projectHead(first.container, PROJECT).dataset.open, 'false', 'one header click did not fold the project');
   assert.ok(storedKeys(window).includes('df.tasksOpen'), 'the fold was not stored');
   first.unmount();
 
   // A folded project renders no graph, so this mount cannot go through mountTasks.
   const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
-  assert.equal(projectHead(container).dataset.open, 'false', 'the stored fold did not seed the next mount');
-  click(window, projectHead(container));
-  assert.equal(projectHead(container).dataset.open, 'true', 'one header click did not unfold the project');
+  assert.equal(projectHead(container, PROJECT).dataset.open, 'false', 'the stored fold did not seed the next mount');
+  click(window, projectHead(container, PROJECT));
+  assert.equal(projectHead(container, PROJECT).dataset.open, 'true', 'one header click did not unfold the project');
   assert.ok(!storedKeys(window).includes('df.tasksOpen'), 'the project is back at its default-open, yet its key is still stored');
 });
 
 function groupingButton(container, label) {
-  const buttons = [...projectHead(container).querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  const buttons = [...projectHead(container, PROJECT).querySelectorAll('.seg button')].filter(button => button.textContent === label);
   assert.equal(buttons.length, 1, `expected one '${label}' grouping button`);
   return buttons[0];
 }
