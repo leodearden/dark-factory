@@ -17,7 +17,9 @@
 #   description_substrings: list[str]  — AT LEAST ONE must appear in
 #                           candidate description+details (case-insensitive)
 #   source_assertions     : list[{file, must_contain, must_not_contain}]
-#                           — file is relative to the fused-memory/ server cwd;
+#                           — file is relative to the curator's source root,
+#                           taskmaster.project_root (the repo root in the
+#                           deployed unit);
 #                           an assertion holds iff every must_contain token is
 #                           present in the file AND every must_not_contain
 #                           token is absent. ALL assertions in the entry must
@@ -57,7 +59,7 @@
     - "missing invalid_at filter"
     - "invalid_at filter"
   source_assertions:
-    - file: src/fused_memory/backends/graphiti_client.py
+    - file: fused-memory/src/fused_memory/backends/graphiti_client.py
       must_contain:
         - "def get_all_valid_edges"
         - "e.invalid_at IS NULL"
@@ -89,14 +91,14 @@
     - "get_valid_edges_for_node"
     - "_ALL_VALID_EDGES_MATCH"
   source_assertions:
-    - file: src/fused_memory/backends/graphiti_client.py
+    - file: fused-memory/src/fused_memory/backends/graphiti_client.py
       must_contain:
         - "_ALL_VALID_EDGES_MATCH"
         - "def get_valid_edges_for_node"
         - "WHERE e.invalid_at IS NULL"
       must_not_contain:
         - "e.expired_at IS NULL"
-    - file: src/fused_memory/services/memory_service.py
+    - file: fused-memory/src/fused_memory/services/memory_service.py
       must_contain:
         - "_restore_falsely_superseded_sibling_edges"
         - "clear_invalid_at=True"
@@ -106,7 +108,7 @@
     esc-1947-17 asked Stage2's flag-query to also consume stage1_flag_marker,
     framing it as a schema-drift bug. This is a forbidden regression: the two
     marker families are deliberately kept separate, pinned by
-    tests/test_stages.py::test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2.
+    fused-memory/tests/test_stages.py::test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2.
     Any recurrence should be dropped without an LLM call while that pinning
     test remains in place.
   title_substrings:
@@ -116,7 +118,7 @@
     - "schema drift"
     - "stage1_flag_marker"
   source_assertions:
-    - file: tests/test_stages.py
+    - file: fused-memory/tests/test_stages.py
       must_contain:
         - "test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2"
 
@@ -136,7 +138,7 @@
     - "length"
     - "field-required"
   source_assertions:
-    - file: src/fused_memory/server/recon_report.py
+    - file: fused-memory/src/fused_memory/server/recon_report.py
       must_not_contain:
         - "max_length"
 
@@ -204,10 +206,11 @@
     - "never wrote an escalation record"
   source_assertions:
     # The archive-inclusive two-tier scan that refutes the premise. Path is
-    # relative to the fused-memory/ server cwd; _assertion_holds fails OPEN on
-    # an unreadable file, so a fused-memory-only deployment without the sibling
-    # escalation package simply leaves this entry inert (the safe direction).
-    - file: ../escalation/src/escalation/queue.py
+    # relative to the curator's source root (the repo root in the deployed
+    # unit); _assertion_holds fails OPEN on an unreadable file, so a deployment
+    # without the sibling escalation package simply leaves this entry inert
+    # (the safe direction).
+    - file: escalation/src/escalation/queue.py
       must_contain:
         - "def get_by_task"
         - "_iter_archive_paths"
@@ -220,7 +223,7 @@
     # literal tool name appears HERE, not in stage1.py/stage2.py). If
     # get_task_escalations is ever retired, this assertion stops holding and
     # the guard self-corrects, letting the candidate through to a human.
-    - file: src/fused_memory/reconciliation/prompts/__init__.py
+    - file: fused-memory/src/fused_memory/reconciliation/prompts/__init__.py
       must_contain:
         - "_GATE_CLOSURE_ARCHIVE_GUIDANCE"
         - "get_task_escalations"
@@ -231,6 +234,6 @@
     # call. Unwiring it also self-corrects the guard, so the candidate is only
     # dropped while an auditor genuinely had the disconfirming instruction in
     # front of it.
-    - file: src/fused_memory/reconciliation/prompts/stage2.py
+    - file: fused-memory/src/fused_memory/reconciliation/prompts/stage2.py
       must_contain:
         - "render_escalation_boundary_note(can_escalate=True)"
