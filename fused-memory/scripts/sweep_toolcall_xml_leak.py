@@ -114,9 +114,9 @@ genuine unknown, which is precisely the state a human has to adjudicate.
 
 Scope
 -----
-Mem0/Qdrant ONLY. Graphiti episodes are NOT covered -- Graphiti-side discovery
-is deliberately out of scope and filed as a follow-up; the residual episode
-d12b0eb4 has its own content-preserving redaction path.
+Mem0/Qdrant ONLY. Graphiti episodes are swept by
+``scripts/sweep_episode_toolcall_xml_leak.py``, which shares this script's
+repair-shape rule.
 
 This script + its test suite are MOCK-unit only (AsyncMock service, no live
 Qdrant), matching every precedent cleanup script in this directory. The live

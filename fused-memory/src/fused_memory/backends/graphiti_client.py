@@ -1855,11 +1855,7 @@ class GraphitiBackend:
         ``group_id``, so a uuid belonging to another project's graph can
         neither be read nor redacted through this call.
 
-        NOT PROVIDED HERE: Graphiti-side DISCOVERY — enumerating which
-        episodes across a graph carry a leak. That needs a full episode scan
-        with no payload index to lean on, and is tracked as follow-up work.
-        This is the remediation primitive for an episode you have ALREADY
-        identified, by hand or from the Mem0 sweep's report.
+        Discovery of which episodes carry a leak is :meth:`scan_episode_toolcall_leaks`.
 
         Args:
             episode_uuid: UUID of the EpisodicNode to redact.
