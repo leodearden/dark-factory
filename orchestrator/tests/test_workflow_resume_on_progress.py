@@ -700,7 +700,7 @@ class TestProgressTimeoutOnANonResumingBackend:
         wf = _make_workflow(tmp_path=tmp_path, max_execute_iterations=1)
         wf.config.backends.implementer = 'mimo'
         _stub_iteration_helpers(wf, _progress_timeout_agent_result())
-        wf._last_invoke_session_id = 'killed-sid'  # type: ignore[attr-defined]
+        wf._last_invoke_session_id = 'killed-sid'
 
         outcome = await wf._execute_iterations()
 
@@ -717,7 +717,6 @@ class TestProgressTimeoutOnANonResumingBackend:
         )
         wf.config.backends.implementer = 'mimo'
         mock_invoke = _stub_iteration_helpers(wf, _zero_output_agent_result())
-        wf._last_invoke_session_id = 'killed-sid'  # type: ignore[attr-defined]
         mock_invoke.side_effect = [
             _zero_output_agent_result(),
             _progress_timeout_agent_result(),
