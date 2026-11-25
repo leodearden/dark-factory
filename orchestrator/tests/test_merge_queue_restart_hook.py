@@ -53,9 +53,7 @@ from orchestrator.merge_lane.worker import (
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    seed_repo(repo)
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture

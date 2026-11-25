@@ -74,14 +74,13 @@ from orchestrator.merge_lane.worker import (
 )
 from orchestrator.verify_runner import HostLease
 
-# ── Fixtures (mirrored from test_merge_queue_verify_base_invariant.py) ────────
+# ── Fixtures (git_repo seeds via seed_repo; the rest mirror
+#    test_merge_queue_verify_base_invariant.py) ──────────────────────────────
 
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    seed_repo(repo)
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture

@@ -13,10 +13,11 @@ Three related surfaces, all additive and backward-compatible:
                                         the log line and in the structured
                                         merge_heartbeat event.
 
-Fixture block (git_repo/git_config/git_ops/config, _make_req,
-_make_item, _make_entry, _make_mock_allocator) is ported from
-test_merge_queue_finalize_head_visibility.py:44-137 so these snapshot tests
-build InflightEntry state exactly the way the existing ones do.
+Fixture block (git_config/git_ops/config, _make_req, _make_item,
+_make_entry, _make_mock_allocator) is ported from
+test_merge_queue_finalize_head_visibility.py so these snapshot tests build
+InflightEntry state exactly the way the existing ones do; git_repo seeds
+through _git_fixtures.py::seed_repo instead.
 
 Steps covered:
   3275/step-3 RED — snapshot()['hosts'] block
@@ -64,14 +65,12 @@ from orchestrator.merge_lane.worker import (
 )
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
-# ── fixtures (ported verbatim from test_merge_queue_finalize_head_visibility) ──
+# ── fixtures (ported from test_merge_queue_finalize_head_visibility) ──────────
 
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    seed_repo(repo)
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
