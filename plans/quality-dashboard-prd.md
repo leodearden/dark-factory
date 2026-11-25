@@ -332,6 +332,22 @@ negative, so an EWMA chart can never show improvement at these rates.
     scope until its G6 gaps are owned. Not coupled to the trickle (an LLM-bearing, committing pipeline;
     heuristic 6). A weekly backfill since 2026-10-08 for df runs once through the same wrapper with an
     explicit sha list (~200 CPU-s per point).
+
+    **Correction (task 10131, 2026-11-25).** The Rust variant is in the cadence, and reify is an
+    instance (its install is task 11691). The instrument follows each sha's structure
+    (`scripts/quality_snapshot_cadence.py::_instrument_for`, from `git ls-tree <sha> -- pyproject.toml
+    Cargo.toml`). A root pyproject.toml means `scripts/quality_metrics_snapshot.py`, so a Python
+    project that also carries a Cargo.toml is measured as before. Otherwise a root Cargo.toml means
+    `scripts/rust_metrics_snapshot.py` (moved from `skills/review-all/scripts/`) under the rules file
+    `scripts/rust_metrics_rules/<project_id>.toml`, and a missing rules file is refused naming it. A tree
+    with neither is refused. The choice and the params prediction are per sha, before pinning, because
+    the identity depends on the instrument and a `--sha` backfill can span a structure change. The G6
+    gaps are owned: params record the measured tokei and lizard versions, `python_version`, the
+    instrument's blob sha, the h14 marks and the rules, and not cargo's version, which rustup resolves
+    per tree. The file records no absolute root, so decision 17's byte-identity below `run_id` and
+    `cost` holds for it. A dirty tree or a moved HEAD is refused, and every failure exits 2. lizard is
+    uv-locked in orchestrator's dev group and runs as `python -m lizard`. A reify point costs about
+    10 min of wall clock.
 20. **Item 2: readers.** `/review-all` Phase 1 step 1's previous-snapshot rule gains "or the newest
     `data/quality-metrics/<project_id>/*.json` whose `as_of_sha` is an ancestor of `AS_OF`, whichever is
     newer" (`skills/review-all/SKILL.md`). The dashboard's `QUALITY_SNAPSHOTS` datum reads both
@@ -437,6 +453,13 @@ negative, so an EWMA chart can never show improvement at these rates.
       `dashboard/tests/test_boundary_js.py::test_quality_same_commit_instrument_marker_names_the_nightly_point`
       and by the matching `quality #20:` client case, which places the instrument mark at the
       nightly's column.
+
+    **Correction (task 10131, 2026-11-25).** Rust snapshots are served `unplaced` by design. The reader
+    summarises every file with the Python instrument, which refuses a `rust-metrics-snapshot` file
+    naming its instrument, so a nightly reify file is listed with that refusal: never placed, never
+    dropped. reify's "Not placed" list grows one line per night until a Rust series lands (task 11692:
+    a Rust `--summary --json` and `--diff` in the reader's wire shape, and the reader dispatching on
+    the recorded instrument).
 21. **Where statistics live**: in the shared producer, not the dashboard module (Leo, 11-04:
     recommended (ii)). `shared/src/shared/memory_eval_limits.py` is left untouched; the quality
     statistics need Wilson, Newcombe, bootstrap, EWMA, CUSUM and Theil–Sen, none of which it has, and
@@ -887,8 +910,8 @@ apply (no load-sampler metric). No waivers.
 
 ## Out of scope
 
-- The reify Rust snapshot variant (`skills/review-all/scripts/rust_metrics_snapshot.py`): lizard absent,
-  hard-coded versions, absolute root, no HEAD-moved check; needs an owner (snapshot PRD §Out of scope).
+- A dashboard series of Rust snapshots: until task 11692 lands, they are served `unplaced` (decision 20,
+  Correction (task 10131)).
 - A per-landing quality-metrics snapshot (design note §6 option C) and the decision-5 blob cache.
 - Costing hand-carried and interactive landings from Claude session ledgers.
 - A task `created_at` column (instruments follow-up item 9).

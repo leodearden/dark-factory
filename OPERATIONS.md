@@ -5546,13 +5546,17 @@ file the Memory tab misreads.
 
 ### Nightly quality snapshot (03:45)
 
-**What it does.** Measures each Python project's `main` once a night with the
-factory's quality-metrics instrument, through
-`scripts/quality_snapshot_cadence.py` (its module docstring and `--help`). The
-skip of a sha already measured at the same identity, and the pinned tree the
-measurement runs in, are `plans/quality-dashboard-prd.md` decisions 18-19. It
-is pure CPU: no LLM, and it never commits. It is deliberately not coupled to
-the legibility trickle.
+**What it does.** Measures each project's `main` once a night, through
+`scripts/quality_snapshot_cadence.py` (its module docstring and `--help`), with
+the factory instrument the tree's structure selects
+(`scripts/quality_snapshot_cadence.py::_instrument_for`). A root
+`pyproject.toml` means `scripts/quality_metrics_snapshot.py`. Otherwise a root
+`Cargo.toml` means `scripts/rust_metrics_snapshot.py` under the rules file
+`scripts/rust_metrics_rules/<project_id>.toml`. A tree with neither fails the
+run. The skip of a sha already measured at the same identity, and the pinned
+tree the measurement runs in, are `plans/quality-dashboard-prd.md` decisions
+18-19. It is pure CPU: no LLM, and it never commits. It is deliberately not
+coupled to the legibility trickle.
 
 | File | Role |
 |---|---|
@@ -5562,9 +5566,27 @@ the legibility trickle.
 | `scripts/quality_snapshot_alarm.py` | files the failure escalation |
 | `scripts/install-quality-snapshot-timer.sh` | installs one project's instance |
 
-**Instances.** `dark_factory`, `solar_challenge`, `solar_challenge_platform`
-and `scoping_intake`. reify is out of scope until the Rust snapshot variant's
-gaps are owned.
+**Instances.** The Python projects `dark_factory`, `solar_challenge`,
+`solar_challenge_platform` and `scoping_intake`, and the Cargo project `reify`,
+whose install is task 11691, the operator gate filed from task 10131.
+
+**What the Rust path needs.**
+- tokei and cargo on the systemd user manager's PATH.
+  `~/.config/environment.d/995-user-path.conf` puts `~/.cargo/bin` there from
+  boot (Linger=yes), so both resolve at 03:45 even after an unattended
+  reboot. A missing tokei fails the run naming `cargo install --locked tokei`.
+- rustup resolves cargo per tree, from the project's `rust-toolchain.toml`.
+  Its version is not part of the identity: cargo supplies only package names
+  and manifest paths.
+- lizard from the factory `.venv`. It is in orchestrator's dev group, so
+  `uv sync --all-packages` installs it, and it runs as `python -m lizard`
+  under the measuring interpreter, whose lizard version params record.
+- A rules file per Cargo project. A missing one fails the run naming the path;
+  write it from the project's `/review-all` overlay, as
+  `scripts/rust_metrics_rules/reify.toml` was.
+
+A reify point costs about 10 minutes of wall clock (9m51s measured on a shared
+clone, 2026-11-25), well inside the unit's `TimeoutStartSec=2h`.
 
 **Where snapshots land.**
 `/home/leo/src/dark-factory/data/quality-metrics/<project_id>/<as_of_sha>.json`,
@@ -5574,14 +5596,19 @@ after each run, but a run killed by `TimeoutStartSec` can leave one there:
 remove the directory, then run `git -C <project_root> worktree prune`. Nothing
 is committed by machine. `/review-all` copies its own baseline to
 `plans/quality-metrics/` in its Phase 5, and its Phase 1 reads both homes
-(`skills/review-all/SKILL.md`).
+(`skills/review-all/SKILL.md`). The dashboard charts Python snapshots only. It
+lists a Rust snapshot under "Not placed", with the Python instrument's refusal
+naming the `rust-metrics-snapshot` instrument, until the Rust series of task
+11692 lands. Until then reify's list grows one line per night.
 
 **Deploy.** From the main checkout after landing, once per project:
 `scripts/install-quality-snapshot-timer.sh <project_root>`. The project id
 derives from the root, and the instance's root lives in
 `~/.config/dark-factory/quality-snapshot/<project_id>.env`. An agent cannot
 run it (see "The nightly ladder" above); this landing's deploy is task 9986.
-It is done when `systemctl --user list-timers --all` lists
+reify's is `scripts/install-quality-snapshot-timer.sh /home/leo/src/reify`,
+after `uv sync --all-packages` in the main checkout installs lizard (task
+11691). It is done when `systemctl --user list-timers --all` lists
 `quality-snapshot@<project_id>.timer`.
 
 **When it fails.** The wrapper's `quality_snapshot_cadence:` line is in
