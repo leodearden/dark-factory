@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _harness_store_paths import point_harness_stores_at
 from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config
 from _orch_helpers import (
@@ -843,23 +844,10 @@ class TestSubmitShadowDivergenceEscalation:
 # --- Real-git fixtures for create_ephemeral_verify_worktree ---
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Set up a minimal git repo with one commit."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo_wcs(tmp_path: Path) -> Path:
     """Real git repository for warm/cold shadow tests."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -1779,25 +1767,10 @@ class TestRunPostMergeVerifyOnResultCallback:
 # --- Integration: _verify_and_advance calls _maybe_schedule_shadow_compare ---
 
 
-async def _setup_wcs_repo(repo: Path) -> None:
-    """Set up a minimal git repo for integration tests (step-15)."""
-    from orchestrator.git_ops import _run
-
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def wcs_repo(tmp_path: Path) -> Path:
     """Minimal git repo for step-15 integration tests."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_wcs_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture

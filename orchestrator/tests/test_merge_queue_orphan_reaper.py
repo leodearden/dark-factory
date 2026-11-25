@@ -12,8 +12,8 @@ Steps covered:
   step-7  RED   — fail-open robustness
   step-8  GREEN — implement fail-open guards
 
-This module reuses the bare-worker git_repo/git_config/git_ops fixtures and
-_setup_repo from test_merge_queue_resource_audit.py (per-file duplication
+This module reuses the bare-worker git_repo/git_config/git_ops fixtures
+from test_merge_queue_resource_audit.py (per-file duplication
 convention — see that module's docstring), along with its
 _mkdir_worktree/_GRACE/_NOW age-test helper pattern. It imports
 orchestrator.merge_lane.worker LOCALLY inside each test so a not-yet-implemented
@@ -33,12 +33,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import FakeClock
 from _packaged_defaults import load_packaged_defaults
 from _worktree_registrations import lane_admin_dir, registered_worktree_paths
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -46,23 +47,10 @@ from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
 # ---------------------------------------------------------------------------
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a bare git repository with a single commit on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture

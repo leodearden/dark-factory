@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pytest
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import (
     FakeClock,
     FakeVerifier,
@@ -63,7 +64,7 @@ from _merge_lane_fakes import (
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.types import (
     InflightStatus,
@@ -97,21 +98,9 @@ _SENTINEL_VERIFY_TASK = object()  # (not a dataframe)
 # ── Fixtures (mirrored from test_merge_queue_conflict_graph.py) ───────────────
 
 
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
