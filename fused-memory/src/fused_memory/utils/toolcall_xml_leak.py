@@ -1,6 +1,6 @@
 """Shared detector for leaked serialized tool-call XML fragments (task 3083).
 
-THE SINGLE SOURCE OF TRUTH for "what a tool-call XML leak looks like". Four
+THE SINGLE SOURCE OF TRUTH for "what a tool-call XML leak looks like". Six
 consumers depend on this module, and they must never drift apart:
 
 * ``scripts/scan_task_toolcall_leaks.py`` — the READ-ONLY Taskmaster task-DB
@@ -10,18 +10,28 @@ consumers depend on this module, and they must never drift apart:
   corpus sweep;
 * ``Mem0Backend.scan_payload_text`` / the ``scan_memory_content`` MCP tool —
   the read capability that makes the corpus sweepable at all;
+* ``fused_memory/backends/episode_toolcall_leak_scan.py`` — the Graphiti
+  episode discovery read (task 3233), the Graphiti counterpart of
+  ``scan_payload_text``;
+* ``fused-memory/scripts/sweep_episode_toolcall_xml_leak.py`` — the Graphiti
+  episode sweep built on that read (task 3233);
 * ``fused_memory/backends/task_text_markup_gate.py`` — the storage-layer
   tripwire that ``SqliteTaskBackend.add_task``/``update_task`` run on every
   write of task text (task 4419). It is the one consumer that runs at WRITE
   time, and it shares :data:`SCANNED_COLUMNS` with the task-DB sweep.
 
+:class:`LeakShape`, :func:`classify_leak_shape` and :func:`repair_leaked_text`
+are the shared repair definition: both sweeps classify and repair through
+them, so the Mem0 and Graphiti sweeps cannot disagree on which leaks are
+content-preservingly repairable.
+
 This detector is deliberately PRECISE: it requires real whitespace between the
 stray closing tag and the continuation, so prose that merely quotes the leak
 shape with an escaped ``\n`` is not a hit. That matters in both positions it
-is used from. The first three consumers run over ALREADY-STORED content, where
-a false positive would provoke an unnecessary rewrite of a user's memory. The
-storage gate runs at write time, where a false positive refuses a legitimate
-write that no caller is placed to resubmit.
+is used from. Every consumer but the storage gate runs over ALREADY-STORED
+content, where a false positive would provoke an unnecessary rewrite of a
+user's memory. The storage gate runs at write time, where a false positive
+refuses a legitimate write that no caller is placed to resubmit.
 
 It is NOT the MCP write-boundary guard. That is
 ``fused_memory/server/markup_guard.py::build_markup_guard`` (task 4458,
