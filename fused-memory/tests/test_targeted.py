@@ -93,6 +93,7 @@ def make_reconciler(mock_memory_service, mock_taskmaster, journal, config, mock_
     """Build a TargetedReconciler over the shared mocks; *kwargs* reach its
     keyword-only constructor parameters (e.g. ``escalation_queue_factory``)."""
     def _make(**kwargs) -> TargetedReconciler:
+        kwargs.setdefault('usage_gate', None)
         r = TargetedReconciler(
             mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
             **kwargs,
@@ -481,6 +482,7 @@ async def test_done_defers_write_during_active_cycle(
     mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -523,6 +525,7 @@ async def test_reads_proceed_during_active_cycle(
     mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -547,6 +550,7 @@ async def test_blocked_proceeds_during_active_cycle(
     ])
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -565,7 +569,7 @@ async def test_blocked_proceeds_during_active_cycle(
 @pytest.mark.asyncio
 async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, journal, config):
     """When event_buffer is None, writes proceed without fence check."""
-    r = TargetedReconciler(mock_memory_service, mock_taskmaster, journal, config)
+    r = TargetedReconciler(mock_memory_service, mock_taskmaster, journal, config, usage_gate=None)
     r.verifier = AsyncMock()
 
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
@@ -645,6 +649,7 @@ async def test_handler_valueerror_caught_as_exception_not_reraised(
     """
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -676,6 +681,7 @@ async def test_journal_failure_does_not_mask_validation_error(
     """
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -1710,7 +1716,7 @@ class TestServerWiringContract:
         mock_journal = MagicMock()
         mock_config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         targeted = TargetedReconciler(
-            mock_memory_service, mock_taskmaster, mock_journal, mock_config
+            mock_memory_service, mock_taskmaster, mock_journal, mock_config, usage_gate=None,
         )
 
         # Before wiring: registry must be None (the reconciler doesn't auto-wire)

@@ -796,6 +796,7 @@ async def run_server():
         from fused_memory.reconciliation.event_queue import EventQueue
         from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.reconciliation.journal import ReconciliationJournal
+        from fused_memory.reconciliation.recon_usage_gate import build_reconciliation_usage_gate
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
 
@@ -890,12 +891,16 @@ async def run_server():
         # Wire event emission into memory_service
         memory_service.set_event_buffer(event_buffer)
 
+        # Built here because TargetedReconciler is constructed before the harness and both share it.
+        recon_usage_gate = build_reconciliation_usage_gate(config.reconciliation)
+
         # Targeted reconciler (needs memory_service + taskmaster + journal)
         targeted = None
         if taskmaster is not None and taskmaster.connected:
             targeted = TargetedReconciler(
                 memory_service, taskmaster, recon_journal, config, event_buffer,
                 cost_store=invocations_store,
+                usage_gate=recon_usage_gate,
             )
             # Wire the planned episode registry so _on_task_done can promote planned
             # episodes when tasks complete (otherwise the promotion code is dead code).
@@ -1005,6 +1010,7 @@ async def run_server():
                 systemd_listeners, config.reconciliation.escalation_port,
             ),
             cost_store=invocations_store,
+            usage_gate=recon_usage_gate,
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
