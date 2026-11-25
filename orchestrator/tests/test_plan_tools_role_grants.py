@@ -105,13 +105,16 @@ def _lane_argv(tmp_path: Path) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_an_unmarked_cli_launch_keeps_the_full_surface_and_warns(
-    tmp_path, artifacts, caplog,
-):
-    with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
-        server = plan_tools.server_from_argv(_lane_argv(tmp_path))
+@pytest.mark.parametrize(
+    'grants', [[], ['--grant', 'mark_step_done']], ids=['no-grant', 'granted'],
+)
+async def test_an_unmarked_cli_launch_exposes_nothing_and_warns(tmp_path, caplog, grants):
+    argv = [*_lane_argv(tmp_path), *grants]
 
-    assert await _listed(server) == await _listed(plan_tools.create_server(artifacts))
+    with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+        server = plan_tools.server_from_argv(argv)
+
+    assert await _listed(server) == []
     assert any(
         record.levelno == logging.WARNING and '--grants-enforced' in record.getMessage()
         for record in caplog.records
@@ -126,10 +129,9 @@ async def test_a_marked_cli_launch_with_no_grant_exposes_nothing(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('marker', [[], ['--grants-enforced']], ids=['unmarked', 'marked'])
-async def test_the_cli_exposes_exactly_the_granted_tools(tmp_path, marker):
+async def test_the_cli_exposes_exactly_the_granted_tools(tmp_path):
     argv = [
-        *_lane_argv(tmp_path), *marker,
+        *_lane_argv(tmp_path), '--grants-enforced',
         '--grant', 'mark_step_done', '--grant', 'record_step_deviation',
     ]
 
