@@ -166,6 +166,13 @@ class Carrier(_View):
     defect_status: DefectStatus
 
 
+class RefLookup(_View):
+    """lookup_defect_ref's answer: the tasks declaring the ref, and the project's tasks whose defect entries did not read, which it cannot say of."""
+
+    carriers: tuple[Carrier, ...]
+    unreadable_task_ids: tuple[str, ...]
+
+
 class TaskView(_View):
     """What the filer reads of a task; metadata another writer shaped differently reads as absent."""
 
@@ -188,6 +195,13 @@ def _carrier(entry: Mapping[str, Any]) -> Carrier:
         task_id=_task_id(entry['task_id']),
         task_status=entry['task_status'],
         defect_status=entry['defect_status'],
+    )
+
+
+def _ref_lookup(reply: Mapping[str, Any]) -> RefLookup:
+    return RefLookup(
+        carriers=tuple(map(_carrier, reply['carriers'])),
+        unreadable_task_ids=tuple(map(_task_id, reply['unreadable_task_ids'])),
     )
 
 
@@ -265,9 +279,9 @@ class ClosedTools:
             raise ToolRefused(tool, RefusalKind.REPLY_CODE, code)
         return reply
 
-    def lookup_defect_ref(self, ref: str) -> tuple[Carrier, ...]:
+    def lookup_defect_ref(self, ref: str) -> RefLookup:
         reply = self._call('lookup_defect_ref', ref=ref)
-        return _parsed('lookup_defect_ref', lambda: tuple(map(_carrier, reply['carriers'])))
+        return _parsed('lookup_defect_ref', lambda: _ref_lookup(reply))
 
     def find_gates(self, ref: str) -> tuple[str, ...]:
         """Every task, of any status, whose metadata names it the human gate of `ref`."""

@@ -21,6 +21,7 @@ from client_feed.filer_tools import (
     Carrier,
     ClosedTools,
     Disposition,
+    RefLookup,
     RefusalKind,
     TaskSubmission,
     ToolRefused,
@@ -105,7 +106,7 @@ def test_every_call_names_the_policy_root_and_only_the_closed_tools(tmp_path: Pa
     gate = tools.submit_planned(_submission(x_client_defect_gate_for=REF))
     tools.add_dependency(fix, gate)
     tools.commit_planning((fix, gate))
-    assert [carrier.task_id for carrier in tools.lookup_defect_ref(REF)] == [fix]
+    assert [carrier.task_id for carrier in tools.lookup_defect_ref(REF).carriers] == [fix]
     assert tools.find_gates(REF) == (gate,)
     assert tools.get_task(fix).dependencies == {gate}
     tools.declare_withdrawal(fix, WITHDRAWAL)
@@ -209,21 +210,24 @@ def test_a_session_failure_is_a_refusal_of_its_kind_without_the_servers_text(
     assert SECRET not in str(caught.value)
 
 
-def test_lookup_is_a_tuple_of_typed_carriers(tmp_path: Path) -> None:
+def test_lookup_is_its_typed_carriers_and_the_unreadable_task_ids(tmp_path: Path) -> None:
     caller = Scripted(
         lookup_defect_ref=[
             {
                 'ref': REF,
                 'live': True,
                 'carriers': [{'task_id': 7, 'task_status': 'pending', 'defect_status': 'open'}],
-                'unreadable_task_ids': [],
+                'unreadable_task_ids': [9, 11],
             }
         ]
     )
 
-    carriers = ClosedTools(caller, tmp_path).lookup_defect_ref(REF)
+    lookup = ClosedTools(caller, tmp_path).lookup_defect_ref(REF)
 
-    assert carriers == (Carrier(task_id='7', task_status=TaskStatus.PENDING, defect_status=DefectStatus.OPEN),)
+    assert lookup == RefLookup(
+        carriers=(Carrier(task_id='7', task_status=TaskStatus.PENDING, defect_status=DefectStatus.OPEN),),
+        unreadable_task_ids=('9', '11'),
+    )
 
 
 @pytest.mark.parametrize('ids', [(4, 5), ('4', '5')], ids=['int', 'str'])
@@ -325,9 +329,9 @@ def test_withheld_writes_forward_reads_and_answer_writes_themselves(tmp_path: Pa
     gate = tools.submit_planned(_submission())
     tools.add_dependency(fix, gate)
     tools.commit_planning((fix, gate))
-    carriers = tools.lookup_defect_ref(REF)
+    lookup = tools.lookup_defect_ref(REF)
 
-    assert (fix, gate, carriers) == ('planned-1', 'planned-2', ())
+    assert (fix, gate, lookup.carriers) == ('planned-1', 'planned-2', ())
     assert [(call.tool, call.withheld) for call in withheld.calls] == [
         ('submit_task', True),
         ('submit_task', True),
@@ -360,7 +364,7 @@ def test_the_session_ignores_proxy_variables(
     fake = FakeFusedMemory(tmp_path / 'root')
 
     with StubMcpServer(stateful=False, tools=fake.handle) as server, open_session(_policy(tmp_path, server.url)) as session:
-        carriers = ClosedTools(session, tmp_path / 'root').lookup_defect_ref(REF)
+        lookup = ClosedTools(session, tmp_path / 'root').lookup_defect_ref(REF)
 
-    assert carriers == ()
+    assert lookup.carriers == ()
     assert [name for name, _ in fake.calls] == ['lookup_defect_ref']

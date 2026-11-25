@@ -33,6 +33,7 @@ from client_feed.filer_tools import (
     ListingCaller,
     OpenSession,
     OpenTools,
+    RefLookup,
     RefusalKind,
     SessionUnavailable,
     TaskView,
@@ -172,6 +173,22 @@ def _just_submitted(task_id: str) -> TaskView:
     )
 
 
+def _names_ref(view: TaskView, ref: str, project_id: str) -> bool:
+    try:
+        facts = ClientDefectFacts.model_validate(view.x_client_defect)
+    except ValidationError:
+        return False
+    return portal_ref(project_id, facts.block, facts.report) == ref
+
+
+def _filer_fix(
+    tools: ClosedTools, declaring: Sequence[TaskView], lookup: RefLookup, ref: str, project_id: str
+) -> TaskView | None:
+    """The filer's fix of `ref`: the lowest of its tasks declaring it, else of those naming it whose defect entries no longer read."""
+    unreadable = () if declaring else _filer_tasks(tools, lookup.unreadable_task_ids)
+    return _lowest(declaring or [view for view in unreadable if _names_ref(view, ref, project_id)], 'fix', ref)
+
+
 def _facts(fix: TaskView, report: DefectReported, fallback: FilerFallback | None) -> ClientDefectFacts:
     try:
         return ClientDefectFacts.model_validate(fix.x_client_defect)
@@ -252,17 +269,18 @@ def _submit_fix(
 
 
 def _filed_fix(
-    tools: ClosedTools, report: DefectReported, ref: str, filer: FilerPolicy, record: RefRecord | None
+    tools: ClosedTools, report: DefectReported, ref: str, policy: Policy, record: RefRecord | None
 ) -> _Filed | None:
     """The ref's filer fix, submitted if the store holds none; None when the ref was filed by hand."""
     with _keeping_record(record):
-        carriers = [tools.get_task(carrier.task_id) for carrier in tools.lookup_defect_ref(ref)]
-    mine = [view for view in carriers if view.source == FILER_IDENTITY]
-    if carriers and not mine:
-        return None
-    fix = _lowest(mine, 'fix', ref)
+        lookup = tools.lookup_defect_ref(ref)
+        carriers = [tools.get_task(carrier.task_id) for carrier in lookup.carriers]
+        mine = [view for view in carriers if view.source == FILER_IDENTITY]
+        if carriers and not mine:
+            return None
+        fix = _filer_fix(tools, mine, lookup, ref, policy.project_id)
     if fix is None:
-        return _submit_fix(tools, report, ref, filer, record)
+        return _submit_fix(tools, report, ref, policy.require_filer(), record)
     return _Filed(fix, _facts(fix, report, None if record is None else record.fallback), record)
 
 
@@ -272,7 +290,7 @@ def converge_filing(
     """File `ref` as a fix and, unless auto-dispatched clean, its gate; every step re-derived from the store."""
     filer = policy.require_filer()
     try:
-        filed = _filed_fix(tools, report, ref, filer, record)
+        filed = _filed_fix(tools, report, ref, policy, record)
         if filed is not None:
             with _keeping_record(filed.record):
                 _gate_and_commit(tools, report, ref, policy, filer, filed.fix, filed.facts)
@@ -296,18 +314,18 @@ def _pending_on_filer_withdrawal(fix: TaskView, ref: str) -> bool:
     return any(declaration.ref == ref and is_filer_withdrawal(declaration) for declaration in fix.defects)
 
 
-def _warn_out_of_reach(ref: str, fix: TaskView, defect_status: DefectStatus) -> None:
-    """A defect no closure may leave (proven, exempted, pending on another closure) takes no write; a withdrawn one is converged."""
+def _warn_out_of_reach(ref: str, fix: TaskView, defect_status: DefectStatus | None) -> None:
+    """A defect no closure may leave (proven, exempted, pending on another closure, unreadable) takes no write; a withdrawn one is converged."""
     if defect_status is not DefectStatus.WITHDRAWN:
         logger.warning(
             "%s: the defect on fix %s is %s; the ruling withdraws nothing and cancels the filer's tasks",
             ref,
             fix.task_id,
-            defect_status,
+            'unreadable' if defect_status is None else defect_status,
         )
 
 
-def _withdraw(tools: ClosedTools, ref: str, fix: TaskView, defect_status: DefectStatus) -> bool:
+def _withdraw(tools: ClosedTools, ref: str, fix: TaskView, defect_status: DefectStatus | None) -> bool:
     """Withdraw the fix's defect as not a defect and record Leo's acceptance; False once the store says the fix went terminal."""
     withdraws = defect_status in _WITHDRAWABLE
     accepts = withdraws or (defect_status is DefectStatus.PENDING and _pending_on_filer_withdrawal(fix, ref))
@@ -325,20 +343,21 @@ def _withdraw(tools: ClosedTools, ref: str, fix: TaskView, defect_status: Defect
     return True
 
 
-def _withdraw_and_cancel_fix(tools: ClosedTools, ref: str) -> None:
+def _withdraw_and_cancel_fix(tools: ClosedTools, ref: str, project_id: str) -> None:
     """The filer's fix of a ruled ref: its defect withdrawn while the fix is live, and the fix cancelled unless started."""
-    carriers = {carrier.task_id: carrier for carrier in tools.lookup_defect_ref(ref)}
-    fix = _lowest(_filer_tasks(tools, tuple(carriers)), 'fix', ref)
+    lookup = tools.lookup_defect_ref(ref)
+    defect_statuses = {carrier.task_id: carrier.defect_status for carrier in lookup.carriers}
+    fix = _filer_fix(tools, _filer_tasks(tools, tuple(defect_statuses)), lookup, ref, project_id)
     if fix is None or fix.status in _TERMINAL:
         return
-    if _withdraw(tools, ref, fix, carriers[fix.task_id].defect_status) and fix.status in _CANCELLABLE_FIX:
+    if _withdraw(tools, ref, fix, defect_statuses.get(fix.task_id)) and fix.status in _CANCELLABLE_FIX:
         tools.cancel(fix.task_id)
 
 
-def converge_ruling(tools: ClosedTools, ref: str, record: RefRecord | None) -> _Outcome:
+def converge_ruling(tools: ClosedTools, ref: str, project_id: str, record: RefRecord | None) -> _Outcome:
     """Carry Leo's portal ruling to the filer's own fix and gate: withdraw and cancel the fix first, since a cancelled gate releases it."""
     try:
-        _withdraw_and_cancel_fix(tools, ref)
+        _withdraw_and_cancel_fix(tools, ref, project_id)
         for gate in _filer_tasks(tools, tools.find_gates(ref)):
             if gate.status not in _TERMINAL:
                 tools.cancel(gate.task_id)
@@ -382,7 +401,7 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
     for ref, state in _ref_states(read, policy.project_id).items():
         record = cursor.refs.get(ref)
         if state.ruled or state.report is None:
-            outcomes[ref] = converge_ruling(tools, ref, record)
+            outcomes[ref] = converge_ruling(tools, ref, policy.project_id, record)
         else:
             outcomes[ref] = converge_filing(tools, state.report, ref, policy, record)
     unconverged = tuple(outcome.refused for outcome in outcomes.values() if outcome.refused is not None)
@@ -520,7 +539,7 @@ def _checked(policy: Policy, session: ListingCaller, cursor: FilerCursor, ref: s
     except ToolRefused as refused:
         return _check_report(ref, (), None, None, str(refused))
     try:
-        live = bool(ClosedTools(session, policy.project_root).lookup_defect_ref(ref))
+        live = bool(ClosedTools(session, policy.project_root).lookup_defect_ref(ref).carriers)
     except ToolRefused as refused:
         return _check_report(ref, missing, None, None, str(refused))
     withheld = WithheldWrites(session)

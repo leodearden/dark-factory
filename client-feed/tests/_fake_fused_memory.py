@@ -50,6 +50,16 @@ def _not_found(task_id: object) -> Reply:
     return {'error': f'Task {task_id} not found', 'error_type': 'TaskNotFound'}
 
 
+def _declarations(entries: object) -> list[DefectDeclaration] | None:
+    """A task's defect entries, or None when any does not read, as the real lookup leaves such a task out of its carriers."""
+    if not isinstance(entries, list):
+        return None
+    try:
+        return [DefectDeclaration.model_validate(entry) for entry in entries]
+    except ValidationError:
+        return None
+
+
 class FakeFusedMemory:
     """fused-memory for one project root; `call_tool` is the in-process ToolCaller, `handle` the StubMcpServer handler."""
 
@@ -137,6 +147,11 @@ class FakeFusedMemory:
         """A status another actor gave a task (a worker started it, a merge landed it); no call is recorded."""
         with self._lock:
             self._tasks[int(task_id)]['status'] = status
+
+    def set_metadata(self, task_id: int | str, key: str, value: object) -> None:
+        """Metadata another writer gave a task (a hand edit, a schema change); no call is recorded."""
+        with self._lock:
+            self._tasks[int(task_id)]['metadata'][key] = copy.deepcopy(value)
 
     def write_tasks_db(self, tasks: TasksDb, *, updated_at: str) -> None:
         """Every task held, written into a real tasks.db in the project's tag, so the publisher's readers see them."""
@@ -246,18 +261,26 @@ class FakeFusedMemory:
             parse_ref(ref)
         except MalformedDefectRef as exc:
             return {'error': str(exc), 'error_type': 'ValidationError'}
-        carriers = [
-            {'task_id': task['id'], 'task_status': task['status'], 'defect_status': entry['status']}
-            for _, task in sorted(self._tasks.items())
-            for entry in task['metadata'].get('defects', [])
-            if entry.get('ref') == ref
-        ]
+        carriers: list[Reply] = []
+        unreadable: list[int] = []
+        for task_id, task in sorted(self._tasks.items()):
+            if 'defects' not in task['metadata']:
+                continue
+            declarations = _declarations(task['metadata']['defects'])
+            if declarations is None:
+                unreadable.append(task_id)
+                continue
+            carriers.extend(
+                {'task_id': task_id, 'task_status': task['status'], 'defect_status': declaration.status.value}
+                for declaration in declarations
+                if declaration.ref == ref
+            )
         return {
             'project_root': self.project_root,
             'ref': ref,
             'live': bool(carriers),
             'carriers': carriers,
-            'unreadable_task_ids': [],
+            'unreadable_task_ids': unreadable,
         }
 
     def _find_tasks_by_metadata(self, arguments: dict[str, Any]) -> Reply:

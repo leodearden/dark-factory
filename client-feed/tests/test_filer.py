@@ -33,6 +33,7 @@ from client_feed.filer_tasks import (
     FIX_TITLE,
     GATE_TITLE,
     RESTATED_HEADING,
+    facts_of,
     operator_acceptance_event,
     withdrawal_event,
 )
@@ -228,6 +229,45 @@ def test_a_hand_filed_carrier_counts_as_filed(gated: World) -> None:
     report, _ = gated.run()
 
     assert gated.writes() == []
+    assert report.converged == (REF,)
+
+
+def _unread_defects(world: World, task_id: int) -> None:
+    """The task's defect entries as a later schema no longer reads them, so lookup_defect_ref names the task unreadable."""
+    entries = world.fake.task(task_id)['metadata']['defects']
+    world.fake.set_metadata(task_id, 'defects', [{**entry, 'status': 'no-such-status'} for entry in entries])
+
+
+def test_a_filer_fix_whose_defects_no_longer_read_is_not_filed_again(gated: World) -> None:
+    append_inbox(gated.in_dir, reported(2, 3, at=AT))
+    gated.run()
+    fix, _ = gated.fix_and_gate()
+    _unread_defects(gated, fix['id'])
+    lookup = gated.tools.lookup_defect_ref(REF)
+    assert (lookup.carriers, lookup.unreadable_task_ids) == ((), (str(fix['id']),))
+    writes_before = len(gated.writes())
+
+    report, _ = gated.run(FilerCursor())
+
+    assert gated.writes()[writes_before:] == []
+    assert len(gated.fixes()) == len(gated.gates()) == 1
+    assert (report.converged, report.unconverged) == ((REF,), ())
+
+
+def test_an_unreadable_task_of_another_report_or_another_writer_is_no_fix_of_this_report(gated: World) -> None:
+    other_report = facts_of(reported(2, 9, at=AT), None).model_dump(mode='json', exclude_none=True)
+    this_report = facts_of(reported(2, 3, at=AT), None).model_dump(mode='json', exclude_none=True)
+    gated.fake.seed_task(
+        metadata={'source': FILER_IDENTITY, 'x_client_defect': other_report, 'defects': [{'ref': portal_ref(PROJECT, 2, 9)}]}
+    )
+    gated.fake.seed_task(metadata={'x_client_defect': this_report, 'defects': [{'ref': REF}]})
+    append_inbox(gated.in_dir, reported(2, 3, at=AT))
+
+    report, _ = gated.run()
+
+    fix, [gate] = gated.fix_of(REF), gated.gates()
+    assert fix['dependencies'] == [gate['id']]
+    assert (fix['status'], gate['status']) == ('pending', 'pending')
     assert report.converged == (REF,)
 
 
@@ -687,6 +727,25 @@ def test_b39_a_ruling_on_a_proven_defect_writes_no_defect_event_and_still_conver
     writes_after_ruling = len(gated.writes())
     gated.run(FilerCursor())
     assert len(gated.writes()) == writes_after_ruling
+
+
+def test_b39_a_ruling_cancels_a_filer_fix_whose_defects_no_longer_read_before_its_gate(
+    gated: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    cursor = _file_then_rule(gated)
+    fix, gate = gated.fix_and_gate()
+    _unread_defects(gated, fix['id'])
+    sent_before = len(gated.fake.calls)
+
+    with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
+        report, _ = gated.run(cursor)
+
+    assert _writes_since(gated, sent_before) == [
+        ('set_task_status', str(fix['id']), 'cancelled'),
+        ('set_task_status', str(gate['id']), 'cancelled'),
+    ]
+    assert report.converged == (REF,)
+    assert any(REF in record.getMessage() and 'unreadable' in record.getMessage() for record in caplog.records)
 
 
 def test_b39_a_ruling_calls_only_closed_tools_and_sets_no_status_but_cancelled(gated: World) -> None:
