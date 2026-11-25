@@ -34,9 +34,11 @@ from types import SimpleNamespace
 
 import pytest
 from shared import toolcall_markup
-from shared.markup_residue_custody import MARKUP_REFUSAL_CUSTODY_CAVEAT
+from shared.markup_residue_custody import MARKUP_REFUSAL_CUSTODY_CAVEAT, residue_prose
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     OUTCOMES,
     residue_header_lines,
 )
@@ -1156,3 +1158,44 @@ class TestTheResidueRecordNamesItsCaller:
 
         missing = set(residue_header_lines({})) - set(detail.splitlines())
         assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
+
+
+class TestTheResidueRecordStatesItsKind:
+    """The filer states what happened to the call in the record kind's own terms."""
+
+    RAW_VALUE = 'The value the leak swallowed.'
+
+    def _filed(self, tmp_path, error_type: str) -> dict:
+        pytest.importorskip('escalation')
+        record = {
+            'error_type': error_type,
+            'tool': 'add_memory',
+            'field': 'metadata',
+            'raw_value': self.RAW_VALUE,
+        }
+        esc_id = markup_tripwire.emit_markup_residue_escalation(
+            str(tmp_path), record, anchor_task_id='markup-residue',
+        )
+        assert esc_id is not None
+        [filed] = (tmp_path / 'data' / 'escalations').glob('esc-*.json')
+        return json.loads(filed.read_text())
+
+    @pytest.mark.parametrize(
+        'error_type',
+        [MARKUP_UNREPAIRABLE_ERROR_TYPE, MARKUP_UNRECOVERED_PARAM_ERROR_TYPE],
+        ids=['refused', 'dropped-slice'],
+    )
+    def test_the_detail_states_the_kinds_outcome_and_custody(self, tmp_path, error_type):
+        detail = self._filed(tmp_path, error_type)['detail']
+
+        prose = residue_prose({'error_type': error_type})
+        assert prose.outcome in detail
+        assert prose.custody in detail
+        assert self.RAW_VALUE in detail
+
+    def test_a_dropped_slice_claims_no_refusal(self, tmp_path):
+        payload = self._filed(tmp_path, MARKUP_UNRECOVERED_PARAM_ERROR_TYPE)
+
+        assert 'REFUSED' not in payload['detail']
+        assert MARKUP_REFUSAL_CUSTODY_CAVEAT not in payload['detail']
+        assert 'unrepairable' not in payload['summary'].lower()
