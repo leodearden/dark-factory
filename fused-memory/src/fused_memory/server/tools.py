@@ -1359,10 +1359,13 @@ def _validate_fields(fields: Any) -> dict[str, Any] | None:
     return None
 
 
-# find_tasks_by_metadata's page-size cap, and its include_value page budget in
-# serialized bytes of ``results`` (plans/task-metadata-lookup-prd.md decision 6).
+# find_tasks_by_metadata's page-size cap, and the page budget its include_value
+# and include_rows pages share, in serialized bytes of ``results``
+# (plans/task-metadata-lookup-prd.md decision 6).
 METADATA_LOOKUP_LIMIT_CAP = 100
 RESULT_BYTE_BUDGET = 48_000
+# Each opt-in payload field a lone over-budget row elides, and the flag marking it.
+_ELIDABLE_FIELDS = (('matched_value', 'truncated_value'), ('metadata', 'truncated_row'))
 
 
 def _json_bytes(obj: Any) -> int:
@@ -1371,8 +1374,12 @@ def _json_bytes(obj: Any) -> int:
 
 
 def _elided_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    elided = {'_elided': True, 'bytes': _json_bytes(row['matched_value'])}
-    return {**row, 'matched_value': elided, 'truncated_value': True}
+    elided = dict(row)
+    for field, flag in _ELIDABLE_FIELDS:
+        if field in row:
+            elided[field] = {'_elided': True, 'bytes': _json_bytes(row[field])}
+            elided[flag] = True
+    return elided
 
 
 def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -1380,7 +1387,7 @@ def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, 
 
     Sizes add up exactly as ``json.dumps`` of the list: ``[]`` plus each row
     plus a ``', '`` between rows. A first row too big to fit alone comes back
-    as the only row, with its value elided.
+    as the only row, with every opted-in payload elided.
     """
     size = len('[]')
     for count, row in enumerate(rows):
@@ -10070,7 +10077,10 @@ def create_mcp_server(
             statuses=statuses, limit=page_size, offset=offset, tag=tag,
             include_value=include_value, include_rows=include_rows,
         )
-        results = _fit_rows_to_budget(found['results']) if include_value else found['results']
+        results = (
+            _fit_rows_to_budget(found['results'])
+            if include_value or include_rows else found['results']
+        )
         pid = resolve_project_id(normalized)
         response: dict[str, Any] = {
             'project_id': pid,
