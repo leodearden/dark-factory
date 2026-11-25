@@ -64,6 +64,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -71,6 +72,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from shared.cost_store import CostStore
 
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
@@ -127,6 +130,11 @@ from fused_memory.maintenance.link_heal_store import (
     server_tool_caller,
 )
 from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
+from fused_memory.models.invocation_ledger import (
+    InvocationLedger,
+    LedgerRole,
+    invocations_ledger_path,
+)
 from fused_memory.models.scope import resolve_project_id
 
 EXIT_OK = 0
@@ -180,8 +188,8 @@ async def qdrant_census(config: FusedMemoryConfig) -> AsyncIterator[LinkCensus]:
         await backend.close()
 
 
-def config_adjudicator(config: FusedMemoryConfig) -> LinkAdjudicator:
-    return configured_adjudicator(config.link_heal)
+def config_adjudicator(config: FusedMemoryConfig, ledger: InvocationLedger) -> LinkAdjudicator:
+    return configured_adjudicator(config.link_heal, ledger=ledger)
 
 
 @dataclass(frozen=True)
@@ -204,7 +212,9 @@ class LinkHealEnv:
     )
     ledger_dir_for: Callable[[FusedMemoryConfig], Path] = config_ledger_dir
     home_root_for: Callable[[FusedMemoryConfig], str] = home_project_root
-    adjudicator_for: Callable[[FusedMemoryConfig], LinkAdjudicator] = config_adjudicator
+    adjudicator_for: Callable[[FusedMemoryConfig, InvocationLedger], LinkAdjudicator] = (
+        config_adjudicator
+    )
     reports_dir_for: Callable[[FusedMemoryConfig], Path] = config_reports_dir
     metrics_root: Path = METRICS_ROOT
     now: Callable[[], datetime] = utc_now
@@ -421,6 +431,7 @@ class _Session:
     ledger: LinkHealLedger
     ledger_dir: Path
     server_url: str
+    invocation_ledger: InvocationLedger
 
     @property
     def limits(self) -> RunLimits:
@@ -485,7 +496,7 @@ async def _plan_from_adjudicator(args: argparse.Namespace, session: _Session) ->
     await session.probe(projects[0])
     async with session.env.census_for(session.config) as census:
         return await run_adjudicator_plan(
-            adjudicate=session.env.adjudicator_for(session.config),
+            adjudicate=session.env.adjudicator_for(session.config, session.invocation_ledger),
             store=session.store,
             census=census,
             ledger=session.ledger,
@@ -592,7 +603,7 @@ async def _sweep(args: argparse.Namespace, session: _Session) -> CommandOutcome:
     await session.probe(settings.projects[0])
     async with session.env.census_for(session.config) as census:
         report = await run_sweep(
-            adjudicate=session.env.adjudicator_for(session.config),
+            adjudicate=session.env.adjudicator_for(session.config, session.invocation_ledger),
             store=session.store,
             census=census,
             ledger=session.ledger,
@@ -628,7 +639,7 @@ async def _calibrate(args: argparse.Namespace, session: _Session) -> CommandOutc
     population, population_sha256 = _calibration_input(args.ratings, args.items)
     report = await run_calibration(
         population,
-        adjudicate=session.env.adjudicator_for(session.config),
+        adjudicate=session.env.adjudicator_for(session.config, session.invocation_ledger),
         ledger=session.ledger,
         settings=CalibrationSettings.from_config(session.config.link_heal),
         filer=FoldedEscapeFiler(session.home_root),
@@ -658,6 +669,18 @@ _RUN_COMMANDS: Mapping[str, _RunCommand] = {
 }
 
 
+def _invocation_ledger(
+    args: argparse.Namespace, config: FusedMemoryConfig, env: LinkHealEnv, cost_store: CostStore,
+) -> InvocationLedger:
+    """Where this run's adjudicator calls land, under a run id minted for the run."""
+    return InvocationLedger(
+        cost_store,
+        LedgerRole.LINK_ADJUDICATOR,
+        run_id=f'link-heal-{args.command}-{env.now():%Y%m%dT%H%M%SZ}-{os.getpid()}',
+        project_id=resolve_project_id(env.home_root_for(config)),
+    )
+
+
 async def _run_command(
     args: argparse.Namespace, config: FusedMemoryConfig, env: LinkHealEnv, ledger_dir: Path,
 ) -> CommandOutcome:
@@ -666,7 +689,10 @@ async def _run_command(
     with RunLock(ledger_dir / LOCK_FILENAME):
         ledger = LinkHealLedger(ledger_dir / LEDGER_FILENAME)
         try:
-            async with env.tool_caller_for(server_url) as tool_caller:
+            async with (
+                CostStore(invocations_ledger_path(ledger_dir)) as cost_store,
+                env.tool_caller_for(server_url) as tool_caller,
+            ):
                 session = _Session(
                     config=config,
                     env=env,
@@ -674,6 +700,7 @@ async def _run_command(
                     ledger=ledger,
                     ledger_dir=ledger_dir,
                     server_url=server_url,
+                    invocation_ledger=_invocation_ledger(args, config, env, cost_store),
                 )
                 return await _RUN_COMMANDS[args.command](args, session)
         finally:
