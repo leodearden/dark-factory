@@ -505,7 +505,7 @@ def test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_
         _ctrl_c(commit.pid)
         release.touch()
         commit.wait(timeout=60)
-        stopped = _eventually(lambda: not _pid_alive(units[0].pid), 30)
+        stopped = _eventually(lambda: not pid_running(units[0].pid), 30)
         logs_removed = _eventually(lambda: not any(hook_tmp.iterdir()), 30)
     finally:
         release.touch()
