@@ -766,8 +766,8 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     `client-feed/tests/test_isolation.py::test_the_committed_dark_factory_snapshot_is_a_valid_bounded_leak_free_feed`
     checks four things on the committed files: they validate as project `dark-factory`; they leak no
     marker, home or tmp path, and no forbidden key; they hold at least one `task_upserted`,
-    `tree_snapshot` and `file_revealed`; and every `test_results` has at most 20 cases. As generated,
-    the feed is 882 KB and the state 828 KB. Most of each is the tree of 5,221 visible files.
+    `tree_snapshot` and `file_revealed`; and every `test_results` has at most 20 cases. Most of each
+    file is the tree snapshot.
   - (b) B22 never snapshots the live root in place. A task or merge worktree has no `.taskmaster/` or
     `data/`, and the main checkout's stores take minutes to snapshot. Instead it runs on a shared,
     unchecked-out clone whose `main` is HEAD (`client-feed/tests/_git_repo.py::clone_of_checkout`).
@@ -807,7 +807,11 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
    cached by sha in `cursor.json`; last-change dates from the commits walked since the previous
-   snapshot. Decide in β2/γ.
+   snapshot. Decide in β2/γ. Measure any fix against
+   `client-feed/tests/test_isolation.py::test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_nothing`,
+   which snapshots this repository's `*/src/**` and `*/tests/**` on every client-feed verify. When
+   ζ (6973) landed it took about a minute, most of it the publisher counting lines blob by blob over
+   the visible tree, which the engagement and the reveal requests trigger.
 2. **One unit per project or one unit with a list.** **Decided by η (6974):** one instance per
    project, `client-feed@<name>.service`, `--config %h/.config/client-feed/<name>.yaml`.
 3. **Default globs** for visible, test, docs and generated sets. Suggested as in §7.2 and §7.6, with
