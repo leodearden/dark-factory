@@ -144,6 +144,7 @@ def test_every_vendored_in_v3_line_is_a_valid_inbox_line_and_reads_in_order(in_d
         'src/export.py',
     ]
     assert [(report.block, report.report) for report in read.reports] == [(2, 1), (2, 2), (2, 3)]
+    assert list(read.rulings) == rulings
     assert read.rejected == ()
     assert read.offset == inbox.stat().st_size
 
