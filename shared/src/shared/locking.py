@@ -154,6 +154,7 @@ FILE_EXTENSIONS: frozenset[str] = frozenset(
         'scss',
         'service',
         'sh',
+        'stderr',
         'step',
         'stl',
         'svg',

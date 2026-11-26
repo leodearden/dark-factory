@@ -39,7 +39,7 @@ _CANONICAL_EXTENSIONS = [
     'lock', 'log',
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
-    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stderr', 'stl', 'svg',
+    'ri', 'rs', 'scss', 'service', 'sh', 'stderr', 'step', 'stl', 'svg',
     'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
