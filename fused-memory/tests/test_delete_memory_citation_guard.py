@@ -1561,11 +1561,12 @@ class TestCascadeCitationRepointPass:
 
         assert result['status'] == 'deleted'
         assert mock_service.get_memory_by_id.await_count == 1
-        # The citation scan is NOT memoized and must not become so: it is the
-        # fail-closed guarantee, and a task can begin citing a doomed id at
-        # any moment. Three pre-flight scans, three on the repoint pass, plus
-        # each sweep's own read.
-        assert interceptor.get_tasks.await_count >= 6
+        # The repoint pass's citation scan is NOT memoized and must not become
+        # so: it is the fail-closed guarantee, and a task can begin citing a
+        # doomed id at any moment. One batched pre-flight read, then one live
+        # scan per record on the repoint pass (3) plus the sweep's own read for
+        # each of the two cited records (2).
+        assert interceptor.get_tasks.await_count == 6
 
     @pytest.mark.asyncio
     async def test_uncited_cascade_pays_for_no_writes(self, mock_service):
@@ -1764,12 +1765,12 @@ class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
 
     @pytest.mark.asyncio
     async def test_descendant_scan_failure_blocks_the_cascade(self):
-        """(c) The per-id fail-closed arm reaches the aggregate.
+        """(c) The fail-closed arm reaches the aggregate.
 
-        The first scan (the descendant, deepest-first) cannot be read, so
-        that id's CitationScanFailed rides the blocked list and the whole
-        cascade is refused — an unreadable citation state for ONE record in
-        the set is enough.
+        The pre-flight reads the task tree ONCE for the whole set, so one
+        failed read leaves EVERY id's citation state unknown: each rides the
+        blocked list as CitationScanFailed and the whole cascade is refused.
+        A second read would have succeeded, and is never made.
         """
         service = _make_service(descendants=[CHILD])
         interceptor = _make_interceptor([])
@@ -1781,8 +1782,10 @@ class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
         result = await _call_delete(mcp_server, cascade=True)
 
         assert result['error_type'] == 'CascadeCitationGateRejected'
-        assert [b['memory_id'] for b in result['blocked']] == [CHILD]
-        assert result['blocked'][0]['error_type'] == 'CitationScanFailed'
+        assert [b['memory_id'] for b in result['blocked']] == [CHILD, DOOMED]
+        assert {b['error_type'] for b in result['blocked']} == {'CitationScanFailed'}
+        assert {b['scan_error_type'] for b in result['blocked']} == {'RuntimeError'}
+        assert interceptor.get_tasks.await_count == 1
         service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2158,3 +2161,48 @@ class TestCascadeHintOffersTheEscapeOnlyWhereItIsTheRemedy:
         assert 'allow_dangling_citations' in result['hint']
         self._assert_shared_cascade_guidance(result['hint'])
         service.delete_memory.assert_not_awaited()
+
+
+class TestCascadePreflightReadsTheTaskTreeOnce:
+    """The non-mutating pre-flight answers for the whole set from ONE read.
+
+    Each record's question is the same gate's, so the rules keep one home; only
+    the task-tree READ is shared. The mutating pass still reads live per
+    record, because that re-read is the fail-closed guarantee.
+    """
+
+    @staticmethod
+    def _server(service, interceptor):
+        return create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_refused_preflight_reads_the_task_tree_once(self):
+        service = _make_service(descendants=[GRANDCHILD, CHILD])
+        interceptor = _make_interceptor([
+            _task('1901', 'pending', {'mem0_canonical_entry': GRANDCHILD}),
+            _task('1902', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1903', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+        result = await _call_delete(self._server(service, interceptor), cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert [b['memory_id'] for b in result['blocked']] == [GRANDCHILD, CHILD, DOOMED]
+        assert interceptor.get_tasks.await_count == 1
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_mutating_pass_still_reads_live_per_record(self):
+        service = _make_service(descendants=[GRANDCHILD, CHILD])
+        interceptor = _make_interceptor([
+            _task('1911', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+        result = await _call_delete(self._server(service, interceptor), cascade=True)
+
+        assert result['status'] == 'deleted'
+        # One pre-flight read, then one LIVE read per record on the pass.
+        assert interceptor.get_tasks.await_count == 4
+        service.delete_memory.assert_awaited_once()
