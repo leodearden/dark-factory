@@ -33,6 +33,7 @@ from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.maintenance._utils import maintenance_service
 from fused_memory.middleware.task_curator import (
+    BACKFILL_DEFAULT_CONCURRENCY,
     BackfillResult,
     PruneResult,
     TaskCurator,
@@ -84,12 +85,15 @@ class BackfillManager:
         self.taskmaster = taskmaster
         self.curator = curator
 
-    async def backfill(self, project_root: str) -> BackfillReport:
+    async def backfill(
+        self, project_root: str, *, concurrency: int = BACKFILL_DEFAULT_CONCURRENCY,
+    ) -> BackfillReport:
         """Fetch the full task tree and upsert all tasks into the curator corpus.
 
         Args:
             project_root: Absolute path to the project root (used to derive project_id
                           and to call get_tasks).
+            concurrency: Most embedding calls the curator keeps in flight.
 
         Returns:
             BackfillReport with task counts and outcome.
@@ -107,7 +111,9 @@ class BackfillManager:
             report.tasks_found, project_id,
         )
 
-        result: BackfillResult = await self.curator.backfill_corpus(flat_tasks, project_id)
+        result: BackfillResult = await self.curator.backfill_corpus(
+            flat_tasks, project_id, concurrency=concurrency,
+        )
         report.upserted = result.upserted
         report.skipped = result.skipped
         report.errors = result.errors
@@ -196,6 +202,8 @@ class BackfillManager:
 async def run_backfill(
     config_path: str | None = None,
     project_root: str = '.',
+    *,
+    concurrency: int = BACKFILL_DEFAULT_CONCURRENCY,
 ) -> BackfillResult:
     """Load config, open the task backend, run backfill, and close resources.
 
@@ -209,6 +217,7 @@ async def run_backfill(
         config_path: Optional path to the YAML config file.  When given it is
                      set as CONFIG_PATH before constructing FusedMemoryConfig.
         project_root: Absolute path to the project root directory.
+        concurrency: Most embedding calls the curator keeps in flight.
 
     Returns:
         BackfillResult with upserted, skipped, and errors counts.
@@ -235,7 +244,7 @@ async def run_backfill(
 
         try:
             manager = BackfillManager(config=config, taskmaster=taskmaster, curator=curator)
-            report = await manager.backfill(project_root=project_root)
+            report = await manager.backfill(project_root=project_root, concurrency=concurrency)
         finally:
             await curator.close()
             await taskmaster.close()
