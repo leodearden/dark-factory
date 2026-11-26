@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -19,7 +20,9 @@ from df_pytest_isolation import run_in_new_session
 
 REPO_ROOT = Path(__file__).parents[2]
 WALK = REPO_ROOT / 'scripts' / 'check_review_all_program_fixture.py'
-EXPECTED = ('B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B16')
+EXPECTED = ('B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14', 'B16')
+PROGRAM_DIR = REPO_ROOT / 'skills' / 'review-all' / 'scripts' / 'program'
+IMPORT_ANCHOR = 'from __future__ import annotations\n'
 SCENARIO_LINE = re.compile(r'^(B\d+) (ok|FAIL) ')
 SUMMARY_PREFIX = 'fixture walk: '
 WALK_TIMEOUT_SECS = 240
@@ -91,3 +94,34 @@ def test_the_walk_runs_as_an_executable(tmp_path: Path) -> None:
         [str(WALK), '--help'], cwd=cwd, env=env, capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, _output(proc)
+
+
+def _mirror_with_planted_import(mirror: Path) -> Path:
+    """A checkout mirror whose program scripts are copies, seam_scan.py importing httpx; returns its walk."""
+    program = mirror / 'skills' / 'review-all' / 'scripts' / 'program'
+    shutil.copytree(PROGRAM_DIR, program, ignore=shutil.ignore_patterns('__pycache__'))
+    (mirror / 'scripts').mkdir()
+    walk = Path(shutil.copy2(WALK, mirror / 'scripts' / WALK.name))
+    for linked in ('shared', 'orchestrator', 'skills/spawn'):
+        (mirror / linked).symlink_to(REPO_ROOT / linked)
+    seam_scan = program / 'seam_scan.py'
+    source = seam_scan.read_text(encoding='utf-8')
+    assert IMPORT_ANCHOR in source, f'{seam_scan} has no {IMPORT_ANCHOR!r} to plant after'
+    seam_scan.write_text(source.replace(IMPORT_ANCHOR, IMPORT_ANCHOR + 'import httpx\n', 1), encoding='utf-8')
+    return walk
+
+
+def _lines_of(stdout: str, scenario: str) -> list[str]:
+    return [line for line in stdout.splitlines() if line.startswith(f'{scenario} ')]
+
+
+def test_a_third_party_import_fails_the_walk_at_b14(tmp_path: Path) -> None:
+    walk = _mirror_with_planted_import(tmp_path / 'mirror')
+
+    proc = _walk(walk, tmp_path)
+
+    assert proc.returncode == 1, _output(proc)
+    (b14,) = _lines_of(proc.stdout, 'B14')
+    assert b14.startswith('B14 FAIL ') and 'seam_scan.py' in b14 and 'httpx' in b14, _output(proc)
+    assert _verdicts(proc.stdout)['B2'] == ['FAIL'], _output(proc)
+    assert _verdicts(proc.stdout)['B1'] == ['ok'], _output(proc)
