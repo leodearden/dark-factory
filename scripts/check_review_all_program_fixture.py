@@ -684,6 +684,102 @@ def b8_handoff(walk: Walk) -> str:
     return 'HANDOFF.md carries the four sections, the inherited duties and the remaining work'
 
 
+# gate_check's verdicts over the fixture stores: in store.json human gate 110 misses open high
+# task 106 and carries outsider 201, and depending on 101, 104 and 106 corrects it; in
+# store-final.json task 104 carries S1's prd_path but no x_finding_run.
+GATE, MISSING_HIGH_TASK, FOREIGN_TASK, ESCAPEE = 110, 106, 201, 104
+CORRECTED_GATE_DEPS = [101, 104, 106]
+
+
+def _gate_check(run: ProgramRun) -> Invocation:
+    return run.run('gate_check.py', '--run', RUN_ID)
+
+
+def _names_task(invocation: Invocation, verdict: str, task_id: int) -> bool:
+    return any(re.match(rf'{verdict}: task {task_id}\b', line) for line in invocation.stdout.splitlines())
+
+
+def _both_authored(run: ProgramRun) -> None:
+    run.init()
+    run.applied('S1.author.json', 'S2.author.json')
+
+
+def _expect_interim_gate(walk: Walk) -> None:
+    with walk.own_run('b7-interim', 'store.json') as run:
+        _both_authored(run)
+        defective = expect_exit(_gate_check(run), 1, f'interim gate {GATE} is defective')
+        for verdict, task_id in (('missing dependency', MISSING_HIGH_TASK), ('foreign dependency', FOREIGN_TASK)):
+            expect(_names_task(defective, verdict, task_id), f'gate_check reports {verdict}: task {task_id}', defective)
+        edit_store(run.own_store, {GATE: {'dependencies': CORRECTED_GATE_DEPS}})
+        correct = expect_exit(_gate_check(run), 0, f'gate {GATE} on {CORRECTED_GATE_DEPS} is correct')
+        expect(correct.stdout.splitlines()[-1:] == [f'gate {GATE}: correct'],
+               f"the last line reads 'gate {GATE}: correct'", correct)
+        edit_store(run.own_store, {GATE: None})
+        absent = expect_exit(_gate_check(run), 3, 'with no gate the check reports its own state, apart from defective')
+        expect(f'no human_gate task carries trigger_chain.run_id = {RUN_ID}' in absent.stdout.splitlines(),
+               'gate_check says no human_gate task carries the run', absent)
+
+
+def _expect_final_gate(walk: Walk) -> None:
+    with walk.own_run('b7-final', 'store-final.json') as run:
+        _both_authored(run)
+        defective = expect_exit(_gate_check(run), 1, f'final gate {GATE} over an untagged program task is defective')
+        expect(_names_task(defective, 'escapes the completion measure', ESCAPEE),
+               f'gate_check reports task {ESCAPEE} escaping the completion measure', defective)
+        edit_store(run.own_store, {ESCAPEE: {'metadata': {'x_finding_run': RUN_ID}}})
+        expect_exit(_gate_check(run), 0, f'the final gate is correct once task {ESCAPEE} carries the run')
+
+
+def b7_gate_check(walk: Walk) -> str:
+    _expect_interim_gate(walk)
+    _expect_final_gate(walk)
+    return (f'interim: missing {MISSING_HIGH_TASK} and foreign {FOREIGN_TASK} then correct, no gate exits 3; '
+            f'final: escapee {ESCAPEE} then correct')
+
+
+B11_SERVERS = (
+    ('--no-include-rows', '--drop-unknown-args'),
+    ('--no-include-rows',),
+)
+
+
+def b11_reader_refuses(walk: Walk) -> str:
+    for flags in B11_SERVERS:
+        with walk.own_run('b11-reader', 'store.json', *flags) as run:
+            run.init()
+            refused = expect_exit(_render(run), 2, f'program_doc.py refuses a store served {" ".join(flags)}')
+            expect('include_rows' in refused.stderr, 'the refusal names include_rows', refused)
+            expect(not run.render.exists(), 'a refused render writes nothing', refused)
+    return 'refused, naming include_rows, by both ' + ' and '.join(f'[{" ".join(flags)}]' for flags in B11_SERVERS)
+
+
+UNKNOWN_ACTION = 'A99'
+
+
+def b13_clerk_ingest(walk: Walk) -> str:
+    run = _decomposed_s1(walk.new_run('b13-ingest'))
+    expect_exit(run.run('clerk_batch.py', 'write', '--run', RUN_ID), 0, 'clerk_batch.py write')
+    batch_ids = [action['id'] for action in read_json(run.home / 'actions' / 'batch-1.json')['actions']]
+    expect(len(batch_ids) >= 2, f'batch-1 carries at least two actions, not {batch_ids}')
+    applied, skipped = batch_ids[:2]
+    decompose = fixture_return('S1.decompose.json')
+    dirtied = [decompose['sidecar_path'], decompose['manifest_path']]
+    result = run.home / 'actions' / 'batch-1.result.json'
+    result.write_text(json.dumps({
+        'applied': [applied, UNKNOWN_ACTION], 'skipped': [{'id': skipped, 'why': 'the walk skips it'}],
+        'rejected': [], 'kept_for_human': [], 'dirtied': dirtied,
+    }), encoding='utf-8')
+    before = len(run.ledger())
+    ingested = expect_exit(run.run('clerk_batch.py', 'ingest', result), 1,
+                           f'ingest refuses a result naming unknown {UNKNOWN_ACTION}')
+    recorded = [(line.get('op'), line.get('id'), line.get('state')) for line in run.ledger()[before:]]
+    expect(recorded == [('action_result', applied, 'applied'), ('action_result', skipped, 'skipped')],
+           f'ingest appends exactly {applied} applied and {skipped} skipped, not {recorded}', ingested)
+    expect(UNKNOWN_ACTION in ingested.stderr, f'ingest names {UNKNOWN_ACTION}', ingested)
+    expect(all(path in ingested.stdout for path in dirtied), 'ingest prints both dirtied paths', ingested)
+    return f'{applied} applied, {skipped} skipped, {UNKNOWN_ACTION} refused, dirtied paths printed'
+
+
 def _rule(run: ProgramRun, ruling: str, *extra: str) -> Invocation:
     return run.run(
         'record.py', 'rule', '--run', RUN_ID, '--by', 'human', '--question', 'Does alpha or beta own C1?',
@@ -716,8 +812,11 @@ SCENARIOS = (
     Scenario('B4', 'decompose return applied', b4_decompose_applied),
     Scenario('B5', 'render', b5_render),
     Scenario('B6', 'heading self-check and publish', b6_publish_and_heading_check),
+    Scenario('B7', 'gate check, both forms', b7_gate_check),
     Scenario('B8', 'handoff', b8_handoff),
+    Scenario('B11', 'reader refuses a server that dropped the argument', b11_reader_refuses),
     Scenario('B12', 'rulings', b12_rulings),
+    Scenario('B13', 'clerk ingest', b13_clerk_ingest),
 )
 
 
