@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import os
 import signal
-import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -14,7 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _held_loop_clock import held_loop_clock
-from _script_survivor import SURVIVOR_SCRIPT, kill_survivor, needs_group_pidfd_signals
+from _script_survivor import (
+    SURVIVOR_SCRIPT,
+    await_recorded_pid,
+    kill_survivor,
+    needs_group_pidfd_signals,
+)
 from shared.proc_group import SigkillDispatch
 from shared.process_identity import Liveness, ProcessIdentity, capture, liveness
 
@@ -99,50 +103,7 @@ def _fake_pgid() -> int:
     return candidate
 
 
-def _wait_for_recorded_pid(
-    pidfile: Path, abandon: threading.Event, *, within: float = 30.0,
-) -> int | None:
-    """Block until *pidfile* holds a complete pid line, or return None once *abandon* is set.
-
-    Runs off-loop because the loop clock may be held.
-    """
-    deadline = time.monotonic() + within
-    while not abandon.is_set():
-        try:
-            text = pidfile.read_text()
-        except FileNotFoundError:
-            text = ''
-        if text.endswith('\n'):
-            return int(text)
-        if time.monotonic() >= deadline:
-            raise AssertionError(
-                f'{pidfile} never held a complete pid line within {within}s: '
-                f'the script never recorded its grandchild'
-            )
-        abandon.wait(0.01)
-    return None
-
-
 RunScriptTask = asyncio.Task[tuple[int, str]]
-
-
-async def _await_recorded_pid(pidfile: Path, run: RunScriptTask) -> int:
-    """The pid the script records for its grandchild, or *run*'s own outcome if it ends first."""
-    abandon = threading.Event()
-    pid_wait = asyncio.ensure_future(
-        asyncio.to_thread(_wait_for_recorded_pid, pidfile, abandon),
-    )
-    try:
-        await asyncio.wait({run, pid_wait}, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        abandon.set()
-    pid = await pid_wait
-    if pid is None or run.done():
-        outcome = await run
-        raise AssertionError(
-            f'run_script returned {outcome!r} before the script recorded its grandchild'
-        )
-    return pid
 
 
 async def _tear_down_through_the_budget(run: RunScriptTask, release: Callable[[], None]) -> None:
@@ -174,9 +135,12 @@ def _wait_until_reaped(pid: int, *, within: float = 30.0) -> None:
         time.sleep(0.01)
 
 
-async def _liveness_once_settled(process: ProcessIdentity, *, within: float = 3.0) -> Liveness:
-    """*process*'s liveness once it reads DEAD, or as it reads after *within* seconds."""
-    deadline = time.monotonic() + within
+async def _liveness_once_settled(process: ProcessIdentity) -> Liveness:
+    """*process*'s liveness once it reads DEAD, or as it reads after ``REAP_GRACE_SECS``.
+
+    A SIGKILLed group member gets the reap grace the teardown allows its leader.
+    """
+    deadline = time.monotonic() + REAP_GRACE_SECS
     state = liveness(process)
     while state is not Liveness.DEAD and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
@@ -255,7 +219,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
                 ),
             )
             try:
-                grandchild_pid = await _await_recorded_pid(pidfile, run)
+                grandchild_pid = await await_recorded_pid(pidfile, run)
                 grandchild = capture(grandchild_pid)
                 assert grandchild is not None, (
                     f'the precondition is a live, recorded grandchild when the budget '
@@ -336,6 +300,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         script.write_text(SURVIVOR_SCRIPT)
         script.chmod(0o755)
 
+        survivor: ProcessIdentity | None = None
         try:
             with held_loop_clock() as release:
                 # Hang tripwire, as in the sibling test above.
@@ -353,7 +318,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
                     ),
                 )
                 try:
-                    survivor_pid = await _await_recorded_pid(pidfile, run)
+                    survivor_pid = await await_recorded_pid(pidfile, run)
                     survivor = capture(survivor_pid)
                     script_pid = os.getpgid(survivor_pid)
                     await asyncio.to_thread(_wait_until_reaped, script_pid)
@@ -387,7 +352,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
                 f'already been reaped, must die with the group: {survivor} reads {state}'
             )
         finally:
-            kill_survivor(pidfile)
+            kill_survivor(survivor)
 
     async def test_terminate_process_tree_swallows_process_lookup_error(
         self, tmp_path: Path,

@@ -21,13 +21,14 @@ import pytest
 from _predicate_specimens import POLLUTED_PREDICATE_OUTPUT
 from _script_survivor import (
     SURVIVOR_SCRIPT,
+    await_recorded_pid,
     kill_survivor,
     needs_group_pidfd_signals,
-    read_survivor_pid,
 )
 from df_pytest_isolation import wait_pid_gone
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.process_identity import ProcessIdentity, capture
 
 # The one orchestrator symbol imported at module scope (the rest are imported
 # inside each test, as this file has always done): a `parametrize` decorator is
@@ -3267,6 +3268,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         spawn (task 10370).  So the child holding the pipe open dies, and the
         escalation must report that kill rather than send the operator to
         find a survivor.
+
+        It pins that escalation text end to end, without holding the loop
+        clock until the script is measured reaped.
+        ``test_before_done_script.py::TestBeforeDoneSubprocessTimeoutHardening::test_timeout_of_a_reaped_script_kills_the_child_holding_its_pipe``
+        does hold it, and is the deterministic guard for the reaped-leader
+        shape itself.
         """
         import asyncio
 
@@ -3298,8 +3305,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             script_runner=None,
         )
 
+        survivor: ProcessIdentity | None = None
         try:
-            outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+            run = asyncio.ensure_future(asyncio.wait_for(runner.run(assignment), timeout=20))
+            survivor_pid = await await_recorded_pid(pidfile, run)
+            survivor = capture(survivor_pid)
+            outcome = await run
 
             assert outcome == WorkflowOutcome.BLOCKED
 
@@ -3336,7 +3347,9 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
                 f'fired, so nothing was captured either way: {esc.detail!r}'
             )
 
-            survivor_pid = read_survivor_pid(pidfile)
+            assert survivor is not None, (
+                f'the precondition is child pid {survivor_pid} alive when it was recorded'
+            )
             assert await asyncio.to_thread(wait_pid_gone, survivor_pid, timeout=REAP_GRACE_SECS), (
                 f'THE MEASUREMENT the assertions below are about: survivor pid '
                 f'{survivor_pid}, holding the pipe of a reaped script, must die '
@@ -3367,7 +3380,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             )
             unit_inspector.assert_not_awaited()
         finally:
-            kill_survivor(pidfile)
+            kill_survivor(survivor)
 
     @pytest.mark.parametrize('exit_code', [None, 7], ids=['no_exit_code', 'exited_rc7'])
     @pytest.mark.parametrize(
