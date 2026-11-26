@@ -24,7 +24,6 @@ import random
 import shlex
 import sqlite3
 import statistics
-import subprocess
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -43,7 +42,7 @@ from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots, 
 from shared.routing_split import split_bucket
 from shared.sqlite_readonly import connect_readonly
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
-from systemd_unit_environment import parse_assignments
+from systemd_unit_environment import SystemdUnanswered, UnitNotLoaded, inspect_unit
 
 EXIT_OK = 0  # report printed
 EXIT_AA_SKEWED = 1  # --aa: a headline metric's |diff| exceeds its null p99
@@ -54,10 +53,7 @@ DEFAULT_SEED = 20261103  # seat N's prototype seed
 DEFAULT_RESAMPLES = 4000  # the PRD's A/A null size
 
 FUSED_MEMORY_UNIT = 'fused-memory.service'
-_UNIT_ENVIRONMENT_ARGV = (
-    'systemctl', '--user', 'show', FUSED_MEMORY_UNIT, '-p', 'Environment', '--value',
-)
-_UNIT_READ_TIMEOUT_SECS = 10
+_UNIT_READ_TIMEOUT_SECS = 10.0
 
 
 class RootSource(Enum):
@@ -71,8 +67,21 @@ class RootSource(Enum):
 
 @dataclass(frozen=True)
 class RootSelection:
+    """The roots to read; *unit_problem* says why the unit fallback was tried and not read."""
+
     roots: tuple[Path, ...]
     source: RootSource
+    unit_problem: str | None = None
+
+
+@dataclass(frozen=True)
+class UnitUnread:
+    """The installed fused-memory unit's Environment= could not be read; *reason* says why."""
+
+    reason: str
+
+
+UnitRead = Mapping[str, str] | UnitUnread
 
 
 class KeyKind(Enum):
@@ -107,20 +116,10 @@ def _roots_listed(text: str) -> tuple[Path, ...]:
     return known_project_roots({KNOWN_PROJECT_ROOTS_ENV: text})
 
 
-def _unit_roots(unit_text: str | None) -> tuple[Path, ...]:
-    if not unit_text:
-        return ()
-    try:
-        entries = shlex.split(unit_text)
-    except ValueError:
-        return ()
-    return known_project_roots(parse_assignments(entries))
-
-
 def resolve_roots(
     cli_roots: str | None,
     environ: Mapping[str, str],
-    unit_environment: Callable[[], str | None],
+    unit_environment: Callable[[], UnitRead],
 ) -> RootSelection:
     """The roots to read: --roots, else the environment, else the installed fused-memory unit.
 
@@ -132,25 +131,23 @@ def resolve_roots(
     from_environment = known_project_roots(environ)
     if from_environment:
         return RootSelection(from_environment, RootSource.ENVIRONMENT)
-    from_unit = _unit_roots(unit_environment())
+    unit = unit_environment()
+    if isinstance(unit, UnitUnread):
+        return RootSelection((), RootSource.NONE, unit_problem=unit.reason)
+    from_unit = known_project_roots(unit)
     if from_unit:
         return RootSelection(from_unit, RootSource.UNIT)
     return RootSelection((), RootSource.NONE)
 
 
-def read_fused_memory_unit_environment() -> str | None:
-    """The installed fused-memory unit's Environment= text, or None when systemd does not answer."""
+def read_fused_memory_unit_environment() -> UnitRead:
+    """The installed fused-memory unit's Environment= assignments, as systemd reports them over D-Bus."""
     try:
-        completed = subprocess.run(
-            _UNIT_ENVIRONMENT_ARGV,
-            capture_output=True,
-            text=True,
-            timeout=_UNIT_READ_TIMEOUT_SECS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return completed.stdout if completed.returncode == 0 else None
+        return inspect_unit(FUSED_MEMORY_UNIT, timeout_secs=_UNIT_READ_TIMEOUT_SECS).assignments
+    except SystemdUnanswered as refusal:
+        return UnitUnread(f'{shlex.join(refusal.argv)}: {refusal.detail}')
+    except UnitNotLoaded as refusal:
+        return UnitUnread(str(refusal))
 
 
 # The large-plan rule ids: orchestrator/src/orchestrator/defaults.yaml routing.rules,
@@ -1158,6 +1155,18 @@ def _warn_unread_stores(statuses: Iterable[RootStatus]) -> None:
             )
 
 
+def _no_roots_message(selection: RootSelection) -> str:
+    """Why no root resolved, naming the unit read's failure when that is the reason."""
+    if selection.unit_problem is not None:
+        unit_clause = f'the {FUSED_MEMORY_UNIT} Environment= could not be read: {selection.unit_problem}'
+    else:
+        unit_clause = f'the installed {FUSED_MEMORY_UNIT} Environment= does not set it'
+    return (
+        f'no project root resolved: no --roots, {KNOWN_PROJECT_ROOTS_ENV} names none, and '
+        f'{unit_clause}; pass --roots or set {KNOWN_PROJECT_ROOTS_ENV}'
+    )
+
+
 def _settings(args: argparse.Namespace) -> Settings:
     return Settings(
         window=Window.trailing(args.until or datetime.now(UTC), args.days),
@@ -1176,15 +1185,12 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     environ: Mapping[str, str] = os.environ,
-    unit_environment: Callable[[], str | None] = read_fused_memory_unit_environment,
+    unit_environment: Callable[[], UnitRead] = read_fused_memory_unit_environment,
 ) -> int:
     args = _parser().parse_args(argv)
     selection = resolve_roots(args.roots, environ, unit_environment)
     if not selection.roots:
-        _warn(
-            f'no project root resolved: pass --roots, set {KNOWN_PROJECT_ROOTS_ENV}, or '
-            f'install {FUSED_MEMORY_UNIT} with it in its Environment='
-        )
+        _warn(_no_roots_message(selection))
         return EXIT_NOTHING_READ
     settings = _settings(args)
     load = load_fleet(selection.roots, settings.window, settings.salt, settings.buckets, settings.key)

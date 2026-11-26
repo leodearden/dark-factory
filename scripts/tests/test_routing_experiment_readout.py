@@ -129,8 +129,8 @@ def _unit_must_not_be_read():
     pytest.fail('the fused-memory unit was read although an earlier source named roots')
 
 
-def _no_unit():
-    return None
+def _unit_naming_no_roots():
+    return {}
 
 
 # --- root resolution -------------------------------------------------------
@@ -158,18 +158,30 @@ def test_environment_roots_win_over_the_unit():
 
 def test_roots_fall_back_to_the_installed_fused_memory_unit_environment():
     selection = readout.resolve_roots(
-        None, {}, lambda: 'PATH=/bin DASHBOARD_KNOWN_PROJECT_ROOTS=/a,/b\n'
+        None, {}, lambda: {'PATH': '/bin', 'DASHBOARD_KNOWN_PROJECT_ROOTS': '/a,/b'}
     )
 
     assert selection.roots == (Path('/a'), Path('/b'))
     assert selection.source is readout.RootSource.UNIT
 
 
-@pytest.mark.parametrize('unit_text', [None, '', 'PATH=/bin', 'DASHBOARD_KNOWN_PROJECT_ROOTS='])
-def test_no_source_naming_a_root_resolves_no_roots(unit_text):
-    selection = readout.resolve_roots(None, {}, lambda: unit_text)
+@pytest.mark.parametrize(
+    'unit_assignments', [{}, {'PATH': '/bin'}, {'DASHBOARD_KNOWN_PROJECT_ROOTS': ''}]
+)
+def test_no_source_naming_a_root_resolves_no_roots(unit_assignments):
+    selection = readout.resolve_roots(None, {}, lambda: unit_assignments)
 
     assert selection.roots == ()
+    assert selection.unit_problem is None
+
+
+def test_an_unreadable_unit_resolves_no_roots_and_carries_the_reason():
+    selection = readout.resolve_roots(
+        None, {}, lambda: readout.UnitUnread('busctl: exit 1: Unit not found')
+    )
+
+    assert selection.roots == ()
+    assert selection.unit_problem == 'busctl: exit 1: Unit not found'
 
 
 # --- CLI -------------------------------------------------------------------
@@ -179,13 +191,27 @@ def test_main_with_no_resolvable_root_exits_nothing_read_naming_both_remedies(ca
     status = readout.main(
         ['--salt', 's', '--days', '30', '--until', UNTIL],
         environ={},
-        unit_environment=_no_unit,
+        unit_environment=_unit_naming_no_roots,
     )
 
     assert status == readout.EXIT_NOTHING_READ == 3
     err = capsys.readouterr().err
     assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in err
     assert '--roots' in err
+    assert 'fused-memory.service Environment= does not set it' in err
+
+
+def test_main_with_an_unreadable_unit_exits_nothing_read_naming_the_failure(capsys):
+    status = readout.main(
+        ['--salt', 's', '--until', UNTIL],
+        environ={},
+        unit_environment=lambda: readout.UnitUnread('busctl: exit 1: Connection refused'),
+    )
+
+    assert status == readout.EXIT_NOTHING_READ
+    err = capsys.readouterr().err
+    assert 'could not be read: busctl: exit 1: Connection refused' in err
+    assert 'does not set it' not in err
 
 
 @pytest.mark.parametrize(
@@ -200,7 +226,7 @@ def test_main_with_no_resolvable_root_exits_nothing_read_naming_both_remedies(ca
 )
 def test_invalid_arguments_are_usage_errors(bad_arguments):
     with pytest.raises(SystemExit) as raised:
-        readout.main(['--salt', 's', *bad_arguments], environ={}, unit_environment=_no_unit)
+        readout.main(['--salt', 's', *bad_arguments], environ={}, unit_environment=_unit_naming_no_roots)
 
     assert raised.value.code == 2
 
