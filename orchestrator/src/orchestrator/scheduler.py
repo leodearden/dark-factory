@@ -1150,6 +1150,10 @@ class TickContext:
     ``dropped_at_confirmation`` names the claimed winners this tick's store
     re-read refused (:meth:`Scheduler._confirm_claim`), so a later phase does
     not claim and re-read a row already known to be stale.
+
+    ``tasks_read_at`` is the wall-clock instant just before this tick's
+    ``get_tasks`` read, which the claimant heartbeats in ``tasks`` are judged
+    as of; it is None only for a context no tick read built.
     """
 
     tasks: list[dict]
@@ -1173,6 +1177,7 @@ class TickContext:
     dispatch_deferred_emitted: bool = False
     scope: DispatchScope = DispatchScope.ANY
     dropped_at_confirmation: set[str] = field(default_factory=set)
+    tasks_read_at: datetime | None = None
 
     def tier_of(self, task_id: str, task: dict) -> str:
         """*task_id*'s tier this tick: its effective priority, else its own ``priority`` coerced."""
@@ -3774,7 +3779,7 @@ class Scheduler:
         state = self._watchdog_state
         if not self.config.starvation_watchdog.enabled:
             state.drop_waiting(list(state.waiting()))
-            self._sync_cap_l1(ctx, now)
+            self._sync_cap_l1(ctx)
             return
         free_slots = self.config.starvation_watchdog.auto_pin_max_concurrent - sum(
             1 for row in ctx.overrides.values()
@@ -3799,18 +3804,27 @@ class Scheduler:
                     'Starvation watchdog: live status read failed (%r); delivering '
                     'none of %d finding(s) this tick', err, len(findings),
                 )
-        self._sync_cap_l1(ctx, now)
+        self._sync_cap_l1(ctx)
 
-    def _sync_cap_l1(self, ctx: TickContext, now: datetime) -> None:
+    def _sync_cap_l1(self, ctx: TickContext) -> None:
         """Bring the auto-pin cap L1 in line with the waiting cohort (task 9636).
 
         The L1 is open only while the cohort is non-empty and alarming, and
         names that cohort; a tick with no lock held changes nothing, and
-        ``starvation_cap.py`` holds the rule.  Blockers,
-        in-flight slots and held locks are read here with no await between
-        them, so the report is one snapshot of the lock state after the
-        tick's live status read; each task's blockers are read once per pass.
+        ``starvation_cap.py`` holds the rule.  The task records are the
+        tick's read at ``ctx.tasks_read_at``, and their claimant heartbeats
+        are judged as of that instant
+        (plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 "Cap L1"
+        *Liveness*).  Blockers, in-flight slots and held locks are read here
+        with no await between them, so they are one snapshot of the lock
+        state after the tick's live status read; each task's blockers are
+        read once per pass.
         """
+        if ctx.tasks_read_at is None:
+            raise ValueError(
+                'TickContext.tasks_read_at is unset: the cap L1 judges holder '
+                'heartbeats as of the tick task read'
+            )
         known: dict[str, tuple[Blocker, ...]] = {}
 
         def blockers_of(task_id: str) -> tuple[Blocker, ...]:
@@ -3824,7 +3838,7 @@ class Scheduler:
         world = LockWorld(
             tasks=ctx.tasks_by_id,
             blockers_of=blockers_of,
-            now=now,
+            as_of=ctx.tasks_read_at,
             claimant_ttl=timedelta(seconds=self.config.claimant_liveness_ttl_secs),
             in_flight=frozenset(self._dispatched),
         )
@@ -7860,6 +7874,7 @@ class Scheduler:
         # dispatch attempts and would otherwise emit every idle_poll_secs for as
         # long as the pause lasts.
         tick_started = time.perf_counter()
+        tasks_read_at = self._wall_now()
         tasks = await self.get_tasks(
             statuses=ACTIVE_TASK_STATUSES, distinguish_failure=True,
         )
@@ -7901,6 +7916,7 @@ class Scheduler:
             tasks_by_id=index.tasks_by_id,
             max_id=index.max_id,
             scope=scope,
+            tasks_read_at=tasks_read_at,
         )
 
         # Ordering-as-data (task 2236, W10-β): drive the whole tick from

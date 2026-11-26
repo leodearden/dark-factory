@@ -33,11 +33,14 @@ class HolderState(StrEnum):
 
 @dataclass(frozen=True)
 class LockWorld:
-    """One tick's view: active task records, each task's blockers, and the slots in flight."""
+    """One tick's view: active task records, each task's blockers, and the slots in flight.
+
+    ``as_of`` is the instant ``tasks`` was read, which every claimant heartbeat is judged as of.
+    """
 
     tasks: Mapping[str, Mapping[str, Any]]
     blockers_of: Callable[[str], Sequence[Blocker]]
-    now: datetime
+    as_of: datetime
     claimant_ttl: timedelta
     in_flight: frozenset[str]
 
@@ -83,9 +86,9 @@ def _held_owner_state(
         return HolderState.LOCK_WITHOUT_SLOT
     if record is None or _awaiting_claim_or_release(record):
         return None
-    if is_stranded_blocked(record, world.now, world.claimant_ttl):
+    if is_stranded_blocked(record, world.as_of, world.claimant_ttl):
         return HolderState.BLOCKED
-    if is_stranded_any_status(record, world.now, world.claimant_ttl):
+    if is_stranded_any_status(record, world.as_of, world.claimant_ttl):
         return HolderState.NO_LIVE_CLAIMANT
     return None
 
