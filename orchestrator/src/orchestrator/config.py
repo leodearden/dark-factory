@@ -11,7 +11,7 @@ import re
 import stat
 from dataclasses import dataclass
 from itertools import pairwise
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import UnionType
 from typing import Annotated, Any, Literal, NamedTuple, Union, get_args, get_origin
 
@@ -1686,6 +1686,69 @@ class MergeDeepConfig(BaseModel):
                     f'rows: {unordered!r}'
                 )
         return table
+
+
+class MergeScreenConfig(BaseModel):
+    """The merge pre-verify screen (task 7919, plans/merge-pre-verify-screen-prd.md).
+
+    ``manifest`` is the kill switch: ``None`` (the default) means no screen
+    code runs at any dispatch site. Every bound below fails OPEN: an
+    instrument fault, timeout or unavailable lane lets the item proceed to
+    its ordinary verify. Decisions 3, 4 and 8 of the PRD are the canonical
+    narrative.
+
+    Plain BaseModel (no ``frozen``) so ``_set_leaf`` mutates it in place on
+    hot-reload, as :class:`MergeDeepConfig` does; every leaf is green-tier.
+    """
+
+    manifest: str | None = Field(
+        default=None,
+        description=(
+            'Repo-relative path of the screen manifest, read in the SCREENED '
+            'tree. null is the kill switch: no screen code runs at any site. '
+            'See plans/merge-pre-verify-screen-prd.md decision 3.'
+        ),
+    )
+    timeout_secs: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            'Bound on one whole item screen, base re-runs and lane reset '
+            'included. On overrun the item proceeds (fail open). See '
+            'plans/merge-pre-verify-screen-prd.md decisions 4 and 8.'
+        ),
+    )
+    chain_timeout_secs: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            'Bound on one chain-tip screen. On overrun the chain proceeds '
+            '(fail open). See plans/merge-pre-verify-screen-prd.md decisions 4 and 8.'
+        ),
+    )
+    error_streak_alarm: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Consecutive instrument-error screens that file one info L1 naming '
+            'the kill switch. Errors never block an item. See '
+            'plans/merge-pre-verify-screen-prd.md decision 8.'
+        ),
+    )
+
+    @field_validator('manifest', mode='after')
+    @classmethod
+    def _validate_manifest(cls, manifest: str | None) -> str | None:
+        if manifest is None:
+            return None
+        if not manifest:
+            raise ValueError('manifest must be a repo-relative path or null, not empty')
+        path = PurePosixPath(manifest)
+        if path.is_absolute() or '..' in path.parts:
+            raise ValueError(
+                f'manifest must be repo-relative with no ".." segment; got {manifest!r}'
+            )
+        return manifest
 
 
 class RetentionConfig(BaseModel):
@@ -5799,6 +5862,10 @@ class OrchestratorConfig(BaseSettings):
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
 
+    # The merge pre-verify screen (task 7919). manifest null is its kill switch;
+    # the defaults live in MergeScreenConfig only, not in defaults.yaml.
+    merge_screen: MergeScreenConfig = Field(default_factory=MergeScreenConfig)
+
     # The merge pool's order, promotion period and bounce cap (task 9933,
     # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
     merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
@@ -7051,6 +7118,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # separate RELOADABLE_FIELDS edit, so chains can be turned on, retuned or
     # killed (chain_cap -> 0) without a restart. See MergeDeepConfig.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # The merge screen (task 7919): read per screen, so its kill switch applies live.
+    _submodel_leaf_paths('merge_screen', MergeScreenConfig),
     # The merge pool's knobs (task 9933): every leaf hot, as merge_deep's are.
     _submodel_leaf_paths('merge_pool', MergePoolConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
