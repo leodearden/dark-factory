@@ -29,7 +29,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.config_models import UsageCapConfig
-from test_harness_park_stop import _cost_store_factory  # noqa: F401 -- reused cross-module fixture
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig

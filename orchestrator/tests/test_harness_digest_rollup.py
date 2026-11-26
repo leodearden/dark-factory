@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 from test_digest import _insert_invocation, _insert_task_result
 from test_harness_park_stop import (
-    _cost_store_factory,  # noqa: F401 -- reused cross-module fixture
     _make_harness_with_mocks,
 )
 
