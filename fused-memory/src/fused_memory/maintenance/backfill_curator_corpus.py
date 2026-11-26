@@ -7,7 +7,8 @@ projects — making the curator blind to all pre-existing work.
 
 This script fetches the full task tree from the SQLite task backend,
 flattens it, and calls ``TaskCurator.backfill_corpus()`` to populate the
-collection in one pass.
+collection. The corpus is upserted in bounded batches, so a batch Qdrant
+refuses is reported in ``errors`` rather than aborting the project.
 
 The operation is idempotent: re-running just re-upserts the same deterministic
 point IDs, leaving nothing duplicated.
@@ -21,9 +22,14 @@ Usage::
     uv run python -m fused_memory.maintenance.backfill_curator_corpus \\
         --config /path/to/config.yaml \\
         --project-root /path/to/project
+
+    # At most 4 embedding calls in flight (default 10):
+    uv run python -m fused_memory.maintenance.backfill_curator_corpus \\
+        --project-root /path/to/project --concurrency 4
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -42,6 +48,8 @@ from fused_memory.middleware.task_curator import (
 from fused_memory.models.scope import resolve_project_id
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 logger = logging.getLogger(__name__)
@@ -296,11 +304,19 @@ async def run_prune(
         return report
 
 
-if __name__ == '__main__':
-    import argparse
+def _positive_int(text: str) -> int:
+    """argparse type for an integer of at least 1."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected an integer >= 1, got {text!r}') from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f'expected an integer >= 1, got {value}')
+    return value
 
-    logging.basicConfig(level=logging.INFO)
 
+def build_parser() -> argparse.ArgumentParser:
+    """The command-line parser for the backfill and prune entrypoints."""
     parser = argparse.ArgumentParser(
         description='Backfill the task_curator Qdrant corpus from the full task tree.',
     )
@@ -322,8 +338,22 @@ if __name__ == '__main__':
             'instead of the default backfill.'
         ),
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        '--concurrency',
+        type=_positive_int,
+        default=BACKFILL_DEFAULT_CONCURRENCY,
+        metavar='N',
+        help=(
+            'Most embedding calls the backfill keeps in flight '
+            f'(default {BACKFILL_DEFAULT_CONCURRENCY}). Ignored with --prune.'
+        ),
+    )
+    return parser
 
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Parse *argv* (default ``sys.argv[1:]``), run the backfill or the prune, print a summary."""
+    args = build_parser().parse_args(argv)
     if args.prune:
         prune_report = asyncio.run(
             run_prune(config_path=args.config, project_root=args.project_root)
@@ -333,8 +363,17 @@ if __name__ == '__main__':
             f'skipped={prune_report.skipped} reason={prune_report.reason!r}'
         )
     else:
-        result = asyncio.run(run_backfill(config_path=args.config, project_root=args.project_root))
+        result = asyncio.run(run_backfill(
+            config_path=args.config,
+            project_root=args.project_root,
+            concurrency=args.concurrency,
+        ))
         print(
             f'Backfill complete: upserted={result.upserted} skipped={result.skipped} '
             f'errors={result.errors}'
         )
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    main()
