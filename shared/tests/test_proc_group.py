@@ -1605,15 +1605,32 @@ class TestScanProcessGroupsUnderPath:
                 _kill_group(pgid)
 
     def test_scan_never_raises_on_real_proc(self, tmp_path):
-        """Scanning the real /proc never raises and returns a set.
+        """A whole-host walk swallows every per-pid failure and still finds its child.
 
         On a non-root runner, ``/proc/1/cwd`` (and other root-owned pids) raise
-        PermissionError, and pids vanish mid-walk (ProcessLookupError); the scan
-        must swallow both.  A fresh, never-created root matches nothing.
+        PermissionError, and pids vanish mid-walk (ProcessLookupError). The
+        public wrapper launders any raise into an empty set, so the witness is
+        a positive find: one sleeper whose cwd is a fresh root, picked out of
+        every pid on the host.
         """
-        result = scan_process_groups_under_path(tmp_path / 'never-created')
-        assert isinstance(result, set)
-        assert result == set()
+        root = tmp_path.resolve() / '_merge-verify'
+        root.mkdir()
+        with subprocess.Popen(
+            ['sleep', str(WHOLE_TREE_SCAN_TEST_TIMEOUT)],
+            cwd=root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as sleeper:
+            try:
+                found = scan_process_groups_under_path(root)
+                assert found == {sleeper.pid}, (
+                    f'expected exactly the sleeper {sleeper.pid} (cwd {root}); '
+                    f'got {found}. An empty set means a per-pid error escaped '
+                    f'the walk and the wrapper laundered it'
+                )
+            finally:
+                _kill_group(sleeper.pid)
 
 
 class TestScanProcessGroupsAgainstASyntheticProc:
