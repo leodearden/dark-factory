@@ -31,6 +31,8 @@ GUARDED_READS = (
 )
 # The writes the same §6.3 guards.
 GUARDED_WRITES = ('escalate_info', 'escalate_blocker')
+# The record transitions the §6.3 amendment of task 11553 guards.
+GUARDED_RESOLVES = ('resolve_issue',)
 
 
 def storm_records(queue: EscalationQueue) -> list[Escalation]:

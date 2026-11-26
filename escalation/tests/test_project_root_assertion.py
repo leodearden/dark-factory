@@ -28,7 +28,8 @@ from escalation.store_identity import StoreIdentity
 
 READS = stores.GUARDED_READS
 WRITES = stores.GUARDED_WRITES
-TOOLS = READS + WRITES
+RESOLVES = stores.GUARDED_RESOLVES
+TOOLS = READS + WRITES + RESOLVES
 FILED_TASK = '77'
 _FILING = {
     'task_id': FILED_TASK,
@@ -36,6 +37,12 @@ _FILING = {
     'category': 'design_concern',
     'summary': 's',
 }
+
+
+def status_of(queue: EscalationQueue, escalation_id: str) -> str:
+    record = queue.get(escalation_id)
+    assert record is not None, escalation_id
+    return record.status
 
 
 async def assert_refused(
@@ -75,6 +82,9 @@ def kwargs_for(seeded_id: str) -> Callable[[str], dict[str, Any]]:
         'get_task_escalations': {'task_id': '42'},
         'escalate_info': dict(_FILING),
         'escalate_blocker': dict(_FILING),
+        'resolve_issue': {
+            'escalation_id': seeded_id, 'resolution': 'closed', 'action': 'close_only',
+        },
     }
     return lambda name: dict(table[name])
 
@@ -134,6 +144,7 @@ class TestProjectStoreMismatch:
         assert str(proj) in result['error']
         assert seeded_id not in json.dumps(result)
         assert queue.get_by_task(FILED_TASK) == []
+        assert status_of(queue, seeded_id) == 'pending'
 
 
 class TestProjectStoreMatch:
@@ -166,6 +177,25 @@ class TestProjectStoreMatch:
             result = await call_tool(project_server, name, **kwargs_for(name), project_root=spelling)
             assert result['status'] == 'queued', spelling
             assert queue.get(result['id']) is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('name', RESOLVES)
+    async def test_matching_resolve_closes_the_record(
+        self,
+        name: str,
+        project_server: FastMCP,
+        queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        matching_spellings: list[str],
+    ) -> None:
+        for spelling in matching_spellings:
+            fresh = _file(queue, '42')
+            result = await call_tool(
+                project_server, name, **kwargs_for(name) | {'escalation_id': fresh.id},
+                project_root=spelling,
+            )
+            assert 'error' not in result, spelling
+            assert status_of(queue, fresh.id) == 'dismissed', spelling
 
 
 class TestReconciliationStore:
@@ -219,6 +249,22 @@ class TestIdentitylessServer:
         assert result['status'] == 'queued'
         assert queue.get(result['id']) is not None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('name', RESOLVES)
+    async def test_any_assertion_resolves(
+        self,
+        name: str,
+        bare_server: FastMCP,
+        queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        seeded_id: str,
+        other: Path,
+    ) -> None:
+        result = await call_tool(bare_server, name, **kwargs_for(name), project_root=str(other))
+
+        assert 'error' not in result
+        assert status_of(queue, seeded_id) == 'dismissed'
+
 
 class TestOmittedAssertionIsUnchanged:
     @pytest.mark.asyncio
@@ -245,6 +291,21 @@ class TestOmittedAssertionIsUnchanged:
         assert await call_tool(project_server, name, **kwargs_for(name), project_root='') == await call_tool(
             project_server, name, **kwargs_for(name)
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('name', RESOLVES)
+    async def test_empty_assertion_resolves(
+        self,
+        name: str,
+        project_server: FastMCP,
+        queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        seeded_id: str,
+    ) -> None:
+        result = await call_tool(project_server, name, **kwargs_for(name), project_root='')
+
+        assert 'error' not in result
+        assert status_of(queue, seeded_id) == 'dismissed'
 
 
 class TestWireShape:
@@ -286,6 +347,22 @@ class TestWireShape:
 
         assert 'reconciliation store' in result.data['error']
 
+    @pytest.mark.asyncio
+    async def test_matching_resolve_is_accepted_over_the_wire(
+        self, project_server: FastMCP, queue: EscalationQueue, seeded_id: str, proj: Path,
+    ) -> None:
+        async with Client(project_server) as client:
+            result = await client.call_tool(
+                'resolve_issue',
+                {
+                    'escalation_id': seeded_id, 'resolution': 'r', 'action': 'close_only',
+                    'project_root': str(proj),
+                },
+            )
+
+        assert 'error' not in result.data
+        assert status_of(queue, seeded_id) == 'dismissed'
+
 
 class TestMismatchStormEscape:
     @pytest.mark.asyncio
@@ -322,17 +399,19 @@ class TestMismatchStormEscape:
         assert records[0].dedupe_count == 0
 
     @pytest.mark.asyncio
-    async def test_archive_inclusive_read_alone_feeds_the_streak(
+    @pytest.mark.parametrize('name', ('get_task_escalations', 'resolve_issue'))
+    async def test_one_tool_alone_feeds_the_streak(
         self,
+        name: str,
         project_server: FastMCP,
         queue: EscalationQueue,
         kwargs_for: Callable[[str], dict[str, Any]],
         other: Path,
     ) -> None:
-        await assert_refused(project_server, kwargs_for, str(other), ['get_task_escalations'] * 4)
+        await assert_refused(project_server, kwargs_for, str(other), [name] * 4)
         assert storm_records(queue) == []
 
-        await assert_refused(project_server, kwargs_for, str(other), ['get_task_escalations'])
+        await assert_refused(project_server, kwargs_for, str(other), [name])
         records = storm_records(queue)
         assert len(records) == 1
         assert str(other) in records[0].summary

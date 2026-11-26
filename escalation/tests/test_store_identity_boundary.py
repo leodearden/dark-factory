@@ -29,7 +29,7 @@ from escalation.store_identity import StoreIdentity
 TASK = '5534'
 READS = stores.GUARDED_READS
 WRITES = stores.GUARDED_WRITES
-GUARDED = READS + WRITES
+GUARDED = READS + WRITES + stores.GUARDED_RESOLVES
 _FILING = {
     'task_id': TASK,
     'agent_role': 'implementer',
@@ -46,6 +46,7 @@ def arguments(name: str, escalation_id: str) -> dict[str, Any]:
         'get_task_escalations': {'task_id': TASK},
         'escalate_info': _FILING,
         'escalate_blocker': _FILING,
+        'resolve_issue': {'escalation_id': escalation_id, 'resolution': 'r', 'action': 'close_only'},
     }
     return dict(table[name])
 
