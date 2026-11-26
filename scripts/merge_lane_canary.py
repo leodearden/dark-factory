@@ -115,7 +115,19 @@ class Predicate:
 
     @property
     def rendered_value(self) -> str:
-        return 'not measured' if self.value is None else f'{self.value:.4g}'
+        return 'not measured' if self.value is None else render_number(self.value)
+
+    @property
+    def rendered_limit(self) -> str:
+        return f'{_COMPARISON_SYMBOLS[self.comparison]} {render_number(self.limit)}'
+
+
+_COMPARISON_SYMBOLS = {Comparison.LT: '<', Comparison.LE: '<=', Comparison.EQ0: '='}
+
+
+def render_number(value: float) -> str:
+    """An integral value without a fraction, any other with four significant digits."""
+    return str(int(value)) if float(value).is_integer() else f'{value:.4g}'
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +791,7 @@ class SweepVerdict:
     sha12: str
     passed: bool
     filed: bool | None
+    category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -860,6 +873,7 @@ class TaskVerifyStart:
 @dataclass(frozen=True)
 class StartedOnRed:
     started: int
+    total: int
     share: float | None
     failed: int
 
@@ -876,7 +890,9 @@ def _on_red(moment: datetime, episodes: Sequence[RedEpisode]) -> bool:
 
 def _started_on_red(starts: Sequence[tuple[datetime, bool]], episodes: Sequence[RedEpisode]) -> StartedOnRed:
     on_red = [failed for moment, failed in starts if _on_red(moment, episodes)]
-    return StartedOnRed(started=len(on_red), share=_share(len(on_red), len(starts)), failed=sum(on_red))
+    return StartedOnRed(
+        started=len(on_red), total=len(starts), share=_share(len(on_red), len(starts)), failed=sum(on_red),
+    )
 
 
 def verifies_started_on_red(
@@ -960,7 +976,7 @@ D12_ROWS: tuple[D12Row, ...] = (
         'verdict_voided rows / landings', '0.78',
     ),
     D12Row(
-        'p_gate_after_gate', 'P(gate | previous landing gated)', 0.3, Comparison.LT,
+        'p_gate_after_gate', 'P(gate after a gated landing)', 0.3, Comparison.LT,
         'consecutive landings in time order; a landing is gated iff a reverify=true gate row for its '
         "task is stamped after the task's last merge_queued and at or before the landing",
         '0.79',
