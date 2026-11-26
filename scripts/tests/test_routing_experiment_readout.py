@@ -6,7 +6,10 @@ They never read the live ledgers. To run just this suite:
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
+import json
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -446,3 +449,216 @@ def test_main_names_each_skipped_root_and_its_reason_on_the_rule_line(
 def test_main_over_only_unreadable_roots_exits_nothing_read(unreadable_roots, capsys):
     assert _run_main(unreadable_roots) == readout.EXIT_NOTHING_READ
     assert 'no runs.db was readable' in capsys.readouterr().err
+
+
+# --- per-arm comparison and its A/A null ----------------------------------
+
+_BASE_RECORD = readout.TaskRecord(
+    project='proj-a',
+    task_id='0',
+    key='0',
+    bucket=0,
+    implementer_models=frozenset(),
+    plan_steps=None,
+    plan_modules=None,
+    large_plan_rule_fired=False,
+    complexity=None,
+    curator_complexity_hint=None,
+    final_outcome='done',
+    blocked_or_escalated=False,
+    max_review_cycles=0,
+    max_execute_iterations=0,
+    cost_usd=0.0,
+    workflow_verify_minutes=0.0,
+    merge_verify_minutes=0.0,
+    reviewer_blocking_count=0.0,
+)
+
+
+def _arm_records(arm_values):
+    """Records from {bucket: [overrides, ...]}, task ids numbered across arms."""
+    records = []
+    for bucket, overrides in arm_values.items():
+        for override in overrides:
+            task_id = str(len(records) + 1)
+            records.append(
+                dataclasses.replace(_BASE_RECORD, task_id=task_id, key=task_id, bucket=bucket,
+                                    **override)
+            )
+    return records
+
+
+def _compare(records, *, buckets=2, resamples=400, seed=readout.DEFAULT_SEED):
+    return readout.compare_arms(
+        records, readout.METRICS, buckets, resamples, random.Random(seed)
+    )
+
+
+def _row(comparison, name):
+    (row,) = [row for row in comparison.rows if row.metric == name]
+    return row
+
+
+def test_a_hand_checkable_fixture_gives_arm_means_and_their_absolute_difference():
+    records = _arm_records({
+        0: [{'cost_usd': cost, 'blocked_or_escalated': cost <= 2} for cost in (1.0, 2.0, 3.0, 4.0)],
+        1: [{'cost_usd': cost} for cost in (2.0, 3.0, 4.0, 5.0)],
+    })
+
+    (comparison,) = _compare(records)
+
+    assert comparison.arm == 1
+    cost = _row(comparison, 'cost_usd')
+    assert (cost.base_n, cost.arm_n) == (4, 4)
+    assert (cost.base_mean, cost.arm_mean, cost.diff) == (2.5, 3.5, 1.0)
+    blocked = _row(comparison, 'blocked_or_escalated')
+    assert (blocked.base_mean, blocked.arm_mean, blocked.diff) == (0.5, 0.0, -0.5)
+
+
+def test_one_comparison_per_treated_arm_against_arm_zero():
+    records = _arm_records({0: [{}], 1: [{}], 2: [{}]})
+
+    assert [comparison.arm for comparison in _compare(records, buckets=3)] == [1, 2]
+
+
+def test_a_column_with_no_spread_has_a_zero_null_band():
+    records = _arm_records({0: [{'cost_usd': 7.0}] * 25, 1: [{'cost_usd': 7.0}] * 25})
+
+    (comparison,) = _compare(records)
+
+    assert _row(comparison, 'cost_usd').null == readout.NullBand(p95=0.0, p99=0.0, mde=0.0)
+
+
+def _balanced_overrides(n_per_arm):
+    return [
+        {
+            'cost_usd': float(i),
+            'workflow_verify_minutes': float(i % 7),
+            'blocked_or_escalated': i % 4 == 0,
+            'max_review_cycles': i % 2,
+        }
+        for i in range(n_per_arm)
+    ]
+
+
+def test_a_balanced_by_construction_split_has_zero_difference_inside_a_nonzero_null():
+    overrides = _balanced_overrides(25)
+    records = _arm_records({0: overrides, 1: overrides})
+
+    (comparison,) = _compare(records)
+
+    cost = _row(comparison, 'cost_usd')
+    assert cost.diff == 0.0
+    assert cost.null is not None
+    assert cost.null.p99 > 0.0
+    assert cost.null.p95 <= cost.null.p99
+    assert cost.null.mde > 0.0
+
+
+def test_means_count_only_eligible_tasks_and_a_thin_metric_gets_no_null():
+    overrides = _balanced_overrides(25)
+    thin_arm = [
+        {**override, 'workflow_verify_minutes': None if i >= 10 else 2.0}
+        for i, override in enumerate(overrides)
+    ]
+    records = _arm_records({0: overrides, 1: thin_arm})
+
+    (comparison,) = _compare(records)
+
+    verify = _row(comparison, 'workflow_verify_minutes')
+    assert (verify.base_n, verify.arm_n, verify.arm_mean) == (25, 10, 2.0)
+    assert readout.MIN_ELIGIBLE_PER_ARM == 20
+    assert verify.null is None
+    assert _row(comparison, 'cost_usd').null is not None
+
+
+def test_the_same_records_and_seed_give_identical_comparisons():
+    overrides = _balanced_overrides(25)
+    records = _arm_records({0: overrides, 1: list(reversed(overrides))})
+
+    assert _compare(records, seed=7) == _compare(records, seed=7)
+
+
+def _balanced_fleet_specs(n_per_arm=25, *, salt=SALT):
+    """Tasks split by the real split_bucket; the i-th task of each arm carries identical values."""
+    arms = {0: [], 1: []}
+    task_id = 0
+    while min(len(ids) for ids in arms.values()) < n_per_arm:
+        task_id += 1
+        bucket = split_bucket(salt, str(task_id), 2)
+        if len(arms[bucket]) < n_per_arm:
+            arms[bucket].append(task_id)
+    return [
+        TaskSpec(
+            task_id,
+            results=(
+                ResultRow('blocked' if i % 4 == 0 else 'done', review_cycles=i % 2,
+                          execute_iterations=i % 3),
+            ),
+            invocations=(Invocation('implementer', 'sonnet', float(i)),),
+            events=(
+                Event('workflow_verify', {'duration_ms': 60_000 * (i % 7)}),
+                Event('merge_verify', {'duration_ms': 30_000 * (i % 5)}),
+                Event('review_completed', {'blocking_count': i % 2}),
+            ),
+        )
+        for ids in arms.values()
+        for i, task_id in enumerate(ids)
+    ]
+
+
+@pytest.fixture
+def balanced_root(fleet_root):
+    return fleet_root('proj-a', _balanced_fleet_specs())
+
+
+def test_main_prints_the_rule_producers_arm_sizes_and_one_row_per_metric(
+    balanced_root, capsys,
+):
+    assert _run_main([balanced_root], '--resamples', '400') == readout.EXIT_OK
+
+    out = capsys.readouterr().out
+    rule = _rule_line(out)
+    for fragment in (
+        '[2026-10-21T00:00:00+00:00, 2026-11-20T00:00:00+00:00)',
+        'population = the 50 tasks',
+        'read proj-a',
+        'key task_id',
+        f"salt '{SALT}' buckets 2",
+        'subset all',
+        '400 permutations',
+        f'seed {readout.DEFAULT_SEED}',
+    ):
+        assert fragment in rule
+    lines = out.splitlines()
+    assert any(line.startswith('producers:') for line in lines)
+    assert 'arm 0: 25 tasks; arm 1: 25 tasks' in out
+    (header,) = [line for line in lines if 'mean0' in line]
+    assert header.split()[1:9] == ['n0', 'n1', 'mean0', 'mean1', 'diff', 'null_p95', 'null_p99',
+                                  'mde']
+    for metric in readout.METRICS:
+        (row,) = [line for line in lines if line.split()[:2] in (['*', metric.name],
+                                                                  ['-', metric.name])]
+        assert row.split()[0] == ('*' if metric.headline else '-')
+
+
+def test_two_runs_with_one_seed_print_byte_identical_output(balanced_root, capsys):
+    _run_main([balanced_root], '--resamples', '400')
+    first = capsys.readouterr().out
+    _run_main([balanced_root], '--resamples', '400')
+
+    assert capsys.readouterr().out == first
+
+
+def test_json_carries_the_per_task_records_and_the_same_comparisons(balanced_root, capsys):
+    assert _run_main([balanced_root], '--resamples', '400', '--json') == readout.EXIT_OK
+
+    report = json.loads(capsys.readouterr().out)
+    load = _load([balanced_root])
+    expected = _compare(load.records, resamples=400)
+    assert sorted(task['task_id'] for task in report['tasks']) == sorted(
+        record.task_id for record in load.records
+    )
+    assert report['comparisons'] == json.loads(
+        json.dumps([dataclasses.asdict(comparison) for comparison in expected])
+    )
