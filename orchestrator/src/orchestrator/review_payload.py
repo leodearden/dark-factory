@@ -254,14 +254,19 @@ def _verdict(payload: Mapping[str, Any]) -> Verdict:
         ) from None
 
 
-def _with_kind_reading(issue: dict[str, Any]) -> dict[str, Any]:
-    """A copy of *issue* recording ``kind_flag`` when its kind reads fail-closed as ``defect``.
+KIND_FLAG_KEY = 'kind_flag'
 
-    The written ``kind`` stays as received, so every later ``issue_kind_of`` reader
-    flags the same issue the same way.
+
+def _with_kind_reading(issue: dict[str, Any]) -> dict[str, Any]:
+    """A copy of *issue* whose ``KIND_FLAG_KEY`` is this normaliser's own reading of its kind.
+
+    The key is present only when the kind reads fail-closed as ``defect``; a value the
+    issue arrived with is dropped. The written ``kind`` stays as received, so every
+    later ``issue_kind_of`` reader flags the same issue the same way.
     """
+    copy = {key: value for key, value in issue.items() if key != KIND_FLAG_KEY}
     reading = issue_kind_of(issue)
-    return {**issue, 'kind_flag': reading.flag.value} if reading.flag else dict(issue)
+    return {**copy, KIND_FLAG_KEY: reading.flag.value} if reading.flag else copy
 
 
 def _issues(payload: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
