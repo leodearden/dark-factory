@@ -64,10 +64,10 @@ def _marked_module(marks: _Marks) -> str:
     return f'src/{marks.shown}.py'
 
 
-def _git_history(root: Path, marks: _Marks, hostile_link_to: Path | None) -> str:
+def _git_history(root: Path, marks: _Marks, hostile_entries_linking_to: Path | None) -> str:
     """main holding the PRD, the criteria, src/ and tests/, and `Merge task/7 into main`; the merge sha.
 
-    With `hostile_link_to`, main also tracks a symlink to it and the work tree holds an untracked file.
+    With `hostile_entries_linking_to`, main also tracks a symlink to it and the work tree holds an untracked file.
     """
     prd_path = _prd_path(marks)
     repo = make_repo(root)
@@ -85,8 +85,8 @@ def _git_history(root: Path, marks: _Marks, hostile_link_to: Path | None) -> str
     }))
     repo.write(REVEALED_PATH, _APP_TEXT)
     repo.write('tests/test_app.py', f'def test_{marks.shown.replace("-", "_")}():\n    pass\n')
-    if hostile_link_to is not None:
-        repo.symlink(TRACKED_SYMLINK, str(hostile_link_to))
+    if hostile_entries_linking_to is not None:
+        repo.symlink(TRACKED_SYMLINK, str(hostile_entries_linking_to))
     repo.commit('Initial', when=_at(-60))
     repo.branch('task/7')
     repo.checkout('task/7')
@@ -94,7 +94,7 @@ def _git_history(root: Path, marks: _Marks, hostile_link_to: Path | None) -> str
     repo.commit(f'Add the {marks.shown} module', when=_at(-30))
     repo.checkout('main')
     merge = repo.merge_no_ff('task/7', 'Merge task/7 into main', when=_at(18))
-    if hostile_link_to is not None:
+    if hostile_entries_linking_to is not None:
         repo.write(UNTRACKED, f'SECRET = {marks.hidden!r}\n')
     return merge
 
@@ -133,12 +133,12 @@ def _runs(root: Path, merge: str, marks: _Marks) -> None:
     )
 
 
-def _project(tmp_path: Path, marks: _Marks, *, hostile_link_to: Path | None = None) -> Project:
+def _project(tmp_path: Path, marks: _Marks, *, hostile_entries_linking_to: Path | None = None) -> Project:
     root = _root(tmp_path, marks)
     out_dir, in_dir = tmp_path / f'{marks.name}-out', tmp_path / f'{marks.name}-in'
     policy = tmp_path / f'{marks.name}.yaml'
     project_id = f'project-{marks.name}'
-    merge = _git_history(root, marks, hostile_link_to)
+    merge = _git_history(root, marks, hostile_entries_linking_to)
     _tasks(root, marks)
     _runs(root, merge, marks)
     EscalationQueueDir.create(root).write(
@@ -156,7 +156,7 @@ def _project(tmp_path: Path, marks: _Marks, *, hostile_link_to: Path | None = No
         'visible_globs': ['src/**', 'tests/**'],
         'reveal_proportion': 1.0,
     }))
-    hostile = hostile_link_to is not None
+    hostile = hostile_entries_linking_to is not None
     return Project(
         root=root, out_dir=out_dir, in_dir=in_dir, policy=policy,
         tracked_symlink=TRACKED_SYMLINK if hostile else None, untracked=UNTRACKED if hostile else None,
@@ -173,7 +173,7 @@ def build_two_projects(tmp_path: Path) -> TwoProjects:
     b_marks = _Marks(name='b', hidden=canary_b, shown=canary_b)
     b_canary_module = _root(tmp_path, b_marks) / _marked_module(b_marks)
     a = _project(
-        tmp_path, _Marks(name='a', hidden=CANARY_A_DESC, shown='alpha'), hostile_link_to=b_canary_module
+        tmp_path, _Marks(name='a', hidden=CANARY_A_DESC, shown='alpha'), hostile_entries_linking_to=b_canary_module
     )
     b = _project(tmp_path, b_marks)
     return TwoProjects(a=a, b=b, canary_b=canary_b)
