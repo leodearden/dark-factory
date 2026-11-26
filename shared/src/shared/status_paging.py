@@ -133,15 +133,20 @@ async def walk_status_pages(
     propagates the same way.  A short map is indistinguishable from a full
     one once it has been returned, so a partial map is never returned.
 
-    There is no changed-``total`` coherence check, because this walk stops on
-    the SERVER's ``has_more``, computed against the population at the instant
-    of each page, not on a client-side ``offset >= total`` comparison that a
-    shrinking total would silently satisfy early.
+    ONE POPULATION, OR REFUSE.  Offsets tile one population.  A delete below
+    the current offset shifts every later slice down, so a live entry is
+    never served; an insert there is never served itself.  Each later page
+    is honest about its own window, and its ``has_more`` still ends the walk
+    normally.  So every page after the first must report the first page's
+    ``total``.  The cost is a refusal when an entry is merely appended
+    mid-walk.  The accepted residual is a delete and an insert between the
+    same two pages: the ``total`` does not move, so the shift goes unseen.
     """
     merged: dict[K, str] = {}
     offset = 0
     pages = 0
     page_budget: int | None = None
+    walk_total: int | None = None
     while True:
         page = await page_fn(offset)
         merged.update(page.statuses)
@@ -174,6 +179,11 @@ async def walk_status_pages(
                 f'offset {offset}: server claims returned={returned} but sent '
                 f'{page.delivered} status(es)'
             )
+        if walk_total is not None and total != walk_total:
+            raise StatusPagingError(
+                f'get_statuses population for {label} changed mid-walk at '
+                f'offset {offset}: total was {walk_total}, now {total!r}'
+            )
         if not has_more:
             break
         if returned <= 0:
@@ -195,6 +205,7 @@ async def walk_status_pages(
                     f'get_statuses pagination for {label} reports no usable '
                     f'total at offset {offset}: total={total!r}'
                 )
+            walk_total = total
             page_budget = math.ceil(total / returned) + 2
         if pages >= page_budget:
             raise StatusPagingError(

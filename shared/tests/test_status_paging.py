@@ -204,6 +204,30 @@ class TestAnInconsistentPageIsRefused:
         assert 'cannot advance' in str(error)
 
 
+class TestAPopulationThatChangesMidWalkIsRefused:
+    @pytest.mark.parametrize('changed', [
+        pytest.param({tid: s for tid, s in _population(10).items() if tid != '1'},
+                     id='a-delete-below-the-offset-skips-a-live-entry'),
+        pytest.param({'0': 'pending', **_population(10)},
+                     id='an-insert-below-the-offset-is-never-served'),
+    ])
+    async def test_a_total_that_moves_between_pages_is_refused(self, changed):
+        """Offset paging tiles ONE population; a shifted one tiles with a gap no page reports.
+
+        Page one serves ids 1-3 of ten.  Delete id 1 and the slice at offset 3
+        starts at id 5, so live id 4 is never served; insert id 0 and it is
+        never served either.  Every later page is honest about its own window.
+        """
+        before = _PagedServer(_population(10), requested=3)
+        after = _PagedServer(changed, requested=3)
+
+        async def _changed_after_the_first_page(offset: int) -> StatusPage[str]:
+            return await (before if offset == 0 else after)(offset)
+
+        error = await _refusal(_changed_after_the_first_page)
+        assert 'changed mid-walk' in str(error)
+
+
 class TestAWalkIsBounded:
     async def test_a_server_that_never_lowers_has_more_is_cut_off_at_its_budget(self):
         """The budget is ``ceil(total / first returned) + 2`` pages, from the SERVED rate."""
