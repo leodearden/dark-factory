@@ -48,6 +48,7 @@ def _deployed_project_root() -> str:
 def _deployed_curator(monkeypatch: pytest.MonkeyPatch) -> tuple[TaskCurator, Path]:
     monkeypatch.setenv('PROJECT_ROOT', _deployed_project_root())
     config = FusedMemoryConfig()
+    assert config.taskmaster is not None, 'the shipped config.yaml must carry a taskmaster section'
     # Mirrors fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._get_curator.
     cwd = Path(config.taskmaster.project_root)
     curator = TaskCurator(
