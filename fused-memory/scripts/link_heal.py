@@ -32,8 +32,10 @@ Usage:
         A run with no heal still applied (a plan run, an undo run, an apply run
         already undone) is refused.
     status [--limit N]
-        List recent runs, and the latest plan of each source with its document,
-        sha and whether it is still the pending plan. Never creates the ledger.
+        List recent runs, each with the invocations-ledger run id its
+        adjudicator calls were written under, and the latest plan of each
+        source with its document, sha and whether it is still the pending
+        plan. Never creates the ledger.
     sweep [--since ISO_DATETIME] [--project P ...] [--dry-run]
         The scheduled sweep: plan from the adjudicator over the links whose
         child was created since the last complete sweep (or since
@@ -389,7 +391,8 @@ def _status_line(run: RunRow) -> str:
     would_escape = ', '.join(counts.get('would_escape') or ()) or 'none'
     return (
         f'{run.run_id[:8]}  {run.source.value}  writes {"yes" if run.writes else "no"}  '
-        f'finished {run.finished_at or "never"}  {tallies}  would_escape {would_escape}'
+        f'finished {run.finished_at or "never"}  {tallies}  would_escape {would_escape}  '
+        f'invocations {run.invocation_run_id or "none"}'
     )
 
 
