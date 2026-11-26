@@ -5,10 +5,10 @@ from collections.abc import Callable, Sequence
 
 import pytest
 from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT
-from orchestrator.narrow_gate_plan import narrow_gate_plan
 
 from orchestrator.config import ModuleConfig
-from orchestrator.narrow_gate_class import MergeGateResolution
+from orchestrator.narrow_gate_class import GateMiss, MergeGateResolution, MissReason
+from orchestrator.narrow_gate_plan import NarrowGateDecision, narrow_gate_plan
 from orchestrator.verify_artifact_consumers import BEHAVIOURAL_ARTIFACTS
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_plan import (
@@ -226,3 +226,36 @@ class TestWholeTreeGuardFamily:
 
     def test_no_lister_enumerates_nothing(self) -> None:
         assert whole_tree_guard_family('orchestrator', None, _reader()) == ()
+
+
+class TestNarrowGateDecision:
+
+    _MISS = GateMiss(MissReason.NOT_ALLOWLISTED, 'pyproject.toml')
+
+    def test_full_carries_its_miss_and_no_plan(self) -> None:
+        decision = NarrowGateDecision.full(self._MISS, ['pyproject.toml'])
+
+        assert (decision.resolution, decision.miss, decision.plan) == (MergeGateResolution.FULL, self._MISS, None)
+        assert decision.changed_paths == ('pyproject.toml',)
+
+    def test_a_narrow_decision_carries_its_plan(self) -> None:
+        plan = _plan(MergeGateResolution.DOCS, ['README.md'], [ORCH])
+        assert plan is not None
+
+        decision = NarrowGateDecision(MergeGateResolution.DOCS, None, plan, ('README.md',))
+
+        assert decision.plan is plan
+
+    @pytest.mark.parametrize(('resolution', 'miss', 'with_plan'), [
+        (MergeGateResolution.DOCS, None, False),
+        (MergeGateResolution.COMMENTS, _MISS, True),
+        (MergeGateResolution.FULL, None, False),
+        (MergeGateResolution.FULL, _MISS, True),
+    ])
+    def test_an_inconsistent_decision_is_refused(
+        self, resolution: MergeGateResolution, miss: GateMiss | None, with_plan: bool,
+    ) -> None:
+        plan = _plan(MergeGateResolution.DOCS, ['README.md'], [ORCH]) if with_plan else None
+
+        with pytest.raises(ValueError, match=resolution.value):
+            NarrowGateDecision(resolution, miss, plan)
