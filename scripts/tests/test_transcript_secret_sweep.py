@@ -279,6 +279,21 @@ def _no_value_in(text: str) -> None:
         assert value not in text
 
 
+def _assert_journal_pointer(line: str, hidden: int) -> None:
+    assert line.startswith(f'... and {hidden} more line(s)')
+    for fragment in (
+        'journalctl --user -u transcript-secret-sweep.service',
+        "--since '2026-10-21 02:30:00 UTC'",
+        "--until '2026-10-22 02:30:00 UTC'",
+        '--all',
+        '-o json',
+        '_LINE_BREAK',
+        'three weeks',
+    ):
+        assert fragment in line, fragment
+    assert (Path(sweep.__file__).parent / sweep.JOURNAL_UNIT).is_file()
+
+
 def test_swept_trees_are_each_projects_transcripts_verify_logs_and_offline_lane_plus_the_claude_projects_dir(tree):
     a, b, claude = tree.project_a, tree.project_b, tree.claude_projects
 
@@ -573,6 +588,32 @@ def test_unswept_problems_are_a_shortfall(tree):
     assert 'cannot list units: boom' in shortfall['detail']
     assert len(poster.findings) == 1
     _no_value_in(json.dumps(poster.calls))
+
+
+@pytest.mark.parametrize(
+    'lines',
+    [
+        pytest.param([f'u{i:04d}' for i in range(300)], id='short-lines'),
+        pytest.param([f'{i:04d}: ' + 'x' * 100 for i in range(300)], id='long-ascii-lines'),
+        pytest.param([f'{i:02d} ' + 'é' * 100 for i in range(30)], id='multibyte-lines'),
+    ],
+)
+def test_a_shortfall_detail_is_bounded_in_lines_and_utf8_bytes_and_points_at_the_journal_record(tmp_path, lines):
+    claude = tmp_path / 'claude'
+    claude.mkdir()
+    config = sweep.SweepConfig(trees=sweep.swept_trees([], claude), now=NOW, unswept=tuple(lines))
+    poster = Recorder()
+
+    sweep.run(config, environ=ENVIRON, post_escalation=poster)
+
+    (shortfall,) = poster.shortfalls
+    detail = shortfall['detail']
+    shown = detail.splitlines()
+    assert len(detail.encode()) <= sweep.MAX_DETAIL_BYTES
+    assert len(shown) - 1 <= sweep.MAX_DETAIL_LINES
+    assert shown[:-1] == lines[:len(shown) - 1]
+    assert len(shown) > 1
+    _assert_journal_pointer(shown[-1], len(lines) - (len(shown) - 1))
 
 
 def test_a_shortfall_escalation_that_cannot_be_filed_is_reported(tree):
