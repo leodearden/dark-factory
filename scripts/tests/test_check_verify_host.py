@@ -69,6 +69,10 @@ hosts:
         for name in ('df', 'p', 'q'):
             self._git('init', '-q', str(self.remote / name))
             self._git('-C', str(self.remote / name), 'config', 'receive.denyCurrentBranch', 'updateInstead')
+        df_orchestrator = self.remote / 'df' / '.venv' / 'bin' / 'orchestrator'
+        df_orchestrator.parent.mkdir(parents=True)
+        df_orchestrator.write_text('#!/bin/sh\n')
+        df_orchestrator.chmod(0o755)
         (self.remote / 'config').mkdir()
         for project in ('p', 'q'):
             shutil.copyfile(rendered / f'{project}.yaml', self.remote / 'config' / f'{project}.yaml')
@@ -135,11 +139,15 @@ def test_an_agent_credential_file_fails_the_check(host: Host) -> None:
 
 
 def test_a_checkout_refusing_pushes_to_its_branch_fails(host: Host) -> None:
+    assert host.rows()[1]['checkouts']['verdict'] == 'ok'
     subprocess.run(
         ['git', '-C', str(host.remote / 'p'), 'config', '--unset', 'receive.denyCurrentBranch'],
         check=True, timeout=CLI_TIMEOUT,
     )
-    assert host.rows()[1]['checkouts']['verdict'] == 'fail'
+    row = host.rows()[1]['checkouts']
+    assert row['verdict'] == 'fail'
+    assert str(host.remote / 'p') in row['observed']
+    assert 'receive.denyCurrentBranch' in row['observed']
 
 
 def test_an_unreachable_host_fails_every_row_without_a_traceback(host: Host) -> None:
