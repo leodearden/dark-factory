@@ -944,7 +944,7 @@ def _committed_report() -> dict:
 
 
 class TestTheCommittedReport:
-    """STRUCTURE only: the measured values inform task 10244's ruling and gate no build."""
+    """STRUCTURE only: the values informed the 2026-11-17 ruling (esc-10244-1) and gate no build."""
 
     def test_it_measured_the_whole_committed_fixture_with_every_arm(self):
         report = _committed_report()
@@ -993,7 +993,7 @@ _COMMITTED_AUDIT_CONFIG = SCRIPTS.parent / 'config' / 'duplicate-audit.yaml'
 
 
 class TestTheRecallCaveatCarriesTheCommittedMeasurement:
-    """The yaml is the single home the 10244 resolver reads; the report is its derivation."""
+    """The yaml is the single home of the measurement; the committed report is its derivation."""
 
     def _caveat(self):
         return _report_schema().load_config(_COMMITTED_AUDIT_CONFIG).recall_caveat
@@ -1005,12 +1005,6 @@ class TestTheRecallCaveatCarriesTheCommittedMeasurement:
 
         assert entry.source == reported['source']
         assert entry.model_dump(mode='json') == reported
-
-    def test_gate_filing_stays_blocked_and_owned_by_4916(self):
-        caveat = self._caveat()
-
-        assert caveat.fitness.gate_filing == 'blocked'
-        assert caveat.gate_filing_owner_task == 4916
 
     def test_the_2026_08_11_measurement_is_unchanged(self):
         caveat = self._caveat()

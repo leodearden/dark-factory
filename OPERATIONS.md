@@ -6651,11 +6651,12 @@ checkout that ran the job:
 
 **What the report is for.** It measures regrowth. Re-emissions are
 near-verbatim, and the detector catches those. The report is
-`authoritative: false`. **Gate filing from it is blocked**: the detector's
-paraphrase recall is far below what enumerating a gate's members needs.
-Task 4916 owns that wiring and the precondition it waits on. The measured
-numbers are `recall_caveat` in `duplicate-audit.yaml`, and every report
-carries a copy. Read them there.
+`authoritative: false`. **Gate filing from it is descoped** by Leo's
+2026-11-17 ruling (esc-10244-1), and nothing is waiting to wire it.
+Duplicate detection stays with reconciliation Stage 1
+(`plans/memory-auto-consolidation-prd.md` D1). The measured numbers and the
+ruling (`gate_filing_ruling`) are `recall_caveat` in `duplicate-audit.yaml`,
+and every report carries a copy. Read them there.
 
 **Reading the diff.** Each cluster carries a `cluster_key` and a `lineage`
 status: `baseline`, `new`, `unchanged`, `grew`, `shrank` or `split`. A key is
