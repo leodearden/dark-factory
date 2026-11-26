@@ -24940,6 +24940,20 @@ entries:
       - (record 154) does not exist
 
       - (record 499) no such file or directory'
+  - date: '2026-11-24'
+    project: dark_factory
+    session: 9553a807-fc75-46b1-8cd9-ea20b0a63157
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Partial match. The digest is an orchestrated-task session with cwd in a worktree, shows a 'no such file or directory' not-found record, and has zero tool_error, self_correct, and interrupt signals, so no other diagnostic accompanies it. The digest shows only bare not-found lines with no surrounding transcript, so the 'repeated' aspect and the agent's actions cannot be verified. Phases are unknown because the digest gives no evidence for them.
+    evidence_quote: '- (record 75) no such file or directory'
+  - date: '2026-11-24'
+    project: dark_factory
+    session: 12032fc8-1247-45f4-824b-6310e0de094b
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest shows an orchestrated-task session in a worktree cwd with four not_found signals and no tool_error, self_correct, or interrupt signals. The phase is not stated in the digest, so both phases are unknown.
+    evidence_quote: '- (record 61) no such file or directory'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -28873,6 +28887,15 @@ entries:
     evidence_quote: '(record 5) <command-message>team</command-message>
 
       <command-name>/team</command-name>'
+  - date: '2026-11-24'
+    project: dark_factory
+    session: 7e9a2569-c1f2-4bf6-9cd0-3eae8837dc52
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The digest's 'User Corrections' bucket captures a /unblock skill invocation (command-message/command-name plus its injected command-args body) as if it were user feedback, even though the session has only 2 user turns and no correction signal fired.
+    evidence_quote: '<command-message>unblock</command-message>
+
+      <command-name>/unblock</command-name>'
   filed_tickets:
   - ticket: tkt_0RW5FRCC10XP47EPHA3X9HRK50
     project_root: /home/leo/src/dark-factory
@@ -29438,6 +29461,20 @@ entries:
     manifested_phase: unknown
     note: Orchestrated-task session hit don't-ask-mode denials on read-only inspection calls (a git merge-base/show Bash command and a fused-memory get_statuses read), matching the entry's denied-read-only-inspection mechanism. The digest does not show the verify-failure context, so phases are unknown.
     evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-24'
+    project: dark_factory
+    session: fdcf7187-393f-44a3-a979-15a87dabc257
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Read-only git inspection (git branch --all --contains, git log, git ls-tree) was denied by the don't-ask permission mode in two separate calls, and the digest shows no alternate read path, so the agent could not verify the commit's presence on main or the plan_cap_alarm test file. The digest does not show the phase, so phase is unknown.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-24'
+    project: dark_factory
+    session: 7aa3e217-ae1f-42ab-8def-245afd695750
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session's read-only Bash inspection (git ls-tree on main) was denied under don't-ask mode, matching the entry's mechanism. The digest does not show the resulting blind guesses, and the phase is not stated.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
   filed_tickets:
   - ticket: null
     project_root: /home/leo/src/dark-factory
@@ -29790,6 +29827,13 @@ entries:
     manifested_phase: unknown
     note: A StructuredOutput tool parameter carries leaked XML envelope markup (`</invoke>`) inside its JSON payload, so the input fails to parse. This is the parameter-contamination mechanism the entry names. The phase cannot be supported from the digest.
     evidence_quote: 'StructuredOutput({"__unparsedToolInput": {"len": 63, "raw": "{\"decisions\": [{\"index\":0,\"decision\":\"not_settled\"}]</invoke>\n}"}})'
+  - date: '2026-11-24'
+    project: dark_factory
+    session: f7049995-2ea7-467f-a357-480c09a38f6d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The record_step_deviation call's 'observed' field carried a '</observed>' closing tag, and the tool rejected it as raw MCP envelope markup. The caller had serialized part of its own tool-call envelope into the payload, which is the contamination mechanism this entry names. The phase is not stated in the digest, so both phases are unknown.
+    evidence_quote: 'Tool call rejected: it carries raw MCP envelope markup in ''observed'', which means the caller serialized part of its own tool-call envelope into the payload.'
   filed_tickets:
   - ticket: tkt_0RWPNGTWB2092RMRM1JP3SM9FK
     project_root: /home/leo/src/dark-factory
@@ -47769,6 +47813,19 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: 'fatal: unable to resolve revision: -A'
+- id: cand-20261124-1
+  title: Test assertion failure message hardcodes one causal interpretation that is false for other failure modes it also covers
+  cause: 'A `len(orphans) == 1` assertion''s failure message asserts ''no late win to settle'', but that conclusion is wrong in at least two cases the assertion also catches: a product regression that drops the asyncio.shield, and a follow-up change that turns the inner acquire into a plain Future. A failing run therefore points the next agent at a false diagnosis.'
+  area: tests
+  first_seen: '2026-11-24'
+  disposition: pending
+  sightings:
+  - date: '2026-11-24'
+    project: dark_factory
+    session: e22c40f8-2c01-4422-b5ef-dcb33593c886
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: '**Misleading failure message:** the `len(orphans) == 1` assertion says "no late win to settle" in two cases where that''s wrong. One is a product regression that drops the `asyncio.shield`. The other is the follow-up ticket turning the inner acquire into a plain Future.'
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
