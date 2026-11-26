@@ -809,13 +809,13 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     `done` nor `cancelled`; and it depends on a gate for its own ref
     (`x_client_defect_gate_for == ref`) whose status is `deferred`. Its ref is then held in
     `cursor.json.deferred_gate_reports: {ref: first_seen}`
-    (`client-feed/src/client_feed/unfiled.py::still_behind_deferred_gates`). The time is the
+    (`client-feed/src/client_feed/filer_checks.py::still_behind_deferred_gates`). The time is the
     publisher's own clock on the pass that first saw it so, not a line's `at`, so it restarts if the
     cursor is lost. The entry is dropped once the carrier no longer waits, and a gate held again after
     its release starts a new one. While any entry is older than `filer_grace_seconds`, the heartbeat
     names `filer` with the reason
     `N defect report(s) waiting on a deferred gate past <filer_grace_seconds>s: <ref>, …`
-    (`client-feed/src/client_feed/unfiled.py::deferred_gate_degradation`). With the carriers
+    (`client-feed/src/client_feed/filer_checks.py::deferred_gate_degradation`). With the carriers
     unreadable, the map stands, as `pending_reports` does.
   - (b) Why. Decision 4 says nothing is left `deferred`, and decision 7's end state has no task left
     `deferred`. That end state breaks when the filer's one `commit_planning([fix, gate])` releases the

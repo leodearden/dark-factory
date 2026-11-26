@@ -49,6 +49,12 @@ from client_feed.criteria import (
 from client_feed.engagement import EngagementUnusable, read_engagement
 from client_feed.envelope import Stamp
 from client_feed.feed_io import Cursor, OutDir
+from client_feed.filer_checks import (
+    deferred_gate_degradation,
+    still_behind_deferred_gates,
+    still_unfiled,
+    unfiled_degradation,
+)
 from client_feed.fold import fold
 from client_feed.inbox import InboxRead, InboxUnusable, read_inbox
 from client_feed.policy import Policy
@@ -69,12 +75,6 @@ from client_feed.sources.store import StoreReadError
 from client_feed.sources.tasks import TasksRead, read_defect_carriers, read_tasks
 from client_feed.sources.tree import VisibleTree, visible_tree
 from client_feed.stream_events import Identity, StreamOutput, identity, stream_events
-from client_feed.unfiled import (
-    deferred_gate_degradation,
-    still_behind_deferred_gates,
-    still_unfiled,
-    unfiled_degradation,
-)
 from client_feed.value_events import (
     branch_event,
     budget_event,

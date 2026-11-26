@@ -1,14 +1,16 @@
-"""The unfiled check: reports read on the inbox wait until a carrier exists or a ruling rules them, and the heartbeat names `filer` once one has waited past the grace (PRD §14.2 decisions 8 and 14)."""
+"""The publisher's two filer checks: reports read on the inbox wait until a carrier exists or a ruling rules them (PRD §14.2 decisions 8 and 14), filed reports whose carrier waits on a deferred gate are held from the pass that first saw them so (PRD §12, 2026-11-26, task 11885), and the heartbeat names `filer` for each once one has waited past the grace."""
 
+from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple, Protocol
 
 import pytest
 from _defects import reported, ruled
 
 from client_feed.contract import Degradation, InboxLine, RevealRequested, Source
 from client_feed.defect_ref import portal_ref
-from client_feed.unfiled import (
+from client_feed.filer_checks import (
     deferred_gate_degradation,
     still_behind_deferred_gates,
     still_unfiled,
@@ -90,52 +92,6 @@ class TestStillUnfiled:
         assert held == {REF: at(0)}
 
 
-class TestUnfiledDegradation:
-    def test_nothing_pending_names_nothing(self) -> None:
-        assert unfiled_degradation({}, now=at(10_000), grace_seconds=GRACE) is None
-
-    def test_a_report_exactly_the_grace_old_is_not_yet_overdue(self) -> None:
-        assert unfiled_degradation({REF: at(0)}, now=at(GRACE), grace_seconds=GRACE) is None
-
-    def test_a_report_older_than_the_grace_names_the_filer(self) -> None:
-        degradation = unfiled_degradation({REF: at(0)}, now=at(GRACE + 1), grace_seconds=GRACE)
-
-        assert degradation == Degradation(
-            source=Source.FILER, reason='1 defect report(s) unfiled past 600s: portal:acme:2:1'
-        )
-
-    def test_overdue_refs_are_named_oldest_first_and_a_young_one_is_not(self) -> None:
-        pending = {
-            'portal:acme:2:1': at(200),
-            'portal:acme:9:9': at(100),
-            'portal:acme:5:5': at(2_000),
-        }
-
-        degradation = unfiled_degradation(pending, now=at(2_100), grace_seconds=GRACE)
-
-        assert degradation == Degradation(
-            source=Source.FILER,
-            reason='2 defect report(s) unfiled past 600s: portal:acme:9:9, portal:acme:2:1',
-        )
-
-    def test_overdue_refs_reported_at_one_time_are_named_in_ref_order(self) -> None:
-        pending = {'portal:acme:3:1': at(0), 'portal:acme:2:1': at(0)}
-
-        degradation = unfiled_degradation(pending, now=at(GRACE + 1), grace_seconds=GRACE)
-
-        assert degradation is not None
-        assert degradation.reason.endswith(': portal:acme:2:1, portal:acme:3:1')
-
-    @pytest.mark.parametrize('grace_seconds', [0, 60, 3_600])
-    def test_the_reason_names_the_grace_it_was_judged_against(self, grace_seconds: int) -> None:
-        degradation = unfiled_degradation(
-            {REF: at(0)}, now=at(grace_seconds + 1), grace_seconds=grace_seconds
-        )
-
-        assert degradation is not None
-        assert f' past {grace_seconds}s: ' in degradation.reason
-
-
 PASS_AT = at(500)
 
 
@@ -170,48 +126,76 @@ class TestStillBehindDeferredGates:
         assert held == {REF: at(10)}
 
 
-class TestDeferredGateDegradation:
-    def test_nothing_held_names_nothing(self) -> None:
-        assert deferred_gate_degradation({}, now=at(10_000), grace_seconds=GRACE) is None
+class OverdueCheck(Protocol):
+    def __call__(
+        self, waiting: Mapping[str, datetime], /, *, now: datetime, grace_seconds: int
+    ) -> Degradation | None: ...
 
-    def test_a_ref_held_exactly_the_grace_is_not_yet_overdue(self) -> None:
-        assert deferred_gate_degradation({REF: at(0)}, now=at(GRACE), grace_seconds=GRACE) is None
 
-    def test_a_ref_held_longer_than_the_grace_names_the_filer(self) -> None:
-        degradation = deferred_gate_degradation(
-            {REF: at(0)}, now=at(GRACE + 1), grace_seconds=GRACE
-        )
+class Check(NamedTuple):
+    overdue: OverdueCheck
+    state: str
 
-        assert degradation == Degradation(
-            source=Source.FILER,
-            reason=f'1 defect report(s) waiting on a deferred gate past 600s: {REF}',
-        )
+
+@pytest.mark.parametrize(
+    'check',
+    [
+        Check(unfiled_degradation, 'unfiled'),
+        Check(deferred_gate_degradation, 'waiting on a deferred gate'),
+    ],
+    ids=['unfiled', 'deferred-gate'],
+)
+class TestEachCheckNamesItsOverdueReports:
+    def test_nothing_waiting_names_nothing(self, check: Check) -> None:
+        assert check.overdue({}, now=at(10_000), grace_seconds=GRACE) is None
+
+    def test_a_report_waiting_exactly_the_grace_is_not_yet_overdue(self, check: Check) -> None:
+        assert check.overdue({REF: at(0)}, now=at(GRACE), grace_seconds=GRACE) is None
 
     def test_overdue_refs_are_named_oldest_first_ties_in_ref_order_and_a_young_one_is_not(
-        self,
+        self, check: Check
     ) -> None:
-        held = {
+        waiting = {
             'portal:acme:2:1': at(200),
             'portal:acme:9:9': at(100),
             'portal:acme:3:3': at(100),
             'portal:acme:5:5': at(2_000),
         }
 
-        degradation = deferred_gate_degradation(held, now=at(2_100), grace_seconds=GRACE)
+        degradation = check.overdue(waiting, now=at(2_100), grace_seconds=GRACE)
 
         assert degradation == Degradation(
             source=Source.FILER,
             reason=(
-                '3 defect report(s) waiting on a deferred gate past 600s:'
+                f'3 defect report(s) {check.state} past 600s:'
                 ' portal:acme:3:3, portal:acme:9:9, portal:acme:2:1'
             ),
         )
 
     @pytest.mark.parametrize('grace_seconds', [0, 60, 3_600])
-    def test_the_reason_names_the_grace_it_was_judged_against(self, grace_seconds: int) -> None:
-        degradation = deferred_gate_degradation(
+    def test_the_reason_names_the_grace_it_was_judged_against(
+        self, check: Check, grace_seconds: int
+    ) -> None:
+        degradation = check.overdue(
             {REF: at(0)}, now=at(grace_seconds + 1), grace_seconds=grace_seconds
         )
 
         assert degradation is not None
         assert f' past {grace_seconds}s: ' in degradation.reason
+
+
+def test_a_report_unfiled_longer_than_the_grace_names_the_filer() -> None:
+    degradation = unfiled_degradation({REF: at(0)}, now=at(GRACE + 1), grace_seconds=GRACE)
+
+    assert degradation == Degradation(
+        source=Source.FILER, reason='1 defect report(s) unfiled past 600s: portal:acme:2:1'
+    )
+
+
+def test_a_ref_held_behind_a_deferred_gate_longer_than_the_grace_names_the_filer() -> None:
+    degradation = deferred_gate_degradation({REF: at(0)}, now=at(GRACE + 1), grace_seconds=GRACE)
+
+    assert degradation == Degradation(
+        source=Source.FILER,
+        reason='1 defect report(s) waiting on a deferred gate past 600s: portal:acme:2:1',
+    )
