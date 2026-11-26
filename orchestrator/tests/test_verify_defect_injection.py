@@ -407,13 +407,14 @@ class TestVerifyLegInjectionEndToEnd:
         before = listing(host)
         monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
         worktree = _make_fixture_project(tmp_path / 'worktree')
-        recorder = worktree / 'pkg' / 'tests' / 'inherited-temproot'
-        (recorder.parent / 'test_temp_root.py').write_text(
-            'import os\nimport pathlib\n\n\n'
-            'def test_records_its_temp_root():\n'
-            "    pathlib.Path(__file__).with_name('inherited-temproot').write_text(\n"
-            "        os.environ.get('PYTEST_DEBUG_TEMPROOT', ''), encoding='utf-8',\n"
-            '    )\n',
+        recorded = worktree / 'pkg' / 'tests' / 'inherited-env.json'
+        (recorded.parent / 'test_session_env.py').write_text(
+            'import json\nimport os\nimport pathlib\n\n\n'
+            'def test_records_its_session_env():\n'
+            "    pathlib.Path(__file__).with_name('inherited-env.json').write_text(json.dumps({\n"
+            "        'temproot': os.environ.get('PYTEST_DEBUG_TEMPROOT', ''),\n"
+            "        'xdist_worker': os.environ.get('PYTEST_XDIST_WORKER', ''),\n"
+            "    }), encoding='utf-8')\n",
             encoding='utf-8',
         )
 
@@ -422,10 +423,16 @@ class TestVerifyLegInjectionEndToEnd:
         )
 
         assert result.passed, result.test_output
-        assert recorder.read_text(encoding='utf-8') == str(host), (
+        session_env = json.loads(recorded.read_text(encoding='utf-8'))
+        assert session_env['temproot'] == str(host), (
             'the nested session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
             'use the real host temp root and leave the stand-in untouched with or '
             'without --basetemp: the assertion below would pass vacuously'
+        )
+        assert session_env['xdist_worker'].startswith('gw'), (
+            'the leg ran without xdist workers, so its controller never resolved a '
+            'basetemp and never armed the exit-time sweep: the assertion below would '
+            f"pass vacuously (PYTEST_XDIST_WORKER={session_env['xdist_worker']!r})"
         )
         after = listing(host)
         assert after == before, (
