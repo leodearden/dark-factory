@@ -9420,7 +9420,7 @@ class MemoryService:
         return deleted
 
     async def memory_exists(
-        self, memory_id: str, *, store: str, project_id: str
+        self, memory_id: str, *, store: SourceStore, project_id: str
     ) -> bool:
         """Whether *memory_id* resolves in *store*; a read failure propagates.
 
@@ -9432,7 +9432,7 @@ class MemoryService:
         citation passes mutate task metadata, since the refusal below in
         :meth:`delete_memory` fires only after them.
         """
-        if SourceStore(store) == SourceStore.mem0:
+        if store == SourceStore.mem0:
             return await self.get_memory_by_id(project_id, memory_id) is not None
         try:
             await self.graphiti.get_edge_text(memory_id, group_id=project_id)
@@ -9552,7 +9552,7 @@ class MemoryService:
                 'cascade if a plain delete of this record is what was meant.'
             )
         require_full_uuid(memory_id, field_name='memory_id')
-        if not await self.memory_exists(memory_id, store=store, project_id=project_id):
+        if not await self.memory_exists(memory_id, store=source, project_id=project_id):
             return memory_not_found(store, memory_id, project_id, nothing_was='deleted')
 
         write_op_id = str(uuid_mod.uuid4())

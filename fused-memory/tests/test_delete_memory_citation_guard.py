@@ -33,7 +33,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.memory_metadata import ParentHasChildrenError
 from fused_memory.server.tools import create_mcp_server
-from fused_memory.services.memory_service import DescendantScan
+from fused_memory.services.memory_service import DescendantScan, MemoryService
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -2362,19 +2362,17 @@ class TestMissingParentCascadeOverARealService:
 
     @pytest.fixture
     def service(self, mock_config):
-        from fused_memory.services.memory_service import MemoryService
-
         svc = MemoryService(mock_config)
         svc.graphiti = MagicMock()
         svc.mem0 = MagicMock()
 
-        async def _point(*args, **kwargs):
-            if DOOMED in args or DOOMED in kwargs.values():
+        async def _point(memory_id, scope):
+            if memory_id == DOOMED:
                 return None
             return {'id': CHILD, 'memory': 'live child', 'metadata': {'parent_id': DOOMED}}
 
-        async def _count(*args, **kwargs):
-            return 1 if DOOMED in repr((args, kwargs)) else 0
+        async def _count(scope, filters):
+            return 1 if filters.get('parent_id') == DOOMED else 0
 
         svc.mem0.get_point_by_id = AsyncMock(side_effect=_point)
         svc.mem0.count_by_metadata = AsyncMock(side_effect=_count)

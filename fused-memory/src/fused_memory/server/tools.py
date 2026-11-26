@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
@@ -1443,10 +1444,20 @@ class _CitationSnapshot:
 
     *scan_error* is set when the read itself failed: every covered id's
     citation state is then unknown, and the gate fails closed on each.
+
+    One snapshot is shared by several gate calls, so *citers_by_id* and each
+    citer are stored as read-only views: ``frozen=True`` alone stops only
+    rebinding the field, not writes through it.
     """
 
     citers_by_id: Mapping[str, tuple[Mapping[str, Any], ...]]
     scan_error: Exception | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'citers_by_id', MappingProxyType({
+            memory_id: tuple(MappingProxyType(dict(citer)) for citer in citers)
+            for memory_id, citers in self.citers_by_id.items()
+        }))
 
     def citers_of(self, memory_id: str) -> list[dict[str, Any]]:
         if memory_id not in self.citers_by_id:
@@ -2448,7 +2459,7 @@ def create_mcp_server(
         so the caller cannot tell which layer refused.
         """
         if await memory_service.memory_exists(
-            memory_id, store=store, project_id=project_id
+            memory_id, store=SourceStore(store), project_id=project_id
         ):
             return None
         return memory_not_found(store, memory_id, project_id, nothing_was='deleted')
