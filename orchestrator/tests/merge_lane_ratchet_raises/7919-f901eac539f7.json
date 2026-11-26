@@ -1,0 +1,42 @@
+{
+  "task_id": "7919",
+  "reason": "net-additive: merge pre-verify screen call sites (PRD merge-pre-verify-screen \u03b1); new branch extracted to _screen_train_tip/_screen_merged_item, one early-return remains in _do_train_merge",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1471,
+      "current": 1479
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::_do_train_merge",
+      "baseline": 37,
+      "current": 38
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_train_attribution.py",
+      "baseline": 9,
+      "current": 10
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_merge_blocked_surfacing.py",
+      "baseline": 7,
+      "current": 11
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5284,
+      "current": 5349
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6135,
+      "current": 6140
+    }
+  ]
+}
