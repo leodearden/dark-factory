@@ -75,6 +75,16 @@ fi
 exit "${FAKE_SYSTEMCTL_RC:-0}"
 """
 
+_SIGHUP_RECORDER = """\
+import os, signal, sys, threading
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGHUP})
+threading.Thread(target=lambda: (sys.stdin.read(), os._exit(0)), daemon=True).start()
+os.write(1, b'ready\\n')
+while True:
+    signal.sigwait({signal.SIGHUP})
+    os.write(1, b'hup\\n')
+"""
+
 
 def put_object(
     store: Path, key: str, size: int, mtime_age: float, atime_age: float | None = None
@@ -313,42 +323,24 @@ class TestPrune:
             f"--user show -p MainPID --value {STORE_UNIT}"
         ]
 
-    def test_signals_the_store_units_main_pid_once(
-        self, world: PrunerWorld, tmp_path: Path
-    ) -> None:
-        hups = tmp_path / "hups"
-        ready = tmp_path / "ready"
-        listener = subprocess.Popen(
-            [
-                sys.executable,
-                "-I",
-                "-c",
-                "import signal, sys, time\n"
-                "hups, ready = sys.argv[1], sys.argv[2]\n"
-                "signal.signal(signal.SIGHUP, lambda *_: open(hups, 'a').write('hup\\n'))\n"
-                "open(ready, 'w').close()\n"
-                "time.sleep(60)\n",
-                str(hups),
-                str(ready),
-            ]
-        )
-        try:
-            deadline = time.monotonic() + 10
-            while not ready.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            for key in ("abc-1", "abd-2", "abe-3"):
-                put_object(world.store, key, 100, mtime_age=3 * DAY)
+    def test_signals_the_store_units_main_pid_once(self, world: PrunerWorld) -> None:
+        for key in ("abc-1", "abd-2", "abe-3"):
+            put_object(world.store, key, 100, mtime_age=3 * DAY)
+        with subprocess.Popen(
+            [sys.executable, "-I", "-c", _SIGHUP_RECORDER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        ) as listener:
+            assert listener.stdin is not None
+            assert listener.stdout is not None
+            assert listener.stdout.readline() == b"ready\n"
             code, report = world.prune(cap=0, rclone_pid=listener.pid)
-            deadline = time.monotonic() + 5
-            while not hups.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-        finally:
-            listener.kill()
-            listener.wait(timeout=10)
-        assert code == 0
-        assert report["removed"] == 3
-        assert report["signalled"] == listener.pid
-        assert hups.read_text() == "hup\n"
+            assert code == 0
+            assert report["removed"] == 3
+            assert report["signalled"] == listener.pid
+            assert listener.stdout.readline() == b"hup\n"
+            listener.stdin.close()
+            assert listener.stdout.read() == b""
 
     def test_systemctl_failure_exits_one_and_removes_nothing(
         self, world: PrunerWorld
