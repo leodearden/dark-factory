@@ -90,7 +90,7 @@ class TestOutcomeKindIsTerminal:
 
     def test_terminal_members_are_terminal(self) -> None:
         terminal_values = _EXPECTED_VALUES - _NON_TERMINAL_VALUES
-        assert len(terminal_values) == 20
+        assert len(terminal_values) == 21
         for value in terminal_values:
             member = OutcomeKind(value)
             assert member.is_terminal is True, f'{member!r} should be terminal'

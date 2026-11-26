@@ -396,6 +396,8 @@ class EventType(StrEnum):
     # escalation (task 2757; Reify 5120 RCA RC-2).  task_id-keyed; payload shape:
     # {reason, category, failure_category, cause_hint}.
     merge_blocked = 'merge_blocked'
+    # One merge pre-verify screen run (task 7919); payload: merge_lane/screen.py::MergeScreen.
+    merge_screen = 'merge_screen'
     # A resumed task branch whose HEAD does not merge cleanly onto main, found at
     # dispatch start before planning (task 7736).  Sole emit site:
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._settle_conflicting_base,
