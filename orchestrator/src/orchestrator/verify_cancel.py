@@ -504,9 +504,16 @@ def _reap_recorded_worktree(
         return
     worktree = read_worktree_path(pgid_path)
     if worktree is not None:
-        _wait_for_lock_release(
-            lane_lock_path(worktree), killed_pid, monotonic=monotonic, sleep=sleep,
-        )
+        lock_path = lane_lock_path(worktree)
+        if not _wait_for_lock_release(
+            lock_path, killed_pid, monotonic=monotonic, sleep=sleep,
+        ):
+            print(
+                f'cancel-verify: killed pid {killed_pid} still holds {lock_path} '
+                f'after {KILLED_RUN_LOCK_RELEASE_SECS}s; '
+                'the worktree may be left for the merge reaper',
+                file=sys.stderr,
+            )
         remove_worktree(worktree)
     remove_worktree_path(pgid_path)
 
