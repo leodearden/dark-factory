@@ -98,7 +98,9 @@ async def test_lint_and_type_are_recorded_as_carried_over(tmp_path, concurrent):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('concurrent', [True, False])
 async def test_the_attempt_wall_time_is_the_recovery_legs_own(tmp_path, concurrent):
-    result, summary = await _verify(tmp_path, concurrent=concurrent)
+    result, summary = await _verify(
+        tmp_path, concurrent=concurrent, type_command='sleep 5',
+    )
 
     test, type_ = _entry(summary, 'test'), _entry(summary, 'type')
     assert type_['duration_secs'] > test['duration_secs'], (
