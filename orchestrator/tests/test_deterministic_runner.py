@@ -19,7 +19,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _predicate_specimens import POLLUTED_PREDICATE_OUTPUT
-from _script_survivor import SURVIVOR_SCRIPT, is_alive, kill_survivor, read_survivor_pid
+from _script_survivor import (
+    SURVIVOR_SCRIPT,
+    kill_survivor,
+    needs_group_pidfd_signals,
+    read_survivor_pid,
+)
+from df_pytest_isolation import wait_pid_gone
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -3032,15 +3038,16 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
     ``communicate()`` times out with the script's REAL exit code already in
     hand.  That is the very shape Layer A (task 2087/2090) exists for, and
     reporting "no exit code was produced" there would swap a fabricated rc
-    for an affirmative falsehood (reviewer amendment).  It is also the shape
-    in which the teardown dispatches NO signal, so it pins the escalation
-    against claiming a kill and against losing the surviving process.
+    for an affirmative falsehood (reviewer amendment).  The teardown still
+    SIGKILLs that reaped script's whole group, through the leader pidfd
+    run_script holds from spawn (task 10370), so it pins the escalation to
+    report both the code and the kill, and the surviving child dead.
 
     The matrix test then drives every {exit code} x {teardown disposition}
     cell through the seam, pinning that the kill claim keys on the MEASURED
     disposition rather than on the exit code — which is not a sound proxy in
-    either direction, and whose exit-during-teardown cell no end-to-end test
-    can reach.
+    either direction, and whose code-without-signal cell no end-to-end test
+    can reach deterministically on a Linux 6.9+ kernel.
 
     A green-on-arrival companion closes the class: only the TIMEOUT wording
     moved, and a genuine non-zero exit code is still reported verbatim.
@@ -3238,6 +3245,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         ]
         assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
 
+    @needs_group_pidfd_signals
     async def test_targetless_deploy_script_that_exited_reports_its_real_exit_code(
         self, tmp_path: Path,
     ):
@@ -3254,12 +3262,11 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         this task removed with an affirmative falsehood about a script that
         ran to completion.
 
-        And because the script was already reaped when the teardown ran, the
-        pid-recycling guard dispatched NO signal: the child holding the pipe
-        open is STILL RUNNING while this escalation is read.  So this test
-        also pins the escalation against claiming a kill — the most
-        operationally costly direction of the defect, since it tells an
-        operator a surviving process is gone when it is not.
+        The script was already reaped when the teardown ran, yet its whole
+        group is SIGKILLed through the leader pidfd run_script holds from
+        spawn (task 10370).  So the child holding the pipe open dies, and the
+        escalation must report that kill rather than send the operator to
+        find a survivor.
         """
         import asyncio
 
@@ -3330,36 +3337,24 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             )
 
             survivor_pid = read_survivor_pid(pidfile)
-            assert is_alive(survivor_pid), (
+            assert await asyncio.to_thread(wait_pid_gone, survivor_pid, timeout=3.0), (
                 f'THE MEASUREMENT the assertions below are about: survivor pid '
-                f'{survivor_pid} is still RUNNING, because the teardown dispatched '
-                f'no signal to it at all'
+                f'{survivor_pid}, holding the pipe of a reaped script, must die '
+                f'with the group'
             )
-            assert 'SIGKILLed' not in esc.detail, (
-                f'HONESTY PIN (task 4252 reviewer finding): in this shape '
-                f"terminate_process_tree's pid-recycling guard dispatched NO "
-                f'signal, so claiming a kill tells the operator that surviving '
-                f'process (pid {survivor_pid}, alive as this runs) is gone when it '
-                f'is not — the most operationally costly direction of the defect: '
-                f'{esc.detail!r}'
+            assert 'SIGKILLed' in esc.detail, (
+                f'the whole group WAS SIGKILLed through the held leader pidfd, so '
+                f'the detail must say so: {esc.detail!r}'
             )
-            assert 'nothing was signalled at all' in esc.detail, (
-                f'the detail must state that the process group was deliberately NOT '
-                f'signalled: {esc.detail!r}'
+            assert 'survivor was killed with the group' in esc.detail, (
+                f'...and that the child holding the pipe died with it: {esc.detail!r}'
             )
-            assert 'recycled pid' in esc.detail, (
-                f'...and WHY: the script had already been reaped, so signalling its '
-                f'pid could hit an unrelated group (task 845): {esc.detail!r}'
+            assert 'nothing was signalled at all' not in esc.detail, (
+                f'HONESTY PIN: a signal WAS dispatched: {esc.detail!r}'
             )
-            assert 'located and killed out-of-band' in esc.detail, (
-                f'nothing else will clean the survivor up, so the detail must tell '
-                f'the operator to find and kill it before resolving: {esc.detail!r}'
-            )
-            assert str(script) in esc.detail, (
-                f'...and must name the script path as the thing to search BY — the '
-                f'raw pid is deliberately not offered, since the runner refused to '
-                f'signal it precisely because it may now belong to an unrelated '
-                f'group: {esc.detail!r}'
+            assert 'located and killed out-of-band' not in esc.detail, (
+                f'the survivor is dead, so sending the operator to find and kill '
+                f'it would be a false lead: {esc.detail!r}'
             )
 
             done_calls = [
@@ -3391,11 +3386,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         out-of-band IFF it did not.
 
         ``exit_code`` is not a sound proxy for either, in either direction —
-        the common exited-script shape short-circuits the killpg entirely,
-        while a script that exits in the window between the timeout firing and
-        the killpg gets both a code AND a real group kill.  That second cell is
-        a race no end-to-end test can drive, which is why the matrix is driven
-        through the seam.
+        the common exited-script shape gets both a code AND a real group kill
+        end to end, through the leader pidfd held from spawn (task 10370),
+        while a script reaped before that pidfd was taken, or one on a kernel
+        before Linux 6.9, gets a code with no signal.  That second cell is a
+        race or a kernel no end-to-end test here can drive, which is why the
+        matrix is driven through the seam.
 
         Raising ``ScriptTimeout`` from an INJECTED ``script_runner`` is a
         deliberate test seam for reaching a specific measured shape.  It is not
