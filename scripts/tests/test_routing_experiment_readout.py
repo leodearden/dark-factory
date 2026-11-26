@@ -435,7 +435,7 @@ def test_main_names_each_skipped_root_and_its_reason_on_the_rule_line(
     assert status == readout.EXIT_OK
     out, err = capsys.readouterr()
     rule = _rule_line(out)
-    assert 'read good, no-tasks' in rule
+    assert 'read no-tasks, good' in rule
     assert 'no-runs (runs.db absent)' in rule
     assert 'garbage (runs.db unreadable: file is not a database)' in rule
     assert 'no-tasks (tasks.db absent)' in rule

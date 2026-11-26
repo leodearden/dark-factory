@@ -161,6 +161,8 @@ _MERGE_VERIFY = 'merge_verify'
 _REVIEW_COMPLETED = 'review_completed'
 _READ_EVENT_TYPES = (_ROUTING_DECISION, _WORKFLOW_VERIFY, _MERGE_VERIFY, _REVIEW_COMPLETED)
 
+NO_CANDIDATE_KEY = 'no candidate_key'
+
 
 @dataclass(frozen=True)
 class TaskRecord:
@@ -445,39 +447,72 @@ def _read_task_rows(root: Path) -> tuple[dict[str, _TaskRow], str | None]:
         return {}, _store_problem('tasks.db', exc)
 
 
+def _read_runs_db(
+    path: Path, window: Window,
+) -> tuple[dict[str, _TaskLedger], dict[str, list[_Event]]]:
+    """Each population task's ledger, and every in-window event by task (for producer evidence)."""
+    with closing(connect_readonly(path)) as conn:
+        population = _population(conn, window)
+        invocations = _invocations(conn, window)
+        events = _events(conn, window)
+    ledgers = {
+        task_id: _TaskLedger(
+            tuple(results), tuple(invocations.get(task_id, ())), tuple(events.get(task_id, ()))
+        )
+        for task_id, results in population.items()
+    }
+    return ledgers, events
+
+
+def _split_key(task_id: str, task_row: _TaskRow, kind: KeyKind) -> str | None:
+    if kind is KeyKind.TASK_ID:
+        return task_id
+    return task_row.candidate_key
+
+
+def _keyed_records(
+    project: str,
+    ledgers: Mapping[str, _TaskLedger],
+    task_rows: Mapping[str, _TaskRow],
+    salt: str,
+    buckets: int,
+    kind: KeyKind,
+) -> tuple[tuple[TaskRecord, ...], dict[str, int]]:
+    records: list[TaskRecord] = []
+    exclusions: Counter[str] = Counter()
+    for task_id, ledger in ledgers.items():
+        task_row = task_rows.get(task_id, _NO_TASK_ROW)
+        key = _split_key(task_id, task_row, kind)
+        if key is None:
+            exclusions[NO_CANDIDATE_KEY] += 1
+            continue
+        bucket = split_bucket(salt, key, buckets)
+        records.append(_record(project, task_id, key, bucket, ledger, task_row))
+    return tuple(records), dict(exclusions)
+
+
+def _skipped(root: Path, problem: str) -> FleetLoad:
+    return FleetLoad((), (RootStatus(root, runs_db_problem=problem),), ProducerEvidence())
+
+
 def load_project(
     root: Path, window: Window, salt: str, buckets: int, key: KeyKind,
 ) -> FleetLoad:
-    """One root's population records, read status and producer evidence."""
+    """One root's population records, read status, producer evidence and exclusions."""
     runs_path = runs_db(root)
     if not runs_path.is_file():
-        return FleetLoad((), (RootStatus(root, runs_db_problem='runs.db absent'),), ProducerEvidence())
+        return _skipped(root, 'runs.db absent')
     try:
-        with closing(connect_readonly(runs_path)) as conn:
-            population = _population(conn, window)
-            invocations = _invocations(conn, window)
-            events = _events(conn, window)
+        ledgers, events = _read_runs_db(runs_path, window)
     except UNREADABLE_STORE_ERRORS as exc:
-        status = RootStatus(root, runs_db_problem=_store_problem('runs.db', exc))
-        return FleetLoad((), (status,), ProducerEvidence())
+        return _skipped(root, _store_problem('runs.db', exc))
     task_rows, tasks_db_problem = _read_task_rows(root)
-    records = tuple(
-        _record(
-            root.name,
-            task_id,
-            task_id,
-            split_bucket(salt, task_id, buckets),
-            _TaskLedger(
-                tuple(results), tuple(invocations.get(task_id, ())), tuple(events.get(task_id, ()))
-            ),
-            task_rows.get(task_id, _NO_TASK_ROW),
-        )
-        for task_id, results in population.items()
-    )
+    records, exclusions = _keyed_records(root.name, ledgers, task_rows, salt, buckets, key)
     return FleetLoad(
         records,
         (RootStatus(root, tasks_db_problem=tasks_db_problem),),
         _evidence(events, records),
+        exclusions,
     )
 
 
@@ -558,6 +593,65 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+@dataclass(frozen=True)
+class Settings:
+    """The command-line choices a report was computed under."""
+
+    window: Window
+    salt: str
+    buckets: int
+    key: KeyKind
+    subset: Subset
+
+
+@dataclass(frozen=True)
+class Report:
+    settings: Settings
+    source: RootSource
+    roots: tuple[RootStatus, ...]
+    evidence: ProducerEvidence
+    exclusions: dict[str, int]
+    tasks: tuple[TaskRecord, ...]
+
+
+def _listing(items: Sequence[str]) -> str:
+    return ', '.join(items) or 'none'
+
+
+def _roots_clause(source: RootSource, statuses: Sequence[RootStatus]) -> str:
+    read = [status.project for status in statuses if status.read]
+    skipped = [f'{status.project} ({status.runs_db_problem})' for status in statuses if not status.read]
+    tasks_unread = [
+        f'{status.project} ({status.tasks_db_problem})'
+        for status in statuses if status.read and status.tasks_db_problem is not None
+    ]
+    clause = f'roots from {source.value}: read {_listing(read)}'
+    if skipped:
+        clause += f'; skipped {_listing(skipped)}'
+    if tasks_unread:
+        clause += f'; tasks.db unread {_listing(tasks_unread)}'
+    return clause
+
+
+def _rule_line(report: Report) -> str:
+    settings = report.settings
+    start, end = settings.window.sql_bounds()
+    excluded = [f'{count} {reason}' for reason, count in report.exclusions.items()]
+    return 'rule: ' + '; '.join([
+        f'window [{start}, {end})',
+        f'population = the {len(report.tasks)} tasks with a task_results row completed in the window',
+        _roots_clause(report.source, report.roots),
+        f'key {settings.key.value}',
+        f'split salt {settings.salt!r} buckets {settings.buckets}',
+        f'subset {settings.subset.value}',
+        f'excluded {_listing(excluded)}',
+    ])
+
+
+def render_text(report: Report) -> str:
+    return _rule_line(report) + '\n'
+
+
 def _warn(message: str) -> None:
     print(f'routing_experiment_readout: {message}', file=sys.stderr)
 
@@ -587,12 +681,25 @@ def main(
             f'install {FUSED_MEMORY_UNIT} with it in its Environment='
         )
         return EXIT_NOTHING_READ
-    window = Window.trailing(args.until or datetime.now(UTC), args.days)
-    load = load_fleet(selection.roots, window, args.salt, args.buckets, args.key)
+    settings = Settings(
+        Window.trailing(args.until or datetime.now(UTC), args.days),
+        args.salt,
+        args.buckets,
+        args.key,
+        args.subset,
+    )
+    load = load_fleet(selection.roots, settings.window, args.salt, args.buckets, args.key)
     _warn_unread_stores(load.roots)
     if not any(status.read for status in load.roots):
-        _warn(f'no runs.db was readable under the {len(load.roots)} root(s) from {selection.source.value}')
+        _warn(
+            f'no runs.db was readable under the {len(load.roots)} root(s) from '
+            f'{selection.source.value}'
+        )
         return EXIT_NOTHING_READ
+    report = Report(
+        settings, selection.source, load.roots, load.evidence, load.exclusions, load.records,
+    )
+    sys.stdout.write(render_text(report))
     return EXIT_OK
 
 
