@@ -194,11 +194,11 @@ def compute_write_set(
     ``TaskArtifacts.task_root_for(worktree.parent, task_id)``.
 
     Pure: reads ``<worktree>/.git`` and resolves symlinks, but performs no
-    filesystem writes (no makedirs) — existence/creation remains the
-    backend's job (landlock_exec's ``_add_path`` already skips non-existent
-    dirs). Fails loudly (``ValueError``) on a missing/malformed/directory
-    ``.git``, and on a *task_id* ``TaskArtifacts.task_root_for`` refuses —
-    fail-closed-friendly, honoring the loud-over-silent norm.
+    filesystem writes; the carve-outs that must pre-exist are created by
+    ``ensure_sandbox_dirs``. Fails loudly (``ValueError``) on a
+    missing/malformed/directory ``.git``, and on a *task_id*
+    ``TaskArtifacts.task_root_for`` refuses — fail-closed-friendly, honoring
+    the loud-over-silent norm.
 
     ``home`` defaults to ``Path.home()``; tests should inject a hermetic
     tmp dir.
@@ -353,8 +353,7 @@ def _docs_shape_refusal(root: Path, target: Path, grant: Path) -> str | None:
 
 def ensure_sandbox_dirs(write_set: WriteSet) -> list[Path]:
     """Best-effort, side-effecting pre-creation of every carve-out that must
-    exist before the sandbox is built: ``claude_fleet`` (task 2996) and
-    ``tree_sitter_cache`` (task 3382).
+    exist before the sandbox is built. The tuple below is the one list of them.
 
     ``compute_write_set`` is intentionally PURE (no makedirs — pinned by
     ``test_purity_no_makedirs_side_effect``), yet neither backend can grant a
